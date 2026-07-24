@@ -145,6 +145,7 @@ pub(crate) struct Grid {
     history_stamp: i64,
     history_stamp_remaining: u16,
     history: VecDeque<GridLine>,
+    history_content_bytes: usize,
     visible: VecDeque<GridLine>,
 }
 
@@ -164,6 +165,7 @@ impl Grid {
             history_stamp: 0,
             history_stamp_remaining: 0,
             history: VecDeque::new(),
+            history_content_bytes: 0,
             visible: (0..sy).map(|_| GridLine::new(sx)).collect(),
         }
     }
@@ -212,7 +214,7 @@ impl Grid {
         self.hlimit = hlimit;
         self.reflow_history_capacity = 0;
         while self.history.len() > self.hlimit {
-            let _ = self.history.pop_front();
+            let _ = self.pop_history_front();
         }
         self.hscrolled = self.hscrolled.min(self.history.len());
     }
@@ -257,7 +259,11 @@ impl Grid {
     /// at the bottom.
     pub fn remove_absolute_line(&mut self, absolute_y: usize) -> bool {
         if absolute_y < self.history.len() {
-            let _ = self.history.remove(absolute_y);
+            if let Some(line) = self.history.remove(absolute_y) {
+                self.history_content_bytes = self
+                    .history_content_bytes
+                    .saturating_sub(history_line_content_bytes(&line));
+            }
             self.reflow_history_capacity = self.reflow_history_capacity.saturating_sub(1);
             self.hscrolled = self.hscrolled.min(self.history.len());
             return true;
@@ -302,6 +308,7 @@ impl Grid {
         while self.history.len() > self.effective_history_capacity() {
             let _ = self.history.pop_front();
         }
+        self.recompute_history_content_bytes();
         self.visible = visible.into();
         self.hscrolled = self.history.len();
         true
@@ -317,6 +324,7 @@ impl Grid {
     /// Clears every history row.
     pub fn clear_history(&mut self) {
         self.history.clear();
+        self.history_content_bytes = 0;
         self.reflow_history_capacity = 0;
         self.hscrolled = 0;
     }
@@ -486,17 +494,52 @@ impl Grid {
 
     /// Returns the retained history size in bytes including newlines.
     #[must_use]
-    pub fn history_byte_size(&self) -> usize {
-        self.history
-            .iter()
-            .map(|line| line.render_text().len() + 1)
-            .sum()
+    pub const fn history_byte_size(&self) -> usize {
+        self.history_content_bytes
     }
 
     /// Captures only the visible rows.
     #[must_use]
     pub fn visible_lines(&self) -> Vec<GridLine> {
         self.visible.iter().cloned().collect()
+    }
+
+    pub(crate) fn clone_recovery_projection(&self, max_history_bytes: usize) -> Self {
+        let mut remaining = max_history_bytes;
+        let mut start = self.history.len();
+        while start > 0 {
+            let group_start = self.logical_start_y(start - 1);
+            let group_bytes = self
+                .history
+                .range(group_start..start)
+                .map(GridLine::recovery_clone_bytes)
+                .fold(0_usize, usize::saturating_add);
+            if group_bytes > remaining {
+                break;
+            }
+            remaining -= group_bytes;
+            start = group_start;
+        }
+
+        let retained = self
+            .history
+            .range(start..)
+            .cloned()
+            .collect::<VecDeque<_>>();
+        let history_content_bytes = retained.iter().map(history_line_content_bytes).sum();
+        Self {
+            sx: self.sx,
+            sy: self.sy,
+            hlimit: retained.len(),
+            reflow_history_capacity: 0,
+            hscrolled: retained.len(),
+            history_enabled: self.history_enabled,
+            history_stamp: self.history_stamp,
+            history_stamp_remaining: self.history_stamp_remaining,
+            history: retained,
+            history_content_bytes,
+            visible: self.visible.clone(),
+        }
     }
 
     pub(crate) fn scroll_region_up(
@@ -627,6 +670,7 @@ impl Grid {
                 line.resize_width_preserving_wrap(sx, bg);
             }
             self.sx = sx;
+            self.recompute_history_content_bytes();
             return self.locate_cursor_from_logical(cursor);
         }
 
@@ -672,6 +716,7 @@ impl Grid {
             line.resize_width_preserving_wrap(sx, bg);
         }
         self.history = compacted_history(reflowed);
+        self.recompute_history_content_bytes();
         self.reflow_history_capacity = if self.history.len() > self.hlimit {
             self.history.len()
         } else {
@@ -731,7 +776,7 @@ impl Grid {
             if self.history_enabled && pull > 0 {
                 let mut restored = Vec::with_capacity(pull as usize);
                 for _ in 0..pull {
-                    if let Some(line) = self.history.pop_back() {
+                    if let Some(line) = self.pop_history_back() {
                         restored.push(line);
                     }
                 }
@@ -878,10 +923,33 @@ impl Grid {
         line.stamp_for_history_at(self.next_history_stamp());
         line.compact_for_history();
         if self.history.len() >= history_capacity {
-            let _ = self.history.pop_front();
+            let _ = self.pop_history_front();
         }
+        self.history_content_bytes = self
+            .history_content_bytes
+            .saturating_add(history_line_content_bytes(&line));
         self.history.push_back(line);
         self.hscrolled = (self.hscrolled + 1).min(self.history.len());
+    }
+
+    fn pop_history_front(&mut self) -> Option<GridLine> {
+        let line = self.history.pop_front()?;
+        self.history_content_bytes = self
+            .history_content_bytes
+            .saturating_sub(history_line_content_bytes(&line));
+        Some(line)
+    }
+
+    fn pop_history_back(&mut self) -> Option<GridLine> {
+        let line = self.history.pop_back()?;
+        self.history_content_bytes = self
+            .history_content_bytes
+            .saturating_sub(history_line_content_bytes(&line));
+        Some(line)
+    }
+
+    fn recompute_history_content_bytes(&mut self) {
+        self.history_content_bytes = self.history.iter().map(history_line_content_bytes).sum();
     }
 
     fn next_history_stamp(&mut self) -> i64 {
@@ -892,6 +960,10 @@ impl Grid {
         self.history_stamp_remaining = self.history_stamp_remaining.saturating_sub(1);
         self.history_stamp
     }
+}
+
+fn history_line_content_bytes(line: &GridLine) -> usize {
+    line.rendered_text_len().saturating_add(1)
 }
 
 fn compacted_history(lines: Vec<GridLine>) -> VecDeque<GridLine> {

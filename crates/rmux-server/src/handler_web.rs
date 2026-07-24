@@ -22,7 +22,7 @@ use super::pane_support::resolve_pane_target_ref;
 use super::{NormalRequestGuard, RequestHandler};
 use crate::outer_terminal::OuterTerminalContext;
 use crate::pane_io::{self, AttachControl, LiveAttachInputContext, PaneOutputReceiver};
-use crate::pane_recovery::PaneRecoverySeed;
+use crate::pane_recovery::PaneRecoveryDraft;
 use crate::pane_terminal_lookup::pane_id_for_target;
 use crate::server_access::current_owner_uid;
 use crate::web::{
@@ -582,19 +582,19 @@ impl RequestHandler {
                     Ok(transcript) => transcript,
                     Err(poisoned) => poisoned.into_inner(),
                 };
-                PaneRecoverySeed::capture(&transcript)
+                PaneRecoveryDraft::capture(&transcript)
             });
             if candidate.0.generation == generation {
                 captured = Some(candidate);
                 break;
             };
         }
-        let Some((boundary, seed, output)) = captured else {
+        let Some((boundary, draft, output)) = captured else {
             return Err(RmuxError::Server(
                 "pane process changed repeatedly while capturing web state".to_owned(),
             ));
         };
-        let seed = seed?;
+        let seed = draft?.materialize()?;
         let keyframe = seed.keyframe();
         let screen = seed.screen();
         let size = screen.size();

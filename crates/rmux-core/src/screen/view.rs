@@ -294,6 +294,48 @@ impl Screen {
         (viewport, metadata_complete)
     }
 
+    /// Clones a transport-bounded recovery projection without rendering it.
+    ///
+    /// The active viewport and saved alternate viewport are retained. Scrollback
+    /// is limited to the newest complete logical-line suffix whose structural
+    /// clone fits `max_history_bytes`.
+    #[must_use]
+    pub fn clone_recovery_projection_bounded(
+        &self,
+        max_string_bytes: usize,
+        max_title_stack_bytes: usize,
+        max_hyperlink_entry_bytes: usize,
+        max_hyperlink_total_bytes: usize,
+        max_history_bytes: usize,
+    ) -> (Self, bool) {
+        let (mut projection, metadata_complete) = self.recovery_viewport_shell(
+            max_string_bytes,
+            max_title_stack_bytes,
+            max_hyperlink_entry_bytes,
+            max_hyperlink_total_bytes,
+        );
+
+        projection.grid = self.grid.clone_recovery_projection(max_history_bytes);
+        projection.cursor_x = self.cursor_x.min(projection.max_cursor_x());
+        projection.cursor_y = self.cursor_y.min(projection.grid.sy().saturating_sub(1));
+        projection.pending_wrap = self.pending_wrap;
+        projection.saved_cursor_x = self.saved_cursor_x;
+        projection.saved_cursor_y = self.saved_cursor_y;
+        projection.saved_cursor_pending_wrap = self.saved_cursor_pending_wrap;
+        projection.saved_grid = self.saved_grid.as_ref().map(|saved| SavedGrid {
+            grid: saved.grid.clone_recovery_projection(0),
+            history_enabled: saved.history_enabled,
+        });
+        projection.rupper = self.rupper.min(projection.grid.sy().saturating_sub(1));
+        projection.rlower = self.rlower.min(projection.grid.sy().saturating_sub(1));
+        projection.tabs = self.tabs.clone();
+        projection.title_rename_enabled = self.title_rename_enabled;
+        projection.alternate_screen_enabled = self.alternate_screen_enabled;
+        projection.preserve_alternate_screen_cursor = self.preserve_alternate_screen_cursor;
+
+        (projection, metadata_complete)
+    }
+
     /// Clones a bounded viewport over absolute rows for Web scroll/copy-mode
     /// recovery without first cloning the backing history.
     #[must_use]

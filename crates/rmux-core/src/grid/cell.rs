@@ -712,6 +712,47 @@ impl GridLine {
         rendered
     }
 
+    pub(super) fn rendered_text_len(&self) -> usize {
+        if let Some(text) = &self.plain_text {
+            return text.trim_end_matches(' ').len();
+        }
+
+        let mut total = 0_usize;
+        let mut trimmed = 0_usize;
+        for cell in &self.cells {
+            if cell.flags.contains(GridCellFlags::PADDING) {
+                continue;
+            }
+            let text = cell.text.as_str();
+            total = total.saturating_add(text.len());
+            let without_trailing_spaces = text.trim_end_matches(' ').len();
+            if without_trailing_spaces > 0 {
+                trimmed = total.saturating_sub(text.len() - without_trailing_spaces);
+            }
+        }
+        trimmed
+    }
+
+    pub(super) fn recovery_clone_bytes(&self) -> usize {
+        let cell_bytes = self
+            .cells
+            .len()
+            .saturating_mul(std::mem::size_of::<GridCell>());
+        let extended_cell_text_bytes = self
+            .cells
+            .iter()
+            .filter(|cell| cell.text.extended.is_some())
+            .map(|cell| {
+                std::mem::size_of::<CompactString>().saturating_add(cell.text.as_str().len())
+            })
+            .sum::<usize>();
+        let plain_text_bytes = self.plain_text.as_ref().map_or(0, CompactString::len);
+        std::mem::size_of::<Self>()
+            .saturating_add(cell_bytes)
+            .saturating_add(extended_cell_text_bytes)
+            .saturating_add(plain_text_bytes)
+    }
+
     pub(super) fn used_end(&self) -> usize {
         if let Some(text) = &self.plain_text {
             return text.len();

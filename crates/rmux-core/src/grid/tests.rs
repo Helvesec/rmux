@@ -296,3 +296,117 @@ fn clear_visible_to_history_preserves_inner_blank_lines() {
         .collect::<Vec<_>>();
     assert_eq!(lines, ["AAA", "", "BBB"]);
 }
+
+fn slow_history_byte_size(grid: &Grid) -> usize {
+    grid.history
+        .iter()
+        .map(|line| line.render_text().len() + 1)
+        .sum()
+}
+
+fn assert_history_byte_cache(grid: &Grid) {
+    assert_eq!(grid.history_byte_size(), slow_history_byte_size(grid));
+}
+
+fn write_visible_line(grid: &mut Grid, row: u32, text: &str, wrapped: bool) {
+    let line = grid.visible_line_mut(row).expect("visible line exists");
+    line.clear(COLOUR_DEFAULT);
+    let state = CellState::default();
+    for (x, ch) in text.chars().enumerate() {
+        *line
+            .cell_mut(u32::try_from(x).expect("test column fits u32"))
+            .expect("test text fits line") =
+            GridCell::from_state(ch, 1, &state, GridCellFlags::default());
+    }
+    line.set_wrapped(wrapped);
+}
+
+#[test]
+fn rendered_text_len_matches_rendered_text_without_allocating() {
+    let mut line = GridLine::new(8);
+    let state = CellState::default();
+    *line.cell_mut(0).expect("cell exists") =
+        GridCell::from_state('é', 1, &state, GridCellFlags::default());
+    *line.cell_mut(1).expect("cell exists") =
+        GridCell::from_state(' ', 1, &state, GridCellFlags::default());
+    *line.cell_mut(2).expect("cell exists") =
+        GridCell::from_state('🙂', 2, &state, GridCellFlags::default());
+    *line.cell_mut(3).expect("cell exists") =
+        GridCell::from_state(' ', 1, &state, GridCellFlags::PADDING);
+    line.cell_mut(4)
+        .expect("cell exists")
+        .set_text("x  ".to_owned());
+
+    assert_eq!(line.rendered_text_len(), line.render_text().len());
+    line.compact_for_history();
+    assert_eq!(line.rendered_text_len(), line.render_text().len());
+}
+
+#[test]
+fn history_byte_cache_tracks_eviction_reflow_removal_and_clear() {
+    let mut grid = Grid::new(TerminalSize { cols: 8, rows: 2 }, 8);
+    for text in ["one", "two two", "é🙂", "four"] {
+        write_visible_line(&mut grid, 0, text, false);
+        grid.scroll_region_up(0, 1, COLOUR_DEFAULT, true);
+        assert_history_byte_cache(&grid);
+    }
+
+    grid.set_hlimit(3);
+    assert_history_byte_cache(&grid);
+    assert!(grid.remove_absolute_line(1));
+    assert_history_byte_cache(&grid);
+
+    let cursor = grid.logical_cursor(0, 0, false);
+    let _ = grid.resize_width_remapping_cursor(3, COLOUR_DEFAULT, cursor);
+    assert_history_byte_cache(&grid);
+
+    let mut cursor_y = 0;
+    grid.resize_height(4, &mut cursor_y, COLOUR_DEFAULT);
+    assert_history_byte_cache(&grid);
+    grid.resize_height(2, &mut cursor_y, COLOUR_DEFAULT);
+    assert_history_byte_cache(&grid);
+
+    let last_history = grid.hsize().saturating_sub(1);
+    assert!(grid.truncate_after_absolute_line(last_history));
+    assert_history_byte_cache(&grid);
+    grid.clear_history();
+    assert_history_byte_cache(&grid);
+}
+
+#[test]
+fn recovery_projection_retains_only_complete_newest_logical_groups() {
+    let mut grid = Grid::new(TerminalSize { cols: 8, rows: 1 }, 8);
+    for (text, wrapped) in [
+        ("old-a", true),
+        ("old-b", false),
+        ("new-a", true),
+        ("new-b", false),
+    ] {
+        write_visible_line(&mut grid, 0, text, wrapped);
+        grid.scroll_region_up(0, 0, COLOUR_DEFAULT, true);
+    }
+    assert_eq!(grid.hsize(), 4);
+
+    let newest_group_bytes = grid.history[2]
+        .recovery_clone_bytes()
+        .saturating_add(grid.history[3].recovery_clone_bytes());
+    let projection = grid.clone_recovery_projection(newest_group_bytes);
+    assert_eq!(projection.hsize(), 2);
+    assert_eq!(
+        projection
+            .history
+            .iter()
+            .map(GridLine::render_text)
+            .collect::<Vec<_>>(),
+        ["new-a", "new-b"]
+    );
+    assert_history_byte_cache(&projection);
+
+    let undersized = grid.clone_recovery_projection(newest_group_bytes.saturating_sub(1));
+    assert_eq!(
+        undersized.hsize(),
+        0,
+        "a recovery draft must not retain only part of a wrapped logical group"
+    );
+    assert_history_byte_cache(&undersized);
+}

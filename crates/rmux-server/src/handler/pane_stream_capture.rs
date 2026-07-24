@@ -8,7 +8,7 @@ use rmux_proto::{
 };
 
 use crate::pane_io::{PaneBoundary, PaneInvalidationReason, PaneOutputReceiver};
-use crate::pane_recovery::PaneRecoverySeed;
+use crate::pane_recovery::{PaneRecoveryDraft, PaneRecoverySeed};
 
 use super::super::pane_support::{
     collect_cells, compute_snapshot_fingerprint, cursor_coord_to_u16,
@@ -33,16 +33,23 @@ pub(in crate::handler) struct CapturedSurfaceBoundary {
 pub(in crate::handler) fn capture_source(
     source: &PaneStreamSource,
 ) -> Result<CapturedPaneBoundary, RmuxError> {
-    let (boundary, seed, receiver) = source.output.capture_with_observer(|| {
+    capture_source_with_materializer(source, PaneRecoveryDraft::materialize)
+}
+
+fn capture_source_with_materializer(
+    source: &PaneStreamSource,
+    materialize: impl FnOnce(PaneRecoveryDraft) -> Result<PaneRecoverySeed, RmuxError>,
+) -> Result<CapturedPaneBoundary, RmuxError> {
+    let (boundary, draft, receiver) = source.output.capture_with_observer(|| {
         let transcript = source
             .transcript
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        PaneRecoverySeed::capture(&transcript)
+        PaneRecoveryDraft::capture(&transcript)
     });
     Ok(CapturedPaneBoundary {
         boundary,
-        seed: seed?,
+        seed: materialize(draft?)?,
         receiver,
     })
 }
@@ -59,13 +66,18 @@ pub(in crate::handler) fn capture_surface_source(
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         let fingerprint = PaneSurfaceFingerprint::capture(transcript.screen());
         let seed =
-            (force || &fingerprint != previous).then(|| PaneRecoverySeed::capture(&transcript));
+            (force || &fingerprint != previous).then(|| PaneRecoveryDraft::capture(&transcript));
         (fingerprint, seed)
     });
+    let seed = captured
+        .1
+        .transpose()?
+        .map(PaneRecoveryDraft::materialize)
+        .transpose()?;
     Ok(CapturedSurfaceBoundary {
         boundary,
         fingerprint: captured.0,
-        seed: captured.1.transpose()?,
+        seed,
         receiver,
     })
 }
@@ -221,4 +233,87 @@ fn validate_recovery_snapshot_geometry(cols: u16, rows: u16) -> Result<(), RmuxE
         )));
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::mpsc;
+    use std::thread;
+    use std::time::Duration;
+
+    use rmux_core::events::{OutputCursorItem, PaneOutputSubscriptionKey};
+    use rmux_core::PaneId;
+    use rmux_proto::{PaneTarget, SessionName, TerminalSize};
+
+    use super::{capture_source_with_materializer, PaneRecoveryDraft, PaneStreamSource};
+    use crate::pane_io;
+    use crate::pane_transcript::PaneTranscript;
+
+    #[test]
+    fn recovery_materialization_does_not_block_output_publication() {
+        let session = SessionName::new("capture-lock-test").expect("valid session name");
+        let output = pane_io::pane_output_channel();
+        let transcript = PaneTranscript::shared(64, TerminalSize { cols: 80, rows: 24 });
+        let source = PaneStreamSource {
+            target: PaneTarget::new(session.clone(), 0),
+            key: PaneOutputSubscriptionKey::new(session, PaneId::new(1)),
+            output: output.clone(),
+            transcript: transcript.clone(),
+            generation: 0,
+        };
+
+        let (materializer_entered_tx, materializer_entered_rx) = mpsc::sync_channel(0);
+        let (release_materializer_tx, release_materializer_rx) = mpsc::sync_channel(0);
+        let capture = thread::spawn(move || {
+            capture_source_with_materializer(&source, |draft: PaneRecoveryDraft| {
+                materializer_entered_tx
+                    .send(())
+                    .expect("test must observe materializer entry");
+                release_materializer_rx
+                    .recv()
+                    .expect("test must release materializer");
+                draft.materialize()
+            })
+        });
+
+        materializer_entered_rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("draft capture must reach out-of-lock materialization");
+
+        let (published_tx, published_rx) = mpsc::sync_channel(1);
+        let publisher = thread::spawn(move || {
+            pane_io::publish_pane_bytes_for_test(&transcript, &output, b"after".to_vec());
+            published_tx
+                .send(())
+                .expect("publication completion must be observable");
+        });
+
+        if let Err(error) = published_rx.recv_timeout(Duration::from_secs(2)) {
+            let _ = release_materializer_tx.send(());
+            let _ = publisher.join();
+            let _ = capture.join();
+            panic!("output publication remained blocked during materialization: {error}");
+        }
+        release_materializer_tx
+            .send(())
+            .expect("materializer must still be waiting");
+
+        publisher.join().expect("publisher thread must not panic");
+        let mut captured = capture
+            .join()
+            .expect("capture thread must not panic")
+            .expect("capture must succeed");
+        assert_eq!(captured.boundary.next_output_sequence, 0);
+        assert_eq!(captured.seed.output_sequence(), 0);
+
+        let Some(OutputCursorItem::Event(event)) = captured.receiver.try_recv() else {
+            panic!("receiver must observe output published after its capture boundary");
+        };
+        assert_eq!(event.sequence(), 0);
+        assert_eq!(event.bytes(), b"after");
+        assert!(
+            captured.receiver.try_recv().is_none(),
+            "captured receiver must not duplicate the post-boundary event"
+        );
+    }
 }

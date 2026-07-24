@@ -26,6 +26,7 @@ pub(crate) const MAX_RECOVERY_STRING_BYTES: usize = 64 * 1024;
 pub(crate) const MAX_RECOVERY_TITLE_STACK_BYTES: usize = 128 * 1024;
 pub(crate) const MAX_RECOVERY_HYPERLINK_ENTRY_BYTES: usize = 512;
 pub(crate) const MAX_RECOVERY_HYPERLINK_TOTAL_BYTES: usize = 128 * 1024;
+const MAX_RECOVERY_DRAFT_HISTORY_BYTES: usize = MAX_RECOVERY_KEYFRAME_BYTES;
 // Cell text is capped by rmux-core at 21 bytes. Ninety-six thousand cells
 // leave more than two MiB of detached-frame headroom for a recovery keyframe,
 // bincode headers and lifecycle companions.
@@ -38,6 +39,23 @@ pub(crate) struct PaneRecoverySeed {
     history_size: usize,
     history_bytes: usize,
     alternate: bool,
+    output_sequence: u64,
+}
+
+/// Structurally bounded terminal state copied at the atomic output boundary.
+///
+/// ANSI rendering happens only after the output-state and transcript locks
+/// have been released.
+pub(crate) struct PaneRecoveryDraft {
+    projection: Screen,
+    metadata_complete: bool,
+    pending_bytes: Vec<u8>,
+    active_cell_state: Vec<u8>,
+    saved_cell_state: Vec<u8>,
+    saved_cursor: (u32, u32, bool),
+    parser_state: Vec<u8>,
+    history_size: usize,
+    history_bytes: usize,
     output_sequence: u64,
 }
 
@@ -58,7 +76,7 @@ struct RenderedRow {
     wrapped: bool,
 }
 
-impl PaneRecoverySeed {
+impl PaneRecoveryDraft {
     pub(crate) fn capture(transcript: &PaneTranscript) -> Result<Self, RmuxError> {
         let source = transcript.screen();
         validate_recovery_geometry(source)?;
@@ -69,44 +87,72 @@ impl PaneRecoverySeed {
             });
         }
 
-        let (screen, viewport_metadata_complete) = source.clone_recovery_viewport_bounded(
+        let (projection, viewport_metadata_complete) = source.clone_recovery_projection_bounded(
             MAX_RECOVERY_STRING_BYTES,
             MAX_RECOVERY_TITLE_STACK_BYTES,
             MAX_RECOVERY_HYPERLINK_ENTRY_BYTES,
             MAX_RECOVERY_HYPERLINK_TOTAL_BYTES,
-        );
-        let renderer = source.recovery_row_renderer(
-            MAX_RECOVERY_HYPERLINK_ENTRY_BYTES,
-            MAX_RECOVERY_HYPERLINK_TOTAL_BYTES,
+            MAX_RECOVERY_DRAFT_HISTORY_BYTES,
         );
         let (active_cell_state, active_cell_complete) =
             transcript.active_cell_state_ansi_bounded(MAX_RECOVERY_HYPERLINK_ENTRY_BYTES);
         let (saved_cell_state, saved_cell_complete) =
             transcript.saved_cell_state_ansi_bounded(MAX_RECOVERY_HYPERLINK_ENTRY_BYTES);
-        let metadata_complete = viewport_metadata_complete
-            && renderer.metadata_complete()
-            && active_cell_complete
-            && saved_cell_complete;
-        let keyframe = materialize_keyframe(
-            source,
-            &screen,
-            &renderer,
-            transcript.pending_bytes_ref(),
-            &active_cell_state,
-            &saved_cell_state,
-            transcript.saved_cursor_state(),
-            &transcript.recovery_parser_state_ansi(),
-            metadata_complete,
-        )?;
-
         Ok(Self {
-            screen,
-            keyframe,
+            projection,
+            metadata_complete: viewport_metadata_complete
+                && active_cell_complete
+                && saved_cell_complete,
+            pending_bytes: transcript.pending_bytes_ref().to_vec(),
+            active_cell_state,
+            saved_cell_state,
+            saved_cursor: transcript.saved_cursor_state(),
+            parser_state: transcript.recovery_parser_state_ansi(),
             history_size: source.history_size(),
             history_bytes: source.history_bytes(),
-            alternate: source.is_alternate(),
             output_sequence: transcript.output_sequence(),
         })
+    }
+
+    pub(crate) fn materialize(self) -> Result<PaneRecoverySeed, RmuxError> {
+        let keyframe = {
+            let renderer = self.projection.recovery_row_renderer(
+                MAX_RECOVERY_HYPERLINK_ENTRY_BYTES,
+                MAX_RECOVERY_HYPERLINK_TOTAL_BYTES,
+            );
+            materialize_keyframe(
+                &self.projection,
+                &renderer,
+                &self.pending_bytes,
+                &self.active_cell_state,
+                &self.saved_cell_state,
+                self.saved_cursor,
+                &self.parser_state,
+                self.history_size,
+                self.metadata_complete && renderer.metadata_complete(),
+            )
+        }?;
+        let (screen, _) = self.projection.clone_recovery_viewport_bounded(
+            MAX_RECOVERY_STRING_BYTES,
+            MAX_RECOVERY_TITLE_STACK_BYTES,
+            MAX_RECOVERY_HYPERLINK_ENTRY_BYTES,
+            MAX_RECOVERY_HYPERLINK_TOTAL_BYTES,
+        );
+        Ok(PaneRecoverySeed {
+            screen,
+            keyframe,
+            history_size: self.history_size,
+            history_bytes: self.history_bytes,
+            alternate: self.projection.is_alternate(),
+            output_sequence: self.output_sequence,
+        })
+    }
+}
+
+impl PaneRecoverySeed {
+    #[cfg(test)]
+    pub(crate) fn capture(transcript: &PaneTranscript) -> Result<Self, RmuxError> {
+        PaneRecoveryDraft::capture(transcript)?.materialize()
     }
 
     pub(crate) const fn screen(&self) -> &Screen {
@@ -141,27 +187,27 @@ impl PaneRecoverySeed {
 #[allow(clippy::too_many_arguments)]
 fn materialize_keyframe(
     source: &Screen,
-    metadata: &Screen,
     renderer: &RecoveryRowRenderer<'_>,
     pending_bytes: &[u8],
     active_cell_state: &[u8],
     saved_cell_state: &[u8],
     saved_cursor: (u32, u32, bool),
     parser_state: &[u8],
+    history_rows_total: usize,
     metadata_complete: bool,
 ) -> Result<PaneRecoveryKeyframe, RmuxError> {
     let size = source.size();
     let alternate = source.is_alternate();
-    let history_rows_total = source.history_size();
+    let captured_history_rows = source.history_size();
     let active_visible = render_active_rows(
         renderer,
-        history_rows_total..history_rows_total.saturating_add(usize::from(size.rows)),
+        captured_history_rows..captured_history_rows.saturating_add(usize::from(size.rows)),
     )?;
 
     let mut prefix = Vec::new();
     prefix.extend_from_slice(RESET_PREFIX);
-    append_title_state(&mut prefix, metadata);
-    append_osc_text(&mut prefix, 7, metadata.path());
+    append_title_state(&mut prefix, source);
+    append_osc_text(&mut prefix, 7, source.path());
     prefix.extend_from_slice(parser_state);
 
     let mut mandatory_before_active = Vec::new();
@@ -171,7 +217,7 @@ fn materialize_keyframe(
         if let Some((x, y, pending_wrap)) = source.alternate_saved_cursor() {
             append_cursor_state(
                 &mut mandatory_before_active,
-                metadata,
+                source,
                 x,
                 y,
                 pending_wrap,
@@ -187,11 +233,11 @@ fn materialize_keyframe(
     }
 
     let mut suffix = Vec::new();
-    append_scroll_region(&mut suffix, metadata);
-    render_dec_modes_for_snapshot(metadata.mode(), metadata.cursor_style(), &mut suffix);
-    append_tab_stops(&mut suffix, metadata);
-    append_saved_decsc(&mut suffix, metadata, saved_cursor, saved_cell_state);
-    append_active_cursor_state(&mut suffix, metadata, &active_visible, active_cell_state);
+    append_scroll_region(&mut suffix, source);
+    render_dec_modes_for_snapshot(source.mode(), source.cursor_style(), &mut suffix);
+    append_tab_stops(&mut suffix, source);
+    append_saved_decsc(&mut suffix, source, saved_cursor, saved_cell_state);
+    append_active_cursor_state(&mut suffix, source, &active_visible, active_cell_state);
     suffix.extend_from_slice(pending_bytes);
 
     let mandatory_rows_len = encoded_rows_len(&active_visible);
@@ -208,7 +254,7 @@ fn materialize_keyframe(
     }
 
     let history_budget = MAX_RECOVERY_KEYFRAME_BYTES - mandatory_len;
-    let history = recent_history_suffix(renderer, history_rows_total, history_budget)?;
+    let history = recent_history_suffix(renderer, captured_history_rows, history_budget)?;
     let history_boundary_len = if history.back().is_some_and(|row| !row.wrapped) {
         2
     } else {
@@ -785,13 +831,21 @@ mod tests {
         }
         output.extend_from_slice(b"\x1b[?1049hALT");
         transcript.append_bytes(&output);
+        let expected_history_size = transcript.screen().history_size();
+        let expected_history_bytes = transcript.screen().history_bytes();
 
         let seed = PaneRecoverySeed::capture(&transcript).expect("capture bounded recovery state");
         assert_eq!(seed.screen().history_size(), 0);
+        assert_eq!(seed.history_size(), expected_history_size);
+        assert_eq!(seed.history_bytes(), expected_history_bytes);
         assert!(seed.screen().is_alternate());
         let keyframe = seed.keyframe();
         assert!(keyframe.alternate);
         assert!(keyframe.bytes.len() <= MAX_RECOVERY_KEYFRAME_BYTES);
+        assert_eq!(
+            keyframe.history_rows_total,
+            u64::try_from(expected_history_size).unwrap_or(u64::MAX)
+        );
         assert!(keyframe.history_rows_total > keyframe.history_rows_included);
         assert!(keyframe.history_rows_included > 0);
 
