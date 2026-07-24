@@ -4,11 +4,21 @@ mod unix {
     use std::os::unix::fs::PermissionsExt;
     use std::path::{Path, PathBuf};
     use std::process::Command;
+    use std::sync::atomic::{AtomicU64, Ordering};
     use std::time::{SystemTime, UNIX_EPOCH};
 
     const SOURCE_SHA: &str = "1111111111111111111111111111111111111111";
     const RELEASE_REF: &str = "v1.2.3";
     const PREDICATE_TYPE: &str = "https://rmux.io/attestations/release-publication-receipt/v1";
+    static NEXT_FIXTURE_ID: AtomicU64 = AtomicU64::new(0);
+
+    fn fixture_root(nonce: u128) -> PathBuf {
+        let fixture_id = NEXT_FIXTURE_ID.fetch_add(1, Ordering::Relaxed);
+        std::env::temp_dir().join(format!(
+            "rmux-receipt-attestation-{}-{nonce}-{fixture_id}",
+            std::process::id()
+        ))
+    }
 
     struct Fixture {
         root: PathBuf,
@@ -26,10 +36,7 @@ mod unix {
                 .duration_since(UNIX_EPOCH)
                 .expect("clock")
                 .as_nanos();
-            let root = std::env::temp_dir().join(format!(
-                "rmux-receipt-attestation-{}-{nonce}",
-                std::process::id()
-            ));
+            let root = fixture_root(nonce);
             fs::create_dir(&root).expect("fixture root");
             let gh = root.join("gh");
             let state = root.join("release-state.json");
@@ -139,6 +146,11 @@ mod unix {
             .next()
             .expect("sha256 digest")
             .to_owned()
+    }
+
+    #[test]
+    fn fixture_roots_are_unique_within_one_clock_tick() {
+        assert_ne!(fixture_root(0), fixture_root(0));
     }
 
     #[test]
