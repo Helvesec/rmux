@@ -590,9 +590,9 @@ jobs:
     timeout-minutes: 90
     strategy:
       fail-fast: false
-      max-parallel: 6
+      max-parallel: 7
       matrix:
-        section: [static, lint, server, cli, tmux, runtime-sdk]
+        section: [static, lint, server, xterm, cli, tmux, runtime-sdk]
     env:
       RUST_MIN_STACK: "8388608"
       CARGO_BUILD_JOBS: "4"
