@@ -35,10 +35,11 @@ use protocol::{
     stream_subscription_limit_error, subscribe_response, validate_detached_response,
     validate_raw_rebase_size, validate_surface_frame_size, wrong_stream_mode,
 };
+use raw::{RawInitializationOutcome, RawSubscriptionStart};
 pub(in crate::handler) use types::{
     CachedRawRebase, EndedPaneStream, PaneStreamSubscription, PendingSurfaceRefresh, SurfaceDriver,
 };
-use types::{PaneStreamSource, PaneSurfaceFingerprint, RawPaneStream, SurfacePaneStream};
+use types::{PaneStreamSource, PaneSurfaceFingerprint, SurfacePaneStream};
 
 pub(super) const MAX_SOURCE_CAPTURE_ATTEMPTS: usize = 4;
 
@@ -201,7 +202,7 @@ impl RequestHandler {
         request: SubscribePaneStreamRequest,
     ) -> Response {
         let now = Instant::now();
-        let (mut source, subscription_id, surface_route) = {
+        let (mut source, subscription_id, surface_route, raw_route) = {
             let state = self.state.lock().await;
             let source = match resolve_stream_source(&state, &request) {
                 Ok(source) => source,
@@ -230,10 +231,42 @@ impl RequestHandler {
             );
             let surface_route = (request.mode == PaneStreamMode::Surface)
                 .then(|| subscriptions.surface_driver_route(&source.key));
-            (source, subscription_id, surface_route)
+            let raw_route = (request.mode == PaneStreamMode::Raw).then(|| {
+                subscriptions.raw_initialization_route(&source.key, request.include_snapshot)
+            });
+            (source, subscription_id, surface_route, raw_route)
         };
         let mut reservation_guard =
             StreamReservationGuard::new(&self.subscriptions, subscription_id);
+
+        let _raw_initialization = if let Some(route) = raw_route {
+            match self
+                .prepare_initial_raw_subscription(
+                    connection_id,
+                    subscription_id,
+                    source,
+                    route,
+                    request.include_snapshot,
+                )
+                .await
+            {
+                RawInitializationOutcome::Complete(response) => {
+                    if matches!(response, Response::SubscribePaneStream(_)) {
+                        reservation_guard.disarm();
+                    }
+                    return response;
+                }
+                RawInitializationOutcome::Capture {
+                    source: current_source,
+                    guard,
+                } => {
+                    source = current_source;
+                    Some(guard)
+                }
+            }
+        } else {
+            None
+        };
 
         let _surface_initialization = if let Some(mut route) = surface_route {
             loop {
@@ -302,9 +335,7 @@ impl RequestHandler {
                     connection_id,
                     subscription_id,
                     source,
-                    captured,
-                    rebase,
-                    request.include_snapshot,
+                    RawSubscriptionStart::captured(captured, rebase, request.include_snapshot),
                 )
             }
             PaneStreamMode::Surface => {
@@ -517,50 +548,6 @@ impl RequestHandler {
             self.remove_reserved_stream(subscription_id);
             return Response::Error(ErrorResponse { error });
         }
-        response
-    }
-
-    fn finish_raw_subscription(
-        &self,
-        connection_id: u64,
-        subscription_id: rmux_proto::PaneOutputSubscriptionId,
-        source: PaneStreamSource,
-        captured: CapturedPaneBoundary,
-        rebase: rmux_proto::PaneRawRebase,
-        include_snapshot: bool,
-    ) -> Response {
-        let response = subscribe_response(
-            subscription_id,
-            &source,
-            PaneStreamEvent::RawRebase(Box::new(rebase.clone())),
-        );
-        if let Err(error) = validate_detached_response(&response) {
-            self.remove_reserved_stream(subscription_id);
-            return Response::Error(ErrorResponse { error });
-        }
-        let mut subscriptions = self
-            .subscriptions
-            .lock()
-            .expect("subscription registry mutex must not be poisoned");
-        let Some(current_key) = reserved_stream_key_if_owned(
-            &subscriptions,
-            connection_id,
-            subscription_id,
-            source.key.pane_id(),
-        ) else {
-            return reserved_stream_lost_response();
-        };
-        subscriptions.streams.insert(
-            subscription_id,
-            PaneStreamSubscription::Raw(RawPaneStream::new(captured.receiver, 1, include_snapshot)),
-        );
-        subscriptions.raw_rebases.insert(
-            current_key,
-            Arc::new(CachedRawRebase {
-                boundary: captured.boundary,
-                rebase: rebase.clone(),
-            }),
-        );
         response
     }
 

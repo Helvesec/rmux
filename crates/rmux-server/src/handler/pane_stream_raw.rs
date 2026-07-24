@@ -1,4 +1,4 @@
-use std::sync::Arc;
+use std::sync::{Arc, Mutex as StdMutex, Weak};
 use std::time::Instant;
 
 use rmux_core::events::{OutputCursorItem, DEFAULT_SUBSCRIPTION_BATCH_EVENTS};
@@ -7,17 +7,236 @@ use rmux_proto::{
     PaneStreamEvent, PaneStreamLifecycleEvent, Response, RmuxError,
 };
 
-use crate::pane_io::{PaneObservationItem, PaneOutputReceiver};
+use crate::pane_io::{PaneBoundary, PaneObservationItem, PaneOutputReceiver};
 
-use super::super::subscription_support::cursor_event_limit;
+use super::super::subscription_support::{
+    cursor_event_limit, OutputSubscriptionState, RawInitializationRoute,
+};
+use super::types::RawPaneStream;
 use super::{
     capture_source, materialize_raw_rebase, owned_stream_record, raw_reason,
     reserved_stream_key_if_owned, slow_consumer_response, stream_cursor_response,
-    validate_detached_response, validate_raw_rebase_size, wrong_stream_mode, CachedRawRebase,
-    PaneStreamSource, PaneStreamSubscription, RawRebaseGuard, RequestHandler,
+    subscribe_response, validate_detached_response, validate_raw_rebase_size, wrong_stream_mode,
+    CachedRawRebase, CapturedPaneBoundary, PaneStreamSource, PaneStreamSubscription,
+    RawRebaseGuard, RequestHandler,
 };
 
+pub(super) enum RawInitializationOutcome {
+    Complete(Response),
+    Capture {
+        source: PaneStreamSource,
+        guard: RawInitializationGuard,
+    },
+}
+
+pub(super) struct RawInitializationGuard {
+    subscriptions: Weak<StdMutex<OutputSubscriptionState>>,
+    token: u64,
+}
+
+pub(super) struct RawSubscriptionStart {
+    receiver: PaneOutputReceiver,
+    boundary: PaneBoundary,
+    rebase: rmux_proto::PaneRawRebase,
+    include_snapshot: bool,
+    cached_rebase: Option<Arc<CachedRawRebase>>,
+}
+
+impl RawSubscriptionStart {
+    pub(super) fn captured(
+        captured: CapturedPaneBoundary,
+        rebase: rmux_proto::PaneRawRebase,
+        include_snapshot: bool,
+    ) -> Self {
+        Self {
+            receiver: captured.receiver,
+            boundary: captured.boundary,
+            rebase,
+            include_snapshot,
+            cached_rebase: None,
+        }
+    }
+
+    fn cached(
+        receiver: PaneOutputReceiver,
+        cached_rebase: Arc<CachedRawRebase>,
+        rebase: rmux_proto::PaneRawRebase,
+        include_snapshot: bool,
+    ) -> Self {
+        Self {
+            receiver,
+            boundary: cached_rebase.boundary,
+            rebase,
+            include_snapshot,
+            cached_rebase: Some(cached_rebase),
+        }
+    }
+}
+
+impl RawInitializationGuard {
+    fn new(subscriptions: &Arc<StdMutex<OutputSubscriptionState>>, token: u64) -> Self {
+        Self {
+            subscriptions: Arc::downgrade(subscriptions),
+            token,
+        }
+    }
+}
+
+impl Drop for RawInitializationGuard {
+    fn drop(&mut self) {
+        let Some(subscriptions) = self.subscriptions.upgrade() else {
+            return;
+        };
+        subscriptions
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .finish_raw_initialization(self.token);
+    }
+}
+
 impl RequestHandler {
+    pub(super) async fn prepare_initial_raw_subscription(
+        &self,
+        connection_id: u64,
+        subscription_id: rmux_proto::PaneOutputSubscriptionId,
+        mut source: PaneStreamSource,
+        mut route: RawInitializationRoute,
+        include_snapshot: bool,
+    ) -> RawInitializationOutcome {
+        loop {
+            match route {
+                RawInitializationRoute::Ready(cached) => {
+                    if let Some(receiver) = source.output.subscribe_at_boundary(cached.boundary) {
+                        let rebase = Self::initial_rebase_from_cache(&cached, include_snapshot);
+                        return RawInitializationOutcome::Complete(self.finish_raw_subscription(
+                            connection_id,
+                            subscription_id,
+                            source,
+                            RawSubscriptionStart::cached(
+                                receiver,
+                                cached,
+                                rebase,
+                                include_snapshot,
+                            ),
+                        ));
+                    }
+                    let mut subscriptions = self
+                        .subscriptions
+                        .lock()
+                        .expect("subscription registry mutex must not be poisoned");
+                    let Some(current_key) = reserved_stream_key_if_owned(
+                        &subscriptions,
+                        connection_id,
+                        subscription_id,
+                        source.key.pane_id(),
+                    ) else {
+                        return RawInitializationOutcome::Complete(
+                            super::reserved_stream_lost_response(),
+                        );
+                    };
+                    source.key = current_key;
+                    subscriptions.discard_raw_rebase_if_current(&source.key, &cached);
+                    route = subscriptions.raw_initialization_route(&source.key, include_snapshot);
+                }
+                RawInitializationRoute::Initialize { token } => {
+                    return RawInitializationOutcome::Capture {
+                        source,
+                        guard: RawInitializationGuard::new(&self.subscriptions, token),
+                    };
+                }
+                RawInitializationRoute::Wait(mut completion) => {
+                    let _ = completion.changed().await;
+                    let mut subscriptions = self
+                        .subscriptions
+                        .lock()
+                        .expect("subscription registry mutex must not be poisoned");
+                    let Some(current_key) = reserved_stream_key_if_owned(
+                        &subscriptions,
+                        connection_id,
+                        subscription_id,
+                        source.key.pane_id(),
+                    ) else {
+                        return RawInitializationOutcome::Complete(
+                            super::reserved_stream_lost_response(),
+                        );
+                    };
+                    source.key = current_key;
+                    route = subscriptions.raw_initialization_route(&source.key, include_snapshot);
+                }
+            }
+        }
+    }
+
+    fn initial_rebase_from_cache(
+        cached: &CachedRawRebase,
+        include_snapshot: bool,
+    ) -> rmux_proto::PaneRawRebase {
+        let rebase = &cached.rebase;
+        rmux_proto::PaneRawRebase {
+            epoch: 1,
+            generation: rebase.generation,
+            invalidation_revision: rebase.invalidation_revision,
+            next_sequence: rebase.next_sequence,
+            cols: rebase.cols,
+            rows: rebase.rows,
+            keyframe: rebase.keyframe.clone(),
+            alternate: rebase.alternate,
+            coverage: rebase.coverage,
+            snapshot: if include_snapshot {
+                rebase.snapshot.clone()
+            } else {
+                None
+            },
+            reason: PaneRawRebaseReason::Initial,
+        }
+    }
+
+    pub(super) fn finish_raw_subscription(
+        &self,
+        connection_id: u64,
+        subscription_id: rmux_proto::PaneOutputSubscriptionId,
+        source: PaneStreamSource,
+        start: RawSubscriptionStart,
+    ) -> Response {
+        let cached_rebase = start.cached_rebase.unwrap_or_else(|| {
+            Arc::new(CachedRawRebase {
+                boundary: start.boundary,
+                rebase: start.rebase.clone(),
+            })
+        });
+        let response = subscribe_response(
+            subscription_id,
+            &source,
+            PaneStreamEvent::RawRebase(Box::new(start.rebase)),
+        );
+        if let Err(error) = validate_detached_response(&response) {
+            self.remove_reserved_stream(subscription_id);
+            return Response::Error(ErrorResponse { error });
+        }
+        let mut subscriptions = self
+            .subscriptions
+            .lock()
+            .expect("subscription registry mutex must not be poisoned");
+        let Some(current_key) = reserved_stream_key_if_owned(
+            &subscriptions,
+            connection_id,
+            subscription_id,
+            source.key.pane_id(),
+        ) else {
+            return super::reserved_stream_lost_response();
+        };
+        subscriptions.streams.insert(
+            subscription_id,
+            PaneStreamSubscription::Raw(RawPaneStream::new(
+                start.receiver,
+                1,
+                start.include_snapshot,
+            )),
+        );
+        subscriptions.raw_rebases.insert(current_key, cached_rebase);
+        response
+    }
+
     pub(super) async fn poll_raw_stream(
         &self,
         connection_id: u64,

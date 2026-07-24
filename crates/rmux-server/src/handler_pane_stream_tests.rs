@@ -813,6 +813,70 @@ async fn cancelled_surface_waiter_releases_its_reserved_quota() {
 }
 
 #[tokio::test]
+async fn raw_waiter_re_elects_after_initializer_wakeup() {
+    let handler = Arc::new(RequestHandler::new());
+    let (target, _, _) = test_pane(handler.as_ref()).await;
+    let key = {
+        let state = handler.state.lock().await;
+        state
+            .pane_output_subscription_key_for_target(&target)
+            .expect("pane output key")
+    };
+    let initialization_token = {
+        let mut subscriptions = handler.subscriptions.lock().expect("subscription lock");
+        let super::super::subscription_support::RawInitializationRoute::Initialize { token } =
+            subscriptions.raw_initialization_route(&key, false)
+        else {
+            panic!("test must reserve the raw initializer");
+        };
+        token
+    };
+
+    let task_handler = Arc::clone(&handler);
+    let task = tokio::spawn(async move {
+        task_handler
+            .handle_subscribe_pane_stream(
+                CONNECTION_ID,
+                SubscribePaneStreamRequest {
+                    target: PaneTargetRef::slot(target),
+                    mode: PaneStreamMode::Raw,
+                    include_snapshot: false,
+                },
+            )
+            .await
+    });
+    for _ in 0..100 {
+        if !handler
+            .subscriptions
+            .lock()
+            .expect("subscription lock")
+            .is_empty()
+        {
+            break;
+        }
+        tokio::task::yield_now().await;
+    }
+    handler
+        .subscriptions
+        .lock()
+        .expect("subscription lock")
+        .finish_raw_initialization(initialization_token);
+
+    let response = tokio::time::timeout(Duration::from_secs(2), task)
+        .await
+        .expect("raw waiter completes")
+        .expect("raw waiter task joins");
+    assert!(
+        matches!(
+            response,
+            Response::SubscribePaneStream(ref subscribed)
+                if matches!(subscribed.event, PaneStreamEvent::RawRebase(_))
+        ),
+        "{response:?}"
+    );
+}
+
+#[tokio::test]
 async fn revoked_access_finishes_an_owned_stream_with_a_typed_end() {
     let handler = RequestHandler::new();
     let (target, _, _) = test_pane(&handler).await;

@@ -21,7 +21,9 @@ use super::{PaneOutputSubscriptionReconciliation, RequestHandler};
 #[path = "handler/output_subscription_state.rs"]
 mod output_subscription_state;
 pub(crate) use output_subscription_state::OutputSubscriptionState;
-pub(in crate::handler) use output_subscription_state::SurfaceDriverRoute;
+pub(in crate::handler) use output_subscription_state::{
+    RawInitializationRoute, SurfaceDriverRoute,
+};
 
 // Keep lag diagnostics well below the detached RPC frame cap after bincode
 // overhead and the rest of the response envelope are added.

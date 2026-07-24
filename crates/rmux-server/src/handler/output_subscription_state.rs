@@ -23,7 +23,13 @@ pub(in crate::handler) enum SurfaceDriverRoute {
     Wait(watch::Receiver<bool>),
 }
 
-struct SurfaceDriverInitialization {
+pub(in crate::handler) enum RawInitializationRoute {
+    Ready(Arc<CachedRawRebase>),
+    Initialize { token: u64 },
+    Wait(watch::Receiver<bool>),
+}
+
+struct PaneStreamInitialization {
     token: u64,
     completion: watch::Sender<bool>,
 }
@@ -35,8 +41,10 @@ pub(crate) struct OutputSubscriptionState {
     pub(in crate::handler) ended_streams: HashMap<PaneOutputSubscriptionId, EndedPaneStream>,
     pub(in crate::handler) surface_drivers: HashMap<PaneOutputSubscriptionKey, SurfaceDriver>,
     pub(in crate::handler) raw_rebases: HashMap<PaneOutputSubscriptionKey, Arc<CachedRawRebase>>,
-    surface_initializations: HashMap<PaneOutputSubscriptionKey, SurfaceDriverInitialization>,
+    surface_initializations: HashMap<PaneOutputSubscriptionKey, PaneStreamInitialization>,
     next_surface_initialization_token: u64,
+    raw_initializations: HashMap<PaneOutputSubscriptionKey, PaneStreamInitialization>,
+    next_raw_initialization_token: u64,
     draining_panes: HashSet<PaneOutputSubscriptionKey>,
 }
 
@@ -54,6 +62,7 @@ impl std::fmt::Debug for OutputSubscriptionState {
                 &self.surface_initializations.len(),
             )
             .field("raw_rebase_count", &self.raw_rebases.len())
+            .field("raw_initialization_count", &self.raw_initializations.len())
             .field("draining_pane_count", &self.draining_panes.len())
             .finish()
     }
@@ -70,6 +79,8 @@ impl OutputSubscriptionState {
             raw_rebases: HashMap::new(),
             surface_initializations: HashMap::new(),
             next_surface_initialization_token: 0,
+            raw_initializations: HashMap::new(),
+            next_raw_initialization_token: 0,
             draining_panes: HashSet::new(),
         }
     }
@@ -131,6 +142,7 @@ impl OutputSubscriptionState {
         self.surface_drivers.remove(pane);
         self.cancel_surface_initialization(pane);
         self.raw_rebases.remove(pane);
+        self.cancel_raw_initialization(pane);
         self.draining_panes.remove(pane);
         removed_any
     }
@@ -150,6 +162,10 @@ impl OutputSubscriptionState {
         }
         if let Some(initialization) = self.surface_initializations.remove(previous) {
             self.surface_initializations
+                .insert(current.clone(), initialization);
+        }
+        if let Some(initialization) = self.raw_initializations.remove(previous) {
+            self.raw_initializations
                 .insert(current.clone(), initialization);
         }
         if was_draining {
@@ -229,6 +245,7 @@ impl OutputSubscriptionState {
         match mode {
             PaneStreamMode::Raw => {
                 self.raw_rebases.remove(pane);
+                self.cancel_raw_initialization(pane);
             }
             PaneStreamMode::Surface => {
                 self.surface_drivers.remove(pane);
@@ -251,11 +268,61 @@ impl OutputSubscriptionState {
             self.next_surface_initialization_token.saturating_add(1);
         let token = self.next_surface_initialization_token;
         let (completion, _) = watch::channel(false);
-        self.surface_initializations.insert(
-            pane.clone(),
-            SurfaceDriverInitialization { token, completion },
-        );
+        self.surface_initializations
+            .insert(pane.clone(), PaneStreamInitialization { token, completion });
         SurfaceDriverRoute::Initialize { token }
+    }
+
+    pub(in crate::handler) fn raw_initialization_route(
+        &mut self,
+        pane: &PaneOutputSubscriptionKey,
+        include_snapshot: bool,
+    ) -> RawInitializationRoute {
+        if let Some(rebase) = self
+            .raw_rebases
+            .get(pane)
+            .filter(|rebase| !include_snapshot || rebase.rebase.snapshot.is_some())
+        {
+            return RawInitializationRoute::Ready(Arc::clone(rebase));
+        }
+        if let Some(initialization) = self.raw_initializations.get(pane) {
+            return RawInitializationRoute::Wait(initialization.completion.subscribe());
+        }
+        self.next_raw_initialization_token = self.next_raw_initialization_token.saturating_add(1);
+        let token = self.next_raw_initialization_token;
+        let (completion, _) = watch::channel(false);
+        self.raw_initializations
+            .insert(pane.clone(), PaneStreamInitialization { token, completion });
+        RawInitializationRoute::Initialize { token }
+    }
+
+    pub(in crate::handler) fn discard_raw_rebase_if_current(
+        &mut self,
+        pane: &PaneOutputSubscriptionKey,
+        stale: &Arc<CachedRawRebase>,
+    ) {
+        if self
+            .raw_rebases
+            .get(pane)
+            .is_some_and(|current| Arc::ptr_eq(current, stale))
+        {
+            self.raw_rebases.remove(pane);
+        }
+    }
+
+    pub(in crate::handler) fn finish_raw_initialization(&mut self, token: u64) {
+        let pane = self
+            .raw_initializations
+            .iter()
+            .find_map(|(pane, initialization)| {
+                (initialization.token == token).then(|| pane.clone())
+            });
+        let Some(pane) = pane else {
+            return;
+        };
+        if let Some(initialization) = self.raw_initializations.remove(&pane) {
+            let _ = initialization.completion.send(true);
+        }
     }
 
     pub(in crate::handler) fn finish_surface_initialization(&mut self, token: u64) {
@@ -314,6 +381,12 @@ impl OutputSubscriptionState {
         }
     }
 
+    fn cancel_raw_initialization(&mut self, pane: &PaneOutputSubscriptionKey) {
+        if let Some(initialization) = self.raw_initializations.remove(pane) {
+            let _ = initialization.completion.send(true);
+        }
+    }
+
     fn discard_drain_if_unused(&mut self, pane: &PaneOutputSubscriptionKey) {
         let has_legacy_receiver = self
             .registry
@@ -366,6 +439,10 @@ impl OutputSubscriptionState {
         removed_any
     }
 }
+
+#[cfg(test)]
+#[path = "output_subscription_state_raw_tests.rs"]
+mod raw_tests;
 
 #[cfg(test)]
 mod tests {
