@@ -219,21 +219,21 @@ impl RequestHandler {
             self.wait_for_windows_deferred_all_pane_pids().await;
             let target = {
                 let mut state = self.state.lock().await;
-                let active_control = self.active_control.lock().await;
-                let exact_client_still_attached = active_control
+                let mut active_control = self.active_control.lock().await;
+                let Some(active) = active_control
                     .by_pid
-                    .get(&control_pid)
-                    .is_some_and(|active| {
+                    .get_mut(&control_pid)
+                    .filter(|active| {
                         active.id == identity.control_id()
                             && !active.closing.load(std::sync::atomic::Ordering::SeqCst)
                             && active.session_name.as_ref() == Some(session_name)
                             && active.session_id == Some(session_id)
-                    });
-                if !exact_client_still_attached {
+                    })
+                else {
                     return Response::Error(ErrorResponse {
                         error: attached_client_required("refresh-client"),
                     });
-                }
+                };
                 match state.mutate_session_and_resize_active_window_terminal(
                     session_name,
                     |session| {
@@ -245,16 +245,40 @@ impl RequestHandler {
                         ))
                     },
                 ) {
-                    Ok(target) => target,
+                    Ok(target) => {
+                        active.client_width = size.cols;
+                        target
+                    }
                     Err(error) => return Response::Error(ErrorResponse { error }),
                 }
             };
             self.emit(LifecycleEvent::WindowLayoutChanged { target })
                 .await;
+        } else if let (None, None, Some(size)) = (session_name.as_ref(), session_id, control_size) {
+            let mut active_control = self.active_control.lock().await;
+            let Some(active) = active_control
+                .by_pid
+                .get_mut(&control_pid)
+                .filter(|active| {
+                    active.id == identity.control_id()
+                        && !active.closing.load(std::sync::atomic::Ordering::SeqCst)
+                        && active.session_name.is_none()
+                        && active.session_id.is_none()
+                })
+            else {
+                return Response::Error(ErrorResponse {
+                    error: attached_client_required("refresh-client"),
+                });
+            };
+            active.client_width = size.cols;
         } else if control_size.is_none() {
             if let Err(error) = self.refresh_control_client_for_identity(identity).await {
                 return Response::Error(ErrorResponse { error });
             }
+        } else {
+            return Response::Error(ErrorResponse {
+                error: attached_client_required("refresh-client"),
+            });
         }
 
         Response::RefreshClient(RefreshClientResponse {

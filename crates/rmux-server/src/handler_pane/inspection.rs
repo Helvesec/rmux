@@ -9,7 +9,7 @@ use rmux_core::{
 };
 use rmux_proto::{
     CommandOutput, DisplayMessageResponse, ErrorResponse, ListPanesResponse, Response, RmuxError,
-    Target, TerminalSize,
+    Target,
 };
 
 use super::super::control_support::{
@@ -926,14 +926,13 @@ pub(in crate::handler) fn display_message_context<'a>(
 }
 
 fn with_runtime_client_values<'a>(
-    runtime: RuntimeFormatContext<'a>,
+    mut runtime: RuntimeFormatContext<'a>,
     client: &ListClientSnapshot,
 ) -> RuntimeFormatContext<'a> {
+    if let Some(client_size) = client.terminal_size() {
+        runtime = runtime.with_client_size(client_size);
+    }
     runtime
-        .with_client_size(TerminalSize {
-            cols: client.width,
-            rows: client.height,
-        })
         .with_named_value("client_name", client.name.clone())
         .with_named_value("client_pid", client.pid.to_string())
         .with_named_value("client_tty", client.tty.clone())
@@ -946,7 +945,7 @@ fn with_runtime_client_values<'a>(
                 .unwrap_or_default(),
         )
         .with_named_value("client_width", client.width.to_string())
-        .with_named_value("client_height", client.height.to_string())
+        .with_named_value("client_height", client.height_value())
         .with_named_value("client_termfeatures", client.termfeatures.clone())
         .with_named_value("client_termname", client.termname.clone())
         .with_named_value("client_termtype", client.termtype.clone())

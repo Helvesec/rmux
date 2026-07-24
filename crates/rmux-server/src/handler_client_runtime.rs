@@ -124,7 +124,7 @@ impl RequestHandler {
                         session_name: Some(active.session_name.clone()),
                         order: active.id,
                         width: active.client_size.cols,
-                        height: active.client_size.rows,
+                        height: Some(active.client_size.rows),
                         termname: active.terminal_context.term_name().to_owned(),
                         termtype: String::new(),
                         termfeatures: outer_terminal.features_string(),
@@ -152,8 +152,8 @@ impl RequestHandler {
                     control: true,
                     session_name: active.session_name.clone(),
                     order: active.id,
-                    width: 0,
-                    height: 0,
+                    width: active.client_width,
+                    height: None,
                     termname: active.terminal_context.term_name().to_owned(),
                     termtype: String::new(),
                     termfeatures: active.terminal_context.explicit_features_string(),
@@ -377,7 +377,7 @@ pub(in crate::handler) fn sort_list_clients(
             SessionSortOrder::Name | SessionSortOrder::Modifier | SessionSortOrder::Order => {
                 left.name.cmp(&right.name)
             }
-            SessionSortOrder::Size => (left.width, left.height).cmp(&(right.width, right.height)),
+            SessionSortOrder::Size => left.sort_size().cmp(&right.sort_size()),
             SessionSortOrder::Creation | SessionSortOrder::Index => left.order.cmp(&right.order),
             SessionSortOrder::Activity => left
                 .session_name
@@ -651,7 +651,7 @@ mod tests {
             session_name: None,
             order,
             width: 80,
-            height: 24,
+            height: Some(24),
             termname: String::new(),
             termtype: String::new(),
             termfeatures: String::new(),

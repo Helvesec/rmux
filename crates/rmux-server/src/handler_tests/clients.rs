@@ -153,6 +153,10 @@ async fn refresh_client_control_size_resizes_real_control_session() {
         .await
         .expect("set control session");
     while event_rx.try_recv().is_ok() {}
+    assert_eq!(
+        control_client_geometry(&handler, requester_pid).await,
+        (80, None)
+    );
 
     let mut lifecycle_events = handler.subscribe_lifecycle_events();
     let response = handler
@@ -172,7 +176,7 @@ async fn refresh_client_control_size_resizes_real_control_session() {
                 flags_alias: None,
                 subscriptions: Vec::new(),
                 subscriptions_format: Vec::new(),
-                control_size: Some("100x30".to_owned()),
+                control_size: Some("101x31".to_owned()),
                 colour_report: None,
             })),
         )
@@ -201,11 +205,34 @@ async fn refresh_client_control_size_resizes_real_control_session() {
             .window()
             .size(),
         TerminalSize {
-            cols: 100,
-            rows: 30
+            cols: 101,
+            rows: 31
         }
     );
     drop(state);
+    assert_eq!(
+        control_client_geometry(&handler, requester_pid).await,
+        (101, None)
+    );
+    assert_eq!(
+        list_client_geometry(&handler).await,
+        "101|\n",
+        "list-clients should expose the width reported by -C and no control-client height"
+    );
+
+    let response = handler
+        .handle(Request::DisplayMessage(DisplayMessageRequest {
+            target: Some(Target::Session(alpha.clone())),
+            print: true,
+            message: Some("#{client_width}|#{client_height}".to_owned()),
+            empty_target_context: false,
+        }))
+        .await;
+    assert_eq!(
+        response.command_output().map(|output| output.stdout()),
+        Some(b"101|\n".as_slice()),
+        "display-message should use the control client's refreshed geometry"
+    );
 
     let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
     let mut saw_layout_change = false;
@@ -226,6 +253,25 @@ async fn refresh_client_control_size_resizes_real_control_session() {
     assert!(
         saw_layout_change,
         "control client should receive a layout-change notification"
+    );
+
+    while event_rx.try_recv().is_ok() {}
+    let response = handler
+        .handle(Request::DisplayMessage(DisplayMessageRequest {
+            target: Some(Target::Session(alpha)),
+            print: false,
+            message: Some("#{client_width}|#{client_height}".to_owned()),
+            empty_target_context: false,
+        }))
+        .await;
+    assert!(matches!(response, Response::DisplayMessage(_)));
+    let event = tokio::time::timeout(Duration::from_secs(1), event_rx.recv())
+        .await
+        .expect("display-message notification arrives")
+        .expect("control notification channel remains open");
+    assert!(
+        matches!(event, ControlServerEvent::Notification(line) if line == "%message 101|"),
+        "display-message should deliver the refreshed control geometry"
     );
 }
 
@@ -251,14 +297,79 @@ async fn control_client_flags_without_session_emit_only_control_mode() {
         )
         .await;
 
-    let active_control = handler.active_control.lock().await;
-    let active = active_control
-        .by_pid
-        .get(&requester_pid)
-        .expect("control client exists");
+    {
+        let active_control = handler.active_control.lock().await;
+        let active = active_control
+            .by_pid
+            .get(&requester_pid)
+            .expect("control client exists");
+        assert_eq!(
+            super::super::format_control_client_flags(active),
+            "control-mode"
+        );
+    }
     assert_eq!(
-        super::super::format_control_client_flags(active),
-        "control-mode"
+        control_client_geometry(&handler, requester_pid).await,
+        (80, None)
+    );
+    assert_eq!(list_client_geometry(&handler).await, "80|\n");
+
+    let mut request = refresh_client_request(requester_pid);
+    request.control_size = Some("91x20".to_owned());
+    let response = handler
+        .handle(Request::RefreshClient(Box::new(request)))
+        .await;
+    assert!(matches!(response, Response::RefreshClient(_)));
+    assert_eq!(
+        control_client_geometry(&handler, requester_pid).await,
+        (91, None)
+    );
+    assert_eq!(list_client_geometry(&handler).await, "91|\n");
+}
+
+#[tokio::test]
+async fn refresh_client_control_size_rolls_back_geometry_when_session_resize_fails() {
+    let handler = RequestHandler::new();
+    let requester_pid = 91_347;
+    let alpha = session_name("control-size-rollback");
+    let response = handler
+        .handle(Request::NewSession(NewSessionRequest {
+            session_name: alpha.clone(),
+            detached: true,
+            size: Some(TerminalSize { cols: 80, rows: 24 }),
+            environment: None,
+        }))
+        .await;
+    assert!(matches!(response, Response::NewSession(_)));
+    handler.wait_for_initial_panes_for_test().await;
+    let (_control_id, _event_rx) =
+        register_control_test_client(&handler, requester_pid, &alpha).await;
+
+    handler.state.lock().await.fail_next_resize_for_test();
+
+    let mut request = refresh_client_request(requester_pid);
+    request.control_size = Some("101x31".to_owned());
+    let response = handler
+        .handle(Request::RefreshClient(Box::new(request)))
+        .await;
+    assert!(matches!(response, Response::Error(_)));
+    assert_eq!(
+        control_client_geometry(&handler, requester_pid).await,
+        (80, None),
+        "failed session resize must not publish the requested control width"
+    );
+    assert_eq!(
+        handler
+            .state
+            .lock()
+            .await
+            .sessions
+            .session(&alpha)
+            .expect("session survives a terminal resize failure")
+            .window()
+            .size(),
+        TerminalSize { cols: 80, rows: 24 },
+        "failed terminal resize must roll back the session geometry"
     );
 }
 
@@ -705,13 +816,22 @@ async fn managed_client_actions_fail_closed_when_a_pid_is_reregistered() {
         Err(mpsc::error::TryRecvError::Empty)
     ));
 
+    let beta_size_before = handler
+        .state
+        .lock()
+        .await
+        .sessions
+        .session(&beta)
+        .expect("replacement control session exists")
+        .window()
+        .size();
     let pause = super::super::client_support::install_managed_client_resolution_pause(control_pid);
     let refresh_handler = handler.clone();
     let refresh = tokio::spawn(async move {
+        let mut request = refresh_client_request(control_pid);
+        request.control_size = Some("101x31".to_owned());
         refresh_handler
-            .handle(Request::RefreshClient(Box::new(refresh_client_request(
-                control_pid,
-            ))))
+            .handle(Request::RefreshClient(Box::new(request)))
             .await
     });
     tokio::time::timeout(Duration::from_secs(1), pause.reached.notified())
@@ -730,6 +850,19 @@ async fn managed_client_actions_fail_closed_when_a_pid_is_reregistered() {
         third_control_rx.try_recv(),
         Err(mpsc::error::TryRecvError::Empty)
     ));
+    assert_eq!(
+        handler
+            .state
+            .lock()
+            .await
+            .sessions
+            .session(&beta)
+            .expect("stale refresh target session survives")
+            .window()
+            .size(),
+        beta_size_before,
+        "a refresh resolved for the old identity must not resize its former session"
+    );
 
     let attach_pid = 91_349;
     let (old_attach_tx, _old_attach_rx) = mpsc::unbounded_channel();
@@ -835,6 +968,15 @@ async fn managed_client_actions_fail_closed_when_a_pid_is_reregistered() {
             .id,
         third_control_id
     );
+    assert_eq!(
+        active_control
+            .by_pid
+            .get(&control_pid)
+            .expect("latest control registration survives")
+            .client_width,
+        80,
+        "a refresh resolved for the old identity must not mutate the replacement geometry"
+    );
     drop(active_control);
     let active_attach = handler.active_attach.lock().await;
     assert_eq!(
@@ -891,6 +1033,33 @@ fn refresh_client_request(target_pid: u32) -> rmux_proto::request::RefreshClient
         control_size: None,
         colour_report: None,
     }
+}
+
+async fn control_client_geometry(handler: &RequestHandler, control_pid: u32) -> (u16, Option<u16>) {
+    let clients = handler.list_clients_snapshot().await;
+    let client = clients
+        .iter()
+        .find(|client| client.control && client.pid == control_pid)
+        .expect("control client snapshot");
+    (client.width, client.height)
+}
+
+async fn list_client_geometry(handler: &RequestHandler) -> String {
+    let response = handler
+        .handle(Request::ListClients(Box::new(
+            rmux_proto::ListClientsRequest {
+                format: Some("#{client_width}|#{client_height}".to_owned()),
+                target_session: None,
+                filter: None,
+                sort_order: None,
+                reversed: false,
+            },
+        )))
+        .await;
+    let Response::ListClients(response) = response else {
+        panic!("expected list-clients response");
+    };
+    String::from_utf8(response.output.stdout().to_vec()).expect("utf-8")
 }
 
 #[tokio::test]

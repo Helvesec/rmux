@@ -29,6 +29,7 @@ use crate::server_access::{
 mod session_attach;
 
 const CONTROL_QUEUE_DRAIN_REGISTRATION_TIMEOUT: Duration = Duration::from_secs(5);
+const DEFAULT_CONTROL_CLIENT_WIDTH: u16 = 80;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum ControlRegistrationError {
@@ -59,6 +60,7 @@ pub(super) struct ActiveControlState {
 pub(super) struct ActiveControl {
     pub(super) id: u64,
     pub(super) last_activity_sequence: u64,
+    pub(super) client_width: u16,
     pub(super) session_name: Option<rmux_proto::SessionName>,
     pub(super) session_id: Option<SessionId>,
     pub(super) last_session: Option<rmux_proto::SessionName>,
@@ -433,6 +435,7 @@ impl RequestHandler {
                     ActiveControl {
                         id: control_id,
                         last_activity_sequence: activity_sequence,
+                        client_width: DEFAULT_CONTROL_CLIENT_WIDTH,
                         session_name: None,
                         session_id: None,
                         last_session: None,

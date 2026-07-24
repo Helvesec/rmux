@@ -677,7 +677,10 @@ async fn display_message_for_control_client_uses_message_notification() {
         Request::DisplayMessage(DisplayMessageRequest {
             target: Some(Target::Session(alpha.clone())),
             print: false,
-            message: Some("hello\t#{session_name}|#{client_session}|#{client_name}".to_owned()),
+            message: Some(
+                "hello\t#{session_name}|#{client_session}|#{client_name}|#{client_width}|#{client_height}"
+                    .to_owned(),
+            ),
             empty_target_context: false,
         }),
     )
@@ -689,7 +692,7 @@ async fn display_message_for_control_client_uses_message_notification() {
     );
     assert_eq!(
         drain_control_notifications(&mut control_rx),
-        vec!["%message hello\\talpha|alpha|610".to_owned()]
+        vec!["%message hello\\talpha|alpha|610|80|".to_owned()]
     );
 
     let response = dispatch_as(
@@ -698,7 +701,10 @@ async fn display_message_for_control_client_uses_message_notification() {
         Request::DisplayMessage(DisplayMessageRequest {
             target: Some(Target::Session(detached.clone())),
             print: false,
-            message: Some("#{session_name}|#{client_session}|#{client_name}".to_owned()),
+            message: Some(
+                "#{session_name}|#{client_session}|#{client_name}|#{client_width}|#{client_height}"
+                    .to_owned(),
+            ),
             empty_target_context: false,
         }),
     )
@@ -706,7 +712,7 @@ async fn display_message_for_control_client_uses_message_notification() {
     assert!(matches!(response, Response::DisplayMessage(_)));
     assert_eq!(
         drain_control_notifications(&mut control_rx),
-        vec!["%message detached|alpha|610".to_owned()]
+        vec!["%message detached|alpha|610|80|".to_owned()]
     );
 
     let response = dispatch_as(
@@ -732,7 +738,10 @@ async fn display_message_for_control_client_uses_message_notification() {
         Request::DisplayMessageExt(Box::new(DisplayMessageExtRequest {
             target: Some(Target::Session(detached.clone())),
             print: true,
-            message: Some("#{session_name}|#{client_session}|#{client_name}".to_owned()),
+            message: Some(
+                "#{session_name}|#{client_session}|#{client_name}|#{client_width}|#{client_height}"
+                    .to_owned(),
+            ),
             target_client: Some("610".to_owned()),
             empty_target_context: false,
             duration_ms: None,
@@ -742,7 +751,7 @@ async fn display_message_for_control_client_uses_message_notification() {
     .await;
     assert_eq!(
         response.command_output().map(|output| output.stdout()),
-        Some(b"detached|alpha|610\n".as_slice())
+        Some(b"detached|alpha|610|80|\n".as_slice())
     );
 
     let response = dispatch_as(

@@ -680,7 +680,7 @@ impl RequestHandler {
                             .unwrap_or_default(),
                     )
                     .with_named_value("client_width", client.width.to_string())
-                    .with_named_value("client_height", client.height.to_string())
+                    .with_named_value("client_height", client.height_value())
                     .with_named_value("client_termfeatures", client.termfeatures.clone())
                     .with_named_value("client_termname", client.termname.clone())
                     .with_named_value("client_termtype", client.termtype.clone())

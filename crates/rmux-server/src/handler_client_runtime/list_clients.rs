@@ -1,4 +1,5 @@
 use rmux_os::identity::UserIdentity;
+use rmux_proto::TerminalSize;
 
 #[derive(Debug, Clone)]
 pub(in crate::handler) struct ListClientSnapshot {
@@ -9,7 +10,7 @@ pub(in crate::handler) struct ListClientSnapshot {
     pub(in crate::handler) session_name: Option<rmux_proto::SessionName>,
     pub(in crate::handler) order: u64,
     pub(in crate::handler) width: u16,
-    pub(in crate::handler) height: u16,
+    pub(in crate::handler) height: Option<u16>,
     pub(in crate::handler) termname: String,
     pub(in crate::handler) termtype: String,
     pub(in crate::handler) termfeatures: String,
@@ -31,5 +32,22 @@ impl ListClientSnapshot {
         } else {
             "0"
         }
+    }
+
+    pub(in crate::handler) fn height_value(&self) -> String {
+        self.height
+            .map(|height| height.to_string())
+            .unwrap_or_default()
+    }
+
+    pub(in crate::handler) fn terminal_size(&self) -> Option<TerminalSize> {
+        Some(TerminalSize {
+            cols: self.width,
+            rows: self.height?,
+        })
+    }
+
+    pub(in crate::handler) fn sort_size(&self) -> (u16, u16) {
+        (self.width, self.height.unwrap_or_default())
     }
 }
