@@ -460,6 +460,46 @@ fn exited_pane_drain_idle_tracks_explicit_progress_not_subscription_touch() {
     );
 }
 
+#[test]
+fn stale_drain_timeout_observation_does_not_expire_new_progress() {
+    let mut subscriptions = OutputSubscriptionState::new(SubscriptionLimits::default());
+    let pane = PaneOutputSubscriptionKey::new(
+        SessionName::new("runtime").expect("valid session name"),
+        PaneId::new(43),
+    );
+    let started = Instant::now();
+    subscriptions
+        .registry
+        .subscribe(5, pane.clone(), started)
+        .expect("subscription is within limits");
+    assert!(subscriptions.begin_pane_drain(pane.clone(), None, started));
+
+    let stale_observation = started + Duration::from_secs(2);
+    assert_eq!(
+        subscriptions.pane_drain_idle_for(&pane, stale_observation),
+        Some(Duration::from_secs(2))
+    );
+
+    let progress = stale_observation + Duration::from_millis(1);
+    subscriptions.note_pane_drain_progress(&pane, progress);
+    assert!(
+        !subscriptions.expire_pane_drain_if_idle(
+            &pane,
+            progress + Duration::from_millis(1),
+            Duration::from_secs(2),
+        ),
+        "expiration must revalidate progress observed after the stale timeout check"
+    );
+    assert!(subscriptions.pane_is_draining(&pane));
+
+    assert!(subscriptions.expire_pane_drain_if_idle(
+        &pane,
+        progress + Duration::from_secs(2),
+        Duration::from_secs(2),
+    ));
+    assert!(!subscriptions.pane_is_draining(&pane));
+}
+
 #[tokio::test]
 async fn exited_pane_subscription_auto_cleans_after_drain_timeout() {
     let handler = RequestHandler::new();

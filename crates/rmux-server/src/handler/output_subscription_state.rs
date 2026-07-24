@@ -234,6 +234,7 @@ impl OutputSubscriptionState {
         self.draining_pane_progress.contains_key(pane)
     }
 
+    #[cfg(test)]
     pub(super) fn pane_drain_idle_for(
         &self,
         pane: &PaneOutputSubscriptionKey,
@@ -242,6 +243,22 @@ impl OutputSubscriptionState {
         self.draining_pane_progress
             .get(pane)
             .map(|last_progress| now.saturating_duration_since(*last_progress))
+    }
+
+    pub(super) fn expire_pane_drain_if_idle(
+        &mut self,
+        pane: &PaneOutputSubscriptionKey,
+        now: Instant,
+        idle_timeout: Duration,
+    ) -> bool {
+        let Some(last_progress) = self.draining_pane_progress.get(pane).copied() else {
+            return false;
+        };
+        if now.saturating_duration_since(last_progress) < idle_timeout {
+            return false;
+        }
+        self.expire_pane_drain(pane, now);
+        true
     }
 
     pub(in crate::handler) fn is_empty(&self) -> bool {

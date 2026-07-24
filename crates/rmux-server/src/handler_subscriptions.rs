@@ -374,13 +374,9 @@ impl RequestHandler {
                     return;
                 }
                 if handler
-                    .pane_drain_idle_for(&pane)
+                    .cleanup_drained_pane_output_subscriptions_if_idle(&pane)
                     .await
-                    .is_some_and(|idle_for| idle_for >= EXITED_PANE_DRAIN_IDLE_TIMEOUT)
                 {
-                    handler
-                        .cleanup_drained_pane_output_subscriptions(&pane)
-                        .await;
                     return;
                 }
                 tokio::time::sleep(EXITED_PANE_DRAIN_POLL_INTERVAL).await;
@@ -396,23 +392,25 @@ impl RequestHandler {
         !subscriptions.pane_is_draining(pane)
     }
 
-    async fn pane_drain_idle_for(&self, pane: &PaneOutputSubscriptionKey) -> Option<Duration> {
-        let subscriptions = self
-            .subscriptions
-            .lock()
-            .expect("subscription registry mutex must not be poisoned");
-        subscriptions.pane_drain_idle_for(pane, Instant::now())
-    }
-
-    async fn cleanup_drained_pane_output_subscriptions(&self, pane: &PaneOutputSubscriptionKey) {
-        {
+    async fn cleanup_drained_pane_output_subscriptions_if_idle(
+        &self,
+        pane: &PaneOutputSubscriptionKey,
+    ) -> bool {
+        let expired = {
             let mut subscriptions = self
                 .subscriptions
                 .lock()
                 .expect("subscription registry mutex must not be poisoned");
-            subscriptions.expire_pane_drain(pane, Instant::now());
+            subscriptions.expire_pane_drain_if_idle(
+                pane,
+                Instant::now(),
+                EXITED_PANE_DRAIN_IDLE_TIMEOUT,
+            )
+        };
+        if expired {
+            let _ = self.request_shutdown_if_pending();
         }
-        let _ = self.request_shutdown_if_pending();
+        expired
     }
 }
 
