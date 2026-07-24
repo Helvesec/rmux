@@ -1129,6 +1129,34 @@ pub(super) fn attach_target_for_session(
             selection: None,
             window_size_override: None,
             master: AttachTargetMaster::Clone,
+            bounded_recovery: false,
+            socket_path,
+        },
+    )
+}
+
+#[cfg(feature = "web")]
+pub(super) fn attach_target_for_web_session(
+    state: &HandlerState,
+    session_name: &rmux_proto::SessionName,
+    attached_count: usize,
+    terminal_context: &OuterTerminalContext,
+    socket_path: &Path,
+) -> Result<AttachTarget, rmux_proto::RmuxError> {
+    attach_target_for_session_with_prompt(
+        state,
+        session_name,
+        attached_count,
+        AttachTargetRenderOptions {
+            prompt: None,
+            key_table: None,
+            terminal_context,
+            render_size: None,
+            window_index: None,
+            selection: None,
+            window_size_override: None,
+            master: AttachTargetMaster::Clone,
+            bounded_recovery: true,
             socket_path,
         },
     )
@@ -1180,6 +1208,7 @@ pub(super) fn attach_target_for_session_switch(
             selection,
             window_size_override,
             master,
+            bounded_recovery: render_stream,
             socket_path,
         },
     )
@@ -1207,6 +1236,7 @@ pub(super) fn attach_render_target_for_session_window(
             selection: None,
             window_size_override: None,
             master: AttachTargetMaster::Omit,
+            bounded_recovery: true,
             socket_path,
         },
     )
@@ -1231,6 +1261,7 @@ pub(super) fn attach_render_target_for_session_with_prompt(
             selection: None,
             window_size_override: None,
             master: AttachTargetMaster::Omit,
+            bounded_recovery: false,
             socket_path: request.socket_path,
         },
     )
@@ -1297,6 +1328,7 @@ struct AttachTargetRenderOptions<'a> {
     selection: Option<&'a SwitchTargetSelection>,
     window_size_override: Option<(u32, TerminalSize)>,
     master: AttachTargetMaster,
+    bounded_recovery: bool,
     socket_path: &'a Path,
 }
 
@@ -1329,6 +1361,20 @@ fn attach_target_for_session_with_prompt(
     // replayable without retaining live-only passthroughs for detached panes.
     let (pane_output_start_sequence, pane_output) = pane_output_sender.subscribe_live_from_now();
     let active_pane = session.window().active_pane().cloned();
+    #[cfg(feature = "web")]
+    let pane_state = if options.bounded_recovery {
+        session
+            .active_pane_id()
+            .map(|pane_id| state.pane_recovery_screen_state(session_name, pane_id))
+            .transpose()?
+            .flatten()
+            .map(|(pane_state, _)| pane_state)
+    } else {
+        session
+            .active_pane_id()
+            .and_then(|pane_id| state.pane_screen_state(session_name, pane_id))
+    };
+    #[cfg(not(feature = "web"))]
     let pane_state = session
         .active_pane_id()
         .and_then(|pane_id| state.pane_screen_state(session_name, pane_id));
@@ -1380,7 +1426,15 @@ fn attach_target_for_session_with_prompt(
         )
         .as_slice(),
     );
+    validate_attach_recovery_frame(&render_frame, options.bounded_recovery)?;
     for pane in session.window().panes() {
+        #[cfg(feature = "web")]
+        let copy_snapshot = if options.bounded_recovery {
+            web_copy_mode_recovery_snapshot(state, session_name, pane.id())?
+        } else {
+            state.pane_copy_mode_render_snapshot(session_name, pane.id())
+        };
+        #[cfg(not(feature = "web"))]
         let copy_snapshot = state.pane_copy_mode_render_snapshot(session_name, pane.id());
         if let Some(snapshot) = copy_snapshot.as_ref() {
             let pane_frame = if options.prompt.is_some() {
@@ -1394,7 +1448,20 @@ fn attach_target_for_session_with_prompt(
                 renderer::render_copy_mode_pane_screen(session, &state.options, pane, snapshot)
             };
             render_frame.extend_from_slice(pane_frame.as_slice());
-        } else if let Some(screen) = state.pane_screen(session_name, pane.id()) {
+        } else {
+            #[cfg(feature = "web")]
+            let screen = if options.bounded_recovery {
+                state
+                    .pane_recovery_screen(session_name, pane.id())?
+                    .map(|(screen, _)| screen)
+            } else {
+                state.pane_screen(session_name, pane.id())
+            };
+            #[cfg(not(feature = "web"))]
+            let screen = state.pane_screen(session_name, pane.id());
+            let Some(screen) = screen else {
+                continue;
+            };
             let pane_frame = if options.prompt.is_some() {
                 renderer::render_pane_screen_preserving_prompt_cursor(
                     session,
@@ -1428,17 +1495,26 @@ fn attach_target_for_session_with_prompt(
                 );
             }
         }
+        validate_attach_recovery_frame(&render_frame, options.bounded_recovery)?;
     }
     render_frame.extend_from_slice(
         renderer::render_pane_border_status_lines(session, &state.options, Some(state)).as_slice(),
     );
+    validate_attach_recovery_frame(&render_frame, options.bounded_recovery)?;
     let live_pane =
         live_pane_render_for_target(state, session, &state.options, session_name, options.prompt);
     if options.prompt.is_none() {
         if let Some(active_pane) = active_pane.clone() {
-            if let Some(snapshot) =
+            #[cfg(feature = "web")]
+            let copy_snapshot = if options.bounded_recovery {
+                web_copy_mode_recovery_snapshot(state, session_name, active_pane.id())?
+            } else {
                 state.pane_copy_mode_render_snapshot(session_name, active_pane.id())
-            {
+            };
+            #[cfg(not(feature = "web"))]
+            let copy_snapshot =
+                state.pane_copy_mode_render_snapshot(session_name, active_pane.id());
+            if let Some(snapshot) = copy_snapshot {
                 render_frame.extend_from_slice(
                     renderer::render_copy_mode_pane_cursor(
                         session,
@@ -1448,14 +1524,32 @@ fn attach_target_for_session_with_prompt(
                     )
                     .as_slice(),
                 );
-            } else if let Some(screen) = state.pane_screen(session_name, active_pane.id()) {
-                render_frame.extend_from_slice(
-                    renderer::render_pane_cursor(session, &state.options, &active_pane, &screen)
+            } else {
+                #[cfg(feature = "web")]
+                let screen = if options.bounded_recovery {
+                    state
+                        .pane_recovery_screen(session_name, active_pane.id())?
+                        .map(|(screen, _)| screen)
+                } else {
+                    state.pane_screen(session_name, active_pane.id())
+                };
+                #[cfg(not(feature = "web"))]
+                let screen = state.pane_screen(session_name, active_pane.id());
+                if let Some(screen) = screen {
+                    render_frame.extend_from_slice(
+                        renderer::render_pane_cursor(
+                            session,
+                            &state.options,
+                            &active_pane,
+                            &screen,
+                        )
                         .as_slice(),
-                );
+                    );
+                }
             }
         }
     }
+    validate_attach_recovery_frame(&render_frame, options.bounded_recovery)?;
 
     let active_pane_geometry = active_pane.as_ref().map_or_else(
         || rmux_core::PaneGeometry::new(0, 0, 0, 0),
@@ -1519,6 +1613,37 @@ fn attach_target_for_session_with_prompt(
         persistent_overlay_state_id: None,
         live_pane,
     })
+}
+
+fn validate_attach_recovery_frame(
+    frame: &[u8],
+    bounded_recovery: bool,
+) -> Result<(), rmux_proto::RmuxError> {
+    #[cfg(feature = "web")]
+    if bounded_recovery && frame.len() > crate::web::WEB_RECOVERY_CONTENT_BYTES_MAX {
+        return Err(rmux_proto::RmuxError::FrameTooLarge {
+            length: frame.len(),
+            maximum: crate::web::WEB_RECOVERY_CONTENT_BYTES_MAX,
+        });
+    }
+    #[cfg(not(feature = "web"))]
+    let _ = (frame, bounded_recovery);
+    Ok(())
+}
+
+#[cfg(feature = "web")]
+fn web_copy_mode_recovery_snapshot(
+    state: &HandlerState,
+    session_name: &rmux_proto::SessionName,
+    pane_id: rmux_core::PaneId,
+) -> Result<Option<crate::copy_mode::CopyModeRenderSnapshot>, rmux_proto::RmuxError> {
+    match state.pane_copy_mode_recovery_snapshot(session_name, pane_id)? {
+        Some((_, false)) => Err(rmux_proto::RmuxError::Server(
+            "copy-mode metadata exceeds the bounded Web recovery contract".to_owned(),
+        )),
+        Some((snapshot, true)) => Ok(Some(snapshot)),
+        None => Ok(None),
+    }
 }
 
 pub(super) fn sized_session(

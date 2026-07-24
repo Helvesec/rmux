@@ -15,7 +15,7 @@ use rmux_proto::{
 use tokio::sync::{mpsc, watch};
 
 use super::attach_support::{
-    attach_render_target_for_session_window, attach_target_for_session, AttachRegistration,
+    attach_render_target_for_session_window, attach_target_for_web_session, AttachRegistration,
     ClientFlags,
 };
 use super::pane_support::resolve_pane_target_ref;
@@ -40,7 +40,7 @@ mod stream;
 
 #[cfg(test)]
 pub(crate) use snapshot::WebSessionView as TestWebSessionView;
-use snapshot::{overlay_pane_lines, session_content_geometry, snapshot_ansi_lines, WebSessionView};
+use snapshot::{overlay_pane_lines, session_content_geometry, WebSessionView};
 pub(crate) use snapshot::{
     WebPaneSnapshot, WebSessionPaneFrame, WebSessionPaneView, WebSessionSnapshot,
 };
@@ -347,7 +347,7 @@ impl RequestHandler {
                 .session_by_id(session_target.id())
                 .ok_or_else(|| session_not_found_web(session_target.name()))?;
             let current_target = WebSessionTarget::new(session.name().clone(), session.id());
-            let target = attach_target_for_session(
+            let target = attach_target_for_web_session(
                 &state,
                 current_target.name(),
                 attached_count,
@@ -525,7 +525,7 @@ impl RequestHandler {
             return Ok(None);
         };
         let Some(scrollback) =
-            state.pane_scrollback_view_from_top_line(session.name(), pane.id(), top_line)
+            state.pane_scrollback_view_from_top_line(session.name(), pane.id(), top_line)?
         else {
             return Err(RmuxError::Server(format!(
                 "missing pane transcript: {}",
@@ -541,7 +541,12 @@ impl RequestHandler {
             })
             .unwrap_or(false);
         let mut frame = Vec::new();
-        overlay_pane_lines(&mut frame, geometry, &scrollback.ansi_lines);
+        if !scrollback.metadata_complete {
+            return Err(RmuxError::Server(
+                "pane scroll frame metadata exceeds the bounded Web recovery contract".to_owned(),
+            ));
+        }
+        overlay_pane_lines(&mut frame, geometry, &scrollback.ansi_lines)?;
         let pane = WebSessionPaneView::new(
             pane.id(),
             geometry,
@@ -551,7 +556,7 @@ impl RequestHandler {
             scrollback.alternate_on,
             mouse_on,
         );
-        Ok(Some(WebSessionPaneFrame::new(window.size(), pane, frame)))
+        Ok(Some(WebSessionPaneFrame::new(window.size(), pane, frame)?))
     }
 
     pub(crate) async fn web_resnapshot(
@@ -589,24 +594,27 @@ impl RequestHandler {
                 "pane process changed repeatedly while capturing web state".to_owned(),
             ));
         };
+        let seed = seed?;
         let keyframe = seed.keyframe();
         let screen = seed.screen();
         let size = screen.size();
         debug_assert_eq!((keyframe.cols, keyframe.rows), (size.cols, size.rows));
-        debug_assert_eq!(keyframe.alternate, screen.is_alternate());
+        debug_assert_eq!(keyframe.alternate, seed.alternate());
         let (cursor_col, cursor_row) = screen.cursor_position();
         let (scroll_top, scroll_bottom) = screen.scroll_region();
         let snapshot = WebPaneSnapshot {
             cols: size.cols,
             rows: size.rows,
             output_sequence: boundary.next_output_sequence,
-            ansi_lines: snapshot_ansi_lines(screen),
+            // The authoritative bounded keyframe below supersedes the legacy
+            // line representation. Avoid rendering and retaining it twice.
+            ansi_lines: Vec::new(),
             cursor_row: cursor_row.min(u32::from(size.rows.saturating_sub(1))) as u16,
             cursor_col: cursor_col.min(u32::from(size.cols.saturating_sub(1))) as u16,
             cursor_visible: screen.mode() & mode::MODE_CURSOR != 0,
             mode_bits: screen.mode(),
             cursor_style: screen.cursor_style(),
-            alternate: screen.is_alternate(),
+            alternate: seed.alternate(),
             scroll_top,
             scroll_bottom,
             recovery_keyframe: Some(keyframe.bytes),
@@ -1308,10 +1316,13 @@ fn web_session_snapshot_from_state(
                 state.pane_scrollback_view_from_top_line(session.name(), pane.id(), top_line)
             }
             None => state.pane_scrollback_view(session.name(), pane.id(), 0),
-        }
+        }?
         .ok_or_else(|| RmuxError::Server(format!("missing pane transcript: {}", pane.id())))?;
         if scrollback.scroll_offset > 0 {
-            overlay_pane_lines(&mut frame, geometry, &scrollback.ansi_lines);
+            overlay_pane_lines(&mut frame, geometry, &scrollback.ansi_lines)?;
+        }
+        if !scrollback.metadata_complete {
+            view.mark_metadata_incomplete();
         }
         view.push_pane(WebSessionPaneView::new(
             pane.id(),
@@ -1324,13 +1335,13 @@ fn web_session_snapshot_from_state(
         ));
     }
 
-    Ok(WebSessionSnapshot::new(
+    WebSessionSnapshot::new(
         window.size(),
         frame,
         view,
         active_mode_bits,
         active_cursor_style,
-    ))
+    )
 }
 
 fn web_session_view_session(

@@ -25,6 +25,8 @@ pub struct PaneSurfaceSnapshot {
     pub title: String,
     /// Terminal-reported working-directory path.
     pub path: String,
+    /// Whether title, path and hyperlink metadata was represented completely.
+    pub metadata_complete: bool,
     /// Raw terminal mode bitset.
     pub mode_bits: u32,
     /// Whether the alternate screen is active.
@@ -341,6 +343,7 @@ fn snapshot_from_proto(value: ProtoSnapshot) -> Result<PaneSurfaceSnapshot> {
         grid,
         title: value.title,
         path: value.path,
+        metadata_complete: value.metadata_complete,
         mode_bits: value.mode_bits,
         alternate: value.alternate,
         scroll_top: value.scroll_top,
@@ -376,6 +379,7 @@ mod tests {
                     .with_revision(revision),
                 title: String::new(),
                 path: String::new(),
+                metadata_complete: true,
                 mode_bits: 0,
                 alternate: false,
                 scroll_top: 0,

@@ -22,8 +22,8 @@ pub mod types;
 
 pub use pane_stream::{PaneStreamEndReason, PaneStreamLifecycleEvent};
 pub use recovery::{
-    PaneRecoveryApplyError, PaneRecoveryEvent, PaneRecoveryOptions, PaneRecoveryRebase,
-    PaneRecoveryRebaseReason, PaneRecoveryState, PaneRecoveryStream,
+    PaneRecoveryApplyError, PaneRecoveryCoverage, PaneRecoveryEvent, PaneRecoveryOptions,
+    PaneRecoveryRebase, PaneRecoveryRebaseReason, PaneRecoveryState, PaneRecoveryStream,
 };
 pub use render::{PaneRenderStream, RenderUpdate};
 pub use streams::{

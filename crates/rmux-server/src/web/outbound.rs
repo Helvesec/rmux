@@ -13,7 +13,7 @@ use super::websocket::WebSocketWriter;
 
 const WEB_WRITE_TIMEOUT: Duration = Duration::from_secs(2);
 const VIEWER_CHANNEL_CAP: usize = 256;
-const BACKLOG_BYTES_MAX: usize = 2 * 1024 * 1024;
+pub(crate) const WEB_OUTBOUND_BYTES_MAX: usize = 2 * 1024 * 1024;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum OutboundQueueResult {
@@ -93,7 +93,7 @@ impl AccountedBacklog {
                 current
                     .checked_sub(replaced_len)?
                     .checked_add(len)
-                    .filter(|next| *next <= BACKLOG_BYTES_MAX)
+                    .filter(|next| *next <= WEB_OUTBOUND_BYTES_MAX)
             })
             .map_err(|_| OutboundQueueResult::Backpressure)?;
         Ok(Self { backlog_bytes, len })
@@ -294,7 +294,7 @@ impl WebSocketOutbound {
             .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
                 current
                     .checked_add(len)
-                    .filter(|next| *next <= BACKLOG_BYTES_MAX)
+                    .filter(|next| *next <= WEB_OUTBOUND_BYTES_MAX)
             })
             .is_err()
         {
@@ -594,7 +594,7 @@ mod tests {
 
     use super::{
         subtract_backlog, ControlCmd, DataCmd, OutboundQueueResult, WebSocketOutbound,
-        BACKLOG_BYTES_MAX, VIEWER_CHANNEL_CAP,
+        VIEWER_CHANNEL_CAP, WEB_OUTBOUND_BYTES_MAX,
     };
 
     #[tokio::test]
@@ -671,12 +671,12 @@ mod tests {
         let (outbound, _data_rx, mut control_rx) = WebSocketOutbound::test_channels();
 
         assert_eq!(
-            outbound.queue_keyframe(vec![vec![0; BACKLOG_BYTES_MAX]]),
+            outbound.queue_keyframe(vec![vec![0; WEB_OUTBOUND_BYTES_MAX]]),
             OutboundQueueResult::Queued
         );
         assert_eq!(
             outbound.backlog_bytes.load(Ordering::Acquire),
-            BACKLOG_BYTES_MAX
+            WEB_OUTBOUND_BYTES_MAX
         );
         assert_eq!(
             outbound.queue_frame(vec![0]),
@@ -690,17 +690,17 @@ mod tests {
         let (outbound, _data_rx, mut control_rx) = WebSocketOutbound::test_channels();
 
         assert_eq!(
-            outbound.queue_keyframe(vec![vec![b'o'; BACKLOG_BYTES_MAX]]),
+            outbound.queue_keyframe(vec![vec![b'o'; WEB_OUTBOUND_BYTES_MAX]]),
             OutboundQueueResult::Queued
         );
         assert_eq!(
-            outbound.queue_keyframe(vec![vec![b'n'; BACKLOG_BYTES_MAX]]),
+            outbound.queue_keyframe(vec![vec![b'n'; WEB_OUTBOUND_BYTES_MAX]]),
             OutboundQueueResult::Queued
         );
 
         assert_eq!(
             outbound.backlog_bytes.load(Ordering::Acquire),
-            BACKLOG_BYTES_MAX
+            WEB_OUTBOUND_BYTES_MAX
         );
         assert!(matches!(control_rx.try_recv(), Ok(ControlCmd::Keyframe)));
         assert!(control_rx.try_recv().is_err());
@@ -713,7 +713,7 @@ mod tests {
         let (outbound, _data_rx, mut control_rx) = WebSocketOutbound::test_channels();
 
         assert_eq!(
-            outbound.queue_keyframe(vec![vec![0; BACKLOG_BYTES_MAX - 1]]),
+            outbound.queue_keyframe(vec![vec![0; WEB_OUTBOUND_BYTES_MAX - 1]]),
             OutboundQueueResult::Queued
         );
         assert!(matches!(control_rx.try_recv(), Ok(ControlCmd::Keyframe)));
@@ -737,7 +737,7 @@ mod tests {
         );
         assert_eq!(
             outbound.backlog_bytes.load(Ordering::Acquire),
-            BACKLOG_BYTES_MAX
+            WEB_OUTBOUND_BYTES_MAX
         );
 
         drop(in_flight);
@@ -757,7 +757,7 @@ mod tests {
         let (outbound, _data_rx, _control_rx) = WebSocketOutbound::test_channels();
 
         assert_eq!(
-            outbound.queue_frame(vec![0; BACKLOG_BYTES_MAX]),
+            outbound.queue_frame(vec![0; WEB_OUTBOUND_BYTES_MAX]),
             OutboundQueueResult::Queued
         );
         assert_eq!(
@@ -770,7 +770,7 @@ mod tests {
         );
         assert_eq!(
             outbound.backlog_bytes.load(Ordering::Acquire),
-            BACKLOG_BYTES_MAX
+            WEB_OUTBOUND_BYTES_MAX
         );
     }
 
@@ -779,7 +779,7 @@ mod tests {
         let (outbound, _data_rx, mut control_rx) = WebSocketOutbound::test_channels();
 
         assert_eq!(
-            outbound.queue_frame(vec![0; BACKLOG_BYTES_MAX]),
+            outbound.queue_frame(vec![0; WEB_OUTBOUND_BYTES_MAX]),
             OutboundQueueResult::Queued
         );
         assert_eq!(
@@ -798,7 +798,7 @@ mod tests {
         let (outbound, _data_rx, mut control_rx) = WebSocketOutbound::test_channels();
 
         assert_eq!(
-            outbound.queue_keyframe(vec![vec![0; BACKLOG_BYTES_MAX], vec![0]]),
+            outbound.queue_keyframe(vec![vec![0; WEB_OUTBOUND_BYTES_MAX], vec![0]]),
             OutboundQueueResult::Backpressure
         );
 

@@ -1,4 +1,4 @@
-use rmux_core::{input::mode, GridRenderOptions, PaneId, Screen, ScreenCaptureRange, Utf8Config};
+use rmux_core::{GridRenderOptions, PaneId, Screen, ScreenCaptureRange, Utf8Config};
 use rmux_proto::{
     OptionName, OptionScopeSelector, PaneTarget, RmuxError, ScopeSelector, SessionName,
 };
@@ -457,19 +457,18 @@ impl HandlerState {
         let transcript = transcript
             .lock()
             .expect("pane transcript mutex must not be poisoned");
-        let mut mode_bits = transcript.mode();
-        if (mode_bits & mode::MODE_KEYS_EXTENDED_2) != 0 {
-            mode_bits |= mode::MODE_KEYS_EXTENDED;
-        }
+        Some(PaneScreenState::from_screen(transcript.screen()))
+    }
 
-        Some(PaneScreenState {
-            mode: mode_bits,
-            alternate_on: transcript.is_alternate(),
-            title: transcript.title().to_owned(),
-            path: transcript.path().to_owned(),
-            cursor_position: transcript.cursor_position(),
-            cursor_style: transcript.cursor_style(),
-        })
+    #[cfg(feature = "web")]
+    pub(crate) fn pane_recovery_screen_state(
+        &self,
+        session_name: &SessionName,
+        pane_id: PaneId,
+    ) -> Result<Option<(PaneScreenState, bool)>, RmuxError> {
+        Ok(self
+            .pane_recovery_screen(session_name, pane_id)?
+            .map(|(screen, complete)| (PaneScreenState::from_screen(&screen), complete)))
     }
 
     pub(crate) fn pane_copy_mode_summary(
@@ -523,6 +522,39 @@ impl HandlerState {
             .copy_mode_render_snapshot()
     }
 
+    #[cfg(feature = "web")]
+    pub(crate) fn pane_copy_mode_recovery_snapshot(
+        &self,
+        session_name: &SessionName,
+        pane_id: PaneId,
+    ) -> Result<Option<(crate::copy_mode::CopyModeRenderSnapshot, bool)>, RmuxError> {
+        let Some(window_index) = self
+            .sessions
+            .session(session_name)
+            .and_then(|session| session.window_index_for_pane_id(pane_id))
+        else {
+            return Ok(None);
+        };
+        let runtime_session_name = self.runtime_session_name_for_window(session_name, window_index);
+        let Some(transcript) = self
+            .transcripts
+            .get(&runtime_session_name)
+            .and_then(|panes| panes.get(&pane_id))
+        else {
+            return Ok(None);
+        };
+        let transcript = transcript
+            .lock()
+            .expect("pane transcript mutex must not be poisoned");
+        crate::pane_recovery::validate_recovery_geometry(transcript.screen())?;
+        Ok(transcript.copy_mode_render_snapshot_bounded(
+            crate::pane_recovery::MAX_RECOVERY_STRING_BYTES,
+            crate::pane_recovery::MAX_RECOVERY_TITLE_STACK_BYTES,
+            crate::pane_recovery::MAX_RECOVERY_HYPERLINK_ENTRY_BYTES,
+            crate::pane_recovery::MAX_RECOVERY_HYPERLINK_TOTAL_BYTES,
+        ))
+    }
+
     pub(crate) fn with_pane_screen<R>(
         &self,
         session_name: &SessionName,
@@ -559,6 +591,40 @@ impl HandlerState {
                 .screen()
                 .clone(),
         )
+    }
+
+    #[cfg(feature = "web")]
+    pub(crate) fn pane_recovery_screen(
+        &self,
+        session_name: &SessionName,
+        pane_id: PaneId,
+    ) -> Result<Option<(Screen, bool)>, RmuxError> {
+        let Some(window_index) = self
+            .sessions
+            .session(session_name)
+            .and_then(|session| session.window_index_for_pane_id(pane_id))
+        else {
+            return Ok(None);
+        };
+        let runtime_session_name = self.runtime_session_name_for_window(session_name, window_index);
+        let Some(transcript) = self
+            .transcripts
+            .get(&runtime_session_name)
+            .and_then(|panes| panes.get(&pane_id))
+        else {
+            return Ok(None);
+        };
+        let transcript = transcript
+            .lock()
+            .expect("pane transcript mutex must not be poisoned");
+        let screen = transcript.screen();
+        crate::pane_recovery::validate_recovery_geometry(screen)?;
+        Ok(Some(screen.clone_recovery_viewport_bounded(
+            crate::pane_recovery::MAX_RECOVERY_STRING_BYTES,
+            crate::pane_recovery::MAX_RECOVERY_TITLE_STACK_BYTES,
+            crate::pane_recovery::MAX_RECOVERY_HYPERLINK_ENTRY_BYTES,
+            crate::pane_recovery::MAX_RECOVERY_HYPERLINK_TOTAL_BYTES,
+        )))
     }
 
     pub(crate) fn pane_in_mode(&self, session_name: &SessionName, pane_id: PaneId) -> bool {

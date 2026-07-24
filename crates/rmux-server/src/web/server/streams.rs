@@ -1073,7 +1073,8 @@ mod tests {
                 mouse_on: false,
             },
             Vec::new(),
-        );
+        )
+        .expect("pane frame fits");
 
         normalize_session_scroll_from_pane_frame(&mut scrolls, &frame);
 
@@ -1099,7 +1100,8 @@ mod tests {
                 mouse_on: false,
             },
             Vec::new(),
-        );
+        )
+        .expect("pane frame fits");
 
         normalize_session_scroll_from_pane_frame(&mut scrolls, &frame);
 
@@ -1128,10 +1130,12 @@ mod tests {
                     alternate_on: false,
                     mouse_on: false,
                 }],
+                metadata_complete: true,
             },
             0,
             0,
-        );
+        )
+        .expect("snapshot fits");
 
         normalize_session_scrolls(&mut scrolls, &snapshot);
 
@@ -1160,10 +1164,12 @@ mod tests {
                     alternate_on: false,
                     mouse_on: false,
                 }],
+                metadata_complete: true,
             },
             0,
             0,
-        );
+        )
+        .expect("snapshot fits");
 
         apply_session_scroll(
             &mut scrolls,

@@ -13,7 +13,7 @@ use super::{
     WS_SESSION_PANE_FRAME, WS_SESSION_VIEW, WS_SNAPSHOT_FULL,
 };
 use crate::handler::{WebPaneSnapshot, WebSessionPaneFrame, WebSessionSnapshot, WebShareStream};
-use crate::web::outbound::{OutboundQueueResult, WebSocketOutbound};
+use crate::web::outbound::{OutboundQueueResult, WebSocketOutbound, WEB_OUTBOUND_BYTES_MAX};
 use crate::web::stream_sanitizer::WebTerminalSanitizer;
 use crate::web::{WebShareConnectionCounts, WebShareRevokeReason};
 
@@ -67,7 +67,10 @@ pub(crate) fn queue_snapshot(
     snapshot: &WebPaneSnapshot,
     sanitizer: &mut WebTerminalSanitizer,
 ) -> OutboundQueueResult {
-    socket.queue_snapshot(pane_snapshot_payload(snapshot, sanitizer))
+    let Some(frame) = pane_snapshot_payload(snapshot, sanitizer) else {
+        return OutboundQueueResult::Closed;
+    };
+    socket.queue_snapshot(frame)
 }
 
 pub(crate) fn queue_session_view(
@@ -86,7 +89,7 @@ pub(crate) fn queue_session_keyframe(
     snapshot: &WebSessionSnapshot,
     sanitizer: &mut WebTerminalSanitizer,
 ) -> OutboundQueueResult {
-    let Ok(frames) = session_keyframe_payloads(resize, snapshot, sanitizer) else {
+    let Some(frames) = session_keyframe_payloads(resize, snapshot, sanitizer) else {
         return OutboundQueueResult::Closed;
     };
     socket.queue_keyframe(frames)
@@ -97,7 +100,10 @@ pub(crate) fn queue_session_pane_frame(
     frame: &WebSessionPaneFrame,
     sanitizer: &mut WebTerminalSanitizer,
 ) -> OutboundQueueResult {
-    socket.queue_frame(session_pane_frame_payload(frame, sanitizer))
+    let Some(frame) = session_pane_frame_payload(frame, sanitizer) else {
+        return OutboundQueueResult::Closed;
+    };
+    socket.queue_frame(frame)
 }
 
 pub(crate) async fn send_ready(
@@ -187,27 +193,27 @@ fn resize_payload(size: TerminalSize) -> Vec<u8> {
 fn pane_snapshot_payload(
     snapshot: &WebPaneSnapshot,
     sanitizer: &mut WebTerminalSanitizer,
-) -> Vec<u8> {
+) -> Option<Vec<u8>> {
     let mut frame = Vec::with_capacity(1);
     frame.push(WS_SNAPSHOT_FULL);
     let mut raw = Vec::new();
     snapshot.append_ansi_bytes(&mut raw);
     sanitizer.reset();
     sanitizer.push(&raw, &mut frame);
-    frame
+    (frame.len() <= WEB_OUTBOUND_BYTES_MAX).then_some(frame)
 }
 
 fn session_snapshot_payload(
     snapshot: &WebSessionSnapshot,
     sanitizer: &mut WebTerminalSanitizer,
-) -> Vec<u8> {
+) -> Option<Vec<u8>> {
     let mut frame = Vec::with_capacity(1);
     frame.push(WS_SNAPSHOT_FULL);
     let mut raw = Vec::new();
     snapshot.append_ansi_bytes(&mut raw);
     sanitizer.reset();
     sanitizer.push(&raw, &mut frame);
-    frame
+    (frame.len() <= WEB_OUTBOUND_BYTES_MAX).then_some(frame)
 }
 
 fn session_view_payload(snapshot: &WebSessionSnapshot) -> serde_json::Result<Vec<u8>> {
@@ -220,7 +226,7 @@ fn session_view_payload(snapshot: &WebSessionSnapshot) -> serde_json::Result<Vec
 fn session_pane_frame_payload(
     frame: &WebSessionPaneFrame,
     sanitizer: &mut WebTerminalSanitizer,
-) -> Vec<u8> {
+) -> Option<Vec<u8>> {
     let mut body = Vec::with_capacity(25 + frame.frame.len());
     body.push(WS_SESSION_PANE_FRAME);
     body.extend_from_slice(&frame.pane.id.to_be_bytes());
@@ -234,21 +240,26 @@ fn session_pane_frame_payload(
     body.extend_from_slice(&saturating_u32(frame.pane.history_size).to_be_bytes());
     sanitizer.reset();
     sanitizer.push(&frame.frame, &mut body);
-    body
+    (body.len() <= WEB_OUTBOUND_BYTES_MAX).then_some(body)
 }
 
 fn session_keyframe_payloads(
     resize: Option<TerminalSize>,
     snapshot: &WebSessionSnapshot,
     sanitizer: &mut WebTerminalSanitizer,
-) -> serde_json::Result<Vec<Vec<u8>>> {
+) -> Option<Vec<Vec<u8>>> {
     let mut frames = Vec::with_capacity(if resize.is_some() { 3 } else { 2 });
     if let Some(size) = resize {
         frames.push(resize_payload(size));
     }
-    frames.push(session_snapshot_payload(snapshot, sanitizer));
-    frames.push(session_view_payload(snapshot)?);
-    Ok(frames)
+    frames.push(session_snapshot_payload(snapshot, sanitizer)?);
+    frames.push(session_view_payload(snapshot).ok()?);
+    let total = frames
+        .iter()
+        .try_fold(0_usize, |total, frame| total.checked_add(frame.len()));
+    total
+        .filter(|total| *total <= WEB_OUTBOUND_BYTES_MAX)
+        .map(|_| frames)
 }
 
 fn saturating_u32(value: usize) -> u32 {
@@ -269,8 +280,8 @@ mod tests {
     use super::{
         pane_snapshot_payload, session_keyframe_payloads, session_pane_frame_payload, PaneSize,
         ServerMessage, WebSessionPaneFrame, WebSessionSnapshot, SERVER_CAPABILITIES,
-        WEB_SHARE_PROTOCOL_VERSION, WS_RESIZE_NOTIFY, WS_SESSION_PANE_FRAME, WS_SESSION_VIEW,
-        WS_SNAPSHOT_FULL,
+        WEB_OUTBOUND_BYTES_MAX, WEB_SHARE_PROTOCOL_VERSION, WS_RESIZE_NOTIFY,
+        WS_SESSION_PANE_FRAME, WS_SESSION_VIEW, WS_SNAPSHOT_FULL,
     };
     use crate::handler::{TestWebSessionView, WebPaneSnapshot, WebSessionPaneView};
     use crate::web::protocol::PANE_FRAME_CAPABILITY;
@@ -368,7 +379,8 @@ mod tests {
     fn session_keyframe_keeps_resize_snapshot_and_view_atomic_order() {
         let size = TerminalSize { cols: 80, rows: 24 };
         let snapshot =
-            WebSessionSnapshot::new(size, b"paint".to_vec(), TestWebSessionView::new(size), 0, 0);
+            WebSessionSnapshot::new(size, b"paint".to_vec(), TestWebSessionView::new(size), 0, 0)
+                .expect("snapshot fits");
         let mut sanitizer = WebTerminalSanitizer::default();
 
         let frames = session_keyframe_payloads(Some(size), &snapshot, &mut sanitizer)
@@ -401,10 +413,11 @@ mod tests {
                 mouse_on: false,
             },
             b"\x1b[3;42Hrow".to_vec(),
-        );
+        )
+        .expect("pane frame fits");
 
         let mut sanitizer = WebTerminalSanitizer::default();
-        let payload = session_pane_frame_payload(&frame, &mut sanitizer);
+        let payload = session_pane_frame_payload(&frame, &mut sanitizer).expect("pane frame fits");
 
         assert_eq!(payload[0], WS_SESSION_PANE_FRAME);
         assert_eq!(u32::from_be_bytes(payload[1..5].try_into().unwrap()), 7);
@@ -432,7 +445,8 @@ mod tests {
             TestWebSessionView::new(size),
             0,
             0,
-        );
+        )
+        .expect("snapshot fits");
         let mut sanitizer = WebTerminalSanitizer::default();
         let frames =
             session_keyframe_payloads(None, &snapshot, &mut sanitizer).expect("view serializes");
@@ -459,8 +473,10 @@ mod tests {
                 mouse_on: false,
             },
             unsafe_link.to_vec(),
-        );
-        let payload = session_pane_frame_payload(&pane_frame, &mut sanitizer);
+        )
+        .expect("pane frame fits");
+        let payload =
+            session_pane_frame_payload(&pane_frame, &mut sanitizer).expect("pane frame fits");
         assert_eq!(&payload[25..], b"beforelink\x1b]8;;\x1b\\after");
     }
 
@@ -482,7 +498,7 @@ mod tests {
             recovery_keyframe: Some(b"safe\x1b]52;c;partial".to_vec()),
         };
         let mut sanitizer = WebTerminalSanitizer::default();
-        let payload = pane_snapshot_payload(&snapshot, &mut sanitizer);
+        let payload = pane_snapshot_payload(&snapshot, &mut sanitizer).expect("snapshot fits");
         assert_eq!(&payload[1..], b"safe");
 
         let mut live = Vec::new();
@@ -491,5 +507,55 @@ mod tests {
             live, b"after",
             "an OSC 52 fragmented across snapshot/live boundaries must stay removed"
         );
+    }
+
+    #[test]
+    fn web_payload_builders_reject_oversized_single_frames() {
+        let pane_snapshot = WebPaneSnapshot {
+            cols: 8,
+            rows: 2,
+            output_sequence: 0,
+            ansi_lines: Vec::new(),
+            cursor_row: 0,
+            cursor_col: 0,
+            cursor_visible: true,
+            mode_bits: 0,
+            cursor_style: 0,
+            alternate: false,
+            scroll_top: 0,
+            scroll_bottom: 1,
+            recovery_keyframe: Some(vec![b'x'; WEB_OUTBOUND_BYTES_MAX]),
+        };
+        let mut sanitizer = WebTerminalSanitizer::default();
+        assert!(pane_snapshot_payload(&pane_snapshot, &mut sanitizer).is_none());
+
+        let size = TerminalSize { cols: 80, rows: 24 };
+        let pane = WebSessionPaneView {
+            id: 7,
+            x: 0,
+            y: 0,
+            cols: 1,
+            rows: 1,
+            active: true,
+            history_size: 0,
+            scroll_offset: 0,
+            alternate_on: false,
+            mouse_on: false,
+        };
+        let view = TestWebSessionView {
+            size,
+            panes: vec![pane; 8_000],
+            windows: Vec::new(),
+            metadata_complete: false,
+        };
+        let snapshot = WebSessionSnapshot::new(
+            size,
+            vec![b'x'; crate::web::WEB_RECOVERY_CONTENT_BYTES_MAX],
+            view,
+            0,
+            0,
+        )
+        .expect("session content alone fits its stricter cap");
+        assert!(session_keyframe_payloads(None, &snapshot, &mut sanitizer).is_none());
     }
 }

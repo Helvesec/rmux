@@ -5,7 +5,69 @@ use crate::transcript::{resolve_screen_capture_range, ScreenCaptureRange};
 
 use super::Screen;
 
+/// Bounded row renderer used to construct transport-safe recovery frames.
+///
+/// The renderer owns a size-limited hyperlink table, so rendering one row
+/// cannot clone an unbounded OSC 8 URI from terminal-controlled state.
+pub struct RecoveryRowRenderer<'a> {
+    screen: &'a Screen,
+    hyperlinks: Hyperlinks,
+    metadata_complete: bool,
+}
+
+impl RecoveryRowRenderer<'_> {
+    /// Returns whether every retained hyperlink fitted the metadata budget.
+    #[must_use]
+    pub const fn metadata_complete(&self) -> bool {
+        self.metadata_complete
+    }
+
+    /// Renders one row of the active grid from a fresh ANSI state.
+    #[must_use]
+    pub fn active_row(
+        &self,
+        absolute_y: usize,
+        options: GridRenderOptions,
+    ) -> Option<(Vec<u8>, bool)> {
+        render_grid_row_independent(&self.screen.grid, &self.hyperlinks, absolute_y, options)
+    }
+
+    /// Returns the active grid's soft-wrap flag without rendering the row.
+    #[must_use]
+    pub fn active_row_wrapped(&self, absolute_y: usize) -> Option<bool> {
+        self.screen.grid.absolute_line_wrapped(absolute_y)
+    }
+
+    /// Renders one row of the saved pre-alternate viewport.
+    #[must_use]
+    pub fn saved_row(
+        &self,
+        absolute_y: usize,
+        options: GridRenderOptions,
+    ) -> Option<(Vec<u8>, bool)> {
+        let saved = self.screen.saved_grid.as_ref()?;
+        render_grid_row_independent(&saved.grid, &self.hyperlinks, absolute_y, options)
+    }
+}
+
 impl Screen {
+    /// Creates a recovery renderer with bounded terminal-controlled metadata.
+    #[must_use]
+    pub fn recovery_row_renderer(
+        &self,
+        max_hyperlink_entry_bytes: usize,
+        max_hyperlink_total_bytes: usize,
+    ) -> RecoveryRowRenderer<'_> {
+        let (hyperlinks, metadata_complete) = self
+            .hyperlinks
+            .clone_bounded(max_hyperlink_entry_bytes, max_hyperlink_total_bytes);
+        RecoveryRowRenderer {
+            screen: self,
+            hyperlinks,
+            metadata_complete,
+        }
+    }
+
     #[cfg_attr(not(test), allow(dead_code))]
     #[must_use]
     pub(crate) fn capture_grid(&self, join_wrapped: bool) -> GridCapture {
@@ -176,6 +238,20 @@ impl Screen {
             .as_ref()
             .map(|saved| capture_grid_line_format_flags(&saved.grid, range))
     }
+}
+
+fn render_grid_row_independent(
+    grid: &Grid,
+    hyperlinks: &Hyperlinks,
+    absolute_y: usize,
+    options: GridRenderOptions,
+) -> Option<(Vec<u8>, bool)> {
+    let mut state = GridStringState::default();
+    let line = grid.render_absolute_line(absolute_y, options, &mut state, Some(hyperlinks))?;
+    Some((
+        line.into_bytes(),
+        grid.absolute_line_wrapped(absolute_y).unwrap_or(false),
+    ))
 }
 
 fn capture_grid_rows_independent(

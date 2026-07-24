@@ -80,7 +80,7 @@ pub use options::{
     OptionStore, ShowOptionsMode,
 };
 pub use pane::{Pane, PaneGeometry};
-pub use screen::{Screen, ScreenCellRef, ScreenCellView, ScreenLineView};
+pub use screen::{RecoveryRowRenderer, Screen, ScreenCellRef, ScreenCellView, ScreenLineView};
 pub use session::{
     BreakPaneOptions, KillPaneOutcome, PaneJoinOptions, PaneSwapOptions, Session,
     SessionPaneTarget, SessionStore,

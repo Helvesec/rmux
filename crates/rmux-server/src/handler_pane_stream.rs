@@ -637,7 +637,7 @@ impl RequestHandler {
         mut source: PaneStreamSource,
     ) -> Result<(PaneStreamSource, CapturedPaneBoundary), RmuxError> {
         for _ in 0..MAX_SOURCE_CAPTURE_ATTEMPTS {
-            let captured = capture_source(&source);
+            let captured = capture_source(&source)?;
             if captured.boundary.generation == source.generation {
                 return Ok((source, captured));
             }

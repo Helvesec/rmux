@@ -381,16 +381,24 @@ impl PaneTranscript {
         self.terminal.pending_bytes()
     }
 
-    pub(crate) fn clone_recovery_screen(&self) -> Screen {
-        self.terminal.clone_recovery_screen()
+    pub(crate) fn pending_bytes_ref(&self) -> &[u8] {
+        self.terminal.pending_bytes_ref()
     }
 
-    pub(crate) fn active_cell_state_ansi(&self) -> Vec<u8> {
-        self.terminal.active_cell_state_ansi()
+    pub(crate) fn active_cell_state_ansi_bounded(
+        &self,
+        max_hyperlink_bytes: usize,
+    ) -> (Vec<u8>, bool) {
+        self.terminal
+            .active_cell_state_ansi_bounded(max_hyperlink_bytes)
     }
 
-    pub(crate) fn saved_cell_state_ansi(&self) -> Vec<u8> {
-        self.terminal.saved_cell_state_ansi()
+    pub(crate) fn saved_cell_state_ansi_bounded(
+        &self,
+        max_hyperlink_bytes: usize,
+    ) -> (Vec<u8>, bool) {
+        self.terminal
+            .saved_cell_state_ansi_bounded(max_hyperlink_bytes)
     }
 
     pub(crate) fn saved_cursor_state(&self) -> (u32, u32, bool) {
@@ -502,6 +510,27 @@ impl PaneTranscript {
         })
     }
 
+    #[cfg(feature = "web")]
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn copy_mode_render_snapshot_bounded(
+        &self,
+        max_string_bytes: usize,
+        max_title_stack_bytes: usize,
+        max_hyperlink_entry_bytes: usize,
+        max_hyperlink_total_bytes: usize,
+    ) -> Option<(CopyModeRenderSnapshot, bool)> {
+        self.copy_mode_state().map(|mode| {
+            let (mut snapshot, metadata_complete) = mode.render_snapshot_bounded(
+                max_string_bytes,
+                max_title_stack_bytes,
+                max_hyperlink_entry_bytes,
+                max_hyperlink_total_bytes,
+            );
+            snapshot.alternate_on = self.terminal.screen().is_alternate();
+            (snapshot, metadata_complete)
+        })
+    }
+
     pub(crate) fn clear_copy_mode(&mut self) -> bool {
         match self.mode {
             Some(PaneModeState::Copy(_)) => {
@@ -601,14 +630,6 @@ impl PaneTranscript {
         self.terminal.screen().mode()
     }
 
-    pub(crate) fn cursor_style(&self) -> u32 {
-        self.terminal.screen().cursor_style()
-    }
-
-    pub(crate) fn cursor_position(&self) -> (u32, u32) {
-        self.terminal.screen().cursor_position()
-    }
-
     pub(crate) fn is_alternate(&self) -> bool {
         self.terminal.screen().is_alternate()
     }
@@ -622,10 +643,6 @@ impl PaneTranscript {
         let new_title = title.into();
         self.terminal.screen_mut().set_title(new_title.clone());
         (old_title != new_title).then_some((old_title, new_title))
-    }
-
-    pub(crate) fn path(&self) -> &str {
-        self.terminal.screen().path()
     }
 
     fn absolute_line_matches(&self, absolute_y: usize, submitted_text: &str) -> bool {

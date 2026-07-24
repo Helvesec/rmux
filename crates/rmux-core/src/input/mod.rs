@@ -251,13 +251,19 @@ impl InputParser {
     /// Returns any bytes still buffered in an incomplete parser state.
     #[must_use]
     pub fn pending_bytes(&self) -> Vec<u8> {
+        self.pending_bytes_ref().to_vec()
+    }
+
+    /// Borrows bytes still buffered in an incomplete parser state.
+    #[must_use]
+    pub(crate) fn pending_bytes_ref(&self) -> &[u8] {
         if self.state != InputState::Ground {
-            return self.since_ground.clone();
+            return &self.since_ground;
         }
         if self.utf8_started {
-            return self.utf8_buf[..usize::from(self.utf8_len)].to_vec();
+            return &self.utf8_buf[..usize::from(self.utf8_len)];
         }
-        Vec::new()
+        &[]
     }
 
     /// Returns true if the ground timer should be running.

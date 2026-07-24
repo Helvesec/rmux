@@ -99,6 +99,68 @@ impl Hyperlinks {
         self.by_uri.clear();
     }
 
+    /// Copies only metadata that fits the supplied recovery budgets.
+    ///
+    /// Grid cells keep their original inner IDs, so retained entries must keep
+    /// those IDs as well. Entries that do not fit are omitted; renderers then
+    /// treat the corresponding cell as unlinked instead of cloning or
+    /// serializing an attacker-sized URI.
+    pub(crate) fn clone_bounded(
+        &self,
+        max_entry_bytes: usize,
+        max_total_bytes: usize,
+    ) -> (Self, bool) {
+        let mut bounded = Self {
+            next_inner: self.next_inner,
+            next_external: self.next_external,
+            order: VecDeque::new(),
+            by_inner: BTreeMap::new(),
+            by_uri: BTreeMap::new(),
+        };
+        let mut retained_bytes = 0_usize;
+        let mut complete = true;
+
+        for inner_id in &self.order {
+            let Some(entry) = self.by_inner.get(inner_id) else {
+                continue;
+            };
+            let entry_bytes = entry
+                .internal_id
+                .len()
+                .saturating_add(entry.external_id.len())
+                .saturating_add(entry.uri.len());
+            let next_total = retained_bytes.saturating_add(entry_bytes);
+            if entry_bytes > max_entry_bytes || next_total > max_total_bytes {
+                complete = false;
+                continue;
+            }
+
+            let entry = entry.clone();
+            if !entry.internal_id.is_empty() {
+                bounded.by_uri.insert(
+                    (entry.internal_id.clone(), entry.uri.clone()),
+                    entry.inner_id,
+                );
+            }
+            bounded.order.push_back(entry.inner_id);
+            bounded.by_inner.insert(entry.inner_id, entry);
+            retained_bytes = next_total;
+        }
+
+        (bounded, complete)
+    }
+
+    pub(crate) fn entry_fits(&self, inner_id: u32, max_bytes: usize) -> bool {
+        self.get(inner_id).is_none_or(|entry| {
+            entry
+                .internal_id
+                .len()
+                .saturating_add(entry.external_id.len())
+                .saturating_add(entry.uri.len())
+                <= max_bytes
+        })
+    }
+
     fn enforce_limit(&mut self) {
         while self.order.len() > MAX_HYPERLINKS {
             let Some(oldest_inner) = self.order.pop_front() else {

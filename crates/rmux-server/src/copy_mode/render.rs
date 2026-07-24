@@ -25,6 +25,40 @@ impl CopyModeState {
         }
     }
 
+    #[cfg(feature = "web")]
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn render_snapshot_bounded(
+        &self,
+        max_string_bytes: usize,
+        max_title_stack_bytes: usize,
+        max_hyperlink_entry_bytes: usize,
+        max_hyperlink_total_bytes: usize,
+    ) -> (CopyModeRenderSnapshot, bool) {
+        let (mut screen, metadata_complete) = self.backing.clone_recovery_viewport_at_bounded(
+            self.top_line,
+            self.cursor.x,
+            self.cursor.y,
+            max_string_bytes,
+            max_title_stack_bytes,
+            max_hyperlink_entry_bytes,
+            max_hyperlink_total_bytes,
+        );
+        if let Some(selection) = self.selection_snapshot() {
+            self.mark_selection_in_viewport(&mut screen, selection);
+        }
+        (
+            CopyModeRenderSnapshot {
+                screen,
+                overlays: self.render_overlays(),
+                history_size: self.backing.history_size(),
+                scroll_position: self.bottom_top_line().saturating_sub(self.top_line),
+                alternate_on: self.backing.is_alternate(),
+                line_numbers_enabled: self.line_numbers_enabled,
+            },
+            metadata_complete,
+        )
+    }
+
     fn render_overlays(&self) -> CopyModeRenderOverlays {
         let mark = (self.show_mark && self.cols() > 0)
             .then_some(self.mark)

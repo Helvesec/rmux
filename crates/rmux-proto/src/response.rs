@@ -42,14 +42,15 @@ pub use pane::{
     PaneBroadcastInputSuccess, PaneForegroundStateResponse, PaneOptionEntry, PaneOptionGetResponse,
     PaneOptionSetResponse, PaneOutputCursor, PaneOutputCursorResponse, PaneOutputEvent,
     PaneOutputLagNotice, PaneOutputLagResponse, PaneRawBytes, PaneRawRebase, PaneRawRebaseReason,
-    PaneRecentOutput, PaneSnapshotCell, PaneSnapshotCursor, PaneSnapshotResponse,
-    PaneStateClosedReason, PaneStateCursorResponse, PaneStateEventDto, PaneStateLagResponse,
-    PaneStateSnapshot, PaneStreamCursorResponse, PaneStreamEndReason, PaneStreamEvent,
-    PaneStreamLifecycleEvent, PaneSurfaceFrame, PaneSurfaceSnapshot, PipePaneResponse,
-    ResizePaneResponse, RespawnPaneResponse, SelectPaneResponse, SendKeysResponse,
-    SplitWindowIdentityResponse, SplitWindowResponse, SubscribePaneOutputResponse,
-    SubscribePaneStateResponse, SubscribePaneStreamResponse, SwapPaneResponse,
-    UnsubscribePaneOutputResponse, UnsubscribePaneStateResponse, UnsubscribePaneStreamResponse,
+    PaneRecentOutput, PaneRecoveryCoverage, PaneSnapshotCell, PaneSnapshotCursor,
+    PaneSnapshotResponse, PaneStateClosedReason, PaneStateCursorResponse, PaneStateEventDto,
+    PaneStateLagResponse, PaneStateSnapshot, PaneStreamCursorResponse, PaneStreamEndReason,
+    PaneStreamEvent, PaneStreamLifecycleEvent, PaneSurfaceFrame, PaneSurfaceSnapshot,
+    PipePaneResponse, ResizePaneResponse, RespawnPaneResponse, SelectPaneResponse,
+    SendKeysResponse, SplitWindowIdentityResponse, SplitWindowResponse,
+    SubscribePaneOutputResponse, SubscribePaneStateResponse, SubscribePaneStreamResponse,
+    SwapPaneResponse, UnsubscribePaneOutputResponse, UnsubscribePaneStateResponse,
+    UnsubscribePaneStreamResponse,
 };
 
 #[path = "response/client.rs"]

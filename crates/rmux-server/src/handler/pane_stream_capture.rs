@@ -3,8 +3,8 @@ use std::sync::Arc;
 use rmux_core::input::mode;
 use rmux_core::PaneId;
 use rmux_proto::{
-    PaneRawRebase, PaneRawRebaseReason, PaneSnapshotCursor, PaneSnapshotResponse, PaneSurfaceFrame,
-    PaneSurfaceSnapshot, RmuxError,
+    PaneRawRebase, PaneRawRebaseReason, PaneRecoveryCoverage, PaneSnapshotCursor,
+    PaneSnapshotResponse, PaneSurfaceFrame, PaneSurfaceSnapshot, RmuxError,
 };
 
 use crate::pane_io::{PaneBoundary, PaneInvalidationReason, PaneOutputReceiver};
@@ -15,6 +15,7 @@ use super::super::pane_support::{
 };
 use super::super::RequestHandler;
 use super::types::{PaneStreamSource, PaneSurfaceFingerprint};
+use crate::pane_recovery::MAX_RECOVERY_TYPED_SNAPSHOT_CELLS;
 
 pub(in crate::handler) struct CapturedPaneBoundary {
     pub(in crate::handler) boundary: PaneBoundary,
@@ -29,7 +30,9 @@ pub(in crate::handler) struct CapturedSurfaceBoundary {
     pub(in crate::handler) receiver: PaneOutputReceiver,
 }
 
-pub(in crate::handler) fn capture_source(source: &PaneStreamSource) -> CapturedPaneBoundary {
+pub(in crate::handler) fn capture_source(
+    source: &PaneStreamSource,
+) -> Result<CapturedPaneBoundary, RmuxError> {
     let (boundary, seed, receiver) = source.output.capture_with_observer(|| {
         let transcript = source
             .transcript
@@ -37,18 +40,18 @@ pub(in crate::handler) fn capture_source(source: &PaneStreamSource) -> CapturedP
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         PaneRecoverySeed::capture(&transcript)
     });
-    CapturedPaneBoundary {
+    Ok(CapturedPaneBoundary {
         boundary,
-        seed,
+        seed: seed?,
         receiver,
-    }
+    })
 }
 
 pub(in crate::handler) fn capture_surface_source(
     source: &PaneStreamSource,
     previous: &PaneSurfaceFingerprint,
     force: bool,
-) -> CapturedSurfaceBoundary {
+) -> Result<CapturedSurfaceBoundary, RmuxError> {
     let (boundary, captured, receiver) = source.output.capture_with_observer(|| {
         let transcript = source
             .transcript
@@ -59,12 +62,12 @@ pub(in crate::handler) fn capture_surface_source(
             (force || &fingerprint != previous).then(|| PaneRecoverySeed::capture(&transcript));
         (fingerprint, seed)
     });
-    CapturedSurfaceBoundary {
+    Ok(CapturedSurfaceBoundary {
         boundary,
         fingerprint: captured.0,
-        seed: captured.1,
+        seed: captured.1.transpose()?,
         receiver,
-    }
+    })
 }
 
 pub(in crate::handler) fn materialize_raw_rebase(
@@ -88,6 +91,11 @@ pub(in crate::handler) fn materialize_raw_rebase(
         rows: keyframe.rows,
         keyframe: keyframe.bytes,
         alternate: keyframe.alternate,
+        coverage: PaneRecoveryCoverage {
+            history_rows_total: keyframe.history_rows_total,
+            history_rows_included: keyframe.history_rows_included,
+            metadata_complete: keyframe.metadata_complete,
+        },
         snapshot,
         reason,
     })
@@ -103,8 +111,9 @@ pub(in crate::handler) fn materialize_surface_frame(
 ) -> Result<Arc<PaneSurfaceFrame>, RmuxError> {
     let screen = seed.screen();
     let size = screen.size();
-    let history_size = screen.history_size();
-    let history_bytes = screen.history_bytes();
+    validate_recovery_snapshot_geometry(size.cols, size.rows)?;
+    let history_size = seed.history_size();
+    let history_bytes = seed.history_bytes();
     let cells = collect_cells(screen, size.cols, size.rows, history_size)?;
     let (cursor_x, cursor_y) = screen.cursor_position();
     let (scroll_top, scroll_bottom) = screen.scroll_region();
@@ -136,8 +145,9 @@ pub(in crate::handler) fn materialize_surface_frame(
             cursor,
             title: screen.title().to_owned(),
             path: screen.path().to_owned(),
+            metadata_complete: seed.metadata_complete(),
             mode_bits: screen.mode(),
-            alternate: screen.is_alternate(),
+            alternate: seed.alternate(),
             scroll_top,
             scroll_bottom,
             history_size: saturating_u64(history_size),
@@ -154,8 +164,9 @@ fn materialize_typed_snapshot(
 ) -> Result<PaneSnapshotResponse, RmuxError> {
     let screen = seed.screen();
     let size = screen.size();
-    let history_size = screen.history_size();
-    let history_bytes = screen.history_bytes();
+    validate_recovery_snapshot_geometry(size.cols, size.rows)?;
+    let history_size = seed.history_size();
+    let history_bytes = seed.history_bytes();
     let cells = collect_cells(screen, size.cols, size.rows, history_size)?;
     let (cursor_x, cursor_y) = screen.cursor_position();
     let cursor = PaneSnapshotCursor {
@@ -198,4 +209,16 @@ pub(in crate::handler) const fn raw_reason(reason: PaneInvalidationReason) -> Pa
 
 fn saturating_u64(value: usize) -> u64 {
     u64::try_from(value).unwrap_or(u64::MAX)
+}
+
+fn validate_recovery_snapshot_geometry(cols: u16, rows: u16) -> Result<(), RmuxError> {
+    let cells = usize::from(cols)
+        .checked_mul(usize::from(rows))
+        .ok_or_else(|| RmuxError::Server("recovery snapshot dimensions overflow".to_owned()))?;
+    if cells > MAX_RECOVERY_TYPED_SNAPSHOT_CELLS {
+        return Err(RmuxError::Server(format!(
+            "recovery snapshot grid has {cells} cells, exceeding the {MAX_RECOVERY_TYPED_SNAPSHOT_CELLS}-cell transport cap"
+        )));
+    }
+    Ok(())
 }

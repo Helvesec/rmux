@@ -2229,6 +2229,7 @@ fn surface_frame_at(
             cursor: snapshot.cursor,
             title: String::new(),
             path: String::new(),
+            metadata_complete: true,
             mode_bits: 0,
             alternate: false,
             scroll_top: 0,

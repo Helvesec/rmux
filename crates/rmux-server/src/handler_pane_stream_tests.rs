@@ -3,9 +3,9 @@ use std::time::Duration;
 
 use rmux_core::events::SubscriptionLimits;
 use rmux_proto::{
-    NewSessionRequest, PaneRawRebase, PaneRawRebaseReason, PaneStreamCursorRequest,
-    PaneStreamEndReason, PaneStreamEvent, PaneStreamLifecycleEvent, PaneStreamMode,
-    PaneSurfaceFrame, PaneTarget, PaneTargetRef, Request, Response, SessionName,
+    NewSessionRequest, PaneRawRebase, PaneRawRebaseReason, PaneRecoveryCoverage,
+    PaneStreamCursorRequest, PaneStreamEndReason, PaneStreamEvent, PaneStreamLifecycleEvent,
+    PaneStreamMode, PaneSurfaceFrame, PaneTarget, PaneTargetRef, Request, Response, SessionName,
     SubscribePaneStreamRequest, SubscribePaneStreamResponse, TerminalSize,
     UnsubscribePaneStreamRequest, DEFAULT_MAX_DETACHED_FRAME_LENGTH,
 };
@@ -877,6 +877,11 @@ fn raw_rebases_reserve_enough_space_for_the_detached_response_envelope() {
         rows: 24,
         keyframe: vec![0; rmux_proto::DEFAULT_MAX_DETACHED_FRAME_LENGTH],
         alternate: false,
+        coverage: PaneRecoveryCoverage {
+            history_rows_total: 0,
+            history_rows_included: 0,
+            metadata_complete: true,
+        },
         snapshot: None,
         reason: PaneRawRebaseReason::Initial,
     };

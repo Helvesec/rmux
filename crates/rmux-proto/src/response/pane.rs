@@ -503,6 +503,28 @@ pub enum PaneRawRebaseReason {
     GenerationChanged,
 }
 
+/// Completeness report for a bounded raw recovery keyframe.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PaneRecoveryCoverage {
+    /// Total scrollback rows retained by the daemon at the capture boundary.
+    pub history_rows_total: u64,
+    /// Newest whole scrollback rows represented by the keyframe.
+    pub history_rows_included: u64,
+    /// Whether every bounded terminal metadata value was represented.
+    ///
+    /// `false` means oversized title, path, title-stack, or hyperlink metadata
+    /// was omitted or shortened. The visible cell grid remains authoritative.
+    pub metadata_complete: bool,
+}
+
+impl PaneRecoveryCoverage {
+    /// Returns whether every retained scrollback row is represented.
+    #[must_use]
+    pub const fn history_complete(self) -> bool {
+        self.history_rows_included >= self.history_rows_total
+    }
+}
+
 /// Complete raw-emulator recovery state delivered in-band.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PaneRawRebase {
@@ -522,6 +544,8 @@ pub struct PaneRawRebase {
     pub keyframe: Vec<u8>,
     /// Whether the captured pane is currently using its alternate screen.
     pub alternate: bool,
+    /// Explicit report for bounded scrollback and terminal metadata.
+    pub coverage: PaneRecoveryCoverage,
     /// Optional typed snapshot requested by an inspection-oriented consumer.
     pub snapshot: Option<PaneSnapshotResponse>,
     /// Cause of this rebase.
@@ -554,6 +578,9 @@ pub struct PaneSurfaceSnapshot {
     pub title: String,
     /// Terminal-reported working-directory path.
     pub path: String,
+    /// Whether terminal-controlled title/path/hyperlink metadata was copied
+    /// completely into this transport-bounded snapshot.
+    pub metadata_complete: bool,
     /// Raw terminal mode bitset.
     pub mode_bits: u32,
     /// Whether the alternate screen is active.

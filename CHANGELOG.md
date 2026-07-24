@@ -7,6 +7,9 @@
 - Add capability-gated `Pane::recover_output()` and `Pane::surface_stream()`.
   Raw recovery emits authoritative in-band rebases after lag, resize, parser
   expiry, history clearing, terminal reset, and process-generation changes.
+  Each rebase always retains the validated viewport, includes the newest whole
+  scrollback rows that fit its transport budget, and reports scrollback and
+  metadata completeness explicitly.
   Surface updates are self-contained and share one lazy daemon-side projection
   per pane.
 - Move `render_stream()` onto the shared surface projection while retaining

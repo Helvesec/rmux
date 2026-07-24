@@ -251,7 +251,7 @@ impl RequestHandler {
             }
         }
 
-        let captured = capture_source(source);
+        let captured = capture_source(source)?;
         let rebase = materialize_raw_rebase(
             self,
             source.key.pane_id(),

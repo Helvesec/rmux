@@ -1,14 +1,18 @@
 use rmux_core::input::mode;
-use rmux_core::{
-    render_dec_modes_for_snapshot, GridRenderOptions, PaneGeometry, PaneId, Screen,
-    ScreenCaptureRange,
-};
-use rmux_proto::TerminalSize;
+use rmux_core::{render_dec_modes_for_snapshot, PaneGeometry, PaneId};
+#[cfg(test)]
+use rmux_core::{GridRenderOptions, Screen, ScreenCaptureRange};
+use rmux_proto::{RmuxError, TerminalSize};
 
 const SNAPSHOT_RESET_PREFIX: &[u8] =
     b"\x1b[?2026l\x1b[?1049l\x1b[?6l\x1b[r\x1b[0m\x1b[?25l\x1b[3J\x1b[2J\x1b[H";
 const SNAPSHOT_ALT_SCREEN_PREFIX: &[u8] =
     b"\x1b[?1049h\x1b[?6l\x1b[r\x1b[0m\x1b[?25l\x1b[3J\x1b[2J\x1b[H";
+pub(crate) const WEB_SESSION_FRAME_BYTES_MAX: usize = 3 * 512 * 1024;
+use crate::web::WEB_RECOVERY_CONTENT_BYTES_MAX;
+const WEB_SESSION_VIEW_ENTRY_MAX: usize = 1024;
+const WEB_SESSION_WINDOW_NAME_MAX: usize = 4 * 1024;
+const WEB_SESSION_WINDOW_NAMES_TOTAL_MAX: usize = 128 * 1024;
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
 pub(crate) struct WebPaneSnapshot {
@@ -57,6 +61,7 @@ pub(crate) struct WebSessionView {
     pub(crate) size: TerminalSize,
     pub(crate) panes: Vec<WebSessionPaneView>,
     pub(crate) windows: Vec<WebSessionWindowView>,
+    pub(crate) metadata_complete: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
@@ -148,14 +153,27 @@ impl WebSessionSnapshot {
         view: WebSessionView,
         active_mode_bits: u32,
         active_cursor_style: u32,
-    ) -> Self {
-        Self {
+    ) -> Result<Self, RmuxError> {
+        let mut mode_state = Vec::new();
+        render_dec_modes_for_snapshot(active_mode_bits, active_cursor_style, &mut mode_state);
+        let encoded_len = SNAPSHOT_RESET_PREFIX
+            .len()
+            .saturating_add(mode_state.len())
+            .saturating_add(frame.len());
+        if frame.len() > WEB_RECOVERY_CONTENT_BYTES_MAX || encoded_len > WEB_SESSION_FRAME_BYTES_MAX
+        {
+            return Err(RmuxError::FrameTooLarge {
+                length: encoded_len,
+                maximum: WEB_SESSION_FRAME_BYTES_MAX,
+            });
+        }
+        Ok(Self {
             size,
             view,
             frame,
             active_mode_bits,
             active_cursor_style,
-        }
+        })
     }
 
     #[cfg(test)]
@@ -176,8 +194,18 @@ impl WebSessionSnapshot {
 }
 
 impl WebSessionPaneFrame {
-    pub(crate) fn new(size: TerminalSize, pane: WebSessionPaneView, frame: Vec<u8>) -> Self {
-        Self { size, pane, frame }
+    pub(crate) fn new(
+        size: TerminalSize,
+        pane: WebSessionPaneView,
+        frame: Vec<u8>,
+    ) -> Result<Self, RmuxError> {
+        if frame.len() > WEB_RECOVERY_CONTENT_BYTES_MAX {
+            return Err(RmuxError::FrameTooLarge {
+                length: frame.len(),
+                maximum: WEB_RECOVERY_CONTENT_BYTES_MAX,
+            });
+        }
+        Ok(Self { size, pane, frame })
     }
 }
 
@@ -187,19 +215,42 @@ impl WebSessionView {
             size,
             panes: Vec::new(),
             windows: Vec::new(),
+            metadata_complete: true,
         }
     }
 
     pub(crate) fn add_window(&mut self, index: u32, name: Option<&str>, active: bool) {
+        if self.windows.len() >= WEB_SESSION_VIEW_ENTRY_MAX {
+            self.metadata_complete = false;
+            return;
+        }
+        let name = name.unwrap_or_default();
+        let retained_name_bytes = self.windows.iter().fold(0_usize, |total, window| {
+            total.saturating_add(window.name.len())
+        });
+        let remaining = WEB_SESSION_WINDOW_NAMES_TOTAL_MAX.saturating_sub(retained_name_bytes);
+        let retained_len = utf8_prefix_len(name, remaining.min(WEB_SESSION_WINDOW_NAME_MAX));
+        if retained_len != name.len() {
+            self.metadata_complete = false;
+        }
+        let name = name[..retained_len].to_owned();
         self.windows.push(WebSessionWindowView {
             index,
-            name: name.unwrap_or_default().to_owned(),
+            name,
             active,
         });
     }
 
     pub(crate) fn push_pane(&mut self, pane: WebSessionPaneView) {
+        if self.panes.len() >= WEB_SESSION_VIEW_ENTRY_MAX {
+            self.metadata_complete = false;
+            return;
+        }
         self.panes.push(pane);
+    }
+
+    pub(crate) fn mark_metadata_incomplete(&mut self) {
+        self.metadata_complete = false;
     }
 }
 
@@ -249,7 +300,25 @@ pub(crate) fn session_content_geometry(
     ))
 }
 
-pub(crate) fn overlay_pane_lines(frame: &mut Vec<u8>, geometry: PaneGeometry, lines: &[Vec<u8>]) {
+pub(crate) fn overlay_pane_lines(
+    frame: &mut Vec<u8>,
+    geometry: PaneGeometry,
+    lines: &[Vec<u8>],
+) -> Result<(), RmuxError> {
+    let additional = (0..usize::from(geometry.rows())).fold(6_usize, |total, row| {
+        let terminal_row = usize::from(geometry.y()) + row + 1;
+        let terminal_col = usize::from(geometry.x()) + 1;
+        total
+            .saturating_add(format!("\x1b[{terminal_row};{terminal_col}H\x1b[0m").len())
+            .saturating_add(lines.get(row).map_or(0, Vec::len))
+    });
+    let encoded_len = frame.len().saturating_add(additional);
+    if encoded_len > WEB_RECOVERY_CONTENT_BYTES_MAX {
+        return Err(RmuxError::FrameTooLarge {
+            length: encoded_len,
+            maximum: WEB_RECOVERY_CONTENT_BYTES_MAX,
+        });
+    }
     for row in 0..usize::from(geometry.rows()) {
         let terminal_row = usize::from(geometry.y()) + row + 1;
         let terminal_col = usize::from(geometry.x()) + 1;
@@ -259,8 +328,18 @@ pub(crate) fn overlay_pane_lines(frame: &mut Vec<u8>, geometry: PaneGeometry, li
         }
     }
     frame.extend_from_slice(b"\x1b[?25l");
+    Ok(())
 }
 
+fn utf8_prefix_len(value: &str, max_bytes: usize) -> usize {
+    let mut end = value.len().min(max_bytes);
+    while end > 0 && !value.is_char_boundary(end) {
+        end -= 1;
+    }
+    end
+}
+
+#[cfg(test)]
 pub(crate) fn snapshot_ansi_lines(screen: &Screen) -> Vec<Vec<u8>> {
     screen.capture_transcript_lines_independent(
         ScreenCaptureRange::default(),
@@ -397,7 +476,8 @@ mod tests {
             WebSessionView::new(size),
             mode::MODE_CURSOR | mode::MODE_WRAP,
             0,
-        );
+        )
+        .expect("snapshot fits");
         let rendered = String::from_utf8(snapshot.ansi_bytes()).expect("snapshot bytes are utf8");
 
         assert!(rendered.starts_with("\x1b[?2026l\x1b[?1049l\x1b[?6l\x1b[r"));
@@ -414,12 +494,51 @@ mod tests {
             WebSessionView::new(size),
             mode::MODE_CURSOR | mode::MODE_WRAP | mode::MODE_MOUSE_BUTTON | mode::MODE_MOUSE_SGR,
             0,
-        );
+        )
+        .expect("snapshot fits");
         let rendered = String::from_utf8(snapshot.ansi_bytes()).expect("snapshot bytes are utf8");
 
         assert!(rendered.contains("\x1b[?1002h"), "{rendered:?}");
         assert!(rendered.contains("\x1b[?1006h"), "{rendered:?}");
         assert!(rendered.ends_with("frame"), "{rendered:?}");
+    }
+
+    #[test]
+    fn web_session_snapshot_rejects_an_oversized_single_frame() {
+        let size = TerminalSize { cols: 80, rows: 24 };
+        let frame = vec![b'x'; WEB_RECOVERY_CONTENT_BYTES_MAX + 1];
+
+        assert!(matches!(
+            WebSessionSnapshot::new(size, frame, WebSessionView::new(size), 0, 0),
+            Err(RmuxError::FrameTooLarge { .. })
+        ));
+    }
+
+    #[test]
+    fn web_overlay_preflights_complete_rows_before_mutating_the_frame() {
+        let mut frame = b"unchanged".to_vec();
+        let original = frame.clone();
+        let lines = vec![vec![b'x'; WEB_RECOVERY_CONTENT_BYTES_MAX]];
+
+        assert!(matches!(
+            overlay_pane_lines(&mut frame, PaneGeometry::new(0, 0, 1, 1), &lines),
+            Err(RmuxError::FrameTooLarge { .. })
+        ));
+        assert_eq!(frame, original);
+    }
+
+    #[test]
+    fn web_session_view_bounds_terminal_controlled_window_names() {
+        let size = TerminalSize { cols: 80, rows: 24 };
+        let mut view = WebSessionView::new(size);
+        let oversized = "é".repeat(WEB_SESSION_WINDOW_NAME_MAX);
+        view.add_window(1, Some(&oversized), true);
+
+        assert!(!view.metadata_complete);
+        assert!(view.windows[0].name.len() <= WEB_SESSION_WINDOW_NAME_MAX);
+        assert!(view.windows[0]
+            .name
+            .is_char_boundary(view.windows[0].name.len()));
     }
 
     #[test]

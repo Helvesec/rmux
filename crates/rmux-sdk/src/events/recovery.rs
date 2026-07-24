@@ -49,6 +49,26 @@ pub enum PaneRecoveryRebaseReason {
     GenerationChanged,
 }
 
+/// Completeness report for a transport-bounded recovery keyframe.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct PaneRecoveryCoverage {
+    /// Total scrollback rows retained by the daemon at capture time.
+    pub history_rows_total: u64,
+    /// Newest whole scrollback rows represented by the keyframe.
+    pub history_rows_included: u64,
+    /// Whether all bounded title, path, title-stack and hyperlink metadata was
+    /// represented.
+    pub metadata_complete: bool,
+}
+
+impl PaneRecoveryCoverage {
+    /// Returns whether the keyframe includes every retained scrollback row.
+    #[must_use]
+    pub const fn history_complete(self) -> bool {
+        self.history_rows_included >= self.history_rows_total
+    }
+}
+
 /// Complete raw-emulator recovery state.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct PaneRecoveryRebase {
@@ -68,6 +88,8 @@ pub struct PaneRecoveryRebase {
     pub keyframe: Vec<u8>,
     /// Whether the reconstructed pane is using its alternate screen.
     pub alternate: bool,
+    /// Explicit report for bounded scrollback and terminal metadata.
+    pub coverage: PaneRecoveryCoverage,
     /// Optional typed viewport requested through [`PaneRecoveryOptions`].
     pub snapshot: Option<PaneSnapshot>,
     /// Cause of this rebase.
@@ -438,6 +460,11 @@ fn rebase_from_proto(value: ProtoRebase) -> Result<PaneRecoveryRebase> {
         rows: value.rows,
         keyframe: value.keyframe,
         alternate: value.alternate,
+        coverage: PaneRecoveryCoverage {
+            history_rows_total: value.coverage.history_rows_total,
+            history_rows_included: value.coverage.history_rows_included,
+            metadata_complete: value.coverage.metadata_complete,
+        },
         snapshot,
         reason: reason_from_proto(value.reason),
     })

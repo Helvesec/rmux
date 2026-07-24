@@ -16,6 +16,8 @@ mod stream_sanitizer;
 mod tunnel;
 mod websocket;
 
+pub(crate) const WEB_RECOVERY_CONTENT_BYTES_MAX: usize = 3 * 512 * 1024 - 4 * 1024;
+
 pub(crate) use record::{
     WebPaneTarget, WebSessionTarget, WebShareAccess, WebShareConnectionCounts,
     WebShareRevokeReason, WebShareTarget,

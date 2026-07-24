@@ -99,6 +99,12 @@ impl TerminalScreen {
         self.parser.pending_bytes()
     }
 
+    /// Borrows bytes buffered inside an incomplete parser state.
+    #[must_use]
+    pub fn pending_bytes_ref(&self) -> &[u8] {
+        self.parser.pending_bytes_ref()
+    }
+
     /// Clones renderer state, including bounded scrollback and saved buffers.
     #[must_use]
     pub fn clone_recovery_screen(&self) -> Screen {
@@ -111,10 +117,26 @@ impl TerminalScreen {
         self.parser.active_cell_state_ansi()
     }
 
+    /// Returns bounded ANSI for the active rendition and whether metadata was
+    /// represented completely.
+    #[must_use]
+    pub fn active_cell_state_ansi_bounded(&self, max_hyperlink_bytes: usize) -> (Vec<u8>, bool) {
+        self.parser
+            .active_cell_state_ansi_bounded(max_hyperlink_bytes)
+    }
+
     /// Returns ANSI restoring the rendition saved by DECSC/SCP.
     #[must_use]
     pub fn saved_cell_state_ansi(&self) -> Vec<u8> {
         self.parser.saved_cell_state_ansi()
+    }
+
+    /// Returns bounded ANSI for the saved rendition and whether metadata was
+    /// represented completely.
+    #[must_use]
+    pub fn saved_cell_state_ansi_bounded(&self, max_hyperlink_bytes: usize) -> (Vec<u8>, bool) {
+        self.parser
+            .saved_cell_state_ansi_bounded(max_hyperlink_bytes)
     }
 
     /// Returns the cursor and origin mode saved by DECSC/SCP.

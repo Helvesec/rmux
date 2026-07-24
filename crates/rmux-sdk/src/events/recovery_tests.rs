@@ -5,10 +5,10 @@ use std::time::Duration;
 use rmux_proto::{
     encode_frame, FrameDecoder, HasSessionRequest, HasSessionResponse, PaneOutputSubscriptionId,
     PaneRawBytes, PaneRawRebase as ProtoRebase, PaneRawRebaseReason as ProtoReason,
-    PaneStreamCursorRequest, PaneStreamCursorResponse, PaneStreamEndReason, PaneStreamEvent,
-    PaneStreamMode, PaneTarget, PaneTargetRef, Request, Response, SessionName,
-    SubscribePaneStreamRequest, SubscribePaneStreamResponse, UnsubscribePaneStreamRequest,
-    UnsubscribePaneStreamResponse,
+    PaneRecoveryCoverage as ProtoCoverage, PaneStreamCursorRequest, PaneStreamCursorResponse,
+    PaneStreamEndReason, PaneStreamEvent, PaneStreamMode, PaneTarget, PaneTargetRef, Request,
+    Response, SessionName, SubscribePaneStreamRequest, SubscribePaneStreamResponse,
+    UnsubscribePaneStreamRequest, UnsubscribePaneStreamResponse,
 };
 use tokio::io::{AsyncReadExt, AsyncWriteExt, DuplexStream};
 
@@ -41,9 +41,31 @@ fn rebase(epoch: u64, reason: ProtoReason) -> ProtoRebase {
         rows: 24,
         keyframe: b"\x1b[2J\x1b[Hready".to_vec(),
         alternate: false,
+        coverage: ProtoCoverage {
+            history_rows_total: 0,
+            history_rows_included: 0,
+            metadata_complete: true,
+        },
         snapshot: None,
         reason,
     }
+}
+
+#[test]
+fn recovery_rebase_maps_explicit_bounded_coverage() {
+    let mut wire = rebase(1, ProtoReason::Initial);
+    wire.coverage = ProtoCoverage {
+        history_rows_total: 50,
+        history_rows_included: 12,
+        metadata_complete: false,
+    };
+
+    let mapped = super::rebase_from_proto(wire).expect("map bounded recovery coverage");
+
+    assert_eq!(mapped.coverage.history_rows_total, 50);
+    assert_eq!(mapped.coverage.history_rows_included, 12);
+    assert!(!mapped.coverage.history_complete());
+    assert!(!mapped.coverage.metadata_complete);
 }
 
 async fn read_request(stream: &mut DuplexStream) -> Request {

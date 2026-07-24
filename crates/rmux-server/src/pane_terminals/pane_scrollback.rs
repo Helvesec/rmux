@@ -1,7 +1,12 @@
-use rmux_core::{GridRenderOptions, PaneId, ScreenCaptureRange};
-use rmux_proto::SessionName;
+use rmux_core::{GridRenderOptions, PaneId};
+use rmux_proto::{RmuxError, SessionName};
 
 use super::HandlerState;
+use crate::pane_recovery::{
+    validate_recovery_geometry, MAX_RECOVERY_HYPERLINK_ENTRY_BYTES,
+    MAX_RECOVERY_HYPERLINK_TOTAL_BYTES, MAX_RECOVERY_STRING_BYTES, MAX_RECOVERY_TITLE_STACK_BYTES,
+};
+use crate::web::WEB_RECOVERY_CONTENT_BYTES_MAX;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct PaneScrollbackView {
@@ -9,6 +14,7 @@ pub(crate) struct PaneScrollbackView {
     pub(crate) scroll_offset: usize,
     pub(crate) alternate_on: bool,
     pub(crate) ansi_lines: Vec<Vec<u8>>,
+    pub(crate) metadata_complete: bool,
 }
 
 impl HandlerState {
@@ -17,7 +23,7 @@ impl HandlerState {
         session_name: &SessionName,
         pane_id: PaneId,
         scroll_offset: usize,
-    ) -> Option<PaneScrollbackView> {
+    ) -> Result<Option<PaneScrollbackView>, RmuxError> {
         self.pane_scrollback_view_with(session_name, pane_id, |history_size, alternate_on| {
             if alternate_on {
                 0
@@ -32,7 +38,7 @@ impl HandlerState {
         session_name: &SessionName,
         pane_id: PaneId,
         top_line: usize,
-    ) -> Option<PaneScrollbackView> {
+    ) -> Result<Option<PaneScrollbackView>, RmuxError> {
         self.pane_scrollback_view_with(session_name, pane_id, |history_size, alternate_on| {
             if alternate_on {
                 0
@@ -47,42 +53,75 @@ impl HandlerState {
         session_name: &SessionName,
         pane_id: PaneId,
         scroll_offset_for: impl FnOnce(usize, bool) -> usize,
-    ) -> Option<PaneScrollbackView> {
-        let window_index = self
+    ) -> Result<Option<PaneScrollbackView>, RmuxError> {
+        let Some(window_index) = self
             .sessions
-            .session(session_name)?
-            .window_index_for_pane_id(pane_id)?;
+            .session(session_name)
+            .and_then(|session| session.window_index_for_pane_id(pane_id))
+        else {
+            return Ok(None);
+        };
         let runtime_session_name = self.runtime_session_name_for_window(session_name, window_index);
-        let transcript = self.transcripts.get(&runtime_session_name)?.get(&pane_id)?;
+        let Some(transcript) = self
+            .transcripts
+            .get(&runtime_session_name)
+            .and_then(|panes| panes.get(&pane_id))
+        else {
+            return Ok(None);
+        };
         let transcript = transcript
             .lock()
             .expect("pane transcript mutex must not be poisoned");
         let screen = transcript.screen();
+        validate_recovery_geometry(screen)?;
         let history_size = screen.history_size();
         let alternate_on = screen.is_alternate();
         let scroll_offset = scroll_offset_for(history_size, alternate_on);
-        let ansi_lines = if scroll_offset == 0 {
-            Vec::new()
+        let metadata_complete = screen.recovery_metadata_fits(
+            MAX_RECOVERY_STRING_BYTES,
+            MAX_RECOVERY_TITLE_STACK_BYTES,
+            MAX_RECOVERY_HYPERLINK_ENTRY_BYTES,
+            MAX_RECOVERY_HYPERLINK_TOTAL_BYTES,
+        );
+        let (ansi_lines, metadata_complete) = if scroll_offset == 0 {
+            (Vec::new(), metadata_complete)
         } else {
             let top_line = history_size.saturating_sub(scroll_offset);
-            let (cursor_x, _) = screen.cursor_position();
-            screen
-                .clone_viewport(top_line, cursor_x, screen.cursor_absolute_y())
-                .capture_transcript_lines_independent(
-                    ScreenCaptureRange::default(),
-                    GridRenderOptions {
-                        with_sequences: true,
-                        trim_spaces: false,
-                        ..GridRenderOptions::default()
-                    },
-                )
+            let renderer = screen.recovery_row_renderer(
+                MAX_RECOVERY_HYPERLINK_ENTRY_BYTES,
+                MAX_RECOVERY_HYPERLINK_TOTAL_BYTES,
+            );
+            let options = GridRenderOptions {
+                with_sequences: true,
+                trim_spaces: false,
+                ..GridRenderOptions::default()
+            };
+            let mut rendered_bytes = 0_usize;
+            let mut lines = Vec::with_capacity(usize::from(screen.size().rows));
+            for row in top_line..top_line.saturating_add(usize::from(screen.size().rows)) {
+                let Some((line, _)) = renderer.active_row(row, options) else {
+                    return Err(RmuxError::Server(
+                        "terminal row disappeared during Web scrollback capture".to_owned(),
+                    ));
+                };
+                rendered_bytes = rendered_bytes.saturating_add(line.len());
+                if rendered_bytes > WEB_RECOVERY_CONTENT_BYTES_MAX {
+                    return Err(RmuxError::FrameTooLarge {
+                        length: rendered_bytes,
+                        maximum: WEB_RECOVERY_CONTENT_BYTES_MAX,
+                    });
+                }
+                lines.push(line);
+            }
+            (lines, metadata_complete && renderer.metadata_complete())
         };
 
-        Some(PaneScrollbackView {
+        Ok(Some(PaneScrollbackView {
             history_size,
             scroll_offset,
             alternate_on,
             ansi_lines,
-        })
+            metadata_complete,
+        }))
     }
 }

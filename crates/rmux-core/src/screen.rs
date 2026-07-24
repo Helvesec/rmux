@@ -22,6 +22,7 @@ mod view;
 #[path = "screen/writer.rs"]
 mod writer;
 
+pub use capture::RecoveryRowRenderer;
 pub use view::{ScreenCellRef, ScreenCellView, ScreenLineView};
 
 pub(crate) const MAX_TERMINAL_PASSTHROUGH_EVENTS: usize = 256;
@@ -70,6 +71,24 @@ pub struct Screen {
 impl Screen {
     pub(crate) fn render_cell_state_ansi(&self, state: &CellState) -> Vec<u8> {
         crate::grid::render_cell_state_ansi(state, &self.hyperlinks)
+    }
+
+    pub(crate) fn render_cell_state_ansi_bounded(
+        &self,
+        state: &CellState,
+        max_hyperlink_bytes: usize,
+    ) -> (Vec<u8>, bool) {
+        let mut bounded = state.clone();
+        let complete = self
+            .hyperlinks
+            .entry_fits(bounded.link(), max_hyperlink_bytes);
+        if !complete {
+            bounded.cell.link = 0;
+        }
+        (
+            crate::grid::render_cell_state_ansi(&bounded, &self.hyperlinks),
+            complete,
+        )
     }
 
     /// Creates a new screen with the given geometry and history limit.
