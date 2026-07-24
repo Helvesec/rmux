@@ -16,6 +16,7 @@ use rmux_proto::{KillServerRequest, ListSessionsRequest, Request, Response};
 const BINARY_OVERRIDE_ENV: &str = "RMUX_INTERNAL_BINARY_PATH";
 const BINARY_OVERRIDE_TEST_OPT_IN_ENV: &str = "RMUX_ALLOW_INTERNAL_BINARY_OVERRIDE";
 const CLIENT_VERSION_OVERRIDE_ENV: &str = "RMUX_INTERNAL_CLIENT_VERSION";
+const CALLER_JOB_TEST_OPT_IN_ENV: &str = "RMUX_ALLOW_INTERNAL_DAEMON_IN_CALLER_JOB";
 const WINDOWS_DAEMON_COMMAND_TIMEOUT: Duration = Duration::from_secs(20);
 const WINDOWS_DAEMON_READY_TIMEOUT: Duration = Duration::from_secs(20);
 const WINDOWS_DAEMON_EXIT_TIMEOUT: Duration = Duration::from_secs(20);
@@ -317,7 +318,8 @@ fn run_client_as_newer_version(
         .args(args)
         .env(BINARY_OVERRIDE_ENV, env!("CARGO_BIN_EXE_rmux"))
         .env(BINARY_OVERRIDE_TEST_OPT_IN_ENV, "1")
-        .env(CLIENT_VERSION_OVERRIDE_ENV, "999.0.0-test");
+        .env(CLIENT_VERSION_OVERRIDE_ENV, "999.0.0-test")
+        .env(CALLER_JOB_TEST_OPT_IN_ENV, "1");
     run_command_status(command)
 }
 
