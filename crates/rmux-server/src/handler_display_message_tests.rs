@@ -1122,9 +1122,10 @@ async fn queued_display_message_ignore_input_is_scoped_to_its_attached_initiator
 }
 
 #[tokio::test]
-async fn direct_display_message_targets_one_recent_client_independently_of_format_target() {
-    // Oracle: an external tmux 3.7b command selects the most recently active
-    // client (newest attach on ties). `-t` changes only format context.
+async fn direct_display_message_delivers_to_recent_client_but_formats_for_target_session() {
+    // Oracle: an external tmux 3.7b command delivers to the most recently
+    // active client, but formats client variables from a client attached to
+    // the `-t` session when one exists.
     let handler = RequestHandler::new();
     let alpha = session_name("format-alpha");
     let beta = session_name("display-beta");
@@ -1134,7 +1135,7 @@ async fn direct_display_message_targets_one_recent_client_independently_of_forma
                 .handle(Request::NewSession(NewSessionRequest {
                     session_name,
                     detached: true,
-                    size: Some(TerminalSize { cols: 20, rows: 4 }),
+                    size: Some(TerminalSize { cols: 100, rows: 4 }),
                     environment: None,
                 }))
                 .await,
@@ -1158,7 +1159,10 @@ async fn direct_display_message_targets_one_recent_client_independently_of_forma
             DisplayMessageExtRequest {
                 target: Some(Target::Session(alpha)),
                 print: false,
-                message: Some("format=#{session_name}".to_owned()),
+                message: Some(
+                    "format=#{session_name}|client=#{client_session}|name=#{client_name}"
+                        .to_owned(),
+                ),
                 target_client: None,
                 empty_target_context: false,
                 duration_ms: Some(rmux_proto::DisplayMessageDurationMillis::new(5_000)),
@@ -1171,7 +1175,9 @@ async fn direct_display_message_targets_one_recent_client_independently_of_forma
     let AttachControl::Overlay(overlay) = recv_overlay_control(&mut beta_rx).await else {
         panic!("recent beta client receives the message");
     };
-    assert!(String::from_utf8_lossy(&overlay.frame).contains("format=format-alpha"));
+    assert!(String::from_utf8_lossy(&overlay.frame).contains(&format!(
+        "format=format-alpha|client=format-alpha|name={alpha_pid}"
+    )));
     let active_attach = handler.active_attach.lock().await;
     assert!(active_attach
         .by_pid
@@ -1182,6 +1188,25 @@ async fn direct_display_message_targets_one_recent_client_independently_of_forma
         .get(&beta_pid)
         .is_some_and(|active| active.transient_message.is_some()));
     drop(active_attach);
+
+    let response = handler
+        .handle_display_message_ext(
+            7_778,
+            DisplayMessageExtRequest {
+                target: Some(Target::Session(session_name("format-alpha"))),
+                print: true,
+                message: Some("#{session_name}|#{client_session}|#{client_name}".to_owned()),
+                target_client: Some(beta_pid.to_string()),
+                empty_target_context: false,
+                duration_ms: None,
+                ignore_input: false,
+            },
+        )
+        .await;
+    assert_eq!(
+        response.command_output().map(|output| output.stdout()),
+        Some(format!("format-alpha|format-alpha|{alpha_pid}\n").as_bytes())
+    );
 
     assert!(handler
         .active_attach
@@ -1354,7 +1379,7 @@ async fn display_message_target_client_uses_client_session_for_overlay_delivery(
             DisplayMessageExtRequest {
                 target: Some(Target::Session(beta)),
                 print: false,
-                message: Some("format #{session_name}".to_owned()),
+                message: Some("format #{session_name} #{client_session}".to_owned()),
                 target_client: Some("42".to_owned()),
                 empty_target_context: false,
                 duration_ms: None,
@@ -1372,7 +1397,7 @@ async fn display_message_target_client_uses_client_session_for_overlay_delivery(
         panic!("expected display-message overlay");
     };
     let frame = String::from_utf8(overlay.frame).expect("overlay is utf-8");
-    assert!(frame.contains("format beta"));
+    assert!(frame.contains("format beta alpha"));
 }
 
 #[tokio::test]

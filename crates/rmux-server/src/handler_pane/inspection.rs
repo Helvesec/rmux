@@ -139,24 +139,21 @@ impl RequestHandler {
             })
     }
 
-    async fn preferred_display_message_client(
+    async fn recent_display_message_client(
         &self,
-        preferred_session: Option<&rmux_proto::SessionName>,
+        session: Option<&rmux_proto::SessionName>,
     ) -> Option<ActiveAttachIdentity> {
         let active_attach = self.active_attach.lock().await;
-        let choose = |session: Option<&rmux_proto::SessionName>| {
-            active_attach
-                .by_pid
-                .iter()
-                .filter(|(_, active)| {
-                    !active.suspended
-                        && !active.closing.load(std::sync::atomic::Ordering::SeqCst)
-                        && session.is_none_or(|name| &active.session_name == name)
-                })
-                .max_by_key(|(_, active)| (active.last_activity_sequence, active.id))
-                .map(|(pid, active)| active.identity(*pid))
-        };
-        choose(preferred_session).or_else(|| preferred_session.and_then(|_| choose(None)))
+        active_attach
+            .by_pid
+            .iter()
+            .filter(|(_, active)| {
+                !active.suspended
+                    && !active.closing.load(std::sync::atomic::Ordering::SeqCst)
+                    && session.is_none_or(|name| &active.session_name == name)
+            })
+            .max_by_key(|(_, active)| (active.last_activity_sequence, active.id))
+            .map(|(pid, active)| active.identity(*pid))
     }
 
     async fn handle_display_message_inner(
@@ -248,12 +245,16 @@ impl RequestHandler {
                 Some(identity) => Some(identity),
                 None if requester_is_control => None,
                 None => {
-                    self.preferred_display_message_client(
-                        requester_environment_target
-                            .as_ref()
-                            .map(Target::session_name),
-                    )
-                    .await
+                    let preferred_session = requester_environment_target
+                        .as_ref()
+                        .map(Target::session_name);
+                    match self.recent_display_message_client(preferred_session).await {
+                        Some(identity) => Some(identity),
+                        None if preferred_session.is_some() => {
+                            self.recent_display_message_client(None).await
+                        }
+                        None => None,
+                    }
                 }
             }
         };
@@ -267,8 +268,23 @@ impl RequestHandler {
             },
             None => None,
         };
-        let display_client_pid = display_client.map(ActiveAttachIdentity::attach_pid);
-        let requester_client = match display_client_pid {
+        let format_client = match (
+            target.as_ref().map(Target::session_name),
+            display_client_session.as_ref(),
+        ) {
+            (Some(target_session), Some((display_session, _)))
+                if target_session == display_session =>
+            {
+                display_client
+            }
+            (Some(target_session), _) => self
+                .recent_display_message_client(Some(target_session))
+                .await
+                .or(display_client),
+            (None, _) => display_client,
+        };
+        let format_client_pid = format_client.map(ActiveAttachIdentity::attach_pid);
+        let format_client_snapshot = match format_client_pid {
             Some(attach_pid) => self
                 .list_clients_snapshot()
                 .await
@@ -319,7 +335,7 @@ impl RequestHandler {
                 let state = self.state.lock().await;
                 let mut runtime =
                     RuntimeFormatContext::new(FormatContext::new()).with_state(&state);
-                if let Some(client) = requester_client.as_ref() {
+                if let Some(client) = format_client_snapshot.as_ref() {
                     runtime = with_runtime_client_values(runtime, client);
                 }
                 render_runtime_template(template, &runtime, true)
@@ -345,7 +361,7 @@ impl RequestHandler {
                 let state = self.state.lock().await;
                 let mut runtime =
                     RuntimeFormatContext::new(FormatContext::new()).with_state(&state);
-                if let Some(client) = requester_client.as_ref() {
+                if let Some(client) = format_client_snapshot.as_ref() {
                     runtime = with_runtime_client_values(runtime, client);
                 }
                 render_runtime_template(template, &runtime, true)
@@ -360,7 +376,7 @@ impl RequestHandler {
                 let state = self.state.lock().await;
                 let mut runtime =
                     RuntimeFormatContext::new(FormatContext::new()).with_state(&state);
-                if let Some(client) = requester_client.as_ref() {
+                if let Some(client) = format_client_snapshot.as_ref() {
                     runtime = with_runtime_client_values(runtime, client);
                 }
                 render_runtime_template(template, &runtime, true)
@@ -430,12 +446,12 @@ impl RequestHandler {
                     Ok(context) => context,
                     Err(error) => return Response::Error(ErrorResponse { error }),
                 };
-            if let Some(client) = requester_client.as_ref() {
+            if let Some(client) = format_client_snapshot.as_ref() {
                 context = with_runtime_client_values(context, client);
             }
             if uses_lone_session_print_context {
                 context = context.without_session_size();
-                if requester_client.is_none() {
+                if format_client_snapshot.is_none() {
                     context = context.with_unclipped_geometry();
                 }
             }
@@ -771,6 +787,14 @@ fn with_runtime_client_values<'a>(
         .with_named_value("client_name", client.name.clone())
         .with_named_value("client_pid", client.pid.to_string())
         .with_named_value("client_tty", client.tty.clone())
+        .with_named_value(
+            "client_session",
+            client
+                .session_name
+                .as_ref()
+                .map(ToString::to_string)
+                .unwrap_or_default(),
+        )
         .with_named_value("client_width", client.width.to_string())
         .with_named_value("client_height", client.height.to_string())
         .with_named_value("client_termfeatures", client.termfeatures.clone())
