@@ -19,9 +19,12 @@ rmux-os = { path = "../rmux-os", version = "0.9.2" }
 rustix = { version = "1.1.4", features = ["process", "termios", "pty", "fs"] }
 
 [target.'cfg(windows)'.dependencies]
+getrandom = "0.3"
+rmux-os = { path = "../rmux-os", version = "0.9.2" }
 windows-sys = { version = "0.61.2", features = [
     "Win32_Foundation",
     "Win32_Security",
+    "Win32_Security_Authorization",
     "Win32_System_Console",
     "Win32_System_Diagnostics_ToolHelp",
     "Win32_System_IO",

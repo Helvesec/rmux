@@ -1325,6 +1325,7 @@ dependencies = [
 name = "rmux-pty"
 version = "0.9.2"
 dependencies = [
+ "getrandom 0.3.4",
  "libc",
  "rmux-os",
  "rmux-types",
