@@ -1,6 +1,8 @@
+#[path = "support/python3.rs"]
+mod python3;
+
 use std::fs;
 use std::path::PathBuf;
-use std::process::Command;
 
 const ACTIVATION: &str = include_str!("../.github/release/release-activation.json");
 const CHOCOLATEY: &str = include_str!("../.github/workflows/release-chocolatey-retry.yml");
@@ -170,7 +172,7 @@ fn retry_helper_enforces_single_depth_no_mutation_and_exact_file_sets() {
 
 #[test]
 fn retry_helper_imports_the_shared_request_model() {
-    let status = Command::new("python3")
+    let status = python3::command()
         .args(["scripts/release/prepare-channel-retry.py", "--help"])
         .status()
         .expect("run Python import probe");
@@ -231,7 +233,7 @@ for field, value in (
         continue
     raise SystemExit(f'forged retry producer accepted: {field}')
 "#;
-    let output = Command::new("python3")
+    let output = python3::command()
         .arg("-c")
         .arg(script)
         .current_dir(repo_root())

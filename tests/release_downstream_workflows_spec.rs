@@ -1,6 +1,10 @@
+#[path = "support/python3.rs"]
+mod python3;
+
 use std::collections::BTreeSet;
 use std::fs;
 use std::path::PathBuf;
+#[cfg(unix)]
 use std::process::Command;
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -360,7 +364,7 @@ fn downstream_json_writer_uses_canonical_lf_bytes_on_every_platform() {
     ));
     fs::create_dir_all(&root).expect("create canonical JSON fixture directory");
     let output_path = root.join("evidence.json");
-    let output = Command::new("python3")
+    let output = python3::command()
         .args([
             "-c",
             "import pathlib,sys; sys.path.insert(0,'scripts/release'); \
@@ -848,7 +852,7 @@ fn downstream_repository_verifier_accepts_github_ruleset_arrays() {
             "repository_ids": [1249553407, 1258602064, 1259133629, 1259135161]
         }),
     );
-    let output = Command::new("python3")
+    let output = python3::command()
         .arg(repo_root().join("scripts/release/verify-downstream-repository.py"))
         .args(["fixtures", "--repository-key", "homebrew-rmux"])
         .arg("--metadata")
