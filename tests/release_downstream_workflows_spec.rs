@@ -345,6 +345,11 @@ fn exact_receipt_ids_digests_origin_and_documents_are_bound() {
     assert!(prepare.contains("channel-policy.py create-plan"));
     assert!(prepare.contains("channel-policy.py verify-plan"));
     assert!(prepare.contains("--snap-candidate-opt-in"));
+    assert!(
+        prepare.contains("${{ runner.temp }}/rmux-downstream/publication-receipt-predicate.json")
+    );
+    assert!(!prepare
+        .contains("${{ runner.temp }}/rmux-downstream/receipt/publication-receipt-predicate.json"));
 }
 
 #[test]
