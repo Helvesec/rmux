@@ -6,7 +6,8 @@ use rmux_proto::{
     NewSessionExtRequest, PaneRawRebase, PaneRawRebaseReason, PaneRecoveryCoverage,
     PaneStreamCursorRequest, PaneStreamEndReason, PaneStreamEvent, PaneStreamLifecycleEvent,
     PaneStreamMode, PaneSurfaceFrame, PaneTarget, PaneTargetRef, RenameSessionRequest, Request,
-    Response, SessionName, SubscribePaneStreamRequest, SubscribePaneStreamResponse, TerminalSize,
+    Response, SessionName, SplitDirection, SplitWindowRequest, SplitWindowTarget,
+    SubscribePaneStreamRequest, SubscribePaneStreamResponse, TerminalSize,
     UnsubscribePaneStreamRequest, DEFAULT_MAX_DETACHED_FRAME_LENGTH,
 };
 
@@ -109,13 +110,22 @@ async fn subscribe(
     target: &PaneTarget,
     mode: PaneStreamMode,
 ) -> SubscribePaneStreamResponse {
+    subscribe_with_snapshot(handler, target, mode, false).await
+}
+
+async fn subscribe_with_snapshot(
+    handler: &RequestHandler,
+    target: &PaneTarget,
+    mode: PaneStreamMode,
+    include_snapshot: bool,
+) -> SubscribePaneStreamResponse {
     let response = handler
         .handle_subscribe_pane_stream(
             CONNECTION_ID,
             SubscribePaneStreamRequest {
                 target: PaneTargetRef::slot(target.clone()),
                 mode,
-                include_snapshot: false,
+                include_snapshot,
             },
         )
         .await;
@@ -1147,6 +1157,124 @@ async fn natural_pane_exit_drains_raw_and_surface_streams_before_end() {
             .is_empty(),
         "ended pane streams must not keep exit-empty shutdown busy"
     );
+}
+
+async fn assert_exit_commit_keeps_stream_source_available(
+    mode: PaneStreamMode,
+    keep_session: bool,
+) {
+    let handler = Arc::new(RequestHandler::new());
+    let (target, output, transcript) = test_pane(handler.as_ref()).await;
+    if keep_session {
+        let response = handler
+            .handle(Request::SplitWindow(SplitWindowRequest {
+                target: SplitWindowTarget::Pane(target.clone()),
+                direction: SplitDirection::Vertical,
+                before: false,
+                environment: None,
+            }))
+            .await;
+        assert!(matches!(response, Response::SplitWindow(_)), "{response:?}");
+    }
+    let subscribed =
+        subscribe_with_snapshot(handler.as_ref(), &target, mode, mode == PaneStreamMode::Raw).await;
+    let key = handler
+        .pane_output_subscription_key_for_test(subscribed.subscription_id)
+        .expect("subscription key");
+
+    transcript
+        .lock()
+        .expect("transcript lock")
+        .append_bytes(b"commit-tail");
+    output.send(b"commit-tail".to_vec());
+    output.mutate_transcript(&transcript, PaneInvalidationReason::Resize, |transcript| {
+        transcript.resize(TerminalSize { cols: 13, rows: 4 });
+        ((), true)
+    });
+    output.send(Vec::new());
+    handler
+        .state
+        .lock()
+        .await
+        .mark_pane_dead_without_exit_details(&target)
+        .expect("mark pane naturally exited");
+
+    let pause = handler.install_pane_exit_commit_pause();
+    let exit_handler = Arc::clone(&handler);
+    let exit_session = target.session_name().clone();
+    let exit_task = tokio::spawn(async move {
+        exit_handler
+            .handle_pane_exit_event(PaneExitEvent::eof_published(
+                exit_session,
+                key.pane_id(),
+                None,
+            ))
+            .await;
+    });
+    tokio::time::timeout(Duration::from_secs(1), pause.reached.notified())
+        .await
+        .expect("pane exit reaches the post-commit pause");
+
+    let mut events = cursor(handler.as_ref(), subscribed.subscription_id).await;
+    events.extend(cursor(handler.as_ref(), subscribed.subscription_id).await);
+    assert!(
+        !events
+            .iter()
+            .any(|event| matches!(event, PaneStreamEvent::End(_))),
+        "stream must not end between state removal and drain publication: {events:?}"
+    );
+    assert!(
+        events.iter().any(|event| matches!(
+            event,
+            PaneStreamEvent::Lifecycle(PaneStreamLifecycleEvent::ProcessExited { .. })
+        )),
+        "process-exit lifecycle must remain available: {events:?}"
+    );
+    match mode {
+        PaneStreamMode::Raw => assert!(events.iter().any(|event| match event {
+            PaneStreamEvent::RawBytes(bytes) => bytes.bytes == b"commit-tail",
+            PaneStreamEvent::RawRebase(rebase) =>
+                rebase.snapshot.as_ref().is_some_and(|snapshot| {
+                    snapshot
+                        .cells
+                        .iter()
+                        .map(|cell| cell.text.as_str())
+                        .collect::<String>()
+                        .contains("commit-tail")
+                }),
+            _ => false,
+        })),
+        PaneStreamMode::Surface => assert!(events.iter().filter_map(surface_frame).any(|frame| {
+            frame
+                .snapshot
+                .cells
+                .iter()
+                .map(|cell| cell.text.as_str())
+                .collect::<String>()
+                .contains("commit-tail")
+        })),
+    }
+
+    pause.release.notify_one();
+    exit_task.await.expect("pane exit task joins");
+    assert_eq!(
+        cursor(handler.as_ref(), subscribed.subscription_id).await,
+        vec![PaneStreamEvent::End(PaneStreamEndReason::PaneRemoved)]
+    );
+}
+
+#[tokio::test]
+async fn natural_exit_publishes_drain_source_atomically_with_pane_removal() {
+    for mode in [PaneStreamMode::Raw, PaneStreamMode::Surface] {
+        assert_exit_commit_keeps_stream_source_available(mode, true).await;
+    }
+}
+
+#[tokio::test]
+async fn natural_exit_publishes_drain_source_atomically_with_session_removal() {
+    for mode in [PaneStreamMode::Raw, PaneStreamMode::Surface] {
+        assert_exit_commit_keeps_stream_source_available(mode, false).await;
+    }
 }
 
 #[tokio::test]

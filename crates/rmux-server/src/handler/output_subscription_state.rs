@@ -201,6 +201,16 @@ impl OutputSubscriptionState {
         true
     }
 
+    pub(super) fn stage_pane_drain_source(
+        &mut self,
+        pane: PaneOutputSubscriptionKey,
+        source: PaneStreamSource,
+    ) {
+        if !self.registry.ids_for_pane(&pane).is_empty() {
+            self.draining_stream_sources.insert(pane, source);
+        }
+    }
+
     pub(in crate::handler) fn note_pane_drain_progress(
         &mut self,
         pane: &PaneOutputSubscriptionKey,

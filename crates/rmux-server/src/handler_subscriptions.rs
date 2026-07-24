@@ -340,6 +340,21 @@ impl RequestHandler {
         }
     }
 
+    /// Makes an exited pane's immutable capture handles visible while the
+    /// caller still holds the state lock that removed the pane. Cursor paths
+    /// resolve live state first and this staged source second, so they cannot
+    /// observe a gap between those two ownership locations.
+    pub(in crate::handler) fn stage_exited_pane_stream_source(
+        &self,
+        pane: PaneOutputSubscriptionKey,
+        source: super::pane_stream_support::PaneStreamSource,
+    ) {
+        self.subscriptions
+            .lock()
+            .expect("subscription registry mutex must not be poisoned")
+            .stage_pane_drain_source(pane, source);
+    }
+
     pub(in crate::handler) async fn drain_exited_pane_output_subscriptions(
         &self,
         pane: PaneOutputSubscriptionKey,

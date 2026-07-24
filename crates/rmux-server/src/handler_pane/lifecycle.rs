@@ -257,6 +257,17 @@ impl RequestHandler {
                                         return;
                                     }
                                 };
+                            if let Some(source) =
+                                output.as_ref().and_then(ExitedPaneOutput::stream_source)
+                            {
+                                self.stage_exited_pane_stream_source(
+                                    PaneOutputSubscriptionKey::new(
+                                        runtime_session_name.clone(),
+                                        event.pane_id,
+                                    ),
+                                    source,
+                                );
+                            }
                             state.retire_removed_lifecycle_targets();
                             let destroyed_sessions = vec![(
                                 target.session_name().clone(),
@@ -318,6 +329,17 @@ impl RequestHandler {
                                 self.plan_all_window_mutation_silence_timers_locked(&state);
                             match state.kill_pane(target.clone()) {
                                 Ok(result) => {
+                                    if let Some(source) =
+                                        output.as_ref().and_then(ExitedPaneOutput::stream_source)
+                                    {
+                                        self.stage_exited_pane_stream_source(
+                                            PaneOutputSubscriptionKey::new(
+                                                runtime_session_name.clone(),
+                                                event.pane_id,
+                                            ),
+                                            source,
+                                        );
+                                    }
                                     state.retire_removed_lifecycle_targets();
                                     self.apply_window_mutation_silence_timers_and_arm_all_locked(
                                         &state,
