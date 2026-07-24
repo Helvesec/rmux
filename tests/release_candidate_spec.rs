@@ -198,10 +198,11 @@ fn release_review_candidate_mode_only_runs_true_deltas() {
     assert!(gate.contains("--evidence-mode"));
     assert!(gate.contains("full|candidate-delta"));
     assert!(gate.contains("section $section is already covered by the exact fast proof"));
-    assert!(delta.contains("section: [static, cli, tmux]"));
+    assert!(delta.contains("section: [static, xterm, cli, tmux]"));
     assert!(!delta.contains("matrix.section == 'lint'"));
     assert!(!delta.contains("matrix.section == 'server'"));
     assert!(!delta.contains("matrix.section == 'runtime-sdk'"));
+    assert!(gate.contains("static|perf|xterm|cli|tmux"));
     assert!(include_str!("../.github/workflows/ci.yml").contains("--retries 0"));
 }
 

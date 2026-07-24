@@ -16,7 +16,7 @@ gate through WSL may require a healthy Linux Rust toolchain and network access.
 Options:
   --target-dir DIR     Cargo target dir. Defaults to /tmp/rmux-release-review-target.
   --layout DIR         Reuse or populate a release layout directory.
-  --section NAME       Run one section: static, perf, lint, server, cli, tmux,
+  --section NAME       Run one section: static, perf, lint, server, xterm, cli, tmux,
                        runtime-sdk, or package. Defaults to all sections.
   --evidence-mode MODE full (default) or candidate-delta. Candidate delta
                        omits checks already proven by the exact fast run.
@@ -127,7 +127,7 @@ while [ "$#" -gt 0 ]; do
 done
 
 case "$section" in
-  all|static|perf|lint|server|cli|tmux|runtime-sdk|package) ;;
+  all|static|perf|lint|server|xterm|cli|tmux|runtime-sdk|package) ;;
   *) die "unknown release review section: $section" ;;
 esac
 case "$evidence_mode" in
@@ -136,7 +136,7 @@ case "$evidence_mode" in
 esac
 if [ "$evidence_mode" = candidate-delta ]; then
   case "$section" in
-    static|perf|cli|tmux) ;;
+    static|perf|xterm|cli|tmux) ;;
     *) die "section $section is already covered by the exact fast proof" ;;
   esac
 fi
@@ -294,6 +294,9 @@ fi
 if section_enabled server; then
   run_step "server lib tests" \
     cargo test -p rmux-server --lib --locked -- --test-threads=1
+fi
+
+if section_enabled xterm; then
   command -v npm >/dev/null 2>&1 ||
     die "npm is required for the pinned independent xterm.js recovery oracle"
   run_step "pinned xterm.js oracle dependencies" \

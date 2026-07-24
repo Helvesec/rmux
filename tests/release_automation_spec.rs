@@ -841,7 +841,7 @@ fn ci_defers_release_review_until_the_protected_fast_lane_finishes() {
         "workflow_call:",
         "Candidate release delta gate",
         "--evidence-mode candidate-delta",
-        "section: [static, cli, tmux]",
+        "section: [static, xterm, cli, tmux]",
         "run-id: ${{ inputs.fast_run_id }}",
     ] {
         assert!(
