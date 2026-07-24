@@ -540,6 +540,57 @@ async fn surface_nonvisual_output_advances_receiver_without_emitting_a_patch() {
 }
 
 #[tokio::test]
+async fn surface_delivers_metadata_completeness_changes_with_same_bounded_title() {
+    let handler = RequestHandler::new();
+    let (target, output, transcript) = test_pane(&handler).await;
+    let subscribed = subscribe(&handler, &target, PaneStreamMode::Surface).await;
+    let bounded_title = "x".repeat(crate::pane_recovery::MAX_RECOVERY_STRING_BYTES);
+
+    for (title, expected_complete) in [
+        (bounded_title.clone(), true),
+        (format!("{bounded_title}y"), false),
+        (bounded_title.clone(), true),
+    ] {
+        let bytes = format!("\x1b]2;{title}\x07").into_bytes();
+        transcript
+            .lock()
+            .expect("transcript lock")
+            .append_bytes(&bytes);
+        output.send(bytes);
+
+        let events = cursor(&handler, subscribed.subscription_id).await;
+        let frame = events
+            .iter()
+            .find_map(surface_frame)
+            .expect("metadata completeness transition");
+        assert_eq!(frame.snapshot.title, bounded_title);
+        assert_eq!(frame.snapshot.metadata_complete, expected_complete);
+    }
+}
+
+#[tokio::test]
+async fn surface_delivers_metadata_only_completeness_changes() {
+    let handler = RequestHandler::new();
+    let (target, output, transcript) = test_pane(&handler).await;
+    let subscribed = subscribe(&handler, &target, PaneStreamMode::Surface).await;
+    let uri = "x".repeat(crate::pane_recovery::MAX_RECOVERY_HYPERLINK_ENTRY_BYTES + 1);
+    let bytes = format!("\x1b]8;;{uri}\x1b\\").into_bytes();
+
+    transcript
+        .lock()
+        .expect("transcript lock")
+        .append_bytes(&bytes);
+    output.send(bytes);
+
+    let events = cursor(&handler, subscribed.subscription_id).await;
+    let frame = events
+        .iter()
+        .find_map(surface_frame)
+        .expect("metadata-only surface update");
+    assert!(!frame.snapshot.metadata_complete);
+}
+
+#[tokio::test]
 async fn surface_refresh_does_not_hide_exit_published_during_its_rebase_window() {
     let handler = RequestHandler::new();
     let (target, output, transcript) = test_pane(&handler).await;

@@ -374,6 +374,7 @@ impl Screen {
             0
         };
         viewport.hyperlinks = hyperlinks;
+        viewport.metadata_revision = self.metadata_revision;
         viewport.utf8_config = self.utf8_config.clone();
         viewport.saved_cursor_x = None;
         viewport.saved_cursor_y = None;
@@ -519,6 +520,7 @@ impl Screen {
         viewport.title_stack = self.title_stack.clone();
         viewport.hyperlinks = self.hyperlinks.clone();
         viewport.active_hyperlink = self.active_hyperlink;
+        viewport.metadata_revision = self.metadata_revision;
         viewport.bell_count = 0;
         viewport.utf8_config = self.utf8_config.clone();
 

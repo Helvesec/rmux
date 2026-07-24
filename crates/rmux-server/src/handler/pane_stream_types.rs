@@ -113,6 +113,7 @@ pub(in crate::handler) struct PaneSurfaceFingerprint {
     scroll_region: (u32, u32),
     history_size: usize,
     history_bytes: usize,
+    metadata_revision: u64,
 }
 
 impl PaneSurfaceFingerprint {
@@ -132,6 +133,7 @@ impl PaneSurfaceFingerprint {
             scroll_region: screen.scroll_region(),
             history_size: screen.history_size(),
             history_bytes: screen.history_bytes(),
+            metadata_revision: screen.metadata_revision(),
         }
     }
 }

@@ -59,6 +59,7 @@ pub struct Screen {
     tabs: Vec<bool>,
     hyperlinks: Hyperlinks,
     active_hyperlink: u32,
+    metadata_revision: u64,
     bell_count: u64,
     terminal_passthrough: Vec<TerminalPassthrough>,
     dropped_terminal_passthrough_count: u64,
@@ -117,6 +118,7 @@ impl Screen {
             tabs: Vec::new(),
             hyperlinks: Hyperlinks::new(),
             active_hyperlink: 0,
+            metadata_revision: 0,
             bell_count: 0,
             terminal_passthrough: Vec::new(),
             dropped_terminal_passthrough_count: 0,
@@ -189,7 +191,21 @@ impl Screen {
 
     /// Sets the current screen title.
     pub fn set_title(&mut self, title: impl Into<String>) {
-        self.title = title.into();
+        let title = title.into();
+        if self.title != title {
+            self.title = title;
+            self.bump_metadata_revision();
+        }
+    }
+
+    /// Returns the revision of terminal-controlled metadata.
+    #[must_use]
+    pub const fn metadata_revision(&self) -> u64 {
+        self.metadata_revision
+    }
+
+    fn bump_metadata_revision(&mut self) {
+        self.metadata_revision = self.metadata_revision.saturating_add(1);
     }
 
     /// Enables or disables title changes requested by pane output.
@@ -467,6 +483,7 @@ impl Screen {
         self.grid.clear_history();
         if reset_hyperlinks {
             self.hyperlinks.reset();
+            self.bump_metadata_revision();
         }
     }
 

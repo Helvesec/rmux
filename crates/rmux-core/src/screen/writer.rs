@@ -425,13 +425,17 @@ impl ScreenWriter for Screen {
     }
 
     fn set_window_name(&mut self, name: &str) {
-        if self.title_rename_enabled {
+        if self.title_rename_enabled && self.window_name != name {
             self.window_name = name.to_owned();
+            self.bump_metadata_revision();
         }
     }
 
     fn set_path(&mut self, path: &str) {
-        self.path = path.to_owned();
+        if self.path != path {
+            self.path = path.to_owned();
+            self.bump_metadata_revision();
+        }
     }
 
     fn save_cursor(&mut self) {
@@ -485,6 +489,7 @@ impl ScreenWriter for Screen {
         self.title_stack.clear();
         self.active_hyperlink = 0;
         self.hyperlinks.reset();
+        self.bump_metadata_revision();
     }
 
     fn start_sync(&mut self) {
@@ -503,9 +508,11 @@ impl ScreenWriter for Screen {
         let (internal_id, uri) = Self::parse_hyperlink(data);
         if uri.is_empty() {
             self.active_hyperlink = 0;
+            self.bump_metadata_revision();
             return;
         }
         self.active_hyperlink = self.hyperlinks.put(&uri, internal_id.as_deref());
+        self.bump_metadata_revision();
     }
 
     fn current_hyperlink_id(&self) -> u32 {
@@ -569,6 +576,7 @@ impl ScreenWriter for Screen {
             self.title_stack.drain(0..excess);
         }
         self.title_stack.push(self.title.clone());
+        self.bump_metadata_revision();
     }
 
     fn pop_title(&mut self) {
@@ -577,6 +585,7 @@ impl ScreenWriter for Screen {
         }
         if let Some(title) = self.title_stack.pop() {
             self.title = title;
+            self.bump_metadata_revision();
         }
     }
 

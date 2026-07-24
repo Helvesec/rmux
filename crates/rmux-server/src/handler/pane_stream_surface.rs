@@ -384,6 +384,7 @@ fn surface_content_equal(
         && current.cursor == next.cursor
         && current.title == next.title
         && current.path == next.path
+        && current.metadata_complete == next.metadata_complete
         && current.mode_bits == next.mode_bits
         && current.alternate == next.alternate
         && current.scroll_top == next.scroll_top
