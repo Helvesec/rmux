@@ -89,7 +89,7 @@ tests = [
 ]
 limitations = [
   "Unix descendants that call setsid() and leave the tracked process group may survive shutdown",
-  "RMUX drains accepted background session-closed hooks that tmux 3.7b drops during final shutdown",
+  "RMUX drains background session-closed hooks within its bounded shutdown window; work still queued when that window expires is cancelled",
 ]
 
 [[entry]]

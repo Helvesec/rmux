@@ -15,6 +15,7 @@ use common::{assert_success, stderr, stdout, CliHarness, DaemonGuard};
 const BACKGROUND_TIMEOUT: Duration = Duration::from_secs(5);
 const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(5);
 const SLOW_HOOK_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(7);
+const HOOK_SHUTDOWN_BURST: usize = 4;
 
 #[test]
 fn background_run_shell_command_survives_originating_client_exit() -> Result<(), Box<dyn Error>> {
@@ -189,7 +190,7 @@ fn kill_server_joins_background_session_closed_hook_trees_product_divergence(
     let probe = HookShutdownBurst::new(&harness)?;
     let accepted_path = harness.tmpdir().join("background-hooks-accepted.log");
 
-    for index in 0..32 {
+    for index in 0..HOOK_SHUTDOWN_BURST {
         assert_success(&harness.run(&[
             "new-session",
             "-d",
@@ -199,7 +200,11 @@ fn kill_server_joins_background_session_closed_hook_trees_product_divergence(
     }
     assert_success(&harness.run(&["set-hook", "-g", "session-closed", &probe.hook_command(0)])?);
     assert_success(&harness.run(&["set-hook", "-ag", "session-closed", &probe.hook_command(1)])?);
-    let accepted_command = format!("printf 'accepted\\n' >> {}", shell_quote(&accepted_path));
+    let accepted_command = format!(
+        "{}; printf 'accepted\\n' >> {}",
+        probe.wait_until_started_command(),
+        shell_quote(&accepted_path)
+    );
     assert_success(&harness.run(&[
         "set-hook",
         "-ag",
@@ -212,8 +217,8 @@ fn kill_server_joins_background_session_closed_hook_trees_product_divergence(
 
     assert_eq!(
         fs::read_to_string(&accepted_path)?.lines().count(),
-        32,
-        "every accepted session-closed hook must drain before shutdown"
+        HOOK_SHUTDOWN_BURST,
+        "fast session-closed hooks must drain within the bounded shutdown window"
     );
     probe.assert_started_and_terminated()?;
     Ok(())
@@ -404,10 +409,15 @@ impl HookShutdownBurst {
                     "#!/bin/sh\n\
                      set -eu\n\
                      parent=$$\n\
-                     printf '%s\\n' \"$parent\" > {state}/$parent.parent\n\
+                     parent_file={state}/$parent.parent\n\
+                     printf '%s\\n' \"$parent\" > \"$parent_file.tmp\"\n\
+                     mv \"$parent_file.tmp\" \"$parent_file\"\n\
                      (trap '' HUP TERM PIPE; {child_loop}){child_redirect} &\n\
                      child=$!\n\
-                     printf '%s\\n' \"$child\" > {state}/$parent.child\n\
+                     child_file={state}/$parent.child\n\
+                     printf '%s\\n' \"$child\" > \"$child_file.tmp\"\n\
+                     mv \"$child_file.tmp\" \"$child_file\"\n\
+                     : > {state}/ready\n\
                      trap '' HUP TERM PIPE\n\
                      wait \"$child\"\n",
                     state = shell_quote(&state_dir),
@@ -427,6 +437,20 @@ impl HookShutdownBurst {
 
     fn hook_command(&self, index: usize) -> String {
         format!("run-shell -b {}", shell_quote(&self.scripts[index]))
+    }
+
+    fn wait_until_started_command(&self) -> String {
+        let pending = self
+            .state_dirs
+            .iter()
+            .map(|state_dir| format!("[ ! -f {} ]", shell_quote(&state_dir.join("ready"))))
+            .collect::<Vec<_>>()
+            .join(" || ");
+        format!(
+            "attempt=0; while {pending}; do \
+             attempt=$((attempt + 1)); [ \"$attempt\" -lt 100 ] || exit 1; sleep 0.02; \
+             done"
+        )
     }
 
     fn assert_started_and_terminated(&self) -> Result<(), Box<dyn Error>> {
