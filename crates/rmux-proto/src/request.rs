@@ -114,6 +114,7 @@ pub use web::{
 
 /// All detached public command and internal RPC requests supported by the wire
 /// protocol.
+#[non_exhaustive]
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Request {
     /// `new-session`

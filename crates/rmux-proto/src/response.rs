@@ -82,6 +82,7 @@ pub use web::{
 };
 
 /// All detached responses supported by the wire protocol.
+#[non_exhaustive]
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Response {
     /// Success payload for `new-session`.
