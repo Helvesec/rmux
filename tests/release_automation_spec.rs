@@ -2000,6 +2000,107 @@ fn rss_fd_detector_does_not_match_foreign_process_arguments() {
 
 #[test]
 #[cfg(unix)]
+fn rpm_repository_refuses_to_clean_unmanaged_output_directories() {
+    use std::os::unix::fs::symlink;
+
+    let root = temp_dir("rpm-repository-output-guard");
+    let tools = root.join("tools");
+    let input = root.join("input");
+    fs::create_dir_all(&tools).expect("create fake tool directory");
+    fs::create_dir_all(&input).expect("create RPM input directory");
+    fs::write(input.join("rmux-0.9.0-1.x86_64.rpm"), b"rpm").expect("write fake RPM");
+
+    let createrepo = tools.join("createrepo_c");
+    fs::write(
+        &createrepo,
+        "#!/bin/sh\nset -eu\nmkdir -p \"$1/repodata\"\nprintf metadata > \"$1/repodata/repomd.xml\"\n",
+    )
+    .expect("write fake createrepo");
+    make_executable(&createrepo);
+    let path = format!(
+        "{}:{}",
+        tools.display(),
+        std::env::var("PATH").unwrap_or_default()
+    );
+    let run = |current_dir: &Path, output: &Path| {
+        Command::new(repo_root().join("scripts/generate-rpm-repository.sh"))
+            .args(["--input-dir"])
+            .arg(&input)
+            .args(["--output-dir"])
+            .arg(output)
+            .env("PATH", &path)
+            .current_dir(current_dir)
+            .output()
+            .expect("run RPM repository generator")
+    };
+    let assert_rejected_without_removal = |result: &Output, sentinel: &Path| {
+        assert!(
+            !result.status.success(),
+            "unsafe output directory was accepted"
+        );
+        assert!(
+            stderr(result).contains("--output-dir"),
+            "{}",
+            stderr(result)
+        );
+        assert_eq!(
+            fs::read(sentinel).expect("read protected sentinel"),
+            b"keep",
+            "unsafe output validation ran after destructive cleanup"
+        );
+    };
+
+    let traversal = root.join("traversal");
+    fs::create_dir_all(traversal.join("child")).expect("create traversal fixture");
+    let traversal_sentinel = traversal.join("keep.txt");
+    fs::write(&traversal_sentinel, b"keep").expect("write traversal sentinel");
+    let result = run(&root, &traversal.join("child/.."));
+    assert_rejected_without_removal(&result, &traversal_sentinel);
+
+    let relative_parent = root.join("relative-parent");
+    let relative_work = relative_parent.join("work");
+    fs::create_dir_all(&relative_work).expect("create relative traversal fixture");
+    let relative_sentinel = relative_parent.join("keep.txt");
+    fs::write(&relative_sentinel, b"keep").expect("write relative traversal sentinel");
+    let result = run(&relative_work, Path::new("./.."));
+    assert_rejected_without_removal(&result, &relative_sentinel);
+
+    let symlink_target = root.join("symlink-target");
+    fs::create_dir_all(&symlink_target).expect("create symlink target");
+    let symlink_sentinel = symlink_target.join("keep.txt");
+    fs::write(&symlink_sentinel, b"keep").expect("write symlink sentinel");
+    let output_link = root.join("output-link");
+    symlink(&symlink_target, &output_link).expect("create output symlink");
+    let result = run(&root, &output_link);
+    assert_rejected_without_removal(&result, &symlink_sentinel);
+
+    let unmanaged = root.join("unmanaged");
+    fs::create_dir_all(&unmanaged).expect("create unmanaged output directory");
+    let unmanaged_sentinel = unmanaged.join("keep.txt");
+    fs::write(&unmanaged_sentinel, b"keep").expect("write unmanaged sentinel");
+    let result = run(&root, &unmanaged);
+    assert_rejected_without_removal(&result, &unmanaged_sentinel);
+
+    let managed = root.join("managed");
+    let first = run(&root, &managed);
+    assert!(first.status.success(), "{}", stderr(&first));
+    fs::write(managed.join("stale.txt"), b"stale").expect("write managed stale file");
+    let second = run(&root, &managed);
+    assert!(second.status.success(), "{}", stderr(&second));
+    assert!(
+        !managed.join("stale.txt").exists(),
+        "a marked output directory must remain safely reusable"
+    );
+    assert!(
+        !managed.join(".rmux-rpm-repository").exists(),
+        "the cleanup marker must not become a published repository file"
+    );
+
+    fs::remove_dir_all(root).expect("remove temp directory");
+}
+
+#[test]
+#[cfg(unix)]
 fn rpm_repository_publishes_both_package_and_repodata_key_urls() {
     let root = temp_dir("rpm-repository-keys");
     let tools = root.join("tools");

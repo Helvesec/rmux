@@ -43,6 +43,9 @@ createrepo_cmd() {
 
 input_dir=""
 output_dir=""
+invocation_dir="$(pwd -P)"
+output_marker_suffix=".rmux-rpm-repository"
+output_marker_value="rmux-rpm-repository-v1"
 baseurl="${RMUX_PACKAGES_RPM_BASE_URL:-https://packages.rmux.io/rpm}"
 repo_id="${RMUX_RPM_REPO_ID:-rmux}"
 repo_name="${RMUX_RPM_REPO_NAME:-RMUX}"
@@ -118,6 +121,8 @@ done
 [ -d "$input_dir" ] || die "input directory not found: $input_dir"
 [ -n "$output_dir" ] || die "--output-dir is required"
 case "$output_dir" in /|.|..) die "--output-dir is too broad: $output_dir" ;; esac
+case "/$output_dir/" in */../*) die "--output-dir must not contain a parent component" ;; esac
+[ ! -L "$output_dir" ] || die "--output-dir must not be a symbolic link"
 case "$baseurl" in http://*|https://*) ;; *) die "--baseurl must be an http(s) URL" ;; esac
 case "$repo_id" in *[!A-Za-z0-9_.:-]*|""|.*) die "invalid repo id: $repo_id" ;; esac
 if [ -z "$gpg_key_url" ]; then
@@ -155,13 +160,35 @@ if [ -n "$rpm_signing_key" ]; then
 fi
 
 repo_tool="$(createrepo_cmd)"
-input_dir="$(cd "$input_dir" && pwd)"
-output_dir="$(mkdir -p "$output_dir" && cd "$output_dir" && pwd)"
+input_dir="$(cd "$input_dir" && pwd -P)"
+mkdir -p "$output_dir"
+[ ! -L "$output_dir" ] || die "--output-dir must not be a symbolic link"
+output_dir="$(cd "$output_dir" && pwd -P)"
+[ "$output_dir" != / ] || die "--output-dir is too broad: $output_dir"
+case "$invocation_dir/" in
+  "$output_dir/"*) die "--output-dir must not contain the working directory" ;;
+esac
+case "$input_dir/" in
+  "$output_dir/"*) die "--output-dir must not contain the input directory" ;;
+esac
 if [ -n "${HOME:-}" ]; then
-  home_dir="$(cd "$HOME" && pwd)"
+  home_dir="$(cd "$HOME" && pwd -P)"
   [ "$output_dir" != "$home_dir" ] || die "--output-dir must not be HOME"
 fi
-rm -rf "$output_dir"/*
+output_marker="${output_dir}${output_marker_suffix}"
+if [ -L "$output_marker" ]; then
+  die "--output-dir has an invalid repository marker"
+elif [ -e "$output_marker" ]; then
+  [ -f "$output_marker" ] || die "--output-dir has an invalid repository marker"
+  [ "$(cat "$output_marker")" = "$output_marker_value" ] || \
+    die "--output-dir has an invalid repository marker"
+elif [ -n "$(find "$output_dir" -mindepth 1 -maxdepth 1 -print -quit)" ]; then
+  die "--output-dir is not an RMUX-managed RPM repository"
+else
+  printf '%s\n' "$output_marker_value" > "$output_marker"
+fi
+cd "$output_dir"
+rm -rf ./*
 
 found=0
 for rpm in "$input_dir"/rmux-*.rpm; do
