@@ -132,6 +132,7 @@ impl RequestHandler {
                 driver.latest.snapshot.revision.saturating_add(1),
                 reset,
                 driver.fingerprint.clone(),
+                driver.receiver.observed_invalidation_revision(),
                 driver.receiver.observed_process_exit_revision(),
                 frame_lifecycle_revision,
                 limit,
@@ -152,6 +153,7 @@ impl RequestHandler {
             minimum_snapshot_revision,
             reset,
             previous_fingerprint,
+            observed_invalidation_revision,
             observed_process_exit_revision,
             frame_lifecycle_revision,
             limit,
@@ -199,6 +201,21 @@ impl RequestHandler {
                 false,
             );
         };
+        if captured.boundary.invalidation_revision > observed_invalidation_revision {
+            let response = {
+                let mut subscriptions = self
+                    .subscriptions
+                    .lock()
+                    .expect("subscription registry mutex must not be poisoned");
+                deliver_surface_latest(
+                    &mut subscriptions,
+                    request.subscription_id,
+                    limit,
+                    source_batch_limited,
+                )
+            };
+            return response;
+        }
         captured
             .receiver
             .preserve_process_exits_since(observed_process_exit_revision);

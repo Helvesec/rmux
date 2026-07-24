@@ -846,6 +846,67 @@ async fn surface_noop_mutation_is_silent_but_resize_resets_epoch() {
 }
 
 #[tokio::test]
+async fn surface_refresh_retries_an_invalidation_captured_during_projection() {
+    let handler = Arc::new(RequestHandler::new());
+    let (target, output, transcript) = test_pane(handler.as_ref()).await;
+    let subscribed = subscribe(handler.as_ref(), &target, PaneStreamMode::Surface).await;
+
+    crate::pane_io::publish_pane_bytes_for_test(&transcript, &output, b"visual".to_vec());
+    let state = handler.state.lock().await;
+    let poll_handler = Arc::clone(&handler);
+    let subscription_id = subscribed.subscription_id;
+    let poll =
+        tokio::spawn(
+            async move { cursor_with_limit(poll_handler.as_ref(), subscription_id, 32).await },
+        );
+
+    let mut refresh_started = false;
+    for _ in 0..100 {
+        refresh_started = handler
+            .subscriptions
+            .lock()
+            .expect("subscription lock")
+            .surface_drivers
+            .values()
+            .any(|driver| driver.refreshing);
+        if refresh_started {
+            break;
+        }
+        tokio::task::yield_now().await;
+    }
+    assert!(refresh_started, "surface refresh starts before capture");
+
+    output.mutate_transcript(&transcript, PaneInvalidationReason::Resize, |transcript| {
+        transcript.resize(TerminalSize { cols: 14, rows: 4 });
+        ((), true)
+    });
+    drop(state);
+
+    let first = poll.await.expect("surface poll joins");
+    let second = cursor_with_limit(handler.as_ref(), subscription_id, 32).await;
+    let events = first
+        .events
+        .into_iter()
+        .chain(second.events)
+        .collect::<Vec<_>>();
+    assert!(
+        events
+            .iter()
+            .all(|event| !matches!(event, PaneStreamEvent::SurfacePatch(_))),
+        "an invalidated projection must not publish a patch in the old epoch"
+    );
+    let reset = events
+        .iter()
+        .find_map(|event| match event {
+            PaneStreamEvent::SurfaceReset(frame) => Some(frame),
+            _ => None,
+        })
+        .expect("the invalidation is retried as a reset");
+    assert_eq!(reset.epoch, 2);
+    assert_eq!((reset.snapshot.cols, reset.snapshot.rows), (14, 4));
+}
+
+#[tokio::test]
 async fn surface_nonvisual_output_advances_receiver_without_emitting_a_patch() {
     let handler = RequestHandler::new();
     let (target, output, transcript) = test_pane(&handler).await;

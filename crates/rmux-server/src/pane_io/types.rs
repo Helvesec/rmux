@@ -342,6 +342,10 @@ impl PaneOutputReceiver {
         Arc::ptr_eq(&self.inner, &other.inner)
     }
 
+    pub(crate) const fn observed_invalidation_revision(&self) -> u64 {
+        self.observed_invalidation_revision
+    }
+
     pub(crate) const fn observed_process_exit_revision(&self) -> u64 {
         self.observed_process_exit_revision
     }
