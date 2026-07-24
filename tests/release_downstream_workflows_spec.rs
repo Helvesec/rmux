@@ -14,6 +14,8 @@ const DOWNSTREAM_PREPARE: &str =
     include_str!("../.github/workflows/release-downstream-prepare.yml");
 const RECEIPT: &str = include_str!("../.github/workflows/release-receipt.yml");
 const CI: &str = include_str!("../.github/workflows/ci.yml");
+const CHANNEL_RESULT_ACTION: &str =
+    include_str!("../.github/actions/release-channel-result/action.yml");
 const RECEIPT_REFERENCE_BUILDER: &str =
     include_str!("../scripts/release/build-downstream-receipt-reference.py");
 
@@ -298,6 +300,13 @@ fn downstream_json_writer_uses_canonical_lf_bytes_on_every_platform() {
     let bytes = fs::read(&output_path).expect("read canonical downstream JSON");
     fs::remove_dir_all(root).expect("remove canonical JSON fixture directory");
     assert_eq!(bytes, b"{\n  \"a\": 2,\n  \"z\": 1\n}\n");
+}
+
+#[test]
+fn downstream_result_digest_is_independent_of_windows_path_escaping() {
+    assert!(CHANNEL_RESULT_ACTION
+        .contains("digest=\"$(sha256sum < \"$RMUX_TARGET_EVIDENCE\" | cut -d' ' -f1)\""));
+    assert!(!CHANNEL_RESULT_ACTION.contains("sha256sum \"$RMUX_TARGET_EVIDENCE\""));
 }
 
 #[test]

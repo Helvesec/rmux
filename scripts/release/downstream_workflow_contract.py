@@ -166,11 +166,18 @@ def _validate_payload_prepare(path: Path) -> None:
 
 def _validate_channel_result_action(path: Path) -> None:
     text = path.read_text(encoding="utf-8")
+    digest = 'digest="$(sha256sum < "$RMUX_TARGET_EVIDENCE" | cut -d\' \' -f1)"'
     qualified = 'echo "subject_digest=sha256:$digest" >> "$GITHUB_OUTPUT"'
     unqualified = 'echo "subject_digest=$digest" >> "$GITHUB_OUTPUT"'
     consumer = "subject-digest: ${{ steps.predicate.outputs.subject_digest }}"
-    if text.count(qualified) != 1 or text.count(consumer) != 1:
+    if (
+        text.count(digest) != 1
+        or text.count(qualified) != 1
+        or text.count(consumer) != 1
+    ):
         raise ValueError("channel result attestation lost its qualified subject digest")
+    if 'sha256sum "$RMUX_TARGET_EVIDENCE"' in text:
+        raise ValueError("channel result digest regained filename-dependent output")
     if unqualified in text:
         raise ValueError("channel result attestation regained an unqualified digest")
 
