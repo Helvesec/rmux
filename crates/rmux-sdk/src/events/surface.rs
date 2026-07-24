@@ -105,6 +105,7 @@ impl PaneSurfaceState {
                             received_revision: frame.revision,
                         });
                     }
+                    validate_output_boundary(current, frame)?;
                 }
                 self.frame = Some(frame.clone());
                 Ok(true)
@@ -127,6 +128,7 @@ impl PaneSurfaceState {
                         received_revision: frame.revision,
                     });
                 }
+                validate_output_boundary(current, frame)?;
                 self.frame = Some(frame.clone());
                 Ok(true)
             }
@@ -178,6 +180,13 @@ pub enum PaneSurfaceApplyError {
         /// Rejected patch revision.
         received_revision: u64,
     },
+    /// A frame moved behind output already represented by the surface.
+    OutputSequenceRegressed {
+        /// First output sequence not represented by the current frame.
+        current_sequence: u64,
+        /// First output sequence not represented by the rejected frame.
+        received_sequence: u64,
+    },
     /// The frame's row-major grid shape was invalid.
     InvalidShape(crate::PaneSnapshotShapeError),
     /// An event arrived after a terminal end.
@@ -208,6 +217,13 @@ impl fmt::Display for PaneSurfaceApplyError {
             } => write!(
                 formatter,
                 "surface revision {received_revision} does not advance current revision {current_revision}"
+            ),
+            Self::OutputSequenceRegressed {
+                current_sequence,
+                received_sequence,
+            } => write!(
+                formatter,
+                "surface output boundary regressed from {current_sequence} to {received_sequence}"
             ),
             Self::InvalidShape(error) => write!(formatter, "invalid surface grid: {error}"),
             Self::AlreadyEnded(reason) => {
@@ -266,6 +282,19 @@ fn validate_frame(frame: &PaneSurfaceFrame) -> std::result::Result<(), PaneSurfa
         .grid
         .validate_shape()
         .map_err(PaneSurfaceApplyError::InvalidShape)
+}
+
+fn validate_output_boundary(
+    current: &PaneSurfaceFrame,
+    received: &PaneSurfaceFrame,
+) -> std::result::Result<(), PaneSurfaceApplyError> {
+    if received.next_output_sequence < current.next_output_sequence {
+        return Err(PaneSurfaceApplyError::OutputSequenceRegressed {
+            current_sequence: current.next_output_sequence,
+            received_sequence: received.next_output_sequence,
+        });
+    }
+    Ok(())
 }
 
 fn map_event(event: ProtoEvent) -> Result<MappedEvent<PaneSurfaceEvent>> {
@@ -333,10 +362,14 @@ mod tests {
     use crate::{PaneCursor, PaneSnapshot};
 
     fn frame(epoch: u64, revision: u64) -> PaneSurfaceFrame {
+        frame_at(epoch, revision, revision)
+    }
+
+    fn frame_at(epoch: u64, revision: u64, next_output_sequence: u64) -> PaneSurfaceFrame {
         PaneSurfaceFrame {
             epoch,
             revision,
-            next_output_sequence: revision,
+            next_output_sequence,
             snapshot: PaneSurfaceSnapshot {
                 grid: PaneSnapshot::new(0, 0, Vec::new(), PaneCursor::default())
                     .expect("zero-sized grid")
@@ -401,6 +434,36 @@ mod tests {
             Err(PaneSurfaceApplyError::AlreadyEnded(
                 PaneStreamEndReason::PaneRemoved
             ))
+        );
+    }
+
+    #[test]
+    fn reducer_rejects_output_boundary_regressions_across_patches_and_resets() {
+        let mut patch_state = PaneSurfaceState::default();
+        patch_state
+            .apply(&PaneSurfaceEvent::Reset(frame_at(1, 1, 8)))
+            .expect("initial reset");
+        assert_eq!(
+            patch_state.apply(&PaneSurfaceEvent::Patch(frame_at(1, 2, 7))),
+            Err(PaneSurfaceApplyError::OutputSequenceRegressed {
+                current_sequence: 8,
+                received_sequence: 7,
+            })
+        );
+        patch_state
+            .apply(&PaneSurfaceEvent::Patch(frame_at(1, 2, 8)))
+            .expect("a frame can advance without new raw output");
+
+        let mut reset_state = PaneSurfaceState::default();
+        reset_state
+            .apply(&PaneSurfaceEvent::Reset(frame_at(1, 1, 8)))
+            .expect("initial reset");
+        assert_eq!(
+            reset_state.apply(&PaneSurfaceEvent::Reset(frame_at(2, 2, 7))),
+            Err(PaneSurfaceApplyError::OutputSequenceRegressed {
+                current_sequence: 8,
+                received_sequence: 7,
+            })
         );
     }
 }
