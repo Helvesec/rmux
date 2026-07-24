@@ -6,6 +6,8 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 const DOWNSTREAM: &str = include_str!("../.github/workflows/release-downstream.yml");
 const DOWNSTREAM_AUDIT: &str = include_str!("../.github/workflows/release-downstream-audit.yml");
+const DOWNSTREAM_AUDIT_ACTION: &str =
+    include_str!("../.github/actions/release-downstream-audit/action.yml");
 const RECEIPT: &str = include_str!("../.github/workflows/release-receipt.yml");
 const CI: &str = include_str!("../.github/workflows/ci.yml");
 const RECEIPT_REFERENCE_BUILDER: &str =
@@ -91,7 +93,13 @@ fn downstream_workflow_is_receipt_gated_read_only_and_active() {
     assert_eq!(DOWNSTREAM.matches("if: ${{ false }}").count(), 0);
     assert!(!DOWNSTREAM.contains("contents: write"));
     assert!(!DOWNSTREAM.contains("secrets: inherit"));
-    assert!(!DOWNSTREAM.contains("environment:"));
+    assert_eq!(
+        DOWNSTREAM
+            .matches("environment: release-publication")
+            .count(),
+        1
+    );
+    assert_eq!(DOWNSTREAM.matches("environment:").count(), 1);
     assert!(!DOWNSTREAM.contains("self-hosted"));
     assert!(!DOWNSTREAM.contains("larger-runner"));
 
@@ -180,25 +188,34 @@ fn downstream_authority_is_rechecked_live_before_payload_staging() {
     assert!(DOWNSTREAM_AUDIT.contains("on:\n  workflow_call:"));
     assert!(DOWNSTREAM_AUDIT.contains("  workflow_dispatch:"));
     assert!(DOWNSTREAM_AUDIT.contains("environment: release-publication"));
-    assert!(DOWNSTREAM_AUDIT.contains("permission-administration: write"));
-    assert!(DOWNSTREAM_AUDIT.contains("permission-contents: read"));
-    assert!(!DOWNSTREAM_AUDIT.contains("permission-administration: read"));
-    assert!(!DOWNSTREAM_AUDIT.contains("permission-contents: write"));
+    assert!(DOWNSTREAM_AUDIT.contains("uses: ./.github/actions/release-downstream-audit"));
     assert!(!DOWNSTREAM_AUDIT.contains("secrets: inherit"));
-    assert!(DOWNSTREAM_AUDIT.contains("collect-downstream-repository.py"));
-    assert!(DOWNSTREAM_AUDIT.contains("verify-downstream-repository.py fixtures"));
+    assert!(DOWNSTREAM_AUDIT_ACTION.contains("permission-administration: write"));
+    assert!(DOWNSTREAM_AUDIT_ACTION.contains("permission-contents: read"));
+    assert!(!DOWNSTREAM_AUDIT_ACTION.contains("permission-administration: read"));
+    assert!(!DOWNSTREAM_AUDIT_ACTION.contains("permission-contents: write"));
+    assert!(DOWNSTREAM_AUDIT_ACTION.contains("collect-downstream-repository.py"));
+    assert!(DOWNSTREAM_AUDIT_ACTION.contains("verify-downstream-repository.py fixtures"));
     assert_eq!(
-        DOWNSTREAM_AUDIT
+        DOWNSTREAM_AUDIT_ACTION
             .matches("actions/create-github-app-token@fee1f7d63c2ff003460e3d139729b119787bc349")
             .count(),
         1
     );
+    assert!(!DOWNSTREAM.contains("uses: ./.github/workflows/release-downstream-audit.yml"));
     assert_eq!(
         DOWNSTREAM
-            .matches("uses: ./.github/workflows/release-downstream-audit.yml")
+            .matches("uses: ./.github/actions/release-downstream-audit")
             .count(),
         1
     );
+    let audit = job(
+        DOWNSTREAM,
+        "audit-downstream-authority",
+        Some("prepare-payloads"),
+    );
+    assert!(audit.contains("environment: release-publication"));
+    assert!(audit.contains("app-private-key: ${{ secrets.RMUX_DOWNSTREAM_APP_PRIVATE_KEY }}"));
     let payloads = job(
         DOWNSTREAM,
         "prepare-payloads",

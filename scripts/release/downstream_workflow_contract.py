@@ -44,6 +44,10 @@ def _audit_path(root: Path) -> Path:
     return root / ".github/workflows/release-downstream-audit.yml"
 
 
+def _audit_action_path(root: Path) -> Path:
+    return root / ".github/actions/release-downstream-audit/action.yml"
+
+
 def _validate_reusable_workflow(path: Path, *, require_repository_guard: bool) -> None:
     text = path.read_text(encoding="utf-8")
     if "on:\n  workflow_call:" not in text or "permissions: {}" not in text:
@@ -186,21 +190,30 @@ def _validate_retry_prepare(path: Path) -> None:
         raise ValueError("channel retry preparer regained a wrong origin or rebuild")
 
 
-def _validate_live_audit(path: Path) -> None:
-    text = path.read_text(encoding="utf-8")
-    required = (
+def _validate_live_audit(path: Path, action_path: Path, main: str) -> None:
+    workflow = path.read_text(encoding="utf-8")
+    action = action_path.read_text(encoding="utf-8")
+    workflow_required = (
         "on:\n  workflow_call:",
         "  workflow_dispatch:",
         "permissions: {}",
         "environment: release-publication",
+        "uses: ./.github/actions/release-downstream-audit",
+        "app-private-key: ${{ secrets.RMUX_DOWNSTREAM_APP_PRIVATE_KEY }}",
+        'test "$GITHUB_RUN_ATTEMPT" = 1',
+        'test "$GITHUB_SHA" = "$RMUX_EXPECTED_SOURCE_SHA"',
+    )
+    action_required = (
+        "using: composite",
+        "actions/create-github-app-token@fee1f7d63c2ff003460e3d139729b119787bc349",
         "permission-administration: write",
         "permission-contents: read",
         "collect-downstream-repository.py",
         "verify-downstream-repository.py fixtures",
-        'test "$GITHUB_RUN_ATTEMPT" = 1',
-        'test "$GITHUB_SHA" = "$RMUX_EXPECTED_SOURCE_SHA"',
     )
-    if any(text.count(value) != 1 for value in required):
+    if any(workflow.count(value) != 1 for value in workflow_required):
+        raise ValueError("standalone downstream audit lost an exact authority gate")
+    if any(action.count(value) != 1 for value in action_required):
         raise ValueError("downstream live audit lost an exact authority gate")
     for repository in (
         "homebrew-rmux",
@@ -208,14 +221,27 @@ def _validate_live_audit(path: Path) -> None:
         "rmux-web-share",
         "scoop-rmux",
     ):
-        if text.count(repository) != 2:
+        if action.count(repository) != 2:
             raise ValueError(f"downstream live audit lost repository {repository}")
     if (
-        "permission-contents: write" in text
-        or "secrets: inherit" in text
-        or "self-hosted" in text
+        "permission-contents: write" in action
+        or "secrets: inherit" in workflow
+        or "secrets: inherit" in main
+        or "self-hosted" in workflow
+        or "self-hosted" in main
     ):
         raise ValueError("downstream live audit gained mutation authority")
+    direct_required = (
+        "\n  audit-downstream-authority:\n",
+        "environment: release-publication",
+        "uses: ./.github/actions/release-downstream-audit",
+        "app-private-key: ${{ secrets.RMUX_DOWNSTREAM_APP_PRIVATE_KEY }}",
+        "needs: [prepare-plan, audit-downstream-authority]",
+    )
+    if any(main.count(value) < 1 for value in direct_required):
+        raise ValueError("nested downstream path lost its direct environment audit")
+    if "uses: ./.github/workflows/release-downstream-audit.yml" in main:
+        raise ValueError("downstream audit must not cross a nested reusable secret boundary")
 
 
 def _validate_helper_sizes(root: Path) -> None:
@@ -246,7 +272,6 @@ def _validate_channel_orchestration(main: str) -> None:
         "release-channel-summary.yml": 2,
         "release-chocolatey-channel.yml": 1,
         "release-crates-channel.yml": 1,
-        "release-downstream-audit.yml": 1,
         "release-linux-repository-build.yml": 1,
         "release-linux-repository-publish.yml": 1,
         "release-owned-repository-channel.yml": 3,
@@ -285,7 +310,7 @@ def _validate_channel_orchestration(main: str) -> None:
         raise ValueError("downstream mutation workflows expose inherited secrets")
     if (
         "needs: [prepare-plan, audit-downstream-authority]" not in main
-        or "uses: ./.github/workflows/release-downstream-audit.yml" not in main
+        or "uses: ./.github/actions/release-downstream-audit" not in main
     ):
         raise ValueError(
             "downstream payloads do not depend on the live authority audit"
@@ -308,7 +333,7 @@ def validate_downstream_workflows(root: Path) -> None:
         _validate_retry(path)
     _validate_retry_dispatch(_retry_dispatch_path(root))
     _validate_retry_prepare(_retry_prepare_path(root))
-    _validate_live_audit(_audit_path(root))
+    _validate_live_audit(_audit_path(root), _audit_action_path(root), main)
     verifier = root / "scripts/release/verify-receipt-attestation.py"
     if "--deny-self-hosted-runners" not in verifier.read_text(encoding="utf-8"):
         raise ValueError("receipt verifier lost its GitHub-hosted runner gate")
