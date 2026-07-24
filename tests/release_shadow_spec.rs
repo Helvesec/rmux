@@ -288,6 +288,62 @@ fn exact_run_verifier_accepts_only_the_contracted_job_set() {
     assert_eq!(hosted["runner_group_name"], "GitHub Actions");
 
     let original_jobs = fs::read_to_string(&jobs_path).expect("read accepted jobs fixture");
+    let mut unassigned_sentinel: serde_json::Value =
+        serde_json::from_str(&original_jobs).expect("parse accepted jobs fixture");
+    let skipped = unassigned_sentinel["jobs"]
+        .as_array_mut()
+        .expect("jobs array")
+        .iter_mut()
+        .find(|job| {
+            job["conclusion"] == "skipped"
+                && job["labels"]
+                    .as_array()
+                    .is_some_and(|labels| !labels.is_empty())
+        })
+        .expect("skipped fixture job");
+    skipped["runner_id"] = serde_json::json!(0);
+    skipped["runner_name"] = serde_json::json!("");
+    skipped["runner_group_id"] = serde_json::json!(0);
+    skipped["runner_group_name"] = serde_json::json!("");
+    fs::write(&jobs_path, unassigned_sentinel.to_string())
+        .expect("write unassigned runner sentinel");
+    let accepted_sentinel = run(&verifier, &common);
+    assert!(
+        accepted_sentinel.status.success(),
+        "{}",
+        String::from_utf8_lossy(&accepted_sentinel.stderr)
+    );
+
+    let mut boolean_sentinel = unassigned_sentinel.clone();
+    let skipped = boolean_sentinel["jobs"]
+        .as_array_mut()
+        .expect("jobs array")
+        .iter_mut()
+        .find(|job| job["runner_id"] == 0)
+        .expect("sentinel fixture job");
+    skipped["runner_id"] = serde_json::json!(false);
+    fs::write(&jobs_path, boolean_sentinel.to_string())
+        .expect("write boolean unassigned runner sentinel");
+    let rejected_boolean_sentinel = run(&verifier, &common);
+    assert!(!rejected_boolean_sentinel.status.success());
+    assert!(String::from_utf8_lossy(&rejected_boolean_sentinel.stderr)
+        .contains("exact unassigned API sentinel"));
+
+    let mut mixed_sentinel = unassigned_sentinel.clone();
+    let skipped = mixed_sentinel["jobs"]
+        .as_array_mut()
+        .expect("jobs array")
+        .iter_mut()
+        .find(|job| job["runner_id"] == 0)
+        .expect("sentinel fixture job");
+    skipped["runner_group_name"] = serde_json::json!("GitHub Actions");
+    fs::write(&jobs_path, mixed_sentinel.to_string())
+        .expect("write mixed unassigned runner sentinel");
+    let rejected_mixed_sentinel = run(&verifier, &common);
+    assert!(!rejected_mixed_sentinel.status.success());
+    assert!(String::from_utf8_lossy(&rejected_mixed_sentinel.stderr)
+        .contains("exact unassigned API sentinel"));
+
     let mut self_hosted: serde_json::Value =
         serde_json::from_str(&original_jobs).expect("parse accepted jobs fixture");
     let executed = self_hosted["jobs"]

@@ -198,15 +198,33 @@ def verify_job_runner(
     if "self-hosted" in labels:
         raise ValueError(f"job {name} used a self-hosted runner")
     if job.get("conclusion") == "skipped":
-        for field in (
+        fields = (
             "runner_id",
             "runner_name",
             "runner_group_id",
             "runner_group_name",
-        ):
+        )
+        for field in fields:
             if field not in job:
                 raise ValueError(f"skipped job {name} is missing {field}")
-            require_equal(job[field], None, f"skipped job {name} {field}")
+        values = tuple(job[field] for field in fields)
+        if all(value is None for value in values):
+            return
+        unassigned_sentinel = (
+            type(values[0]) is int
+            and values[0] == 0
+            and type(values[1]) is str
+            and values[1] == ""
+            and type(values[2]) is int
+            and values[2] == 0
+            and type(values[3]) is str
+            and values[3] == ""
+        )
+        if not unassigned_sentinel:
+            raise ValueError(
+                f"skipped job {name} runner metadata must be all null "
+                "or the exact unassigned API sentinel"
+            )
         return
     runner_id = job.get("runner_id")
     if type(runner_id) is not int or runner_id <= 0:

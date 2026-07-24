@@ -183,10 +183,49 @@ jobs:
           ./scripts/windows_ctrl_matrix.ps1 -StaticMatrixSpec
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
+  windows-channel-result-digest:
+    name: Candidate delta Windows channel-result digest
+    runs-on: windows-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+
+      - id: fixture
+        name: Create a native Windows channel-result fixture
+        shell: pwsh
+        env:
+          RMUX_SOURCE_SHA: ${{ inputs.expected_source_sha }}
+        run: |
+          $root = Join-Path $env:RUNNER_TEMP "rmux-channel-result-smoke"
+          New-Item -ItemType Directory -Force -Path $root | Out-Null
+          $evidence = Join-Path $root "downstream-channel-target-evidence.json"
+          $contents = '{"source_git_sha":"' + $env:RMUX_SOURCE_SHA + '"}' + "`n"
+          [IO.File]::WriteAllText(
+            $evidence,
+            $contents,
+            [Text.UTF8Encoding]::new($false)
+          )
+          "evidence=$evidence" >> $env:GITHUB_OUTPUT
+
+      - name: Verify the exact channel-result digest expression
+        shell: bash
+        env:
+          RMUX_TARGET_EVIDENCE: ${{ steps.fixture.outputs.evidence }}
+        run: |
+          set -euo pipefail
+          digest="$(sha256sum < "$RMUX_TARGET_EVIDENCE" | cut -d' ' -f1)"
+          [[ "$digest" =~ ^[0-9a-f]{64}$ ]]
+
   gate:
     name: Candidate release delta gate
     if: always()
-    needs: [release-review-perf, release-review-sections, snap, nix, windows-ctrl-matrix]
+    needs:
+      [release-review-perf, release-review-sections, snap, nix, windows-ctrl-matrix, windows-channel-result-digest]
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:
@@ -196,10 +235,12 @@ jobs:
           PERF_RESULT: ${{ needs.release-review-perf.result }}
           REVIEW_RESULT: ${{ needs.release-review-sections.result }}
           SNAP_RESULT: ${{ needs.snap.result }}
+          WINDOWS_CHANNEL_DIGEST_RESULT: ${{ needs.windows-channel-result-digest.result }}
           WINDOWS_RESULT: ${{ needs.windows-ctrl-matrix.result }}
         run: |
           test "$NIX_RESULT" = success
           test "$PERF_RESULT" = success
           test "$REVIEW_RESULT" = success
           test "$SNAP_RESULT" = success
+          test "$WINDOWS_CHANNEL_DIGEST_RESULT" = success
           test "$WINDOWS_RESULT" = success
