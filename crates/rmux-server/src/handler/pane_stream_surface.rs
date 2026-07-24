@@ -72,23 +72,28 @@ impl RequestHandler {
                     break;
                 };
                 observed = observed.saturating_add(1);
+                let lifecycle_at_observation =
+                    driver.lifecycle_revision.saturating_add(lifecycle_events);
                 match item {
                     PaneObservationItem::Invalidated(_) => {
+                        frame_lifecycle_revision = lifecycle_at_observation;
                         dirty = true;
                         reset = true;
                         break;
                     }
                     PaneObservationItem::ProcessExited { .. } => {
                         lifecycle_events = lifecycle_events.saturating_add(1);
-                        frame_lifecycle_revision =
-                            driver.lifecycle_revision.saturating_add(lifecycle_events);
                     }
                     PaneObservationItem::Output(OutputCursorItem::Gap(_)) => {
+                        frame_lifecycle_revision = lifecycle_at_observation;
                         dirty = true;
                         reset = true;
                         break;
                     }
-                    PaneObservationItem::Output(OutputCursorItem::Event(_)) => dirty = true,
+                    PaneObservationItem::Output(OutputCursorItem::Event(_)) => {
+                        frame_lifecycle_revision = lifecycle_at_observation;
+                        dirty = true;
+                    }
                 }
             }
             driver.lifecycle_revision = driver.lifecycle_revision.saturating_add(lifecycle_events);

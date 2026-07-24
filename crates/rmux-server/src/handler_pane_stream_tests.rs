@@ -701,6 +701,58 @@ async fn surface_refresh_does_not_hide_exit_published_during_its_rebase_window()
 }
 
 #[tokio::test]
+async fn surface_patch_lifecycle_order_is_independent_of_cursor_batch_size() {
+    async fn observed_order(max_events: u16, visual_before_exit: bool) -> Vec<&'static str> {
+        let handler = RequestHandler::new();
+        let (target, output, transcript) = test_pane(&handler).await;
+        let subscribed = subscribe(&handler, &target, PaneStreamMode::Surface).await;
+
+        let send_visual = || {
+            transcript
+                .lock()
+                .expect("transcript lock")
+                .append_bytes(b"visual");
+            output.send(b"visual".to_vec());
+        };
+        if visual_before_exit {
+            send_visual();
+            output.send(Vec::new());
+        } else {
+            output.send(Vec::new());
+            send_visual();
+        }
+
+        let mut order = Vec::new();
+        loop {
+            let response =
+                cursor_with_limit(&handler, subscribed.subscription_id, max_events).await;
+            order.extend(response.events.iter().map(|event| match event {
+                PaneStreamEvent::SurfacePatch(_) => "patch",
+                PaneStreamEvent::Lifecycle(PaneStreamLifecycleEvent::ProcessExited { .. }) => {
+                    "lifecycle"
+                }
+                event => panic!("unexpected surface event: {event:?}"),
+            }));
+            if !response.limited {
+                break;
+            }
+        }
+        order
+    }
+
+    for (visual_before_exit, expected) in [
+        (true, vec!["patch", "lifecycle"]),
+        (false, vec!["lifecycle", "patch"]),
+    ] {
+        let single_event = observed_order(1, visual_before_exit).await;
+        let batched = observed_order(32, visual_before_exit).await;
+
+        assert_eq!(single_event, expected);
+        assert_eq!(batched, single_event);
+    }
+}
+
+#[tokio::test]
 async fn surface_delivers_exit_before_a_following_generation_reset() {
     let handler = RequestHandler::new();
     let (target, output, _) = test_pane(&handler).await;
