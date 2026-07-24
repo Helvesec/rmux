@@ -128,11 +128,11 @@ impl RmuxBuilder {
     /// [`Rmux::shutdown`] for an explicit shutdown request.
     pub async fn connect_or_start(self) -> Result<Rmux> {
         let endpoint = discovery::resolve_endpoint(&self.endpoint)?;
-        let transport = connect_or_start_transport(&endpoint, self.default_timeout).await?;
+        let connected = connect_or_start_transport(&endpoint, self.default_timeout).await?;
         Ok(Rmux::from_connected_transport(
-            endpoint,
+            connected.endpoint,
             self.default_timeout,
-            transport,
+            connected.transport,
         ))
     }
 }

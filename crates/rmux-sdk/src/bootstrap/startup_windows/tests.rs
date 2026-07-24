@@ -1,10 +1,18 @@
 use super::mutex::StartupMutexHolder;
 use super::name::{startup_mutex_name, test_pipe, validate_pipe_name};
 use super::*;
+use std::error::Error;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc;
 use std::thread;
 
-use rmux_ipc::MAX_NAMED_MUTEX_LEN;
+use rmux_ipc::{LocalListener, LocalStream, MAX_NAMED_MUTEX_LEN};
+use rmux_proto::{encode_frame, FrameDecoder, HasSessionResponse, Request, Response};
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+type TestResult<T = ()> = Result<T, Box<dyn Error + Send + Sync>>;
+
+static UNIQUE_ENDPOINT: AtomicU64 = AtomicU64::new(0);
 
 fn pipe(label: &str) -> PathBuf {
     test_pipe(label)
@@ -134,6 +142,72 @@ async fn startup_mutex_holder_releases_on_acquiring_thread() {
     // worker already exited and the channel is closed.
     holder.release();
     drop(holder);
+}
+
+#[tokio::test]
+async fn concurrent_loser_reports_the_running_rotated_generation() -> TestResult {
+    let unique = UNIQUE_ENDPOINT.fetch_add(1, Ordering::Relaxed);
+    let old_endpoint = rmux_ipc::endpoint_for_label(format!(
+        "sdk-selected-loser-{}-{unique}",
+        std::process::id()
+    ))?;
+    let old_pipe = old_endpoint.as_path().to_path_buf();
+    drop(LocalListener::bind(&old_endpoint)?);
+
+    let reservation = rmux_ipc::reserve_managed_endpoint_start(&old_pipe)?;
+    assert!(
+        reservation.is_owner(),
+        "the setup caller must own the replacement generation"
+    );
+    let selected_endpoint = reservation.endpoint().clone();
+    assert_ne!(selected_endpoint.as_path(), old_pipe);
+    let listener = LocalListener::bind(&selected_endpoint)?;
+    let server = tokio::spawn(answer_startup_probe(listener));
+
+    let (outcome, reported_endpoint) = connect_or_start_selected_with_timeout(
+        &old_pipe,
+        |_| async { Err(io::Error::other("joiner must not launch another daemon")) },
+        Some(DEFAULT_STARTUP_DEADLINE),
+        STARTUP_POLL_INTERVAL,
+    )
+    .await?;
+
+    assert!(
+        matches!(&outcome, StartupOutcome::JoinedExisting(_)),
+        "the losing caller must join the running replacement"
+    );
+    assert_eq!(
+        reported_endpoint, selected_endpoint,
+        "the losing caller must report the generation it actually joined"
+    );
+    tokio::task::spawn_blocking(move || drop(outcome)).await?;
+    server.await??;
+    Ok(())
+}
+
+async fn answer_startup_probe(listener: LocalListener) -> TestResult {
+    let (mut stream, _) = listener.accept().await?;
+    let request = read_startup_request(&mut stream).await?;
+    assert!(matches!(request, Request::HasSession(_)));
+    let frame = encode_frame(&Response::HasSession(HasSessionResponse { exists: false }))?;
+    stream.write_all(&frame).await?;
+    stream.flush().await?;
+    Ok(())
+}
+
+async fn read_startup_request(stream: &mut LocalStream) -> TestResult<Request> {
+    let mut decoder = FrameDecoder::new();
+    let mut buffer = [0_u8; 1024];
+    loop {
+        if let Some(request) = decoder.next_frame::<Request>()? {
+            return Ok(request);
+        }
+        let read = stream.read(&mut buffer).await?;
+        if read == 0 {
+            return Err("startup probe closed before sending its request".into());
+        }
+        decoder.push_bytes(&buffer[..read]);
+    }
 }
 
 #[test]

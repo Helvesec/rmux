@@ -333,12 +333,28 @@ where
     L: FnOnce(&Path) -> F,
     F: Future<Output = io::Result<()>>,
 {
+    let (outcome, _) =
+        connect_or_start_selected_with_timeout(pipe_name, launcher, deadline, poll_interval)
+            .await?;
+    Ok(outcome)
+}
+
+pub(crate) async fn connect_or_start_selected_with_timeout<L, F>(
+    pipe_name: &Path,
+    launcher: L,
+    deadline: Option<Duration>,
+    poll_interval: Duration,
+) -> Result<(StartupOutcome, LocalEndpoint), StartupError>
+where
+    L: FnOnce(&Path) -> F,
+    F: Future<Output = io::Result<()>>,
+{
     let deadline = StartupDeadline::from_timeout(deadline);
     validate_pipe_name(pipe_name)?;
     let endpoint = LocalEndpoint::from_path(pipe_name.to_path_buf());
 
     if let Some(stream) = probe_responsive(&endpoint, pipe_name).await? {
-        return Ok(StartupOutcome::JoinedExisting(stream));
+        return Ok((StartupOutcome::JoinedExisting(stream), endpoint));
     }
 
     let mutex_name = startup_mutex_name(pipe_name)?;
@@ -347,7 +363,7 @@ where
     if let Some(stream) = probe_responsive(&endpoint, pipe_name).await? {
         // Drop the guard implicitly at end of scope; the daemon another
         // caller started is already responsive.
-        return Ok(StartupOutcome::JoinedExisting(stream));
+        return Ok((StartupOutcome::JoinedExisting(stream), endpoint));
     }
 
     let mut reservation = reserve_endpoint_start(pipe_name)?;
@@ -362,7 +378,7 @@ where
         match probe_responsive(&selected_endpoint, selected_pipe).await {
             Ok(Some(stream)) => {
                 drop(_guard);
-                return Ok(StartupOutcome::JoinedExisting(stream));
+                return Ok((StartupOutcome::JoinedExisting(stream), selected_endpoint));
             }
             Ok(None) | Err(StartupError::PipeBusy { .. }) => {}
             Err(error) => return Err(error),
@@ -385,7 +401,7 @@ where
     let stream =
         wait_for_daemon(&selected_endpoint, selected_pipe, deadline, poll_interval).await?;
     drop(_guard);
-    Ok(StartupOutcome::Started(stream))
+    Ok((StartupOutcome::Started(stream), selected_endpoint))
 }
 
 /// Blocking variant of [`connect_or_start_with`] for synchronous Windows

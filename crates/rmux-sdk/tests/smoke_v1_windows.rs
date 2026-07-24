@@ -18,11 +18,68 @@ mod windows {
     use rmux_sdk::{
         EnsureSession, EnsureSessionPolicy, PaneOutputChunk, PaneOutputStart, PaneOutputStream,
         PaneProcessState, PaneRecoveryEvent, PaneRecoveryStream, PaneSurfaceEvent,
-        PaneSurfaceStream,
+        PaneSurfaceStream, Rmux, RmuxEndpoint,
     };
     use tokio::time::{sleep, timeout, Instant};
 
     const MARKER: &str = "RMUX_SDK_SMOKE_V1_WINDOWS_OK";
+
+    #[tokio::test]
+    async fn sdk_autostart_persists_a_rotated_managed_endpoint() -> TestResult {
+        let _lock = LIVE_DAEMON_LOCK.lock().await;
+        let (harness, old_pipe) =
+            Harness::start_after_stopped_managed_generation("rotated").await?;
+        let selected_pipe = harness.pipe_name().to_owned();
+
+        assert_ne!(
+            selected_pipe, old_pipe,
+            "a stopped managed generation must rotate before SDK autostart"
+        );
+        assert_eq!(
+            harness.rmux().endpoint(),
+            &RmuxEndpoint::WindowsPipe(selected_pipe.clone()),
+            "the live SDK facade must retain the generation selected during startup"
+        );
+
+        let session_name = session_name("sdkwinrotated");
+        let session = harness
+            .rmux()
+            .ensure_session(
+                EnsureSession::named(session_name.clone())
+                    .policy(EnsureSessionPolicy::CreateOrReuse)
+                    .detached(true),
+            )
+            .await?;
+        assert_eq!(
+            session.endpoint(),
+            &RmuxEndpoint::WindowsPipe(selected_pipe.clone()),
+            "derived SDK handles must retain the selected generation"
+        );
+
+        let command = harness
+            .cmd(["has-session", "-t", session_name.as_str()])
+            .await?;
+        assert_eq!(
+            command.exit,
+            Some(0),
+            "the SDK command escape hatch must inject the selected generation: {}",
+            String::from_utf8_lossy(&command.stderr)
+        );
+
+        let secondary = Rmux::connect(RmuxEndpoint::WindowsPipe(selected_pipe.clone())).await?;
+        assert!(
+            secondary
+                .list_sessions()
+                .await?
+                .iter()
+                .any(|listed| listed == &session_name),
+            "a second public SDK transport must reach the selected generation"
+        );
+        drop(secondary);
+
+        harness.finish().await?;
+        wait_for_daemon_unavailable(&selected_pipe).await
+    }
 
     #[tokio::test]
     async fn sdk_cmd_can_cold_start_an_independent_windows_daemon() -> TestResult {

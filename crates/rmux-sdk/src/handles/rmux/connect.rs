@@ -64,10 +64,15 @@ pub(crate) async fn connect_transport_to_endpoint(
 pub(crate) async fn connect_or_start_transport(
     endpoint: &RmuxEndpoint,
     default_timeout: Option<Duration>,
-) -> Result<TransportClient> {
+) -> Result<ConnectedTransport> {
     let deadline = OperationDeadline::from_timeout(startup_operation_timeout(default_timeout));
     let caller_cwd = std::env::current_dir().ok();
     connect_or_start_transport_for_platform(endpoint, deadline, caller_cwd).await
+}
+
+pub(crate) struct ConnectedTransport {
+    pub(crate) endpoint: RmuxEndpoint,
+    pub(crate) transport: TransportClient,
 }
 
 #[cfg(unix)]
@@ -75,9 +80,13 @@ async fn connect_or_start_transport_for_platform(
     endpoint: &RmuxEndpoint,
     deadline: OperationDeadline,
     caller_cwd: Option<PathBuf>,
-) -> Result<TransportClient> {
+) -> Result<ConnectedTransport> {
     let RmuxEndpoint::UnixSocket(socket_path) = endpoint else {
-        return connect_transport(endpoint, deadline.remaining_timeout()).await;
+        let transport = connect_transport(endpoint, deadline.remaining_timeout()).await?;
+        return Ok(ConnectedTransport {
+            endpoint: endpoint.clone(),
+            transport,
+        });
     };
     let socket_path = socket_path.clone();
     let launcher_cwd = caller_cwd.clone();
@@ -100,7 +109,10 @@ async fn connect_or_start_transport_for_platform(
     .map_err(startup_error)?;
     let transport = TransportClient::spawn(outcome.into_stream()).with_operation_deadline(deadline);
     startup_config::wait_until_loaded(&transport, deadline).await?;
-    Ok(transport.reusable())
+    Ok(ConnectedTransport {
+        endpoint: endpoint.clone(),
+        transport: transport.reusable(),
+    })
 }
 
 #[cfg(windows)]
@@ -108,29 +120,34 @@ async fn connect_or_start_transport_for_platform(
     endpoint: &RmuxEndpoint,
     startup_deadline: OperationDeadline,
     caller_cwd: Option<PathBuf>,
-) -> Result<TransportClient> {
+) -> Result<ConnectedTransport> {
     let RmuxEndpoint::WindowsPipe(pipe) = endpoint else {
-        return connect_transport(endpoint, startup_deadline.remaining_timeout()).await;
+        let transport = connect_transport(endpoint, startup_deadline.remaining_timeout()).await?;
+        return Ok(ConnectedTransport {
+            endpoint: endpoint.clone(),
+            transport,
+        });
     };
     let pipe_path = std::path::PathBuf::from(pipe);
     let launcher_cwd = caller_cwd.clone();
-    let outcome = crate::bootstrap::startup_windows::connect_or_start_with_timeout(
-        &pipe_path,
-        |reserved_pipe| {
-            let reserved_pipe = reserved_pipe.as_os_str().to_owned();
-            async move {
-                startup_config::spawn_hidden_daemon(
-                    reserved_pipe.as_os_str(),
-                    launcher_cwd.as_deref(),
-                    startup_deadline,
-                )
-            }
-        },
-        startup_deadline.remaining_timeout(),
-        crate::bootstrap::startup_windows::STARTUP_POLL_INTERVAL,
-    )
-    .await
-    .map_err(startup_error)?;
+    let (outcome, selected_endpoint) =
+        crate::bootstrap::startup_windows::connect_or_start_selected_with_timeout(
+            &pipe_path,
+            |reserved_pipe| {
+                let reserved_pipe = reserved_pipe.as_os_str().to_owned();
+                async move {
+                    startup_config::spawn_hidden_daemon(
+                        reserved_pipe.as_os_str(),
+                        launcher_cwd.as_deref(),
+                        startup_deadline,
+                    )
+                }
+            },
+            startup_deadline.remaining_timeout(),
+            crate::bootstrap::startup_windows::STARTUP_POLL_INTERVAL,
+        )
+        .await
+        .map_err(startup_error)?;
     // Windows startup probes use a blocking client stream owned by a private
     // Tokio runtime. The SDK transport actor must own an async pipe client on
     // the caller's runtime, so reconnect here with the same configured retry
@@ -138,11 +155,28 @@ async fn connect_or_start_transport_for_platform(
     // startup budget so connect_or_start never becomes startup timeout plus
     // another full connect timeout.
     drop_windows_startup_probe_stream(outcome).await?;
-    let transport = connect_transport(endpoint, startup_deadline.remaining_timeout())
+    let selected_pipe = selected_endpoint
+        .into_path()
+        .into_os_string()
+        .into_string()
+        .map_err(|_| {
+            RmuxError::transport(
+                "resolve selected Windows daemon endpoint",
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "selected Windows named-pipe endpoint is not valid Unicode",
+                ),
+            )
+        })?;
+    let selected_endpoint = RmuxEndpoint::WindowsPipe(selected_pipe);
+    let transport = connect_transport(&selected_endpoint, startup_deadline.remaining_timeout())
         .await?
         .with_operation_deadline(startup_deadline);
     startup_config::wait_until_loaded(&transport, startup_deadline).await?;
-    Ok(transport.reusable())
+    Ok(ConnectedTransport {
+        endpoint: selected_endpoint,
+        transport: transport.reusable(),
+    })
 }
 
 #[cfg(windows)]
@@ -164,8 +198,12 @@ async fn connect_or_start_transport_for_platform(
     endpoint: &RmuxEndpoint,
     deadline: OperationDeadline,
     _caller_cwd: Option<PathBuf>,
-) -> Result<TransportClient> {
-    connect_transport(endpoint, deadline.remaining_timeout()).await
+) -> Result<ConnectedTransport> {
+    let transport = connect_transport(endpoint, deadline.remaining_timeout()).await?;
+    Ok(ConnectedTransport {
+        endpoint: endpoint.clone(),
+        transport,
+    })
 }
 
 pub(super) fn startup_operation_timeout(default_timeout: Option<Duration>) -> Option<Duration> {

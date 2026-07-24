@@ -11,8 +11,8 @@ use std::sync::OnceLock;
 use std::time::Duration;
 
 use rmux_sdk::{
-    bootstrap::discovery::SDK_DAEMON_BINARY_ENV, PaneOutputChunk, PaneOutputStream, Rmux,
-    RmuxBuilder, SessionName,
+    bootstrap::discovery::SDK_DAEMON_BINARY_ENV, CommandRun, PaneOutputChunk, PaneOutputStream,
+    Rmux, RmuxBuilder, RmuxEndpoint, SessionName,
 };
 use tokio::sync::Mutex;
 use tokio::time::{sleep, timeout, Instant};
@@ -66,6 +66,38 @@ impl Harness {
         })
     }
 
+    pub async fn start_after_stopped_managed_generation(label: &str) -> TestResult<(Self, String)> {
+        let local = format!("sdkv1win{}{}", std::process::id(), unique_id());
+        let old_endpoint = rmux_ipc::endpoint_for_label(format!("{local}{label}"))?;
+        let old_pipe = old_endpoint
+            .as_path()
+            .as_os_str()
+            .to_string_lossy()
+            .into_owned();
+        drop(rmux_ipc::LocalListener::bind(&old_endpoint)?);
+
+        let daemon_binary = rmux_binary()?.to_path_buf();
+        let _daemon_binary_env = EnvGuard::set(SDK_DAEMON_BINARY_ENV, daemon_binary.as_os_str());
+        let rmux = Rmux::connect_or_start_at(RmuxEndpoint::WindowsPipe(old_pipe.clone())).await?;
+        let selected_pipe = match rmux.endpoint() {
+            RmuxEndpoint::WindowsPipe(pipe) => pipe.clone(),
+            endpoint => {
+                return Err(format!(
+                    "Windows managed startup returned non-pipe endpoint: {endpoint:?}"
+                )
+                .into());
+            }
+        };
+        Ok((
+            Self {
+                pipe_name: selected_pipe,
+                rmux: Some(rmux),
+                armed: true,
+            },
+            old_pipe,
+        ))
+    }
+
     pub async fn start_via_cmd(label: &str, session_name: &SessionName) -> TestResult<Self> {
         let pipe_name = unique_pipe_name(label)?;
         let daemon_binary = rmux_binary()?.to_path_buf();
@@ -112,6 +144,16 @@ impl Harness {
 
     pub fn rmux(&self) -> &Rmux {
         self.rmux.as_ref().expect("harness rmux is available")
+    }
+
+    pub async fn cmd<I, S>(&self, args: I) -> TestResult<CommandRun>
+    where
+        I: IntoIterator<Item = S>,
+        S: AsRef<std::ffi::OsStr>,
+    {
+        let daemon_binary = rmux_binary()?.to_path_buf();
+        let _daemon_binary_env = EnvGuard::set(SDK_DAEMON_BINARY_ENV, daemon_binary.as_os_str());
+        Ok(self.rmux().cmd(args).await?)
     }
 
     pub fn pipe_name(&self) -> &str {
