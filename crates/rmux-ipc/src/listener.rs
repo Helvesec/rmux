@@ -42,6 +42,7 @@ pub struct LocalListener {
 pub struct LocalListener {
     pipe_name: OsString,
     pending: tokio::sync::Mutex<VecDeque<NamedPipeServer>>,
+    _legacy_guard: Option<NamedPipeServer>,
     _registration: Option<crate::windows_endpoint_state::ManagedEndpointRegistration>,
 }
 
@@ -114,12 +115,17 @@ fn bind_impl(endpoint: &LocalEndpoint) -> io::Result<LocalListener> {
             "managed endpoint generation is no longer current",
         ));
     }
+    let legacy_guard = reservation
+        .legacy_endpoint()
+        .map(|endpoint| create_server(&endpoint.as_pipe_name().to_owned(), true))
+        .transpose()?;
     let pending = create_pending_servers(&pipe_name)?;
     let registration = crate::windows_endpoint_state::register_running(&pipe_name)?;
     drop(reservation);
     Ok(LocalListener {
         pipe_name,
         pending: tokio::sync::Mutex::new(pending),
+        _legacy_guard: legacy_guard,
         _registration: registration,
     })
 }

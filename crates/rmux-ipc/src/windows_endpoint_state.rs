@@ -13,21 +13,18 @@ use std::ptr::null_mut;
 
 use sha2::{Digest, Sha256};
 use windows_sys::Win32::Foundation::{
-    CloseHandle, FILETIME, GENERIC_READ, GENERIC_WRITE, HANDLE, INVALID_HANDLE_VALUE, WAIT_TIMEOUT,
+    CloseHandle, GENERIC_READ, GENERIC_WRITE, HANDLE, INVALID_HANDLE_VALUE,
 };
 use windows_sys::Win32::Storage::FileSystem::{
     CreateFileW, LockFileEx, MoveFileExW, UnlockFileEx, CREATE_NEW, FILE_ATTRIBUTE_HIDDEN,
     FILE_FLAG_OPEN_REPARSE_POINT, FILE_FLAG_WRITE_THROUGH, FILE_SHARE_DELETE, FILE_SHARE_READ,
     FILE_SHARE_WRITE, LOCKFILE_EXCLUSIVE_LOCK, MOVEFILE_REPLACE_EXISTING, MOVEFILE_WRITE_THROUGH,
-    OPEN_ALWAYS, OPEN_EXISTING, READ_CONTROL, SYNCHRONIZE,
-};
-use windows_sys::Win32::System::Threading::{
-    GetCurrentProcess, GetProcessTimes, OpenProcess, WaitForSingleObject,
-    PROCESS_QUERY_LIMITED_INFORMATION,
+    OPEN_ALWAYS, OPEN_EXISTING, READ_CONTROL,
 };
 use windows_sys::Win32::System::IO::OVERLAPPED;
 
 use crate::endpoint::{current_integrity_label, pipe_component, LocalEndpoint, PIPE_PREFIX};
+use crate::windows_endpoint_legacy;
 use crate::windows_endpoint_record::{
     is_lower_hex, parse as parse_record, serialize as serialize_record, EndpointPhase,
     EndpointRecord, ProcessStamp, KEY_HEX_LEN, NONCE_HEX_LEN,
@@ -39,6 +36,7 @@ use crate::windows_endpoint_reservation::{
 use crate::windows_endpoint_security::{
     ensure_private_directory, validate_private_handle, wide_path, SameUserSecurityAttributes,
 };
+use crate::windows_process_stamp::{current as current_process_stamp, is_live as process_is_live};
 
 const MANAGED_PIPE_MARKER: &str = "-g-";
 const MAX_STATE_BYTES: u64 = 512;
@@ -75,6 +73,7 @@ pub(crate) fn endpoint_for_label(
     integrity: &'static str,
 ) -> io::Result<LocalEndpoint> {
     let key = endpoint_key(label, sid_component, integrity);
+    windows_endpoint_legacy::remember_component(&key, sid_component, integrity, label);
     if let Some(state) = StateStore::open_existing(&key, integrity)? {
         let _lock = state.lock()?;
         if let Some(record) = state.read_record()? {
@@ -110,24 +109,33 @@ pub fn reserve_managed_endpoint_start(
     pipe_name: &Path,
 ) -> io::Result<ManagedEndpointStartReservation> {
     let Some(components) = managed_components(pipe_name.as_os_str())? else {
-        return Ok(ManagedEndpointStartReservation {
-            endpoint: LocalEndpoint::from_path(pipe_name.to_path_buf()),
-            owner: true,
-            _claim: None,
-        });
+        return Ok(ManagedEndpointStartReservation::explicit(
+            LocalEndpoint::from_path(pipe_name.to_path_buf()),
+        ));
     };
     let state = StateStore::open(&components.key, components.integrity)?;
     let _lock = state.lock()?;
     let requester = current_process_stamp()?;
+    let remembered_legacy = windows_endpoint_legacy::remembered_component(&components.key);
     let Some(mut record) = state.read_record()? else {
         let record = EndpointRecord {
             phase: EndpointPhase::Starting,
             key: components.key.clone(),
             nonce: components.nonce.clone(),
+            legacy_component: remembered_legacy,
             process: requester,
         };
+        ensure_legacy_namespace_available(&components, &record)?;
         state.write_record(&record)?;
-        return Ok(owner_reservation(&components, record, requester));
+        let legacy_endpoint = legacy_endpoint(&components, record.legacy_component.as_deref());
+        return Ok(ManagedEndpointStartReservation::owner(
+            managed_endpoint(&components, &record.nonce),
+            components.key,
+            record.nonce,
+            requester,
+            components.integrity,
+            legacy_endpoint,
+        ));
     };
     let decision = decide_reservation(
         &record,
@@ -138,13 +146,16 @@ pub fn reserve_managed_endpoint_start(
 
     if decision == ReservationDecision::JoinCurrent {
         let endpoint = managed_endpoint(&components, &record.nonce);
-        return Ok(ManagedEndpointStartReservation {
+        let legacy_endpoint = legacy_endpoint(&components, record.legacy_component.as_deref());
+        return Ok(ManagedEndpointStartReservation::join(
             endpoint,
-            owner: false,
-            _claim: None,
-        });
+            legacy_endpoint,
+        ));
     }
 
+    if remembered_legacy.is_some() {
+        record.legacy_component = remembered_legacy;
+    }
     if decision == ReservationDecision::Rotate {
         record.nonce = if record.nonce == components.nonce {
             random_nonce()?
@@ -154,8 +165,17 @@ pub fn reserve_managed_endpoint_start(
     }
     record.phase = EndpointPhase::Starting;
     record.process = requester;
+    ensure_legacy_namespace_available(&components, &record)?;
     state.write_record(&record)?;
-    Ok(owner_reservation(&components, record, requester))
+    let legacy_endpoint = legacy_endpoint(&components, record.legacy_component.as_deref());
+    Ok(ManagedEndpointStartReservation::owner(
+        managed_endpoint(&components, &record.nonce),
+        components.key,
+        record.nonce,
+        requester,
+        components.integrity,
+        legacy_endpoint,
+    ))
 }
 
 pub(crate) fn register_running(
@@ -285,21 +305,31 @@ fn managed_endpoint(components: &ManagedComponents, nonce: &str) -> LocalEndpoin
     ))
 }
 
-fn owner_reservation(
+fn ensure_legacy_namespace_available(
     components: &ManagedComponents,
-    record: EndpointRecord,
-    requester: ProcessStamp,
-) -> ManagedEndpointStartReservation {
-    ManagedEndpointStartReservation {
-        endpoint: managed_endpoint(components, &record.nonce),
-        owner: true,
-        _claim: Some(ManagedStartClaim {
-            key: components.key.clone(),
-            nonce: record.nonce,
-            process: requester,
-            integrity: components.integrity,
-        }),
+    record: &EndpointRecord,
+) -> io::Result<()> {
+    let Some(component) = record.legacy_component.as_deref() else {
+        return Ok(());
+    };
+    let endpoint =
+        windows_endpoint_legacy::endpoint(&components.sid, components.integrity, component);
+    if windows_endpoint_legacy::namespace_exists(&endpoint)? {
+        return Err(io::Error::new(
+            io::ErrorKind::AddrInUse,
+            "an older RMUX daemon still owns this label; stop it before starting wire v6",
+        ));
     }
+    Ok(())
+}
+
+fn legacy_endpoint(
+    components: &ManagedComponents,
+    component: Option<&str>,
+) -> Option<LocalEndpoint> {
+    component.map(|component| {
+        windows_endpoint_legacy::endpoint(&components.sid, components.integrity, component)
+    })
 }
 
 fn endpoint_key(label: &OsStr, sid: &str, integrity: &str) -> String {
@@ -538,50 +568,6 @@ fn open_private_file(
     Ok(Some(file))
 }
 
-fn current_process_stamp() -> io::Result<ProcessStamp> {
-    process_stamp(unsafe {
-        // SAFETY: GetCurrentProcess returns a valid pseudo-handle.
-        GetCurrentProcess()
-    })
-    .map(|created| ProcessStamp {
-        pid: std::process::id(),
-        created,
-    })
-}
-
-fn process_is_live(stamp: ProcessStamp) -> bool {
-    let process = unsafe {
-        // SAFETY: OpenProcess validates the pid.
-        OpenProcess(
-            PROCESS_QUERY_LIMITED_INFORMATION | SYNCHRONIZE,
-            0,
-            stamp.pid,
-        )
-    };
-    if process.is_null() {
-        return false;
-    }
-    let alive = unsafe { WaitForSingleObject(process, 0) } == WAIT_TIMEOUT;
-    let created = process_stamp(process).ok();
-    unsafe {
-        // SAFETY: process is a live handle returned by OpenProcess.
-        CloseHandle(process);
-    }
-    alive && created == Some(stamp.created)
-}
-
-fn process_stamp(process: HANDLE) -> io::Result<u64> {
-    let mut creation: FILETIME = unsafe { zeroed() };
-    let mut exit: FILETIME = unsafe { zeroed() };
-    let mut kernel: FILETIME = unsafe { zeroed() };
-    let mut user: FILETIME = unsafe { zeroed() };
-    let ok = unsafe { GetProcessTimes(process, &mut creation, &mut exit, &mut kernel, &mut user) };
-    if ok == 0 {
-        return Err(io::Error::last_os_error());
-    }
-    Ok((u64::from(creation.dwHighDateTime) << 32) | u64::from(creation.dwLowDateTime))
-}
-
 fn strip_ascii_prefix<'a>(value: &'a str, prefix: &str) -> Option<&'a str> {
     value
         .get(..prefix.len())
@@ -591,19 +577,4 @@ fn strip_ascii_prefix<'a>(value: &'a str, prefix: &str) -> Option<&'a str> {
 
 fn invalid_state(message: &'static str) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidData, message)
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn process_liveness_rejects_pid_reuse_by_creation_time() {
-        let current = current_process_stamp().expect("current process stamp");
-        assert!(process_is_live(current));
-        assert!(!process_is_live(ProcessStamp {
-            created: current.created.wrapping_add(1),
-            ..current
-        }));
-    }
 }

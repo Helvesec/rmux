@@ -13,15 +13,59 @@ use crate::windows_endpoint_record::{EndpointPhase, EndpointRecord, ProcessStamp
 #[derive(Debug)]
 pub struct ManagedEndpointStartReservation {
     pub(crate) endpoint: LocalEndpoint,
+    pub(crate) legacy_endpoint: Option<LocalEndpoint>,
     pub(crate) owner: bool,
     pub(crate) _claim: Option<ManagedStartClaim>,
 }
 
 impl ManagedEndpointStartReservation {
+    pub(crate) fn explicit(endpoint: LocalEndpoint) -> Self {
+        Self {
+            endpoint,
+            legacy_endpoint: None,
+            owner: true,
+            _claim: None,
+        }
+    }
+
+    pub(crate) fn join(endpoint: LocalEndpoint, legacy_endpoint: Option<LocalEndpoint>) -> Self {
+        Self {
+            endpoint,
+            legacy_endpoint,
+            owner: false,
+            _claim: None,
+        }
+    }
+
+    pub(crate) fn owner(
+        endpoint: LocalEndpoint,
+        key: String,
+        nonce: String,
+        process: ProcessStamp,
+        integrity: &'static str,
+        legacy_endpoint: Option<LocalEndpoint>,
+    ) -> Self {
+        Self {
+            endpoint,
+            legacy_endpoint,
+            owner: true,
+            _claim: Some(ManagedStartClaim {
+                key,
+                nonce,
+                process,
+                integrity,
+            }),
+        }
+    }
+
     /// Returns the exact endpoint generation that must be probed or launched.
     #[must_use]
     pub fn endpoint(&self) -> &LocalEndpoint {
         &self.endpoint
+    }
+
+    pub(crate) fn legacy_endpoint(&self) -> Option<&LocalEndpoint> {
+        self.legacy_endpoint.as_ref()
     }
 
     /// Returns whether this caller owns startup for the selected generation.
@@ -95,6 +139,7 @@ mod tests {
             phase,
             key: "a".repeat(crate::windows_endpoint_record::KEY_HEX_LEN),
             nonce: nonce.to_owned(),
+            legacy_component: None,
             process,
         }
     }

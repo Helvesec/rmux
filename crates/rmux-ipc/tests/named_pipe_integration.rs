@@ -404,6 +404,43 @@ async fn resolve_only_process_cannot_publish_a_starting_owner() -> std::io::Resu
     Ok(())
 }
 
+#[test]
+fn live_legacy_namespace_blocks_v6_reservation_before_startup() -> std::io::Result<()> {
+    let label = format!("legacy-upgrade-{}", std::process::id());
+    let candidate = endpoint_for_label(&label)?;
+    let legacy_path = legacy_path_for(&label, &candidate);
+    let _legacy_daemon = ServerOptions::new()
+        .first_pipe_instance(true)
+        .create(&legacy_path)?;
+
+    let error = reserve_managed_endpoint_start(candidate.as_path())
+        .expect_err("a live legacy daemon must block v6 startup");
+    assert_eq!(error.kind(), ErrorKind::AddrInUse);
+    assert!(error.to_string().contains("stop"));
+    Ok(())
+}
+
+#[tokio::test]
+async fn managed_listener_holds_legacy_namespace_until_shutdown() -> std::io::Result<()> {
+    let label = format!("legacy-rollback-{}", std::process::id());
+    let endpoint = endpoint_for_label(&label)?;
+    let legacy_path = legacy_path_for(&label, &endpoint);
+    let listener = LocalListener::bind(&endpoint)?;
+
+    let conflict = ServerOptions::new()
+        .first_pipe_instance(true)
+        .create(&legacy_path)
+        .expect_err("a rollback daemon must not coexist with v6");
+    assert_bind_conflict(conflict);
+
+    drop(listener);
+    let legacy_after_shutdown = ServerOptions::new()
+        .first_pipe_instance(true)
+        .create(&legacy_path)?;
+    drop(legacy_after_shutdown);
+    Ok(())
+}
+
 #[tokio::test]
 async fn stopped_listener_rotates_away_from_preclaimed_old_generation() -> std::io::Result<()> {
     let label = format!("generation-restart-squat-{}", std::process::id());
@@ -560,6 +597,14 @@ fn wait_for_file(path: &Path) -> std::io::Result<()> {
         ErrorKind::TimedOut,
         format!("timed out waiting for {}", path.display()),
     ))
+}
+
+fn legacy_path_for(label: &str, managed: &rmux_ipc::LocalEndpoint) -> std::path::PathBuf {
+    let managed = managed.as_path().to_string_lossy();
+    let marker = managed
+        .rfind("-g-")
+        .expect("managed endpoint contains generation marker");
+    std::path::PathBuf::from(format!("{}-{label}", &managed[..marker]))
 }
 
 fn assert_bind_conflict(error: std::io::Error) {

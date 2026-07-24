@@ -12,6 +12,8 @@ mod listener;
 mod managed_socket_unix;
 mod stream;
 #[cfg(windows)]
+mod windows_endpoint_legacy;
+#[cfg(windows)]
 mod windows_endpoint_record;
 #[cfg(windows)]
 mod windows_endpoint_reservation;
@@ -21,6 +23,8 @@ mod windows_endpoint_security;
 mod windows_endpoint_state;
 #[cfg(windows)]
 mod windows_mutex;
+#[cfg(windows)]
+mod windows_process_stamp;
 
 pub use endpoint::{
     default_endpoint, endpoint_for_label, resolve_endpoint, resolve_tmux_compatible_endpoint,
