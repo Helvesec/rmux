@@ -2,6 +2,31 @@ use super::*;
 use crate::handler::scripting_support::install_queue_exact_target_capture_pause;
 use crate::pane_io::AttachControl;
 
+// Source-file queues can nest command dispatch and attached rendering in one poll.
+// Mirror the daemon worker budget without depending on the test harness thread stack.
+const DAEMON_TEST_STACK_SIZE: usize = 8 * 1024 * 1024;
+
+fn run_on_daemon_test_stack<F, Fut>(test: F)
+where
+    F: FnOnce() -> Fut + Send + 'static,
+    Fut: std::future::Future<Output = ()> + 'static,
+{
+    let worker = std::thread::Builder::new()
+        .name("source-file-test".to_owned())
+        .stack_size(DAEMON_TEST_STACK_SIZE)
+        .spawn(|| {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("source-file test runtime should build");
+            runtime.block_on(test());
+        })
+        .expect("source-file test worker should spawn");
+    if let Err(panic) = worker.join() {
+        std::panic::resume_unwind(panic);
+    }
+}
+
 #[tokio::test]
 async fn compact_short_options_execute_from_source_file() {
     let handler = RequestHandler::new();
@@ -149,8 +174,12 @@ async fn source_file_command_bounds_matches_across_separate_paths() {
     );
 }
 
-#[tokio::test]
-async fn source_file_preserves_target_client_and_show_hooks_flags() {
+#[test]
+fn source_file_preserves_target_client_and_show_hooks_flags() {
+    run_on_daemon_test_stack(source_file_preserves_target_client_and_show_hooks_flags_body);
+}
+
+async fn source_file_preserves_target_client_and_show_hooks_flags_body() {
     let handler = RequestHandler::new();
     let alpha = session_name("source-target-client");
     assert!(matches!(
