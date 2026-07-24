@@ -692,7 +692,7 @@ async fn display_message_for_control_client_uses_message_notification() {
     );
     assert_eq!(
         drain_control_notifications(&mut control_rx),
-        vec!["%message hello\\talpha|alpha|610|80|".to_owned()]
+        vec!["%message hello\\talpha|alpha|client-610|80|".to_owned()]
     );
 
     let response = dispatch_as(
@@ -712,7 +712,7 @@ async fn display_message_for_control_client_uses_message_notification() {
     assert!(matches!(response, Response::DisplayMessage(_)));
     assert_eq!(
         drain_control_notifications(&mut control_rx),
-        vec!["%message detached|alpha|610|80|".to_owned()]
+        vec!["%message detached|alpha|client-610|80|".to_owned()]
     );
 
     let response = dispatch_as(
@@ -729,7 +729,7 @@ async fn display_message_for_control_client_uses_message_notification() {
     assert!(matches!(response, Response::DisplayMessage(_)));
     assert_eq!(
         drain_control_notifications(&mut control_rx),
-        vec!["%message external alpha|610".to_owned()]
+        vec!["%message external alpha|client-610".to_owned()]
     );
 
     let response = dispatch_as(
@@ -751,7 +751,7 @@ async fn display_message_for_control_client_uses_message_notification() {
     .await;
     assert_eq!(
         response.command_output().map(|output| output.stdout()),
-        Some(b"detached|alpha|610|80|\n".as_slice())
+        Some(b"detached|alpha|client-610|80|\n".as_slice())
     );
 
     let response = dispatch_as(
@@ -771,7 +771,7 @@ async fn display_message_for_control_client_uses_message_notification() {
     assert!(matches!(response, Response::DisplayMessage(_)));
     assert_eq!(
         drain_control_notifications(&mut control_rx),
-        vec!["%message targeted alpha|610".to_owned()]
+        vec!["%message targeted alpha|client-610".to_owned()]
     );
 
     let mut second_alpha_rx =
@@ -802,11 +802,11 @@ async fn display_message_for_control_client_uses_message_notification() {
     assert!(matches!(response, Response::DisplayMessage(_)));
     assert_eq!(
         drain_control_notifications(&mut control_rx),
-        vec!["%message stable alpha|611".to_owned()]
+        vec!["%message stable alpha|client-611".to_owned()]
     );
     assert_eq!(
         drain_control_notifications(&mut second_alpha_rx),
-        vec!["%message stable alpha|611".to_owned()]
+        vec!["%message stable alpha|client-611".to_owned()]
     );
     assert!(drain_control_notifications(&mut beta_rx).is_empty());
 }
