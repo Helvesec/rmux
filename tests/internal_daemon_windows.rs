@@ -216,6 +216,82 @@ fn start_server_with_captured_output_returns_after_spawning_windows_daemon(
 }
 
 #[test]
+fn queued_start_server_commands_follow_the_rotated_windows_endpoint() -> Result<(), Box<dyn Error>>
+{
+    let label = format!("queued-rotation-windows-{}", std::process::id());
+    let old_socket_path = socket_path_for_label(&label)?;
+    let mut old_daemon = spawn_hidden_daemon(&old_socket_path)?;
+    let mut old_connection = match wait_for_connection(&old_socket_path, &mut old_daemon) {
+        Ok(connection) => connection,
+        Err(error) => {
+            let _ = old_daemon.kill();
+            let _ = old_daemon.wait();
+            return Err(error);
+        }
+    };
+    let response = old_connection.roundtrip(&Request::KillServer(KillServerRequest))?;
+    assert!(matches!(response, Response::KillServer(_)));
+    drop(old_connection);
+    wait_for_child_exit(&mut old_daemon)?;
+
+    let create_and_list = run_rmux_command_with_auto_start_binary(
+        &old_socket_path,
+        &[
+            "new-session",
+            "-d",
+            "-s",
+            "alpha",
+            ";",
+            "list-sessions",
+            "-F",
+            "#{session_name}",
+        ],
+    )?;
+    assert!(
+        create_and_list.status.success(),
+        "queued new-session/list-sessions failed after rotation: status={:?}\nstdout={}\nstderr={}",
+        create_and_list.status.code(),
+        String::from_utf8_lossy(&create_and_list.stdout),
+        String::from_utf8_lossy(&create_and_list.stderr)
+    );
+    assert_eq!(String::from_utf8_lossy(&create_and_list.stdout), "alpha\n");
+
+    let selected_socket_path = socket_path_for_label(&label)?;
+    assert_ne!(
+        selected_socket_path, old_socket_path,
+        "startup must rotate away from the stopped generation"
+    );
+
+    let start_and_list = run_rmux_command_with_auto_start_binary(
+        &old_socket_path,
+        &[
+            "start-server",
+            ";",
+            "list-sessions",
+            "-F",
+            "#{session_name}",
+        ],
+    )?;
+    assert!(
+        start_and_list.status.success(),
+        "queued start-server/list-sessions failed on selected generation: status={:?}\nstdout={}\nstderr={}",
+        start_and_list.status.code(),
+        String::from_utf8_lossy(&start_and_list.stdout),
+        String::from_utf8_lossy(&start_and_list.stderr)
+    );
+    assert_eq!(String::from_utf8_lossy(&start_and_list.stdout), "alpha\n");
+
+    let kill = run_rmux_command(&selected_socket_path, &["kill-server"])?;
+    assert!(
+        kill.status.success(),
+        "replacement daemon cleanup failed: stderr={}",
+        String::from_utf8_lossy(&kill.stderr)
+    );
+    wait_for_daemon_process_absent(&selected_socket_path)?;
+    Ok(())
+}
+
+#[test]
 fn seamless_upgrade_restarts_idle_stale_windows_daemon() -> Result<(), Box<dyn Error>> {
     let _guard = env_lock().lock().expect("lock env");
     let label = format!("seamless-upgrade-windows-{}", std::process::id());

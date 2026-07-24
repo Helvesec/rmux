@@ -416,7 +416,30 @@ pub fn connect_or_start_blocking_with<L>(
 where
     L: FnOnce(&Path) -> io::Result<()>,
 {
-    connect_or_start_blocking_with_timeout(pipe_name, launcher, Some(deadline), poll_interval)
+    connect_or_start_blocking_selected_with(pipe_name, launcher, deadline, poll_interval)
+        .map(|(outcome, _)| outcome)
+}
+
+/// Blocking startup that also returns the exact endpoint generation selected.
+///
+/// Managed Windows endpoints can rotate after the caller resolves its initial
+/// path. Callers that reconnect during the same invocation must retain this
+/// endpoint instead of resolving or reusing the stale candidate.
+pub fn connect_or_start_blocking_selected_with<L>(
+    pipe_name: &Path,
+    launcher: L,
+    deadline: Duration,
+    poll_interval: Duration,
+) -> Result<(StartupOutcome, LocalEndpoint), StartupError>
+where
+    L: FnOnce(&Path) -> io::Result<()>,
+{
+    connect_or_start_blocking_selected_with_timeout(
+        pipe_name,
+        launcher,
+        Some(deadline),
+        poll_interval,
+    )
 }
 
 /// Blocking variant of [`connect_or_start_with_timeout`].
@@ -429,12 +452,25 @@ pub fn connect_or_start_blocking_with_timeout<L>(
 where
     L: FnOnce(&Path) -> io::Result<()>,
 {
+    connect_or_start_blocking_selected_with_timeout(pipe_name, launcher, deadline, poll_interval)
+        .map(|(outcome, _)| outcome)
+}
+
+fn connect_or_start_blocking_selected_with_timeout<L>(
+    pipe_name: &Path,
+    launcher: L,
+    deadline: Option<Duration>,
+    poll_interval: Duration,
+) -> Result<(StartupOutcome, LocalEndpoint), StartupError>
+where
+    L: FnOnce(&Path) -> io::Result<()>,
+{
     let deadline = StartupDeadline::from_timeout(deadline);
     validate_pipe_name(pipe_name)?;
     let endpoint = LocalEndpoint::from_path(pipe_name.to_path_buf());
 
     if let Some(stream) = probe_blocking(&endpoint, pipe_name)? {
-        return Ok(StartupOutcome::JoinedExisting(stream));
+        return Ok((StartupOutcome::JoinedExisting(stream), endpoint));
     }
 
     let mutex_name = startup_mutex_name(pipe_name)?;
@@ -442,7 +478,7 @@ where
 
     if let Some(stream) = probe_blocking(&endpoint, pipe_name)? {
         drop(guard);
-        return Ok(StartupOutcome::JoinedExisting(stream));
+        return Ok((StartupOutcome::JoinedExisting(stream), endpoint));
     }
 
     let mut reservation = reserve_endpoint_start(pipe_name)?;
@@ -457,7 +493,7 @@ where
         match probe_blocking(&selected_endpoint, selected_pipe) {
             Ok(Some(stream)) => {
                 drop(guard);
-                return Ok(StartupOutcome::JoinedExisting(stream));
+                return Ok((StartupOutcome::JoinedExisting(stream), selected_endpoint));
             }
             Ok(None) | Err(StartupError::PipeBusy { .. }) => {}
             Err(error) => return Err(error),
@@ -478,7 +514,7 @@ where
     let stream =
         wait_for_daemon_blocking(&selected_endpoint, selected_pipe, deadline, poll_interval)?;
     drop(guard);
-    Ok(StartupOutcome::Started(stream))
+    Ok((StartupOutcome::Started(stream), selected_endpoint))
 }
 
 fn reserve_endpoint_start(

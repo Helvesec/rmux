@@ -203,7 +203,7 @@ where
     accept_compatibility_options(&cli);
     let mut startup_config = startup_config_from_cli(&cli);
 
-    let socket_path = if invoked_as_tmux(&args) {
+    let mut socket_path = if invoked_as_tmux(&args) {
         resolve_tmux_compatible_socket_path(cli.socket_name(), cli.socket_path())
     } else {
         resolve_socket_path(cli.socket_name(), cli.socket_path())
@@ -236,10 +236,11 @@ where
         .map_err(ExitFailure::from_auto_start)
         .map_err(|error| error.with_socket_context(&socket_path))?;
         let connection = PrestartedConnection::new(outcome);
+        let selected_socket_path = connection.socket_path().to_path_buf();
         let cold_resolution = connection.with_connection_mut(|connection| {
             alias_fallback::runtime_command_resolution_after_startup(
                 &args,
-                &socket_path,
+                &selected_socket_path,
                 connection,
             )
         })?;
@@ -258,6 +259,10 @@ where
             accept_compatibility_options(&cli);
             startup_config = startup_config_from_cli(&cli);
         }
+    }
+
+    if let Some(prestarted) = startup_connection.as_ref() {
+        socket_path = prestarted.socket_path().to_path_buf();
     }
 
     if let Some(shell_command) = cli.shell_command.as_deref() {
@@ -331,8 +336,13 @@ fn parse_cold_alias_queue_after_startup(
             .map_err(ExitFailure::from_auto_start)
             .map_err(|error| error.with_socket_context(&socket_path))?;
     let connection = PrestartedConnection::new(outcome);
+    let selected_socket_path = connection.socket_path().to_path_buf();
     let resolution = connection.with_connection_mut(|connection| {
-        alias_fallback::runtime_command_resolution_after_startup(args, &socket_path, connection)
+        alias_fallback::runtime_command_resolution_after_startup(
+            args,
+            &selected_socket_path,
+            connection,
+        )
     })?;
     let Some(resolution) = resolution else {
         return Err(ExitFailure::from_clap(original_error));
@@ -509,6 +519,13 @@ fn connect_with_startserver(
     if startup.no_start_server {
         connect(socket_path).map_err(|error| ExitFailure::from_client_connect(socket_path, error))
     } else {
+        if let Some(prestarted) = startup
+            .prestarted_connection
+            .as_ref()
+            .and_then(PrestartedConnection::take)
+        {
+            return Ok(prestarted.into_connection());
+        }
         ensure_server_running_with_config(socket_path, startup.config)
             .map_err(ExitFailure::from_auto_start)
     }
@@ -542,8 +559,9 @@ fn connect_with_startserver_outcome(
         let outcome = ensure_server_running_with_config_outcome(socket_path, startup.config)
             .map_err(ExitFailure::from_auto_start)?;
         let provenance = outcome.provenance();
+        let connection = outcome.into_connection();
         Ok(PrestartedServerConnection {
-            connection: outcome.into_connection(),
+            connection,
             provenance,
         })
     }

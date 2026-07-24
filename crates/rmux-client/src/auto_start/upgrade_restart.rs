@@ -1,4 +1,4 @@
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -15,18 +15,33 @@ use super::{
 };
 #[cfg(windows)]
 use rmux_sdk::bootstrap::startup_windows::{
-    connect_or_start_blocking_with, DEFAULT_STARTUP_DEADLINE, STARTUP_POLL_INTERVAL,
+    connect_or_start_blocking_selected_with, DEFAULT_STARTUP_DEADLINE, STARTUP_POLL_INTERVAL,
 };
 
 const SEAMLESS_RESTART_TIMEOUT: Duration = Duration::from_secs(5);
 const SEAMLESS_RESTART_POLL_INTERVAL: Duration = Duration::from_millis(50);
+
+#[derive(Debug)]
+pub(super) struct ReadyServerConnection {
+    pub(super) connection: Connection,
+    pub(super) socket_path: PathBuf,
+}
+
+impl ReadyServerConnection {
+    fn new(connection: Connection, socket_path: &Path) -> Self {
+        Self {
+            connection,
+            socket_path: socket_path.to_path_buf(),
+        }
+    }
+}
 
 pub(super) fn ensure_daemon_fresh_or_restart(
     mut connection: Connection,
     socket_path: &Path,
     binary_path: &Path,
     config: &AutoStartConfig,
-) -> Result<Connection, AutoStartError> {
+) -> Result<ReadyServerConnection, AutoStartError> {
     let freshness = match upgrade::inspect_daemon(&mut connection) {
         Ok(freshness) => freshness,
         Err(error) => {
@@ -34,7 +49,7 @@ pub(super) fn ensure_daemon_fresh_or_restart(
                 error = ?error,
                 "daemon freshness inspection failed; assuming current daemon"
             );
-            return Ok(connection);
+            return Ok(ReadyServerConnection::new(connection, socket_path));
         }
     };
 
@@ -44,7 +59,7 @@ pub(super) fn ensure_daemon_fresh_or_restart(
         }
         upgrade::DaemonFreshness::StaleActive(stale) => {
             upgrade::warn_stale_active_daemon(&stale, socket_path);
-            Ok(connection)
+            Ok(ReadyServerConnection::new(connection, socket_path))
         }
         upgrade::DaemonFreshness::Incompatible(incompatible) => {
             Err(AutoStartError::IncompatibleDaemon {
@@ -57,12 +72,12 @@ pub(super) fn ensure_daemon_fresh_or_restart(
                 .map_err(AutoStartError::Client)?
             {
                 upgrade::warn_stale_active_daemon(&stale, socket_path);
-                return Ok(connection);
+                return Ok(ReadyServerConnection::new(connection, socket_path));
             }
             drop(connection);
             if let Some(connection) = wait_for_server_absent(socket_path)? {
                 upgrade::warn_stale_active_daemon(&stale, socket_path);
-                return Ok(connection);
+                return Ok(ReadyServerConnection::new(connection, socket_path));
             }
             restart_hidden_daemon(binary_path, socket_path, config)
         }
@@ -76,7 +91,7 @@ pub(super) fn ensure_daemon_fresh_or_restart_after_windows_readiness(
     binary_path: &Path,
     config: &AutoStartConfig,
     readiness_status: Option<DaemonStatusResponse>,
-) -> Result<Connection, AutoStartError> {
+) -> Result<ReadyServerConnection, AutoStartError> {
     if let Some(status) = readiness_status {
         match upgrade::daemon_status_matches_current_client(&status) {
             Ok(true) => {
@@ -105,9 +120,9 @@ fn ensure_required_web_capability_or_restart(
     socket_path: &Path,
     binary_path: &Path,
     config: &AutoStartConfig,
-) -> Result<Connection, AutoStartError> {
+) -> Result<ReadyServerConnection, AutoStartError> {
     if !config.web_required || connection.supports_capability(CAPABILITY_WEB_SHARE)? {
-        return Ok(connection);
+        return Ok(ReadyServerConnection::new(connection, socket_path));
     }
 
     let Response::DaemonStatus(status) =
@@ -161,10 +176,10 @@ fn restart_hidden_daemon(
     binary_path: &Path,
     socket_path: &Path,
     config: &AutoStartConfig,
-) -> Result<Connection, AutoStartError> {
+) -> Result<ReadyServerConnection, AutoStartError> {
     #[cfg(windows)]
     {
-        let outcome = connect_or_start_blocking_with(
+        let (outcome, selected_endpoint) = connect_or_start_blocking_selected_with(
             socket_path,
             |reserved_socket_path| {
                 spawn_hidden_daemon_for(binary_path, reserved_socket_path, config)
@@ -173,8 +188,13 @@ fn restart_hidden_daemon(
             STARTUP_POLL_INTERVAL,
         )
         .map_err(|error| super::auto_start_error_from_startup(error, binary_path, socket_path))?;
+        let selected_socket_path = selected_endpoint.into_path();
         let connection = super::startup_outcome_into_connection(outcome)?;
-        probe_connected_server(connection, config, socket_path)
+        let connection = probe_connected_server(connection, config, &selected_socket_path)?;
+        Ok(ReadyServerConnection {
+            connection,
+            socket_path: selected_socket_path,
+        })
     }
 
     #[cfg(not(windows))]
@@ -185,7 +205,8 @@ fn restart_hidden_daemon(
                 error,
             }
         })?;
-        wait_for_connected_server(socket_path, config)
+        let connection = wait_for_connected_server(socket_path, config)?;
+        Ok(ReadyServerConnection::new(connection, socket_path))
     }
 }
 

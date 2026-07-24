@@ -1,6 +1,8 @@
 use std::path::Path;
 
-use rmux_client::{connect, ClientError, Connection, StartServerError};
+#[cfg(windows)]
+use rmux_client::Connection;
+use rmux_client::{connect, ClientError};
 use rmux_client::{connect_or_absent, ConnectResult};
 use rmux_proto::RmuxError;
 #[cfg(windows)]
@@ -8,8 +10,8 @@ use rmux_proto::CAPABILITY_DAEMON_STATUS;
 use rmux_proto::{ListSessionsRequest, RMUX_WIRE_VERSION};
 
 use super::{
-    expect_command_output, resolve_session_target_or_current, run_command, run_command_resolved,
-    run_payload_command, ExitFailure, StartupOptions,
+    connect_with_startserver, expect_command_output, resolve_session_target_or_current,
+    run_command, run_command_resolved, run_payload_command, ExitFailure, StartupOptions,
 };
 #[cfg(not(windows))]
 use super::{expect_command_success, write_command_output};
@@ -19,15 +21,7 @@ pub(super) fn run_start_server(
     socket_path: &Path,
     startup: StartupOptions,
 ) -> Result<i32, ExitFailure> {
-    let mut connection = Connection::start_server(
-        socket_path,
-        startup.no_start_server,
-        startup.config,
-    )
-    .map_err(|error| match error {
-        StartServerError::Client(error) => ExitFailure::from_client_connect(socket_path, error),
-        StartServerError::AutoStart(error) => ExitFailure::from_auto_start(error),
-    })?;
+    let mut connection = connect_with_startserver(socket_path, startup)?;
     let response = connection
         .list_sessions(ListSessionsRequest {
             format: None,

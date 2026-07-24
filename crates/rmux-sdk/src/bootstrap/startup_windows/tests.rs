@@ -185,6 +185,50 @@ async fn concurrent_loser_reports_the_running_rotated_generation() -> TestResult
     Ok(())
 }
 
+#[tokio::test(flavor = "multi_thread")]
+async fn blocking_loser_reports_the_running_rotated_generation() -> TestResult {
+    let unique = UNIQUE_ENDPOINT.fetch_add(1, Ordering::Relaxed);
+    let old_endpoint = rmux_ipc::endpoint_for_label(format!(
+        "sdk-blocking-selected-loser-{}-{unique}",
+        std::process::id()
+    ))?;
+    let old_pipe = old_endpoint.as_path().to_path_buf();
+    drop(LocalListener::bind(&old_endpoint)?);
+
+    let reservation = rmux_ipc::reserve_managed_endpoint_start(&old_pipe)?;
+    assert!(
+        reservation.is_owner(),
+        "the setup caller must own the replacement generation"
+    );
+    let selected_endpoint = reservation.endpoint().clone();
+    assert_ne!(selected_endpoint.as_path(), old_pipe);
+    let listener = LocalListener::bind(&selected_endpoint)?;
+    let server = tokio::spawn(answer_startup_probe(listener));
+
+    let startup_pipe = old_pipe.clone();
+    let (outcome, reported_endpoint) = tokio::task::spawn_blocking(move || {
+        connect_or_start_blocking_selected_with(
+            &startup_pipe,
+            |_| Err(io::Error::other("joiner must not launch another daemon")),
+            DEFAULT_STARTUP_DEADLINE,
+            STARTUP_POLL_INTERVAL,
+        )
+    })
+    .await??;
+
+    assert!(
+        matches!(&outcome, StartupOutcome::JoinedExisting(_)),
+        "the blocking loser must join the running replacement"
+    );
+    assert_eq!(
+        reported_endpoint, selected_endpoint,
+        "blocking startup must report the generation it actually joined"
+    );
+    tokio::task::spawn_blocking(move || drop(outcome)).await?;
+    server.await??;
+    Ok(())
+}
+
 async fn answer_startup_probe(listener: LocalListener) -> TestResult {
     let (mut stream, _) = listener.accept().await?;
     let request = read_startup_request(&mut stream).await?;

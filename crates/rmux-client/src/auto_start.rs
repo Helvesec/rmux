@@ -19,8 +19,8 @@ use rmux_sdk::bootstrap::startup_unix::{
 };
 #[cfg(windows)]
 use rmux_sdk::bootstrap::startup_windows::{
-    connect_or_start_blocking_with, StartupError, StartupOutcome, DEFAULT_STARTUP_DEADLINE,
-    STARTUP_POLL_INTERVAL,
+    connect_or_start_blocking_selected_with, StartupError, StartupOutcome,
+    DEFAULT_STARTUP_DEADLINE, STARTUP_POLL_INTERVAL,
 };
 
 use crate::shell_quote::shell_quote_path;
@@ -190,13 +190,19 @@ pub enum ServerConnectionProvenance {
 pub struct EnsuredServerConnection {
     connection: Connection,
     provenance: ServerConnectionProvenance,
+    socket_path: PathBuf,
 }
 
 impl EnsuredServerConnection {
-    fn new(connection: Connection, provenance: ServerConnectionProvenance) -> Self {
+    fn new(
+        connection: Connection,
+        provenance: ServerConnectionProvenance,
+        socket_path: PathBuf,
+    ) -> Self {
         Self {
             connection,
             provenance,
+            socket_path,
         }
     }
 
@@ -206,10 +212,25 @@ impl EnsuredServerConnection {
         self.provenance
     }
 
+    /// Returns the exact endpoint serving this connection.
+    ///
+    /// On Windows this may differ from the originally resolved path when a
+    /// managed endpoint generation rotates during startup.
+    #[must_use]
+    pub fn socket_path(&self) -> &Path {
+        &self.socket_path
+    }
+
     /// Consumes the outcome and returns the ready connection.
     #[must_use]
     pub fn into_connection(self) -> Connection {
         self.connection
+    }
+
+    /// Consumes the outcome and preserves both the connection and endpoint.
+    #[must_use]
+    pub fn into_connection_and_socket_path(self) -> (Connection, PathBuf) {
+        (self.connection, self.socket_path)
     }
 }
 
@@ -302,13 +323,17 @@ fn ensure_server_running_unix(
     let connection = startup_outcome_into_connection(outcome)?;
 
     let connection = probe_connected_server(connection, &config, socket_path)?;
-    let connection = upgrade_restart::ensure_daemon_fresh_or_restart(
+    let connected = upgrade_restart::ensure_daemon_fresh_or_restart(
         connection,
         socket_path,
         &binary_path,
         &config,
     )?;
-    Ok(EnsuredServerConnection::new(connection, provenance))
+    Ok(EnsuredServerConnection::new(
+        connected.connection,
+        provenance,
+        connected.socket_path,
+    ))
 }
 
 #[cfg(unix)]
@@ -332,7 +357,7 @@ fn ensure_server_running_windows(
     let launcher_binary_path = binary_path.clone();
     let launcher_config = config.clone();
 
-    let outcome = connect_or_start_blocking_with(
+    let (outcome, selected_endpoint) = connect_or_start_blocking_selected_with(
         socket_path,
         move |reserved_socket_path| {
             spawn_hidden_daemon_for(
@@ -343,22 +368,25 @@ fn ensure_server_running_windows(
         },
         DEFAULT_STARTUP_DEADLINE,
         STARTUP_POLL_INTERVAL,
-    );
-
-    let outcome =
-        outcome.map_err(|error| auto_start_error_from_startup(error, &binary_path, socket_path))?;
+    )
+    .map_err(|error| auto_start_error_from_startup(error, &binary_path, socket_path))?;
+    let selected_socket_path = selected_endpoint.into_path();
     let provenance = startup_outcome_provenance(&outcome);
     let connection = startup_outcome_into_connection(outcome)?;
     let (connection, readiness_status) =
-        probe_connected_server_windows(connection, &config, socket_path)?;
-    let connection = upgrade_restart::ensure_daemon_fresh_or_restart_after_windows_readiness(
+        probe_connected_server_windows(connection, &config, &selected_socket_path)?;
+    let connected = upgrade_restart::ensure_daemon_fresh_or_restart_after_windows_readiness(
         connection,
-        socket_path,
+        &selected_socket_path,
         &binary_path,
         &config,
         readiness_status,
     )?;
-    Ok(EnsuredServerConnection::new(connection, provenance))
+    Ok(EnsuredServerConnection::new(
+        connected.connection,
+        provenance,
+        connected.socket_path,
+    ))
 }
 
 #[cfg(any(unix, windows))]
@@ -740,6 +768,7 @@ where
             return Ok(EnsuredServerConnection::new(
                 connection,
                 ServerConnectionProvenance::JoinedExisting,
+                socket_path.to_path_buf(),
             ));
         }
         ConnectResult::Absent => {}
@@ -756,6 +785,7 @@ where
     Ok(EnsuredServerConnection::new(
         connection,
         ServerConnectionProvenance::StartedByCaller,
+        socket_path.to_path_buf(),
     ))
 }
 

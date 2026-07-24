@@ -26,18 +26,24 @@ pub(in crate::cli) struct PrestartedServerConnection {
 #[derive(Debug, Clone)]
 pub(in crate::cli) struct PrestartedConnection {
     inner: Rc<RefCell<Option<PrestartedServerConnection>>>,
+    socket_path: std::path::PathBuf,
 }
 
 impl PrestartedConnection {
     pub(in crate::cli) fn new(outcome: EnsuredServerConnection) -> Self {
         let provenance = outcome.provenance();
-        let connection = outcome.into_connection();
+        let (connection, socket_path) = outcome.into_connection_and_socket_path();
         Self {
             inner: Rc::new(RefCell::new(Some(PrestartedServerConnection {
                 connection,
                 provenance,
             }))),
+            socket_path,
         }
+    }
+
+    pub(in crate::cli) fn socket_path(&self) -> &Path {
+        &self.socket_path
     }
 
     pub(in crate::cli) fn with_connection_mut<T>(
