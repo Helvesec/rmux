@@ -243,7 +243,7 @@ fn rmux_sdk_cargo_manifest_does_not_depend_on_internal_crates() {
 }
 
 #[test]
-fn rmux_sdk_tokio_dependency_stays_narrow_async_io_plumbing() {
+fn rmux_sdk_tokio_dependency_stays_narrow_async_runtime_plumbing() {
     let manifest = include_str!("../Cargo.toml");
     let sections = parse_manifest_sections(manifest);
     let dependencies_body = sections
@@ -255,7 +255,12 @@ fn rmux_sdk_tokio_dependency_stays_narrow_async_io_plumbing() {
     let tokio = dependency_line(dependencies_body, "tokio")
         .expect("rmux-sdk transport actor depends on Tokio async I/O plumbing");
 
-    for forbidden_feature in ["macros", "net", "process", "rt-multi-thread", "time"] {
+    assert!(
+        tokio.contains("\"macros\""),
+        "rmux-sdk production futures use tokio::select! and require the Tokio macros feature",
+    );
+
+    for forbidden_feature in ["net", "process", "rt-multi-thread", "time"] {
         assert!(
             !tokio.contains(&format!("\"{forbidden_feature}\"")),
             "rmux-sdk must not enable Tokio feature `{forbidden_feature}` as a normal dependency",
