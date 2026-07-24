@@ -91,11 +91,13 @@ def read_object(path: Path, label: str) -> dict[str, Any]:
     return read_json_object(path, label)
 
 
+def canonical_file_bytes(value: Any) -> bytes:
+    return (json.dumps(value, indent=2, sort_keys=True) + "\n").encode("utf-8")
+
+
 def write_object(path: Path, value: dict[str, Any]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(
-        json.dumps(value, indent=2, sort_keys=True) + "\n", encoding="utf-8"
-    )
+    path.write_bytes(canonical_file_bytes(value))
 
 
 def canonical_hash(value: Any) -> str:
@@ -106,8 +108,7 @@ def canonical_hash(value: Any) -> str:
 
 
 def canonical_file_hash(value: Any) -> str:
-    rendered = json.dumps(value, indent=2, sort_keys=True) + "\n"
-    return hashlib.sha256(rendered.encode("utf-8")).hexdigest()
+    return hashlib.sha256(canonical_file_bytes(value)).hexdigest()
 
 
 def file_hash(path: Path) -> str:
