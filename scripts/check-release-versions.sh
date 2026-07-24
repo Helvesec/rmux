@@ -193,7 +193,7 @@ if match is None:
 identity_re = match.group(1)
 identity = (
     "https://github.com/Helvesec/rmux/.github/workflows/"
-    f"release.yml@refs/tags/v{version}"
+    f"release-promote.yml@refs/tags/v{version}"
 )
 if re.fullmatch(identity_re, identity) is None:
     print(

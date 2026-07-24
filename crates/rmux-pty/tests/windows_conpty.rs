@@ -358,20 +358,24 @@ fn conpty_force_kill_reaps_child() -> Result<(), Box<dyn std::error::Error>> {
 #[test]
 fn conpty_force_kill_reaps_grandchild_process_tree() -> Result<(), Box<dyn std::error::Error>> {
     let command = concat!(
-        "powershell -NoLogo -NoProfile -NonInteractive -Command ",
-        "\"$child = Start-Process -FilePath ($PSHOME + '\\powershell.exe') ",
+        "$child = Start-Process -FilePath ($PSHOME + '\\powershell.exe') ",
         "-ArgumentList '-NoLogo -NoProfile -NonInteractive -Command Start-Sleep -Seconds 30' ",
         "-WindowStyle Hidden -PassThru; ",
         "[Console]::Out.WriteLine('RMUX_' + 'GRANDCHILD=' + $child.Id); ",
-        "[Console]::Out.Flush()\"\r\n"
+        "[Console]::Out.Flush(); ",
+        "Start-Sleep -Seconds 30"
     );
-    let mut spawned = ChildCommand::new("C:\\Windows\\System32\\cmd.exe")
-        .args(["/D", "/K"])
-        .size(TerminalSize::new(100, 30))
-        .spawn()?;
-    let io = spawned.master().try_clone_io()?;
-    let _ = read_until_io(&io, b">", Duration::from_secs(2))?;
-    io.write_all(command.as_bytes())?;
+    let mut spawned =
+        ChildCommand::new("C:\\Windows\\System32\\WindowsPowerShell\\v1.0\\powershell.exe")
+            .args([
+                "-NoLogo",
+                "-NoProfile",
+                "-NonInteractive",
+                "-Command",
+                command,
+            ])
+            .size(TerminalSize::new(100, 30))
+            .spawn()?;
 
     let output = read_until_or_kill(
         &mut spawned,
