@@ -401,11 +401,8 @@ fn run_process_registration_race(
     // Hold registration across shutdown to model the production race in
     // which the daemon could otherwise detach a just-spawned process tree.
     release.recv().expect("release registration race");
-    match shell_processes.register(child.controller()) {
-        Err(ShellProcessRegistrationError::Closing) => {
-            let _ = child.terminate();
-            let _ = child.wait();
-        }
+    match shell_processes.register_spawned(&mut child) {
+        Err(ShellProcessRegistrationError::Closing) => {}
         Err(error) => panic!("unexpected registration error: {error:?}"),
         Ok(_guard) => panic!("closed registry accepted a process tree"),
     }

@@ -2,10 +2,12 @@ use std::collections::HashMap;
 use std::fmt;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex as StdMutex};
+use std::time::Duration;
 
-use rmux_os::process_tree::ProcessTreeController;
+use rmux_os::process_tree::{ProcessTreeChild, ProcessTreeController};
 
 const MAX_SHELL_PROCESS_GROUPS: usize = 1024;
+const SHELL_PROCESS_FORCE_TERMINATION_WAIT: Duration = Duration::from_millis(100);
 
 pub(in crate::handler) struct ShellProcessRegistry {
     inner: StdMutex<ShellProcessRegistryInner>,
@@ -40,7 +42,18 @@ impl ShellProcessRegistry {
         }
     }
 
-    pub(in crate::handler) fn register(
+    pub(in crate::handler) fn register_spawned(
+        self: &Arc<Self>,
+        child: &mut ProcessTreeChild,
+    ) -> Result<ShellProcessGuard, ShellProcessRegistrationError> {
+        let registration = self.register_controller(child.controller());
+        if registration.is_err() {
+            terminate_and_reap_shell_process(child);
+        }
+        registration
+    }
+
+    fn register_controller(
         self: &Arc<Self>,
         controller: ProcessTreeController,
     ) -> Result<ShellProcessGuard, ShellProcessRegistrationError> {
@@ -91,6 +104,19 @@ impl ShellProcessRegistry {
             .processes
             .remove(&id);
     }
+}
+
+pub(in crate::handler) fn terminate_and_reap_shell_process(child: &mut ProcessTreeChild) {
+    // `wait` disarms the process-group or Job Object identity. Settle every
+    // descendant first so shutdown cannot return while a child is still live.
+    let tree_stopped = child
+        .controller()
+        .terminate_and_wait(SHELL_PROCESS_FORCE_TERMINATION_WAIT)
+        .unwrap_or(false);
+    if !tree_stopped {
+        let _ = child.terminate();
+    }
+    let _ = child.wait();
 }
 
 impl Default for ShellProcessRegistry {

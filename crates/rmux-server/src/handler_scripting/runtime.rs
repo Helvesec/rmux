@@ -260,22 +260,14 @@ fn register_shell_process(
     let Some(shell_processes) = shell_processes else {
         return Ok(None);
     };
-    match shell_processes.register(child.controller()) {
+    match shell_processes.register_spawned(child) {
         Ok(guard) => Ok(Some(guard)),
-        Err(ShellProcessRegistrationError::Closing) => {
-            let _ = child.terminate();
-            let _ = child.wait();
-            Err(RmuxError::Server(
-                "shell command interrupted by server shutdown".to_owned(),
-            ))
-        }
-        Err(ShellProcessRegistrationError::LimitReached { limit }) => {
-            let _ = child.terminate();
-            let _ = child.wait();
-            Err(RmuxError::Server(format!(
-                "too many active shell process groups; limit is {limit}"
-            )))
-        }
+        Err(ShellProcessRegistrationError::Closing) => Err(RmuxError::Server(
+            "shell command interrupted by server shutdown".to_owned(),
+        )),
+        Err(ShellProcessRegistrationError::LimitReached { limit }) => Err(RmuxError::Server(
+            format!("too many active shell process groups; limit is {limit}"),
+        )),
     }
 }
 

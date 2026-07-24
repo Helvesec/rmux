@@ -9,7 +9,9 @@ use rmux_proto::RmuxError;
 use tokio::sync::oneshot;
 use tracing::warn;
 
-use super::super::shell_processes::{ShellProcessRegistrationError, ShellProcessRegistry};
+use super::super::shell_processes::{
+    terminate_and_reap_shell_process, ShellProcessRegistrationError, ShellProcessRegistry,
+};
 use super::super::RequestHandler;
 use crate::terminal::shell_std_command;
 
@@ -79,20 +81,14 @@ fn run_pipe_command_blocking(
         }
     };
     let controller = child.controller();
-    let process_guard = match shell_processes.register(controller.clone()) {
+    let process_guard = match shell_processes.register_spawned(&mut child) {
         Ok(guard) => guard,
         Err(ShellProcessRegistrationError::Closing) => {
-            terminate_rejected_pipe_command(
-                &mut child,
-                &command,
-                started,
-                "server shutdown started",
-            );
+            report_rejected_pipe_command(&command, started, "server shutdown started");
             return;
         }
         Err(ShellProcessRegistrationError::LimitReached { limit }) => {
-            terminate_rejected_pipe_command(
-                &mut child,
+            report_rejected_pipe_command(
                 &command,
                 started,
                 &format!("active shell process limit of {limit} was reached"),
@@ -101,8 +97,8 @@ fn run_pipe_command_blocking(
         }
     };
     if let Err(controller) = startup_guard.handoff(controller) {
-        let _ = controller.terminate();
-        let _ = child.wait();
+        drop(controller);
+        terminate_and_reap_shell_process(&mut child);
         let _ = started.send(Err(RmuxError::Server(format!(
             "pipe command '{command}' was cancelled before startup completed"
         ))));
@@ -110,8 +106,7 @@ fn run_pipe_command_blocking(
     }
     if process_guard.shutdown_started() {
         startup_guard.terminate();
-        let _ = child.terminate();
-        let _ = child.wait();
+        terminate_and_reap_shell_process(&mut child);
         let _ = started.send(Err(RmuxError::Server(format!(
             "pipe command '{command}' was interrupted by server shutdown"
         ))));
@@ -129,14 +124,11 @@ fn run_pipe_command_blocking(
     }
 }
 
-fn terminate_rejected_pipe_command(
-    child: &mut ProcessTreeChild,
+fn report_rejected_pipe_command(
     command: &str,
     started: oneshot::Sender<Result<(), RmuxError>>,
     reason: &str,
 ) {
-    let _ = child.terminate();
-    let _ = child.wait();
     let _ = started.send(Err(RmuxError::Server(format!(
         "pipe command '{command}' was cancelled before startup completed: {reason}"
     ))));
