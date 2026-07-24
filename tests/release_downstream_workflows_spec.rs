@@ -10,6 +10,8 @@ const DOWNSTREAM_AUDIT_ACTION: &str =
     include_str!("../.github/actions/release-downstream-audit/action.yml");
 const DOWNSTREAM_AUTHORITY_PROOF: &str =
     include_str!("../.github/actions/release-downstream-authority-proof/action.yml");
+const DOWNSTREAM_PREPARE: &str =
+    include_str!("../.github/workflows/release-downstream-prepare.yml");
 const RECEIPT: &str = include_str!("../.github/workflows/release-receipt.yml");
 const CI: &str = include_str!("../.github/workflows/ci.yml");
 const RECEIPT_REFERENCE_BUILDER: &str =
@@ -272,6 +274,30 @@ fn downstream_rc_payloads_keep_stable_package_names() {
     assert!(staging.contains("version = manifest[\"package_version\"]"));
     assert!(!staging.contains("version = release_ref.removeprefix(\"v\")"));
     assert!(snap.contains("version = package_version(args.release_ref)"));
+}
+
+#[test]
+fn downstream_payloads_bind_the_complete_shadow_run_identity() {
+    let marker = "- name: Verify exact candidate manifest artifact identity";
+    let next_marker = "- name: Download only the exact candidate manifest artifact ID";
+    let verification = DOWNSTREAM_PREPARE
+        .split(marker)
+        .nth(1)
+        .expect("candidate manifest verification")
+        .split(next_marker)
+        .next()
+        .expect("candidate manifest verification boundary");
+    for expected in [
+        "--expected-workflow-id 316223904",
+        "--expected-workflow-path .github/workflows/release-shadow.yml",
+        "--expected-event workflow_dispatch",
+        "--expected-head-branch main",
+    ] {
+        assert!(
+            verification.contains(expected),
+            "missing shadow run identity {expected}"
+        );
+    }
 }
 
 #[test]

@@ -141,6 +141,25 @@ def _validate_receipt_origin(main: str) -> None:
         raise ValueError("downstream plan artifact must flatten its receipt predicate")
 
 
+def _validate_payload_prepare(path: Path) -> None:
+    text = path.read_text(encoding="utf-8")
+    marker = "- name: Verify exact candidate manifest artifact identity"
+    next_marker = "- name: Download only the exact candidate manifest artifact ID"
+    if text.count(marker) != 1 or text.count(next_marker) != 1:
+        raise ValueError("downstream payload preparer lost candidate manifest binding")
+    verification = text.split(marker, 1)[1].split(next_marker, 1)[0]
+    required = (
+        "--expected-workflow-id 316223904",
+        "--expected-workflow-path .github/workflows/release-shadow.yml",
+        "--expected-event workflow_dispatch",
+        "--expected-head-branch main",
+    )
+    if any(verification.count(value) != 1 for value in required):
+        raise ValueError(
+            "downstream payload preparer lost the exact shadow run identity"
+        )
+
+
 def _validate_retry(path: Path) -> None:
     retry = path.read_text(encoding="utf-8")
     channel = "chocolatey" if "chocolatey" in path.name else "snap_candidate"
@@ -382,6 +401,9 @@ def validate_downstream_workflows(root: Path) -> None:
     main = paths[0].read_text(encoding="utf-8")
     _validate_receipt_origin(main)
     _validate_channel_orchestration(main)
+    _validate_payload_prepare(
+        root / ".github/workflows/release-downstream-prepare.yml"
+    )
     for path in paths[1:]:
         _validate_retry(path)
     _validate_retry_dispatch(_retry_dispatch_path(root))
