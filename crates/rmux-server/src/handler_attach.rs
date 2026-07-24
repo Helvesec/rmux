@@ -2290,6 +2290,7 @@ mod tests {
             client_pixels: None,
             size_sequence: 0,
             last_activity_sequence: 0,
+            activity_at: 0,
             persistent_overlay_epoch: persistent_overlay_epoch.clone(),
             render_generation: 5,
             overlay_generation: 11,

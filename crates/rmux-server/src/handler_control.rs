@@ -11,7 +11,8 @@ use tokio::sync::{mpsc, watch};
 
 use super::{
     attach_support::resize_control_session_for_client, client_support::SwitchTargetSelection,
-    update_environment_from_client, QueuedLifecycleEvent, RequestHandler,
+    current_client_activity_timestamp, update_environment_from_client, QueuedLifecycleEvent,
+    RequestHandler,
 };
 use crate::control::{ControlClientFlags, ControlModeUpgrade, ControlServerEvent};
 use crate::control_notifications::{collect_control_notifications, ControlClientSnapshot};
@@ -61,6 +62,7 @@ pub(super) struct ActiveControlState {
 pub(super) struct ActiveControl {
     pub(super) id: u64,
     pub(super) last_activity_sequence: u64,
+    pub(super) activity_at: i64,
     pub(super) client_width: u16,
     pub(super) client_height: u16,
     pub(super) session_name: Option<rmux_proto::SessionName>,
@@ -437,6 +439,7 @@ impl RequestHandler {
                     ActiveControl {
                         id: control_id,
                         last_activity_sequence: activity_sequence,
+                        activity_at: current_client_activity_timestamp(),
                         client_width: DEFAULT_CONTROL_CLIENT_WIDTH,
                         client_height: DEFAULT_CONTROL_CLIENT_HEIGHT,
                         session_name: None,

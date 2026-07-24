@@ -3,6 +3,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::Mutex as StdMutex;
 use std::sync::{Arc, Weak};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use rmux_core::events::{PaneSnapshotCoalescerRegistry, SubscriptionLimits};
 use rmux_ipc::PeerIdentity;
@@ -280,6 +281,13 @@ impl DetachedRequesterAccess {
     pub(in crate::handler) fn is_empty(&self) -> bool {
         self.scopes.is_empty()
     }
+}
+
+pub(in crate::handler) fn current_client_activity_timestamp() -> i64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs() as i64
 }
 
 #[derive(Debug)]

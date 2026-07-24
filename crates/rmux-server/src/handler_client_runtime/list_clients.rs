@@ -9,6 +9,7 @@ pub(in crate::handler) struct ListClientSnapshot {
     pub(in crate::handler) control: bool,
     pub(in crate::handler) session_name: Option<rmux_proto::SessionName>,
     pub(in crate::handler) order: u64,
+    pub(in crate::handler) activity_at: i64,
     pub(in crate::handler) width: u16,
     pub(in crate::handler) height: Option<u16>,
     pub(in crate::handler) sort_height: u16,

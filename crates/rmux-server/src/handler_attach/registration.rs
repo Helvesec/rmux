@@ -7,7 +7,7 @@ use rmux_core::LifecycleEvent;
 #[cfg(test)]
 use tokio::sync::mpsc;
 
-use crate::handler::RequestHandler;
+use crate::handler::{current_client_activity_timestamp, RequestHandler};
 use crate::mouse::ClientMouseState;
 #[cfg(test)]
 use crate::outer_terminal::OuterTerminalContext;
@@ -229,6 +229,7 @@ impl RequestHandler {
                     client_pixels: None,
                     size_sequence,
                     last_activity_sequence: activity_sequence,
+                    activity_at: current_client_activity_timestamp(),
                     persistent_overlay_epoch: registration.persistent_overlay_epoch,
                     render_generation: 0,
                     overlay_generation: 0,

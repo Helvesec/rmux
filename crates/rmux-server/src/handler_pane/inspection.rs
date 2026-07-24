@@ -946,6 +946,7 @@ fn with_runtime_client_values<'a>(
         .with_named_value("client_name", client.name.clone())
         .with_named_value("client_pid", client.pid.to_string())
         .with_named_value("client_tty", client.tty.clone())
+        .with_named_value("client_activity", client.activity_at.to_string())
         .with_named_value(
             "client_session",
             client

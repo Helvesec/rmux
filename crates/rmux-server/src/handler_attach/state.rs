@@ -14,7 +14,7 @@ use super::super::prompt_support::ClientPromptState;
 use super::super::scripting_support::{
     rename_pane_target_session, rename_window_target_session, QueueExecutionContext,
 };
-use super::super::{RequesterOrigin, StableTargetIdentity};
+use super::super::{current_client_activity_timestamp, RequesterOrigin, StableTargetIdentity};
 use super::transient_message::TransientMessageInputState;
 use crate::client_flags::ClientFlags;
 use crate::handler_support::{ambiguous_attached_client, attached_client_required};
@@ -59,6 +59,8 @@ pub(in crate::handler) struct ActiveAttach {
     pub(in crate::handler) size_sequence: u64,
     /// Server-monotonic ordering of the client's latest accepted live input.
     pub(in crate::handler) last_activity_sequence: u64,
+    /// Unix timestamp of the client's latest accepted live input.
+    pub(in crate::handler) activity_at: i64,
     pub(in crate::handler) persistent_overlay_epoch: Arc<AtomicU64>,
     pub(in crate::handler) render_generation: u64,
     pub(in crate::handler) overlay_generation: u64,
@@ -217,6 +219,7 @@ impl ActiveAttachState {
             return false;
         };
         active.last_activity_sequence = sequence;
+        active.activity_at = current_client_activity_timestamp();
         true
     }
 

@@ -837,6 +837,32 @@ pub(super) fn run_control_mode_client(
     })
 }
 
+fn run_control_mode_client_delayed(
+    mut command: Command,
+    first: &str,
+    delay: Duration,
+    second: &str,
+) -> Result<ControlModeOutput, Box<dyn Error>> {
+    let mut child = command
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()?;
+    let mut stdin = child.stdin.take().expect("control stdin");
+    stdin.write_all(first.as_bytes())?;
+    stdin.flush()?;
+    std::thread::sleep(delay);
+    stdin.write_all(second.as_bytes())?;
+    drop(stdin);
+
+    let output = child.wait_with_output()?;
+    Ok(ControlModeOutput {
+        status_code: output.status.code(),
+        stdout: String::from_utf8_lossy(&output.stdout).into_owned(),
+        stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
+    })
+}
+
 pub(super) fn run_rmux_control_mode(
     harness: &TmuxCompatHarness,
     commands: &str,
@@ -868,6 +894,29 @@ pub(super) fn run_rmux_control_mode_with(
     }
     command.args(top_level_args).arg("-C");
     run_control_mode_client(command, commands)
+}
+
+pub(super) fn run_rmux_control_mode_delayed(
+    harness: &TmuxCompatHarness,
+    first: &str,
+    delay: Duration,
+    second: &str,
+) -> Result<ControlModeOutput, Box<dyn Error>> {
+    let home = harness.tmpdir().join("home");
+    let xdg = harness.tmpdir().join("xdg");
+    fs::create_dir_all(&home)?;
+    fs::create_dir_all(&xdg)?;
+
+    let mut command = Command::new(env!("CARGO_BIN_EXE_rmux"));
+    command
+        .env("TMPDIR", harness.tmpdir())
+        .env("RMUX_TMPDIR", harness.tmpdir())
+        .env("HOME", &home)
+        .env("XDG_CONFIG_HOME", &xdg)
+        .env("TERM", "xterm-256color")
+        .env_remove("RMUX")
+        .arg("-C");
+    run_control_mode_client_delayed(command, first, delay, second)
 }
 
 pub(super) fn run_tmux_control_mode(
@@ -908,6 +957,34 @@ pub(super) fn run_tmux_control_mode_with(
         .arg("-S")
         .arg(harness.tmux_socket_path());
     run_control_mode_client(command, commands)
+}
+
+pub(super) fn run_tmux_control_mode_delayed(
+    harness: &TmuxCompatHarness,
+    tmux_binary: &Path,
+    first: &str,
+    delay: Duration,
+    second: &str,
+) -> Result<ControlModeOutput, Box<dyn Error>> {
+    let home = harness.tmpdir().join("home");
+    let xdg = harness.tmpdir().join("xdg");
+    fs::create_dir_all(&home)?;
+    fs::create_dir_all(&xdg)?;
+
+    let mut command = Command::new(tmux_binary);
+    command
+        .env("TMPDIR", harness.tmpdir())
+        .env("TMUX_TMPDIR", harness.tmpdir())
+        .env("HOME", &home)
+        .env("XDG_CONFIG_HOME", &xdg)
+        .env("TERM", "xterm-256color")
+        .env_remove("TMUX")
+        .arg("-f")
+        .arg("/dev/null")
+        .arg("-C")
+        .arg("-S")
+        .arg(harness.tmux_socket_path());
+    run_control_mode_client_delayed(command, first, delay, second)
 }
 
 pub(super) fn sorted_first_words(output: &str) -> Vec<String> {

@@ -549,6 +549,59 @@ fn tmux_compat_list_clients_control_mode_flags_when_frozen_tmux_is_available(
 }
 
 #[test]
+fn tmux_compat_control_commands_do_not_refresh_client_activity_when_frozen_tmux_is_available(
+) -> Result<(), Box<dyn Error>> {
+    let harness = TmuxCompatHarness::new("tmux-compat-control-client-activity")?;
+    let Some(tmux_binary) = frozen_tmux_or_skip(&harness)? else {
+        return Ok(());
+    };
+    let create = harness.run_pair_with(
+        &tmux_binary,
+        &["new-session", "-d", "-s", "alpha"],
+        tmux_compat_config(),
+    )?;
+    assert_quiet_success(&create);
+
+    let first = concat!(
+        "attach-session -t alpha\n",
+        "display-message -p 'activity=#{client_activity}'\n",
+    );
+    let second = "display-message -p 'activity=#{client_activity}'\n";
+    let delay = Duration::from_millis(1_200);
+    let tmux_run = run_tmux_control_mode_delayed(&harness, &tmux_binary, first, delay, second)?;
+    let rmux_run = run_rmux_control_mode_delayed(&harness, first, delay, second)?;
+    assert_eq!(tmux_run.status_code, Some(0));
+    assert_eq!(rmux_run.status_code, Some(0));
+    assert!(tmux_run.stderr.is_empty(), "{:?}", tmux_run.stderr);
+    assert!(rmux_run.stderr.is_empty(), "{:?}", rmux_run.stderr);
+
+    let activity_lines = |output: &str| {
+        extract_control_frame_payload_lines(output)
+            .into_iter()
+            .filter(|line| line.starts_with("activity="))
+            .collect::<Vec<_>>()
+    };
+    let tmux_activity = activity_lines(&tmux_run.stdout);
+    let rmux_activity = activity_lines(&rmux_run.stdout);
+    assert_eq!(tmux_activity.len(), 2, "{:?}", tmux_run.stdout);
+    assert_eq!(rmux_activity.len(), 2, "{:?}", rmux_run.stdout);
+    assert_eq!(tmux_activity[0], tmux_activity[1]);
+    assert_eq!(rmux_activity[0], rmux_activity[1]);
+    let timestamp = |line: &str| {
+        line.strip_prefix("activity=")
+            .expect("activity line prefix")
+            .parse::<i64>()
+            .expect("client_activity is a Unix timestamp")
+    };
+    assert!(
+        timestamp(&tmux_activity[0]).abs_diff(timestamp(&rmux_activity[0])) <= 30,
+        "tmux and rmux registration timestamps use different epochs: tmux={tmux_activity:?}, rmux={rmux_activity:?}"
+    );
+
+    Ok(())
+}
+
+#[test]
 fn tmux_compat_attached_client_top_level_terminal_runtime_overrides_when_frozen_tmux_is_available(
 ) -> Result<(), Box<dyn Error>> {
     let harness = TmuxCompatHarness::new("tmux-compat-client-runtime-top-level-attach")?;

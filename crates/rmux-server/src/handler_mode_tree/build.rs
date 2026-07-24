@@ -186,7 +186,6 @@ impl RequestHandler {
     }
 
     pub(super) async fn mode_tree_clients_snapshot(&self) -> Vec<ClientSnapshot> {
-        let now = Local::now().timestamp();
         let active_attach = self.active_attach.lock().await;
         active_attach
             .by_pid
@@ -196,7 +195,7 @@ impl RequestHandler {
                 attach_id: active.id,
                 session_name: Some(active.session_name.clone()),
                 label: attached_client_label(pid),
-                activity: now,
+                activity: active.activity_at,
                 width: active.client_size.cols,
                 height: active.client_size.rows,
             })

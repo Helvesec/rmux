@@ -123,6 +123,7 @@ impl RequestHandler {
                         control: false,
                         session_name: Some(active.session_name.clone()),
                         order: active.id,
+                        activity_at: active.activity_at,
                         width: active.client_size.cols,
                         height: Some(active.client_size.rows),
                         sort_height: active.client_size.rows,
@@ -153,6 +154,7 @@ impl RequestHandler {
                     control: true,
                     session_name: active.session_name.clone(),
                     order: active.id,
+                    activity_at: active.activity_at,
                     width: active.client_width,
                     height: None,
                     sort_height: active.client_height,
@@ -381,11 +383,7 @@ pub(in crate::handler) fn sort_list_clients(
             }
             SessionSortOrder::Size => left.sort_size().cmp(&right.sort_size()),
             SessionSortOrder::Creation | SessionSortOrder::Index => left.order.cmp(&right.order),
-            SessionSortOrder::Activity => left
-                .session_name
-                .as_ref()
-                .map(ToString::to_string)
-                .cmp(&right.session_name.as_ref().map(ToString::to_string)),
+            SessionSortOrder::Activity => right.activity_at.cmp(&left.activity_at),
         };
         let ordering = if reversed {
             ordering.reverse()
@@ -664,6 +662,7 @@ mod tests {
             control: false,
             session_name: None,
             order,
+            activity_at: 0,
             width: 80,
             height: Some(24),
             sort_height: 24,
@@ -725,6 +724,33 @@ mod tests {
                 .iter()
                 .all(|client| client.height_value().is_empty()),
             "the control height remains hidden from formatting"
+        );
+    }
+
+    #[test]
+    fn list_clients_activity_sort_uses_latest_client_input_first() {
+        let mut older = client_snapshot("older", 1);
+        older.activity_at = 10;
+        let mut newer = client_snapshot("newer", 2);
+        newer.activity_at = 20;
+        let mut clients = vec![older, newer];
+
+        sort_list_clients(&mut clients, Some("activity"), false);
+        assert_eq!(
+            clients
+                .iter()
+                .map(|client| client.name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["newer", "older"]
+        );
+
+        sort_list_clients(&mut clients, Some("activity"), true);
+        assert_eq!(
+            clients
+                .iter()
+                .map(|client| client.name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["older", "newer"]
         );
     }
 
