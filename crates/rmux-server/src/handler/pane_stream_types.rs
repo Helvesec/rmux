@@ -336,3 +336,16 @@ pub(in crate::handler) struct PaneStreamSource {
     pub(in crate::handler) transcript: crate::pane_transcript::SharedPaneTranscript,
     pub(in crate::handler) generation: u64,
 }
+
+impl PaneStreamSource {
+    pub(in crate::handler) fn rekey(&mut self, current_key: PaneOutputSubscriptionKey) {
+        if self.target.session_name() == self.key.runtime_session_name() {
+            self.target = rmux_proto::PaneTarget::with_window(
+                current_key.runtime_session_name().clone(),
+                self.target.window_index(),
+                self.target.pane_index(),
+            );
+        }
+        self.key = current_key;
+    }
+}

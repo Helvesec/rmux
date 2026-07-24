@@ -5,8 +5,8 @@ use rmux_core::events::SubscriptionLimits;
 use rmux_proto::{
     NewSessionExtRequest, PaneRawRebase, PaneRawRebaseReason, PaneRecoveryCoverage,
     PaneStreamCursorRequest, PaneStreamEndReason, PaneStreamEvent, PaneStreamLifecycleEvent,
-    PaneStreamMode, PaneSurfaceFrame, PaneTarget, PaneTargetRef, Request, Response, SessionName,
-    SubscribePaneStreamRequest, SubscribePaneStreamResponse, TerminalSize,
+    PaneStreamMode, PaneSurfaceFrame, PaneTarget, PaneTargetRef, RenameSessionRequest, Request,
+    Response, SessionName, SubscribePaneStreamRequest, SubscribePaneStreamResponse, TerminalSize,
     UnsubscribePaneStreamRequest, DEFAULT_MAX_DETACHED_FRAME_LENGTH,
 };
 
@@ -1236,6 +1236,70 @@ async fn reserved_raw_subscription_keeps_exit_reason_when_initialization_finishe
     assert_eq!(
         cursor(&handler, reserved_id).await,
         vec![PaneStreamEvent::End(PaneStreamEndReason::PaneRemoved)]
+    );
+}
+
+#[tokio::test]
+async fn raw_subscription_response_uses_rekeyed_session_after_concurrent_rename() {
+    let handler = RequestHandler::new();
+    let (target, _, _) = test_pane(&handler).await;
+    let renamed_session =
+        SessionName::new("pane-stream-renamed").expect("valid renamed session name");
+    let source = {
+        let state = handler.state.lock().await;
+        super::stream_source_for_target(&state, target).expect("stream source")
+    };
+    let (source, captured) = handler
+        .capture_current_stream_source(source)
+        .await
+        .expect("capture stream source");
+    let rebase = super::materialize_raw_rebase(
+        &handler,
+        source.key.pane_id(),
+        1,
+        PaneRawRebaseReason::Initial,
+        false,
+        &captured,
+    )
+    .expect("materialize raw rebase");
+    let reserved_id = {
+        let mut subscriptions = handler.subscriptions.lock().expect("subscription lock");
+        let id = subscriptions
+            .registry
+            .subscribe(CONNECTION_ID, source.key.clone(), std::time::Instant::now())
+            .expect("raw reservation")
+            .id();
+        subscriptions.streams.insert(
+            id,
+            super::PaneStreamSubscription::reserved(PaneStreamMode::Raw),
+        );
+        id
+    };
+
+    let rename = handler
+        .handle(Request::RenameSession(RenameSessionRequest {
+            target: source.target.session_name().clone(),
+            new_name: renamed_session.clone(),
+        }))
+        .await;
+    assert!(matches!(rename, Response::RenameSession(_)), "{rename:?}");
+
+    let response = handler.finish_raw_subscription(
+        CONNECTION_ID,
+        reserved_id,
+        source,
+        super::RawSubscriptionStart::captured(captured, rebase, false),
+    );
+    let Response::SubscribePaneStream(response) = response else {
+        panic!("raw subscription should succeed: {response:?}");
+    };
+    assert_eq!(response.target.session_name(), &renamed_session);
+    assert_eq!(
+        handler
+            .pane_output_subscription_key_for_test(reserved_id)
+            .expect("subscription survives rename")
+            .runtime_session_name(),
+        &renamed_session
     );
 }
 

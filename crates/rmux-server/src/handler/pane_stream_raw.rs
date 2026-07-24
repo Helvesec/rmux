@@ -151,7 +151,7 @@ impl RequestHandler {
                             super::reserved_stream_lost_response(),
                         );
                     };
-                    source.key = current_key;
+                    source.rekey(current_key);
                     subscriptions.discard_raw_rebase_if_current(&source.key, &cached);
                     route = subscriptions.raw_initialization_route(&source.key, include_snapshot);
                 }
@@ -177,7 +177,7 @@ impl RequestHandler {
                             super::reserved_stream_lost_response(),
                         );
                     };
-                    source.key = current_key;
+                    source.rekey(current_key);
                     route = subscriptions.raw_initialization_route(&source.key, include_snapshot);
                 }
             }
@@ -212,7 +212,7 @@ impl RequestHandler {
         &self,
         connection_id: u64,
         subscription_id: rmux_proto::PaneOutputSubscriptionId,
-        source: PaneStreamSource,
+        mut source: PaneStreamSource,
         start: RawSubscriptionStart,
     ) -> Response {
         let cached_rebase = start.cached_rebase.unwrap_or_else(|| {
@@ -221,43 +221,72 @@ impl RequestHandler {
                 rebase: start.rebase.clone(),
             })
         });
-        let response = subscribe_response(
-            subscription_id,
-            &source,
-            PaneStreamEvent::RawRebase(Box::new(start.rebase)),
-        );
-        if let Err(error) = validate_detached_response(&response) {
-            self.remove_reserved_stream(subscription_id);
-            return Response::Error(ErrorResponse { error });
+        for _ in 0..super::MAX_SOURCE_CAPTURE_ATTEMPTS {
+            let current_key = {
+                let subscriptions = self
+                    .subscriptions
+                    .lock()
+                    .expect("subscription registry mutex must not be poisoned");
+                let Some(current_key) = reserved_stream_key_if_owned(
+                    &subscriptions,
+                    connection_id,
+                    subscription_id,
+                    source.key.pane_id(),
+                ) else {
+                    return super::reserved_stream_lost_response();
+                };
+                current_key
+            };
+            source.rekey(current_key);
+            let response = subscribe_response(
+                subscription_id,
+                &source,
+                PaneStreamEvent::RawRebase(Box::new(start.rebase.clone())),
+            );
+            if let Err(error) = validate_detached_response(&response) {
+                self.remove_reserved_stream(subscription_id);
+                return Response::Error(ErrorResponse { error });
+            }
+
+            let mut subscriptions = self
+                .subscriptions
+                .lock()
+                .expect("subscription registry mutex must not be poisoned");
+            let Some(current_key) = reserved_stream_key_if_owned(
+                &subscriptions,
+                connection_id,
+                subscription_id,
+                source.key.pane_id(),
+            ) else {
+                return super::reserved_stream_lost_response();
+            };
+            if current_key != source.key {
+                continue;
+            }
+            let end_reason = subscriptions
+                .streams
+                .get(&subscription_id)
+                .and_then(PaneStreamSubscription::end_reason);
+            subscriptions.streams.insert(
+                subscription_id,
+                PaneStreamSubscription::Raw(RawPaneStream::new(
+                    start.receiver,
+                    1,
+                    start.include_snapshot,
+                    end_reason,
+                )),
+            );
+            subscriptions.note_pane_drain_progress(&current_key, Instant::now());
+            subscriptions.raw_rebases.insert(current_key, cached_rebase);
+            return response;
         }
-        let mut subscriptions = self
-            .subscriptions
-            .lock()
-            .expect("subscription registry mutex must not be poisoned");
-        let Some(current_key) = reserved_stream_key_if_owned(
-            &subscriptions,
-            connection_id,
-            subscription_id,
-            source.key.pane_id(),
-        ) else {
-            return super::reserved_stream_lost_response();
-        };
-        let end_reason = subscriptions
-            .streams
-            .get(&subscription_id)
-            .and_then(PaneStreamSubscription::end_reason);
-        subscriptions.streams.insert(
-            subscription_id,
-            PaneStreamSubscription::Raw(RawPaneStream::new(
-                start.receiver,
-                1,
-                start.include_snapshot,
-                end_reason,
-            )),
-        );
-        subscriptions.note_pane_drain_progress(&current_key, Instant::now());
-        subscriptions.raw_rebases.insert(current_key, cached_rebase);
-        response
+        self.remove_reserved_stream(subscription_id);
+        Response::Error(ErrorResponse {
+            error: RmuxError::Server(
+                "pane stream identity changed repeatedly while preparing the initial response"
+                    .to_owned(),
+            ),
+        })
     }
 
     pub(super) async fn poll_raw_stream(
