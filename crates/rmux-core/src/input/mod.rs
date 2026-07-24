@@ -278,6 +278,12 @@ impl InputParser {
         &self.cell
     }
 
+    /// Returns the state restored by DECRC/SCP.
+    #[must_use]
+    pub const fn saved_state(&self) -> &SavedState {
+        &self.saved
+    }
+
     pub(crate) fn plain_output_forwarding_safe(&self) -> bool {
         self.state == InputState::Ground && !self.utf8_started && self.cell == CellState::default()
     }

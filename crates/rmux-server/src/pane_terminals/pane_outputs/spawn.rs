@@ -373,8 +373,7 @@ impl HandlerState {
                 .clone(),
         };
         let generation = self.advance_pane_output_generation(session_name, pane_id);
-        pane_output.set_generation(generation);
-        pane_output.clear_retained();
+        pane_output.reset_generation(generation);
         if let Some(dead_panes) = self.dead_panes.get_mut(session_name) {
             let _ = dead_panes.remove(&pane_id);
         }

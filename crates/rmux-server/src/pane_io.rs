@@ -15,7 +15,7 @@ use tokio::sync::watch;
 #[cfg(any(unix, windows))]
 use tokio::time::{Duration, Instant};
 
-const READ_BUFFER_SIZE: usize = 64 * 1024;
+pub(crate) const READ_BUFFER_SIZE: usize = 64 * 1024;
 #[cfg(any(unix, windows))]
 const ATTACH_INTERACTIVE_OUTPUT_WINDOW: Duration = Duration::from_millis(250);
 #[cfg(any(unix, windows))]
@@ -192,8 +192,8 @@ pub(crate) use types::LiveAttachInputContext;
 #[cfg_attr(windows, allow(unused_imports))]
 pub(crate) use types::{
     pane_output_channel, AttachSessionUpgrade, AttachTarget, HandleOutcome, OverlayFrame,
-    PaneAlertCallback, PaneAlertEvent, PaneExitCallback, PaneExitEvent, PaneOutputReceiver,
-    PaneOutputSender,
+    PaneAlertCallback, PaneAlertEvent, PaneBoundary, PaneExitCallback, PaneExitEvent,
+    PaneInvalidationReason, PaneObservationItem, PaneOutputReceiver, PaneOutputSender,
 };
 #[cfg(any(unix, windows))]
 use wire::{

@@ -14,6 +14,7 @@ use super::{
 };
 use crate::handler::{WebPaneSnapshot, WebSessionPaneFrame, WebSessionSnapshot, WebShareStream};
 use crate::web::outbound::{OutboundQueueResult, WebSocketOutbound};
+use crate::web::stream_sanitizer::WebTerminalSanitizer;
 use crate::web::{WebShareConnectionCounts, WebShareRevokeReason};
 
 #[derive(Debug, Serialize)]
@@ -64,8 +65,9 @@ pub(crate) fn queue_output(socket: &WebSocketOutbound, bytes: &[u8]) -> Outbound
 pub(crate) fn queue_snapshot(
     socket: &WebSocketOutbound,
     snapshot: &WebPaneSnapshot,
+    sanitizer: &mut WebTerminalSanitizer,
 ) -> OutboundQueueResult {
-    socket.queue_snapshot(pane_snapshot_payload(snapshot))
+    socket.queue_snapshot(pane_snapshot_payload(snapshot, sanitizer))
 }
 
 pub(crate) fn queue_session_view(
@@ -180,10 +182,16 @@ fn resize_payload(size: TerminalSize) -> Vec<u8> {
     )
 }
 
-fn pane_snapshot_payload(snapshot: &WebPaneSnapshot) -> Vec<u8> {
+fn pane_snapshot_payload(
+    snapshot: &WebPaneSnapshot,
+    sanitizer: &mut WebTerminalSanitizer,
+) -> Vec<u8> {
     let mut frame = Vec::with_capacity(1);
     frame.push(WS_SNAPSHOT_FULL);
-    snapshot.append_ansi_bytes(&mut frame);
+    let mut raw = Vec::new();
+    snapshot.append_ansi_bytes(&mut raw);
+    sanitizer.reset();
+    sanitizer.push(&raw, &mut frame);
     frame
 }
 
@@ -246,12 +254,14 @@ mod tests {
     use serde_json::json;
 
     use super::{
-        session_keyframe_payloads, session_pane_frame_payload, PaneSize, ServerMessage,
-        WebSessionPaneFrame, WebSessionSnapshot, SERVER_CAPABILITIES, WEB_SHARE_PROTOCOL_VERSION,
-        WS_RESIZE_NOTIFY, WS_SESSION_PANE_FRAME, WS_SESSION_VIEW, WS_SNAPSHOT_FULL,
+        pane_snapshot_payload, session_keyframe_payloads, session_pane_frame_payload, PaneSize,
+        ServerMessage, WebSessionPaneFrame, WebSessionSnapshot, SERVER_CAPABILITIES,
+        WEB_SHARE_PROTOCOL_VERSION, WS_RESIZE_NOTIFY, WS_SESSION_PANE_FRAME, WS_SESSION_VIEW,
+        WS_SNAPSHOT_FULL,
     };
-    use crate::handler::{TestWebSessionView, WebSessionPaneView};
+    use crate::handler::{TestWebSessionView, WebPaneSnapshot, WebSessionPaneView};
     use crate::web::protocol::PANE_FRAME_CAPABILITY;
+    use crate::web::stream_sanitizer::WebTerminalSanitizer;
     use crate::web::{WebShareConnectionCounts, WebShareRevokeReason};
 
     #[test]
@@ -394,5 +404,34 @@ mod tests {
             50_000
         );
         assert_eq!(&payload[25..], b"\x1b[3;42Hrow");
+    }
+
+    #[test]
+    fn pane_recovery_keyframe_and_live_tail_share_one_sanitizer_state() {
+        let snapshot = WebPaneSnapshot {
+            cols: 8,
+            rows: 2,
+            output_sequence: 4,
+            ansi_lines: Vec::new(),
+            cursor_row: 0,
+            cursor_col: 0,
+            cursor_visible: true,
+            mode_bits: 0,
+            cursor_style: 0,
+            alternate: false,
+            scroll_top: 0,
+            scroll_bottom: 1,
+            recovery_keyframe: Some(b"safe\x1b]52;c;partial".to_vec()),
+        };
+        let mut sanitizer = WebTerminalSanitizer::default();
+        let payload = pane_snapshot_payload(&snapshot, &mut sanitizer);
+        assert_eq!(&payload[1..], b"safe");
+
+        let mut live = Vec::new();
+        sanitizer.push(b"Zm9v\x07after", &mut live);
+        assert_eq!(
+            live, b"after",
+            "an OSC 52 fragmented across snapshot/live boundaries must stay removed"
+        );
     }
 }

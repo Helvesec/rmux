@@ -3,6 +3,7 @@ use rmux_proto::{
     OptionName, OptionScopeSelector, PaneTarget, RmuxError, ScopeSelector, SessionName,
 };
 
+use crate::pane_io::PaneInvalidationReason;
 use crate::pane_screen_state::PaneScreenState;
 use crate::pane_terminal_lookup::{missing_pane_terminal, pane_id_for_target};
 use crate::pane_transcript::SharedPaneTranscript;
@@ -182,6 +183,7 @@ impl HandlerState {
             .transcripts
             .get(&runtime_session_name)
             .and_then(|panes| panes.get(&pane_id))
+            .cloned()
             .ok_or_else(|| {
                 missing_pane_terminal(
                     target.session_name(),
@@ -189,28 +191,62 @@ impl HandlerState {
                     target.pane_index(),
                 )
             })?;
-        let mut transcript = transcript
-            .lock()
-            .expect("pane transcript mutex must not be poisoned");
-        transcript.clear_history(reset_hyperlinks);
+        let output = self
+            .pane_outputs
+            .get(&runtime_session_name)
+            .and_then(|panes| panes.get(&pane_id))
+            .cloned()
+            .ok_or_else(|| {
+                missing_pane_terminal(
+                    target.session_name(),
+                    target.window_index(),
+                    target.pane_index(),
+                )
+            })?;
+        output.mutate_transcript(
+            &transcript,
+            PaneInvalidationReason::ClearHistory,
+            |transcript| {
+                transcript.clear_history(reset_hyperlinks);
+                ((), true)
+            },
+        );
         Ok(())
     }
 
     pub(crate) fn reset_pane_terminal_state(&self, target: &PaneTarget) -> Result<(), RmuxError> {
         let transcript = self.transcript_handle(target)?;
-        let mut transcript = transcript
-            .lock()
-            .expect("pane transcript mutex must not be poisoned");
-        transcript.reset_terminal_state();
+        let output = self.pane_output_for_target(
+            target.session_name(),
+            target.window_index(),
+            target.pane_index(),
+        )?;
+        output.mutate_transcript(
+            &transcript,
+            PaneInvalidationReason::TerminalReset,
+            |transcript| {
+                transcript.reset_terminal_state();
+                ((), true)
+            },
+        );
         Ok(())
     }
 
     pub(crate) fn trim_pane_below_cursor(&self, target: &PaneTarget) -> Result<(), RmuxError> {
         let transcript = self.transcript_handle(target)?;
-        let mut transcript = transcript
-            .lock()
-            .expect("pane transcript mutex must not be poisoned");
-        let _ = transcript.trim_below_cursor();
+        let output = self.pane_output_for_target(
+            target.session_name(),
+            target.window_index(),
+            target.pane_index(),
+        )?;
+        output.mutate_transcript(
+            &transcript,
+            PaneInvalidationReason::TranscriptMutation,
+            |transcript| {
+                let changed = transcript.trim_below_cursor();
+                ((), changed)
+            },
+        );
         Ok(())
     }
 
@@ -220,10 +256,20 @@ impl HandlerState {
         title: &str,
     ) -> Result<Option<(String, String)>, RmuxError> {
         let transcript = self.transcript_handle(target)?;
-        let mut transcript = transcript
-            .lock()
-            .expect("pane transcript mutex must not be poisoned");
-        Ok(transcript.set_title(title))
+        let output = self.pane_output_for_target(
+            target.session_name(),
+            target.window_index(),
+            target.pane_index(),
+        )?;
+        Ok(output.mutate_transcript(
+            &transcript,
+            PaneInvalidationReason::TranscriptMutation,
+            |transcript| {
+                let changed = transcript.set_title(title);
+                let did_change = changed.is_some();
+                (changed, did_change)
+            },
+        ))
     }
 
     pub(crate) fn refresh_transcript_limits_for_scope(
@@ -652,11 +698,28 @@ impl HandlerState {
             .transcripts
             .get(&runtime_session_name)
             .and_then(|panes| panes.get(&pane_id))
+            .cloned()
             .ok_or_else(|| missing_pane_terminal(session_name, window_index, pane_index))?;
-        transcript
-            .lock()
-            .expect("pane transcript mutex must not be poisoned")
-            .append_bytes(bytes);
+        if let Some(output) = self
+            .pane_outputs
+            .get(&runtime_session_name)
+            .and_then(|panes| panes.get(&pane_id))
+            .cloned()
+        {
+            output.mutate_transcript(
+                &transcript,
+                PaneInvalidationReason::TranscriptMutation,
+                |transcript| {
+                    transcript.append_bytes(bytes);
+                    ((), !bytes.is_empty())
+                },
+            );
+        } else {
+            transcript
+                .lock()
+                .expect("pane transcript mutex must not be poisoned")
+                .append_bytes(bytes);
+        }
         Ok(())
     }
 
@@ -676,8 +739,43 @@ impl HandlerState {
     ) {
         let limit = self.history_limit_for_session(session_name);
         let runtime_session_name = self.runtime_session_name(session_name);
-        if let Some(transcripts) = self.transcripts.get_mut(&runtime_session_name) {
-            for transcript in transcripts.values() {
+        let transcripts = self
+            .transcripts
+            .get(&runtime_session_name)
+            .map(|transcripts| {
+                transcripts
+                    .iter()
+                    .map(|(pane_id, transcript)| (*pane_id, transcript.clone()))
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        for (pane_id, transcript) in transcripts {
+            let changed = transcript
+                .lock()
+                .expect("pane transcript mutex must not be poisoned")
+                .history_limit()
+                != limit;
+            if !changed {
+                continue;
+            }
+            if let Some(output) = self
+                .pane_outputs
+                .get(&runtime_session_name)
+                .and_then(|panes| panes.get(&pane_id))
+                .cloned()
+            {
+                output.mutate_transcript(
+                    &transcript,
+                    PaneInvalidationReason::TranscriptMutation,
+                    |transcript| {
+                        let changed = transcript.history_limit() != limit;
+                        if changed {
+                            transcript.set_limit(limit);
+                        }
+                        ((), changed)
+                    },
+                );
+            } else {
                 transcript
                     .lock()
                     .expect("pane transcript mutex must not be poisoned")
@@ -880,23 +978,59 @@ impl HandlerState {
         session_name: &SessionName,
         pane_geometries: &[crate::pane_terminal_lookup::SessionPane],
     ) {
-        let Some(transcripts) = self.transcripts.get_mut(session_name) else {
+        let Some(transcripts) = self.transcripts.get(session_name) else {
             return;
         };
+        let outputs = self.pane_outputs.get(session_name);
 
         let mut resized_panes = Vec::new();
         for pane in pane_geometries {
-            let Some(transcript) = transcripts.get(&pane.id) else {
+            let Some(transcript) = transcripts.get(&pane.id).cloned() else {
                 continue;
             };
-            transcript
+            let size = rmux_proto::TerminalSize {
+                cols: pane.geometry.cols(),
+                rows: pane.geometry.rows(),
+            };
+            // Border drags routinely enqueue repeated copies of the same
+            // geometry. Reject those before taking PaneOutputState, then
+            // recheck under the atomic output -> transcript critical section
+            // for the actual mutation.
+            let needs_resize = transcript
                 .lock()
-                .expect("pane transcript mutex must not be poisoned")
-                .resize(rmux_proto::TerminalSize {
-                    cols: pane.geometry.cols(),
-                    rows: pane.geometry.rows(),
-                });
-            resized_panes.push(pane.id);
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .screen()
+                .size()
+                != size;
+            if !needs_resize {
+                continue;
+            }
+            let changed =
+                if let Some(output) = outputs.and_then(|outputs| outputs.get(&pane.id)).cloned() {
+                    output.mutate_transcript(
+                        &transcript,
+                        PaneInvalidationReason::Resize,
+                        |transcript| {
+                            let changed = transcript.screen().size() != size;
+                            if changed {
+                                transcript.resize(size);
+                            }
+                            (changed, changed)
+                        },
+                    )
+                } else {
+                    let mut transcript = transcript
+                        .lock()
+                        .expect("pane transcript mutex must not be poisoned");
+                    let changed = transcript.screen().size() != size;
+                    if changed {
+                        transcript.resize(size);
+                    }
+                    changed
+                };
+            if changed {
+                resized_panes.push(pane.id);
+            }
         }
         for pane_id in resized_panes {
             self.clear_attached_submitted_line(session_name, pane_id);

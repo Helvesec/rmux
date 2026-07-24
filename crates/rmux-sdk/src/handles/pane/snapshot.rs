@@ -94,7 +94,7 @@ async fn request_pane_snapshot(
     }
 }
 
-pub(super) fn snapshot_from_response(response: PaneSnapshotResponse) -> Result<PaneSnapshot> {
+pub(crate) fn snapshot_from_response(response: PaneSnapshotResponse) -> Result<PaneSnapshot> {
     let cells = response.cells.into_iter().map(cell_from_wire).collect();
     let cursor = cursor_from_wire(response.cursor);
     let snapshot = PaneSnapshot {
@@ -112,7 +112,7 @@ pub(super) fn snapshot_from_response(response: PaneSnapshotResponse) -> Result<P
     Ok(snapshot)
 }
 
-pub(super) fn cell_from_wire(cell: PaneSnapshotCell) -> PaneCell {
+pub(crate) fn cell_from_wire(cell: PaneSnapshotCell) -> PaneCell {
     let glyph = if cell.padding {
         PaneGlyph {
             text: cell.text,
@@ -131,6 +131,6 @@ pub(super) fn cell_from_wire(cell: PaneSnapshotCell) -> PaneCell {
     }
 }
 
-fn cursor_from_wire(cursor: PaneSnapshotCursor) -> PaneCursor {
+pub(crate) fn cursor_from_wire(cursor: PaneSnapshotCursor) -> PaneCursor {
     PaneCursor::new(cursor.row, cursor.col, cursor.visible, cursor.style)
 }

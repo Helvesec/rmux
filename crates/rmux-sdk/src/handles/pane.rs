@@ -30,7 +30,7 @@ mod output;
 #[path = "pane/queries.rs"]
 mod queries;
 #[path = "pane/snapshot.rs"]
-mod snapshot;
+pub(crate) mod snapshot;
 #[path = "pane/spawn.rs"]
 mod spawn;
 #[path = "pane/split.rs"]

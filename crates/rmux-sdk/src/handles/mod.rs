@@ -6,7 +6,7 @@
 
 mod builder;
 mod owned_session;
-mod pane;
+pub(crate) mod pane;
 mod rmux;
 pub(crate) mod session;
 mod split;

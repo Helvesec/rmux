@@ -37,7 +37,7 @@
   <a href="#verification"><img src="https://img.shields.io/badge/unsafe-restricted-success.svg" alt="Unsafe policy"></a>
   <a href="https://github.com/Helvesec/rmux/actions/workflows/ci.yml?query=branch%3Amain"><img src="https://img.shields.io/github/actions/workflow/status/Helvesec/rmux/ci.yml?branch=main&amp;event=push&amp;label=CI" alt="CI"></a>
   <a href="https://www.bestpractices.dev/projects/13290"><img src="https://www.bestpractices.dev/projects/13290/badge" alt="OpenSSF Best Practices"></a>
-  <a href="https://github.com/Helvesec/rmux/releases/tag/v0.9.1"><img src="https://img.shields.io/badge/rmux-0.9.1-informational.svg" alt="rmux 0.9.1"></a>
+  <a href="https://github.com/Helvesec/rmux/releases/tag/v0.9.2"><img src="https://img.shields.io/badge/rmux-0.9.2-informational.svg" alt="rmux 0.9.2"></a>
 </p>
 
 </div>
@@ -124,7 +124,7 @@ Use `rmux -V` for the installed version.
 | <picture><source media="(prefers-color-scheme: dark)" srcset="docs/install/linux.svg"><img src="docs/install/linux-light.svg" width="28" alt="Linux"></picture> <picture><source media="(prefers-color-scheme: dark)" srcset="docs/install/apple.svg"><img src="docs/install/apple-light.svg" width="28" alt="macOS"></picture> / Nix | `nix profile install github:Helvesec/rmux` |
 | <picture><source media="(prefers-color-scheme: dark)" srcset="docs/install/rust.svg"><img src="docs/install/rust-light.svg" width="28" alt="Rust"></picture> / Cargo | `cargo install rmux --locked` |
 
-Direct downloads (`.tar.gz`, `.deb`, `.rpm`, `.zip`) are available from the [v0.9.1 GitHub Release](https://github.com/Helvesec/rmux/releases/tag/v0.9.1).
+Direct downloads (`.tar.gz`, `.deb`, `.rpm`, `.zip`) are available from the [v0.9.2 GitHub Release](https://github.com/Helvesec/rmux/releases/tag/v0.9.2).
 
 Package managers can lag while registries review new releases; use the versioned
 GitHub Release download when a manager has not caught up yet.

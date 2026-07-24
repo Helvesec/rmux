@@ -13,6 +13,7 @@ __pycache__/
 /scripts/fuzz/target/
 tests/reference/screenshots/*/*/
 SDK demo/node_modules/
+tests/xterm-oracle/node_modules/
 SDK demo/.astro/
 SDK demo/dist/
 SDK demo/test-results/

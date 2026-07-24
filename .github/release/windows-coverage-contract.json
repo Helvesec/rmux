@@ -14,6 +14,7 @@
     {"name": "mutating target-action retry tests", "proof": "fast_exact", "evidence": "Windows workspace test archive and 18 slices"},
     {"name": "server lib tests", "proof": "fast_exact", "evidence": "Windows workspace test archive and 18 slices"},
     {"name": "SDK lib tests", "proof": "fast_exact", "evidence": "Windows workspace test archive and 18 slices"},
+    {"name": "independent xterm.js recovery oracle", "proof": "release_delta", "evidence": "pinned xterm.js recovery oracle on Windows release review"},
     {"name": "CLI acceptance matrix", "proof": "fast_exact", "evidence": "Windows workspace test archive and 18 slices"},
     {"name": "source/config acceptance matrix", "proof": "fast_exact", "evidence": "Windows workspace test archive and 18 slices"},
     {"name": "target/format acceptance matrix", "proof": "fast_exact", "evidence": "Windows workspace test archive and 18 slices"},

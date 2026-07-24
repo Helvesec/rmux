@@ -587,7 +587,13 @@ fn publish_pane_bytes(context: PanePublishContext<'_>, bytes: Vec<u8>) -> Vec<u8
         return Vec::new();
     };
     if let Some(timer) = append_result.ground_timer {
-        schedule_pane_ground_timer(session_name, pane_id, Arc::clone(transcript), timer);
+        schedule_pane_ground_timer(
+            session_name,
+            pane_id,
+            Arc::clone(transcript),
+            pane_output.clone(),
+            timer,
+        );
     }
     let replies = append_result.replies;
     let dropped_passthrough_count = append_result.dropped_passthrough_count;
@@ -671,6 +677,7 @@ pub(super) fn osc52_payload_decodes(payload: &[u8]) -> bool {
 
 struct PaneGroundTimerJob {
     transcript: SharedPaneTranscript,
+    pane_output: PaneOutputSender,
     timer: PaneGroundTimer,
 }
 
@@ -678,9 +685,14 @@ fn schedule_pane_ground_timer(
     session_name: &rmux_proto::SessionName,
     pane_id: PaneId,
     transcript: SharedPaneTranscript,
+    pane_output: PaneOutputSender,
     timer: PaneGroundTimer,
 ) {
-    let job = PaneGroundTimerJob { transcript, timer };
+    let job = PaneGroundTimerJob {
+        transcript,
+        pane_output,
+        timer,
+    };
     if let Err(error) = pane_ground_timer_tx().send(job) {
         warn!(
             session = %session_name,
@@ -764,17 +776,14 @@ fn expire_due_pane_ground_timers(jobs: &mut Vec<PaneGroundTimerJob>) {
 }
 
 fn expire_pane_ground_timer_job(job: PaneGroundTimerJob) {
-    let mut transcript = match job.transcript.lock() {
-        Ok(transcript) => transcript,
-        Err(poisoned) => {
-            warn!(
-                "pane transcript mutex was poisoned while expiring parser ground timer; \
-                 recovering timer worker"
-            );
-            poisoned.into_inner()
-        }
-    };
-    let _ = transcript.expire_ground_timer(job.timer);
+    job.pane_output.mutate_transcript(
+        &job.transcript,
+        super::PaneInvalidationReason::ParserStateExpired,
+        |transcript| {
+            let expired = transcript.expire_ground_timer(job.timer);
+            ((), expired)
+        },
+    );
 }
 
 #[cfg(unix)]
@@ -1468,7 +1477,11 @@ mod windows_tests {
             panic!("poison pane transcript mutex for timer worker test");
         });
 
-        let mut jobs = vec![PaneGroundTimerJob { transcript, timer }];
+        let mut jobs = vec![PaneGroundTimerJob {
+            transcript,
+            pane_output: pane_output_channel(),
+            timer,
+        }];
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             expire_due_pane_ground_timers(&mut jobs);
         }));

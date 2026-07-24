@@ -63,6 +63,8 @@ mod overlay_support;
 mod pane_output_subscription_rekeys;
 #[path = "handler_pane_state.rs"]
 mod pane_state_support;
+#[path = "handler_pane_stream.rs"]
+mod pane_stream_support;
 #[path = "handler_pane.rs"]
 mod pane_support;
 #[path = "handler/post_commit_sequencer.rs"]
@@ -1029,6 +1031,18 @@ impl RequestHandler {
             .lock()
             .ok()
             .and_then(|server_access| server_access.admission_for_identity(&peer.user))
+    }
+
+    pub(crate) fn server_access_admission_is_current(
+        &self,
+        peer: &PeerIdentity,
+        admission: &ServerAccessAdmission,
+    ) -> bool {
+        self.server_access
+            .lock()
+            .ok()
+            .and_then(|server_access| server_access.revalidate_admission(admission, &peer.user))
+            .is_some()
     }
 
     #[cfg(test)]

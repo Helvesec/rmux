@@ -35,13 +35,14 @@ pub use pane::{
     PaneKillRequest, PaneOptionGetRequest, PaneOptionSetRequest, PaneOutputCursorRequest,
     PaneOutputSubscriptionStart, PaneResizeRequest, PaneRespawnRequest, PaneSelectRequest,
     PaneSnapshotRefRequest, PaneSnapshotRequest, PaneSplitSize, PaneStateCursorRequest,
-    PipePaneRequest, ResizePaneRequest, ResizePaneTargetActionRequest, RespawnPaneRequest,
-    SelectPaneAdjacentRequest, SelectPaneDirection, SelectPaneMarkRequest, SelectPaneRequest,
-    SendKeysExt2Request, SendKeysExtRequest, SendKeysRequest, SplitWindowExtRequest,
-    SplitWindowIdentityRequest, SplitWindowRequest, SplitWindowTarget,
-    SplitWindowTargetActionRequest, SubscribePaneOutputRefRequest, SubscribePaneOutputRequest,
-    SubscribePaneStateRequest, SwapPaneDirection, SwapPaneRequest, UnsubscribePaneOutputRequest,
-    UnsubscribePaneStateRequest,
+    PaneStreamCursorRequest, PaneStreamMode, PipePaneRequest, ResizePaneRequest,
+    ResizePaneTargetActionRequest, RespawnPaneRequest, SelectPaneAdjacentRequest,
+    SelectPaneDirection, SelectPaneMarkRequest, SelectPaneRequest, SendKeysExt2Request,
+    SendKeysExtRequest, SendKeysRequest, SplitWindowExtRequest, SplitWindowIdentityRequest,
+    SplitWindowRequest, SplitWindowTarget, SplitWindowTargetActionRequest,
+    SubscribePaneOutputRefRequest, SubscribePaneOutputRequest, SubscribePaneStateRequest,
+    SubscribePaneStreamRequest, SwapPaneDirection, SwapPaneRequest, UnsubscribePaneOutputRequest,
+    UnsubscribePaneStateRequest, UnsubscribePaneStreamRequest,
 };
 
 #[path = "request/window.rs"]
@@ -371,6 +372,12 @@ pub enum Request {
     PaneForegroundState(PaneForegroundStateRequest),
     /// SDK split endpoint returning visible and stable pane identity atomically.
     SplitWindowIdentity(Box<SplitWindowIdentityRequest>),
+    /// Opens a recoverable raw or surface pane stream.
+    SubscribePaneStream(SubscribePaneStreamRequest),
+    /// Polls a recoverable raw or surface pane stream.
+    PaneStreamCursor(PaneStreamCursorRequest),
+    /// Closes a recoverable raw or surface pane stream.
+    UnsubscribePaneStream(UnsubscribePaneStreamRequest),
 }
 
 impl Request {
@@ -433,6 +440,9 @@ impl Request {
             }
             Self::UnsubscribePaneOutput(_) => "unsubscribe-pane-output",
             Self::PaneOutputCursor(_) => "pane-output-cursor",
+            Self::SubscribePaneStream(_) => "subscribe-pane-stream",
+            Self::PaneStreamCursor(_) => "pane-stream-cursor",
+            Self::UnsubscribePaneStream(_) => "unsubscribe-pane-stream",
             Self::SdkWaitForOutput(_) | Self::SdkWaitForOutputRef(_) => "sdk-wait-output",
             Self::CancelSdkWait(_) => "cancel-sdk-wait",
             Self::PaneInput(_) => "send-keys",

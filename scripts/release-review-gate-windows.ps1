@@ -240,6 +240,18 @@ Step "mutating target-action retry tests" {
 Step "server lib tests" {
     Run "cargo" @("test", "-p", "rmux-server", "--lib", "--locked", "--", "--test-threads=1")
 }
+Step "independent xterm.js recovery oracle" {
+    $npm = Get-Command npm.cmd -ErrorAction SilentlyContinue
+    if (-not $npm) {
+        throw "npm.cmd is required for the pinned independent xterm.js recovery oracle"
+    }
+    Run $npm.Source @("--prefix", "tests\xterm-oracle", "ci", "--ignore-scripts", "--no-audit", "--no-fund")
+    Run "cargo" @(
+        "test", "-p", "rmux-server", "--lib", "--locked",
+        "pane_recovery::tests::keyframes_converge_in_independent_xterm_oracle",
+        "--", "--ignored", "--exact", "--test-threads=1"
+    )
+}
 Step "SDK lib tests" {
     Run "cargo" @("test", "-p", "rmux-sdk", "--lib", "--locked", "--", "--test-threads=1")
 }

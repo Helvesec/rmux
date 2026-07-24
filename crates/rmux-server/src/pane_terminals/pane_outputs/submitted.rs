@@ -97,10 +97,29 @@ impl HandlerState {
             self.clear_attached_submitted_line(runtime_session_name, pane_id);
             return Ok(false);
         };
-        let removed = transcript
-            .lock()
-            .expect("pane transcript mutex must not be poisoned")
-            .delete_attached_submitted_line(submitted_line.absolute_y, &submitted_line.text);
+        let output = self
+            .pane_outputs
+            .get(runtime_session_name)
+            .and_then(|panes| panes.get(&pane_id))
+            .cloned();
+        let removed = if let Some(output) = output {
+            output.mutate_transcript(
+                &transcript,
+                crate::pane_io::PaneInvalidationReason::TranscriptMutation,
+                |transcript| {
+                    let removed = transcript.delete_attached_submitted_line(
+                        submitted_line.absolute_y,
+                        &submitted_line.text,
+                    );
+                    (removed, removed)
+                },
+            )
+        } else {
+            transcript
+                .lock()
+                .expect("pane transcript mutex must not be poisoned")
+                .delete_attached_submitted_line(submitted_line.absolute_y, &submitted_line.text)
+        };
         if removed {
             self.clear_attached_submitted_line(runtime_session_name, pane_id);
         }

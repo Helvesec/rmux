@@ -12,6 +12,7 @@ mod registry;
 mod secrets;
 mod server;
 mod settings;
+mod stream_sanitizer;
 mod tunnel;
 mod websocket;
 

@@ -1327,6 +1327,33 @@ pub const V1_FRAME_LEDGER: &[FrameLedgerEntry] = &[
         Some("split_window_identity_request"),
         "Atomic SDK split identity request; pinned bincode tag 127.",
     ),
+    entry(
+        c2s(128),
+        FrameDirection::ClientToServer,
+        ACTIVE,
+        "SubscribePaneStreamRequest",
+        FrameFeature::Panes,
+        Some("subscribe_pane_stream_request"),
+        "Recoverable pane stream subscription request; pinned bincode tag 128.",
+    ),
+    entry(
+        c2s(129),
+        FrameDirection::ClientToServer,
+        ACTIVE,
+        "PaneStreamCursorRequest",
+        FrameFeature::Panes,
+        Some("pane_stream_cursor_request"),
+        "Recoverable pane stream cursor request; pinned bincode tag 129.",
+    ),
+    entry(
+        c2s(130),
+        FrameDirection::ClientToServer,
+        ACTIVE,
+        "UnsubscribePaneStreamRequest",
+        FrameFeature::Panes,
+        Some("unsubscribe_pane_stream_request"),
+        "Recoverable pane stream unsubscribe request; pinned bincode tag 130.",
+    ),
     // Reserved client→server slot. Removed values must be listed and never reused.
     entry(
         c2s(0x7FFE),
@@ -2265,6 +2292,33 @@ pub const V1_FRAME_LEDGER: &[FrameLedgerEntry] = &[
         Some("split_window_identity_response"),
         "Atomic SDK split identity response; pinned bincode tag 101.",
     ),
+    entry(
+        s2c(102),
+        FrameDirection::ServerToClient,
+        ACTIVE,
+        "SubscribePaneStreamResponse",
+        FrameFeature::Panes,
+        Some("subscribe_pane_stream_response"),
+        "Recoverable pane stream subscription response; pinned bincode tag 102.",
+    ),
+    entry(
+        s2c(103),
+        FrameDirection::ServerToClient,
+        ACTIVE,
+        "PaneStreamCursorResponse",
+        FrameFeature::Panes,
+        Some("pane_stream_cursor_response"),
+        "Recoverable pane stream cursor response; pinned bincode tag 103.",
+    ),
+    entry(
+        s2c(104),
+        FrameDirection::ServerToClient,
+        ACTIVE,
+        "UnsubscribePaneStreamResponse",
+        FrameFeature::Panes,
+        Some("unsubscribe_pane_stream_response"),
+        "Recoverable pane stream unsubscribe response; pinned bincode tag 104.",
+    ),
     // Reserved server→client slot. Removed values must be listed and never reused.
     entry(
         s2c(0x7FFE),
@@ -2422,6 +2476,9 @@ pub const fn frame_kind_for_request(request: &Request) -> FrameKind {
         Request::UnsubscribePaneState(_) => c2s(125),
         Request::PaneForegroundState(_) => c2s(126),
         Request::SplitWindowIdentity(_) => c2s(127),
+        Request::SubscribePaneStream(_) => c2s(128),
+        Request::PaneStreamCursor(_) => c2s(129),
+        Request::UnsubscribePaneStream(_) => c2s(130),
     }
 }
 
@@ -2531,6 +2588,9 @@ pub const fn frame_kind_for_response(response: &Response) -> FrameKind {
         Response::UnsubscribePaneState(_) => s2c(99),
         Response::PaneForegroundState(_) => s2c(100),
         Response::SplitWindowIdentity(_) => s2c(101),
+        Response::SubscribePaneStream(_) => s2c(102),
+        Response::PaneStreamCursor(_) => s2c(103),
+        Response::UnsubscribePaneStream(_) => s2c(104),
     }
 }
 

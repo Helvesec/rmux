@@ -1,138 +1,33 @@
-use std::collections::{HashMap, HashSet};
 use std::time::{Duration, Instant};
 
 use rmux_core::events::{
     OutputCursor, OutputCursorItem, OutputGap, PaneOutputSubscriptionKey, SubscriptionLimitError,
-    SubscriptionLimits, SubscriptionRegistry,
 };
+#[cfg(test)]
+use rmux_proto::PaneOutputSubscriptionId;
 use rmux_proto::{
     ErrorResponse, PaneOutputCursor, PaneOutputCursorRequest, PaneOutputCursorResponse,
-    PaneOutputEvent, PaneOutputLagNotice, PaneOutputLagResponse, PaneOutputSubscriptionId,
-    PaneOutputSubscriptionStart, PaneRecentOutput, PaneTarget, PaneTargetRef, Response, RmuxError,
+    PaneOutputEvent, PaneOutputLagNotice, PaneOutputLagResponse, PaneOutputSubscriptionStart,
+    PaneRecentOutput, PaneTarget, PaneTargetRef, Response, RmuxError,
     SubscribePaneOutputRefRequest, SubscribePaneOutputRequest, SubscribePaneOutputResponse,
     UnsubscribePaneOutputRequest, UnsubscribePaneOutputResponse,
 };
 
-use crate::pane_io::{PaneOutputReceiver, PaneOutputSender};
+use crate::pane_io::PaneOutputSender;
 use crate::pane_terminals::{session_not_found, HandlerState};
 
 use super::{PaneOutputSubscriptionReconciliation, RequestHandler};
+
+#[path = "handler/output_subscription_state.rs"]
+mod output_subscription_state;
+pub(crate) use output_subscription_state::OutputSubscriptionState;
+pub(in crate::handler) use output_subscription_state::SurfaceDriverRoute;
 
 // Keep lag diagnostics well below the detached RPC frame cap after bincode
 // overhead and the rest of the response envelope are added.
 const MAX_LAG_RECENT_BYTES: usize = 64 * 1024;
 const EXITED_PANE_DRAIN_POLL_INTERVAL: Duration = Duration::from_millis(25);
 const EXITED_PANE_DRAIN_IDLE_TIMEOUT: Duration = Duration::from_secs(2);
-
-pub(crate) struct OutputSubscriptionState {
-    registry: SubscriptionRegistry,
-    receivers: HashMap<PaneOutputSubscriptionId, PaneOutputReceiver>,
-    draining_panes: HashSet<PaneOutputSubscriptionKey>,
-}
-
-impl std::fmt::Debug for OutputSubscriptionState {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        formatter
-            .debug_struct("OutputSubscriptionState")
-            .field("registry", &self.registry)
-            .field("receiver_count", &self.receivers.len())
-            .field("draining_pane_count", &self.draining_panes.len())
-            .finish()
-    }
-}
-
-impl OutputSubscriptionState {
-    pub(crate) fn new(limits: SubscriptionLimits) -> Self {
-        Self {
-            registry: SubscriptionRegistry::new(limits),
-            receivers: HashMap::new(),
-            draining_panes: HashSet::new(),
-        }
-    }
-
-    fn limits(&self) -> SubscriptionLimits {
-        self.registry.limits()
-    }
-
-    fn cleanup_stale(&mut self, now: Instant) {
-        for record in self.registry.cleanup_stale(now) {
-            self.receivers.remove(&record.id());
-            self.discard_drain_if_unused(record.pane());
-        }
-    }
-
-    fn remove_connection(&mut self, connection_id: u64) {
-        for record in self.registry.remove_connection(connection_id) {
-            self.receivers.remove(&record.id());
-            self.discard_drain_if_unused(record.pane());
-        }
-    }
-
-    fn remove_pane(&mut self, pane: &PaneOutputSubscriptionKey) -> bool {
-        let removed = self.registry.remove_pane(pane);
-        let removed_any = !removed.is_empty();
-        for record in removed {
-            self.receivers.remove(&record.id());
-        }
-        self.draining_panes.remove(pane);
-        removed_any
-    }
-
-    fn rekey_pane(
-        &mut self,
-        previous: &PaneOutputSubscriptionKey,
-        current: PaneOutputSubscriptionKey,
-    ) {
-        let was_draining = self.draining_panes.remove(previous);
-        let _ = self.registry.rekey_pane(previous, current.clone());
-        if was_draining {
-            self.draining_panes.insert(current);
-        }
-    }
-
-    fn begin_pane_drain(&mut self, pane: PaneOutputSubscriptionKey) -> bool {
-        if !self.registry.contains_pane(&pane) {
-            return false;
-        }
-        self.draining_panes.insert(pane);
-        true
-    }
-
-    fn pane_is_draining(&self, pane: &PaneOutputSubscriptionKey) -> bool {
-        self.draining_panes.contains(pane)
-    }
-
-    fn pane_drain_idle_for(
-        &self,
-        pane: &PaneOutputSubscriptionKey,
-        now: Instant,
-    ) -> Option<Duration> {
-        let last_seen = self
-            .registry
-            .ids_for_pane(pane)
-            .into_iter()
-            .filter_map(|id| self.registry.get(id).map(|record| record.last_seen()))
-            .max()?;
-        Some(now.saturating_duration_since(last_seen))
-    }
-
-    pub(in crate::handler) fn is_empty(&self) -> bool {
-        self.registry.is_empty()
-    }
-
-    fn remove_subscription(&mut self, subscription_id: PaneOutputSubscriptionId) {
-        if let Some(record) = self.registry.unsubscribe(subscription_id) {
-            self.receivers.remove(&subscription_id);
-            self.discard_drain_if_unused(record.pane());
-        }
-    }
-
-    fn discard_drain_if_unused(&mut self, pane: &PaneOutputSubscriptionKey) {
-        if !self.registry.contains_pane(pane) {
-            self.draining_panes.remove(pane);
-        }
-    }
-}
 
 impl RequestHandler {
     #[cfg(test)]
@@ -476,7 +371,7 @@ impl RequestHandler {
                     .is_some_and(|idle_for| idle_for >= EXITED_PANE_DRAIN_IDLE_TIMEOUT)
                 {
                     handler
-                        .cleanup_pane_output_subscriptions(std::slice::from_ref(&pane))
+                        .cleanup_drained_pane_output_subscriptions(&pane)
                         .await;
                     return;
                 }
@@ -499,6 +394,17 @@ impl RequestHandler {
             .lock()
             .expect("subscription registry mutex must not be poisoned");
         subscriptions.pane_drain_idle_for(pane, Instant::now())
+    }
+
+    async fn cleanup_drained_pane_output_subscriptions(&self, pane: &PaneOutputSubscriptionKey) {
+        {
+            let mut subscriptions = self
+                .subscriptions
+                .lock()
+                .expect("subscription registry mutex must not be poisoned");
+            let _ = subscriptions.remove_drained_legacy_subscriptions(pane);
+        }
+        let _ = self.request_shutdown_if_pending();
     }
 }
 
@@ -563,7 +469,10 @@ fn resolve_pane_target_ref(
     }
 }
 
-fn cursor_event_limit(requested: Option<u16>, default: usize) -> Result<usize, RmuxError> {
+pub(in crate::handler) fn cursor_event_limit(
+    requested: Option<u16>,
+    default: usize,
+) -> Result<usize, RmuxError> {
     match requested {
         Some(0) => Err(RmuxError::Server(
             "pane output cursor max_events must be greater than zero".to_owned(),

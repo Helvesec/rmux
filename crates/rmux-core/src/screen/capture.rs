@@ -39,7 +39,25 @@ impl Screen {
         range: ScreenCaptureRange,
         options: GridRenderOptions,
     ) -> Vec<Vec<u8>> {
-        capture_grid_lines_independent(&self.grid, &self.hyperlinks, range, options)
+        capture_grid_rows_independent(&self.grid, &self.hyperlinks, range, options)
+            .into_iter()
+            .map(|(bytes, _wrapped)| bytes)
+            .collect()
+    }
+
+    /// Captures physical rows from fresh ANSI states together with each row's
+    /// soft-wrap flag.
+    ///
+    /// Recovery renderers use the flag to preserve scrollback reflow: a
+    /// wrapped row is followed immediately by the next row, while a hard line
+    /// break is represented by CRLF.
+    #[must_use]
+    pub fn capture_transcript_rows_independent(
+        &self,
+        range: ScreenCaptureRange,
+        options: GridRenderOptions,
+    ) -> Vec<(Vec<u8>, bool)> {
+        capture_grid_rows_independent(&self.grid, &self.hyperlinks, range, options)
     }
 
     #[must_use]
@@ -97,6 +115,33 @@ impl Screen {
             .map(|saved| capture_grid_bytes(&saved.grid, &self.hyperlinks, range, options))
     }
 
+    /// Captures saved pre-alternate-screen rows from independent ANSI states.
+    #[must_use]
+    pub fn capture_saved_transcript_lines_independent(
+        &self,
+        range: ScreenCaptureRange,
+        options: GridRenderOptions,
+    ) -> Option<Vec<Vec<u8>>> {
+        self.saved_grid.as_ref().map(|saved| {
+            capture_grid_rows_independent(&saved.grid, &self.hyperlinks, range, options)
+                .into_iter()
+                .map(|(bytes, _wrapped)| bytes)
+                .collect()
+        })
+    }
+
+    /// Captures saved pre-alternate-screen rows and their soft-wrap flags.
+    #[must_use]
+    pub fn capture_saved_transcript_rows_independent(
+        &self,
+        range: ScreenCaptureRange,
+        options: GridRenderOptions,
+    ) -> Option<Vec<(Vec<u8>, bool)>> {
+        self.saved_grid.as_ref().map(|saved| {
+            capture_grid_rows_independent(&saved.grid, &self.hyperlinks, range, options)
+        })
+    }
+
     /// Captures tmux-style per-line format flags from the saved alternate screen.
     #[must_use]
     pub fn capture_saved_line_format_flags(&self, range: ScreenCaptureRange) -> Option<Vec<u8>> {
@@ -106,12 +151,12 @@ impl Screen {
     }
 }
 
-fn capture_grid_lines_independent(
+fn capture_grid_rows_independent(
     grid: &Grid,
     hyperlinks: &Hyperlinks,
     range: ScreenCaptureRange,
     options: GridRenderOptions,
-) -> Vec<Vec<u8>> {
+) -> Vec<(Vec<u8>, bool)> {
     let total_lines = grid.hsize() + usize::try_from(grid.sy()).unwrap_or(usize::MAX);
     let Some(range) = resolve_screen_capture_range(range, grid.hsize(), total_lines) else {
         return Vec::new();
@@ -125,7 +170,10 @@ fn capture_grid_lines_independent(
         else {
             continue;
         };
-        output.push(line.into_bytes());
+        output.push((
+            line.into_bytes(),
+            grid.absolute_line_wrapped(absolute_y).unwrap_or(false),
+        ));
     }
     output
 }

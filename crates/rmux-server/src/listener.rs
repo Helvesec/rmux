@@ -292,10 +292,16 @@ async fn serve_connection(
                 let Some(access_admission) =
                     handler.server_access_admission_for_peer(&requester)
                 else {
-                    conn.write_response(&Response::Error(ErrorResponse {
-                        error: rmux_proto::RmuxError::Server("access not allowed".to_owned()),
-                    }))
-                    .await?;
+                    let response = match request {
+                        Request::PaneStreamCursor(request) => handler
+                            .handle_revoked_pane_stream_cursor(connection_id, request),
+                        _ => Response::Error(ErrorResponse {
+                            error: rmux_proto::RmuxError::Server(
+                                "access not allowed".to_owned(),
+                            ),
+                        }),
+                    };
+                    conn.write_response(&response).await?;
                     continue;
                 };
                 let can_write = access_admission.can_write();
@@ -481,6 +487,18 @@ async fn serve_connection(
                 } else {
                     None
                 };
+
+                if matches!(
+                    outcome.response,
+                    Response::SubscribePaneStream(_) | Response::PaneStreamCursor(_)
+                ) && !handler
+                    .server_access_admission_is_current(&requester, &access_admission)
+                {
+                    outcome.response = handler.revoke_inflight_pane_stream_response(
+                        connection_id,
+                        outcome.response,
+                    );
+                }
 
                 let response_result = match (legacy_kill_server_wire, &outcome.response) {
                     (Some(wire_version), Response::KillServer(_)) => {

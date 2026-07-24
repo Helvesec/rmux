@@ -17,6 +17,25 @@ mod render;
 pub(crate) use cell::{GridCell, GridCellFlags, GridLine, GridLineFlags};
 use render::{append_cell_text, append_grid_string_code, append_hyperlink};
 
+pub(crate) fn render_cell_state_ansi(
+    state: &crate::input::CellState,
+    hyperlinks: &Hyperlinks,
+) -> Vec<u8> {
+    let previous = GridCell::blank_with_bg(COLOUR_DEFAULT);
+    let current = GridCell::from_state(' ', 1, state, GridCellFlags::default());
+    let mut rendered = String::new();
+    let mut has_link = false;
+    append_grid_string_code(
+        &previous,
+        &current,
+        &mut rendered,
+        false,
+        Some(hyperlinks),
+        &mut has_link,
+    );
+    rendered.into_bytes()
+}
+
 const HISTORY_STAMP_REFRESH_LINES: u16 = 256;
 
 /// Captured grid content rendered as logical lines.

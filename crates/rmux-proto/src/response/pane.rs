@@ -482,6 +482,189 @@ pub struct PaneOutputLagResponse {
     pub lag: PaneOutputLagNotice,
 }
 
+/// Why a raw pane stream emitted a new authoritative keyframe.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum PaneRawRebaseReason {
+    /// Initial authoritative boundary created when the stream opens.
+    Initial,
+    /// The consumer fell behind the bounded output ring.
+    Lag,
+    /// Pane geometry changed without a corresponding output byte.
+    Resize,
+    /// Retained terminal history was explicitly cleared.
+    ClearHistory,
+    /// An incomplete parser sequence expired.
+    ParserStateExpired,
+    /// The terminal state was reset.
+    TerminalReset,
+    /// Another cold-path transcript mutation invalidated continuation.
+    TranscriptMutation,
+    /// The pane process generation changed.
+    GenerationChanged,
+}
+
+/// Complete raw-emulator recovery state delivered in-band.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PaneRawRebase {
+    /// Stream-local epoch stamped onto subsequent raw byte events.
+    pub epoch: u64,
+    /// Pane process generation observed by the atomic boundary.
+    pub generation: u64,
+    /// Cold-path invalidation revision observed by the atomic boundary.
+    pub invalidation_revision: u64,
+    /// First pane-output sequence not represented by this keyframe.
+    pub next_sequence: u64,
+    /// Terminal width represented by the keyframe.
+    pub cols: u16,
+    /// Terminal height represented by the keyframe.
+    pub rows: u16,
+    /// ANSI bytes that reset and reconstruct a compatible terminal emulator.
+    pub keyframe: Vec<u8>,
+    /// Whether the captured pane is currently using its alternate screen.
+    pub alternate: bool,
+    /// Optional typed snapshot requested by an inspection-oriented consumer.
+    pub snapshot: Option<PaneSnapshotResponse>,
+    /// Cause of this rebase.
+    pub reason: PaneRawRebaseReason,
+}
+
+/// One raw byte event tied to a preceding rebase epoch.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PaneRawBytes {
+    /// Stream-local epoch established by the latest raw rebase.
+    pub epoch: u64,
+    /// Monotonic pane-output sequence.
+    pub sequence: u64,
+    /// Exact output bytes published for this sequence.
+    pub bytes: Vec<u8>,
+}
+
+/// Authoritative structured pane state.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PaneSurfaceSnapshot {
+    /// Visible pane width in terminal columns.
+    pub cols: u16,
+    /// Visible pane height in terminal rows.
+    pub rows: u16,
+    /// Row-major visible cells, exactly `cols * rows` long.
+    pub cells: Vec<PaneSnapshotCell>,
+    /// Current cursor state.
+    pub cursor: PaneSnapshotCursor,
+    /// Terminal title observed at this boundary.
+    pub title: String,
+    /// Terminal-reported working-directory path.
+    pub path: String,
+    /// Raw terminal mode bitset.
+    pub mode_bits: u32,
+    /// Whether the alternate screen is active.
+    pub alternate: bool,
+    /// Inclusive top row of the scrolling region.
+    pub scroll_top: u32,
+    /// Inclusive bottom row of the scrolling region.
+    pub scroll_bottom: u32,
+    /// Number of retained scrollback rows.
+    pub history_size: u64,
+    /// Bytes retained by the terminal history representation.
+    pub history_bytes: u64,
+    /// Monotonic pane-grid revision shared with `PaneSnapshotResponse`.
+    pub revision: u64,
+}
+
+/// A self-contained surface frame; no earlier patch is required to apply it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PaneSurfaceFrame {
+    /// Stream-local epoch established by the latest surface reset.
+    pub epoch: u64,
+    /// Monotonic revision of the complete surface projection.
+    pub revision: u64,
+    /// First pane-output sequence not represented by this atomic surface.
+    pub next_output_sequence: u64,
+    /// Complete authoritative surface represented by this frame.
+    pub snapshot: PaneSurfaceSnapshot,
+}
+
+/// Pane lifecycle observations that do not terminate the logical stream.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum PaneStreamLifecycleEvent {
+    /// The current child process exited after its output reached EOF.
+    ///
+    /// A kept pane may later be respawned on the same subscription.
+    ProcessExited {
+        /// Exact output-ring sequence occupied by the EOF marker when it was
+        /// still retained. `None` means lifecycle was recovered across an
+        /// invalidation or retention gap; the adjacent rebase is authoritative
+        /// for raw sequence continuation.
+        output_sequence: Option<u64>,
+    },
+}
+
+/// Distinguishes logical pane removal from subscription termination.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum PaneStreamEndReason {
+    /// The logical pane resource was removed.
+    PaneRemoved,
+    /// The caller no longer has permission to observe the pane.
+    AccessRevoked,
+    /// The bounded subscription could not keep up.
+    SlowConsumer,
+    /// The idle subscription lease expired.
+    SubscriptionExpired,
+    /// The underlying detached transport was lost.
+    TransportLost,
+    /// The daemon could not materialize the requested projection.
+    ProjectionFailed,
+}
+
+/// One item in either recoverable pane projection.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum PaneStreamEvent {
+    /// Authoritative raw-emulator reset and reconstruction payload.
+    RawRebase(Box<PaneRawRebase>),
+    /// Exact raw output following the latest rebase.
+    RawBytes(PaneRawBytes),
+    /// Complete authoritative surface establishing a new epoch.
+    SurfaceReset(Box<PaneSurfaceFrame>),
+    /// Self-contained authoritative surface update.
+    SurfacePatch(Box<PaneSurfaceFrame>),
+    /// Non-terminal process lifecycle observation.
+    Lifecycle(PaneStreamLifecycleEvent),
+    /// Typed terminal or subscription termination.
+    End(PaneStreamEndReason),
+}
+
+/// Atomic initial event and already-reserved pane stream subscription.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SubscribePaneStreamResponse {
+    /// Opaque stream subscription allocated by the daemon.
+    pub subscription_id: PaneOutputSubscriptionId,
+    /// Resolved pane slot at subscription time.
+    pub target: PaneTarget,
+    /// Stable pane identity at subscription time.
+    pub pane_id: PaneId,
+    /// Initial authoritative event.
+    pub event: PaneStreamEvent,
+}
+
+/// Batched recoverable pane stream events.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PaneStreamCursorResponse {
+    /// Polled stream subscription.
+    pub subscription_id: PaneOutputSubscriptionId,
+    /// Events delivered in stream order.
+    pub events: Vec<PaneStreamEvent>,
+    /// Whether this response stopped at the server-side batch cap.
+    pub limited: bool,
+}
+
+/// Result of explicitly closing a recoverable pane stream.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct UnsubscribePaneStreamResponse {
+    /// Requested stream subscription.
+    pub subscription_id: PaneOutputSubscriptionId,
+    /// Whether a live stream was removed.
+    pub removed: bool,
+}
+
 /// One captured pane cell on the daemon snapshot wire.
 ///
 /// Cells are produced from rmux-core's structured `ScreenCellView`, so the

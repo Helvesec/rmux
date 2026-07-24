@@ -42,6 +42,10 @@ pub const CAPABILITY_SDK_PANE_STATE_EVENTS: &str = "sdk.pane.state_events";
 pub const CAPABILITY_SDK_PANE_FOREGROUND: &str = "sdk.pane.foreground";
 /// Stable feature id for atomic SDK split visible/stable identity responses.
 pub const CAPABILITY_SDK_PANE_SPLIT_IDENTITY: &str = "sdk.pane.split_identity";
+/// Stable feature id for recoverable raw pane-output streams.
+pub const CAPABILITY_SDK_PANE_RAW_RECOVERY: &str = "sdk.pane.raw_recovery";
+/// Stable feature id for authoritative pane-surface streams.
+pub const CAPABILITY_SDK_PANE_SURFACE_STREAM: &str = "sdk.pane.surface_stream";
 /// Stable feature id for daemon-side app-owned session leases.
 pub const CAPABILITY_SDK_SESSION_LEASE: &str = "sdk.session.lease";
 /// Stable feature id for app-owned session lease requests addressed by session id.
@@ -98,6 +102,8 @@ pub const SUPPORTED_CAPABILITIES: &[&str] = &[
     CAPABILITY_CLI_RUNTIME_COMMAND_EXPANSION,
     CAPABILITY_CLI_LIST_WINDOWS_ALL_QUEUE,
     CAPABILITY_SDK_PANE_SPLIT_IDENTITY,
+    CAPABILITY_SDK_PANE_RAW_RECOVERY,
+    CAPABILITY_SDK_PANE_SURFACE_STREAM,
 ];
 
 /// Builds the capability inventory for a binary with the supplied optional
@@ -217,7 +223,8 @@ mod tests {
         capabilities_for_features, HandshakeRequest, HandshakeResponse, CAPABILITY_ATTACH_RENDER,
         CAPABILITY_ATTACH_WINDOWS_CONSOLE_KEY, CAPABILITY_CLI_CAPTURE_TARGET_ACTION,
         CAPABILITY_CLI_LIST_WINDOWS_ALL_QUEUE, CAPABILITY_CLI_TARGET_ACTIONS, CAPABILITY_HANDSHAKE,
-        CAPABILITY_SDK_OWNED_SESSION_STABLE_IDENTITY, CAPABILITY_SDK_PANE_SPLIT_IDENTITY,
+        CAPABILITY_SDK_OWNED_SESSION_STABLE_IDENTITY, CAPABILITY_SDK_PANE_RAW_RECOVERY,
+        CAPABILITY_SDK_PANE_SPLIT_IDENTITY, CAPABILITY_SDK_PANE_SURFACE_STREAM,
         CAPABILITY_SDK_SESSION_LEASE_BY_ID, CAPABILITY_SDK_SESSION_LEASE_BY_ID_V2,
         CAPABILITY_SDK_WAITS_ARMED, CAPABILITY_WEB_SHARE,
     };
@@ -289,6 +296,24 @@ mod tests {
             .capabilities
             .iter()
             .any(|capability| capability == CAPABILITY_SDK_PANE_SPLIT_IDENTITY));
+    }
+
+    #[test]
+    fn current_handshake_advertises_both_pane_stream_projections() {
+        let response = HandshakeResponse::current();
+
+        for expected in [
+            CAPABILITY_SDK_PANE_RAW_RECOVERY,
+            CAPABILITY_SDK_PANE_SURFACE_STREAM,
+        ] {
+            assert!(
+                response
+                    .capabilities
+                    .iter()
+                    .any(|capability| capability == expected),
+                "missing capability {expected}"
+            );
+        }
     }
 
     #[test]

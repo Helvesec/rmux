@@ -31,19 +31,23 @@ use rmux_proto::{
     PaneOptionGetRequest, PaneOptionGetResponse, PaneOptionSetRequest, PaneOptionSetResponse,
     PaneOutputCursor, PaneOutputCursorRequest, PaneOutputCursorResponse, PaneOutputEvent,
     PaneOutputLagNotice, PaneOutputLagResponse, PaneOutputSubscriptionId,
-    PaneOutputSubscriptionStart, PaneRecentOutput, PaneResizeRequest, PaneRespawnRequest,
-    PaneSelectRequest, PaneSnapshotCursor, PaneSnapshotRefRequest, PaneSnapshotResponse,
-    PaneStateClosedReason, PaneStateCursorRequest, PaneStateCursorResponse, PaneStateEventDto,
-    PaneStateLagResponse, PaneStateSnapshot, PaneStateSubscriptionId, PaneTarget, PaneTargetRef,
-    Request, ResizePaneAdjustment, ResizePaneTargetActionRequest, ResolveTargetRequest,
-    ResolveTargetType, Response, RmuxError, ScopeSelector, SdkWaitForOutputRefRequest,
-    SdkWaitForOutputRequest, SdkWaitForOutputResponse, SdkWaitId, SdkWaitOutcome, SdkWaitOwnerId,
-    SendKeysExt2Request, SendKeysRequest, SendKeysResponse, SessionName, SetHookRequest,
-    SetOptionMode, SetOptionRequest, SplitDirection, SplitWindowIdentityRequest,
-    SplitWindowIdentityResponse, SplitWindowTargetActionRequest, SubscribePaneOutputRefRequest,
-    SubscribePaneOutputRequest, SubscribePaneOutputResponse, SubscribePaneStateRequest,
-    SubscribePaneStateResponse, TerminalSize, UnsubscribePaneOutputRequest,
-    UnsubscribePaneOutputResponse, UnsubscribePaneStateRequest, UnsubscribePaneStateResponse,
+    PaneOutputSubscriptionStart, PaneRawBytes, PaneRawRebase, PaneRawRebaseReason,
+    PaneRecentOutput, PaneResizeRequest, PaneRespawnRequest, PaneSelectRequest, PaneSnapshotCursor,
+    PaneSnapshotRefRequest, PaneSnapshotResponse, PaneStateClosedReason, PaneStateCursorRequest,
+    PaneStateCursorResponse, PaneStateEventDto, PaneStateLagResponse, PaneStateSnapshot,
+    PaneStateSubscriptionId, PaneStreamCursorRequest, PaneStreamCursorResponse,
+    PaneStreamEndReason, PaneStreamEvent, PaneStreamLifecycleEvent, PaneStreamMode,
+    PaneSurfaceFrame, PaneSurfaceSnapshot, PaneTarget, PaneTargetRef, Request,
+    ResizePaneAdjustment, ResizePaneTargetActionRequest, ResolveTargetRequest, ResolveTargetType,
+    Response, RmuxError, ScopeSelector, SdkWaitForOutputRefRequest, SdkWaitForOutputRequest,
+    SdkWaitForOutputResponse, SdkWaitId, SdkWaitOutcome, SdkWaitOwnerId, SendKeysExt2Request,
+    SendKeysRequest, SendKeysResponse, SessionName, SetHookRequest, SetOptionMode,
+    SetOptionRequest, SplitDirection, SplitWindowIdentityRequest, SplitWindowIdentityResponse,
+    SplitWindowTargetActionRequest, SubscribePaneOutputRefRequest, SubscribePaneOutputRequest,
+    SubscribePaneOutputResponse, SubscribePaneStateRequest, SubscribePaneStateResponse,
+    SubscribePaneStreamRequest, SubscribePaneStreamResponse, TerminalSize,
+    UnsubscribePaneOutputRequest, UnsubscribePaneOutputResponse, UnsubscribePaneStateRequest,
+    UnsubscribePaneStateResponse, UnsubscribePaneStreamRequest, UnsubscribePaneStreamResponse,
     WebShareConfigRequest, WebShareListener, WebShareRequest, WebShareResponse, WindowTarget,
     RMUX_FRAME_MAGIC, RMUX_WIRE_VERSION, V1_FRAME_LEDGER,
 };
@@ -235,6 +239,19 @@ fn fixtures() -> Vec<FullFrameFixture> {
     let pane_foreground_state = Request::PaneForegroundState(PaneForegroundStateRequest {
         target: pane_ref.clone(),
     });
+    let pane_stream_subscription = PaneOutputSubscriptionId::new(17);
+    let subscribe_pane_stream = Request::SubscribePaneStream(SubscribePaneStreamRequest {
+        target: pane_ref.clone(),
+        mode: PaneStreamMode::Raw,
+        include_snapshot: true,
+    });
+    let pane_stream_cursor = Request::PaneStreamCursor(PaneStreamCursorRequest {
+        subscription_id: pane_stream_subscription,
+        max_events: Some(16),
+    });
+    let unsubscribe_pane_stream = Request::UnsubscribePaneStream(UnsubscribePaneStreamRequest {
+        subscription_id: pane_stream_subscription,
+    });
     let new_session_response = Response::NewSession(NewSessionResponse {
         session_name: alpha(),
         detached: true,
@@ -300,6 +317,80 @@ fn fixtures() -> Vec<FullFrameFixture> {
         pane: PaneTarget::with_window(alpha(), 2, 7),
         pane_id: PaneId::new(42),
     });
+    let stream_cursor = PaneSnapshotCursor {
+        row: 0,
+        col: 1,
+        visible: true,
+        style: 0,
+    };
+    let raw_rebase = PaneRawRebase {
+        epoch: 2,
+        generation: 3,
+        invalidation_revision: 5,
+        next_sequence: 9,
+        cols: 2,
+        rows: 1,
+        keyframe: b"\x1b[2Jok".to_vec(),
+        alternate: false,
+        snapshot: Some(PaneSnapshotResponse {
+            cols: 2,
+            rows: 1,
+            cells: Vec::new(),
+            cursor: stream_cursor,
+            revision: 7,
+        }),
+        reason: PaneRawRebaseReason::Resize,
+    };
+    let surface = PaneSurfaceFrame {
+        epoch: 4,
+        revision: 9,
+        next_output_sequence: 11,
+        snapshot: PaneSurfaceSnapshot {
+            cols: 2,
+            rows: 1,
+            cells: Vec::new(),
+            cursor: stream_cursor,
+            title: "build".to_owned(),
+            path: "/work/rmux".to_owned(),
+            mode_bits: 1,
+            alternate: false,
+            scroll_top: 0,
+            scroll_bottom: 0,
+            history_size: 12,
+            history_bytes: 64,
+            revision: 8,
+        },
+    };
+    let subscribe_pane_stream_response =
+        Response::SubscribePaneStream(Box::new(SubscribePaneStreamResponse {
+            subscription_id: pane_stream_subscription,
+            target: pane_alpha_2(),
+            pane_id: PaneId::new(42),
+            event: PaneStreamEvent::SurfaceReset(Box::new(surface.clone())),
+        }));
+    let pane_stream_cursor_response =
+        Response::PaneStreamCursor(Box::new(PaneStreamCursorResponse {
+            subscription_id: pane_stream_subscription,
+            events: vec![
+                PaneStreamEvent::RawRebase(Box::new(raw_rebase)),
+                PaneStreamEvent::RawBytes(PaneRawBytes {
+                    epoch: 2,
+                    sequence: 9,
+                    bytes: b"tail".to_vec(),
+                }),
+                PaneStreamEvent::SurfacePatch(Box::new(surface)),
+                PaneStreamEvent::Lifecycle(PaneStreamLifecycleEvent::ProcessExited {
+                    output_sequence: Some(10),
+                }),
+                PaneStreamEvent::End(PaneStreamEndReason::ProjectionFailed),
+            ],
+            limited: false,
+        }));
+    let unsubscribe_pane_stream_response =
+        Response::UnsubscribePaneStream(UnsubscribePaneStreamResponse {
+            subscription_id: pane_stream_subscription,
+            removed: true,
+        });
 
     vec![
         FullFrameFixture {
@@ -408,6 +499,27 @@ fn fixtures() -> Vec<FullFrameFixture> {
             encode: Frame::Request(pane_foreground_state),
         },
         FullFrameFixture {
+            name: "subscribe_pane_stream_request",
+            kind: frame_kind_for_request(&subscribe_pane_stream),
+            direction: FrameDirection::ClientToServer,
+            feature: FrameFeature::Panes,
+            encode: Frame::Request(subscribe_pane_stream),
+        },
+        FullFrameFixture {
+            name: "pane_stream_cursor_request",
+            kind: frame_kind_for_request(&pane_stream_cursor),
+            direction: FrameDirection::ClientToServer,
+            feature: FrameFeature::Panes,
+            encode: Frame::Request(pane_stream_cursor),
+        },
+        FullFrameFixture {
+            name: "unsubscribe_pane_stream_request",
+            kind: frame_kind_for_request(&unsubscribe_pane_stream),
+            direction: FrameDirection::ClientToServer,
+            feature: FrameFeature::Panes,
+            encode: Frame::Request(unsubscribe_pane_stream),
+        },
+        FullFrameFixture {
             name: "new_session_response",
             kind: frame_kind_for_response(&new_session_response),
             direction: FrameDirection::ServerToClient,
@@ -477,6 +589,27 @@ fn fixtures() -> Vec<FullFrameFixture> {
             feature: FrameFeature::Panes,
             encode: Frame::Response(split_identity_response),
         },
+        FullFrameFixture {
+            name: "subscribe_pane_stream_response",
+            kind: frame_kind_for_response(&subscribe_pane_stream_response),
+            direction: FrameDirection::ServerToClient,
+            feature: FrameFeature::Panes,
+            encode: Frame::Response(subscribe_pane_stream_response),
+        },
+        FullFrameFixture {
+            name: "pane_stream_cursor_response",
+            kind: frame_kind_for_response(&pane_stream_cursor_response),
+            direction: FrameDirection::ServerToClient,
+            feature: FrameFeature::Panes,
+            encode: Frame::Response(pane_stream_cursor_response),
+        },
+        FullFrameFixture {
+            name: "unsubscribe_pane_stream_response",
+            kind: frame_kind_for_response(&unsubscribe_pane_stream_response),
+            direction: FrameDirection::ServerToClient,
+            feature: FrameFeature::Panes,
+            encode: Frame::Response(unsubscribe_pane_stream_response),
+        },
     ]
 }
 
@@ -491,7 +624,7 @@ fn encode_fixture(fixture: &FullFrameFixture) -> Vec<u8> {
 fn fixture_count_matches_manifest() {
     assert_eq!(
         fixtures().len(),
-        25,
+        31,
         "ledger fixture manifest must stay explicit"
     );
 }
@@ -1134,8 +1267,8 @@ fn ledger_active_size_matches_request_and_response_variant_count() {
         .iter()
         .filter(|entry| matches!(entry.status, FrameStatus::Active))
         .count();
-    // Active entries = 128 Request variants + 102 Response variants.
-    assert_eq!(active_count, 128 + 102, "active ledger size mismatch");
+    // Active entries = 131 Request variants + 105 Response variants.
+    assert_eq!(active_count, 131 + 105, "active ledger size mismatch");
 }
 
 #[test]
@@ -1343,6 +1476,15 @@ fn assert_request_semantic_equal(actual: &Request, expected: &Request, label: &s
         (Request::SplitWindowIdentity(actual), Request::SplitWindowIdentity(expected)) => {
             assert_eq!(actual, expected, "{label}");
         }
+        (Request::SubscribePaneStream(actual), Request::SubscribePaneStream(expected)) => {
+            assert_eq!(actual, expected, "{label}");
+        }
+        (Request::PaneStreamCursor(actual), Request::PaneStreamCursor(expected)) => {
+            assert_eq!(actual, expected, "{label}");
+        }
+        (Request::UnsubscribePaneStream(actual), Request::UnsubscribePaneStream(expected)) => {
+            assert_eq!(actual, expected, "{label}");
+        }
         (Request::NewSession(actual), Request::NewSession(expected)) => {
             assert_eq!(
                 actual.session_name.as_str(),
@@ -1401,6 +1543,15 @@ fn assert_response_semantic_equal(actual: &Response, expected: &Response, label:
             assert_eq!(actual, expected, "{label}");
         }
         (Response::SplitWindowIdentity(actual), Response::SplitWindowIdentity(expected)) => {
+            assert_eq!(actual, expected, "{label}");
+        }
+        (Response::SubscribePaneStream(actual), Response::SubscribePaneStream(expected)) => {
+            assert_eq!(actual, expected, "{label}");
+        }
+        (Response::PaneStreamCursor(actual), Response::PaneStreamCursor(expected)) => {
+            assert_eq!(actual, expected, "{label}");
+        }
+        (Response::UnsubscribePaneStream(actual), Response::UnsubscribePaneStream(expected)) => {
             assert_eq!(actual, expected, "{label}");
         }
         (actual, expected) => {
@@ -1767,6 +1918,9 @@ fn fixture_set_kinds_match_manifest_table() {
         ("unsubscribe_pane_state_request", 0x007D),
         ("pane_foreground_state_request", 0x007E),
         ("split_window_identity_request", 0x007F),
+        ("subscribe_pane_stream_request", 0x0080),
+        ("pane_stream_cursor_request", 0x0081),
+        ("unsubscribe_pane_stream_request", 0x0082),
         ("new_session_response", 0x8000),
         ("error_response", 0x801F),
         ("pane_option_set_response", 0x805E),
@@ -1777,6 +1931,9 @@ fn fixture_set_kinds_match_manifest_table() {
         ("unsubscribe_pane_state_response", 0x8063),
         ("pane_foreground_state_response", 0x8064),
         ("split_window_identity_response", 0x8065),
+        ("subscribe_pane_stream_response", 0x8066),
+        ("pane_stream_cursor_response", 0x8067),
+        ("unsubscribe_pane_stream_response", 0x8068),
     ];
     let mut by_name: std::collections::HashMap<&str, u16> = std::collections::HashMap::new();
     for entry in V1_FRAME_LEDGER {

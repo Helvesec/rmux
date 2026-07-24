@@ -4,7 +4,6 @@ use std::pin::Pin;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 
-use rmux_core::events::OutputCursorItem;
 use rmux_core::PaneId;
 use tokio::sync::{mpsc, watch};
 use tokio::task::JoinHandle;
@@ -16,6 +15,7 @@ use super::rate_limit::OperatorRateLimiter;
 use crate::handler::{
     RequestHandler, WebPaneStream, WebSessionAttachEvent, WebSessionSnapshot, WebSessionStream,
 };
+use crate::pane_io::PaneObservationItem;
 use crate::web::crypto::EncryptedWebSocketReader;
 use crate::web::outbound::{OutboundQueueResult, WebSocketOutbound};
 use crate::web::protocol::{
@@ -24,6 +24,7 @@ use crate::web::protocol::{
     queue_session_pane_frame, queue_session_view, queue_snapshot, send_revoked, send_viewer_count,
     SessionClientTextOutcome, SessionOperatorBinaryOutcome, SessionScrollRequest,
 };
+use crate::web::stream_sanitizer::WebTerminalSanitizer;
 use crate::web::websocket::WebSocketMessage;
 use crate::web::{WebShareConnectionCounts, WebShareRevokeReason};
 
@@ -43,12 +44,9 @@ pub(super) async fn serve_pane_loop(
     mut pane: WebPaneStream,
     mut shutdown: watch::Receiver<bool>,
 ) -> io::Result<()> {
-    queue_or_close(
-        &outbound,
-        queue_snapshot(&outbound, &pane.snapshot),
-        &share_id,
-    )
-    .await?;
+    let mut sanitizer = WebTerminalSanitizer::default();
+    let initial_snapshot = queue_snapshot(&outbound, &pane.snapshot, &mut sanitizer);
+    queue_or_close(&outbound, initial_snapshot, &share_id).await?;
     let mut rate_limiter = OperatorRateLimiter::new();
     let mut last_connection_counts = pane.connection_counts();
     let mut alive_tick = tokio::time::interval(Duration::from_millis(500));
@@ -75,16 +73,22 @@ pub(super) async fn serve_pane_loop(
                 // can account for the stream and its attach cleanup.
                 return Ok(());
             }
-            item = pane.output.recv() => {
+            item = pane.output.recv_observed() => {
                 match item {
-                    OutputCursorItem::Event(event) => {
+                    PaneObservationItem::Output(rmux_core::events::OutputCursorItem::Event(event)) => {
                         if snapshot_pending {
                             continue;
                         }
-                        match queue_output(&outbound, event.bytes()) {
+                        let mut safe = Vec::with_capacity(event.bytes().len());
+                        sanitizer.push(event.bytes(), &mut safe);
+                        if safe.is_empty() {
+                            continue;
+                        }
+                        match queue_output(&outbound, &safe) {
                             OutboundQueueResult::Queued => {}
                             result if is_recoverable_session_queue_pressure(result) => {
                                 debug!(share_id = %share_id, "web-share viewer backlog exceeded; resyncing");
+                                sanitizer.reset();
                                 snapshot_pending = true;
                                 schedule_session_refresh(
                                     snapshot_sleep.as_mut(),
@@ -97,13 +101,32 @@ pub(super) async fn serve_pane_loop(
                             }
                         }
                     }
-                    OutputCursorItem::Gap(gap) => {
+                    PaneObservationItem::Output(rmux_core::events::OutputCursorItem::Gap(gap)) => {
                         debug!(missed = gap.missed_events(), "web-share spectator resync");
+                        sanitizer.reset();
                         snapshot_pending = true;
                         schedule_session_refresh(
                             snapshot_sleep.as_mut(),
                             &mut pending_started_at,
                         );
+                    }
+                    PaneObservationItem::Invalidated(invalidation) => {
+                        debug!(
+                            reason = ?invalidation.reason,
+                            revision = invalidation.boundary.invalidation_revision,
+                            "web-share pane state invalidated; resyncing"
+                        );
+                        sanitizer.reset();
+                        snapshot_pending = true;
+                        schedule_session_refresh(
+                            snapshot_sleep.as_mut(),
+                            &mut pending_started_at,
+                        );
+                    }
+                    PaneObservationItem::ProcessExited { .. } => {
+                        // Child EOF is not logical pane removal. Kept panes
+                        // remain attached and may later be respawned.
+                        sanitizer.reset();
                     }
                 }
             }
@@ -154,12 +177,18 @@ pub(super) async fn serve_pane_loop(
                 return Ok(());
             }
             _ = snapshot_sleep.as_mut(), if snapshot_pending => {
-                match queue_fresh_pane_snapshot(handler.as_ref(), &outbound, &mut pane).await? {
+                match queue_fresh_pane_snapshot(
+                    handler.as_ref(),
+                    &outbound,
+                    &mut pane,
+                    &mut sanitizer,
+                ).await? {
                     OutboundQueueResult::Queued => {
                         snapshot_pending = false;
                         pending_started_at = None;
                     }
                     result if is_recoverable_session_queue_pressure(result) => {
+                        sanitizer.reset();
                         snapshot_pending = true;
                         pending_started_at = None;
                         schedule_session_refresh(
@@ -250,6 +279,7 @@ async fn queue_fresh_pane_snapshot(
     handler: &RequestHandler,
     outbound: &WebSocketOutbound,
     pane: &mut WebPaneStream,
+    sanitizer: &mut WebTerminalSanitizer,
 ) -> io::Result<OutboundQueueResult> {
     let target = handler
         .current_web_pane_target(pane.session_id(), pane.target())
@@ -262,7 +292,7 @@ async fn queue_fresh_pane_snapshot(
         .map_err(|error| io::Error::other(error.to_string()))?;
     pane.snapshot = snapshot;
     pane.output = output;
-    Ok(queue_snapshot(outbound, &pane.snapshot))
+    Ok(queue_snapshot(outbound, &pane.snapshot, sanitizer))
 }
 
 pub(super) async fn serve_session_loop(
@@ -294,6 +324,7 @@ pub(super) async fn serve_session_loop(
     let mut view_pending = false;
     let mut pending_started_at = None;
     let mut inbound = WebSocketReadPump::new(socket);
+    let mut sanitizer = WebTerminalSanitizer::default();
 
     loop {
         tokio::select! {
@@ -307,9 +338,15 @@ pub(super) async fn serve_session_loop(
                 match output? {
                     Some(WebSessionAttachEvent::Data(frame)) => {
                         if snapshot_pending {
+                            sanitizer.reset();
                             continue;
                         }
-                        match queue_output(&outbound, &frame) {
+                        let mut safe = Vec::with_capacity(frame.len());
+                        sanitizer.push(&frame, &mut safe);
+                        if safe.is_empty() {
+                            continue;
+                        }
+                        match queue_output(&outbound, &safe) {
                             OutboundQueueResult::Queued => {
                                 view_pending = true;
                                 schedule_session_refresh(
@@ -319,6 +356,7 @@ pub(super) async fn serve_session_loop(
                             }
                             result if is_recoverable_session_queue_pressure(result) => {
                                 debug!(share_id = %share_id, "web-share session viewer backlog exceeded; resyncing");
+                                sanitizer.reset();
                                 snapshot_pending = true;
                                 view_pending = false;
                                 schedule_session_refresh(
@@ -333,6 +371,7 @@ pub(super) async fn serve_session_loop(
                         }
                     },
                     Some(WebSessionAttachEvent::Resize) => {
+                        sanitizer.reset();
                         snapshot_pending = true;
                         view_pending = false;
                         schedule_session_refresh(snapshot_sleep.as_mut(), &mut pending_started_at);
@@ -435,7 +474,7 @@ pub(super) async fn serve_session_loop(
                                 &share_id,
                                 &mut scrolls,
                             ).await? {
-                                OutboundQueueResult::Queued => {}
+                                OutboundQueueResult::Queued => sanitizer.reset(),
                                 result if is_recoverable_session_queue_pressure(result) => {
                                     snapshot_pending = true;
                                     view_pending = false;
@@ -505,6 +544,7 @@ pub(super) async fn serve_session_loop(
                         &mut scrolls,
                     ).await? {
                         OutboundQueueResult::Queued => {
+                            sanitizer.reset();
                             snapshot_pending = false;
                             view_pending = false;
                             pending_started_at = None;

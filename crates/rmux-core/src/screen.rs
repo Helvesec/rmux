@@ -68,6 +68,10 @@ pub struct Screen {
 }
 
 impl Screen {
+    pub(crate) fn render_cell_state_ansi(&self, state: &CellState) -> Vec<u8> {
+        crate::grid::render_cell_state_ansi(state, &self.hyperlinks)
+    }
+
     /// Creates a new screen with the given geometry and history limit.
     #[must_use]
     pub fn new(size: TerminalSize, history_limit: usize) -> Self {
@@ -184,6 +188,46 @@ impl Screen {
     #[must_use]
     pub fn is_alternate(&self) -> bool {
         self.saved_grid.is_some()
+    }
+
+    /// Returns the cursor saved by DEC alternate-screen entry, when present.
+    #[must_use]
+    pub fn alternate_saved_cursor(&self) -> Option<(u32, u32, bool)> {
+        self.saved_cursor_x.zip(self.saved_cursor_y).map(|(x, y)| {
+            (
+                x,
+                y,
+                self.saved_cursor_pending_wrap && self.mode & mode::MODE_WRAP != 0,
+            )
+        })
+    }
+
+    /// Returns whether the next printable character first performs autowrap.
+    #[must_use]
+    pub const fn pending_wrap(&self) -> bool {
+        self.pending_wrap
+    }
+
+    /// Returns the active tab-stop bitmap.
+    #[must_use]
+    pub fn tab_stops(&self) -> &[bool] {
+        &self.tabs
+    }
+
+    /// Clones all state needed to reconstruct a renderer, including bounded
+    /// scrollback and the saved main buffer beneath alternate screen.
+    ///
+    /// Ephemeral notifications and passthrough side effects are discarded:
+    /// replaying a recovery keyframe must not replay clipboard, graphics, bell,
+    /// or other host-side effects.
+    #[must_use]
+    pub(crate) fn clone_recovery_state(&self) -> Self {
+        let mut recovery = self.clone();
+        recovery.bell_count = 0;
+        recovery.terminal_passthrough.clear();
+        recovery.dropped_terminal_passthrough_count = 0;
+        recovery.has_selected_cells = false;
+        recovery
     }
 
     /// Returns the configured history limit.

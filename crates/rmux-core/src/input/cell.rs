@@ -123,3 +123,23 @@ pub struct SavedState {
     pub(crate) cy: u32,
     pub(crate) mode_origin: bool,
 }
+
+impl SavedState {
+    /// Returns the saved rendition and character-set state.
+    #[must_use]
+    pub const fn cell(&self) -> &CellState {
+        &self.cell
+    }
+
+    /// Returns the cursor saved by DECSC/SCP.
+    #[must_use]
+    pub const fn cursor_position(&self) -> (u32, u32) {
+        (self.cx, self.cy)
+    }
+
+    /// Returns whether origin mode was active at save time.
+    #[must_use]
+    pub const fn origin_mode(&self) -> bool {
+        self.mode_origin
+    }
+}

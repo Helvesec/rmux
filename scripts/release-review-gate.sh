@@ -294,6 +294,14 @@ fi
 if section_enabled server; then
   run_step "server lib tests" \
     cargo test -p rmux-server --lib --locked -- --test-threads=1
+  command -v npm >/dev/null 2>&1 ||
+    die "npm is required for the pinned independent xterm.js recovery oracle"
+  run_step "pinned xterm.js oracle dependencies" \
+    npm --prefix tests/xterm-oracle ci --ignore-scripts --no-audit --no-fund
+  run_step "independent xterm.js recovery oracle" \
+    cargo test -p rmux-server --lib --locked \
+      pane_recovery::tests::keyframes_converge_in_independent_xterm_oracle -- \
+      --ignored --exact --test-threads=1
 fi
 
 if section_enabled cli; then

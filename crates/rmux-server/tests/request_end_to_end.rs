@@ -19,7 +19,7 @@ use rmux_proto::{
 };
 use tokio::time::sleep;
 
-const COMMAND_SURFACE_COUNT: usize = 79;
+const COMMAND_SURFACE_COUNT: usize = 82;
 const HANDLER_DISPATCH_ANCHORS: [&str; 2] = [
     "async fn dispatch_request(",
     "async fn dispatch_request_inner(",
@@ -152,6 +152,9 @@ const COMMAND_SURFACE: [&str; COMMAND_SURFACE_COUNT] = [
     "subscribe-pane-output",
     "unsubscribe-pane-output",
     "pane-output-cursor",
+    "subscribe-pane-stream",
+    "unsubscribe-pane-stream",
+    "pane-stream-cursor",
     "rename-session",
     "list-sessions",
     "list-panes",

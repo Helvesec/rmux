@@ -13,14 +13,26 @@
 //! producer, and the daemon-side ordering rules documented on
 //! [`PaneEvent`] match that producer's behaviour.
 
+mod pane_stream;
+pub mod recovery;
 pub mod render;
 pub mod streams;
+pub mod surface;
 pub mod types;
 
+pub use pane_stream::{PaneStreamEndReason, PaneStreamLifecycleEvent};
+pub use recovery::{
+    PaneRecoveryApplyError, PaneRecoveryEvent, PaneRecoveryOptions, PaneRecoveryRebase,
+    PaneRecoveryRebaseReason, PaneRecoveryState, PaneRecoveryStream,
+};
 pub use render::{PaneRenderStream, RenderUpdate};
 pub use streams::{
     PaneLagNotice, PaneLineItem, PaneLineStream, PaneOutputChunk, PaneOutputStart,
     PaneOutputStream, PaneRecentOutput,
+};
+pub use surface::{
+    PaneSurfaceApplyError, PaneSurfaceEvent, PaneSurfaceFrame, PaneSurfaceSnapshot,
+    PaneSurfaceState, PaneSurfaceStream,
 };
 pub use types::{
     PaneCommandStatus, PaneCommandSummary, PaneDisconnectReason, PaneEvent, PaneExitReason,

@@ -580,6 +580,17 @@ impl RequestHandler {
             Request::PaneOutputCursor(request) => HandleOutcome::response(
                 self.handle_pane_output_cursor(connection_id, request).await,
             ),
+            Request::SubscribePaneStream(request) => HandleOutcome::response(
+                self.handle_subscribe_pane_stream(connection_id, request)
+                    .await,
+            ),
+            Request::PaneStreamCursor(request) => HandleOutcome::response(
+                self.handle_pane_stream_cursor(connection_id, request).await,
+            ),
+            Request::UnsubscribePaneStream(request) => HandleOutcome::response(
+                self.handle_unsubscribe_pane_stream(connection_id, request)
+                    .await,
+            ),
             Request::SdkWaitForOutput(request) => HandleOutcome::response(
                 self.handle_sdk_wait_for_output(connection_id, request)
                     .await,
@@ -764,7 +775,7 @@ impl RequestHandler {
 // target pane's session. Commands that reference a second location (move-pane,
 // swap-pane) keep the conservative all-session wait so a still-starting
 // destination is not skipped.
-#[cfg(windows)]
+#[cfg(any(windows, test))]
 fn request_deferred_wait_target(request: &Request) -> Option<rmux_proto::Target> {
     use rmux_proto::{PaneTargetRef, Target};
     fn scope_from_ref(target: &PaneTargetRef) -> Target {
@@ -788,13 +799,14 @@ fn request_deferred_wait_target(request: &Request) -> Option<rmux_proto::Target>
         // layer, so keep the conservative wait to stay safe against a
         // still-starting sibling.
         Request::PaneResize(request) => Some(scope_from_ref(&request.target)),
+        Request::SubscribePaneStream(request) => Some(scope_from_ref(&request.target)),
         Request::PipePane(request) => Some(Target::Pane(request.target.clone())),
         Request::PasteBuffer(request) => Some(Target::Pane(request.target.clone())),
         _ => None,
     }
 }
 
-#[cfg(windows)]
+#[cfg(any(windows, test))]
 fn request_waits_for_windows_deferred_panes(request: &Request) -> bool {
     match request {
         Request::NewWindow(request) if request.detached => return false,
@@ -858,6 +870,8 @@ fn request_waits_for_windows_deferred_panes(request: &Request) -> bool {
             | Request::SubscribePaneOutputRef(_)
             | Request::UnsubscribePaneOutput(_)
             | Request::PaneOutputCursor(_)
+            | Request::PaneStreamCursor(_)
+            | Request::UnsubscribePaneStream(_)
             | Request::SubscribePaneState(_)
             | Request::PaneStateCursor(_)
             | Request::UnsubscribePaneState(_)
@@ -893,7 +907,7 @@ fn supported_capabilities() -> Vec<&'static str> {
     capabilities_for_features(cfg!(all(any(unix, windows), feature = "web")))
 }
 
-#[cfg(all(test, windows))]
+#[cfg(test)]
 mod windows_deferred_wait_tests {
     use rmux_core::PaneId;
     use rmux_proto::request::{
@@ -901,13 +915,15 @@ mod windows_deferred_wait_tests {
         PaneKillRequest, PaneRespawnRequest, PreviousWindowRequest, Request, RespawnPaneRequest,
         SelectPaneAdjacentRequest, SelectPaneDirection, SelectPaneMarkRequest, SelectPaneRequest,
         SelectWindowRequest, SplitWindowExtRequest, SplitWindowTargetActionRequest,
+        SubscribePaneStreamRequest, UnsubscribePaneStreamRequest,
     };
     use rmux_proto::{
-        PaneTarget, PaneTargetRef, ProcessCommand, SessionName, SplitDirection, SplitWindowTarget,
+        PaneOutputSubscriptionId, PaneStreamCursorRequest, PaneStreamMode, PaneTarget,
+        PaneTargetRef, ProcessCommand, SessionName, SplitDirection, SplitWindowTarget, Target,
         WindowTarget,
     };
 
-    use super::request_waits_for_windows_deferred_panes;
+    use super::{request_deferred_wait_target, request_waits_for_windows_deferred_panes};
 
     fn session_name(value: &str) -> SessionName {
         SessionName::new(value).expect("valid session name")
@@ -1092,5 +1108,30 @@ mod windows_deferred_wait_tests {
         assert!(request_waits_for_windows_deferred_panes(
             &split_window_target_action(false)
         ));
+    }
+
+    #[test]
+    fn initial_stream_subscribe_waits_for_its_conpty_but_cursor_cleanup_never_waits() {
+        let subscribe = Request::SubscribePaneStream(SubscribePaneStreamRequest {
+            target: PaneTargetRef::slot(pane_target()),
+            mode: PaneStreamMode::Raw,
+            include_snapshot: false,
+        });
+        assert!(request_waits_for_windows_deferred_panes(&subscribe));
+        assert_eq!(
+            request_deferred_wait_target(&subscribe),
+            Some(Target::Pane(pane_target())),
+            "the Windows wait must be scoped to the requested starting pane"
+        );
+
+        let subscription_id = PaneOutputSubscriptionId::new(9);
+        let cursor = Request::PaneStreamCursor(PaneStreamCursorRequest {
+            subscription_id,
+            max_events: Some(1),
+        });
+        let unsubscribe =
+            Request::UnsubscribePaneStream(UnsubscribePaneStreamRequest { subscription_id });
+        assert!(!request_waits_for_windows_deferred_panes(&cursor));
+        assert!(!request_waits_for_windows_deferred_panes(&unsubscribe));
     }
 }

@@ -276,6 +276,30 @@ def resize_pane_absolute_200x50(adapter: Adapter) -> float:
     )
 
 
+def resize_pane_storm_200(adapter: Adapter) -> float:
+    with tempfile.NamedTemporaryFile("w", encoding="utf-8", delete=False) as handle:
+        for _ in range(100):
+            handle.write("resize-pane -t bench:0.0 -R 1\n")
+            handle.write("resize-pane -t bench:0.0 -L 1\n")
+        path = handle.name
+
+    def setup(socket: str) -> None:
+        quiet(adapter.command(socket, ["split-window", "-h", "-d", "-t", "bench"]))
+
+    try:
+        return with_session(
+            adapter,
+            "resize_pane_storm_200",
+            ["source-file", path],
+            setup=setup,
+            width=200,
+            height=50,
+            timeout=30.0,
+        )
+    finally:
+        Path(path).unlink(missing_ok=True)
+
+
 def list_sessions_default(adapter: Adapter) -> float:
     return with_session(adapter, "list_sessions_default", ["list-sessions"])
 
@@ -726,6 +750,7 @@ OPERATIONS: list[tuple[str, AdapterOperation]] = [
     ("resize_pane_left_1", resize_pane_left_1),
     ("resize_pane_right_10", resize_pane_right_10),
     ("resize_pane_absolute_200x50", resize_pane_absolute_200x50),
+    ("resize_pane_storm_200", resize_pane_storm_200),
     ("display_message_default", display_message_default),
     ("show_options_global", show_options_global),
     ("show_window_options", show_window_options),

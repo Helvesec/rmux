@@ -97,8 +97,11 @@ pub use error::{CollectError, Result, RmuxError};
 pub use events::{
     PaneCommandStatus, PaneCommandSummary, PaneDisconnectReason, PaneEvent, PaneExitReason,
     PaneLagNotice, PaneLineItem, PaneLineStream, PaneNotification, PaneOutputChunk,
-    PaneOutputStart, PaneOutputStream, PanePermissionScope, PaneRecentOutput, PaneRenderStream,
-    RenderUpdate,
+    PaneOutputStart, PaneOutputStream, PanePermissionScope, PaneRecentOutput,
+    PaneRecoveryApplyError, PaneRecoveryEvent, PaneRecoveryOptions, PaneRecoveryRebase,
+    PaneRecoveryRebaseReason, PaneRecoveryState, PaneRecoveryStream, PaneRenderStream,
+    PaneStreamEndReason, PaneStreamLifecycleEvent, PaneSurfaceApplyError, PaneSurfaceEvent,
+    PaneSurfaceFrame, PaneSurfaceSnapshot, PaneSurfaceState, PaneSurfaceStream, RenderUpdate,
 };
 pub use extract::{CollectedPaneOutput, PaneTextMatch};
 pub use handles::{

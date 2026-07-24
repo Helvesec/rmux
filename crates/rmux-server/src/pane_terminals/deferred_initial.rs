@@ -364,15 +364,22 @@ impl HandlerState {
         );
         self.add_message(message.clone());
         let bytes = format!("{message}\r\n").into_bytes();
-        let _ =
-            self.append_bytes_to_runtime_pane_transcript(&runtime_session_name, pane_id, &bytes);
-        if let Some(sender) = self
-            .pane_outputs
-            .get(&runtime_session_name)
-            .and_then(|panes| panes.get(&pane_id))
-        {
-            let _ = sender.send_for_generation(Some(identity.generation()), bytes);
-            let _ = sender.send_for_generation(Some(identity.generation()), Vec::new());
+        let published = self
+            .publish_bytes_to_runtime_pane_transcript(
+                &runtime_session_name,
+                pane_id,
+                Some(identity.generation()),
+                bytes,
+            )
+            .unwrap_or(false);
+        if published {
+            if let Some(sender) = self
+                .pane_outputs
+                .get(&runtime_session_name)
+                .and_then(|panes| panes.get(&pane_id))
+            {
+                let _ = sender.send_for_generation(Some(identity.generation()), Vec::new());
+            }
         }
         let metadata = PaneExitMetadata {
             status: Some(1),

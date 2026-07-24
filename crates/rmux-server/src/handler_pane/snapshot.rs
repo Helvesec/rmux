@@ -32,7 +32,7 @@ pub(in crate::handler) struct PaneSnapshotInputs {
 /// well-formed pane keeps the cursor inside `u16` bounds, but a defensive
 /// saturating cast guarantees that pathological screen state cannot produce a
 /// silently-truncated cursor coordinate on the wire.
-fn cursor_coord_to_u16(value: u32) -> u16 {
+pub(in crate::handler) fn cursor_coord_to_u16(value: u32) -> u16 {
     if value > u16::MAX as u32 {
         u16::MAX
     } else {
@@ -168,7 +168,11 @@ impl RequestHandler {
         coalescers.observe(pane_id, revision, now)
     }
 
-    fn assign_pane_snapshot_revision(&self, pane_id: PaneId, fingerprint: u64) -> u64 {
+    pub(in crate::handler) fn assign_pane_snapshot_revision(
+        &self,
+        pane_id: PaneId,
+        fingerprint: u64,
+    ) -> u64 {
         let mut revisions = self
             .pane_snapshot_revisions
             .lock()
@@ -215,7 +219,7 @@ impl RequestHandler {
     }
 }
 
-fn collect_cells(
+pub(in crate::handler) fn collect_cells(
     screen: &rmux_core::Screen,
     cols: u16,
     rows: u16,
@@ -281,7 +285,7 @@ fn blank_cell() -> PaneSnapshotCell {
 }
 
 #[allow(clippy::too_many_arguments)]
-fn compute_snapshot_fingerprint(
+pub(in crate::handler) fn compute_snapshot_fingerprint(
     cols: u16,
     rows: u16,
     cells: &[PaneSnapshotCell],

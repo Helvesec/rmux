@@ -541,16 +541,18 @@ fn inject_split_window_stdin_output(
 ) -> Result<(), rmux_proto::RmuxError> {
     let payload = normalize_split_window_stdin_payload(payload);
     let transcript = state.transcript_handle(target)?;
-    transcript
-        .lock()
-        .expect("pane transcript mutex must not be poisoned")
-        .append_bytes(&payload);
     let pane_output = state.pane_output_for_target(
         target.session_name(),
         target.window_index(),
         target.pane_index(),
     )?;
-    let _ = pane_output.send_for_generation(None, payload);
+    let _ = pane_output.publish_for_generation(None, payload, |bytes| {
+        transcript
+            .lock()
+            .expect("pane transcript mutex must not be poisoned")
+            .append_bytes(bytes);
+        ((), Vec::new())
+    });
     Ok(())
 }
 

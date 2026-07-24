@@ -190,39 +190,33 @@ fn winget_portable_archive_preserves_the_private_runtime_layout() {
 #[test]
 fn release_line_changelog_records_the_exact_detached_wire_version() {
     let changelog = include_str!("../CHANGELOG.md");
-    let wire_cut_release = changelog_release_section(changelog, "0.9.0");
-    let expected = format!(
-        "detached RPC frame envelope from wire version 3 to {}",
-        rmux_proto::RMUX_WIRE_VERSION
-    );
-    let normalized = wire_cut_release
+    let initial_wire_cut = changelog_release_section(changelog, "0.9.0")
         .split_whitespace()
         .collect::<Vec<_>>()
         .join(" ");
-
     assert!(
-        normalized.contains(&expected),
-        "0.9.0 changelog must record the current detached wire version: {expected}"
+        initial_wire_cut.contains("detached RPC frame envelope from wire version 3 to 5"),
+        "0.9.0 changelog must retain its historical wire 3 to 5 cut"
     );
     assert!(
-        normalized.contains("already-running pre-0.9 server must be restarted"),
+        initial_wire_cut.contains("already-running pre-0.9 server must be restarted"),
         "0.9.0 changelog must tell operators that this hard wire cut requires a server restart"
     );
 
     let current_version = env!("CARGO_PKG_VERSION");
-    if current_version != "0.9.0" {
-        let current_release = changelog_release_section(changelog, current_version)
-            .split_whitespace()
-            .collect::<Vec<_>>()
-            .join(" ");
-        assert!(
-            current_release.contains(&format!(
-                "wire version {} unchanged",
-                rmux_proto::RMUX_WIRE_VERSION
-            )),
-            "{current_version} changelog must record the unchanged detached wire version"
-        );
-    }
+    let current_release = changelog_release_section(changelog, current_version)
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ");
+    assert_eq!(rmux_proto::RMUX_WIRE_VERSION, 6);
+    assert!(
+        current_release.contains("wire version 5 to wire version 6"),
+        "{current_version} changelog must record the current detached wire cut"
+    );
+    assert!(
+        current_release.contains("wire-v5 daemon must be restarted"),
+        "{current_version} changelog must document the required daemon restart"
+    );
 }
 
 fn changelog_release_section<'a>(changelog: &'a str, version: &str) -> &'a str {

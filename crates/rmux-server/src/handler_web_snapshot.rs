@@ -29,6 +29,8 @@ pub(crate) struct WebPaneSnapshot {
     /// DECSTBM scroll region (top, bottom), 0-based inclusive.
     pub(crate) scroll_top: u32,
     pub(crate) scroll_bottom: u32,
+    #[serde(skip)]
+    pub(crate) recovery_keyframe: Option<Vec<u8>>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
@@ -87,6 +89,10 @@ impl WebPaneSnapshot {
     }
 
     pub(crate) fn append_ansi_bytes(&self, out: &mut Vec<u8>) {
+        if let Some(keyframe) = &self.recovery_keyframe {
+            out.extend_from_slice(keyframe);
+            return;
+        }
         out.extend_from_slice(SNAPSHOT_RESET_PREFIX);
         // Match the inner program's alternate-screen state so the browser's
         // emulator stays in sync with the later 1049h/l toggles in the live
@@ -288,6 +294,7 @@ mod tests {
             alternate: false,
             scroll_top: 0,
             scroll_bottom: 23,
+            recovery_keyframe: None,
         }
     }
 

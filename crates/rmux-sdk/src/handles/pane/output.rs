@@ -1,10 +1,78 @@
 use crate::events::streams::{PaneLineStream, PaneOutputStart, PaneOutputStream};
-use crate::{CollectedPaneOutput, PaneRenderStream, Result, RmuxError};
+use crate::{
+    CollectedPaneOutput, PaneRecoveryOptions, PaneRecoveryStream, PaneRenderStream,
+    PaneSurfaceStream, Result, RmuxError,
+};
 
 use super::target::is_stale_pane_id_target_error;
 use super::Pane;
 
 impl Pane {
+    /// Opens raw pane output that automatically repairs renderer state.
+    ///
+    /// The first item is a complete ANSI rebase. Resize, clear-history,
+    /// parser expiry, lag, and process-generation changes emit later rebases
+    /// in-band on the same subscription; callers never need to reopen it.
+    pub async fn recover_output(&self) -> Result<PaneRecoveryStream> {
+        self.recover_output_with(PaneRecoveryOptions::default())
+            .await
+    }
+
+    /// Opens recoverable raw output with explicit cold-path options.
+    pub async fn recover_output_with(
+        &self,
+        options: PaneRecoveryOptions,
+    ) -> Result<PaneRecoveryStream> {
+        let pane = self.begin_operation_handle();
+        let target = pane.required_resolved_proto_target_ref().await?;
+        crate::capabilities::require(
+            &pane.transport,
+            &[rmux_proto::CAPABILITY_SDK_PANE_RAW_RECOVERY],
+        )
+        .await?;
+        match PaneRecoveryStream::open(pane.transport.clone(), target.clone(), options).await {
+            Ok(stream) => Ok(stream),
+            Err(error) if pane.is_stable_id() && is_stale_pane_id_target_error(&error, &target) => {
+                let pane_id = pane
+                    .stable_id
+                    .expect("stable-id retry is guarded by is_stable_id");
+                let retry_target = pane.resolved_proto_target_ref().await?.ok_or_else(|| {
+                    RmuxError::pane_not_found(pane.target.session_name.clone(), pane_id)
+                })?;
+                PaneRecoveryStream::open(pane.transport.clone(), retry_target, options).await
+            }
+            Err(error) => Err(error),
+        }
+    }
+
+    /// Opens an authoritative structured pane-surface stream.
+    ///
+    /// Every reset and patch is self-contained. The daemon renders one shared
+    /// projection per pane rather than repeating terminal rendering for each
+    /// subscriber.
+    pub async fn surface_stream(&self) -> Result<PaneSurfaceStream> {
+        let pane = self.begin_operation_handle();
+        let target = pane.required_resolved_proto_target_ref().await?;
+        crate::capabilities::require(
+            &pane.transport,
+            &[rmux_proto::CAPABILITY_SDK_PANE_SURFACE_STREAM],
+        )
+        .await?;
+        match PaneSurfaceStream::open(pane.transport.clone(), target.clone()).await {
+            Ok(stream) => Ok(stream),
+            Err(error) if pane.is_stable_id() && is_stale_pane_id_target_error(&error, &target) => {
+                let pane_id = pane
+                    .stable_id
+                    .expect("stable-id retry is guarded by is_stable_id");
+                let retry_target = pane.resolved_proto_target_ref().await?.ok_or_else(|| {
+                    RmuxError::pane_not_found(pane.target.session_name.clone(), pane_id)
+                })?;
+                PaneSurfaceStream::open(pane.transport.clone(), retry_target).await
+            }
+            Err(error) => Err(error),
+        }
+    }
+
     /// Subscribes to the live raw pane output starting now.
     ///
     /// Setup performs one `subscribe-pane-output` round trip and is
@@ -98,11 +166,11 @@ impl Pane {
         Ok(PaneLineStream::wrap(inner))
     }
 
-    /// Opens a minimal render stream that emits snapshots after output.
+    /// Opens a render stream backed by the daemon's shared surface projection.
     ///
-    /// The implementation is output-driven with debounce and revision
-    /// filtering. It avoids fixed-rate blind refresh loops but is not a
-    /// daemon-native snapshot-diff stream.
+    /// The daemon filters non-visual output before materializing a surface and
+    /// shares that work across viewers. The SDK retains the legacy raw
+    /// subscription only to preserve detailed [`crate::PaneLagNotice`] values.
     pub async fn render_stream(&self) -> Result<PaneRenderStream> {
         PaneRenderStream::open(self.clone()).await
     }

@@ -1,5 +1,53 @@
 # Changelog
 
+## 0.9.2
+
+### SDK
+
+- Add capability-gated `Pane::recover_output()` and `Pane::surface_stream()`.
+  Raw recovery emits authoritative in-band rebases after lag, resize, parser
+  expiry, history clearing, terminal reset, and process-generation changes.
+  Surface updates are self-contained and share one lazy daemon-side projection
+  per pane.
+- Move `render_stream()` onto the shared surface projection while retaining
+  legacy lag notices and cancellation-safe in-flight cursor polling.
+
+### Web sharing
+
+- Capture WebShare pane state and its live cursor at one atomic output boundary,
+  then materialize recovery data outside the output-state lock.
+- Apply one fragmentation-safe policy across snapshot and live bytes. Visual
+  OSC commands remain available; OSC 52, unknown OSC commands, APC, DCS, PM,
+  and SOS strings are removed. Kitty graphics and SIXEL are therefore not part
+  of the WebShare pane data plane.
+
+### Protocol
+
+- Move detached RPC from wire version 5 to wire version 6 for the additive pane
+  stream requests, responses, lifecycle events, and capabilities. An
+  already-running wire-v5 daemon must be restarted before a 0.9.2 client can
+  connect.
+
+### Reliability and performance
+
+- Linearize pane generation, output sequence, invalidation revision, transcript
+  capture, and observer registration. Mutations without output bytes now wake
+  recoverable consumers, and child exit remains lifecycle rather than logical
+  pane removal.
+- Coalesce no-op resize storms before the atomic critical section, keep
+  notification outside locks, reserve subscription quota before capture, and
+  keep the existing output publish path free of surface rendering.
+- Validate raw recovery against a pinned independent xterm.js oracle, including
+  scrollback, wrapped rows, alternate-screen state, custom tab stops, saved
+  cursor/rendition state, and fragmented parser input.
+
+### Remaining boundaries
+
+- Pane streams synchronize bounded live state; they are not a durable event
+  store.
+- WebShare intentionally omits terminal graphics protocols carried by APC or
+  DCS until a bounded, independently testable browser contract exists.
+
 ## 0.9.1
 
 ### Security

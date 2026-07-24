@@ -368,6 +368,18 @@ function Get-WindowsOutputCommandArgs {
     )
 }
 
+function New-ResizeStormSourceFile {
+    param([string] $Target)
+    $path = [System.IO.Path]::GetTempFileName()
+    $lines = [System.Collections.Generic.List[string]]::new()
+    for ($i = 0; $i -lt 100; $i++) {
+        $lines.Add("resize-pane -t $Target -R 1")
+        $lines.Add("resize-pane -t $Target -L 1")
+    }
+    [System.IO.File]::WriteAllLines($path, $lines, [System.Text.Encoding]::ASCII)
+    return $path
+}
+
 function Test-OperationNeedsReadyPane {
     param([string] $Operation)
     return $Operation -notin @(
@@ -689,6 +701,15 @@ function Measure-NativeTmuxLikeOperation {
             "resize_pane_left_1" { return Measure-CommandMs -Command @($Executable, "-L", $socket, "resize-pane", "-t", "bench", "-L", "1") }
             "resize_pane_absolute_100x30" { return Measure-CommandMs -Command @($Executable, "-L", $socket, "resize-pane", "-x", "100", "-y", "30", "-t", "bench") }
             "resize_pane_absolute_200x50" { return Measure-CommandMs -Command @($Executable, "-L", $socket, "resize-pane", "-x", "200", "-y", "50", "-t", "bench") }
+            "resize_pane_storm_200" {
+                Invoke-Quiet -Command @($Executable, "-L", $socket, "split-window", "-h", "-d", "-t", "bench")
+                $sourceFile = New-ResizeStormSourceFile "bench:0.0"
+                try {
+                    return Measure-CommandMs -Command @($Executable, "-L", $socket, "source-file", $sourceFile) -TimeoutSeconds 30
+                } finally {
+                    Remove-Item -LiteralPath $sourceFile -Force -ErrorAction SilentlyContinue
+                }
+            }
             "list_sessions_default" { return Measure-CommandMs -Command @($Executable, "-L", $socket, "list-sessions") }
             "capture_pane_5000_lines" { return Measure-CommandMs -Command @($Executable, "-L", $socket, "capture-pane", "-p", "-t", "bench") }
             "capture_pane_80x24" { return Measure-CommandMs -Command @($Executable, "-L", $socket, "capture-pane", "-p", "-t", "bench") }
@@ -801,6 +822,15 @@ function Measure-PsmuxOperation {
             "resize_pane_left_1" { return Measure-CommandMs -Command @($Psmux, "resize-pane", "-t", $session, "-L", "1") }
             "resize_pane_absolute_100x30" { return Measure-CommandMs -Command @($Psmux, "resize-pane", "-x", "100", "-y", "30", "-t", $session) }
             "resize_pane_absolute_200x50" { return Measure-CommandMs -Command @($Psmux, "resize-pane", "-x", "200", "-y", "50", "-t", $session) }
+            "resize_pane_storm_200" {
+                Invoke-Quiet -Command @($Psmux, "split-window", "-h", "-d", "-t", $session)
+                $sourceFile = New-ResizeStormSourceFile "$($session):0.0"
+                try {
+                    return Measure-CommandMs -Command @($Psmux, "source-file", $sourceFile) -TimeoutSeconds 30
+                } finally {
+                    Remove-Item -LiteralPath $sourceFile -Force -ErrorAction SilentlyContinue
+                }
+            }
             "list_sessions_default" { return Measure-CommandMs -Command @($Psmux, "list-sessions") }
             "capture_pane_5000_lines" { return Measure-CommandMs -Command @($Psmux, "capture-pane", "-p", "-t", $session) }
             "capture_pane_80x24" { return Measure-CommandMs -Command @($Psmux, "capture-pane", "-p", "-t", $session) }
@@ -911,6 +941,16 @@ function Measure-WslTmuxOperation {
             "resize_pane_left_1" { return Measure-CommandMs -Command (New-WslTmuxCommand "-L" $socket "resize-pane" "-t" "bench" "-L" "1") }
             "resize_pane_absolute_100x30" { return Measure-CommandMs -Command (New-WslTmuxCommand "-L" $socket "resize-pane" "-x" "100" "-y" "30" "-t" "bench") }
             "resize_pane_absolute_200x50" { return Measure-CommandMs -Command (New-WslTmuxCommand "-L" $socket "resize-pane" "-x" "200" "-y" "50" "-t" "bench") }
+            "resize_pane_storm_200" {
+                Invoke-Quiet -Command (New-WslTmuxCommand "-L" $socket "split-window" "-h" "-d" "-t" "bench")
+                $storm = New-WslTmuxCommand "-L" $socket
+                for ($i = 0; $i -lt 100; $i++) {
+                    $storm += @("resize-pane", "-t", "bench:0.0", "-R", "1", ";")
+                    $storm += @("resize-pane", "-t", "bench:0.0", "-L", "1", ";")
+                }
+                $storm = $storm[0..($storm.Count - 2)]
+                return Measure-CommandMs -Command $storm -TimeoutSeconds 30
+            }
             "list_sessions_default" { return Measure-CommandMs -Command (New-WslTmuxCommand "-L" $socket "list-sessions") }
             "capture_pane_5000_lines" { return Measure-CommandMs -Command (New-WslTmuxCommand "-L" $socket "capture-pane" "-p" "-t" "bench") }
             "capture_pane_80x24" { return Measure-CommandMs -Command (New-WslTmuxCommand "-L" $socket "capture-pane" "-p" "-t" "bench") }
@@ -1189,6 +1229,7 @@ $allOperations = @(
     "resize_pane_left_1",
     "resize_pane_right_10",
     "resize_pane_absolute_200x50",
+    "resize_pane_storm_200",
     "capture_pane_80x24",
     "capture_pane_200x50_scrollback_10k",
     "send_keys_detached_round_trip",

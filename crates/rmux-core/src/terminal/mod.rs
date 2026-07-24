@@ -171,6 +171,40 @@ impl TerminalParser {
         self.parser.pending_bytes()
     }
 
+    pub(crate) fn clone_recovery_screen(&self) -> Screen {
+        self.screen.clone_recovery_state()
+    }
+
+    pub(crate) fn active_cell_state_ansi(&self) -> Vec<u8> {
+        self.cell_state_ansi(self.parser.cell_state())
+    }
+
+    pub(crate) fn saved_cell_state_ansi(&self) -> Vec<u8> {
+        self.cell_state_ansi(self.parser.saved_state().cell())
+    }
+
+    pub(crate) fn saved_cursor_state(&self) -> (u32, u32, bool) {
+        let saved = self.parser.saved_state();
+        let (x, y) = saved.cursor_position();
+        (x, y, saved.origin_mode())
+    }
+
+    fn cell_state_ansi(&self, cell: &crate::input::CellState) -> Vec<u8> {
+        let mut out = self.screen.render_cell_state_ansi(cell);
+        out.extend_from_slice(if cell.g0set != 0 {
+            b"\x1b(0"
+        } else {
+            b"\x1b(B"
+        });
+        out.extend_from_slice(if cell.g1set != 0 {
+            b"\x1b)0"
+        } else {
+            b"\x1b)B"
+        });
+        out.push(if cell.set == 0 { 0x0f } else { 0x0e });
+        out
+    }
+
     /// Returns whether the parser ground timer would currently be running.
     #[must_use]
     pub(crate) fn ground_timer_active(&self) -> bool {

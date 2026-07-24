@@ -22,6 +22,7 @@ use super::pane_support::resolve_pane_target_ref;
 use super::{NormalRequestGuard, RequestHandler};
 use crate::outer_terminal::OuterTerminalContext;
 use crate::pane_io::{self, AttachControl, LiveAttachInputContext, PaneOutputReceiver};
+use crate::pane_recovery::PaneRecoverySeed;
 use crate::pane_terminal_lookup::pane_id_for_target;
 use crate::server_access::current_owner_uid;
 use crate::web::{
@@ -568,35 +569,35 @@ impl RequestHandler {
             let transcript = state.transcript_handle(&target)?;
             (pane_output, transcript)
         };
-        let (output_sequence, snapshot) = pane_output.capture_with_next_sequence(|| {
+        let (boundary, seed, output) = pane_output.capture_with_observer(|| {
             let transcript = match transcript.lock() {
                 Ok(transcript) => transcript,
                 Err(poisoned) => poisoned.into_inner(),
             };
-            let screen = transcript.screen();
-            let size = screen.size();
-            let (cursor_col, cursor_row) = screen.cursor_position();
-            let (scroll_top, scroll_bottom) = screen.scroll_region();
-            WebPaneSnapshot {
-                cols: size.cols,
-                rows: size.rows,
-                output_sequence: 0,
-                ansi_lines: snapshot_ansi_lines(screen),
-                cursor_row: cursor_row.min(u32::from(size.rows.saturating_sub(1))) as u16,
-                cursor_col: cursor_col.min(u32::from(size.cols.saturating_sub(1))) as u16,
-                cursor_visible: screen.mode() & mode::MODE_CURSOR != 0,
-                mode_bits: screen.mode(),
-                cursor_style: screen.cursor_style(),
-                alternate: screen.is_alternate(),
-                scroll_top,
-                scroll_bottom,
-            }
+            PaneRecoverySeed::capture(&transcript)
         });
+        let keyframe = seed.keyframe();
+        let screen = seed.screen();
+        let size = screen.size();
+        debug_assert_eq!((keyframe.cols, keyframe.rows), (size.cols, size.rows));
+        debug_assert_eq!(keyframe.alternate, screen.is_alternate());
+        let (cursor_col, cursor_row) = screen.cursor_position();
+        let (scroll_top, scroll_bottom) = screen.scroll_region();
         let snapshot = WebPaneSnapshot {
-            output_sequence,
-            ..snapshot
+            cols: size.cols,
+            rows: size.rows,
+            output_sequence: boundary.next_output_sequence,
+            ansi_lines: snapshot_ansi_lines(screen),
+            cursor_row: cursor_row.min(u32::from(size.rows.saturating_sub(1))) as u16,
+            cursor_col: cursor_col.min(u32::from(size.cols.saturating_sub(1))) as u16,
+            cursor_visible: screen.mode() & mode::MODE_CURSOR != 0,
+            mode_bits: screen.mode(),
+            cursor_style: screen.cursor_style(),
+            alternate: screen.is_alternate(),
+            scroll_top,
+            scroll_bottom,
+            recovery_keyframe: Some(keyframe.bytes),
         };
-        let output = pane_output.subscribe_from_sequence(output_sequence);
         Ok((snapshot, output))
     }
 

@@ -41,13 +41,15 @@ pub use pane::{
     MovePaneResponse, PaneBroadcastInputFailure, PaneBroadcastInputResponse,
     PaneBroadcastInputSuccess, PaneForegroundStateResponse, PaneOptionEntry, PaneOptionGetResponse,
     PaneOptionSetResponse, PaneOutputCursor, PaneOutputCursorResponse, PaneOutputEvent,
-    PaneOutputLagNotice, PaneOutputLagResponse, PaneRecentOutput, PaneSnapshotCell,
-    PaneSnapshotCursor, PaneSnapshotResponse, PaneStateClosedReason, PaneStateCursorResponse,
-    PaneStateEventDto, PaneStateLagResponse, PaneStateSnapshot, PipePaneResponse,
+    PaneOutputLagNotice, PaneOutputLagResponse, PaneRawBytes, PaneRawRebase, PaneRawRebaseReason,
+    PaneRecentOutput, PaneSnapshotCell, PaneSnapshotCursor, PaneSnapshotResponse,
+    PaneStateClosedReason, PaneStateCursorResponse, PaneStateEventDto, PaneStateLagResponse,
+    PaneStateSnapshot, PaneStreamCursorResponse, PaneStreamEndReason, PaneStreamEvent,
+    PaneStreamLifecycleEvent, PaneSurfaceFrame, PaneSurfaceSnapshot, PipePaneResponse,
     ResizePaneResponse, RespawnPaneResponse, SelectPaneResponse, SendKeysResponse,
     SplitWindowIdentityResponse, SplitWindowResponse, SubscribePaneOutputResponse,
-    SubscribePaneStateResponse, SwapPaneResponse, UnsubscribePaneOutputResponse,
-    UnsubscribePaneStateResponse,
+    SubscribePaneStateResponse, SubscribePaneStreamResponse, SwapPaneResponse,
+    UnsubscribePaneOutputResponse, UnsubscribePaneStateResponse, UnsubscribePaneStreamResponse,
 };
 
 #[path = "response/client.rs"]
@@ -286,6 +288,12 @@ pub enum Response {
     PaneForegroundState(Box<PaneForegroundStateResponse>),
     /// Atomic visible and stable identity returned by an SDK split.
     SplitWindowIdentity(SplitWindowIdentityResponse),
+    /// Atomic initial recoverable pane stream event.
+    SubscribePaneStream(Box<SubscribePaneStreamResponse>),
+    /// Batched recoverable pane stream events.
+    PaneStreamCursor(Box<PaneStreamCursorResponse>),
+    /// Recoverable pane stream unsubscription result.
+    UnsubscribePaneStream(UnsubscribePaneStreamResponse),
 }
 
 impl Response {
@@ -376,6 +384,9 @@ impl Response {
             Self::UnsubscribePaneOutput(_) => "unsubscribe-pane-output",
             Self::PaneOutputCursor(_) => "pane-output-cursor",
             Self::PaneOutputLag(_) => "pane-output-lag",
+            Self::SubscribePaneStream(_) => "subscribe-pane-stream",
+            Self::PaneStreamCursor(_) => "pane-stream-cursor",
+            Self::UnsubscribePaneStream(_) => "unsubscribe-pane-stream",
             Self::SdkWaitForOutput(_) => "sdk-wait-output",
             Self::CancelSdkWait(_) => "cancel-sdk-wait",
             Self::PaneBroadcastInput(_) => "send-keys",
@@ -438,6 +449,9 @@ impl Response {
             | Self::UnsubscribePaneOutput(_)
             | Self::PaneOutputCursor(_)
             | Self::PaneOutputLag(_)
+            | Self::SubscribePaneStream(_)
+            | Self::PaneStreamCursor(_)
+            | Self::UnsubscribePaneStream(_)
             | Self::SdkWaitForOutput(_)
             | Self::CancelSdkWait(_)
             | Self::PaneBroadcastInput(_)

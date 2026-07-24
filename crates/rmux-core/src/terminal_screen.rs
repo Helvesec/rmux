@@ -89,6 +89,30 @@ impl TerminalScreen {
         self.parser.pending_bytes()
     }
 
+    /// Clones renderer state, including bounded scrollback and saved buffers.
+    #[must_use]
+    pub fn clone_recovery_screen(&self) -> Screen {
+        self.parser.clone_recovery_screen()
+    }
+
+    /// Returns ANSI restoring the parser's active rendition and character sets.
+    #[must_use]
+    pub fn active_cell_state_ansi(&self) -> Vec<u8> {
+        self.parser.active_cell_state_ansi()
+    }
+
+    /// Returns ANSI restoring the rendition saved by DECSC/SCP.
+    #[must_use]
+    pub fn saved_cell_state_ansi(&self) -> Vec<u8> {
+        self.parser.saved_cell_state_ansi()
+    }
+
+    /// Returns the cursor and origin mode saved by DECSC/SCP.
+    #[must_use]
+    pub fn saved_cursor_state(&self) -> (u32, u32, bool) {
+        self.parser.saved_cursor_state()
+    }
+
     /// Returns whether the parser ground timeout is currently armed.
     #[must_use]
     pub fn ground_timer_active(&self) -> bool {

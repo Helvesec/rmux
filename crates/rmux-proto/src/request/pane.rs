@@ -718,6 +718,46 @@ pub struct PaneOutputCursorRequest {
     pub max_events: Option<u16>,
 }
 
+/// Projection selected for a recoverable pane stream.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum PaneStreamMode {
+    /// Raw terminal bytes with automatic in-band renderer rebases.
+    Raw,
+    /// Authoritative structured viewport frames.
+    Surface,
+}
+
+/// Request payload for opening a recoverable pane stream.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SubscribePaneStreamRequest {
+    /// Stable pane identity or pane slot resolved atomically by the daemon.
+    pub target: PaneTargetRef,
+    /// Requested projection.
+    pub mode: PaneStreamMode,
+    /// Include a typed snapshot with raw rebases.
+    ///
+    /// Raw emulator consumers normally leave this false; inspection tools can
+    /// request it without forcing every rebase to carry duplicate state.
+    pub include_snapshot: bool,
+}
+
+/// Request payload for polling a recoverable pane stream.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PaneStreamCursorRequest {
+    /// Opaque stream subscription allocated by the daemon.
+    pub subscription_id: PaneOutputSubscriptionId,
+    /// Optional caller cap, clamped to the daemon subscription limit.
+    #[serde(default)]
+    pub max_events: Option<u16>,
+}
+
+/// Request payload for closing a recoverable pane stream.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct UnsubscribePaneStreamRequest {
+    /// Opaque stream subscription allocated by the daemon.
+    pub subscription_id: PaneOutputSubscriptionId,
+}
+
 /// Request payload for `send-keys`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SendKeysRequest {

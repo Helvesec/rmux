@@ -378,6 +378,22 @@ impl PaneTranscript {
         self.terminal.pending_bytes()
     }
 
+    pub(crate) fn clone_recovery_screen(&self) -> Screen {
+        self.terminal.clone_recovery_screen()
+    }
+
+    pub(crate) fn active_cell_state_ansi(&self) -> Vec<u8> {
+        self.terminal.active_cell_state_ansi()
+    }
+
+    pub(crate) fn saved_cell_state_ansi(&self) -> Vec<u8> {
+        self.terminal.saved_cell_state_ansi()
+    }
+
+    pub(crate) fn saved_cursor_state(&self) -> (u32, u32, bool) {
+        self.terminal.saved_cursor_state()
+    }
+
     pub(crate) fn clear_history(&mut self, reset_hyperlinks: bool) {
         self.terminal
             .screen_mut()
