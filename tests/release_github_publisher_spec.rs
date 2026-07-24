@@ -67,6 +67,7 @@ struct ServerState {
     assets: BTreeMap<String, Value>,
     requests: Vec<RequestRecord>,
     expected_assets: BTreeMap<String, AssetSpec>,
+    audit_run_status: String,
 }
 
 struct FakeServer {
@@ -121,6 +122,7 @@ impl FakeServer {
             assets,
             requests: Vec::new(),
             expected_assets,
+            audit_run_status: "in_progress".to_owned(),
         }));
         let stop = Arc::new(AtomicBool::new(false));
         let thread_state = Arc::clone(&state);
@@ -159,6 +161,10 @@ impl FakeServer {
 
     fn is_public(&self) -> bool {
         self.state.lock().expect("fake API state").draft == Some(false)
+    }
+
+    fn set_audit_run_status(&self, status: &str) {
+        self.state.lock().expect("fake API state").audit_run_status = status.to_owned();
     }
 }
 
@@ -606,7 +612,7 @@ fn handle_request(mut stream: TcpStream, shared: &Arc<Mutex<ServerState>>) {
         ),
         ("GET", "/repos/Helvesec/rmux/actions/runs/501") => (
             200,
-            json!({"id": 501, "run_attempt": 1, "workflow_id": 316435346, "path": ".github/workflows/release-promote.yml", "head_sha": SOURCE, "status": "in_progress", "conclusion": null, "repository": {"id": 1239918790}}),
+            json!({"id": 501, "run_attempt": 1, "workflow_id": 316435346, "path": ".github/workflows/release-promote.yml", "head_sha": SOURCE, "status": state.audit_run_status.clone(), "conclusion": null, "repository": {"id": 1239918790}}),
         ),
         ("GET", "/repos/Helvesec/rmux/actions/artifacts/503") => (
             200,
@@ -786,6 +792,17 @@ fn creates_exact_draft_uploads_exact_bytes_then_publishes_once() {
         .map(|item| item.method.as_str())
         .collect();
     assert_eq!(tail, ["PATCH", "GET", "GET"]);
+}
+
+#[test]
+fn publisher_accepts_nonterminal_policy_audit_run_states() {
+    for status in ["queued", "requested", "waiting", "pending"] {
+        let fixture = fixture(true);
+        let server = FakeServer::start(&fixture, InitialRelease::ExactDraft(fixture.assets.len()));
+        server.set_audit_run_status(status);
+        let result = assert_success(invoke(&fixture, &server, true));
+        assert_eq!(result["published"], true, "status={status}");
+    }
 }
 
 #[test]

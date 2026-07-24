@@ -740,9 +740,30 @@ fn actions_artifact_binding_rejects_digest_or_run_drift() {
         "{}",
         String::from_utf8_lossy(&running.stderr)
     );
-    running_run["status"] = serde_json::json!("waiting");
-    fs::write(&run_path, running_run.to_string()).expect("write waiting fixture");
-    let waiting = Command::new(python())
+    for status in ["waiting", "queued", "requested", "pending"] {
+        running_run["status"] = serde_json::json!(status);
+        fs::write(&run_path, running_run.to_string()).expect("write active fixture");
+        let active = Command::new(python())
+            .arg(&script)
+            .args(strict_args)
+            .arg("--allow-running-current-run")
+            .env("GITHUB_RUN_ID", "77")
+            .env("GITHUB_RUN_ATTEMPT", "1")
+            .env("GITHUB_SHA", source)
+            .env("GITHUB_REF_NAME", "main")
+            .env("GITHUB_EVENT_NAME", "workflow_dispatch")
+            .current_dir(repo_root())
+            .output()
+            .expect("verify current active artifact");
+        assert!(
+            active.status.success(),
+            "status={status}: {}",
+            String::from_utf8_lossy(&active.stderr)
+        );
+    }
+    running_run["status"] = serde_json::json!("completed");
+    fs::write(&run_path, running_run.to_string()).expect("write completed fixture");
+    let completed = Command::new(python())
         .arg(&script)
         .args(strict_args)
         .arg("--allow-running-current-run")
@@ -753,27 +774,8 @@ fn actions_artifact_binding_rejects_digest_or_run_drift() {
         .env("GITHUB_EVENT_NAME", "workflow_dispatch")
         .current_dir(repo_root())
         .output()
-        .expect("verify current waiting artifact");
-    assert!(
-        waiting.status.success(),
-        "{}",
-        String::from_utf8_lossy(&waiting.stderr)
-    );
-    running_run["status"] = serde_json::json!("queued");
-    fs::write(&run_path, running_run.to_string()).expect("write queued fixture");
-    let queued = Command::new(python())
-        .arg(&script)
-        .args(strict_args)
-        .arg("--allow-running-current-run")
-        .env("GITHUB_RUN_ID", "77")
-        .env("GITHUB_RUN_ATTEMPT", "1")
-        .env("GITHUB_SHA", source)
-        .env("GITHUB_REF_NAME", "main")
-        .env("GITHUB_EVENT_NAME", "workflow_dispatch")
-        .current_dir(repo_root())
-        .output()
-        .expect("reject queued current artifact");
-    assert!(!queued.status.success());
+        .expect("reject completed current artifact");
+    assert!(!completed.status.success());
     running_run["status"] = serde_json::json!("waiting");
     fs::write(&run_path, running_run.to_string()).expect("restore waiting fixture");
     let wrong_current_run = Command::new(python())
