@@ -12,11 +12,12 @@ use rmux_proto::{
     PaneOutputCursorResponse, PaneOutputEvent, PaneOutputLagNotice, PaneOutputLagResponse,
     PaneOutputSubscriptionId, PaneOutputSubscriptionStart, PaneRecentOutput, PaneSnapshotCell,
     PaneSnapshotCursor, PaneSnapshotResponse, PaneStateSnapshot, PaneStateSubscriptionId,
-    PaneStreamCursorResponse, PaneStreamEvent, PaneStreamMode, PaneSurfaceFrame,
-    PaneSurfaceSnapshot, PaneTarget, PaneTargetRef, Request, ResizePaneAdjustment,
-    ResizePaneResponse, RespawnPaneResponse, Response, SelectPaneResponse, SendKeysResponse,
-    SubscribePaneOutputResponse, SubscribePaneStateResponse, SubscribePaneStreamResponse,
-    TerminalSize, WindowListEntry, WindowTarget, CAPABILITY_HANDSHAKE,
+    PaneStreamCursorResponse, PaneStreamEvent, PaneStreamLifecycleEvent, PaneStreamMode,
+    PaneSurfaceFrame, PaneSurfaceSnapshot, PaneTarget, PaneTargetRef, Request,
+    ResizePaneAdjustment, ResizePaneResponse, RespawnPaneResponse, Response, SelectPaneResponse,
+    SendKeysResponse, SubscribePaneOutputResponse, SubscribePaneStateResponse,
+    SubscribePaneStreamResponse, TerminalSize, UnsubscribePaneOutputResponse, WindowListEntry,
+    WindowTarget, CAPABILITY_HANDSHAKE,
 };
 use rmux_sdk::{
     LayoutName, Pane, PaneCloseOutcome, PaneId, PaneRef, PaneStateEvent, PaneStateEventsOptions,
@@ -193,8 +194,200 @@ async fn render_stream_correlates_lag_that_arrives_after_its_surface_frame() -> 
 }
 
 #[tokio::test]
-async fn render_stream_keeps_following_surface_after_output_eof() -> TestResult {
+async fn render_stream_reopens_lag_tracking_after_respawn() -> TestResult {
     let socket = TestSocket::new("render-output-eof-respawn")?;
+    let listener = UnixListener::bind(socket.path())?;
+    let (finish_server, server_finished) = tokio::sync::oneshot::channel();
+    let server = tokio::spawn(async move {
+        let mut peer = accept_peer(&listener).await?;
+        expect_initial_preferred_lookup(&mut peer).await?;
+        expect_direct_beta_resolution(&mut peer).await?;
+        expect_direct_beta_resolution(&mut peer).await?;
+        expect_by_id_handshake(&mut peer).await?;
+        let output_id = expect_output_subscription(&mut peer).await?;
+        expect_direct_beta_resolution(&mut peer).await?;
+        let surface_id =
+            expect_surface_subscription(&mut peer, resolved_target(), resolved_slot(), 41, "base")
+                .await?;
+
+        let mut eof_sent = false;
+        let mut lifecycle_sent = false;
+        while !eof_sent || !lifecycle_sent {
+            match peer.expect_request().await? {
+                Request::PaneStreamCursor(request) if request.subscription_id == surface_id => {
+                    peer.write_response(Response::PaneStreamCursor(Box::new(
+                        PaneStreamCursorResponse {
+                            subscription_id: surface_id,
+                            events: vec![PaneStreamEvent::Lifecycle(
+                                PaneStreamLifecycleEvent::ProcessExited {
+                                    output_sequence: Some(1),
+                                },
+                            )],
+                            limited: false,
+                        },
+                    )))
+                    .await?;
+                    lifecycle_sent = true;
+                }
+                Request::PaneOutputCursor(request) if request.subscription_id == output_id => {
+                    write_output_eof(&mut peer, output_id, 1).await?;
+                    eof_sent = true;
+                }
+                request => {
+                    return Err(format!("expected render cursor request, got {request:?}").into());
+                }
+            }
+        }
+
+        let request = peer.expect_request().await?;
+        let Request::PaneStreamCursor(request) = request else {
+            return Err(format!("expected respawn surface reset, got {request:?}").into());
+        };
+        assert_eq!(request.subscription_id, surface_id);
+        peer.write_response(Response::PaneStreamCursor(Box::new(
+            PaneStreamCursorResponse {
+                subscription_id: surface_id,
+                events: vec![PaneStreamEvent::SurfaceReset(Box::new(
+                    surface_frame_at_epoch("respawned", 42, 2, 2, 2),
+                ))],
+                limited: false,
+            },
+        )))
+        .await?;
+
+        expect_direct_beta_resolution(&mut peer).await?;
+        let request = peer.expect_request().await?;
+        let Request::SubscribePaneOutputRef(request) = request else {
+            return Err(
+                format!("expected first respawn output subscription, got {request:?}").into(),
+            );
+        };
+        assert_eq!(request.target, resolved_target());
+        assert_eq!(request.start, PaneOutputSubscriptionStart::Now);
+        peer.write_response(Response::Error(ErrorResponse {
+            error: rmux_proto::RmuxError::Server(
+                "temporary respawn subscription failure".to_owned(),
+            ),
+        }))
+        .await?;
+
+        expect_direct_beta_resolution(&mut peer).await?;
+        let reopened_output_id = PaneOutputSubscriptionId::new(29);
+        expect_output_subscription_at_cursor(
+            &mut peer,
+            resolved_target(),
+            resolved_slot(),
+            reopened_output_id,
+            2,
+        )
+        .await?;
+
+        let mut lag_sent = false;
+        let mut patch_sent = false;
+        while !patch_sent {
+            match peer.expect_request().await? {
+                Request::UnsubscribePaneOutput(request) if request.subscription_id == output_id => {
+                    peer.write_response(Response::UnsubscribePaneOutput(
+                        UnsubscribePaneOutputResponse {
+                            subscription_id: output_id,
+                            removed: true,
+                        },
+                    ))
+                    .await?;
+                }
+                Request::PaneOutputCursor(request)
+                    if request.subscription_id == reopened_output_id =>
+                {
+                    peer.write_response(Response::PaneOutputLag(Box::new(PaneOutputLagResponse {
+                        subscription_id: reopened_output_id,
+                        cursor: PaneOutputCursor {
+                            next_sequence: 3,
+                            missed_events: 1,
+                        },
+                        lag: PaneOutputLagNotice {
+                            expected_sequence: 2,
+                            resume_sequence: 3,
+                            missed_events: 1,
+                            newest_sequence: 2,
+                            recent: PaneRecentOutput {
+                                bytes: Vec::new(),
+                                oldest_sequence: None,
+                                newest_sequence: None,
+                            },
+                        },
+                    })))
+                    .await?;
+                    lag_sent = true;
+                }
+                Request::PaneStreamCursor(request) if request.subscription_id == surface_id => {
+                    if lag_sent {
+                        peer.write_response(Response::PaneStreamCursor(Box::new(
+                            PaneStreamCursorResponse {
+                                subscription_id: surface_id,
+                                events: vec![PaneStreamEvent::SurfacePatch(Box::new(
+                                    surface_frame_at_epoch("live-again", 43, 3, 3, 2),
+                                ))],
+                                limited: false,
+                            },
+                        )))
+                        .await?;
+                        patch_sent = true;
+                    } else {
+                        write_empty_surface_cursor(&mut peer, surface_id).await?;
+                    }
+                }
+                request => {
+                    return Err(format!("expected reopened render request, got {request:?}").into());
+                }
+            }
+        }
+        server_finished
+            .await
+            .map_err(|_| "render respawn completion signal dropped")?;
+        TestResult::Ok(())
+    });
+
+    let pane = pane_by_id(socket.path()).await?;
+    let mut render = pane.render_stream().await?.with_debounce(Duration::ZERO);
+    let error = render
+        .next()
+        .await
+        .expect_err("the first respawn subscription failure must propagate");
+    assert!(
+        error
+            .to_string()
+            .contains("temporary respawn subscription failure"),
+        "{error}"
+    );
+    let update = render
+        .next()
+        .await?
+        .expect("the retained surface remains live after output EOF");
+    assert_eq!(update.snapshot().revision, 42);
+    assert_eq!(update.snapshot().visible_text(), "respawned");
+    assert!(update.lag().is_none());
+
+    let update = render
+        .next()
+        .await?
+        .expect("lag tracking resumes for the respawned generation");
+    assert_eq!(update.snapshot().revision, 43);
+    assert_eq!(update.snapshot().visible_text(), "live-again");
+    let lag = update
+        .lag()
+        .expect("the reopened output stream reports the new generation lag");
+    assert_eq!(lag.expected_sequence, 2);
+    assert_eq!(lag.resume_sequence, 3);
+    let _ = finish_server.send(());
+    drop(render);
+    drop(pane);
+    server.await??;
+    Ok(())
+}
+
+#[tokio::test]
+async fn render_stream_does_not_reopen_after_eof_and_reset_without_lifecycle() -> TestResult {
+    let socket = TestSocket::new("render-output-eof-reset-only")?;
     let listener = UnixListener::bind(socket.path())?;
     let server = tokio::spawn(async move {
         let mut peer = accept_peer(&listener).await?;
@@ -210,21 +403,12 @@ async fn render_stream_keeps_following_surface_after_output_eof() -> TestResult 
 
         loop {
             match peer.expect_request().await? {
-                Request::PaneStreamCursor(request) if request.subscription_id == surface_id => {
-                    peer.write_response(Response::PaneStreamCursor(Box::new(
-                        PaneStreamCursorResponse {
-                            subscription_id: surface_id,
-                            events: vec![PaneStreamEvent::SurfaceReset(Box::new(
-                                surface_frame_at("respawned", 42, 2, 3),
-                            ))],
-                            limited: false,
-                        },
-                    )))
-                    .await?;
+                Request::PaneOutputCursor(request) if request.subscription_id == output_id => {
+                    write_output_eof(&mut peer, output_id, 1).await?;
                     break;
                 }
-                Request::PaneOutputCursor(request) if request.subscription_id == output_id => {
-                    write_empty_output_cursor(&mut peer, output_id).await?;
+                Request::PaneStreamCursor(request) if request.subscription_id == surface_id => {
+                    write_empty_surface_cursor(&mut peer, surface_id).await?;
                 }
                 request => {
                     return Err(format!("expected render cursor request, got {request:?}").into());
@@ -233,13 +417,36 @@ async fn render_stream_keeps_following_surface_after_output_eof() -> TestResult 
         }
 
         let request = peer.expect_request().await?;
-        let Request::PaneOutputCursor(request) = request else {
-            return Err(
-                format!("expected output drain after surface reset, got {request:?}").into(),
-            );
+        let Request::PaneStreamCursor(request) = request else {
+            return Err(format!("EOF alone unexpectedly armed a resubscribe: {request:?}").into());
         };
-        assert_eq!(request.subscription_id, output_id);
-        write_output_eof(&mut peer, output_id, 1).await?;
+        assert_eq!(request.subscription_id, surface_id);
+        peer.write_response(Response::PaneStreamCursor(Box::new(
+            PaneStreamCursorResponse {
+                subscription_id: surface_id,
+                events: vec![PaneStreamEvent::SurfaceReset(Box::new(
+                    surface_frame_at_epoch("reset-only", 42, 2, 2, 2),
+                ))],
+                limited: false,
+            },
+        )))
+        .await?;
+
+        let request = peer.expect_request().await?;
+        let Request::PaneStreamCursor(request) = request else {
+            return Err(format!("reset without lifecycle reopened output: {request:?}").into());
+        };
+        assert_eq!(request.subscription_id, surface_id);
+        peer.write_response(Response::PaneStreamCursor(Box::new(
+            PaneStreamCursorResponse {
+                subscription_id: surface_id,
+                events: vec![PaneStreamEvent::End(
+                    rmux_proto::PaneStreamEndReason::PaneRemoved,
+                )],
+                limited: false,
+            },
+        )))
+        .await?;
         TestResult::Ok(())
     });
 
@@ -248,9 +455,10 @@ async fn render_stream_keeps_following_surface_after_output_eof() -> TestResult 
     let update = render
         .next()
         .await?
-        .expect("the retained surface remains live after output EOF");
+        .expect("the reset-only surface remains observable");
     assert_eq!(update.snapshot().revision, 42);
-    assert_eq!(update.snapshot().visible_text(), "respawned");
+    assert_eq!(update.snapshot().visible_text(), "reset-only");
+    assert!(render.next().await?.is_none());
     drop(render);
     drop(pane);
     server.await??;
@@ -1946,6 +2154,17 @@ async fn expect_output_subscription_at(
     response_target: PaneTarget,
     subscription_id: PaneOutputSubscriptionId,
 ) -> TestResult {
+    expect_output_subscription_at_cursor(peer, expected_target, response_target, subscription_id, 1)
+        .await
+}
+
+async fn expect_output_subscription_at_cursor(
+    peer: &mut Peer,
+    expected_target: PaneTargetRef,
+    response_target: PaneTarget,
+    subscription_id: PaneOutputSubscriptionId,
+    next_sequence: u64,
+) -> TestResult {
     let request = peer.expect_request().await?;
     let Request::SubscribePaneOutputRef(request) = request else {
         return Err(format!("expected by-id output subscription, got {request:?}").into());
@@ -1958,7 +2177,7 @@ async fn expect_output_subscription_at(
         target: response_target,
         pane_id: pane_id(),
         cursor: PaneOutputCursor {
-            next_sequence: 1,
+            next_sequence,
             missed_events: 0,
         },
     }))
@@ -2217,9 +2436,25 @@ fn surface_frame_at(
     surface_revision: u64,
     next_output_sequence: u64,
 ) -> PaneSurfaceFrame {
+    surface_frame_at_epoch(
+        text,
+        grid_revision,
+        surface_revision,
+        next_output_sequence,
+        1,
+    )
+}
+
+fn surface_frame_at_epoch(
+    text: &str,
+    grid_revision: u64,
+    surface_revision: u64,
+    next_output_sequence: u64,
+    epoch: u64,
+) -> PaneSurfaceFrame {
     let snapshot = snapshot_response(text, grid_revision);
     PaneSurfaceFrame {
-        epoch: 1,
+        epoch,
         revision: surface_revision,
         next_output_sequence,
         snapshot: PaneSurfaceSnapshot {

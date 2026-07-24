@@ -3,12 +3,19 @@
 use std::time::Duration;
 
 use crate::{
-    Pane, PaneLagNotice, PaneOutputChunk, PaneOutputStream, PaneSnapshot, PaneSurfaceEvent,
-    PaneSurfaceStream, Result, RmuxError,
+    Pane, PaneLagNotice, PaneOutputChunk, PaneOutputStream, PaneSnapshot, PaneStreamLifecycleEvent,
+    PaneSurfaceEvent, PaneSurfaceFrame, PaneSurfaceStream, Result, RmuxError,
 };
 use tokio::time::Instant;
 
 const DEFAULT_RENDER_DEBOUNCE: Duration = Duration::from_millis(16);
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum OutputGenerationPhase {
+    Live,
+    AwaitingReset,
+    Respawned { output_boundary: u64 },
+}
 
 /// Snapshot update emitted by [`PaneRenderStream`].
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -55,6 +62,8 @@ pub struct PaneRenderStream {
     pending_output_boundary: Option<u64>,
     render_deadline: Option<Instant>,
     output_closed: bool,
+    output_generation: OutputGenerationPhase,
+    surface_epoch: u64,
     surface_closed: bool,
 }
 
@@ -63,18 +72,20 @@ impl PaneRenderStream {
         let (operation_pane, _) = pane.begin_pinned_operation_handle().await?;
         let output = operation_pane.output_stream().await?;
         let mut surface = operation_pane.surface_stream().await?;
-        let baseline = initial_surface_snapshot(&mut surface).await?;
+        let baseline = initial_surface_frame(&mut surface).await?;
         Ok(Self {
             pane: operation_pane.into_reusable_handle(),
             output,
             surface,
             debounce: DEFAULT_RENDER_DEBOUNCE,
-            last_snapshot: baseline,
+            last_snapshot: baseline.snapshot.grid,
             pending_lag: None,
             pending_snapshot: None,
             pending_output_boundary: None,
             render_deadline: None,
             output_closed: false,
+            output_generation: OutputGenerationPhase::Live,
+            surface_epoch: baseline.epoch,
             surface_closed: false,
         })
     }
@@ -90,6 +101,7 @@ impl PaneRenderStream {
     /// surface reports a typed terminal end.
     pub async fn next(&mut self) -> Result<Option<RenderUpdate>> {
         loop {
+            self.reopen_output_after_respawn().await?;
             if self
                 .render_deadline
                 .is_some_and(|deadline| deadline <= Instant::now())
@@ -137,35 +149,81 @@ impl PaneRenderStream {
 
     fn observe_surface(&mut self, event: Option<PaneSurfaceEvent>) {
         match event {
-            Some(PaneSurfaceEvent::Reset(frame) | PaneSurfaceEvent::Patch(frame)) => {
-                let next_output_sequence = frame.next_output_sequence;
-                let snapshot = frame.snapshot.grid;
-                if self.last_snapshot.revision == snapshot.revision
-                    || self
-                        .pending_snapshot
-                        .as_ref()
-                        .is_some_and(|pending| pending.revision >= snapshot.revision)
-                {
-                    return;
+            Some(PaneSurfaceEvent::Reset(frame)) => {
+                if frame.epoch > self.surface_epoch {
+                    self.surface_epoch = frame.epoch;
+                    if self.output_generation == OutputGenerationPhase::AwaitingReset {
+                        self.output_generation = OutputGenerationPhase::Respawned {
+                            output_boundary: frame.next_output_sequence,
+                        };
+                    }
                 }
-                self.pending_snapshot = Some(snapshot);
-                self.pending_output_boundary = Some(next_output_sequence);
-                self.render_deadline
-                    .get_or_insert_with(|| Instant::now() + self.debounce);
+                self.observe_surface_frame(frame);
             }
-            Some(PaneSurfaceEvent::Lifecycle(_)) => {}
+            Some(PaneSurfaceEvent::Patch(frame)) => self.observe_surface_frame(frame),
+            Some(PaneSurfaceEvent::Lifecycle(PaneStreamLifecycleEvent::ProcessExited {
+                ..
+            })) => {
+                self.output_generation = OutputGenerationPhase::AwaitingReset;
+            }
             Some(PaneSurfaceEvent::End(_)) | None => {
                 self.surface_closed = true;
             }
         }
     }
 
+    fn observe_surface_frame(&mut self, frame: PaneSurfaceFrame) {
+        let next_output_sequence = frame.next_output_sequence;
+        let snapshot = frame.snapshot.grid;
+        if self.last_snapshot.revision == snapshot.revision
+            || self
+                .pending_snapshot
+                .as_ref()
+                .is_some_and(|pending| pending.revision >= snapshot.revision)
+        {
+            return;
+        }
+        self.pending_snapshot = Some(snapshot);
+        self.pending_output_boundary = Some(next_output_sequence);
+        self.render_deadline
+            .get_or_insert_with(|| Instant::now() + self.debounce);
+    }
+
+    async fn reopen_output_after_respawn(&mut self) -> Result<()> {
+        if !self.output_closed
+            || !matches!(
+                self.output_generation,
+                OutputGenerationPhase::Respawned { .. }
+            )
+        {
+            return Ok(());
+        }
+
+        // Consume one authoritative exit -> reset transition before opening.
+        // If the pane disappears concurrently, return that operation error
+        // once instead of retrying forever against a dead logical pane.
+        let output = self.pane.output_stream().await?;
+        self.output = output;
+        self.output_closed = false;
+        self.output_generation = OutputGenerationPhase::Live;
+        Ok(())
+    }
+
     fn observe_output(&mut self, chunk: Option<PaneOutputChunk>) {
         match chunk {
             Some(PaneOutputChunk::Lag(lag)) => self.pending_lag = Some(lag),
-            Some(PaneOutputChunk::Bytes { bytes, .. }) => {
+            Some(PaneOutputChunk::Bytes { sequence, bytes }) => {
                 if bytes.is_empty() {
                     self.output_closed = true;
+                    self.output_generation = match self.output_generation {
+                        OutputGenerationPhase::Respawned { output_boundary }
+                            if sequence < output_boundary =>
+                        {
+                            self.output_generation
+                        }
+                        OutputGenerationPhase::Respawned { .. } => OutputGenerationPhase::Live,
+                        phase => phase,
+                    };
                 }
             }
             None => self.output_closed = true,
@@ -239,15 +297,17 @@ impl std::fmt::Debug for PaneRenderStream {
             .field("pending_snapshot", &self.pending_snapshot.is_some())
             .field("render_deadline", &self.render_deadline)
             .field("output_closed", &self.output_closed)
+            .field("output_generation", &self.output_generation)
+            .field("surface_epoch", &self.surface_epoch)
             .field("surface_closed", &self.surface_closed)
             .finish_non_exhaustive()
     }
 }
 
-async fn initial_surface_snapshot(surface: &mut PaneSurfaceStream) -> Result<PaneSnapshot> {
+async fn initial_surface_frame(surface: &mut PaneSurfaceStream) -> Result<PaneSurfaceFrame> {
     loop {
         match surface.next().await? {
-            Some(PaneSurfaceEvent::Reset(frame)) => return Ok(frame.snapshot.grid),
+            Some(PaneSurfaceEvent::Reset(frame)) => return Ok(frame),
             Some(PaneSurfaceEvent::Lifecycle(_)) => {}
             Some(PaneSurfaceEvent::End(reason)) => {
                 return Err(RmuxError::protocol(rmux_proto::RmuxError::Server(format!(
