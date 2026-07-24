@@ -85,6 +85,14 @@ def _validate_reusable_workflow(path: Path, *, require_repository_guard: bool) -
         ):
             if f"      {name}:" not in dispatch[1]:
                 raise ValueError(f"Linux repository recovery lost input {name}")
+        for mode in (
+            "--allow-completed-failed-run",
+            "--allow-running-current-run",
+        ):
+            if text.count(mode) != 1:
+                raise ValueError(f"Linux repository recovery lost run mode {mode}")
+        if text.count('test "$GITHUB_REF" = "refs/heads/main"') != 1:
+            raise ValueError("Linux repository recovery is not bound to protected main")
     elif "\n  workflow_dispatch:" in text:
         raise ValueError(f"{path.name} gained a mutation-capable dispatch trigger")
     if "runs-on: self-hosted" in text or "\n      - self-hosted" in text:
