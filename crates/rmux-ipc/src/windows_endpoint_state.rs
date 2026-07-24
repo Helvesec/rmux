@@ -129,6 +129,35 @@ pub(crate) fn endpoint_for_label(
     ))
 }
 
+/// Resolves the pre-rotation endpoint recorded for a managed endpoint.
+///
+/// This is intentionally limited to a passive `Resolved` generation. A
+/// `Starting` or `Running` generation may own the legacy namespace as a guard,
+/// and must never be mistaken for an older daemon. The private state record
+/// also has to name the exact managed nonce supplied by the caller.
+pub fn legacy_shutdown_endpoint(pipe_name: &Path) -> io::Result<Option<LocalEndpoint>> {
+    let Some(components) = managed_components(pipe_name.as_os_str())? else {
+        return Ok(None);
+    };
+    let Some(state) = StateStore::open_existing(&components.key, components.integrity)? else {
+        return Ok(None);
+    };
+    let _lock = state.lock()?;
+    let Some(record) = state.read_record()? else {
+        return Ok(None);
+    };
+    if record.phase != EndpointPhase::Resolved
+        || record.key != components.key
+        || record.nonce != components.nonce
+    {
+        return Ok(None);
+    }
+    let Some(endpoint) = legacy_endpoint(&components, record.legacy_component.as_deref()) else {
+        return Ok(None);
+    };
+    windows_endpoint_legacy::namespace_exists(&endpoint).map(|exists| exists.then_some(endpoint))
+}
+
 /// Atomically reserves a private Windows label endpoint for daemon startup.
 ///
 /// Explicit `-S`, `RMUX`, and `TMUX` pipe paths are unchanged: paths without

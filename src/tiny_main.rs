@@ -12,6 +12,8 @@ use rmux_client::attach_terminal_with_initial_bytes;
 use rmux_client::attach_terminal_with_initial_bytes_and_resize_geometry;
 #[cfg(windows)]
 use rmux_client::attach_terminal_with_initial_bytes_and_windows_console_key;
+#[cfg(windows)]
+use rmux_client::connect_for_server_shutdown;
 use rmux_client::{
     connect, connect_or_absent, ensure_server_running_with_config_outcome, resolve_socket_path,
     resolve_tmux_compatible_socket_path, wait_for_server_endpoint_cleanup, AttachTransition,
@@ -1125,17 +1127,18 @@ fn resolve_active_window_index(
 
 #[cfg(windows)]
 fn run_kill_server(socket_path: &Path) -> Result<i32, String> {
-    let mut connection = connect(socket_path).map_err(|error| client_error(socket_path, error))?;
+    let (mut connection, selected_socket_path) = connect_for_server_shutdown(socket_path)
+        .map_err(|error| client_error(socket_path, error))?;
     match probe_kill_server_compatible(&mut connection) {
         Ok(()) => {}
         Err(error) if kill_server_connection_closed(&error) => {
             drop(connection);
-            wait_for_killed_server_socket_cleanup(socket_path)?;
+            wait_for_killed_server_socket_cleanup(&selected_socket_path)?;
             return Ok(0);
         }
         Err(error) => {
             if let Some(wire_version) = legacy_shutdown_fallback_wire_version(&error) {
-                return run_legacy_wire_kill_server(socket_path, wire_version);
+                return run_legacy_wire_kill_server(&selected_socket_path, wire_version);
             }
             return Err(error.to_string());
         }
@@ -1144,11 +1147,11 @@ fn run_kill_server(socket_path: &Path) -> Result<i32, String> {
     drop(connection);
     match shutdown {
         Ok(()) => {
-            wait_for_killed_server_socket_cleanup(socket_path)?;
+            wait_for_killed_server_socket_cleanup(&selected_socket_path)?;
             Ok(0)
         }
         Err(error) if kill_server_connection_closed(&error) => {
-            wait_for_killed_server_socket_cleanup(socket_path)?;
+            wait_for_killed_server_socket_cleanup(&selected_socket_path)?;
             Ok(0)
         }
         Err(error) => Err(error.to_string()),

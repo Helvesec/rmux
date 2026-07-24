@@ -1,8 +1,10 @@
 use std::path::Path;
 
+#[cfg(not(windows))]
+use rmux_client::connect;
+use rmux_client::ClientError;
 #[cfg(windows)]
-use rmux_client::Connection;
-use rmux_client::{connect, ClientError};
+use rmux_client::{connect_for_server_shutdown, Connection};
 use rmux_client::{connect_or_absent, ConnectResult};
 use rmux_proto::RmuxError;
 #[cfg(windows)]
@@ -36,18 +38,18 @@ pub(super) fn run_start_server(
 
 #[cfg(windows)]
 pub(super) fn run_kill_server(socket_path: &Path) -> Result<i32, ExitFailure> {
-    let mut connection = connect(socket_path)
+    let (mut connection, selected_socket_path) = connect_for_server_shutdown(socket_path)
         .map_err(|error| ExitFailure::from_client_connect(socket_path, error))?;
     match probe_kill_server_compatible(&mut connection) {
         Ok(()) => {}
         Err(error) if kill_server_connection_closed(&error) => {
             drop(connection);
-            wait_for_killed_server_socket_cleanup(socket_path)?;
+            wait_for_killed_server_socket_cleanup(&selected_socket_path)?;
             return Ok(0);
         }
         Err(error) => {
             if let Some(wire_version) = legacy_shutdown_fallback_wire_version(&error) {
-                return run_legacy_wire_kill_server(socket_path, wire_version);
+                return run_legacy_wire_kill_server(&selected_socket_path, wire_version);
             }
             return Err(ExitFailure::from_client(error));
         }
@@ -56,11 +58,11 @@ pub(super) fn run_kill_server(socket_path: &Path) -> Result<i32, ExitFailure> {
     drop(connection);
     match shutdown {
         Ok(()) => {
-            wait_for_killed_server_socket_cleanup(socket_path)?;
+            wait_for_killed_server_socket_cleanup(&selected_socket_path)?;
             Ok(0)
         }
         Err(error) if kill_server_connection_closed(&error) => {
-            wait_for_killed_server_socket_cleanup(socket_path)?;
+            wait_for_killed_server_socket_cleanup(&selected_socket_path)?;
             Ok(0)
         }
         Err(error) => Err(ExitFailure::from_client(error)),

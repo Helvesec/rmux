@@ -44,7 +44,7 @@ pub use stream::{connect_windows_pipe, WindowsPipeClient};
 #[cfg(windows)]
 pub use windows_endpoint_reservation::ManagedEndpointStartReservation;
 #[cfg(windows)]
-pub use windows_endpoint_state::reserve_managed_endpoint_start;
+pub use windows_endpoint_state::{legacy_shutdown_endpoint, reserve_managed_endpoint_start};
 #[cfg(windows)]
 pub use windows_mutex::{
     acquire_named_mutex, NamedMutexAcquire, NamedMutexError, NamedMutexGuard, MAX_NAMED_MUTEX_LEN,

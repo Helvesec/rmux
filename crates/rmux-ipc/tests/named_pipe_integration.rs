@@ -8,8 +8,8 @@ use std::sync::{Arc, Barrier};
 use std::time::Duration;
 
 use rmux_ipc::{
-    connect_blocking, connect_windows_pipe, endpoint_for_label, reserve_managed_endpoint_start,
-    wait_for_peer_close, LocalEndpoint, LocalListener,
+    connect_blocking, connect_windows_pipe, endpoint_for_label, legacy_shutdown_endpoint,
+    reserve_managed_endpoint_start, wait_for_peer_close, LocalEndpoint, LocalListener,
 };
 use rmux_os::identity::{IdentityResolver, UserIdentity};
 use rmux_os::path::socket_paths_match;
@@ -466,6 +466,39 @@ async fn live_legacy_namespace_blocks_v6_reservation_before_startup() -> std::io
         .expect_err("a live legacy daemon must block v6 startup");
     assert_eq!(error.kind(), ErrorKind::AddrInUse);
     assert!(error.to_string().contains("stop"));
+    Ok(())
+}
+
+#[tokio::test]
+async fn legacy_shutdown_resolution_requires_the_exact_passive_generation() -> std::io::Result<()> {
+    let label = format!("legacy-shutdown-{}", std::process::id());
+    let candidate = endpoint_for_label(&label)?;
+    let legacy_path = legacy_path_for(&label, &candidate);
+    let _legacy_daemon = ServerOptions::new()
+        .first_pipe_instance(true)
+        .create(&legacy_path)?;
+
+    let legacy = legacy_shutdown_endpoint(candidate.as_path())?
+        .expect("resolved generation should retain its live legacy endpoint");
+    assert_eq!(legacy.as_path(), legacy_path);
+
+    let mut forged = candidate.as_path().to_string_lossy().into_owned();
+    let replacement = if forged.ends_with('0') { '1' } else { '0' };
+    forged.pop();
+    forged.push(replacement);
+    assert!(legacy_shutdown_endpoint(Path::new(&forged))?.is_none());
+    assert!(legacy_shutdown_endpoint(&legacy_path)?.is_none());
+    Ok(())
+}
+
+#[tokio::test]
+async fn running_generation_never_resolves_its_legacy_guard_for_shutdown() -> std::io::Result<()> {
+    let label = format!("legacy-shutdown-running-{}", std::process::id());
+    let endpoint = endpoint_for_label(&label)?;
+    let listener = LocalListener::bind(&endpoint)?;
+
+    assert!(legacy_shutdown_endpoint(endpoint.as_path())?.is_none());
+    drop(listener);
     Ok(())
 }
 

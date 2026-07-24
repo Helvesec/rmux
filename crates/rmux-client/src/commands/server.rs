@@ -1,5 +1,7 @@
 use std::fmt;
 use std::path::Path;
+#[cfg(windows)]
+use std::path::PathBuf;
 
 use rmux_proto::{
     DaemonStatusRequest, KillServerRequest, LockClientRequest, LockServerRequest,
@@ -11,6 +13,40 @@ use crate::{
     connection::{connect, Connection},
     ClientError,
 };
+
+/// Connects to the exact endpoint eligible for a `kill-server` request.
+///
+/// On Windows, a pre-rotation daemon may still own the static endpoint while
+/// the current client has resolved a private managed generation. Only an
+/// absent managed endpoint may fall back to the legacy endpoint authenticated
+/// by the private discovery record. Ordinary commands never use this path.
+#[cfg(windows)]
+pub fn connect_for_server_shutdown(
+    socket_path: &Path,
+) -> Result<(Connection, PathBuf), ClientError> {
+    let primary_error = match connect(socket_path) {
+        Ok(connection) => return Ok((connection, socket_path.to_path_buf())),
+        Err(error) if shutdown_endpoint_is_absent(&error) => error,
+        Err(error) => return Err(error),
+    };
+    let Some(legacy_endpoint) = rmux_ipc::legacy_shutdown_endpoint(socket_path)? else {
+        return Err(primary_error);
+    };
+    let legacy_path = legacy_endpoint.into_path();
+    connect(&legacy_path).map(|connection| (connection, legacy_path))
+}
+
+#[cfg(windows)]
+fn shutdown_endpoint_is_absent(error: &ClientError) -> bool {
+    matches!(
+        error,
+        ClientError::Io(error)
+            if matches!(
+                error.kind(),
+                std::io::ErrorKind::NotFound | std::io::ErrorKind::ConnectionRefused
+            )
+    )
+}
 
 impl Connection {
     /// Ensures the server is available, honouring top-level no-start-server behavior.

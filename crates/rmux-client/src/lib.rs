@@ -36,6 +36,8 @@ pub use auto_start::{
     ensure_server_running_with_config_outcome, AutoStartConfig, AutoStartConfigSelection,
     AutoStartError, EnsuredServerConnection, ServerConnectionProvenance, INTERNAL_DAEMON_FLAG,
 };
+#[cfg(windows)]
+pub use commands::server::connect_for_server_shutdown;
 pub use commands::server::StartServerError;
 pub use commands::window::SplitWindowOptions;
 pub use connection::{
