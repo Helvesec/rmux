@@ -268,6 +268,39 @@ fn downstream_writers_keep_the_python_310_runtime_contract() {
 }
 
 #[test]
+fn downstream_json_writer_uses_canonical_lf_bytes_on_every_platform() {
+    let nonce = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("system time")
+        .as_nanos();
+    let root = std::env::temp_dir().join(format!(
+        "rmux-downstream-json-{}-{nonce}",
+        std::process::id()
+    ));
+    fs::create_dir_all(&root).expect("create canonical JSON fixture directory");
+    let output_path = root.join("evidence.json");
+    let output = Command::new("python3")
+        .args([
+            "-c",
+            "import pathlib,sys; sys.path.insert(0,'scripts/release'); \
+             from downstream_channels import write_object; \
+             write_object(pathlib.Path(sys.argv[1]), {'z': 1, 'a': 2})",
+        ])
+        .arg(&output_path)
+        .current_dir(repo_root())
+        .output()
+        .expect("run canonical downstream JSON writer");
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let bytes = fs::read(&output_path).expect("read canonical downstream JSON");
+    fs::remove_dir_all(root).expect("remove canonical JSON fixture directory");
+    assert_eq!(bytes, b"{\n  \"a\": 2,\n  \"z\": 1\n}\n");
+}
+
+#[test]
 fn downstream_rc_payloads_keep_stable_package_names() {
     let staging = include_str!("../scripts/release/stage-downstream-payloads.py");
     let snap = include_str!("../scripts/release/snap-candidate-status.py");
