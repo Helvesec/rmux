@@ -389,19 +389,7 @@ impl StateStore {
     }
 
     fn paths(key: &str, integrity: &'static str) -> io::Result<Self> {
-        let local_app_data = std::env::var_os("LOCALAPPDATA").ok_or_else(|| {
-            io::Error::new(
-                io::ErrorKind::NotFound,
-                "LOCALAPPDATA is unavailable for Windows endpoint discovery",
-            )
-        })?;
-        let local_app_data = PathBuf::from(local_app_data);
-        if !local_app_data.is_absolute() {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "LOCALAPPDATA is not absolute",
-            ));
-        }
+        let local_app_data = crate::windows_endpoint_directory::state_base(integrity)?;
         let root = local_app_data.join(format!("RMUX-runtime-{integrity}"));
         Ok(Self {
             state_path: root.join(format!("{key}.state")),
