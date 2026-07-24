@@ -100,6 +100,16 @@ jobs:
             --expected-event workflow_dispatch --expected-head-branch "$RMUX_RELEASE_REF" \
             "${mode[@]}" --max-attempts 1
 
+      - name: Preserve protected recovery metadata generator
+        shell: bash
+        run: |
+          set -euo pipefail
+          generator="$RUNNER_TEMP/rmux-recovery-generate-apt-repository.sh"
+          rm -f "$generator"
+          if test "$GITHUB_RUN_ID" != "$RMUX_RECEIPT_RUN_ID"; then
+            install -m 0755 scripts/generate-apt-repository.sh "$generator"
+          fi
+
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
         with:
           ref: ${{ inputs.expected_source_sha }}
@@ -157,6 +167,10 @@ jobs:
           set -euo pipefail
           root="$RUNNER_TEMP/rmux-linux-repository"
           version="${RMUX_RELEASE_REF#v}"
+          apt_generator="scripts/generate-apt-repository.sh"
+          if test -x "$RUNNER_TEMP/rmux-recovery-generate-apt-repository.sh"; then
+            apt_generator="$RUNNER_TEMP/rmux-recovery-generate-apt-repository.sh"
+          fi
           git clone --depth 1 --branch main \
             https://github.com/Helvesec/rmux-packages.git "$root/history"
           base="$(git -C "$root/history" rev-parse HEAD)"
@@ -171,7 +185,7 @@ jobs:
             --rpm-signing-key "$RMUX_RPM_GPG_KEY" --current-version "$version" \
             --apt-architecture amd64 --apt-architecture arm64 \
             --rpm-architecture x86_64 --rpm-architecture aarch64
-          scripts/generate-apt-repository.sh \
+          "$apt_generator" \
             --input-dir "$root/packages" --output-dir "$root/output/debian" \
             --suite stable --component main --architecture amd64 --architecture arm64 \
             --signing-key "$RMUX_APT_GPG_KEY"
