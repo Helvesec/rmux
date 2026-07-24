@@ -119,7 +119,10 @@ def verify_run_identity(args: argparse.Namespace) -> None:
             raise ValueError(
                 "running artifact verification differs from the current context"
             )
-        if run.get("status") != "in_progress" or run.get("conclusion") is not None:
+        if (
+            run.get("status") not in {"in_progress", "waiting"}
+            or run.get("conclusion") is not None
+        ):
             raise ValueError("current workflow run is not actively in progress")
     elif run.get("status") != "completed" or run.get("conclusion") != "success":
         raise ValueError("workflow run is not completed successfully")
