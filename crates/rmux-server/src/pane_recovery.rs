@@ -146,7 +146,7 @@ impl PaneRecoveryDraft {
                 MAX_RECOVERY_HYPERLINK_ENTRY_BYTES,
                 MAX_RECOVERY_HYPERLINK_TOTAL_BYTES,
             );
-            materialize_keyframe(
+            let rendered = materialize_keyframe(
                 &self.projection,
                 &renderer,
                 &self.pending_bytes,
@@ -156,7 +156,24 @@ impl PaneRecoveryDraft {
                 &self.parser_state,
                 self.history_size,
                 self.metadata_complete && renderer.metadata_complete(),
-            )
+            );
+            match rendered {
+                Err(RmuxError::FrameTooLarge { .. }) => {
+                    let renderer = self.projection.recovery_row_renderer(0, 0);
+                    materialize_keyframe(
+                        &self.projection,
+                        &renderer,
+                        &self.pending_bytes,
+                        &self.active_cell_state,
+                        &self.saved_cell_state,
+                        self.saved_cursor,
+                        &self.parser_state,
+                        self.history_size,
+                        false,
+                    )
+                }
+                result => result,
+            }
         }?;
         let (screen, _) = self.projection.clone_recovery_viewport_bounded(
             MAX_RECOVERY_STRING_BYTES,
@@ -929,6 +946,49 @@ mod tests {
         let keyframe = seed.keyframe();
         assert!(!keyframe.metadata_complete);
         assert!(keyframe.bytes.len() <= MAX_RECOVERY_KEYFRAME_BYTES);
+    }
+
+    #[test]
+    fn keyframe_drops_amplified_hyperlinks_before_failing_the_stream() {
+        let size = TerminalSize {
+            cols: MAX_RECOVERY_COLS as u16,
+            rows: 1,
+        };
+        let left = "https://left.test/".to_owned() + &"a".repeat(450);
+        let right = "https://right.test/".to_owned() + &"b".repeat(450);
+        let mut output = Vec::with_capacity(MAX_RECOVERY_COLS * 512);
+        for column in 0..MAX_RECOVERY_COLS {
+            let (id, uri) = if column % 2 == 0 {
+                ("left", &left)
+            } else {
+                ("right", &right)
+            };
+            write!(output, "\x1b]8;id={id};{uri}\x1b\\x").expect("write linked cell");
+        }
+        output.extend_from_slice(b"\x1b]8;;\x1b\\");
+
+        let mut transcript = PaneTranscript::new(0, size);
+        transcript.append_bytes(&output);
+        let keyframe = PaneRecoverySeed::capture(&transcript)
+            .expect("hyperlink amplification must degrade instead of failing")
+            .keyframe();
+
+        assert!(!keyframe.metadata_complete);
+        assert!(keyframe.bytes.len() <= MAX_RECOVERY_KEYFRAME_BYTES);
+        assert!(!keyframe
+            .bytes
+            .windows(b"https://left.test/".len())
+            .any(|window| window == b"https://left.test/"));
+
+        let mut recovered = TerminalScreen::new(size, 0);
+        recovered.feed(&keyframe.bytes);
+        let plain = recovered
+            .screen()
+            .capture_transcript(ScreenCaptureRange::default(), GridRenderOptions::default());
+        assert_eq!(
+            plain.iter().filter(|byte| **byte == b'x').count(),
+            MAX_RECOVERY_COLS
+        );
     }
 
     #[test]
