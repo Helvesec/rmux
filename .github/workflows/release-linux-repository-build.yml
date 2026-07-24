@@ -71,27 +71,39 @@ jobs:
           [[ "$RMUX_PAYLOAD_ARTIFACT_DIGEST" =~ ^sha256:[0-9a-f]{64}$ ]]
           [[ "$RMUX_SOURCE_SHA" =~ ^[0-9a-f]{40}$ ]]
           [[ "$RMUX_RELEASE_REF" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]
+          if test "$GITHUB_RUN_ID" != "$RMUX_RECEIPT_RUN_ID"; then
+            test "$GITHUB_REF" = "refs/heads/main"
+          fi
+
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
+        with:
+          persist-credentials: false
+
+      - name: Verify exact APT/RPM payload artifact identity
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          mode=(--allow-completed-failed-run)
+          if test "$GITHUB_RUN_ID" = "$RMUX_RECEIPT_RUN_ID"; then
+            mode=(--allow-running-current-run)
+          fi
+          scripts/release/actions-artifact.py verify \
+            --repository "$GITHUB_REPOSITORY" --run-id "$RMUX_RECEIPT_RUN_ID" \
+            --artifact-id "$RMUX_PAYLOAD_ARTIFACT_ID" \
+            --name "rmux-downstream-apt_rpm-payload-$RMUX_SOURCE_SHA-$RMUX_RELEASE_ID" \
+            --expected-source-sha "$RMUX_SOURCE_SHA" \
+            --expected-digest "$RMUX_PAYLOAD_ARTIFACT_DIGEST" \
+            --expected-workflow-id 316435347 \
+            --expected-workflow-path .github/workflows/release-receipt.yml \
+            --expected-event workflow_dispatch --expected-head-branch "$RMUX_RELEASE_REF" \
+            "${mode[@]}" --max-attempts 1
 
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
         with:
           ref: ${{ inputs.expected_source_sha }}
           persist-credentials: false
-
-      - name: Verify exact APT/RPM payload artifact identity
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: >-
-          scripts/release/actions-artifact.py verify
-          --repository "$GITHUB_REPOSITORY" --run-id "$RMUX_RECEIPT_RUN_ID"
-          --artifact-id "$RMUX_PAYLOAD_ARTIFACT_ID"
-          --name "rmux-downstream-apt_rpm-payload-$RMUX_SOURCE_SHA-$RMUX_RELEASE_ID"
-          --expected-source-sha "$RMUX_SOURCE_SHA"
-          --expected-digest "$RMUX_PAYLOAD_ARTIFACT_DIGEST"
-          --expected-workflow-id 316435347
-          --expected-workflow-path .github/workflows/release-receipt.yml
-          --expected-event workflow_dispatch --expected-head-branch "$RMUX_RELEASE_REF"
-          --allow-running-current-run
-          --max-attempts 1
 
       - name: Download only the exact APT/RPM payload artifact ID
         uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093

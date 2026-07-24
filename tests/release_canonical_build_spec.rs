@@ -776,7 +776,37 @@ fn actions_artifact_binding_rejects_digest_or_run_drift() {
         .output()
         .expect("reject completed current artifact");
     assert!(!completed.status.success());
+    running_run["conclusion"] = serde_json::json!("failure");
+    fs::write(&run_path, running_run.to_string()).expect("write failed fixture");
+    let failed_recovery = Command::new(python())
+        .arg(&script)
+        .args(strict_args)
+        .arg("--allow-completed-failed-run")
+        .current_dir(repo_root())
+        .output()
+        .expect("verify retained artifact from failed run");
+    assert!(
+        failed_recovery.status.success(),
+        "{}",
+        String::from_utf8_lossy(&failed_recovery.stderr)
+    );
+    for conclusion in ["cancelled", "success"] {
+        running_run["conclusion"] = serde_json::json!(conclusion);
+        fs::write(&run_path, running_run.to_string()).expect("write rejected fixture");
+        let rejected_recovery = Command::new(python())
+            .arg(&script)
+            .args(strict_args)
+            .arg("--allow-completed-failed-run")
+            .current_dir(repo_root())
+            .output()
+            .expect("reject non-failed retained artifact");
+        assert!(
+            !rejected_recovery.status.success(),
+            "conclusion={conclusion}"
+        );
+    }
     running_run["status"] = serde_json::json!("waiting");
+    running_run["conclusion"] = serde_json::Value::Null;
     fs::write(&run_path, running_run.to_string()).expect("restore waiting fixture");
     let wrong_current_run = Command::new(python())
         .arg(&script)

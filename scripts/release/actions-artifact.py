@@ -77,8 +77,13 @@ def verify_run_identity(args: argparse.Namespace) -> None:
         args.expected_event,
         args.expected_head_branch,
     )
-    if args.allow_running_current_run and all(value is None for value in expected):
-        raise ValueError("running artifact verification requires exact run identity")
+    allows_non_success = (
+        args.allow_running_current_run or args.allow_completed_failed_run
+    )
+    if allows_non_success and all(value is None for value in expected):
+        raise ValueError(
+            "non-success artifact verification requires exact run identity"
+        )
     if all(value is None for value in expected):
         return
     if any(value is None for value in expected):
@@ -127,6 +132,9 @@ def verify_run_identity(args: argparse.Namespace) -> None:
             or run.get("conclusion") is not None
         ):
             raise ValueError("current workflow run is not actively in progress")
+    elif args.allow_completed_failed_run:
+        if run.get("status") != "completed" or run.get("conclusion") != "failure":
+            raise ValueError("workflow run is not a completed failed run")
     elif run.get("status") != "completed" or run.get("conclusion") != "success":
         raise ValueError("workflow run is not completed successfully")
 
@@ -242,7 +250,9 @@ def parse_args() -> argparse.Namespace:
             "--expected-event", choices=("workflow_call", "workflow_dispatch")
         )
         command.add_argument("--expected-head-branch")
-        command.add_argument("--allow-running-current-run", action="store_true")
+        run_mode = command.add_mutually_exclusive_group()
+        run_mode.add_argument("--allow-running-current-run", action="store_true")
+        run_mode.add_argument("--allow-completed-failed-run", action="store_true")
         command.add_argument("--include-retention", action="store_true")
         if name in {"resolve-id", "verify"}:
             command.add_argument("--artifact-id", type=int, required=True)
