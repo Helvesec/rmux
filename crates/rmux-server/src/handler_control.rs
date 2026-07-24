@@ -6,12 +6,12 @@ use std::time::Duration;
 
 use rmux_core::LifecycleEvent;
 use rmux_os::identity::UserIdentity;
-use rmux_proto::SessionId;
+use rmux_proto::{SessionId, TerminalSize};
 use tokio::sync::{mpsc, watch};
 
 use super::{
-    client_support::SwitchTargetSelection, update_environment_from_client, QueuedLifecycleEvent,
-    RequestHandler,
+    attach_support::resize_control_session_for_client, client_support::SwitchTargetSelection,
+    update_environment_from_client, QueuedLifecycleEvent, RequestHandler,
 };
 use crate::control::{ControlClientFlags, ControlModeUpgrade, ControlServerEvent};
 use crate::control_notifications::{collect_control_notifications, ControlClientSnapshot};
@@ -1200,6 +1200,7 @@ impl RequestHandler {
                 .transpose()?,
             ControlOutputStart::Oldest => None,
         };
+        let active_attach = self.active_attach.lock().await;
         let mut active_control = self.active_control.lock().await;
         let Some(active) = active_control.by_pid.get_mut(&requester_pid) else {
             return Err(attached_client_required(command_name));
@@ -1217,6 +1218,10 @@ impl RequestHandler {
                 .expect("a switch target selection carries a stable session identity");
             selection.validate_for_session_identity(&state, session_name, session_id)?;
         }
+        let control_size = TerminalSize {
+            cols: active.client_width,
+            rows: active.client_height,
+        };
         let (previous, delivered) = update_control_session(
             active,
             next_session_name.clone(),
@@ -1238,6 +1243,24 @@ impl RequestHandler {
         } else {
             Vec::new()
         };
+        let resized_target = if exact_client_identity {
+            next_session_name
+                .as_ref()
+                .zip(next_session_id)
+                .map(|(session_name, session_id)| {
+                    resize_control_session_for_client(
+                        &mut state,
+                        &active_attach,
+                        session_name,
+                        session_id,
+                        control_size,
+                    )
+                })
+                .transpose()?
+                .flatten()
+        } else {
+            None
+        };
         if touch_attached {
             let session_name = next_session_name
                 .as_ref()
@@ -1249,8 +1272,13 @@ impl RequestHandler {
                 .touch_attached();
         }
         drop(active_control);
+        drop(active_attach);
         drop(state);
         self.refresh_linked_window_sessions(refresh_sessions).await;
+        if let Some(target) = resized_target {
+            self.emit(LifecycleEvent::WindowLayoutChanged { target })
+                .await;
+        }
         Ok(previous)
     }
 

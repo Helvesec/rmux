@@ -24,6 +24,9 @@ use super::{
 
 #[path = "handler_client/attach.rs"]
 mod attach;
+#[cfg(test)]
+#[path = "handler_client/control_geometry_tests.rs"]
+mod control_geometry_tests;
 #[path = "handler_client/detach.rs"]
 mod detach;
 #[path = "handler_client/refresh.rs"]

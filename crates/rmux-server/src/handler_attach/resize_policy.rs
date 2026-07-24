@@ -51,6 +51,62 @@ impl AttachedSizeSelection {
 
 pub(in crate::handler) const ATTACHED_SIZE_RECONCILE_ATTEMPTS: usize = 4;
 
+pub(in crate::handler) fn resize_control_session_for_client(
+    state: &mut crate::pane_terminals::HandlerState,
+    active_attach: &super::ActiveAttachState,
+    session_name: &SessionName,
+    expected_session_id: SessionId,
+    client_size: TerminalSize,
+) -> Result<Option<WindowTarget>, RmuxError> {
+    let (window_index, current_size, selected_size) = {
+        let session = state
+            .sessions
+            .session(session_name)
+            .filter(|session| session.id() == expected_session_id)
+            .ok_or_else(|| crate::pane_terminals::session_not_found(session_name))?;
+        let window_index = session.active_window_index();
+        let policy = policy_from_option_value(state.options.resolve_for_window(
+            session_name,
+            window_index,
+            OptionName::WindowSize,
+        ));
+        let aggressive_resize = state.options.resolve_for_window(
+            session_name,
+            window_index,
+            OptionName::AggressiveResize,
+        ) == Some("on");
+        let linked_sessions =
+            linked_session_identities(state, session_name, window_index, aggressive_resize);
+        (
+            window_index,
+            session.window().size(),
+            selected_attached_size(
+                policy,
+                &attached_size_candidates(active_attach, &linked_sessions, Some(client_size)),
+            ),
+        )
+    };
+    let Some(selected_size) = selected_size else {
+        return Ok(None);
+    };
+    if current_size == selected_size {
+        return Ok(None);
+    }
+
+    state.mutate_session_and_resize_active_window_terminal(session_name, |session| {
+        if session.id() != expected_session_id {
+            return Err(crate::pane_terminals::session_not_found(session_name));
+        }
+        session.touch_attached();
+        session.resize_active_window_terminal(selected_size);
+        Ok(())
+    })?;
+    Ok(Some(WindowTarget::with_window(
+        session_name.clone(),
+        window_index,
+    )))
+}
+
 impl RequestHandler {
     pub(in crate::handler) async fn attached_window_size_policy_for_session(
         &self,

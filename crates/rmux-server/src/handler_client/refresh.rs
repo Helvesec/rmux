@@ -2,7 +2,6 @@ use rmux_core::LifecycleEvent;
 use rmux_proto::request::RefreshClientRequest;
 use rmux_proto::{
     ErrorResponse, RefreshClientResponse, Response, RmuxError, SessionId, TerminalSize,
-    WindowTarget,
 };
 
 use crate::handler_support::attached_client_required;
@@ -217,8 +216,9 @@ impl RequestHandler {
         {
             #[cfg(windows)]
             self.wait_for_windows_deferred_all_pane_pids().await;
-            let target = {
+            let resized_target = {
                 let mut state = self.state.lock().await;
+                let active_attach = self.active_attach.lock().await;
                 let mut active_control = self.active_control.lock().await;
                 let Some(active) = active_control
                     .by_pid
@@ -234,16 +234,12 @@ impl RequestHandler {
                         error: attached_client_required("refresh-client"),
                     });
                 };
-                match state.mutate_session_and_resize_active_window_terminal(
+                match super::super::attach_support::resize_control_session_for_client(
+                    &mut state,
+                    &active_attach,
                     session_name,
-                    |session| {
-                        session.touch_attached();
-                        session.resize_active_window_terminal(size);
-                        Ok(WindowTarget::with_window(
-                            session_name.clone(),
-                            session.active_window_index(),
-                        ))
-                    },
+                    session_id,
+                    size,
                 ) {
                     Ok(target) => {
                         active.client_width = size.cols;
@@ -253,8 +249,10 @@ impl RequestHandler {
                     Err(error) => return Response::Error(ErrorResponse { error }),
                 }
             };
-            self.emit(LifecycleEvent::WindowLayoutChanged { target })
-                .await;
+            if let Some(target) = resized_target {
+                self.emit(LifecycleEvent::WindowLayoutChanged { target })
+                    .await;
+            }
         } else if let (None, None, Some(size)) = (session_name.as_ref(), session_id, control_size) {
             let mut active_control = self.active_control.lock().await;
             let Some(active) = active_control
