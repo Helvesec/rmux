@@ -158,7 +158,11 @@ impl PaneRenderStream {
     fn observe_output(&mut self, chunk: Option<PaneOutputChunk>) {
         match chunk {
             Some(PaneOutputChunk::Lag(lag)) => self.pending_lag = Some(lag),
-            Some(PaneOutputChunk::Bytes { .. }) => {}
+            Some(PaneOutputChunk::Bytes { bytes, .. }) => {
+                if bytes.is_empty() {
+                    self.output_closed = true;
+                }
+            }
             None => self.output_closed = true,
         }
     }
