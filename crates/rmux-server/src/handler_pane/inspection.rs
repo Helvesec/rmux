@@ -13,7 +13,10 @@ use rmux_proto::{
 };
 
 use super::super::target_support::{pane_id_target, requester_environment_pane_id};
-use super::super::{format_client_uid, format_client_user, ListClientSnapshot, RequestHandler};
+use super::super::{
+    current_expected_attach_identity, format_client_uid, format_client_user, ListClientSnapshot,
+    RequestHandler,
+};
 #[cfg(windows)]
 use super::pane_deferred_wait::format_references_pane_pid;
 use crate::control_notifications::format_control_message_line;
@@ -218,45 +221,43 @@ impl RequestHandler {
             .is_none()
             .then(|| captured_target_client_session.clone())
             .flatten();
-        let resolved_requester_client = match explicit_display_client {
+        let resolved_requester_client = match current_expected_attach_identity() {
             Some(identity) => Some(identity),
             None => self
                 .resolve_target_attach_client_identity(requester_pid, None, "display-message")
                 .await
                 .ok(),
         };
-        let requester_environment_target = if target_client.is_none() {
+        let requester_environment_target = {
             let socket_path = self.socket_path();
-            let requester_pane_id = requester_environment_pane_id(requester_pid, &socket_path);
-            match requester_pane_id {
+            match requester_environment_pane_id(requester_pid, &socket_path) {
                 Some(pane_id) => {
                     let state = self.state.lock().await;
                     pane_id_target(&state.sessions, pane_id)
                 }
                 None => None,
             }
-        } else {
-            None
+        };
+        let format_fallback_client = match resolved_requester_client {
+            Some(identity) => Some(identity),
+            None if requester_is_control => None,
+            None => {
+                let preferred_session = requester_environment_target
+                    .as_ref()
+                    .map(Target::session_name);
+                match self.recent_display_message_client(preferred_session).await {
+                    Some(identity) => Some(identity),
+                    None if preferred_session.is_some() => {
+                        self.recent_display_message_client(None).await
+                    }
+                    None => None,
+                }
+            }
         };
         let display_client = if route_control_to_target_session {
             None
         } else {
-            match resolved_requester_client {
-                Some(identity) => Some(identity),
-                None if requester_is_control => None,
-                None => {
-                    let preferred_session = requester_environment_target
-                        .as_ref()
-                        .map(Target::session_name);
-                    match self.recent_display_message_client(preferred_session).await {
-                        Some(identity) => Some(identity),
-                        None if preferred_session.is_some() => {
-                            self.recent_display_message_client(None).await
-                        }
-                        None => None,
-                    }
-                }
-            }
+            explicit_display_client.or(format_fallback_client)
         };
         let display_client_session = match display_client {
             Some(identity) => match self.attached_session_identity_for_identity(identity).await {
@@ -280,8 +281,9 @@ impl RequestHandler {
             (Some(target_session), _) => self
                 .recent_display_message_client(Some(target_session))
                 .await
+                .or(format_fallback_client)
                 .or(display_client),
-            (None, _) => display_client,
+            (None, _) => format_fallback_client.or(display_client),
         };
         let format_client_pid = format_client.map(ActiveAttachIdentity::attach_pid);
         let format_client_snapshot = match format_client_pid {
@@ -292,12 +294,10 @@ impl RequestHandler {
                 .find(|client| !client.control && client.pid == attach_pid),
             None => None,
         };
-        let attached_session_name = if let Some((session_name, _)) = &exact_target_client_session {
-            Some(session_name.clone())
-        } else if target.is_none() {
-            display_client_session
+        let attached_session_name = if target.is_none() {
+            format_client_snapshot
                 .as_ref()
-                .map(|(session_name, _)| session_name.clone())
+                .and_then(|client| client.session_name.clone())
         } else {
             None
         };
@@ -401,10 +401,10 @@ impl RequestHandler {
             let mut state = self.state.lock().await;
             if exact_target_client_session
                 .as_ref()
-                .is_some_and(|(_, expected_id)| {
+                .is_some_and(|(expected_name, expected_id)| {
                     state
                         .sessions
-                        .session(&session_name)
+                        .session(expected_name)
                         .map(|session| session.id())
                         != Some(*expected_id)
                 })

@@ -1235,6 +1235,180 @@ async fn direct_display_message_delivers_to_recent_client_but_formats_for_target
 }
 
 #[tokio::test]
+async fn direct_display_message_target_client_does_not_replace_current_format_client() {
+    // Oracle: tmux 3.7b treats `-c` as the delivery client. Without `-t`,
+    // formats still use the command client's current context.
+    let handler = RequestHandler::new();
+    let alpha = session_name("direct-delivery-alpha");
+    let beta = session_name("direct-format-beta");
+    let detached = session_name("direct-target-detached");
+    for session_name in [alpha.clone(), beta.clone(), detached.clone()] {
+        assert!(matches!(
+            handler
+                .handle(Request::NewSession(NewSessionRequest {
+                    session_name,
+                    detached: true,
+                    size: Some(TerminalSize { cols: 100, rows: 4 }),
+                    environment: None,
+                }))
+                .await,
+            Response::NewSession(_)
+        ));
+    }
+    let alpha_pid = u32::MAX - 98;
+    let beta_pid = u32::MAX - 97;
+    let (alpha_tx, mut alpha_rx) = mpsc::unbounded_channel();
+    let (beta_tx, mut beta_rx) = mpsc::unbounded_channel();
+    handler.register_attach(alpha_pid, alpha, alpha_tx).await;
+    handler.register_attach(beta_pid, beta, beta_tx).await;
+
+    let template = "#{session_name}|#{client_session}|#{client_name}";
+    let response = handler
+        .handle_display_message_ext(
+            7_779,
+            DisplayMessageExtRequest {
+                target: None,
+                print: true,
+                message: Some(template.to_owned()),
+                target_client: Some(alpha_pid.to_string()),
+                empty_target_context: false,
+                duration_ms: None,
+                ignore_input: false,
+            },
+        )
+        .await;
+    assert_eq!(
+        response.command_output().map(|output| output.stdout()),
+        Some(format!("direct-format-beta|direct-format-beta|{beta_pid}\n").as_bytes())
+    );
+
+    let response = handler
+        .handle_display_message_ext(
+            7_780,
+            DisplayMessageExtRequest {
+                target: Some(Target::Session(detached.clone())),
+                print: true,
+                message: Some(template.to_owned()),
+                target_client: Some(alpha_pid.to_string()),
+                empty_target_context: false,
+                duration_ms: None,
+                ignore_input: false,
+            },
+        )
+        .await;
+    assert_eq!(
+        response.command_output().map(|output| output.stdout()),
+        Some(format!("{detached}|direct-format-beta|{beta_pid}\n").as_bytes())
+    );
+
+    let response = handler
+        .handle_display_message_ext(
+            7_781,
+            DisplayMessageExtRequest {
+                target: None,
+                print: false,
+                message: Some(template.to_owned()),
+                target_client: Some(alpha_pid.to_string()),
+                empty_target_context: false,
+                duration_ms: Some(rmux_proto::DisplayMessageDurationMillis::new(5_000)),
+                ignore_input: false,
+            },
+        )
+        .await;
+    assert!(matches!(response, Response::DisplayMessage(_)));
+    let AttachControl::Overlay(overlay) = recv_overlay_control(&mut alpha_rx).await else {
+        panic!("explicit delivery client receives the message");
+    };
+    assert!(String::from_utf8_lossy(&overlay.frame)
+        .contains(&format!("direct-format-beta|direct-format-beta|{beta_pid}")));
+    assert!(
+        beta_rx.try_recv().is_err(),
+        "format client must not become the delivery client"
+    );
+}
+
+#[tokio::test]
+async fn queued_display_message_cross_client_detached_target_keeps_initiator_format_context() {
+    // Oracle: from client A, `display-message -c B -t detached` delivers to B
+    // but falls back to A for client formats because the target has no client.
+    let handler = RequestHandler::new();
+    let alpha = session_name("queued-format-alpha");
+    let beta = session_name("queued-delivery-beta");
+    let detached = session_name("queued-target-detached");
+    for session_name in [alpha.clone(), beta.clone(), detached.clone()] {
+        assert!(matches!(
+            handler
+                .handle(Request::NewSession(NewSessionRequest {
+                    session_name,
+                    detached: true,
+                    size: Some(TerminalSize { cols: 100, rows: 4 }),
+                    environment: None,
+                }))
+                .await,
+            Response::NewSession(_)
+        ));
+    }
+    let initiator_pid = u32::MAX - 96;
+    let delivery_pid = u32::MAX - 95;
+    let (initiator_tx, mut initiator_rx) = mpsc::unbounded_channel();
+    let (delivery_tx, mut delivery_rx) = mpsc::unbounded_channel();
+    handler
+        .register_attach(initiator_pid, alpha.clone(), initiator_tx)
+        .await;
+    handler
+        .register_attach(delivery_pid, beta, delivery_tx)
+        .await;
+    let initiator = handler
+        .active_attach_identity(initiator_pid)
+        .await
+        .expect("initiating attached identity");
+    let template = "#{session_name}|#{client_session}|#{client_name}";
+
+    let commands = handler
+        .parse_control_commands(&format!(
+            "display-message -p -c {delivery_pid} -t {detached} '{template}'"
+        ))
+        .await
+        .expect("queued printed display-message parses");
+    let output = super::with_expected_attach_and_session_identity(
+        initiator,
+        alpha.clone(),
+        initiator.session_id(),
+        handler.execute_parsed_commands_for_test(initiator_pid, commands),
+    )
+    .await
+    .expect("queued printed display-message executes");
+    assert_eq!(
+        output.stdout(),
+        format!("{detached}|{alpha}|{initiator_pid}\n").as_bytes()
+    );
+
+    let commands = handler
+        .parse_control_commands(&format!(
+            "display-message -d 5000 -c {delivery_pid} -t {detached} '{template}'"
+        ))
+        .await
+        .expect("queued overlay display-message parses");
+    super::with_expected_attach_and_session_identity(
+        initiator,
+        alpha.clone(),
+        initiator.session_id(),
+        handler.execute_parsed_commands_for_test(initiator_pid, commands),
+    )
+    .await
+    .expect("queued overlay display-message executes");
+    assert!(
+        initiator_rx.try_recv().is_err(),
+        "initiator supplies format context but does not receive the message"
+    );
+    let AttachControl::Overlay(overlay) = recv_overlay_control(&mut delivery_rx).await else {
+        panic!("explicit delivery client receives the queued message");
+    };
+    assert!(String::from_utf8_lossy(&overlay.frame)
+        .contains(&format!("{detached}|{alpha}|{initiator_pid}")));
+}
+
+#[tokio::test]
 async fn stable_pane_run_shell_message_broadcasts_only_to_the_target_session() {
     // Oracle: tmux 3.7b delivers targeted run-shell output to every client
     // attached to the target session, and to no client in another session.
