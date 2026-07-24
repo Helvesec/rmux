@@ -408,6 +408,38 @@ async fn raw_batch_defers_lifecycle_that_would_overflow_the_response() {
 }
 
 #[tokio::test]
+async fn raw_stream_rebases_when_new_output_expires_parser_state() {
+    let handler = RequestHandler::new();
+    let (target, output, transcript) = test_pane(&handler).await;
+    let subscribed = subscribe(&handler, &target, PaneStreamMode::Raw).await;
+
+    crate::pane_io::publish_pane_bytes_for_test(
+        &transcript,
+        &output,
+        b"\x1bPunterminated".to_vec(),
+    );
+    assert!(matches!(
+        cursor(&handler, subscribed.subscription_id).await.as_slice(),
+        [PaneStreamEvent::RawBytes(bytes)] if bytes.bytes == b"\x1bPunterminated"
+    ));
+    transcript
+        .lock()
+        .expect("transcript lock")
+        .make_ground_timer_due_for_test();
+
+    crate::pane_io::publish_pane_bytes_for_test(&transcript, &output, b"AFTER".to_vec());
+    let events = cursor(&handler, subscribed.subscription_id).await;
+    let rebase = events
+        .iter()
+        .find_map(raw_rebase)
+        .expect("parser expiry during append must rebase");
+    assert_eq!(rebase.reason, PaneRawRebaseReason::TranscriptMutation);
+    assert!(events.iter().all(
+        |event| !matches!(event, PaneStreamEvent::RawBytes(bytes) if bytes.bytes == b"AFTER")
+    ));
+}
+
+#[tokio::test]
 async fn process_exit_is_delivered_before_generation_rebase() {
     let handler = RequestHandler::new();
     let (target, output, _) = test_pane(&handler).await;

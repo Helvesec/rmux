@@ -133,14 +133,15 @@ impl PaneTranscript {
 
     pub(crate) fn append_bytes_with_effects(&mut self, bytes: &[u8]) -> PaneAppendResult {
         let now = Instant::now();
-        self.expire_ground_timer_if_due(now);
+        let ground_timer_expired = self.expire_ground_timer_if_due(now);
         if !bytes.is_empty() {
             self.output_sequence = self.output_sequence.saturating_add(1);
         }
         let title_before = self.terminal.screen().title().to_owned();
         let alternate_before = self.terminal.screen().is_alternate();
         self.terminal.feed(bytes);
-        let recovery_rebase_required = self.terminal.take_recovery_rebase_required();
+        let recovery_rebase_required =
+            ground_timer_expired || self.terminal.take_recovery_rebase_required();
         let title_after = self.terminal.screen().title().to_owned();
         let title_changed = title_after != title_before;
         let passthroughs = self.terminal.take_terminal_passthrough();
@@ -229,6 +230,13 @@ impl PaneTranscript {
             return false;
         }
         self.expire_ground_timer_now()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn make_ground_timer_due_for_test(&mut self) {
+        if self.ground_timer_started_at.is_some() {
+            self.ground_timer_started_at = Some(Instant::now() - PANE_INPUT_GROUND_TIMEOUT);
+        }
     }
 
     pub(crate) fn reset_terminal_state(&mut self) {
