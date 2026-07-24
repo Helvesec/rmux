@@ -37,6 +37,8 @@ pub(crate) fn is_live(stamp: ProcessStamp) -> bool {
     if process.is_null() {
         return false;
     }
+    // SAFETY: `process` is a non-null handle returned by OpenProcess and the
+    // zero timeout does not transfer ownership of it.
     let alive = unsafe { WaitForSingleObject(process, 0) } == WAIT_TIMEOUT;
     let created = creation_time(process).ok();
     unsafe {
@@ -47,10 +49,15 @@ pub(crate) fn is_live(stamp: ProcessStamp) -> bool {
 }
 
 fn creation_time(process: HANDLE) -> io::Result<u64> {
+    // SAFETY: FILETIME is plain old data, and `process` is either the current
+    // process pseudo-handle or a live handle returned by OpenProcess. The four
+    // FILETIME out-pointers remain valid for the duration of GetProcessTimes.
     let mut creation: FILETIME = unsafe { zeroed() };
     let mut exit: FILETIME = unsafe { zeroed() };
     let mut kernel: FILETIME = unsafe { zeroed() };
     let mut user: FILETIME = unsafe { zeroed() };
+    // SAFETY: `process` and all four FILETIME out-pointers satisfy the
+    // GetProcessTimes contract described above.
     let ok = unsafe { GetProcessTimes(process, &mut creation, &mut exit, &mut kernel, &mut user) };
     if ok == 0 {
         return Err(io::Error::last_os_error());

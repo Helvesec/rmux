@@ -93,6 +93,7 @@ pub(crate) fn ensure_private_directory(path: &Path, integrity: &str) -> io::Resu
         CreateDirectoryW(wide.as_ptr(), security.as_ptr())
     };
     if created == 0 {
+        // SAFETY: GetLastError has no pointer or lifetime preconditions.
         let error = unsafe { GetLastError() };
         if error != ERROR_ALREADY_EXISTS {
             return Err(io::Error::from_raw_os_error(error as i32));
@@ -154,6 +155,8 @@ pub(crate) fn validate_private_handle(
     let _descriptor = LocalSecurityDescriptor(descriptor);
 
     let current_sid = CurrentSid::new()?;
+    // SAFETY: GetSecurityInfo returned `owner` backed by `_descriptor`, which
+    // remains live here; CurrentSid owns a valid SID for the current user.
     if owner.is_null() || unsafe { EqualSid(owner, current_sid.as_ptr()) } == 0 {
         return Err(permission_denied(
             "managed endpoint state owner is not the current user",
@@ -170,6 +173,7 @@ fn validate_file_kind(handle: HANDLE, expect_directory: bool) -> io::Result<()> 
         // by GetFileInformationByHandle before any field is read.
         zeroed()
     };
+    // SAFETY: `handle` is live and `information` is a writable out-parameter.
     let ok = unsafe { GetFileInformationByHandle(handle, &mut information) };
     if ok == 0 {
         return Err(io::Error::last_os_error());
@@ -200,6 +204,8 @@ fn validate_owner_only_dacl(
     }
     let mut control = 0_u16;
     let mut revision = 0_u32;
+    // SAFETY: `descriptor` was returned by GetSecurityInfo and both outputs
+    // remain writable for the duration of the call.
     let ok = unsafe { GetSecurityDescriptorControl(descriptor, &mut control, &mut revision) };
     if ok == 0 {
         return Err(io::Error::last_os_error());
@@ -209,6 +215,7 @@ fn validate_owner_only_dacl(
             "managed endpoint state DACL inherits permissions",
         ));
     }
+    // SAFETY: `dacl` was checked non-null and remains backed by `descriptor`.
     let ace_count = unsafe { (*dacl).AceCount };
     if ace_count != 1 {
         return Err(permission_denied(
@@ -216,10 +223,12 @@ fn validate_owner_only_dacl(
         ));
     }
     let mut ace = null_mut();
+    // SAFETY: `dacl` is a live ACL and `ace` is a writable out-parameter.
     let ok = unsafe { GetAce(dacl, 0, &mut ace) };
     if ok == 0 {
         return Err(io::Error::last_os_error());
     }
+    // SAFETY: successful GetAce returns a pointer to at least an ACE_HEADER.
     let header = unsafe { &*ace.cast::<ACE_HEADER>() };
     if u32::from(header.AceType) != ACCESS_ALLOWED_ACE_TYPE
         || usize::from(header.AceSize) < size_of::<ACCESS_ALLOWED_ACE>()
@@ -228,8 +237,12 @@ fn validate_owner_only_dacl(
             "managed endpoint state DACL contains an unexpected ACE",
         ));
     }
+    // SAFETY: the preceding size and type checks establish an
+    // ACCESS_ALLOWED_ACE at `ace`.
     let allowed = unsafe { &*ace.cast::<ACCESS_ALLOWED_ACE>() };
     let sid = std::ptr::addr_of!(allowed.SidStart).cast_mut().cast();
+    // SAFETY: `sid` points into the validated ACE and `current_sid` owns a
+    // valid SID for the duration of the comparison.
     if allowed.Mask != FILE_ALL_ACCESS || unsafe { EqualSid(sid, current_sid) } == 0 {
         return Err(permission_denied(
             "managed endpoint state DACL is not exact owner-only full access",
@@ -245,6 +258,8 @@ fn validate_mandatory_label(label_acl: *const ACL, integrity: &str) -> io::Resul
         ));
     }
     let expected = integrity_rid(integrity)?;
+    // SAFETY: `label_acl` was checked non-null and remains backed by the
+    // security descriptor owned by the caller.
     let ace_count = unsafe { (*label_acl).AceCount };
     if ace_count != 1 {
         return Err(permission_denied(
@@ -252,10 +267,12 @@ fn validate_mandatory_label(label_acl: *const ACL, integrity: &str) -> io::Resul
         ));
     }
     let mut ace = null_mut();
+    // SAFETY: `label_acl` is a live ACL and `ace` is a writable out-parameter.
     let ok = unsafe { GetAce(label_acl, 0, &mut ace) };
     if ok == 0 {
         return Err(io::Error::last_os_error());
     }
+    // SAFETY: successful GetAce returns a pointer to at least an ACE_HEADER.
     let header = unsafe { &*ace.cast::<ACE_HEADER>() };
     if u32::from(header.AceType) != SYSTEM_MANDATORY_LABEL_ACE_TYPE
         || usize::from(header.AceSize) < size_of::<SYSTEM_MANDATORY_LABEL_ACE>()
@@ -264,6 +281,8 @@ fn validate_mandatory_label(label_acl: *const ACL, integrity: &str) -> io::Resul
             "managed endpoint state mandatory label is malformed",
         ));
     }
+    // SAFETY: the preceding size and type checks establish a
+    // SYSTEM_MANDATORY_LABEL_ACE at `ace`.
     let mandatory = unsafe { &*ace.cast::<SYSTEM_MANDATORY_LABEL_ACE>() };
     let sid = std::ptr::addr_of!(mandatory.SidStart).cast_mut().cast();
     if mandatory.Mask != SYSTEM_MANDATORY_LABEL_NO_WRITE_UP || sid_integrity_rid(sid)? != expected {
@@ -275,6 +294,8 @@ fn validate_mandatory_label(label_acl: *const ACL, integrity: &str) -> io::Resul
 }
 
 fn sid_integrity_rid(sid: PSID) -> io::Result<u32> {
+    // SAFETY: callers pass the SID embedded in a validated mandatory-label
+    // ACE, which remains live for the duration of this function.
     let count = unsafe { GetSidSubAuthorityCount(sid) };
     if count.is_null() || unsafe { *count } == 0 {
         return Err(io::Error::new(
@@ -282,11 +303,16 @@ fn sid_integrity_rid(sid: PSID) -> io::Result<u32> {
             "Windows returned an invalid mandatory-label SID",
         ));
     }
+    // SAFETY: GetSidSubAuthorityCount returned a non-null pointer to the live
+    // SID's one-byte sub-authority count.
     let index = u32::from(unsafe { *count } - 1);
+    // SAFETY: the nonzero count above makes `index` a valid sub-authority
+    // index for the live SID.
     let rid = unsafe { GetSidSubAuthority(sid, index) };
     if rid.is_null() {
         return Err(io::Error::last_os_error());
     }
+    // SAFETY: GetSidSubAuthority returned a non-null pointer backed by `sid`.
     Ok(unsafe { *rid })
 }
 
@@ -305,6 +331,8 @@ impl CurrentSid {
     fn new() -> io::Result<Self> {
         let wide = wide_null(&current_sid_string()?);
         let mut sid = null_mut();
+        // SAFETY: `wide` is NUL-terminated and `sid` is a writable out-pointer
+        // whose allocation is released by CurrentSid::drop.
         let ok = unsafe { ConvertStringSidToSidW(wide.as_ptr(), &mut sid) };
         if ok == 0 {
             return Err(io::Error::last_os_error());
