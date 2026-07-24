@@ -141,7 +141,9 @@ jobs:
             --name "rmux-candidate-manifest-${{ steps.candidate.outputs.candidate_run_id }}" \
             --expected-source-sha "$RMUX_EXPECTED_SOURCE_SHA" \
             --expected-digest "${{ steps.candidate.outputs.manifest_artifact_digest }}" \
+            --expected-workflow-id 316223904 \
             --expected-workflow-path .github/workflows/release-shadow.yml \
+            --expected-event workflow_dispatch --expected-head-branch main \
             --max-attempts 1
 
       - name: Download only the exact candidate manifest artifact ID
