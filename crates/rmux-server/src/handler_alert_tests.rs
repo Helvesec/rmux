@@ -717,6 +717,19 @@ async fn drain_attach_controls_until_idle(receiver: &mut mpsc::UnboundedReceiver
     }
 }
 
+async fn queue_alert_with_timeout(
+    handler: &RequestHandler,
+    target: WindowTarget,
+    flags: AlertFlags,
+) {
+    timeout(
+        ALERT_TEST_EVENT_TIMEOUT,
+        handler.alerts_queue_window(target, flags),
+    )
+    .await
+    .expect("alert dispatch should complete before timeout");
+}
+
 async fn drain_attach_controls_until_quiet(
     receiver: &mut mpsc::UnboundedReceiver<AttachControl>,
     quiet_for: Duration,
@@ -2814,9 +2827,7 @@ async fn visual_bell_modes_dispatch_overlay_write_and_action_gating() {
         "off",
     )
     .await;
-    handler
-        .alerts_queue_window(current_window.clone(), rmux_core::WINDOW_BELL)
-        .await;
+    queue_alert_with_timeout(&handler, current_window.clone(), rmux_core::WINDOW_BELL).await;
     match recv_non_switch_control(&mut control_rx).await {
         AttachControl::Write(bytes) => assert_eq!(bytes, vec![0x07]),
         other => panic!("expected bell write, got {other:?}"),
@@ -2830,9 +2841,7 @@ async fn visual_bell_modes_dispatch_overlay_write_and_action_gating() {
         "on",
     )
     .await;
-    handler
-        .alerts_queue_window(current_window.clone(), rmux_core::WINDOW_BELL)
-        .await;
+    queue_alert_with_timeout(&handler, current_window.clone(), rmux_core::WINDOW_BELL).await;
     recv_visual_bell_overlay(&mut control_rx).await;
     assert_no_visual_bell_delivery(&mut control_rx).await;
 
@@ -2843,9 +2852,7 @@ async fn visual_bell_modes_dispatch_overlay_write_and_action_gating() {
         "both",
     )
     .await;
-    handler
-        .alerts_queue_window(current_window, rmux_core::WINDOW_BELL)
-        .await;
+    queue_alert_with_timeout(&handler, current_window, rmux_core::WINDOW_BELL).await;
     recv_visual_bell_write_and_overlay(&mut control_rx).await;
 
     set_option(
@@ -2855,14 +2862,15 @@ async fn visual_bell_modes_dispatch_overlay_write_and_action_gating() {
         "other",
     )
     .await;
-    handler
-        .alerts_queue_window(WindowTarget::new(session.clone()), rmux_core::WINDOW_BELL)
-        .await;
+    queue_alert_with_timeout(
+        &handler,
+        WindowTarget::new(session.clone()),
+        rmux_core::WINDOW_BELL,
+    )
+    .await;
     assert_no_visual_bell_delivery(&mut control_rx).await;
 
-    handler
-        .alerts_queue_window(other_window.clone(), rmux_core::WINDOW_BELL)
-        .await;
+    queue_alert_with_timeout(&handler, other_window.clone(), rmux_core::WINDOW_BELL).await;
     recv_visual_bell_delivery(&mut control_rx).await;
     let state = handler.state.lock().await;
     let flags = state

@@ -200,13 +200,16 @@ impl RequestHandler {
         message: String,
         duration: std::time::Duration,
     ) {
-        let state = self.state.lock().await;
-        let Some(session_name) = state
-            .sessions
-            .session_by_id(session_id)
-            .map(|session| session.name().clone())
-        else {
-            return;
+        let session_name = {
+            let state = self.state.lock().await;
+            let Some(session_name) = state
+                .sessions
+                .session_by_id(session_id)
+                .map(|session| session.name().clone())
+            else {
+                return;
+            };
+            session_name
         };
         let _ = self
             .send_attached_overlay(
