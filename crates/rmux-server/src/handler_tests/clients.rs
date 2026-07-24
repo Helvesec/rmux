@@ -276,7 +276,7 @@ async fn refresh_client_control_size_resizes_real_control_session() {
 }
 
 #[tokio::test]
-async fn control_client_flags_without_session_emit_only_control_mode() {
+async fn list_clients_hides_a_control_client_without_a_session() {
     let handler = RequestHandler::new();
     let requester_pid = std::process::id();
     let (event_tx, _event_rx) = mpsc::channel(CONTROL_SERVER_EVENT_CAPACITY);
@@ -312,7 +312,10 @@ async fn control_client_flags_without_session_emit_only_control_mode() {
         control_client_geometry(&handler, requester_pid).await,
         (80, None)
     );
-    assert_eq!(list_client_geometry(&handler).await, "80|\n");
+    assert!(
+        list_client_geometry(&handler).await.is_empty(),
+        "tmux 3.7b omits clients that have no session"
+    );
 
     let mut request = refresh_client_request(requester_pid);
     request.control_size = Some("91x20".to_owned());
@@ -324,7 +327,10 @@ async fn control_client_flags_without_session_emit_only_control_mode() {
         control_client_geometry(&handler, requester_pid).await,
         (91, None)
     );
-    assert_eq!(list_client_geometry(&handler).await, "91|\n");
+    assert!(
+        list_client_geometry(&handler).await.is_empty(),
+        "refreshing geometry must not make a sessionless client listable"
+    );
 }
 
 #[tokio::test]

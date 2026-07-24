@@ -644,6 +644,7 @@ impl RequestHandler {
         let socket_path = self.socket_path();
         let requester_uid = self.requester_uid(requester_pid).await;
         let mut clients = self.list_clients_snapshot().await;
+        clients.retain(|client| client.session_name.is_some());
         if let Some(target_session) = request.target_session.as_ref() {
             clients.retain(|client| client.session_name.as_ref() == Some(target_session));
         }
