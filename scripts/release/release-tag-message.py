@@ -57,7 +57,7 @@ def main() -> int:
         if args.output is None:
             sys.stdout.write(message)
         else:
-            args.output.write_text(message, encoding="utf-8", newline="\n")
+            args.output.write_bytes(message.encode("utf-8"))
         return 0
     message = args.message.read_text(encoding="utf-8")
     actual = parse_message(message)

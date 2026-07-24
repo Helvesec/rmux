@@ -258,7 +258,7 @@ def parse_message(message: str) -> ReleaseTagIdentity:
         raise PolicyError("tag message has a non-canonical title")
     release_ref = title.removeprefix("RMUX release ")
     values: dict[str, str] = {}
-    for line, (expected_label, field) in zip(lines[2:], TRAILERS, strict=True):
+    for line, (expected_label, field) in zip(lines[2:], TRAILERS):
         prefix = f"{expected_label}: "
         if not line.startswith(prefix):
             raise PolicyError(f"expected unique canonical trailer {expected_label}")
