@@ -49,7 +49,7 @@ pub struct PaneRenderStream {
     output: PaneOutputStream,
     surface: PaneSurfaceStream,
     debounce: Duration,
-    last_revision: Option<u64>,
+    last_snapshot: PaneSnapshot,
     pending_lag: Option<PaneLagNotice>,
     pending_snapshot: Option<PaneSnapshot>,
     pending_output_boundary: Option<u64>,
@@ -69,7 +69,7 @@ impl PaneRenderStream {
             output,
             surface,
             debounce: DEFAULT_RENDER_DEBOUNCE,
-            last_revision: Some(baseline.revision),
+            last_snapshot: baseline,
             pending_lag: None,
             pending_snapshot: None,
             pending_output_boundary: None,
@@ -135,7 +135,7 @@ impl PaneRenderStream {
             Some(PaneSurfaceEvent::Reset(frame) | PaneSurfaceEvent::Patch(frame)) => {
                 let next_output_sequence = frame.next_output_sequence;
                 let snapshot = frame.snapshot.grid;
-                if self.last_revision == Some(snapshot.revision)
+                if self.last_snapshot.revision == snapshot.revision
                     || self
                         .pending_snapshot
                         .as_ref()
@@ -170,8 +170,19 @@ impl PaneRenderStream {
     fn emit_pending(&mut self) -> Option<RenderUpdate> {
         self.render_deadline = None;
         self.pending_output_boundary = None;
-        let snapshot = self.pending_snapshot.take()?;
-        self.last_revision = Some(snapshot.revision);
+        let snapshot = match self.pending_snapshot.take() {
+            Some(snapshot) => {
+                self.last_snapshot = snapshot.clone();
+                snapshot
+            }
+            None => {
+                let lag = self.pending_lag.take()?;
+                return Some(RenderUpdate {
+                    snapshot: self.last_snapshot.clone(),
+                    lag: Some(lag),
+                });
+            }
+        };
         Some(RenderUpdate {
             snapshot,
             lag: self.pending_lag.take(),
@@ -218,7 +229,7 @@ impl std::fmt::Debug for PaneRenderStream {
             .field("pane", &self.pane)
             .field("phase", &phase)
             .field("debounce", &self.debounce)
-            .field("last_revision", &self.last_revision)
+            .field("last_revision", &self.last_snapshot.revision)
             .field("pending_lag", &self.pending_lag)
             .field("pending_snapshot", &self.pending_snapshot.is_some())
             .field("render_deadline", &self.render_deadline)

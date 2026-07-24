@@ -258,6 +258,107 @@ async fn render_stream_keeps_following_surface_after_output_eof() -> TestResult 
 }
 
 #[tokio::test]
+async fn render_stream_reports_pending_lag_before_surface_end() -> TestResult {
+    let socket = TestSocket::new("render-lag-before-end")?;
+    let listener = UnixListener::bind(socket.path())?;
+    let (finish_server, server_finished) = tokio::sync::oneshot::channel();
+    let server = tokio::spawn(async move {
+        let mut peer = accept_peer(&listener).await?;
+        expect_initial_preferred_lookup(&mut peer).await?;
+        expect_direct_beta_resolution(&mut peer).await?;
+        expect_direct_beta_resolution(&mut peer).await?;
+        expect_by_id_handshake(&mut peer).await?;
+        let output_id = expect_output_subscription(&mut peer).await?;
+        expect_direct_beta_resolution(&mut peer).await?;
+        let surface_id =
+            expect_surface_subscription(&mut peer, resolved_target(), resolved_slot(), 41, "base")
+                .await?;
+
+        loop {
+            match peer.expect_request().await? {
+                Request::PaneStreamCursor(request) if request.subscription_id == surface_id => {
+                    write_empty_surface_cursor(&mut peer, surface_id).await?;
+                }
+                Request::PaneOutputCursor(request) if request.subscription_id == output_id => {
+                    peer.write_response(Response::PaneOutputLag(Box::new(PaneOutputLagResponse {
+                        subscription_id: output_id,
+                        cursor: PaneOutputCursor {
+                            next_sequence: 2,
+                            missed_events: 1,
+                        },
+                        lag: PaneOutputLagNotice {
+                            expected_sequence: 1,
+                            resume_sequence: 2,
+                            missed_events: 1,
+                            newest_sequence: 1,
+                            recent: PaneRecentOutput {
+                                bytes: Vec::new(),
+                                oldest_sequence: None,
+                                newest_sequence: None,
+                            },
+                        },
+                    })))
+                    .await?;
+                    break;
+                }
+                request => {
+                    return Err(format!("expected render cursor request, got {request:?}").into());
+                }
+            }
+        }
+
+        loop {
+            match peer.expect_request().await? {
+                Request::PaneOutputCursor(request) if request.subscription_id == output_id => {
+                    write_empty_output_cursor(&mut peer, output_id).await?;
+                }
+                Request::PaneStreamCursor(request) if request.subscription_id == surface_id => {
+                    peer.write_response(Response::PaneStreamCursor(Box::new(
+                        PaneStreamCursorResponse {
+                            subscription_id: surface_id,
+                            events: vec![PaneStreamEvent::End(
+                                rmux_proto::PaneStreamEndReason::PaneRemoved,
+                            )],
+                            limited: false,
+                        },
+                    )))
+                    .await?;
+                    break;
+                }
+                request => {
+                    return Err(
+                        format!("expected surface cursor after lag, got {request:?}").into(),
+                    );
+                }
+            }
+        }
+        server_finished
+            .await
+            .map_err(|_| "render test completion signal dropped")?;
+        TestResult::Ok(())
+    });
+
+    let pane = pane_by_id(socket.path()).await?;
+    let mut render = pane.render_stream().await?.with_debounce(Duration::ZERO);
+    let update = render
+        .next()
+        .await?
+        .expect("the final lag notice remains observable");
+    assert_eq!(update.snapshot().revision, 41);
+    let lag = update
+        .lag()
+        .expect("the final update carries the lag notice");
+    assert_eq!(lag.expected_sequence, 1);
+    assert_eq!(lag.resume_sequence, 2);
+    assert!(render.next().await?.is_none());
+    let _ = finish_server.send(());
+    drop(render);
+    drop(pane);
+    server.await??;
+    Ok(())
+}
+
+#[tokio::test]
 async fn render_stream_resumes_a_wake_cancelled_during_debounce() -> TestResult {
     let socket = TestSocket::new("render-cancel-debounce")?;
     let listener = UnixListener::bind(socket.path())?;
