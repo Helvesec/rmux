@@ -245,6 +245,10 @@ Step "independent xterm.js recovery oracle" {
     if (-not $npm) {
         throw "npm.cmd is required for the pinned independent xterm.js recovery oracle"
     }
+    Assert-CargoFilter 1 @(
+        "test", "-p", "rmux-server", "--lib", "--locked",
+        "pane_recovery::tests::keyframes_converge_in_independent_xterm_oracle"
+    )
     Run $npm.Source @("--prefix", "tests\xterm-oracle", "ci", "--ignore-scripts", "--no-audit", "--no-fund")
     Run "cargo" @(
         "test", "-p", "rmux-server", "--lib", "--locked",

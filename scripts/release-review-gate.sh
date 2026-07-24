@@ -299,6 +299,9 @@ fi
 if section_enabled xterm; then
   command -v npm >/dev/null 2>&1 ||
     die "npm is required for the pinned independent xterm.js recovery oracle"
+  run_step "xterm.js oracle filter selects tests" \
+    scripts/assert-cargo-filter-nonempty.sh 1 -- test -p rmux-server --lib --locked \
+      pane_recovery::tests::keyframes_converge_in_independent_xterm_oracle
   run_step "pinned xterm.js oracle dependencies" \
     npm --prefix tests/xterm-oracle ci --ignore-scripts --no-audit --no-fund
   run_step "independent xterm.js recovery oracle" \

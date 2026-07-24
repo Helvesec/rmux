@@ -852,6 +852,47 @@ fn ci_defers_release_review_until_the_protected_fast_lane_finishes() {
 }
 
 #[test]
+fn xterm_oracle_inputs_and_filter_are_release_policy() {
+    let contract: serde_json::Value =
+        serde_json::from_str(include_str!("../.github/release/candidate-contract.json"))
+            .expect("candidate contract");
+    let policy_paths = contract["policy_paths"]
+        .as_array()
+        .expect("policy_paths array")
+        .iter()
+        .filter_map(serde_json::Value::as_str)
+        .collect::<Vec<_>>();
+    for path in [
+        "tests/xterm-oracle/package-lock.json",
+        "tests/xterm-oracle/package.json",
+        "tests/xterm-oracle/recovery-oracle.mjs",
+    ] {
+        assert!(
+            policy_paths.contains(&path),
+            "candidate policy root omitted xterm oracle input {path}"
+        );
+    }
+
+    let unix = include_str!("../scripts/release-review-gate.sh");
+    assert!(
+        unix.contains(
+            "scripts/assert-cargo-filter-nonempty.sh 1 -- test -p rmux-server --lib --locked"
+        ) && unix.contains("pane_recovery::tests::keyframes_converge_in_independent_xterm_oracle"),
+        "Unix xterm oracle may silently select zero tests"
+    );
+
+    let windows = include_str!("../scripts/release-review-gate-windows.ps1");
+    assert!(
+        windows.contains(
+            "Assert-CargoFilter 1 @(\n        \"test\", \"-p\", \"rmux-server\", \"--lib\", \"--locked\","
+        ) && windows.contains(
+            "\"pane_recovery::tests::keyframes_converge_in_independent_xterm_oracle\""
+        ),
+        "Windows xterm oracle may silently select zero tests"
+    );
+}
+
+#[test]
 fn ci_keeps_release_only_work_behind_the_protected_fast_lane() {
     let ci = include_str!("../.github/workflows/ci.yml");
     assert!(ci.contains("release_qualification:"));

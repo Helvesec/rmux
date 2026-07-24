@@ -580,6 +580,9 @@
     "tests/release_receipt_attestation_spec.rs",
     "tests/release_shadow_spec.rs",
     "tests/release_signed_tag_spec.rs",
-    "tests/release_tag_contract_spec.rs"
+    "tests/release_tag_contract_spec.rs",
+    "tests/xterm-oracle/package-lock.json",
+    "tests/xterm-oracle/package.json",
+    "tests/xterm-oracle/recovery-oracle.mjs"
   ]
 }
