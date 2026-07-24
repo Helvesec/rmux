@@ -14,7 +14,8 @@ use tokio::sync::watch;
 use crate::pane_io::PaneOutputReceiver;
 
 use super::super::pane_stream_support::{
-    CachedRawRebase, EndedPaneStream, PaneStreamSubscription, PendingSurfaceRefresh, SurfaceDriver,
+    CachedRawRebase, EndedPaneStream, PaneStreamSource, PaneStreamSubscription,
+    PendingSurfaceRefresh, SurfaceDriver,
 };
 
 pub(in crate::handler) enum SurfaceDriverRoute {
@@ -46,6 +47,7 @@ pub(crate) struct OutputSubscriptionState {
     raw_initializations: HashMap<PaneOutputSubscriptionKey, PaneStreamInitialization>,
     next_raw_initialization_token: u64,
     draining_panes: HashSet<PaneOutputSubscriptionKey>,
+    draining_stream_sources: HashMap<PaneOutputSubscriptionKey, PaneStreamSource>,
 }
 
 impl std::fmt::Debug for OutputSubscriptionState {
@@ -64,6 +66,10 @@ impl std::fmt::Debug for OutputSubscriptionState {
             .field("raw_rebase_count", &self.raw_rebases.len())
             .field("raw_initialization_count", &self.raw_initializations.len())
             .field("draining_pane_count", &self.draining_panes.len())
+            .field(
+                "draining_stream_source_count",
+                &self.draining_stream_sources.len(),
+            )
             .finish()
     }
 }
@@ -82,6 +88,7 @@ impl OutputSubscriptionState {
             raw_initializations: HashMap::new(),
             next_raw_initialization_token: 0,
             draining_panes: HashSet::new(),
+            draining_stream_sources: HashMap::new(),
         }
     }
 
@@ -144,6 +151,7 @@ impl OutputSubscriptionState {
         self.raw_rebases.remove(pane);
         self.cancel_raw_initialization(pane);
         self.draining_panes.remove(pane);
+        self.draining_stream_sources.remove(pane);
         removed_any
     }
 
@@ -168,17 +176,47 @@ impl OutputSubscriptionState {
             self.raw_initializations
                 .insert(current.clone(), initialization);
         }
+        if let Some(mut source) = self.draining_stream_sources.remove(previous) {
+            source.key = current.clone();
+            self.draining_stream_sources.insert(current.clone(), source);
+        }
         if was_draining {
             self.draining_panes.insert(current);
         }
     }
 
-    pub(super) fn begin_pane_drain(&mut self, pane: PaneOutputSubscriptionKey) -> bool {
+    pub(super) fn begin_pane_drain(
+        &mut self,
+        pane: PaneOutputSubscriptionKey,
+        source: Option<PaneStreamSource>,
+    ) -> bool {
         if self.registry.ids_for_pane(&pane).is_empty() {
             return false;
         }
+        if let Some(source) = source {
+            self.draining_stream_sources.insert(pane.clone(), source);
+        }
         self.draining_panes.insert(pane);
         true
+    }
+
+    pub(in crate::handler) fn draining_stream_source(
+        &self,
+        pane: &PaneOutputSubscriptionKey,
+    ) -> Option<PaneStreamSource> {
+        self.draining_stream_sources.get(pane).cloned()
+    }
+
+    pub(in crate::handler) fn mark_pane_streams_ending(
+        &mut self,
+        pane: &PaneOutputSubscriptionKey,
+        reason: PaneStreamEndReason,
+    ) {
+        for id in self.registry.ids_for_pane(pane) {
+            if let Some(stream) = self.streams.get_mut(&id) {
+                stream.mark_ending(reason);
+            }
+        }
     }
 
     pub(super) fn pane_is_draining(&self, pane: &PaneOutputSubscriptionKey) -> bool {
@@ -388,13 +426,9 @@ impl OutputSubscriptionState {
     }
 
     fn discard_drain_if_unused(&mut self, pane: &PaneOutputSubscriptionKey) {
-        let has_legacy_receiver = self
-            .registry
-            .ids_for_pane(pane)
-            .into_iter()
-            .any(|id| self.receivers.contains_key(&id));
-        if !has_legacy_receiver {
+        if self.registry.ids_for_pane(pane).is_empty() {
             self.draining_panes.remove(pane);
+            self.draining_stream_sources.remove(pane);
         }
     }
 
@@ -403,10 +437,14 @@ impl OutputSubscriptionState {
         let mut has_surface = false;
         for id in self.registry.ids_for_pane(pane) {
             match self.streams.get(&id) {
-                Some(PaneStreamSubscription::Reserved(PaneStreamMode::Raw)) => has_raw = true,
-                Some(PaneStreamSubscription::Reserved(PaneStreamMode::Surface)) => {
-                    has_surface = true;
-                }
+                Some(PaneStreamSubscription::Reserved {
+                    mode: PaneStreamMode::Raw,
+                    ..
+                }) => has_raw = true,
+                Some(PaneStreamSubscription::Reserved {
+                    mode: PaneStreamMode::Surface,
+                    ..
+                }) => has_surface = true,
                 Some(PaneStreamSubscription::Raw(_)) => has_raw = true,
                 Some(PaneStreamSubscription::Surface(_)) => has_surface = true,
                 None => {}
@@ -434,9 +472,21 @@ impl OutputSubscriptionState {
             let _ = self.registry.unsubscribe(id);
             removed_any = true;
         }
-        self.draining_panes.remove(pane);
         self.discard_drain_if_unused(pane);
         removed_any
+    }
+
+    pub(in crate::handler) fn expire_pane_drain(
+        &mut self,
+        pane: &PaneOutputSubscriptionKey,
+        now: Instant,
+    ) {
+        let _ = self.remove_drained_legacy_subscriptions(pane);
+        for mode in [PaneStreamMode::Raw, PaneStreamMode::Surface] {
+            self.end_pane_streams(pane, mode, PaneStreamEndReason::PaneRemoved, now);
+        }
+        self.draining_panes.remove(pane);
+        self.draining_stream_sources.remove(pane);
     }
 }
 

@@ -37,9 +37,10 @@ use protocol::{
 };
 use raw::{RawInitializationOutcome, RawSubscriptionStart};
 pub(in crate::handler) use types::{
-    CachedRawRebase, EndedPaneStream, PaneStreamSubscription, PendingSurfaceRefresh, SurfaceDriver,
+    CachedRawRebase, EndedPaneStream, PaneStreamSource, PaneStreamSubscription,
+    PendingSurfaceRefresh, SurfaceDriver,
 };
-use types::{PaneStreamSource, PaneSurfaceFingerprint, SurfacePaneStream};
+use types::{PaneSurfaceFingerprint, SurfacePaneStream};
 
 pub(super) const MAX_SOURCE_CAPTURE_ATTEMPTS: usize = 4;
 
@@ -227,7 +228,7 @@ impl RequestHandler {
                 };
             subscriptions.streams.insert(
                 subscription_id,
-                PaneStreamSubscription::Reserved(request.mode),
+                PaneStreamSubscription::reserved(request.mode),
             );
             let surface_route = (request.mode == PaneStreamMode::Surface)
                 .then(|| subscriptions.surface_driver_route(&source.key));
@@ -533,12 +534,17 @@ impl RequestHandler {
         };
         let frame = Arc::clone(&driver.latest);
         let lifecycle_revision = driver.lifecycle_revision;
+        let end_reason = subscriptions
+            .streams
+            .get(&subscription_id)
+            .and_then(PaneStreamSubscription::end_reason);
         subscriptions.streams.insert(
             subscription_id,
             PaneStreamSubscription::Surface(SurfacePaneStream {
                 delivered_revision: frame.revision,
                 delivered_epoch: frame.epoch,
                 delivered_lifecycle_revision: lifecycle_revision,
+                end_reason,
             }),
         );
         drop(subscriptions);
@@ -588,12 +594,17 @@ impl RequestHandler {
             .surface_drivers
             .get(&current_key)
             .map_or(0, |driver| driver.lifecycle_revision);
+        let end_reason = subscriptions
+            .streams
+            .get(&subscription_id)
+            .and_then(PaneStreamSubscription::end_reason);
         subscriptions.streams.insert(
             subscription_id,
             PaneStreamSubscription::Surface(SurfacePaneStream {
                 delivered_revision: frame.revision,
                 delivered_epoch: frame.epoch,
                 delivered_lifecycle_revision: lifecycle_revision,
+                end_reason,
             }),
         );
         drop(subscriptions);
@@ -614,12 +625,24 @@ impl RequestHandler {
         pane_id: rmux_core::PaneId,
         preferred_runtime_session: &rmux_proto::SessionName,
     ) -> Result<PaneStreamSource, RmuxError> {
-        let state = self.state.lock().await;
-        let target = state
-            .pane_target_for_runtime_pane(preferred_runtime_session, pane_id)
-            .or_else(|| state.pane_alias_targets(pane_id).into_iter().next())
-            .ok_or_else(|| RmuxError::pane_not_found(preferred_runtime_session.clone(), pane_id))?;
-        stream_source_for_target(&state, target)
+        {
+            let state = self.state.lock().await;
+            if let Some(target) = state
+                .pane_target_for_runtime_pane(preferred_runtime_session, pane_id)
+                .or_else(|| state.pane_alias_targets(pane_id).into_iter().next())
+            {
+                return stream_source_for_target(&state, target);
+            }
+        }
+        let key = rmux_core::events::PaneOutputSubscriptionKey::new(
+            preferred_runtime_session.clone(),
+            pane_id,
+        );
+        self.subscriptions
+            .lock()
+            .expect("subscription registry mutex must not be poisoned")
+            .draining_stream_source(&key)
+            .ok_or_else(|| RmuxError::pane_not_found(preferred_runtime_session.clone(), pane_id))
     }
 
     async fn capture_current_stream_source(
@@ -686,7 +709,7 @@ fn resolve_stream_source(
     stream_source_for_target(state, target)
 }
 
-fn stream_source_for_target(
+pub(in crate::handler) fn stream_source_for_target(
     state: &HandlerState,
     target: rmux_proto::PaneTarget,
 ) -> Result<PaneStreamSource, RmuxError> {

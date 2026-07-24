@@ -8,9 +8,9 @@ use rmux_proto::PaneOutputSubscriptionId;
 use rmux_proto::{
     ErrorResponse, PaneOutputCursor, PaneOutputCursorRequest, PaneOutputCursorResponse,
     PaneOutputEvent, PaneOutputLagNotice, PaneOutputLagResponse, PaneOutputSubscriptionStart,
-    PaneRecentOutput, PaneStreamEndReason, PaneStreamMode, PaneTarget, PaneTargetRef, Response,
-    RmuxError, SubscribePaneOutputRefRequest, SubscribePaneOutputRequest,
-    SubscribePaneOutputResponse, UnsubscribePaneOutputRequest, UnsubscribePaneOutputResponse,
+    PaneRecentOutput, PaneStreamEndReason, PaneTarget, PaneTargetRef, Response, RmuxError,
+    SubscribePaneOutputRefRequest, SubscribePaneOutputRequest, SubscribePaneOutputResponse,
+    UnsubscribePaneOutputRequest, UnsubscribePaneOutputResponse,
 };
 
 use crate::pane_io::PaneOutputSender;
@@ -341,20 +341,18 @@ impl RequestHandler {
         }
     }
 
-    pub(crate) async fn drain_exited_pane_output_subscriptions(
+    pub(in crate::handler) async fn drain_exited_pane_output_subscriptions(
         &self,
         pane: PaneOutputSubscriptionKey,
+        source: Option<super::pane_stream_support::PaneStreamSource>,
     ) {
         let should_watch = {
             let mut subscriptions = self
                 .subscriptions
                 .lock()
                 .expect("subscription registry mutex must not be poisoned");
-            let now = std::time::Instant::now();
-            for mode in [PaneStreamMode::Raw, PaneStreamMode::Surface] {
-                subscriptions.end_pane_streams(&pane, mode, PaneStreamEndReason::PaneRemoved, now);
-            }
-            subscriptions.begin_pane_drain(pane.clone())
+            subscriptions.mark_pane_streams_ending(&pane, PaneStreamEndReason::PaneRemoved);
+            subscriptions.begin_pane_drain(pane.clone(), source)
         };
         if should_watch {
             self.watch_exited_pane_drain(pane);
@@ -408,7 +406,7 @@ impl RequestHandler {
                 .subscriptions
                 .lock()
                 .expect("subscription registry mutex must not be poisoned");
-            let _ = subscriptions.remove_drained_legacy_subscriptions(pane);
+            subscriptions.expire_pane_drain(pane, Instant::now());
         }
         let _ = self.request_shutdown_if_pending();
     }

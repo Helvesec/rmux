@@ -279,7 +279,7 @@ async fn exited_pane_subscription_stays_alive_after_eof_until_cleanup() {
     };
 
     handler
-        .drain_exited_pane_output_subscriptions(pane.clone())
+        .drain_exited_pane_output_subscriptions(pane.clone(), None)
         .await;
 
     let empty_before_eof = handler
@@ -376,7 +376,7 @@ async fn empty_server_shutdown_waits_for_exited_pane_subscription_drain() {
     };
 
     handler
-        .drain_exited_pane_output_subscriptions(pane.clone())
+        .drain_exited_pane_output_subscriptions(pane.clone(), None)
         .await;
     assert!(
         !handler.request_shutdown_if_server_empty().await,
@@ -437,7 +437,7 @@ fn exited_pane_drain_idle_tracks_subscription_touch() {
         .subscribe(5, pane.clone(), created)
         .expect("subscription is within limits");
 
-    assert!(subscriptions.begin_pane_drain(pane.clone()));
+    assert!(subscriptions.begin_pane_drain(pane.clone(), None));
     assert_eq!(
         subscriptions.pane_drain_idle_for(&pane, created),
         Some(Duration::ZERO)
@@ -479,7 +479,7 @@ async fn exited_pane_subscription_auto_cleans_after_drain_timeout() {
     };
 
     handler
-        .drain_exited_pane_output_subscriptions(pane.clone())
+        .drain_exited_pane_output_subscriptions(pane.clone(), None)
         .await;
     sender.send(b"tail".to_vec());
     sender.send(Vec::new());

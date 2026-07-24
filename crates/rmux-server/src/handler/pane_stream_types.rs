@@ -18,6 +18,7 @@ pub(in crate::handler) struct RawPaneStream {
     rebase_token: u64,
     pending_rebase: Option<PaneRawRebaseReason>,
     pending_observation: Option<PaneObservationItem>,
+    end_reason: Option<PaneStreamEndReason>,
 }
 
 impl RawPaneStream {
@@ -25,6 +26,7 @@ impl RawPaneStream {
         receiver: PaneOutputReceiver,
         epoch: u64,
         include_snapshot: bool,
+        end_reason: Option<PaneStreamEndReason>,
     ) -> Self {
         Self {
             receiver,
@@ -34,6 +36,7 @@ impl RawPaneStream {
             rebase_token: 0,
             pending_rebase: None,
             pending_observation: None,
+            end_reason,
         }
     }
 
@@ -52,6 +55,14 @@ impl RawPaneStream {
     pub(in crate::handler) fn defer_observation(&mut self, item: PaneObservationItem) {
         debug_assert!(self.pending_observation.is_none());
         self.pending_observation = Some(item);
+    }
+
+    pub(in crate::handler) const fn end_reason(&self) -> Option<PaneStreamEndReason> {
+        self.end_reason
+    }
+
+    pub(in crate::handler) fn mark_ending(&mut self, reason: PaneStreamEndReason) {
+        self.end_reason = Some(reason);
     }
 
     pub(in crate::handler) fn begin_rebase(&mut self) -> Option<u64> {
@@ -93,21 +104,48 @@ pub(in crate::handler) struct SurfacePaneStream {
     pub(in crate::handler) delivered_revision: u64,
     pub(in crate::handler) delivered_epoch: u64,
     pub(in crate::handler) delivered_lifecycle_revision: u64,
+    pub(in crate::handler) end_reason: Option<PaneStreamEndReason>,
 }
 
 #[derive(Debug)]
 pub(in crate::handler) enum PaneStreamSubscription {
-    Reserved(PaneStreamMode),
+    Reserved {
+        mode: PaneStreamMode,
+        end_reason: Option<PaneStreamEndReason>,
+    },
     Raw(RawPaneStream),
     Surface(SurfacePaneStream),
 }
 
 impl PaneStreamSubscription {
+    pub(in crate::handler) const fn reserved(mode: PaneStreamMode) -> Self {
+        Self::Reserved {
+            mode,
+            end_reason: None,
+        }
+    }
+
     pub(in crate::handler) const fn mode(&self) -> PaneStreamMode {
         match self {
-            Self::Reserved(mode) => *mode,
+            Self::Reserved { mode, .. } => *mode,
             Self::Raw(_) => PaneStreamMode::Raw,
             Self::Surface(_) => PaneStreamMode::Surface,
+        }
+    }
+
+    pub(in crate::handler) const fn end_reason(&self) -> Option<PaneStreamEndReason> {
+        match self {
+            Self::Reserved { end_reason, .. } => *end_reason,
+            Self::Raw(stream) => stream.end_reason(),
+            Self::Surface(stream) => stream.end_reason,
+        }
+    }
+
+    pub(in crate::handler) fn mark_ending(&mut self, reason: PaneStreamEndReason) {
+        match self {
+            Self::Reserved { end_reason, .. } => *end_reason = Some(reason),
+            Self::Raw(stream) => stream.mark_ending(reason),
+            Self::Surface(stream) => stream.end_reason = Some(reason),
         }
     }
 }
@@ -290,7 +328,7 @@ impl EndedPaneStream {
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub(in crate::handler) struct PaneStreamSource {
     pub(in crate::handler) target: rmux_proto::PaneTarget,
     pub(in crate::handler) key: PaneOutputSubscriptionKey,

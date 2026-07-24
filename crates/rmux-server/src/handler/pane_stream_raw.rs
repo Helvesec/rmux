@@ -242,12 +242,17 @@ impl RequestHandler {
         ) else {
             return super::reserved_stream_lost_response();
         };
+        let end_reason = subscriptions
+            .streams
+            .get(&subscription_id)
+            .and_then(PaneStreamSubscription::end_reason);
         subscriptions.streams.insert(
             subscription_id,
             PaneStreamSubscription::Raw(RawPaneStream::new(
                 start.receiver,
                 1,
                 start.include_snapshot,
+                end_reason,
             )),
         );
         subscriptions.raw_rebases.insert(current_key, cached_rebase);
@@ -269,7 +274,7 @@ impl RequestHandler {
             Ok(size) => size,
             Err(error) => return Response::Error(ErrorResponse { error }),
         };
-        let (rebase, reached_limit) = {
+        let (rebase, reached_limit, finish_after_end) = {
             let mut subscriptions = self
                 .subscriptions
                 .lock()
@@ -302,12 +307,14 @@ impl RequestHandler {
             let mut reason = stream.pending_rebase();
             let mut observed = 0_usize;
             let mut reached_frame_limit = false;
+            let mut source_drained = false;
             if reason.is_none() {
                 for _ in 0..limit {
                     let item = stream
                         .take_pending_observation()
                         .or_else(|| stream.receiver.try_recv_observed());
                     let Some(item) = item else {
+                        source_drained = true;
                         break;
                     };
                     observed = observed.saturating_add(1);
@@ -370,6 +377,24 @@ impl RequestHandler {
                     }
                 }
             }
+            let mut finish_after_end = false;
+            if reason.is_none() && source_drained {
+                if let Some(end_reason) = stream.end_reason() {
+                    let end = PaneStreamEvent::End(end_reason);
+                    let event_size = match encoded_stream_event_size(&end) {
+                        Ok(size) => size,
+                        Err(error) => return Response::Error(ErrorResponse { error }),
+                    };
+                    let next_response_size = response_size.saturating_add(event_size);
+                    if events.is_empty() || next_response_size <= DEFAULT_MAX_DETACHED_FRAME_LENGTH
+                    {
+                        events.push(end);
+                        finish_after_end = true;
+                    } else {
+                        reached_frame_limit = true;
+                    }
+                }
+            }
             (
                 reason.map(|reason| {
                     let token = stream
@@ -385,6 +410,7 @@ impl RequestHandler {
                     )
                 }),
                 reason.is_none() && (observed == limit || reached_frame_limit),
+                finish_after_end,
             )
         };
 
@@ -400,6 +426,9 @@ impl RequestHandler {
                     }
                     error => Response::Error(ErrorResponse { error }),
                 };
+            }
+            if finish_after_end {
+                self.finish_stream_after_end(request.subscription_id);
             }
             return response;
         };
@@ -478,7 +507,7 @@ impl RequestHandler {
             Some(PaneStreamSubscription::Raw(stream)) => {
                 stream.finish_rebase(token, receiver, epoch)
             }
-            Some(PaneStreamSubscription::Reserved(_) | PaneStreamSubscription::Surface(_)) => {
+            Some(PaneStreamSubscription::Reserved { .. } | PaneStreamSubscription::Surface(_)) => {
                 return wrong_stream_mode()
             }
             None => {

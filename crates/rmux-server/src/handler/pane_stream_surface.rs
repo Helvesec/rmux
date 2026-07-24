@@ -332,32 +332,53 @@ fn deliver_surface_latest(
         driver.lifecycle_revision
     };
     let frame_lifecycle_revision = driver.frame_lifecycle_revision;
-    let Some(PaneStreamSubscription::Surface(stream)) =
-        subscriptions.streams.get_mut(&subscription_id)
-    else {
-        return wrong_stream_mode();
-    };
-    let mut events = Vec::new();
-    let has_pending_frame = stream.delivered_revision < frame.revision;
-    let lifecycle_before_frame = if has_pending_frame {
-        frame_lifecycle_revision
-    } else {
-        stream.delivered_lifecycle_revision
-    };
-    append_surface_lifecycle_events(&mut events, stream, lifecycle_before_frame, limit);
-    if events.len() < limit && has_pending_frame {
-        if stream.delivered_epoch != frame.epoch {
-            events.push(PaneStreamEvent::SurfaceReset(Box::new((*frame).clone())));
+    let driver_refreshing = driver.refreshing;
+    let (events, limited, finish_after_end) = {
+        let Some(PaneStreamSubscription::Surface(stream)) =
+            subscriptions.streams.get_mut(&subscription_id)
+        else {
+            return wrong_stream_mode();
+        };
+        let mut events = Vec::new();
+        let has_pending_frame = stream.delivered_revision < frame.revision;
+        let lifecycle_before_frame = if has_pending_frame {
+            frame_lifecycle_revision
         } else {
-            events.push(PaneStreamEvent::SurfacePatch(Box::new((*frame).clone())));
+            stream.delivered_lifecycle_revision
+        };
+        append_surface_lifecycle_events(&mut events, stream, lifecycle_before_frame, limit);
+        if events.len() < limit && has_pending_frame {
+            if stream.delivered_epoch != frame.epoch {
+                events.push(PaneStreamEvent::SurfaceReset(Box::new((*frame).clone())));
+            } else {
+                events.push(PaneStreamEvent::SurfacePatch(Box::new((*frame).clone())));
+            }
+            stream.delivered_revision = frame.revision;
+            stream.delivered_epoch = frame.epoch;
         }
-        stream.delivered_revision = frame.revision;
-        stream.delivered_epoch = frame.epoch;
+        append_surface_lifecycle_events(&mut events, stream, lifecycle_revision, limit);
+        let projection_drained = !source_batch_limited
+            && !driver_refreshing
+            && stream.delivered_revision >= frame.revision
+            && stream.delivered_lifecycle_revision >= lifecycle_revision;
+        let finish_after_end =
+            projection_drained && events.len() < limit && stream.end_reason.is_some();
+        if finish_after_end {
+            events.push(PaneStreamEvent::End(
+                stream
+                    .end_reason
+                    .expect("ending surface stream has a reason"),
+            ));
+        }
+        let limited = source_batch_limited
+            || stream.delivered_revision < frame.revision
+            || stream.delivered_lifecycle_revision < lifecycle_revision
+            || (stream.end_reason.is_some() && !finish_after_end);
+        (events, limited, finish_after_end)
+    };
+    if finish_after_end {
+        subscriptions.remove_subscription(subscription_id);
     }
-    append_surface_lifecycle_events(&mut events, stream, lifecycle_revision, limit);
-    let limited = source_batch_limited
-        || stream.delivered_revision < frame.revision
-        || stream.delivered_lifecycle_revision < lifecycle_revision;
     stream_cursor_response(subscription_id, events, limited)
 }
 

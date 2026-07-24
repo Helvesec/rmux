@@ -5,8 +5,12 @@ use rmux_core::LifecycleEvent;
 use rmux_proto::{OptionName, PaneStateClosedReason, PaneTarget, RmuxError, Target, WindowTarget};
 
 use super::super::{
-    attach_support::SessionDetachOnDestroy, exited_output_support::RetainedExitedPaneIdentities,
-    prepare_lifecycle_event, scripting_support::format_context_for_target, RequestHandler,
+    attach_support::SessionDetachOnDestroy,
+    exited_output_support::RetainedExitedPaneIdentities,
+    pane_stream_support::{stream_source_for_target, PaneStreamSource},
+    prepare_lifecycle_event,
+    scripting_support::format_context_for_target,
+    RequestHandler,
 };
 use super::pane_kill_effects::KillPaneLifecycleBatch;
 use crate::format_runtime::render_runtime_template;
@@ -64,6 +68,7 @@ enum PaneExitPlan {
 struct ExitedPaneOutput {
     receiver: Option<PaneOutputReceiver>,
     sender: Option<PaneOutputSender>,
+    stream_source: Option<PaneStreamSource>,
 }
 
 impl ExitedPaneOutput {
@@ -74,7 +79,14 @@ impl ExitedPaneOutput {
     ) -> Self {
         let (receiver, sender) =
             state.runtime_pane_output_drain_handles(runtime_session_name, pane_id);
-        Self { receiver, sender }
+        let stream_source = state
+            .pane_target_for_runtime_pane(runtime_session_name, pane_id)
+            .and_then(|target| stream_source_for_target(state, target).ok());
+        Self {
+            receiver,
+            sender,
+            stream_source,
+        }
     }
 
     async fn ensure_eof(&mut self, generation: Option<u64>, output_eof_published: bool) -> bool {
@@ -92,6 +104,10 @@ impl ExitedPaneOutput {
 
     fn sender(&self) -> Option<PaneOutputSender> {
         self.sender.clone()
+    }
+
+    fn stream_source(&self) -> Option<PaneStreamSource> {
+        self.stream_source.clone()
     }
 }
 
@@ -498,8 +514,12 @@ impl RequestHandler {
                 )
                 .await;
                 self.forget_pane_snapshot_coalescers(&removed_pane_ids);
-                self.cleanup_exited_pane_output_subscription(&runtime_session_name, event.pane_id)
-                    .await;
+                self.cleanup_exited_pane_output_subscription(
+                    &runtime_session_name,
+                    event.pane_id,
+                    &output,
+                )
+                .await;
                 let mut prepared_attached_switches = std::collections::HashMap::new();
                 let mut prepared_rehome_order = Vec::new();
                 for (session_name, session_id, detach_on_destroy) in &destroyed_attached_sessions {
@@ -590,8 +610,12 @@ impl RequestHandler {
                     session_id,
                 )));
                 self.forget_pane_snapshot_coalescers(&removed_pane_ids);
-                self.cleanup_exited_pane_output_subscription(&runtime_session_name, event.pane_id)
-                    .await;
+                self.cleanup_exited_pane_output_subscription(
+                    &runtime_session_name,
+                    event.pane_id,
+                    &output,
+                )
+                .await;
                 let mut prepared = self
                     .prepare_destroy_session_rehome(&session_name, session_id, detach_on_destroy)
                     .await;
@@ -633,9 +657,11 @@ impl RequestHandler {
         &self,
         runtime_session_name: &rmux_proto::SessionName,
         pane_id: rmux_core::PaneId,
+        output: &ExitedPaneOutput,
     ) {
         let key = PaneOutputSubscriptionKey::new(runtime_session_name.clone(), pane_id);
-        self.drain_exited_pane_output_subscriptions(key).await;
+        self.drain_exited_pane_output_subscriptions(key, output.stream_source())
+            .await;
     }
 
     async fn commit_kept_dead_pane(
@@ -910,6 +936,7 @@ mod tests {
         let mut output = ExitedPaneOutput {
             receiver: Some(receiver),
             sender: Some(sender),
+            stream_source: None,
         };
 
         tokio::time::timeout(

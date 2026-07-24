@@ -10,7 +10,7 @@ use rmux_proto::{
     UnsubscribePaneStreamRequest, DEFAULT_MAX_DETACHED_FRAME_LENGTH,
 };
 
-use crate::pane_io::{PaneInvalidationReason, PaneOutputSender};
+use crate::pane_io::{PaneExitEvent, PaneInvalidationReason, PaneOutputSender};
 use crate::pane_transcript::SharedPaneTranscript;
 
 use super::{validate_raw_rebase_size, RequestHandler};
@@ -150,6 +150,21 @@ async fn cursor_with_limit(
         panic!("unexpected cursor response: {response:?}");
     };
     *response
+}
+
+async fn cursor_until_unlimited(
+    handler: &RequestHandler,
+    subscription_id: rmux_proto::PaneOutputSubscriptionId,
+    max_events: u16,
+) -> Vec<PaneStreamEvent> {
+    let mut events = Vec::new();
+    loop {
+        let response = cursor_with_limit(handler, subscription_id, max_events).await;
+        events.extend(response.events);
+        if !response.limited {
+            return events;
+        }
+    }
 }
 
 fn raw_rebase(event: &PaneStreamEvent) -> Option<&PaneRawRebase> {
@@ -647,7 +662,7 @@ async fn reserved_surface_subscriber_keeps_the_shared_driver_alive() {
             .id();
         subscriptions.streams.insert(
             id,
-            super::PaneStreamSubscription::Reserved(PaneStreamMode::Surface),
+            super::PaneStreamSubscription::reserved(PaneStreamMode::Surface),
         );
         id
     };
@@ -1006,23 +1021,60 @@ async fn pane_removal_finishes_stream_with_typed_end() {
 }
 
 #[tokio::test]
-async fn natural_pane_exit_finishes_raw_and_surface_streams() {
+async fn natural_pane_exit_drains_raw_and_surface_streams_before_end() {
     let handler = RequestHandler::new();
-    let (target, _, _) = test_pane(&handler).await;
+    let (target, output, transcript) = test_pane(&handler).await;
     let raw = subscribe(&handler, &target, PaneStreamMode::Raw).await;
     let surface = subscribe(&handler, &target, PaneStreamMode::Surface).await;
     let key = handler
         .pane_output_subscription_key_for_test(raw.subscription_id)
         .expect("subscription key");
 
-    handler.drain_exited_pane_output_subscriptions(key).await;
+    transcript
+        .lock()
+        .expect("transcript lock")
+        .append_bytes(b"natural-tail");
+    output.send(b"natural-tail".to_vec());
+    output.send(Vec::new());
+    handler
+        .state
+        .lock()
+        .await
+        .mark_pane_dead_without_exit_details(&target)
+        .expect("mark pane naturally exited");
+    handler
+        .handle_pane_exit_event(PaneExitEvent::eof_published(
+            target.session_name().clone(),
+            key.pane_id(),
+            None,
+        ))
+        .await;
 
-    for subscription_id in [raw.subscription_id, surface.subscription_id] {
-        assert_eq!(
-            cursor(&handler, subscription_id).await,
-            vec![PaneStreamEvent::End(PaneStreamEndReason::PaneRemoved)]
-        );
-    }
+    let raw_events = cursor_until_unlimited(&handler, raw.subscription_id, 1).await;
+    assert!(matches!(
+        raw_events.as_slice(),
+        [
+            PaneStreamEvent::RawBytes(bytes),
+            PaneStreamEvent::Lifecycle(PaneStreamLifecycleEvent::ProcessExited { .. }),
+            PaneStreamEvent::End(PaneStreamEndReason::PaneRemoved),
+        ] if bytes.bytes == b"natural-tail"
+    ));
+
+    let surface_events = cursor_until_unlimited(&handler, surface.subscription_id, 1).await;
+    assert!(matches!(
+        surface_events.as_slice(),
+        [
+            PaneStreamEvent::SurfacePatch(frame),
+            PaneStreamEvent::Lifecycle(PaneStreamLifecycleEvent::ProcessExited { .. }),
+            PaneStreamEvent::End(PaneStreamEndReason::PaneRemoved),
+        ] if frame
+            .snapshot
+            .cells
+            .iter()
+            .map(|cell| cell.text.as_str())
+            .collect::<String>()
+            .contains("natural-tail")
+    ));
     assert!(
         handler
             .subscriptions
@@ -1030,6 +1082,179 @@ async fn natural_pane_exit_finishes_raw_and_surface_streams() {
             .expect("subscription lock")
             .is_empty(),
         "ended pane streams must not keep exit-empty shutdown busy"
+    );
+}
+
+#[tokio::test]
+async fn reserved_surface_subscription_keeps_exit_reason_when_initialization_finishes() {
+    let handler = RequestHandler::new();
+    let (target, _, _) = test_pane(&handler).await;
+    let active = subscribe(&handler, &target, PaneStreamMode::Surface).await;
+    let source = {
+        let state = handler.state.lock().await;
+        super::stream_source_for_target(&state, target).expect("stream source")
+    };
+    let key = handler
+        .pane_output_subscription_key_for_test(active.subscription_id)
+        .expect("subscription key");
+    let reserved_id = {
+        let mut subscriptions = handler.subscriptions.lock().expect("subscription lock");
+        let id = subscriptions
+            .registry
+            .subscribe(CONNECTION_ID, key.clone(), std::time::Instant::now())
+            .expect("second reservation")
+            .id();
+        subscriptions.streams.insert(
+            id,
+            super::PaneStreamSubscription::reserved(PaneStreamMode::Surface),
+        );
+        subscriptions.mark_pane_streams_ending(&key, PaneStreamEndReason::PaneRemoved);
+        id
+    };
+
+    let response = handler.finish_existing_surface_subscription(CONNECTION_ID, reserved_id, source);
+    assert!(
+        matches!(response, Response::SubscribePaneStream(_)),
+        "{response:?}"
+    );
+    assert_eq!(
+        cursor(&handler, reserved_id).await,
+        vec![PaneStreamEvent::End(PaneStreamEndReason::PaneRemoved)]
+    );
+    handler.cleanup_connection_subscriptions_sync(CONNECTION_ID);
+}
+
+#[tokio::test]
+async fn reserved_raw_subscription_keeps_exit_reason_when_initialization_finishes() {
+    let handler = RequestHandler::new();
+    let (target, _, _) = test_pane(&handler).await;
+    let source = {
+        let state = handler.state.lock().await;
+        super::stream_source_for_target(&state, target).expect("stream source")
+    };
+    let (source, captured) = handler
+        .capture_current_stream_source(source)
+        .await
+        .expect("capture stream source");
+    let rebase = super::materialize_raw_rebase(
+        &handler,
+        source.key.pane_id(),
+        1,
+        PaneRawRebaseReason::Initial,
+        false,
+        &captured,
+    )
+    .expect("materialize raw rebase");
+    let reserved_id = {
+        let mut subscriptions = handler.subscriptions.lock().expect("subscription lock");
+        let id = subscriptions
+            .registry
+            .subscribe(CONNECTION_ID, source.key.clone(), std::time::Instant::now())
+            .expect("raw reservation")
+            .id();
+        subscriptions.streams.insert(
+            id,
+            super::PaneStreamSubscription::reserved(PaneStreamMode::Raw),
+        );
+        subscriptions.mark_pane_streams_ending(&source.key, PaneStreamEndReason::PaneRemoved);
+        id
+    };
+
+    let response = handler.finish_raw_subscription(
+        CONNECTION_ID,
+        reserved_id,
+        source,
+        super::RawSubscriptionStart::captured(captured, rebase, false),
+    );
+    assert!(
+        matches!(response, Response::SubscribePaneStream(_)),
+        "{response:?}"
+    );
+    assert_eq!(
+        cursor(&handler, reserved_id).await,
+        vec![PaneStreamEvent::End(PaneStreamEndReason::PaneRemoved)]
+    );
+}
+
+#[tokio::test]
+async fn late_stream_subscriptions_are_rejected_while_an_exited_pane_drains() {
+    let handler = RequestHandler::new();
+    let (target, _, _) = test_pane(&handler).await;
+    let active = subscribe(&handler, &target, PaneStreamMode::Raw).await;
+    let source = {
+        let state = handler.state.lock().await;
+        super::stream_source_for_target(&state, target.clone()).expect("stream source")
+    };
+    let key = handler
+        .pane_output_subscription_key_for_test(active.subscription_id)
+        .expect("subscription key");
+    let removed_session = handler
+        .state
+        .lock()
+        .await
+        .sessions
+        .remove_session(target.session_name())
+        .expect("remove session before stream drain");
+    handler
+        .drain_exited_pane_output_subscriptions(key.clone(), Some(source))
+        .await;
+
+    for mode in [PaneStreamMode::Raw, PaneStreamMode::Surface] {
+        let response = handler
+            .handle_subscribe_pane_stream(
+                CONNECTION_ID + 1,
+                SubscribePaneStreamRequest {
+                    target: PaneTargetRef::slot(target.clone()),
+                    mode,
+                    include_snapshot: false,
+                },
+            )
+            .await;
+        assert!(
+            matches!(response, Response::Error(_)),
+            "{mode:?} late subscription unexpectedly succeeded: {response:?}"
+        );
+    }
+
+    handler
+        .subscriptions
+        .lock()
+        .expect("subscription lock")
+        .expire_pane_drain(&key, std::time::Instant::now());
+    handler
+        .state
+        .lock()
+        .await
+        .sessions
+        .insert_existing_session(removed_session)
+        .expect("restore test session");
+}
+
+#[tokio::test]
+async fn pane_exit_drain_timeout_force_ends_an_undrained_stream() {
+    let handler = RequestHandler::new();
+    let (target, _, _) = test_pane(&handler).await;
+    let subscribed = subscribe(&handler, &target, PaneStreamMode::Raw).await;
+    let source = {
+        let state = handler.state.lock().await;
+        super::stream_source_for_target(&state, target).expect("stream source")
+    };
+    let key = handler
+        .pane_output_subscription_key_for_test(subscribed.subscription_id)
+        .expect("subscription key");
+    handler
+        .drain_exited_pane_output_subscriptions(key.clone(), Some(source))
+        .await;
+
+    handler
+        .subscriptions
+        .lock()
+        .expect("subscription lock")
+        .expire_pane_drain(&key, std::time::Instant::now());
+
+    assert_eq!(
+        cursor(&handler, subscribed.subscription_id).await,
+        vec![PaneStreamEvent::End(PaneStreamEndReason::PaneRemoved)]
     );
 }
 
