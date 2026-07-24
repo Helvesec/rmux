@@ -162,7 +162,9 @@ impl RequestHandler {
             Some(PaneStreamSubscription::Raw(stream)) => {
                 stream.finish_rebase(token, receiver, epoch)
             }
-            Some(PaneStreamSubscription::Surface(_)) => return wrong_stream_mode(),
+            Some(PaneStreamSubscription::Reserved(_) | PaneStreamSubscription::Surface(_)) => {
+                return wrong_stream_mode()
+            }
             None => return stream_cursor_response(request.subscription_id, events, false),
         };
         if !finished {

@@ -7,6 +7,7 @@ use rmux_proto::{
     PaneStreamEndReason, PaneStreamEvent, PaneStreamLifecycleEvent, PaneStreamMode,
     PaneSurfaceFrame, PaneTarget, PaneTargetRef, Request, Response, SessionName,
     SubscribePaneStreamRequest, SubscribePaneStreamResponse, TerminalSize,
+    UnsubscribePaneStreamRequest,
 };
 
 use crate::pane_io::{PaneInvalidationReason, PaneOutputSender};
@@ -284,6 +285,57 @@ async fn surface_subscribers_share_one_driver_and_receive_the_same_frame() {
         first_events.first(),
         Some(PaneStreamEvent::SurfacePatch(_))
     ));
+}
+
+#[tokio::test]
+async fn reserved_surface_subscriber_keeps_the_shared_driver_alive() {
+    let handler = RequestHandler::new();
+    let (target, _, _) = test_pane(&handler).await;
+    let first = subscribe(&handler, &target, PaneStreamMode::Surface).await;
+    let key = handler
+        .pane_output_subscription_key_for_test(first.subscription_id)
+        .expect("subscription key");
+    let reserved_id = {
+        let mut subscriptions = handler.subscriptions.lock().expect("subscription lock");
+        let id = subscriptions
+            .registry
+            .subscribe(CONNECTION_ID, key.clone(), std::time::Instant::now())
+            .expect("second reservation")
+            .id();
+        subscriptions.streams.insert(
+            id,
+            super::PaneStreamSubscription::Reserved(PaneStreamMode::Surface),
+        );
+        id
+    };
+
+    let response = handler
+        .handle_unsubscribe_pane_stream(
+            CONNECTION_ID,
+            UnsubscribePaneStreamRequest {
+                subscription_id: first.subscription_id,
+            },
+        )
+        .await;
+    assert!(matches!(response, Response::UnsubscribePaneStream(_)));
+    assert!(
+        handler
+            .subscriptions
+            .lock()
+            .expect("subscription lock")
+            .surface_drivers
+            .contains_key(&key),
+        "an in-flight surface reservation still needs the existing driver"
+    );
+
+    let _ = handler
+        .handle_unsubscribe_pane_stream(
+            CONNECTION_ID,
+            UnsubscribePaneStreamRequest {
+                subscription_id: reserved_id,
+            },
+        )
+        .await;
 }
 
 #[tokio::test]

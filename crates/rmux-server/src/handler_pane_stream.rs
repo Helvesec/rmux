@@ -210,21 +210,25 @@ impl RequestHandler {
                 .lock()
                 .expect("subscription registry mutex must not be poisoned");
             subscriptions.cleanup_stale(now);
-            let record =
+            let subscription_id =
                 match subscriptions
                     .registry
                     .subscribe(connection_id, source.key.clone(), now)
                 {
-                    Ok(record) => record,
+                    Ok(record) => record.id(),
                     Err(error) => {
                         return Response::Error(ErrorResponse {
                             error: stream_subscription_limit_error(error),
                         });
                     }
                 };
+            subscriptions.streams.insert(
+                subscription_id,
+                PaneStreamSubscription::Reserved(request.mode),
+            );
             let surface_route = (request.mode == PaneStreamMode::Surface)
                 .then(|| subscriptions.surface_driver_route(&source.key));
-            (source, record.id(), surface_route)
+            (source, subscription_id, surface_route)
         };
         let mut reservation_guard =
             StreamReservationGuard::new(&self.subscriptions, subscription_id);

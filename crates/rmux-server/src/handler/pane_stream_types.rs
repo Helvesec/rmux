@@ -85,6 +85,7 @@ pub(in crate::handler) struct SurfacePaneStream {
 
 #[derive(Debug)]
 pub(in crate::handler) enum PaneStreamSubscription {
+    Reserved(PaneStreamMode),
     Raw(RawPaneStream),
     Surface(SurfacePaneStream),
 }
@@ -92,6 +93,7 @@ pub(in crate::handler) enum PaneStreamSubscription {
 impl PaneStreamSubscription {
     pub(in crate::handler) const fn mode(&self) -> PaneStreamMode {
         match self {
+            Self::Reserved(mode) => *mode,
             Self::Raw(_) => PaneStreamMode::Raw,
             Self::Surface(_) => PaneStreamMode::Surface,
         }

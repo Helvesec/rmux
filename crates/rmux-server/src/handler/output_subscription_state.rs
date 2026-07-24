@@ -330,6 +330,10 @@ impl OutputSubscriptionState {
         let mut has_surface = false;
         for id in self.registry.ids_for_pane(pane) {
             match self.streams.get(&id) {
+                Some(PaneStreamSubscription::Reserved(PaneStreamMode::Raw)) => has_raw = true,
+                Some(PaneStreamSubscription::Reserved(PaneStreamMode::Surface)) => {
+                    has_surface = true;
+                }
                 Some(PaneStreamSubscription::Raw(_)) => has_raw = true,
                 Some(PaneStreamSubscription::Surface(_)) => has_surface = true,
                 None => {}
