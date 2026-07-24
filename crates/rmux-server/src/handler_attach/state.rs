@@ -26,7 +26,6 @@ use crate::pane_io::{AttachControl, AttachControlSender};
 pub(in crate::handler) struct ActiveAttachState {
     pub(in crate::handler) next_id: u64,
     pub(in crate::handler) next_size_sequence: u64,
-    pub(in crate::handler) next_activity_sequence: u64,
     pub(in crate::handler) by_pid: HashMap<u32, ActiveAttach>,
     pub(in crate::handler) active_client_by_window:
         HashMap<rmux_proto::SessionName, HashMap<u32, u32>>,
@@ -209,12 +208,14 @@ fn rename_display_panes_state(
 }
 
 impl ActiveAttachState {
-    pub(in crate::handler) fn record_client_activity(&mut self, attach_pid: u32) -> bool {
+    pub(in crate::handler) fn record_client_activity(
+        &mut self,
+        attach_pid: u32,
+        sequence: u64,
+    ) -> bool {
         let Some(active) = self.by_pid.get_mut(&attach_pid) else {
             return false;
         };
-        let sequence = self.next_activity_sequence;
-        self.next_activity_sequence = self.next_activity_sequence.saturating_add(1);
         active.last_activity_sequence = sequence;
         true
     }

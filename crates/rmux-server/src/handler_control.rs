@@ -58,6 +58,7 @@ pub(super) struct ActiveControlState {
 #[derive(Debug)]
 pub(super) struct ActiveControl {
     pub(super) id: u64,
+    pub(super) last_activity_sequence: u64,
     pub(super) session_name: Option<rmux_proto::SessionName>,
     pub(super) session_id: Option<SessionId>,
     pub(super) last_session: Option<rmux_proto::SessionName>,
@@ -380,6 +381,7 @@ impl RequestHandler {
         }
         let drain_deadline = tokio::time::Instant::now() + drain_timeout;
         let (control_id, replaced_session, detached_event) = loop {
+            let activity_sequence = self.next_client_activity_sequence();
             // Session lifecycle events and the logical client replacement
             // share the established state -> active-control lock order. This
             // keeps the detach ticket at the exact replacement boundary.
@@ -430,6 +432,7 @@ impl RequestHandler {
                     requester_pid,
                     ActiveControl {
                         id: control_id,
+                        last_activity_sequence: activity_sequence,
                         session_name: None,
                         session_id: None,
                         last_session: None,
@@ -490,6 +493,22 @@ impl RequestHandler {
         }
 
         Ok(control_id)
+    }
+
+    pub(crate) async fn record_control_client_activity(
+        &self,
+        identity: ControlClientIdentity,
+    ) -> bool {
+        let activity_sequence = self.next_client_activity_sequence();
+        let mut active_control = self.active_control.lock().await;
+        let Some(active) = active_control.by_pid.get_mut(&identity.requester_pid()) else {
+            return false;
+        };
+        if active.id != identity.control_id() || active.closing.load(Ordering::SeqCst) {
+            return false;
+        }
+        active.last_activity_sequence = activity_sequence;
+        true
     }
 
     pub(crate) async fn begin_control_queue_drain(

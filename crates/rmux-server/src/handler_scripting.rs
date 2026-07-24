@@ -15,7 +15,7 @@ use super::attach_support::ActiveAttachIdentity;
 use super::client_support::capture_switch_client_target_identity;
 use super::control_support::{
     control_queue_eof_action, current_control_queue_identity, with_control_queue_identity,
-    ControlClientIdentity, ControlQueueEofAction,
+    ControlClientIdentity, ControlQueueEofAction, ManagedClient,
 };
 #[cfg(windows)]
 use super::pane_support::format_references_pane_pid;
@@ -153,6 +153,7 @@ tokio::task_local! {
 pub(in crate::handler) enum QueuedDisplayTargetClient {
     Missing,
     Attached(ActiveAttachIdentity),
+    Control(ControlClientIdentity),
     ResolutionError(RmuxError),
 }
 
@@ -191,18 +192,35 @@ impl RequestHandler {
             _ => return None,
         };
         if target_client.is_none() {
-            return current_expected_attach_identity().map(QueuedDisplayTargetClient::Attached);
+            return current_expected_attach_identity()
+                .map(QueuedDisplayTargetClient::Attached)
+                .or_else(|| {
+                    current_control_queue_identity(requester_pid)
+                        .map(QueuedDisplayTargetClient::Control)
+                });
         }
         Some(
             match self
-                .find_target_attach_client_identity(
+                .find_display_message_client(
                     requester_pid,
                     target_client.expect("target client was checked above"),
-                    "display-message",
                 )
                 .await
             {
-                Ok(Some(identity)) => QueuedDisplayTargetClient::Attached(identity),
+                Ok(Some(ManagedClient::Attach { pid, attach_id })) => {
+                    let active_attach = self.active_attach.lock().await;
+                    match active_attach
+                        .by_pid
+                        .get(&pid)
+                        .filter(|active| active.id == attach_id)
+                    {
+                        Some(active) => QueuedDisplayTargetClient::Attached(active.identity(pid)),
+                        None => QueuedDisplayTargetClient::Missing,
+                    }
+                }
+                Ok(Some(ManagedClient::Control(identity))) => {
+                    QueuedDisplayTargetClient::Control(identity)
+                }
                 Ok(None) => QueuedDisplayTargetClient::Missing,
                 Err(error) => QueuedDisplayTargetClient::ResolutionError(error),
             },
@@ -310,6 +328,12 @@ impl RequestHandler {
         expected_control_id: u64,
         commands: ParsedCommands,
     ) -> ControlCommandResult {
+        let _ = self
+            .record_control_client_activity(ControlClientIdentity::new(
+                requester_pid,
+                expected_control_id,
+            ))
+            .await;
         self.execute_command_queue(
             requester_pid,
             commands,

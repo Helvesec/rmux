@@ -282,45 +282,58 @@ impl RequestHandler {
         Ok(None)
     }
 
-    pub(in crate::handler) async fn find_target_attach_client_identity(
+    pub(in crate::handler) async fn find_display_message_client(
         &self,
         requester_pid: u32,
         target_client: &str,
-        command_name: &str,
-    ) -> Result<Option<ActiveAttachIdentity>, RmuxError> {
+    ) -> Result<Option<ManagedClient>, RmuxError> {
         let target_client = normalize_target_client(target_client);
         if target_client == "=" {
-            let attach_pid = self
-                .resolve_target_attach_client_pid(requester_pid, Some(target_client), command_name)
-                .await?;
-            return Ok(self.active_attach_identity(attach_pid).await);
+            return self
+                .resolve_target_managed_client(
+                    requester_pid,
+                    Some(target_client),
+                    "display-message",
+                )
+                .await
+                .map(Some);
         }
 
         {
             let active_attach = self.active_attach.lock().await;
-            if let Ok(pid) = target_client.parse::<u32>() {
-                if let Some(active) = active_attach.by_pid.get(&pid) {
-                    return Ok(Some(active.identity(pid)));
-                }
-            } else if let Some((&pid, active)) = active_attach
-                .by_pid
-                .iter()
-                .find(|(pid, _)| attached_client_matches_target(**pid, target_client))
-            {
-                return Ok(Some(active.identity(pid)));
+            let attached = if let Ok(pid) = target_client.parse::<u32>() {
+                active_attach.by_pid.get(&pid).and_then(|active| {
+                    (!active.closing.load(Ordering::SeqCst)).then_some(ManagedClient::Attach {
+                        pid,
+                        attach_id: active.id,
+                    })
+                })
+            } else {
+                active_attach
+                    .by_pid
+                    .iter()
+                    .filter(|(_, active)| !active.closing.load(Ordering::SeqCst))
+                    .find(|(pid, _)| attached_client_matches_target(**pid, target_client))
+                    .map(|(&pid, active)| ManagedClient::Attach {
+                        pid,
+                        attach_id: active.id,
+                    })
+            };
+            if attached.is_some() {
+                return Ok(attached);
             }
         }
 
         let active_control = self.active_control.lock().await;
-        if let Ok(pid) = target_client.parse::<u32>() {
-            if active_control.by_pid.contains_key(&pid) {
-                return Err(RmuxError::Server(format!(
-                    "{command_name} requires an attached client"
-                )));
-            }
-        }
-
-        Ok(None)
+        // list-clients exposes a control client under its decimal PID, which
+        // is also the canonical typed target accepted by the shared resolver.
+        Ok(target_client.parse::<u32>().ok().and_then(|pid| {
+            active_control.by_pid.get(&pid).and_then(|active| {
+                (!active.closing.load(Ordering::SeqCst)).then_some(ManagedClient::Control(
+                    super::control_support::ControlClientIdentity::new(pid, active.id),
+                ))
+            })
+        }))
     }
 
     pub(in crate::handler) async fn resolve_target_attach_client_pid(

@@ -413,7 +413,8 @@ impl RequestHandler {
             })
             .ok_or_else(|| io_other("attached client disappeared"))?;
         if active.can_write && !active.flags.contains(ClientFlags::READONLY) {
-            let _ = active_attach.record_client_activity(identity.attach_pid());
+            let sequence = self.next_client_activity_sequence();
+            let _ = active_attach.record_client_activity(identity.attach_pid(), sequence);
         }
         Ok(())
     }

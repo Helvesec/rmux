@@ -12,10 +12,13 @@ use rmux_proto::{
     Target, TerminalSize,
 };
 
+use super::super::control_support::{
+    current_control_queue_identity, ManagedClient as ManagedDisplayClient,
+};
 use super::super::target_support::{pane_id_target, requester_environment_pane_id};
 use super::super::{
-    current_expected_attach_identity, format_client_uid, format_client_user, ListClientSnapshot,
-    RequestHandler,
+    current_expected_attach_identity, format_client_uid, format_client_user, ControlClientIdentity,
+    ListClientSnapshot, RequestHandler,
 };
 #[cfg(windows)]
 use super::pane_deferred_wait::format_references_pane_pid;
@@ -42,6 +45,12 @@ struct DisplayMessageInvocation {
     route_control_to_target_session: bool,
     duration_ms: Option<rmux_proto::DisplayMessageDurationMillis>,
     ignore_input: bool,
+}
+
+#[derive(Clone, Copy)]
+enum DisplayMessageClient {
+    Attached(ActiveAttachIdentity),
+    Control(ControlClientIdentity),
 }
 
 impl RequestHandler {
@@ -142,21 +151,139 @@ impl RequestHandler {
             })
     }
 
+    async fn display_message_client_from_managed(
+        &self,
+        client: ManagedDisplayClient,
+    ) -> Option<DisplayMessageClient> {
+        match client {
+            ManagedDisplayClient::Attach { pid, attach_id } => {
+                let active_attach = self.active_attach.lock().await;
+                active_attach
+                    .by_pid
+                    .get(&pid)
+                    .filter(|active| {
+                        active.id == attach_id
+                            && !active.closing.load(std::sync::atomic::Ordering::SeqCst)
+                    })
+                    .map(|active| DisplayMessageClient::Attached(active.identity(pid)))
+            }
+            ManagedDisplayClient::Control(identity) => {
+                Some(DisplayMessageClient::Control(identity))
+            }
+        }
+    }
+
     async fn recent_display_message_client(
         &self,
         session: Option<&rmux_proto::SessionName>,
-    ) -> Option<ActiveAttachIdentity> {
-        let active_attach = self.active_attach.lock().await;
-        active_attach
-            .by_pid
-            .iter()
-            .filter(|(_, active)| {
-                !active.suspended
-                    && !active.closing.load(std::sync::atomic::Ordering::SeqCst)
-                    && session.is_none_or(|name| &active.session_name == name)
-            })
-            .max_by_key(|(_, active)| (active.last_activity_sequence, active.id))
-            .map(|(pid, active)| active.identity(*pid))
+    ) -> Option<DisplayMessageClient> {
+        let attached = {
+            let active_attach = self.active_attach.lock().await;
+            active_attach
+                .by_pid
+                .iter()
+                .filter(|(_, active)| {
+                    !active.suspended
+                        && !active.closing.load(std::sync::atomic::Ordering::SeqCst)
+                        && session.is_none_or(|name| &active.session_name == name)
+                })
+                .max_by_key(|(_, active)| (active.last_activity_sequence, active.id))
+                .map(|(pid, active)| {
+                    (
+                        active.last_activity_sequence,
+                        DisplayMessageClient::Attached(active.identity(*pid)),
+                    )
+                })
+        };
+        let control = {
+            let active_control = self.active_control.lock().await;
+            active_control
+                .by_pid
+                .iter()
+                .filter(|(_, active)| {
+                    !active.closing.load(std::sync::atomic::Ordering::SeqCst)
+                        && session.is_none_or(|name| active.session_name.as_ref() == Some(name))
+                })
+                .max_by_key(|(_, active)| (active.last_activity_sequence, active.id))
+                .map(|(pid, active)| {
+                    (
+                        active.last_activity_sequence,
+                        DisplayMessageClient::Control(ControlClientIdentity::new(*pid, active.id)),
+                    )
+                })
+        };
+        match (attached, control) {
+            (Some((attached_activity, attached)), Some((control_activity, control))) => {
+                Some(if control_activity > attached_activity {
+                    control
+                } else {
+                    attached
+                })
+            }
+            (Some((_, attached)), None) => Some(attached),
+            (None, Some((_, control))) => Some(control),
+            (None, None) => None,
+        }
+    }
+
+    async fn display_message_client_session(
+        &self,
+        client: DisplayMessageClient,
+    ) -> Result<Option<(rmux_proto::SessionName, rmux_proto::SessionId)>, RmuxError> {
+        match client {
+            DisplayMessageClient::Attached(identity) => self
+                .attached_session_identity_for_identity(identity)
+                .await
+                .map(Some),
+            DisplayMessageClient::Control(identity) => {
+                let active_control = self.active_control.lock().await;
+                let active = active_control
+                    .by_pid
+                    .get(&identity.requester_pid())
+                    .filter(|active| {
+                        active.id == identity.control_id()
+                            && !active.closing.load(std::sync::atomic::Ordering::SeqCst)
+                    })
+                    .ok_or_else(|| RmuxError::Server("control client disappeared".to_owned()))?;
+                match (&active.session_name, active.session_id) {
+                    (Some(session_name), Some(session_id)) => {
+                        Ok(Some((session_name.clone(), session_id)))
+                    }
+                    (None, None) => Ok(None),
+                    _ => Err(RmuxError::Server(
+                        "control client has an invalid session identity".to_owned(),
+                    )),
+                }
+            }
+        }
+    }
+
+    async fn send_display_message_to_control_session_identity(
+        &self,
+        session_name: &rmux_proto::SessionName,
+        session_id: rmux_proto::SessionId,
+        message: &str,
+    ) -> bool {
+        let identities = {
+            let active_control = self.active_control.lock().await;
+            active_control
+                .by_pid
+                .iter()
+                .filter(|(_, active)| {
+                    active.session_name.as_ref() == Some(session_name)
+                        && active.session_id == Some(session_id)
+                        && !active.closing.load(std::sync::atomic::Ordering::SeqCst)
+                })
+                .map(|(pid, active)| ControlClientIdentity::new(*pid, active.id))
+                .collect::<Vec<_>>()
+        };
+        let delivered = !identities.is_empty();
+        let line = format_control_message_line(message);
+        for identity in identities {
+            self.send_control_notification_to_queue(identity, line.clone())
+                .await;
+        }
+        delivered
     }
 
     async fn handle_display_message_inner(
@@ -176,34 +303,29 @@ impl RequestHandler {
             ignore_input,
         } = invocation;
         let explicit_display_client = match queued_display_target_client() {
-            Some(QueuedDisplayTargetClient::Attached(identity)) => Some(identity),
+            Some(QueuedDisplayTargetClient::Attached(identity)) => {
+                Some(DisplayMessageClient::Attached(identity))
+            }
+            Some(QueuedDisplayTargetClient::Control(identity)) => {
+                Some(DisplayMessageClient::Control(identity))
+            }
             Some(QueuedDisplayTargetClient::Missing) if print => None,
             Some(QueuedDisplayTargetClient::Missing) => {
                 return Response::DisplayMessage(DisplayMessageResponse::no_output());
-            }
-            Some(QueuedDisplayTargetClient::ResolutionError(error))
-                if print && display_message_client_is_control_only(&error) =>
-            {
-                None
             }
             Some(QueuedDisplayTargetClient::ResolutionError(error)) => {
                 return Response::Error(ErrorResponse { error });
             }
             None => match target_client.as_deref() {
                 Some(target_client) => match self
-                    .find_target_attach_client_identity(
-                        requester_pid,
-                        target_client,
-                        "display-message",
-                    )
+                    .find_display_message_client(requester_pid, target_client)
                     .await
                 {
-                    Ok(Some(identity)) => Some(identity),
+                    Ok(Some(client)) => self.display_message_client_from_managed(client).await,
                     Ok(None) if print => None,
                     Ok(None) => {
                         return Response::DisplayMessage(DisplayMessageResponse::no_output());
                     }
-                    Err(error) if print && display_message_client_is_control_only(&error) => None,
                     Err(error) => return Response::Error(ErrorResponse { error }),
                 },
                 None => None,
@@ -211,8 +333,8 @@ impl RequestHandler {
         };
         let requester_is_control = self.is_control_client(requester_pid).await;
         let captured_target_client_session = match explicit_display_client {
-            Some(identity) => match self.attached_session_identity_for_identity(identity).await {
-                Ok(session) => Some(session),
+            Some(identity) => match self.display_message_client_session(identity).await {
+                Ok(session) => session,
                 Err(error) => return Response::Error(ErrorResponse { error }),
             },
             None => None,
@@ -221,12 +343,18 @@ impl RequestHandler {
             .is_none()
             .then(|| captured_target_client_session.clone())
             .flatten();
-        let resolved_requester_client = match current_expected_attach_identity() {
-            Some(identity) => Some(identity),
-            None => self
-                .resolve_target_attach_client_identity(requester_pid, None, "display-message")
+        let resolved_requester_client = if let Some(identity) = current_expected_attach_identity() {
+            Some(DisplayMessageClient::Attached(identity))
+        } else if let Some(identity) = current_control_queue_identity(requester_pid) {
+            Some(DisplayMessageClient::Control(identity))
+        } else {
+            match self
+                .resolve_target_managed_client(requester_pid, None, "display-message")
                 .await
-                .ok(),
+            {
+                Ok(client) => self.display_message_client_from_managed(client).await,
+                Err(_) => None,
+            }
         };
         let requester_environment_target = {
             let socket_path = self.socket_path();
@@ -260,8 +388,8 @@ impl RequestHandler {
             explicit_display_client.or(format_fallback_client)
         };
         let display_client_session = match display_client {
-            Some(identity) => match self.attached_session_identity_for_identity(identity).await {
-                Ok(session) => Some(session),
+            Some(identity) => match self.display_message_client_session(identity).await {
+                Ok(session) => session,
                 Err(error) if explicit_display_client.is_some() => {
                     return Response::Error(ErrorResponse { error });
                 }
@@ -285,13 +413,25 @@ impl RequestHandler {
                 .or(display_client),
             (None, _) => format_fallback_client.or(display_client),
         };
-        let format_client_pid = format_client.map(ActiveAttachIdentity::attach_pid);
-        let format_client_snapshot = match format_client_pid {
-            Some(attach_pid) => self
+        let format_client_snapshot = match format_client {
+            Some(DisplayMessageClient::Attached(identity)) => self
                 .list_clients_snapshot()
                 .await
                 .into_iter()
-                .find(|client| !client.control && client.pid == attach_pid),
+                .find(|client| {
+                    !client.control
+                        && client.pid == identity.attach_pid()
+                        && client.order == identity.attach_id()
+                }),
+            Some(DisplayMessageClient::Control(identity)) => self
+                .list_clients_snapshot()
+                .await
+                .into_iter()
+                .find(|client| {
+                    client.control
+                        && client.pid == identity.requester_pid()
+                        && client.order == identity.control_id()
+                }),
             None => None,
         };
         let attached_session_name = if target.is_none() {
@@ -515,17 +655,26 @@ impl RequestHandler {
             super::super::attach_support::TransientMessageInputPolicy::DismissAndForward
         };
         let delivered = if route_control_to_target_session {
-            self.send_attached_overlay_to_session_identity(
-                &session_name,
-                display_session_id,
-                expanded.clone(),
-                duration,
-                input_policy,
-            )
-            .await
+            let attached = self
+                .send_attached_overlay_to_session_identity(
+                    &session_name,
+                    display_session_id,
+                    expanded.clone(),
+                    duration,
+                    input_policy,
+                )
+                .await;
+            let control = self
+                .send_display_message_to_control_session_identity(
+                    &session_name,
+                    display_session_id,
+                    &expanded,
+                )
+                .await;
+            attached || control
         } else {
             match display_client {
-                Some(identity) => {
+                Some(DisplayMessageClient::Attached(identity)) => {
                     self.send_attached_overlay_to_client_identity(
                         identity,
                         Some(display_session_id),
@@ -534,6 +683,14 @@ impl RequestHandler {
                         input_policy,
                     )
                     .await
+                }
+                Some(DisplayMessageClient::Control(identity)) => {
+                    self.send_control_notification_to_queue(
+                        identity,
+                        format_control_message_line(&expanded),
+                    )
+                    .await;
+                    true
                 }
                 None => false,
             }
@@ -606,13 +763,6 @@ impl RequestHandler {
         };
         Response::ListPanes(ListPanesResponse { output })
     }
-}
-
-fn display_message_client_is_control_only(error: &RmuxError) -> bool {
-    matches!(
-        error,
-        RmuxError::Server(message) if message == "display-message requires an attached client"
-    )
 }
 
 fn display_message_stable_target_moved(response: &Response) -> bool {

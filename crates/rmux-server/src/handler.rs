@@ -289,6 +289,7 @@ pub(crate) struct RequestHandler {
     clipboard_queries: Arc<StdMutex<ClipboardQueryState>>,
     active_attach_epoch: Arc<AtomicU64>,
     active_attach_forwarders: Arc<AtomicUsize>,
+    client_activity_sequence: Arc<AtomicU64>,
     active_control: Arc<Mutex<ActiveControlState>>,
     silence_timers: Arc<StdMutex<HashMap<WindowTarget, alert_support::SilenceTimerState>>>,
     pane_alert_coalescer: Arc<StdMutex<alert_support::PaneAlertCoalescer>>,
@@ -382,6 +383,7 @@ impl Clone for RequestHandler {
             clipboard_queries: self.clipboard_queries.clone(),
             active_attach_epoch: self.active_attach_epoch.clone(),
             active_attach_forwarders: self.active_attach_forwarders.clone(),
+            client_activity_sequence: self.client_activity_sequence.clone(),
             active_control: self.active_control.clone(),
             silence_timers: self.silence_timers.clone(),
             pane_alert_coalescer: self.pane_alert_coalescer.clone(),
@@ -464,6 +466,7 @@ pub(crate) struct WeakRequestHandler {
     clipboard_queries: Weak<StdMutex<ClipboardQueryState>>,
     active_attach_epoch: Weak<AtomicU64>,
     active_attach_forwarders: Weak<AtomicUsize>,
+    client_activity_sequence: Weak<AtomicU64>,
     active_control: Weak<Mutex<ActiveControlState>>,
     silence_timers: Weak<StdMutex<HashMap<WindowTarget, alert_support::SilenceTimerState>>>,
     pane_alert_coalescer: Weak<StdMutex<alert_support::PaneAlertCoalescer>>,
@@ -524,6 +527,7 @@ impl WeakRequestHandler {
             clipboard_queries: self.clipboard_queries.upgrade()?,
             active_attach_epoch: self.active_attach_epoch.upgrade()?,
             active_attach_forwarders: self.active_attach_forwarders.upgrade()?,
+            client_activity_sequence: self.client_activity_sequence.upgrade()?,
             active_control: self.active_control.upgrade()?,
             silence_timers: self.silence_timers.upgrade()?,
             pane_alert_coalescer: self.pane_alert_coalescer.upgrade()?,
@@ -808,6 +812,7 @@ impl RequestHandler {
             clipboard_queries: Arc::new(StdMutex::new(ClipboardQueryState::default())),
             active_attach_epoch: Arc::new(AtomicU64::new(0)),
             active_attach_forwarders: Arc::new(AtomicUsize::new(0)),
+            client_activity_sequence: Arc::new(AtomicU64::new(0)),
             active_control: Arc::new(Mutex::new(ActiveControlState::default())),
             silence_timers: Arc::new(StdMutex::new(HashMap::new())),
             pane_alert_coalescer: Arc::new(StdMutex::new(
@@ -904,6 +909,7 @@ impl RequestHandler {
             clipboard_queries: Arc::downgrade(&self.clipboard_queries),
             active_attach_epoch: Arc::downgrade(&self.active_attach_epoch),
             active_attach_forwarders: Arc::downgrade(&self.active_attach_forwarders),
+            client_activity_sequence: Arc::downgrade(&self.client_activity_sequence),
             active_control: Arc::downgrade(&self.active_control),
             silence_timers: Arc::downgrade(&self.silence_timers),
             pane_alert_coalescer: Arc::downgrade(&self.pane_alert_coalescer),
@@ -960,6 +966,11 @@ impl RequestHandler {
 
     pub(crate) fn allocate_connection_id(&self) -> u64 {
         self.next_connection_id.fetch_add(1, Ordering::Relaxed)
+    }
+
+    pub(in crate::handler) fn next_client_activity_sequence(&self) -> u64 {
+        self.client_activity_sequence
+            .fetch_add(1, Ordering::Relaxed)
     }
 
     pub(in crate::handler) fn bump_active_attach_epoch(&self) {

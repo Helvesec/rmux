@@ -163,6 +163,70 @@ async fn parsed_queue_display_message_print_ignores_missing_target_client() {
 }
 
 #[tokio::test]
+async fn parsed_queue_display_message_targets_control_client_with_initiator_context() {
+    let handler = RequestHandler::new();
+    let alpha = session_name("display-control-alpha");
+    let detached = session_name("display-control-detached");
+    for session_name in [alpha.clone(), detached.clone()] {
+        assert!(matches!(
+            handler
+                .handle(Request::NewSession(NewSessionRequest {
+                    session_name,
+                    detached: true,
+                    size: Some(TerminalSize { cols: 80, rows: 24 }),
+                    environment: None,
+                }))
+                .await,
+            Response::NewSession(_)
+        ));
+    }
+    let requester_pid = 99_613;
+    let (control_id, mut events) =
+        register_control_for_session(&handler, requester_pid, alpha.clone()).await;
+    while events.try_recv().is_ok() {}
+    let identity = ControlClientIdentity::new(requester_pid, control_id);
+    let template = "#{session_name}|#{client_session}|#{client_name}";
+
+    let parsed = CommandParser::new()
+        .parse(&format!(
+            "display-message -p -c {requester_pid} -t {detached} '{template}'"
+        ))
+        .expect("queued control display-message parses");
+    let output = with_control_queue_identity(
+        identity,
+        handler.execute_parsed_commands_for_test(requester_pid, parsed),
+    )
+    .await
+    .expect("queued control display-message prints");
+    assert_eq!(
+        output.stdout(),
+        format!("{detached}|{alpha}|{requester_pid}\n").as_bytes()
+    );
+
+    let parsed = CommandParser::new()
+        .parse(&format!(
+            "display-message -c {requester_pid} -t {detached} '{template}'"
+        ))
+        .expect("queued control overlay parses");
+    with_control_queue_identity(
+        identity,
+        handler.execute_parsed_commands_for_test(requester_pid, parsed),
+    )
+    .await
+    .expect("queued control overlay executes");
+    let notification = std::iter::from_fn(|| events.try_recv().ok())
+        .find_map(|event| match event {
+            ControlServerEvent::Notification(line) => Some(line),
+            _ => None,
+        })
+        .expect("target control client receives a message notification");
+    assert_eq!(
+        notification,
+        format!("%message {detached}|{alpha}|{requester_pid}")
+    );
+}
+
+#[tokio::test]
 async fn parsed_queue_send_keys_c_missing_client_is_noop() {
     let handler = RequestHandler::new();
 

@@ -196,9 +196,7 @@ impl RequestHandler {
             active_attach.next_id += 1;
             let size_sequence = active_attach.next_size_sequence;
             active_attach.next_size_sequence = active_attach.next_size_sequence.saturating_add(1);
-            let activity_sequence = active_attach.next_activity_sequence;
-            active_attach.next_activity_sequence =
-                active_attach.next_activity_sequence.saturating_add(1);
+            let activity_sequence = self.next_client_activity_sequence();
             let control_backlog = registration.control_backlog;
             let control_tx = AttachControlSender::new(
                 registration.control_tx,

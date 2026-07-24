@@ -1208,11 +1208,12 @@ async fn direct_display_message_delivers_to_recent_client_but_formats_for_target
         Some(format!("format-alpha|format-alpha|{alpha_pid}\n").as_bytes())
     );
 
+    let activity_sequence = handler.next_client_activity_sequence();
     assert!(handler
         .active_attach
         .lock()
         .await
-        .record_client_activity(alpha_pid));
+        .record_client_activity(alpha_pid, activity_sequence));
     let response = handler
         .handle_display_message_ext(
             7_778,

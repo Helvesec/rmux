@@ -4,13 +4,14 @@ use std::time::Duration;
 
 use super::RequestHandler;
 use crate::control::{ControlModeUpgrade, ControlServerEvent, CONTROL_SERVER_EVENT_CAPACITY};
+use crate::pane_io::AttachControl;
 use rmux_core::LifecycleEvent;
 use rmux_proto::{
-    ControlMode, DeleteBufferRequest, DetachClientRequest, DisplayMessageRequest, HookLifecycle,
-    HookName, KillSessionRequest, KillWindowRequest, NewSessionRequest, NewWindowRequest,
-    RenameSessionRequest, RenameWindowRequest, Request, Response, ScopeSelector,
-    SelectWindowRequest, SessionName, SetBufferRequest, SetHookRequest, ShowOptionsRequest,
-    SwitchClientRequest, Target, TerminalSize, WindowTarget,
+    ControlMode, DeleteBufferRequest, DetachClientRequest, DisplayMessageExtRequest,
+    DisplayMessageRequest, HookLifecycle, HookName, KillSessionRequest, KillWindowRequest,
+    NewSessionRequest, NewWindowRequest, RenameSessionRequest, RenameWindowRequest, Request,
+    Response, ScopeSelector, SelectWindowRequest, SessionName, SetBufferRequest, SetHookRequest,
+    ShowOptionsRequest, SwitchClientRequest, Target, TerminalSize, WindowTarget,
 };
 use tokio::sync::mpsc;
 
@@ -663,7 +664,9 @@ async fn detached_control_clients_skip_session_scoped_window_notifications() {
 async fn display_message_for_control_client_uses_message_notification() {
     let handler = RequestHandler::new();
     let alpha = session_name("alpha");
+    let detached = session_name("detached");
     new_session(&handler, &alpha).await;
+    new_session(&handler, &detached).await;
 
     let mut control_rx = register_control_client(&handler, 610, Some(alpha.clone())).await;
     let _ = drain_control_notifications(&mut control_rx);
@@ -672,9 +675,9 @@ async fn display_message_for_control_client_uses_message_notification() {
         &handler,
         610,
         Request::DisplayMessage(DisplayMessageRequest {
-            target: Some(Target::Session(alpha)),
+            target: Some(Target::Session(alpha.clone())),
             print: false,
-            message: Some("hello\t#{session_name}".to_owned()),
+            message: Some("hello\t#{session_name}|#{client_session}|#{client_name}".to_owned()),
             empty_target_context: false,
         }),
     )
@@ -686,7 +689,193 @@ async fn display_message_for_control_client_uses_message_notification() {
     );
     assert_eq!(
         drain_control_notifications(&mut control_rx),
-        vec!["%message hello\\talpha".to_owned()]
+        vec!["%message hello\\talpha|alpha|610".to_owned()]
+    );
+
+    let response = dispatch_as(
+        &handler,
+        610,
+        Request::DisplayMessage(DisplayMessageRequest {
+            target: Some(Target::Session(detached.clone())),
+            print: false,
+            message: Some("#{session_name}|#{client_session}|#{client_name}".to_owned()),
+            empty_target_context: false,
+        }),
+    )
+    .await;
+    assert!(matches!(response, Response::DisplayMessage(_)));
+    assert_eq!(
+        drain_control_notifications(&mut control_rx),
+        vec!["%message detached|alpha|610".to_owned()]
+    );
+
+    let response = dispatch_as(
+        &handler,
+        99_610,
+        Request::DisplayMessage(DisplayMessageRequest {
+            target: Some(Target::Session(alpha)),
+            print: false,
+            message: Some("external #{client_session}|#{client_name}".to_owned()),
+            empty_target_context: false,
+        }),
+    )
+    .await;
+    assert!(matches!(response, Response::DisplayMessage(_)));
+    assert_eq!(
+        drain_control_notifications(&mut control_rx),
+        vec!["%message external alpha|610".to_owned()]
+    );
+
+    let response = dispatch_as(
+        &handler,
+        99_611,
+        Request::DisplayMessageExt(Box::new(DisplayMessageExtRequest {
+            target: Some(Target::Session(detached.clone())),
+            print: true,
+            message: Some("#{session_name}|#{client_session}|#{client_name}".to_owned()),
+            target_client: Some("610".to_owned()),
+            empty_target_context: false,
+            duration_ms: None,
+            ignore_input: false,
+        })),
+    )
+    .await;
+    assert_eq!(
+        response.command_output().map(|output| output.stdout()),
+        Some(b"detached|alpha|610\n".as_slice())
+    );
+
+    let response = dispatch_as(
+        &handler,
+        99_612,
+        Request::DisplayMessageExt(Box::new(DisplayMessageExtRequest {
+            target: Some(Target::Session(detached.clone())),
+            print: false,
+            message: Some("targeted #{client_session}|#{client_name}".to_owned()),
+            target_client: Some("610".to_owned()),
+            empty_target_context: false,
+            duration_ms: None,
+            ignore_input: false,
+        })),
+    )
+    .await;
+    assert!(matches!(response, Response::DisplayMessage(_)));
+    assert_eq!(
+        drain_control_notifications(&mut control_rx),
+        vec!["%message targeted alpha|610".to_owned()]
+    );
+
+    let mut second_alpha_rx =
+        register_control_client(&handler, 611, Some(session_name("alpha"))).await;
+    let mut beta_rx = register_control_client(&handler, 612, Some(detached)).await;
+    let _ = drain_control_notifications(&mut second_alpha_rx);
+    let _ = drain_control_notifications(&mut beta_rx);
+    let pane_id = handler
+        .state
+        .lock()
+        .await
+        .sessions
+        .session(&session_name("alpha"))
+        .and_then(rmux_core::Session::active_pane_id)
+        .expect("alpha active pane");
+    let response = handler
+        .handle_display_message_for_stable_pane(
+            99_613,
+            pane_id,
+            DisplayMessageRequest {
+                target: Some(Target::Session(session_name("alpha"))),
+                print: false,
+                message: Some("stable #{client_session}|#{client_name}".to_owned()),
+                empty_target_context: false,
+            },
+        )
+        .await;
+    assert!(matches!(response, Response::DisplayMessage(_)));
+    assert_eq!(
+        drain_control_notifications(&mut control_rx),
+        vec!["%message stable alpha|611".to_owned()]
+    );
+    assert_eq!(
+        drain_control_notifications(&mut second_alpha_rx),
+        vec!["%message stable alpha|611".to_owned()]
+    );
+    assert!(drain_control_notifications(&mut beta_rx).is_empty());
+}
+
+#[tokio::test]
+async fn display_message_orders_attached_and_control_clients_by_shared_activity() {
+    // tmux 3.7b chooses the most recently active client across both client
+    // types. Registration is initial activity; later accepted attached input
+    // moves the attached client ahead of the control client.
+    let handler = RequestHandler::new();
+    let alpha = session_name("alpha");
+    new_session(&handler, &alpha).await;
+
+    let attach_pid = 620;
+    let (attach_tx, mut attach_rx) = mpsc::unbounded_channel();
+    handler
+        .register_attach(attach_pid, alpha.clone(), attach_tx)
+        .await;
+    let mut control_rx = register_control_client(&handler, 621, Some(alpha.clone())).await;
+    let _ = drain_control_notifications(&mut control_rx);
+
+    let request = || {
+        Request::DisplayMessage(DisplayMessageRequest {
+            target: Some(Target::Session(alpha.clone())),
+            print: false,
+            message: Some("activity".to_owned()),
+            empty_target_context: false,
+        })
+    };
+    assert!(matches!(
+        dispatch_as(&handler, 99_620, request()).await,
+        Response::DisplayMessage(_)
+    ));
+    assert_eq!(
+        drain_control_notifications(&mut control_rx),
+        vec!["%message activity".to_owned()]
+    );
+    assert!(attach_rx.try_recv().is_err());
+
+    let activity_sequence = handler.next_client_activity_sequence();
+    assert!(handler
+        .active_attach
+        .lock()
+        .await
+        .record_client_activity(attach_pid, activity_sequence));
+    assert!(matches!(
+        dispatch_as(&handler, 99_621, request()).await,
+        Response::DisplayMessage(_)
+    ));
+    assert!(drain_control_notifications(&mut control_rx).is_empty());
+    assert!(matches!(
+        attach_rx.recv().await,
+        Some(AttachControl::Overlay(_))
+    ));
+
+    let control_id = handler
+        .active_control
+        .lock()
+        .await
+        .by_pid
+        .get(&621)
+        .expect("control client remains active")
+        .id;
+    let commands = handler
+        .parse_control_commands("display-message -p control-activity")
+        .await
+        .expect("control command parses");
+    let result = handler
+        .execute_control_commands_identity(621, control_id, commands)
+        .await;
+    assert!(result.error.is_none(), "{:?}", result.error);
+    assert!(matches!(
+        dispatch_as(&handler, 99_622, request()).await,
+        Response::DisplayMessage(_)
+    ));
+    assert_eq!(
+        drain_control_notifications(&mut control_rx),
+        vec!["%message activity".to_owned()]
     );
 }
 
