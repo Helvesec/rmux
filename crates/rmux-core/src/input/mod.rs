@@ -13,6 +13,7 @@ mod dispatch;
 pub mod mode;
 mod params;
 mod passthrough;
+mod recovery;
 mod sgr;
 mod states;
 mod tables;

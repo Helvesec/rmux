@@ -4,11 +4,12 @@ use rmux_core::{render_dec_modes_for_snapshot, GridRenderOptions, Screen, Screen
 use crate::pane_transcript::PaneTranscript;
 
 const RESET_PREFIX: &[u8] =
-    b"\x1b[?2026l\x1b[?1049l\x1b[?6l\x1b[r\x1b[0m\x1b]8;;\x1b\\\x1b[?25l\x1b[3J\x1b[2J\x1b[H";
+    b"\x1b[?2026l\x1b[?1049l\x1b[?6l\x1b[r\x1b[0m\x1b]8;;\x1b\\\x1b[?25l\x1b[2J\x1b[3J\x1b[H";
 const ALT_SCREEN_PREFIX: &[u8] =
-    b"\x1b[?1049h\x1b[?6l\x1b[r\x1b[0m\x1b]8;;\x1b\\\x1b[?25l\x1b[3J\x1b[2J\x1b[H";
+    b"\x1b[?1049h\x1b[?6l\x1b[r\x1b[0m\x1b]8;;\x1b\\\x1b[?25l\x1b[2J\x1b[H";
 const ALT_SCREEN_NO_CURSOR_PREFIX: &[u8] =
-    b"\x1b[?47h\x1b[?6l\x1b[r\x1b[0m\x1b]8;;\x1b\\\x1b[?25l\x1b[3J\x1b[2J\x1b[H";
+    b"\x1b[?47h\x1b[?6l\x1b[r\x1b[0m\x1b]8;;\x1b\\\x1b[?25l\x1b[2J\x1b[H";
+const RESET_RENDITION: &[u8] = b"\x1b[0m\x1b]8;;\x1b\\";
 
 /// Owned terminal state copied at an atomic pane boundary.
 pub(crate) struct PaneRecoverySeed {
@@ -17,6 +18,7 @@ pub(crate) struct PaneRecoverySeed {
     active_cell_state: Vec<u8>,
     saved_cell_state: Vec<u8>,
     saved_cursor: (u32, u32, bool),
+    parser_state: Vec<u8>,
     output_sequence: u64,
 }
 
@@ -36,6 +38,7 @@ impl PaneRecoverySeed {
             active_cell_state: transcript.active_cell_state_ansi(),
             saved_cell_state: transcript.saved_cell_state_ansi(),
             saved_cursor: transcript.saved_cursor_state(),
+            parser_state: transcript.recovery_parser_state_ansi(),
             output_sequence: transcript.output_sequence(),
         }
     }
@@ -62,7 +65,9 @@ impl PaneRecoverySeed {
 
     fn append_ansi(&self, out: &mut Vec<u8>) {
         out.extend_from_slice(RESET_PREFIX);
-        append_osc_text(out, 2, self.screen.title());
+        append_title_state(out, &self.screen);
+        append_osc_text(out, 7, self.screen.path());
+        out.extend_from_slice(&self.parser_state);
         if self.screen.is_alternate() {
             self.append_saved_main_screen(out);
             out.extend_from_slice(if self.screen.alternate_saved_cursor().is_some() {
@@ -72,7 +77,10 @@ impl PaneRecoverySeed {
             });
         }
 
-        append_ansi_rows(out, &snapshot_ansi_rows(&self.screen, true));
+        append_ansi_rows(
+            out,
+            &snapshot_ansi_rows(&self.screen, !self.screen.is_alternate()),
+        );
         append_scroll_region(out, &self.screen);
         // Repaint in the neutral reset state. Origin/insert modes and a
         // restricted scrolling region can otherwise redirect or scroll the
@@ -87,7 +95,7 @@ impl PaneRecoverySeed {
     fn append_saved_main_screen(&self, out: &mut Vec<u8>) {
         let rows = self
             .screen
-            .capture_saved_transcript_rows_independent(complete_capture_range(), capture_options());
+            .capture_saved_recovery_rows_independent(capture_options());
         if let Some(rows) = rows.as_deref() {
             append_ansi_rows(out, rows);
         }
@@ -112,6 +120,7 @@ impl PaneRecoverySeed {
     fn append_saved_decsc(&self, out: &mut Vec<u8>) {
         let (x, y, origin) = self.saved_cursor;
         out.extend_from_slice(b"\x1b[?6l");
+        out.extend_from_slice(RESET_RENDITION);
         out.extend_from_slice(&self.saved_cell_state);
         if origin {
             out.extend_from_slice(b"\x1b[?6h");
@@ -133,7 +142,7 @@ impl PaneRecoverySeed {
         } else {
             out.extend_from_slice(b"\x1b[?6l");
         }
-        out.extend_from_slice(b"\x1b[0m\x1b]8;;\x1b\\");
+        out.extend_from_slice(RESET_RENDITION);
         let lines = snapshot_ansi_lines(&self.screen);
         append_cursor_state(
             out,
@@ -147,7 +156,7 @@ impl PaneRecoverySeed {
         // Recreating pending-wrap may repaint the cursor cell and therefore
         // leave that cell's rendition active. Restore the parser rendition
         // after positioning so future raw bytes continue from the boundary.
-        out.extend_from_slice(b"\x1b[0m\x1b]8;;\x1b\\");
+        out.extend_from_slice(RESET_RENDITION);
         out.extend_from_slice(&self.active_cell_state);
         out.extend_from_slice(if self.screen.mode() & mode::MODE_CURSOR != 0 {
             b"\x1b[?25h"
@@ -155,6 +164,17 @@ impl PaneRecoverySeed {
             b"\x1b[?25l"
         });
     }
+}
+
+fn append_title_state(out: &mut Vec<u8>, screen: &Screen) {
+    for _ in 0..Screen::title_stack_limit() {
+        out.extend_from_slice(b"\x1b[23;2t");
+    }
+    for title in screen.title_stack() {
+        append_osc_text(out, 2, title);
+        out.extend_from_slice(b"\x1b[22;2t");
+    }
+    append_osc_text(out, 2, screen.title());
 }
 
 fn append_osc_text(out: &mut Vec<u8>, command: u8, value: &str) {
@@ -310,6 +330,12 @@ mod tests {
             actual.screen().scroll_region(),
             expected.screen().scroll_region()
         );
+        assert_eq!(actual.screen().title(), expected.screen().title());
+        assert_eq!(
+            actual.screen().title_stack(),
+            expected.screen().title_stack()
+        );
+        assert_eq!(actual.screen().path(), expected.screen().path());
         assert_eq!(actual.pending_bytes(), expected.pending_bytes());
     }
 
@@ -345,6 +371,14 @@ mod tests {
     }
 
     #[test]
+    fn keyframe_restores_default_decsc_rendition_absolutely() {
+        let initial =
+            b"\x1b[2;3H\x1b7\x1b[31m\x1b]8;id=active;https://example.test\x1b\\\x1b[5;10H";
+        let (actual, expected) = recovered(initial, b"\x1b8X");
+        assert_visible_equal(&actual, &expected);
+    }
+
+    #[test]
     fn keyframe_preserves_incomplete_parser_state() {
         let (actual, expected) = recovered(b"base\x1b[38;2;1", b"2;34;56mX");
         assert_visible_equal(&actual, &expected);
@@ -358,10 +392,44 @@ mod tests {
     }
 
     #[test]
+    fn keyframe_preserves_main_scrollback_while_alternate_is_active() {
+        let initial = b"one\r\ntwo\r\nthree\r\nfour\r\nfive\r\nsix\r\nseven\r\neight\x1b[?1049h\x1b[2J\x1b[Halt";
+        let (actual, expected) = recovered(initial, b"\x1b[?1049l\r\nTAIL");
+        assert_complete_equal(&actual, &expected);
+    }
+
+    #[test]
+    fn keyframe_replaces_stale_main_and_alternate_buffers() {
+        let initial = b"one\r\ntwo\r\nthree\r\nfour\r\nfive\r\nsix\r\nseven\r\neight\x1b[?1049h\x1b[2J\x1b[Halt";
+        let mut transcript = PaneTranscript::new(100, SIZE);
+        transcript.append_bytes(initial);
+        let keyframe = PaneRecoverySeed::capture(&transcript).keyframe();
+
+        let mut actual = TerminalScreen::new(SIZE, 100);
+        actual.feed(
+            b"stale-one\r\nstale-two\r\nstale-three\r\nstale-four\r\nstale-five\r\nstale-six\r\nstale-seven\x1b[?1049hstale-alt",
+        );
+        actual.feed(&keyframe.bytes);
+        actual.feed(b"\x1b[?1049l\r\nTAIL");
+
+        let mut expected = TerminalScreen::new(SIZE, 100);
+        expected.feed(initial);
+        expected.feed(b"\x1b[?1049l\r\nTAIL");
+        assert_complete_equal(&actual, &expected);
+    }
+
+    #[test]
     fn keyframe_preserves_saved_main_pending_wrap_while_alternate_is_active() {
         let initial = b"0123456789abcdef\x1b[?1049h\x1b[2J\x1b[Hdifferent-alt";
         let (actual, expected) = recovered(initial, b"\x1b[?1049lX");
         assert_visible_equal(&actual, &expected);
+    }
+
+    #[test]
+    fn keyframe_preserves_active_alternate_pending_wrap() {
+        let initial = b"main\x1b[?1049h0123456789abcdef";
+        let (actual, expected) = recovered(initial, b"X\x1b[?1049l");
+        assert_complete_equal(&actual, &expected);
     }
 
     #[test]
@@ -381,6 +449,63 @@ mod tests {
         let (actual, expected) = recovered("\u{1b}]2;hé-界\u{7}".as_bytes(), b"");
         assert_eq!(actual.screen().title(), expected.screen().title());
         assert_eq!(actual.screen().title(), "hé-界");
+    }
+
+    #[test]
+    fn keyframe_preserves_path_and_title_stack_for_continuation() {
+        let initial = b"\x1b]7;file:///srv/build\x1b\\\x1b]2;first\x1b\\\x1b[22;2t\x1b]2;second\x1b\\\x1b[22;2t\x1b]2;current\x1b\\";
+        let (actual, expected) = recovered(initial, b"\x1b[23;2t");
+        assert_visible_equal(&actual, &expected);
+        assert_eq!(actual.screen().path(), "file:///srv/build");
+        assert_eq!(actual.screen().title(), "second");
+    }
+
+    #[test]
+    fn keyframe_replaces_stale_title_stack_before_continuation() {
+        let initial =
+            b"\x1b]2;first\x1b\\\x1b[22;2t\x1b]2;second\x1b\\\x1b[22;2t\x1b]2;current\x1b\\";
+        let mut transcript = PaneTranscript::new(100, SIZE);
+        transcript.append_bytes(initial);
+        let keyframe = PaneRecoverySeed::capture(&transcript).keyframe();
+
+        let mut actual = TerminalScreen::new(SIZE, 100);
+        actual.feed(
+            b"\x1b]2;stale-a\x1b\\\x1b[22;2t\x1b]2;stale-b\x1b\\\x1b[22;2t\x1b]2;stale-current\x1b\\",
+        );
+        actual.feed(&keyframe.bytes);
+        actual.feed(b"\x1b[23;2t");
+
+        let mut expected = TerminalScreen::new(SIZE, 100);
+        expected.feed(initial);
+        expected.feed(b"\x1b[23;2t");
+        assert_visible_equal(&actual, &expected);
+        assert_eq!(actual.screen().title(), "second");
+    }
+
+    #[test]
+    fn keyframe_preserves_dynamic_colour_query_state() {
+        let initial = b"\x1b]10;#112233\x1b\\\x1b]11;rgb:44/55/66\x07\x1b]12;#778899\x1b\\";
+        let (mut actual, mut expected) = recovered(initial, b"");
+        let queries = b"\x1b]10;?\x1b\\\x1b]11;?\x07\x1b]12;?\x1b\\";
+        actual.feed(queries);
+        expected.feed(queries);
+        let expected_replies = expected.take_replies();
+        assert!(
+            !expected_replies.is_empty(),
+            "the continuation must exercise stored colour state"
+        );
+        assert_eq!(actual.take_replies(), expected_replies);
+    }
+
+    #[test]
+    fn keyframe_clears_stale_dynamic_colour_query_state() {
+        let transcript = PaneTranscript::new(100, SIZE);
+        let keyframe = PaneRecoverySeed::capture(&transcript).keyframe();
+        let mut actual = TerminalScreen::new(SIZE, 100);
+        actual.feed(b"\x1b]10;#112233\x1b\\");
+        actual.feed(&keyframe.bytes);
+        actual.feed(b"\x1b]10;?\x1b\\");
+        assert!(actual.take_replies().is_empty());
     }
 
     #[test]
@@ -406,6 +531,19 @@ mod tests {
                 TerminalSize { cols: 16, rows: 5 },
                 b"0123456789abcdef\x1b[?1049h\x1b[2J\x1b[Hdifferent-alt".as_slice(),
                 b"\x1b[?1049lX".as_slice(),
+            ),
+            (
+                "alternate-saved-main-scrollback",
+                TerminalSize { cols: 16, rows: 5 },
+                b"one\r\ntwo\r\nthree\r\nfour\r\nfive\r\nsix\r\nseven\r\neight\x1b[?1049h\x1b[2J\x1b[Halt"
+                    .as_slice(),
+                b"\x1b[?1049l\r\nTAIL".as_slice(),
+            ),
+            (
+                "alternate-active-pending-wrap",
+                TerminalSize { cols: 16, rows: 5 },
+                b"main\x1b[?1049h0123456789abcdef".as_slice(),
+                b"X\x1b[?1049l".as_slice(),
             ),
             (
                 "tabs-decsc-parser",
@@ -434,6 +572,13 @@ mod tests {
                     .as_slice(),
                 b"\x1b[0mY".as_slice(),
             ),
+            (
+                "decsc-default-rendition-is-absolute",
+                TerminalSize { cols: 16, rows: 6 },
+                b"\x1b[2;3H\x1b7\x1b[31m\x1b]8;id=active;https://example.test\x1b\\\x1b[5;10H"
+                    .as_slice(),
+                b"\x1b8X".as_slice(),
+            ),
         ];
         let vectors = vectors
             .into_iter()
@@ -446,6 +591,7 @@ mod tests {
                     "cols": size.cols,
                     "rows": size.rows,
                     "scrollback": 100,
+                    "actualPrefix": b"\x1b]2;stale\x1b\\\x1b[31mstale-main\r\nstale-history\x1b[?1049hstale-alt".as_slice(),
                     "initial": initial,
                     "keyframe": keyframe.bytes,
                     "tail": tail,

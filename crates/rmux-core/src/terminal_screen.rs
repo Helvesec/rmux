@@ -113,6 +113,13 @@ impl TerminalScreen {
         self.parser.saved_cursor_state()
     }
 
+    /// Returns ANSI restoring parser-owned state that has a faithful terminal
+    /// representation, such as application-defined dynamic colours.
+    #[must_use]
+    pub fn recovery_parser_state_ansi(&self) -> Vec<u8> {
+        self.parser.recovery_parser_state_ansi()
+    }
+
     /// Returns whether the parser ground timeout is currently armed.
     #[must_use]
     pub fn ground_timer_active(&self) -> bool {

@@ -394,6 +394,10 @@ impl PaneTranscript {
         self.terminal.saved_cursor_state()
     }
 
+    pub(crate) fn recovery_parser_state_ansi(&self) -> Vec<u8> {
+        self.terminal.recovery_parser_state_ansi()
+    }
+
     pub(crate) fn clear_history(&mut self, reset_hyperlinks: bool) {
         self.terminal
             .screen_mut()

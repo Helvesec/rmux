@@ -95,7 +95,11 @@ async function run(bytes, tail, vector) {
 
 for (const vector of input.vectors) {
   const expected = await run(vector.initial, vector.tail, vector);
-  const actual = await run(vector.keyframe, vector.tail, vector);
+  const actual = await run(
+    [...(vector.actualPrefix ?? []), ...vector.keyframe],
+    vector.tail,
+    vector
+  );
   if (JSON.stringify(actual) !== JSON.stringify(expected)) {
     process.stderr.write(`${vector.name}: xterm.js state mismatch\n`);
     const summarize = (state) => ({

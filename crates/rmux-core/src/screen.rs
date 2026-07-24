@@ -156,6 +156,18 @@ impl Screen {
         &self.title
     }
 
+    /// Returns the title stack from oldest to newest.
+    #[must_use]
+    pub fn title_stack(&self) -> &[String] {
+        &self.title_stack
+    }
+
+    /// Maximum title stack depth accepted by the terminal model.
+    #[must_use]
+    pub const fn title_stack_limit() -> usize {
+        TITLE_STACK_MAX
+    }
+
     /// Sets the current screen title.
     pub fn set_title(&mut self, title: impl Into<String>) {
         self.title = title.into();

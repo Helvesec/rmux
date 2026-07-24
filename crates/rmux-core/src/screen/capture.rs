@@ -142,6 +142,33 @@ impl Screen {
         })
     }
 
+    /// Captures the complete saved main screen while alternate mode is active.
+    ///
+    /// The live grid retains main-screen history while the saved grid retains
+    /// its visible rows, so recovery must join those two stores explicitly.
+    #[must_use]
+    pub fn capture_saved_recovery_rows_independent(
+        &self,
+        options: GridRenderOptions,
+    ) -> Option<Vec<(Vec<u8>, bool)>> {
+        let saved = self.saved_grid.as_ref()?;
+        let mut rows = capture_grid_absolute_rows_independent(
+            &self.grid,
+            &self.hyperlinks,
+            0..self.grid.hsize(),
+            options,
+        );
+        let saved_total =
+            saved.grid.hsize() + usize::try_from(saved.grid.sy()).unwrap_or(usize::MAX);
+        rows.extend(capture_grid_absolute_rows_independent(
+            &saved.grid,
+            &self.hyperlinks,
+            saved.grid.hsize()..saved_total,
+            options,
+        ));
+        Some(rows)
+    }
+
     /// Captures tmux-style per-line format flags from the saved alternate screen.
     #[must_use]
     pub fn capture_saved_line_format_flags(&self, range: ScreenCaptureRange) -> Option<Vec<u8>> {
@@ -162,8 +189,17 @@ fn capture_grid_rows_independent(
         return Vec::new();
     };
 
+    capture_grid_absolute_rows_independent(grid, hyperlinks, range, options)
+}
+
+fn capture_grid_absolute_rows_independent(
+    grid: &Grid,
+    hyperlinks: &Hyperlinks,
+    rows: impl IntoIterator<Item = usize>,
+    options: GridRenderOptions,
+) -> Vec<(Vec<u8>, bool)> {
     let mut output = Vec::new();
-    for absolute_y in range {
+    for absolute_y in rows {
         let mut state = GridStringState::default();
         let Some(line) =
             grid.render_absolute_line(absolute_y, options, &mut state, Some(hyperlinks))

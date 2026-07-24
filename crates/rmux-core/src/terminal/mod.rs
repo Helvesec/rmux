@@ -189,6 +189,10 @@ impl TerminalParser {
         (x, y, saved.origin_mode())
     }
 
+    pub(crate) fn recovery_parser_state_ansi(&self) -> Vec<u8> {
+        self.parser.recovery_dynamic_colours_ansi()
+    }
+
     fn cell_state_ansi(&self, cell: &crate::input::CellState) -> Vec<u8> {
         let mut out = self.screen.render_cell_state_ansi(cell);
         out.extend_from_slice(if cell.g0set != 0 {
