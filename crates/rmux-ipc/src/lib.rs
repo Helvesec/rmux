@@ -12,6 +12,12 @@ mod listener;
 mod managed_socket_unix;
 mod stream;
 #[cfg(windows)]
+mod windows_endpoint_record;
+#[cfg(windows)]
+mod windows_endpoint_security;
+#[cfg(windows)]
+mod windows_endpoint_state;
+#[cfg(windows)]
 mod windows_mutex;
 
 pub use endpoint::{
@@ -25,6 +31,8 @@ pub use stream::{
 };
 #[cfg(windows)]
 pub use stream::{connect_windows_pipe, WindowsPipeClient};
+#[cfg(windows)]
+pub use windows_endpoint_state::claim_managed_endpoint_start;
 #[cfg(windows)]
 pub use windows_mutex::{
     acquire_named_mutex, NamedMutexAcquire, NamedMutexError, NamedMutexGuard, MAX_NAMED_MUTEX_LEN,

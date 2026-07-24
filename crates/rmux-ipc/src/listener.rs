@@ -42,6 +42,7 @@ pub struct LocalListener {
 pub struct LocalListener {
     pipe_name: OsString,
     pending: tokio::sync::Mutex<VecDeque<NamedPipeServer>>,
+    _registration: Option<crate::windows_endpoint_state::ManagedEndpointRegistration>,
 }
 
 #[cfg(windows)]
@@ -106,9 +107,11 @@ fn bind_rustix_listener(_endpoint: &LocalEndpoint) -> io::Result<LocalListener> 
 fn bind_impl(endpoint: &LocalEndpoint) -> io::Result<LocalListener> {
     let pipe_name = endpoint.as_pipe_name().to_owned();
     let pending = create_pending_servers(&pipe_name)?;
+    let registration = crate::windows_endpoint_state::register_running(&pipe_name)?;
     Ok(LocalListener {
         pipe_name,
         pending: tokio::sync::Mutex::new(pending),
+        _registration: registration,
     })
 }
 

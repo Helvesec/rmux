@@ -7,11 +7,11 @@
 //! owns that check, layered on top of the existing `rmux-ipc` Windows pipe
 //! contract:
 //!
-//! * Endpoint names stay `\\.\pipe\rmux-{SID}-il-{integrity}-{label}`. This
-//!   module never invents new pipe names.
+//! * Default and label-selected endpoints resolve to a private rotating
+//!   generation. Explicit `-S`, `RMUX`, and `TMUX` pipe paths remain exact.
 //! * The same `IdentityResolver`/SID values that scope the pipe ACL also
-//!   scope the mutex's discretionary ACL, so a peer running under a
-//!   different identity cannot acquire the mutex or open the pipe.
+//!   scope the discovery state, mutex, and pipe discretionary ACLs, so a peer
+//!   running under a different identity cannot acquire or replace them.
 //! * `ServerOptions::first_pipe_instance(true)` remains the authoritative
 //!   first-instance enforcement inside `rmux-ipc`. The mutex prevents two
 //!   `rmux` callers from racing to spawn that listener; it does not
@@ -25,8 +25,9 @@
 //! 2. Otherwise acquire the per-endpoint named mutex.
 //! 3. Re-probe under the mutex. If a peer started the daemon while we were
 //!    waiting, return [`StartupOutcome::JoinedExisting`] without spawning.
-//! 4. Run the launcher closure exactly once and wait for the new daemon to
-//!    respond to the same probe.
+//! 4. Pin the selected private generation to the startup owner, run the
+//!    launcher closure exactly once, and wait for the new daemon to respond
+//!    to the same probe.
 //!
 //! Busy/not-found/no-data/access-denied/timeout errors raised by the pipe or
 //! the mutex surface as typed [`StartupError`] variants.
@@ -345,6 +346,11 @@ where
         return Ok(StartupOutcome::JoinedExisting(stream));
     }
 
+    rmux_ipc::claim_managed_endpoint_start(pipe_name).map_err(|source| StartupError::PipeIo {
+        operation: "claim private endpoint generation",
+        pipe_name: pipe_name.to_path_buf(),
+        source,
+    })?;
     launcher()
         .await
         .map_err(|source| StartupError::Launcher { source })?;
@@ -395,6 +401,11 @@ where
         return Ok(StartupOutcome::JoinedExisting(stream));
     }
 
+    rmux_ipc::claim_managed_endpoint_start(pipe_name).map_err(|source| StartupError::PipeIo {
+        operation: "claim private endpoint generation",
+        pipe_name: pipe_name.to_path_buf(),
+        source,
+    })?;
     launcher().map_err(|source| StartupError::Launcher { source })?;
 
     let stream = wait_for_daemon_blocking(&endpoint, pipe_name, deadline, poll_interval)?;

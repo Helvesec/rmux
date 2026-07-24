@@ -3,6 +3,8 @@
 use std::io::ErrorKind;
 use std::io::{Read, Write};
 use std::path::Path;
+use std::process::Command;
+use std::sync::{Arc, Barrier};
 use std::time::Duration;
 
 use rmux_ipc::{
@@ -16,6 +18,8 @@ use tokio::net::windows::named_pipe::ServerOptions;
 use tokio::time::timeout;
 
 const WINDOWS_IPC_TEST_TIMEOUT: Duration = Duration::from_secs(10);
+const STALE_GENERATION_HELPER_ENV: &str = "RMUX_TEST_STALE_GENERATION_LABEL";
+const STALE_GENERATION_OUTPUT_ENV: &str = "RMUX_TEST_STALE_GENERATION_OUTPUT";
 
 #[test]
 fn blocking_connect_to_missing_pipe_reports_not_found() -> std::io::Result<()> {
@@ -330,6 +334,93 @@ async fn first_pipe_instance_rejects_preexisting_raw_server() -> std::io::Result
 
     assert_bind_conflict(error);
     Ok(())
+}
+
+#[test]
+fn concurrent_label_resolution_shares_one_private_generation() -> std::io::Result<()> {
+    let label = format!("generation-concurrency-{}", std::process::id());
+    let barrier = Arc::new(Barrier::new(12));
+    let threads = (0..12)
+        .map(|_| {
+            let label = label.clone();
+            let barrier = Arc::clone(&barrier);
+            std::thread::spawn(move || {
+                barrier.wait();
+                endpoint_for_label(label).map(|endpoint| endpoint.into_path())
+            })
+        })
+        .collect::<Vec<_>>();
+
+    let paths = threads
+        .into_iter()
+        .map(|thread| thread.join().expect("resolver thread"))
+        .collect::<std::io::Result<Vec<_>>>()?;
+    assert!(
+        paths.windows(2).all(|pair| pair[0] == pair[1]),
+        "concurrent same-label callers must share one startup generation"
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn stopped_listener_rotates_away_from_preclaimed_old_generation() -> std::io::Result<()> {
+    let label = format!("generation-restart-squat-{}", std::process::id());
+    let first = endpoint_for_label(&label)?;
+    let first_path = first.clone().into_path();
+    let listener = LocalListener::bind(&first)?;
+    drop(listener);
+
+    let _old_generation_squatter = ServerOptions::new()
+        .first_pipe_instance(true)
+        .create(first.as_pipe_name())?;
+    let replacement = endpoint_for_label(&label)?;
+
+    assert_ne!(
+        replacement.as_path(),
+        first_path,
+        "restart must never reuse the publicly observed stopped generation"
+    );
+    let replacement_listener = LocalListener::bind(&replacement)?;
+    drop(replacement_listener);
+    Ok(())
+}
+
+#[test]
+fn dead_starting_process_cannot_pin_a_generation() -> std::io::Result<()> {
+    let label = format!("generation-dead-owner-{}", std::process::id());
+    let output = std::env::temp_dir().join(format!(
+        "rmux-generation-dead-owner-{}.txt",
+        std::process::id()
+    ));
+    let status = Command::new(std::env::current_exe()?)
+        .arg("--exact")
+        .arg("stale_generation_helper")
+        .arg("--nocapture")
+        .env(STALE_GENERATION_HELPER_ENV, &label)
+        .env(STALE_GENERATION_OUTPUT_ENV, &output)
+        .status()?;
+    assert!(status.success(), "stale-generation helper failed");
+
+    let stale = std::fs::read_to_string(&output)?;
+    let replacement = endpoint_for_label(&label)?;
+    assert_ne!(
+        replacement.as_path().to_string_lossy(),
+        stale,
+        "a dead resolver process must force generation rotation"
+    );
+    let _ = std::fs::remove_file(output);
+    Ok(())
+}
+
+#[test]
+fn stale_generation_helper() -> std::io::Result<()> {
+    let Some(label) = std::env::var_os(STALE_GENERATION_HELPER_ENV) else {
+        return Ok(());
+    };
+    let output = std::env::var_os(STALE_GENERATION_OUTPUT_ENV)
+        .ok_or_else(|| std::io::Error::other("missing stale-generation output path"))?;
+    let endpoint = endpoint_for_label(label)?;
+    std::fs::write(output, endpoint.as_path().to_string_lossy().as_bytes())
 }
 
 fn assert_bind_conflict(error: std::io::Error) {

@@ -39,7 +39,7 @@ const RMUX_TMPDIR_ENV: &str = "RMUX_TMPDIR";
 const TMUX_TMPDIR_ENV: &str = "TMUX_TMPDIR";
 const SOCKET_DIR_PREFIX: &str = "rmux";
 #[cfg(windows)]
-const PIPE_PREFIX: &str = r"\\.\pipe\";
+pub(crate) const PIPE_PREFIX: &str = r"\\.\pipe\";
 
 /// Address of a local RMUX endpoint.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -173,9 +173,7 @@ fn endpoint_for_label_impl(label: &OsStr) -> io::Result<LocalEndpoint> {
     let label = pipe_component(label);
     let sid = pipe_component(OsStr::new(sid.as_ref()));
     let integrity = current_integrity_label()?;
-    Ok(LocalEndpoint::from_path(PathBuf::from(format!(
-        "{PIPE_PREFIX}{SOCKET_DIR_PREFIX}-{sid}-il-{integrity}-{label}"
-    ))))
+    crate::windows_endpoint_state::endpoint_for_label(OsStr::new(&label), &sid, integrity)
 }
 
 #[cfg(unix)]
@@ -460,7 +458,7 @@ fn path_buf_from_bytes(bytes: Vec<u8>) -> PathBuf {
 }
 
 #[cfg(windows)]
-fn pipe_component(value: &OsStr) -> String {
+pub(crate) fn pipe_component(value: &OsStr) -> String {
     let mut component = String::new();
     for unit in value.encode_wide() {
         if is_pipe_component_unit(unit) {
@@ -701,7 +699,7 @@ mod tests {
 
         assert!(path.starts_with(r"\\.\pipe\rmux-S-"));
         assert!(path.contains("-il-"));
-        assert!(path.ends_with("-default"));
+        assert!(path.contains("-g-"));
     }
 
     #[cfg(windows)]
@@ -948,6 +946,17 @@ mod tests {
             socket_path_from_rmux_env(Some(OsStr::new(&env_value))).expect("rmux pipe endpoint");
 
         assert_eq!(path, endpoint.into_path());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn explicit_socket_path_preserves_the_exact_managed_pipe_generation() {
+        let endpoint = endpoint_for_label("explicit-current").expect("managed endpoint");
+        let explicit =
+            resolve_endpoint(Some(OsStr::new("ignored-label")), Some(endpoint.as_path()))
+                .expect("explicit endpoint");
+
+        assert_eq!(explicit, endpoint);
     }
 
     #[cfg(windows)]
