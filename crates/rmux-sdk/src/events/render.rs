@@ -105,25 +105,30 @@ impl PaneRenderStream {
                 continue;
             }
 
+            // Output cursor responses precede their correlated surface wake.
+            // Consume them first so a concurrent terminal surface event cannot
+            // discard the final lag notice; an expired debounce still wins.
             if let Some(deadline) = self.render_deadline {
                 tokio::select! {
+                    biased;
                     _ = tokio::time::sleep_until(deadline) => {
                         return self.emit_ready_pending().await;
                     }
-                    event = self.surface.next() => {
-                        self.observe_surface(event?);
-                    }
                     chunk = self.output.next() => {
                         self.observe_output(chunk?);
+                    }
+                    event = self.surface.next() => {
+                        self.observe_surface(event?);
                     }
                 }
             } else {
                 tokio::select! {
-                    event = self.surface.next() => {
-                        self.observe_surface(event?);
-                    }
+                    biased;
                     chunk = self.output.next() => {
                         self.observe_output(chunk?);
+                    }
+                    event = self.surface.next() => {
+                        self.observe_surface(event?);
                     }
                 }
             }
