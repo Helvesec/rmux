@@ -11,12 +11,24 @@ from typing import Any
 from downstream_channels import (
     file_hash,
     read_object,
+    timestamp,
     validate_receipt_reference,
     write_object,
 )
 
 REPOSITORY_ID = 1239918790
 RECEIPT_WORKFLOW = ".github/workflows/release-receipt.yml"
+DOWNSTREAM_RELEASE_FIELDS = (
+    "id",
+    "ref",
+    "intent_id",
+    "kind",
+    "tag_object_sha",
+    "immutable",
+)
+RECEIPT_RELEASE_FIELDS = frozenset(
+    (*DOWNSTREAM_RELEASE_FIELDS, "created_at", "published_at")
+)
 
 
 def parse_args() -> argparse.Namespace:
@@ -58,6 +70,21 @@ def artifact_reference(value: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def downstream_release_identity(value: dict[str, Any]) -> dict[str, Any]:
+    actual = set(value)
+    if actual != RECEIPT_RELEASE_FIELDS:
+        raise ValueError(
+            "publication receipt release keys differ: "
+            f"missing={sorted(RECEIPT_RELEASE_FIELDS - actual)}, "
+            f"extra={sorted(actual - RECEIPT_RELEASE_FIELDS)}"
+        )
+    created_at = timestamp(value["created_at"], "release created_at")
+    published_at = timestamp(value["published_at"], "release published_at")
+    if created_at > published_at:
+        raise ValueError("release publication predates release creation")
+    return {field: value[field] for field in DOWNSTREAM_RELEASE_FIELDS}
+
+
 def build(args: argparse.Namespace) -> None:
     exact_file_set(
         args.predicate.parent,
@@ -93,11 +120,12 @@ def build(args: argparse.Namespace) -> None:
         or not isinstance(release, dict)
     ):
         raise ValueError("publication receipt predicate identity differs")
+    release_identity = downstream_release_identity(release)
     if (
-        release.get("id") != args.release_id
-        or release.get("ref") != args.release_ref
-        or release.get("kind") != args.release_kind
-        or release.get("immutable") is not True
+        release_identity["id"] != args.release_id
+        or release_identity["ref"] != args.release_ref
+        or release_identity["kind"] != args.release_kind
+        or release_identity["immutable"] is not True
     ):
         raise ValueError("publication receipt release identity differs")
     predicate_sha = file_hash(args.predicate)
@@ -128,7 +156,7 @@ def build(args: argparse.Namespace) -> None:
         "downstream_authority": True,
         "repository_id": REPOSITORY_ID,
         "source_git_sha": args.source_sha,
-        "release": release,
+        "release": release_identity,
         "receipt": receipt,
         "predicate_bundle": predicate_artifact,
         "predicate_sha256": predicate_sha,
