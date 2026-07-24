@@ -13,6 +13,10 @@ use super::{
     is_transient_connect_error, probe_connected_server, spawn_hidden_daemon_for, AutoStartConfig,
     AutoStartError,
 };
+#[cfg(windows)]
+use rmux_sdk::bootstrap::startup_windows::{
+    connect_or_start_blocking_with, DEFAULT_STARTUP_DEADLINE, STARTUP_POLL_INTERVAL,
+};
 
 const SEAMLESS_RESTART_TIMEOUT: Duration = Duration::from_secs(5);
 const SEAMLESS_RESTART_POLL_INTERVAL: Duration = Duration::from_millis(50);
@@ -60,13 +64,7 @@ pub(super) fn ensure_daemon_fresh_or_restart(
                 upgrade::warn_stale_active_daemon(&stale, socket_path);
                 return Ok(connection);
             }
-            spawn_hidden_daemon_for(binary_path, socket_path, config).map_err(|error| {
-                AutoStartError::Launch {
-                    path: binary_path.to_path_buf(),
-                    error,
-                }
-            })?;
-            wait_for_connected_server(socket_path, config)
+            restart_hidden_daemon(binary_path, socket_path, config)
         }
     }
 }
@@ -156,13 +154,39 @@ fn ensure_required_web_capability_or_restart(
         });
     }
 
-    spawn_hidden_daemon_for(binary_path, socket_path, config).map_err(|error| {
-        AutoStartError::Launch {
-            path: binary_path.to_path_buf(),
-            error,
-        }
-    })?;
-    wait_for_connected_server(socket_path, config)
+    restart_hidden_daemon(binary_path, socket_path, config)
+}
+
+fn restart_hidden_daemon(
+    binary_path: &Path,
+    socket_path: &Path,
+    config: &AutoStartConfig,
+) -> Result<Connection, AutoStartError> {
+    #[cfg(windows)]
+    {
+        let outcome = connect_or_start_blocking_with(
+            socket_path,
+            |reserved_socket_path| {
+                spawn_hidden_daemon_for(binary_path, reserved_socket_path, config)
+            },
+            DEFAULT_STARTUP_DEADLINE,
+            STARTUP_POLL_INTERVAL,
+        )
+        .map_err(|error| super::auto_start_error_from_startup(error, binary_path, socket_path))?;
+        let connection = super::startup_outcome_into_connection(outcome)?;
+        probe_connected_server(connection, config, socket_path)
+    }
+
+    #[cfg(not(windows))]
+    {
+        spawn_hidden_daemon_for(binary_path, socket_path, config).map_err(|error| {
+            AutoStartError::Launch {
+                path: binary_path.to_path_buf(),
+                error,
+            }
+        })?;
+        wait_for_connected_server(socket_path, config)
+    }
 }
 
 fn wait_for_server_absent(socket_path: &Path) -> Result<Option<Connection>, AutoStartError> {
@@ -212,6 +236,7 @@ where
     }
 }
 
+#[cfg(not(windows))]
 fn wait_for_connected_server(
     socket_path: &Path,
     config: &AutoStartConfig,

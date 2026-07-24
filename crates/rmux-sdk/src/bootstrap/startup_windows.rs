@@ -42,6 +42,7 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use rmux_ipc::{BlockingLocalStream, LocalEndpoint};
+use tokio::time::sleep;
 
 use crate::bootstrap::deadline::StartupDeadline;
 
@@ -282,12 +283,15 @@ impl Error for StartupError {
 
 /// Connects to the daemon serving `pipe_name`, starting it under a
 /// per-endpoint named mutex if no live daemon is reachable.
+///
+/// Managed label endpoints may rotate after the initial probe. The launcher
+/// receives the exact reserved endpoint that the child must bind.
 pub async fn connect_or_start<L, F>(
     pipe_name: &Path,
     launcher: L,
 ) -> Result<StartupOutcome, StartupError>
 where
-    L: FnOnce() -> F,
+    L: FnOnce(&Path) -> F,
     F: Future<Output = io::Result<()>>,
 {
     connect_or_start_with(
@@ -308,7 +312,7 @@ pub async fn connect_or_start_with<L, F>(
     poll_interval: Duration,
 ) -> Result<StartupOutcome, StartupError>
 where
-    L: FnOnce() -> F,
+    L: FnOnce(&Path) -> F,
     F: Future<Output = io::Result<()>>,
 {
     connect_or_start_with_timeout(pipe_name, launcher, Some(deadline), poll_interval).await
@@ -326,7 +330,7 @@ pub async fn connect_or_start_with_timeout<L, F>(
     poll_interval: Duration,
 ) -> Result<StartupOutcome, StartupError>
 where
-    L: FnOnce() -> F,
+    L: FnOnce(&Path) -> F,
     F: Future<Output = io::Result<()>>,
 {
     let deadline = StartupDeadline::from_timeout(deadline);
@@ -346,16 +350,40 @@ where
         return Ok(StartupOutcome::JoinedExisting(stream));
     }
 
-    rmux_ipc::claim_managed_endpoint_start(pipe_name).map_err(|source| StartupError::PipeIo {
-        operation: "claim private endpoint generation",
-        pipe_name: pipe_name.to_path_buf(),
-        source,
-    })?;
-    launcher()
+    let mut reservation = reserve_endpoint_start(pipe_name)?;
+    let selected_endpoint = loop {
+        let selected_endpoint = reservation.endpoint().clone();
+        let selected_pipe = selected_endpoint.as_path();
+        if reservation.is_owner() {
+            break selected_endpoint;
+        }
+        drop(reservation);
+
+        match probe_responsive(&selected_endpoint, selected_pipe).await {
+            Ok(Some(stream)) => {
+                drop(_guard);
+                return Ok(StartupOutcome::JoinedExisting(stream));
+            }
+            Ok(None) | Err(StartupError::PipeBusy { .. }) => {}
+            Err(error) => return Err(error),
+        }
+        if deadline.is_elapsed() {
+            return Err(StartupError::StartupTimeout {
+                pipe_name: selected_pipe.to_path_buf(),
+                waited: deadline.elapsed(),
+            });
+        }
+        sleep(deadline.sleep_for(poll_interval.max(Duration::from_millis(1)))).await;
+        reservation = reserve_endpoint_start(selected_pipe)?;
+    };
+    let selected_pipe = selected_endpoint.as_path();
+
+    launcher(selected_pipe)
         .await
         .map_err(|source| StartupError::Launcher { source })?;
 
-    let stream = wait_for_daemon(&endpoint, pipe_name, deadline, poll_interval).await?;
+    let stream =
+        wait_for_daemon(&selected_endpoint, selected_pipe, deadline, poll_interval).await?;
     drop(_guard);
     Ok(StartupOutcome::Started(stream))
 }
@@ -370,7 +398,7 @@ pub fn connect_or_start_blocking_with<L>(
     poll_interval: Duration,
 ) -> Result<StartupOutcome, StartupError>
 where
-    L: FnOnce() -> io::Result<()>,
+    L: FnOnce(&Path) -> io::Result<()>,
 {
     connect_or_start_blocking_with_timeout(pipe_name, launcher, Some(deadline), poll_interval)
 }
@@ -383,7 +411,7 @@ pub fn connect_or_start_blocking_with_timeout<L>(
     poll_interval: Duration,
 ) -> Result<StartupOutcome, StartupError>
 where
-    L: FnOnce() -> io::Result<()>,
+    L: FnOnce(&Path) -> io::Result<()>,
 {
     let deadline = StartupDeadline::from_timeout(deadline);
     validate_pipe_name(pipe_name)?;
@@ -401,16 +429,50 @@ where
         return Ok(StartupOutcome::JoinedExisting(stream));
     }
 
-    rmux_ipc::claim_managed_endpoint_start(pipe_name).map_err(|source| StartupError::PipeIo {
-        operation: "claim private endpoint generation",
-        pipe_name: pipe_name.to_path_buf(),
-        source,
-    })?;
-    launcher().map_err(|source| StartupError::Launcher { source })?;
+    let mut reservation = reserve_endpoint_start(pipe_name)?;
+    let selected_endpoint = loop {
+        let selected_endpoint = reservation.endpoint().clone();
+        let selected_pipe = selected_endpoint.as_path();
+        if reservation.is_owner() {
+            break selected_endpoint;
+        }
+        drop(reservation);
 
-    let stream = wait_for_daemon_blocking(&endpoint, pipe_name, deadline, poll_interval)?;
+        match probe_blocking(&selected_endpoint, selected_pipe) {
+            Ok(Some(stream)) => {
+                drop(guard);
+                return Ok(StartupOutcome::JoinedExisting(stream));
+            }
+            Ok(None) | Err(StartupError::PipeBusy { .. }) => {}
+            Err(error) => return Err(error),
+        }
+        if deadline.is_elapsed() {
+            return Err(StartupError::StartupTimeout {
+                pipe_name: selected_pipe.to_path_buf(),
+                waited: deadline.elapsed(),
+            });
+        }
+        std::thread::sleep(deadline.sleep_for(poll_interval.max(Duration::from_millis(1))));
+        reservation = reserve_endpoint_start(selected_pipe)?;
+    };
+    let selected_pipe = selected_endpoint.as_path();
+
+    launcher(selected_pipe).map_err(|source| StartupError::Launcher { source })?;
+
+    let stream =
+        wait_for_daemon_blocking(&selected_endpoint, selected_pipe, deadline, poll_interval)?;
     drop(guard);
     Ok(StartupOutcome::Started(stream))
+}
+
+fn reserve_endpoint_start(
+    pipe_name: &Path,
+) -> Result<rmux_ipc::ManagedEndpointStartReservation, StartupError> {
+    rmux_ipc::reserve_managed_endpoint_start(pipe_name).map_err(|source| StartupError::PipeIo {
+        operation: "reserve private endpoint generation",
+        pipe_name: pipe_name.to_path_buf(),
+        source,
+    })
 }
 
 #[cfg(test)]

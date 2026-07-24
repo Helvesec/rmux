@@ -116,11 +116,11 @@ async fn connect_or_start_transport_for_platform(
     let launcher_cwd = caller_cwd.clone();
     let outcome = crate::bootstrap::startup_windows::connect_or_start_with_timeout(
         &pipe_path,
-        || {
-            let pipe_path = pipe_path.clone();
+        |reserved_pipe| {
+            let reserved_pipe = reserved_pipe.as_os_str().to_owned();
             async move {
                 startup_config::spawn_hidden_daemon(
-                    pipe_path.as_os_str(),
+                    reserved_pipe.as_os_str(),
                     launcher_cwd.as_deref(),
                     startup_deadline,
                 )

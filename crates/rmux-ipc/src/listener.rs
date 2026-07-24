@@ -106,8 +106,8 @@ fn bind_rustix_listener(_endpoint: &LocalEndpoint) -> io::Result<LocalListener> 
 #[cfg(windows)]
 fn bind_impl(endpoint: &LocalEndpoint) -> io::Result<LocalListener> {
     let pipe_name = endpoint.as_pipe_name().to_owned();
-    let pending = create_pending_servers(&pipe_name)?;
     let registration = crate::windows_endpoint_state::register_running(&pipe_name)?;
+    let pending = create_pending_servers(&pipe_name)?;
     Ok(LocalListener {
         pipe_name,
         pending: tokio::sync::Mutex::new(pending),

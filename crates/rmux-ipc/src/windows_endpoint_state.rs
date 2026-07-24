@@ -32,14 +32,17 @@ use crate::windows_endpoint_record::{
     is_lower_hex, parse as parse_record, serialize as serialize_record, EndpointPhase,
     EndpointRecord, ProcessStamp, KEY_HEX_LEN, NONCE_HEX_LEN,
 };
+use crate::windows_endpoint_reservation::{
+    decide as decide_reservation, ManagedEndpointStartReservation, ManagedStartClaim,
+    ReservationDecision,
+};
 use crate::windows_endpoint_security::{
     ensure_private_directory, validate_private_handle, wide_path, SameUserSecurityAttributes,
 };
 
 const MANAGED_PIPE_MARKER: &str = "-g-";
 const MAX_STATE_BYTES: u64 = 512;
-
-/// Registration held by a managed listener for its full lifetime.
+/// Registration held by a managed listener for its lifetime.
 pub(crate) struct ManagedEndpointRegistration {
     key: String,
     nonce: String,
@@ -105,27 +108,61 @@ pub(crate) fn endpoint_for_label(
     )))
 }
 
-/// Pins a private Windows label endpoint to the process about to launch it.
+/// Atomically reserves a private Windows label endpoint for daemon startup.
 ///
 /// Explicit `-S`, `RMUX`, and `TMUX` pipe paths are unchanged: paths without
-/// matching private discovery state are treated as caller-owned and ignored.
-pub fn claim_managed_endpoint_start(pipe_name: &Path) -> io::Result<()> {
+/// the managed private shape remain caller-owned. A dead or stopped managed
+/// generation is always rotated before it can be launched again.
+pub fn reserve_managed_endpoint_start(
+    pipe_name: &Path,
+) -> io::Result<ManagedEndpointStartReservation> {
     let Some(components) = managed_components(pipe_name.as_os_str())? else {
-        return Ok(());
+        return Ok(ManagedEndpointStartReservation {
+            endpoint: LocalEndpoint::from_path(pipe_name.to_path_buf()),
+            owner: true,
+            _claim: None,
+        });
     };
-    let Some(state) = StateStore::open_existing(&components.key, components.integrity)? else {
-        return Ok(());
-    };
+    let state = StateStore::open_existing(&components.key, components.integrity)?
+        .ok_or_else(|| invalid_state("managed endpoint discovery state is missing"))?;
     let _lock = state.lock()?;
-    let Some(mut record) = state.read_record()? else {
-        return Ok(());
-    };
-    if record.key != components.key || record.nonce != components.nonce {
-        return Ok(());
+    let mut record = state
+        .read_record()?
+        .ok_or_else(|| invalid_state("managed endpoint discovery record is missing"))?;
+    let requester = current_process_stamp()?;
+    let decision = decide_reservation(
+        &record,
+        &components.nonce,
+        requester,
+        process_is_live(record.process),
+    );
+
+    if decision == ReservationDecision::JoinCurrent {
+        let endpoint = managed_endpoint(&components, &record.nonce);
+        return Ok(ManagedEndpointStartReservation {
+            endpoint,
+            owner: false,
+            _claim: None,
+        });
+    }
+
+    if decision == ReservationDecision::Rotate {
+        record.nonce = random_nonce()?;
     }
     record.phase = EndpointPhase::Starting;
-    record.process = current_process_stamp()?;
-    state.write_record(&record)
+    record.process = requester;
+    state.write_record(&record)?;
+    let endpoint = managed_endpoint(&components, &record.nonce);
+    Ok(ManagedEndpointStartReservation {
+        endpoint,
+        owner: true,
+        _claim: Some(ManagedStartClaim {
+            key: components.key,
+            nonce: record.nonce,
+            process: requester,
+            integrity: components.integrity,
+        }),
+    })
 }
 
 pub(crate) fn register_running(
@@ -134,15 +171,20 @@ pub(crate) fn register_running(
     let Some(components) = managed_components(pipe_name)? else {
         return Ok(None);
     };
-    let Some(state) = StateStore::open_existing(&components.key, components.integrity)? else {
-        return Ok(None);
-    };
+    let state = StateStore::open_existing(&components.key, components.integrity)?
+        .ok_or_else(|| invalid_state("managed endpoint discovery state is missing"))?;
     let _lock = state.lock()?;
-    let Some(mut record) = state.read_record()? else {
-        return Ok(None);
-    };
-    if record.key != components.key || record.nonce != components.nonce {
-        return Ok(None);
+    let mut record = state
+        .read_record()?
+        .ok_or_else(|| invalid_state("managed endpoint discovery record is missing"))?;
+    if record.key != components.key
+        || record.nonce != components.nonce
+        || record.phase != EndpointPhase::Starting
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "managed endpoint generation is no longer reserved for startup",
+        ));
     }
 
     let process = current_process_stamp()?;
@@ -157,17 +199,44 @@ pub(crate) fn register_running(
     }))
 }
 
+pub(crate) fn retire_starting_claim(claim: &ManagedStartClaim) -> io::Result<()> {
+    retire_matching_record(
+        &claim.key,
+        &claim.nonce,
+        claim.process,
+        claim.integrity,
+        EndpointPhase::Starting,
+    )
+}
+
 fn mark_stopped(registration: &ManagedEndpointRegistration) -> io::Result<()> {
-    let Some(state) = StateStore::open_existing(&registration.key, registration.integrity)? else {
+    retire_matching_record(
+        &registration.key,
+        &registration.nonce,
+        registration.process,
+        registration.integrity,
+        EndpointPhase::Running,
+    )
+}
+
+fn retire_matching_record(
+    key: &str,
+    nonce: &str,
+    process: ProcessStamp,
+    integrity: &'static str,
+    expected_phase: EndpointPhase,
+) -> io::Result<()> {
+    let Some(state) = StateStore::open_existing(key, integrity)? else {
         return Ok(());
     };
     let _lock = state.lock()?;
     let Some(mut record) = state.read_record()? else {
         return Ok(());
     };
-    if record.key != registration.key
-        || record.nonce != registration.nonce
-        || record.process != registration.process
+    if record.key != key
+        || record.nonce != nonce
+        || record.process != process
+        || record.phase != expected_phase
     {
         return Ok(());
     }
@@ -176,6 +245,7 @@ fn mark_stopped(registration: &ManagedEndpointRegistration) -> io::Result<()> {
 }
 
 struct ManagedComponents {
+    sid: String,
     key: String,
     nonce: String,
     integrity: &'static str,
@@ -206,10 +276,20 @@ fn managed_components(pipe_name: &OsStr) -> io::Result<Option<ManagedComponents>
         return Ok(None);
     }
     Ok(Some(ManagedComponents {
+        sid,
         key: key.to_owned(),
         nonce: nonce.to_owned(),
         integrity,
     }))
+}
+
+fn managed_endpoint(components: &ManagedComponents, nonce: &str) -> LocalEndpoint {
+    LocalEndpoint::from_path(pipe_path(
+        &components.sid,
+        components.integrity,
+        &components.key,
+        nonce,
+    ))
 }
 
 fn endpoint_key(label: &OsStr, sid: &str, integrity: &str) -> String {

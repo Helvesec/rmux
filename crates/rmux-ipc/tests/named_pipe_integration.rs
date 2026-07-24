@@ -8,7 +8,8 @@ use std::sync::{Arc, Barrier};
 use std::time::Duration;
 
 use rmux_ipc::{
-    connect_blocking, connect_windows_pipe, endpoint_for_label, wait_for_peer_close, LocalListener,
+    connect_blocking, connect_windows_pipe, endpoint_for_label, reserve_managed_endpoint_start,
+    wait_for_peer_close, LocalListener,
 };
 use rmux_os::identity::{IdentityResolver, UserIdentity};
 use rmux_os::path::socket_paths_match;
@@ -20,6 +21,8 @@ use tokio::time::timeout;
 const WINDOWS_IPC_TEST_TIMEOUT: Duration = Duration::from_secs(10);
 const STALE_GENERATION_HELPER_ENV: &str = "RMUX_TEST_STALE_GENERATION_LABEL";
 const STALE_GENERATION_OUTPUT_ENV: &str = "RMUX_TEST_STALE_GENERATION_OUTPUT";
+const DEAD_RUNNING_HELPER_ENV: &str = "RMUX_TEST_DEAD_RUNNING_GENERATION_LABEL";
+const DEAD_RUNNING_OUTPUT_ENV: &str = "RMUX_TEST_DEAD_RUNNING_GENERATION_OUTPUT";
 
 #[test]
 fn blocking_connect_to_missing_pipe_reports_not_found() -> std::io::Result<()> {
@@ -385,6 +388,34 @@ async fn stopped_listener_rotates_away_from_preclaimed_old_generation() -> std::
     Ok(())
 }
 
+#[tokio::test]
+async fn concurrent_restart_reservation_rejects_the_abandoned_child_generation(
+) -> std::io::Result<()> {
+    let label = format!("generation-restart-reservation-{}", std::process::id());
+    let abandoned_endpoint = endpoint_for_label(&label)?;
+    let abandoned_path = abandoned_endpoint.as_path().to_path_buf();
+
+    let abandoned_claim = reserve_managed_endpoint_start(&abandoned_path)?;
+    assert!(abandoned_claim.is_owner());
+    drop(abandoned_claim);
+
+    let winner = reserve_managed_endpoint_start(&abandoned_path)?;
+    assert!(winner.is_owner());
+    assert_ne!(winner.endpoint().as_path(), abandoned_path);
+
+    let loser = reserve_managed_endpoint_start(&abandoned_path)?;
+    assert!(!loser.is_owner());
+    assert_eq!(loser.endpoint(), winner.endpoint());
+
+    let stale_error = LocalListener::bind(&abandoned_endpoint)
+        .expect_err("an abandoned child must not bind after generation rotation");
+    assert_eq!(stale_error.kind(), ErrorKind::PermissionDenied);
+
+    let replacement_listener = LocalListener::bind(winner.endpoint())?;
+    drop(replacement_listener);
+    Ok(())
+}
+
 #[test]
 fn dead_starting_process_cannot_pin_a_generation() -> std::io::Result<()> {
     let label = format!("generation-dead-owner-{}", std::process::id());
@@ -413,6 +444,34 @@ fn dead_starting_process_cannot_pin_a_generation() -> std::io::Result<()> {
 }
 
 #[test]
+fn daemon_death_between_resolve_and_reservation_rotates_the_generation() -> std::io::Result<()> {
+    let label = format!("generation-dead-running-{}", std::process::id());
+    let output = std::env::temp_dir().join(format!(
+        "rmux-generation-dead-running-{}.txt",
+        std::process::id()
+    ));
+    let status = Command::new(std::env::current_exe()?)
+        .arg("--exact")
+        .arg("dead_running_generation_helper")
+        .arg("--nocapture")
+        .env(DEAD_RUNNING_HELPER_ENV, &label)
+        .env(DEAD_RUNNING_OUTPUT_ENV, &output)
+        .status()?;
+    assert!(status.success(), "dead-running helper failed");
+
+    let stale = std::fs::read_to_string(&output)?;
+    let reservation = reserve_managed_endpoint_start(Path::new(stale.trim()))?;
+    assert!(reservation.is_owner());
+    assert_ne!(
+        reservation.endpoint().as_path().to_string_lossy(),
+        stale.trim(),
+        "a dead Running owner must rotate during the atomic reservation"
+    );
+    let _ = std::fs::remove_file(output);
+    Ok(())
+}
+
+#[test]
 fn stale_generation_helper() -> std::io::Result<()> {
     let Some(label) = std::env::var_os(STALE_GENERATION_HELPER_ENV) else {
         return Ok(());
@@ -421,6 +480,20 @@ fn stale_generation_helper() -> std::io::Result<()> {
         .ok_or_else(|| std::io::Error::other("missing stale-generation output path"))?;
     let endpoint = endpoint_for_label(label)?;
     std::fs::write(output, endpoint.as_path().to_string_lossy().as_bytes())
+}
+
+#[tokio::test]
+async fn dead_running_generation_helper() -> std::io::Result<()> {
+    let Some(label) = std::env::var_os(DEAD_RUNNING_HELPER_ENV) else {
+        return Ok(());
+    };
+    let output = std::env::var_os(DEAD_RUNNING_OUTPUT_ENV)
+        .ok_or_else(|| std::io::Error::other("missing dead-running output path"))?;
+    let endpoint = endpoint_for_label(label)?;
+    let listener = LocalListener::bind(&endpoint)?;
+    std::fs::write(output, endpoint.as_path().to_string_lossy().as_bytes())?;
+    std::mem::forget(listener);
+    std::process::exit(0);
 }
 
 fn assert_bind_conflict(error: std::io::Error) {

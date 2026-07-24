@@ -330,15 +330,14 @@ fn ensure_server_running_windows(
 ) -> Result<EnsuredServerConnection, AutoStartError> {
     let binary_path = rmux_binary_path(&config).map_err(AutoStartError::BinaryPath)?;
     let launcher_binary_path = binary_path.clone();
-    let launcher_socket_path = socket_path.to_path_buf();
     let launcher_config = config.clone();
 
     let outcome = connect_or_start_blocking_with(
         socket_path,
-        move || {
+        move |reserved_socket_path| {
             spawn_hidden_daemon_for(
                 &launcher_binary_path,
-                &launcher_socket_path,
+                reserved_socket_path,
                 &launcher_config,
             )
         },

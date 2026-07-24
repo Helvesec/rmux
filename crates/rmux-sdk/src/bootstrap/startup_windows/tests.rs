@@ -70,7 +70,7 @@ fn startup_mutex_name_rejects_oversized_label() {
 fn blocking_startup_reuses_pipe_validation() {
     let error = connect_or_start_blocking_with(
         Path::new("/tmp/not-a-pipe"),
-        || panic!("invalid pipes must not launch"),
+        |_| panic!("invalid pipes must not launch"),
         DEFAULT_STARTUP_DEADLINE,
         STARTUP_POLL_INTERVAL,
     )
