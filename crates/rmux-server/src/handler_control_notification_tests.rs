@@ -889,10 +889,10 @@ async fn rejected_session_control_message_is_not_added_to_show_messages() {
 }
 
 #[tokio::test]
-async fn display_message_orders_attached_and_control_clients_by_shared_activity() {
-    // tmux 3.7b chooses the most recently active client across both client
-    // types. Registration is initial activity; later accepted attached input
-    // moves the attached client ahead of the control client.
+async fn display_message_orders_attached_and_control_clients_by_tmux_activity_semantics() {
+    // tmux 3.7b uses registration as the control client's initial activity,
+    // but commands read from control mode do not update client_activity.
+    // Later accepted attached input therefore keeps the attached client ahead.
     let handler = RequestHandler::new();
     let alpha = session_name("alpha");
     new_session(&handler, &alpha).await;
@@ -959,10 +959,11 @@ async fn display_message_orders_attached_and_control_clients_by_shared_activity(
         dispatch_as(&handler, 99_622, request()).await,
         Response::DisplayMessage(_)
     ));
-    assert_eq!(
-        drain_control_notifications(&mut control_rx),
-        vec!["%message activity".to_owned()]
-    );
+    assert!(drain_control_notifications(&mut control_rx).is_empty());
+    assert!(matches!(
+        attach_rx.recv().await,
+        Some(AttachControl::Overlay(_))
+    ));
 }
 
 #[tokio::test]

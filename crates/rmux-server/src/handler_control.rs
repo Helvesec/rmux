@@ -501,22 +501,6 @@ impl RequestHandler {
         Ok(control_id)
     }
 
-    pub(crate) async fn record_control_client_activity(
-        &self,
-        identity: ControlClientIdentity,
-    ) -> bool {
-        let activity_sequence = self.next_client_activity_sequence();
-        let mut active_control = self.active_control.lock().await;
-        let Some(active) = active_control.by_pid.get_mut(&identity.requester_pid()) else {
-            return false;
-        };
-        if active.id != identity.control_id() || active.closing.load(Ordering::SeqCst) {
-            return false;
-        }
-        active.last_activity_sequence = activity_sequence;
-        true
-    }
-
     pub(crate) async fn begin_control_queue_drain(
         &self,
         identity: ControlClientIdentity,

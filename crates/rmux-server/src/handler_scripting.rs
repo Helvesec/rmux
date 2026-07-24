@@ -328,12 +328,6 @@ impl RequestHandler {
         expected_control_id: u64,
         commands: ParsedCommands,
     ) -> ControlCommandResult {
-        let _ = self
-            .record_control_client_activity(ControlClientIdentity::new(
-                requester_pid,
-                expected_control_id,
-            ))
-            .await;
         self.execute_command_queue(
             requester_pid,
             commands,
