@@ -91,7 +91,15 @@ HOSTS = {
 
 PRODUCERS = {}
 for channel, workflows in load_contract()['result_evidence']['producer_workflows'].items():
-    initial = [(path, workflow_id) for path, workflow_id in workflows.items() if '-retry.yml' not in path]
+    initial = [
+        (path, workflow_id)
+        for path, workflow_id in workflows.items()
+        if '-retry.yml' not in path
+        and not (
+            path == '.github/workflows/release-policy-channel.yml'
+            and len(workflows) > 1
+        )
+    ]
     if len(initial) != 1:
         raise RuntimeError(f'channel {channel} lacks one exact initial producer')
     PRODUCERS[channel] = initial[0]

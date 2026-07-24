@@ -109,7 +109,10 @@ RESULT_STATES = {
     "submitted",
 }
 RESULT_PRODUCERS = {
-    "apt_rpm": {".github/workflows/release-linux-repository-publish.yml": 316435347},
+    "apt_rpm": {
+        ".github/workflows/release-linux-repository-publish.yml": 316435347,
+        ".github/workflows/release-policy-channel.yml": 316435347,
+    },
     "chocolatey": {
         ".github/workflows/release-chocolatey-channel.yml": 316435347,
         ".github/workflows/release-chocolatey-retry.yml": 316439352,
