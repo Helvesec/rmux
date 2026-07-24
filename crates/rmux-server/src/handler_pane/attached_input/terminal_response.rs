@@ -1,7 +1,7 @@
 use rmux_core::TerminalPaletteIndex;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(super) enum TerminalResponseDecode {
+pub(in crate::handler) enum TerminalResponseDecode {
     NotResponse,
     Partial,
     PaneBound {
@@ -23,7 +23,7 @@ pub(super) enum TerminalResponseDecode {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(super) enum TerminalControlEvent {
+pub(in crate::handler) enum TerminalControlEvent {
     FocusIn,
     FocusOut,
     ClientLightTheme,
@@ -38,7 +38,7 @@ pub(super) fn decode_attached_terminal_control(
     decode_attached_terminal_control_after_append(input, focus_passthrough, 0)
 }
 
-pub(super) fn decode_attached_terminal_control_after_append(
+pub(in crate::handler) fn decode_attached_terminal_control_after_append(
     input: &[u8],
     focus_passthrough: bool,
     new_input_at: usize,

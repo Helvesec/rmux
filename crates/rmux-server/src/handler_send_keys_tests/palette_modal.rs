@@ -62,6 +62,54 @@ async fn assert_surface_active(
     assert!(is_active, "{} must remain active", surface.name());
 }
 
+#[tokio::test]
+async fn command_prompt_supersedes_an_ignored_display_message() {
+    let handler = RequestHandler::new();
+    let alpha = session_name("prompt-supersedes-message");
+    let requester_pid = std::process::id();
+    create_send_keys_test_session(&handler, &alpha).await;
+    let (control_tx, _control_rx) = mpsc::unbounded_channel();
+    handler
+        .register_attach(requester_pid, alpha.clone(), control_tx)
+        .await;
+    assert!(matches!(
+        handler
+            .handle(Request::DisplayMessageExt(Box::new(
+                DisplayMessageExtRequest {
+                    target: Some(Target::Session(alpha)),
+                    print: false,
+                    message: Some("old message".to_owned()),
+                    target_client: Some(requester_pid.to_string()),
+                    empty_target_context: false,
+                    duration_ms: Some(rmux_proto::DisplayMessageDurationMillis::new(10_000)),
+                    ignore_input: true,
+                },
+            )))
+            .await,
+        Response::DisplayMessage(_)
+    ));
+
+    activate_surface(&handler, requester_pid, PaletteModalSurface::Prompt).await;
+    assert!(
+        handler.active_attach.lock().await.by_pid[&requester_pid]
+            .transient_message
+            .is_none(),
+        "the prompt must cancel the old input policy"
+    );
+    handler
+        .handle_attached_live_input_for_test(requester_pid, b"abc")
+        .await
+        .expect("prompt input remains live");
+    assert_eq!(
+        handler
+            .attached_prompt_render(requester_pid)
+            .await
+            .expect("prompt remains active")
+            .input,
+        "abc"
+    );
+}
+
 async fn register_palette_query(
     handler: &RequestHandler,
     session: &rmux_proto::SessionName,

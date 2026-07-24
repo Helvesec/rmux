@@ -725,8 +725,9 @@ impl RequestHandler {
         &self,
         attach_pid: u32,
     ) -> Result<(), RmuxError> {
-        self.refresh_interactive_overlay_with_expected_identity(attach_pid, None)
+        self.refresh_interactive_overlay_with_expected_identity(attach_pid, None, None)
             .await
+            .map(|_| ())
     }
 
     pub(super) async fn refresh_interactive_overlay_for_optional_identity(
@@ -757,8 +758,10 @@ impl RequestHandler {
         self.refresh_interactive_overlay_with_expected_identity(
             attach_pid,
             Some((expected_attach_id, session_name, None)),
+            None,
         )
         .await
+        .map(|_| ())
     }
 
     pub(in crate::handler) async fn refresh_interactive_overlay_for_session_identity(
@@ -770,6 +773,23 @@ impl RequestHandler {
         self.refresh_interactive_overlay_with_expected_identity(
             identity.attach_pid(),
             Some((identity.attach_id(), session_name, Some(session_id))),
+            None,
+        )
+        .await
+        .map(|_| ())
+    }
+
+    pub(in crate::handler) async fn refresh_interactive_overlay_for_session_identity_guarded(
+        &self,
+        identity: ActiveAttachIdentity,
+        session_name: &rmux_proto::SessionName,
+        session_id: rmux_proto::SessionId,
+        restore_guard: Option<crate::handler::attach_support::TransientMessageRestoreGuard>,
+    ) -> Result<bool, RmuxError> {
+        self.refresh_interactive_overlay_with_expected_identity(
+            identity.attach_pid(),
+            Some((identity.attach_id(), session_name, Some(session_id))),
+            restore_guard,
         )
         .await
     }
@@ -778,7 +798,8 @@ impl RequestHandler {
         &self,
         attach_pid: u32,
         expected_identity: Option<(u64, &rmux_proto::SessionName, Option<rmux_proto::SessionId>)>,
-    ) -> Result<(), RmuxError> {
+        restore_guard: Option<crate::handler::attach_support::TransientMessageRestoreGuard>,
+    ) -> Result<bool, RmuxError> {
         let (overlay, captured_attach_id, captured_session_name, captured_session_id) = {
             let active_attach = self.active_attach.lock().await;
             let active = active_attach
@@ -801,10 +822,13 @@ impl RequestHandler {
             if expected_identity.is_some_and(|(_, _, expected_session_id)| {
                 expected_session_id.is_some() && active.prompt.is_some()
             }) {
-                return Ok(());
+                return Ok(false);
+            }
+            if restore_guard.is_some_and(|guard| !guard.matches(active)) {
+                return Ok(false);
             }
             let Some(overlay) = active.overlay.clone() else {
-                return Ok(());
+                return Ok(false);
             };
             (
                 overlay,
@@ -814,7 +838,7 @@ impl RequestHandler {
             )
         };
 
-        let frame = overlay.render();
+        let mut frame = overlay.render();
         let mut active_attach = self.active_attach.lock().await;
         let active = active_attach
             .by_pid
@@ -825,7 +849,7 @@ impl RequestHandler {
             || active.session_id != captured_session_id
             || active.closing.load(std::sync::atomic::Ordering::SeqCst)
         {
-            return expected_identity.map_or(Ok(()), |_| {
+            return expected_identity.map_or(Ok(false), |_| {
                 Err(crate::handler_support::attached_client_required(
                     "refresh-client",
                 ))
@@ -846,7 +870,10 @@ impl RequestHandler {
         if expected_identity.is_some_and(|(_, _, expected_session_id)| {
             expected_session_id.is_some() && active.prompt.is_some()
         }) {
-            return Ok(());
+            return Ok(false);
+        }
+        if restore_guard.is_some_and(|guard| !guard.matches(active)) {
+            return Ok(false);
         }
         if active
             .overlay
@@ -854,8 +881,9 @@ impl RequestHandler {
             .map(|current| current.id() != overlay.id())
             .unwrap_or(true)
         {
-            return Ok(());
+            return Ok(false);
         }
+        crate::handler::attach_support::append_transient_message_frame(active, &mut frame);
         active.overlay_generation = active.overlay_generation.saturating_add(1);
         let delivered = active
             .control_tx
@@ -869,7 +897,7 @@ impl RequestHandler {
                 "refresh-client",
             ));
         }
-        Ok(())
+        Ok(delivered.is_ok())
     }
 
     pub(super) async fn clear_interactive_overlay(
@@ -962,7 +990,7 @@ impl RequestHandler {
         expected_overlay_id: Option<u64>,
         terminate_popup_job: bool,
     ) -> Result<(), RmuxError> {
-        let (control_tx, render_generation, overlay_generation, popup_job) = {
+        let (control_tx, render_generation, overlay_generation, popup_job, transient_restore) = {
             let mut active_attach = self.active_attach.lock().await;
             let active = active_attach
                 .by_pid
@@ -986,11 +1014,16 @@ impl RequestHandler {
                 _ => None,
             };
             active.overlay_generation = active.overlay_generation.saturating_add(1);
+            let transient_restore = active
+                .transient_message
+                .is_some()
+                .then(|| (active.identity(attach_pid), active.session_name.clone()));
             (
                 active.control_tx.clone(),
                 active.render_generation,
                 active.overlay_generation,
                 popup_job,
+                transient_restore,
             )
         };
         if let Some(job) = popup_job {
@@ -1001,7 +1034,26 @@ impl RequestHandler {
             render_generation,
             overlay_generation,
         )));
+        self.restore_transient_message_after_persistent_clear(transient_restore)
+            .await;
         Ok(())
+    }
+
+    async fn restore_transient_message_after_persistent_clear(
+        &self,
+        restore: Option<(ActiveAttachIdentity, rmux_proto::SessionName)>,
+    ) {
+        let Some((identity, session_name)) = restore else {
+            return;
+        };
+        let _ = self
+            .refresh_attached_client_for_identity(
+                identity.attach_pid(),
+                identity.attach_id(),
+                &session_name,
+                "overlay clear",
+            )
+            .await;
     }
 
     pub(super) async fn popup_reader_tick(
@@ -1058,15 +1110,24 @@ impl RequestHandler {
                     active.control_tx.clone(),
                     active.render_generation,
                     active.overlay_generation,
+                    active.transient_message.is_some().then(|| {
+                        (
+                            active.identity(identity.attach_pid()),
+                            active.session_name.clone(),
+                        )
+                    }),
                 ))
             }
         };
-        if let Some((control_tx, render_generation, overlay_generation)) = clear {
+        if let Some((control_tx, render_generation, overlay_generation, transient_restore)) = clear
+        {
             let _ = control_tx.send(AttachControl::Overlay(OverlayFrame::persistent(
                 Vec::new(),
                 render_generation,
                 overlay_generation,
             )));
+            self.restore_transient_message_after_persistent_clear(transient_restore)
+                .await;
         } else {
             self.refresh_popup_overlay_for_identity(identity, popup_id)
                 .await?;
@@ -1098,7 +1159,7 @@ impl RequestHandler {
             overlay
         };
 
-        let frame = overlay.render();
+        let mut frame = overlay.render();
         let mut active_attach = self.active_attach.lock().await;
         let Some(active) = active_attach.by_pid.get_mut(&identity.attach_pid()) else {
             return Ok(());
@@ -1112,6 +1173,7 @@ impl RequestHandler {
         {
             return Ok(());
         }
+        crate::handler::attach_support::append_transient_message_frame(active, &mut frame);
         active.overlay_generation = active.overlay_generation.saturating_add(1);
         let _ = active
             .control_tx

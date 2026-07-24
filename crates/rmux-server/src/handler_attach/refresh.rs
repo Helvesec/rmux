@@ -74,6 +74,7 @@ impl RequestHandler {
                     active.mode_tree_state_id,
                     active.mode_tree.is_some(),
                     active.key_table_name.clone(),
+                    super::transient_message_render_snapshot(active),
                 ));
             }
             (
@@ -106,6 +107,7 @@ impl RequestHandler {
                 mode_tree_state_id,
                 mode_tree_active,
                 key_table,
+                transient_message,
             ) in &refresh_contexts
             {
                 let Ok(mut target) = super::attach_render_target_for_session_with_prompt(
@@ -125,7 +127,22 @@ impl RequestHandler {
                 if *mode_tree_active {
                     target.persistent_overlay_state_id = Some(*mode_tree_state_id);
                 }
-                targets.push((*pid, target));
+                let rendered_status = match transient_message
+                    .as_ref()
+                    .map(|message| {
+                        super::render_status_message_for_attached_size(
+                            &state,
+                            session_name,
+                            *client_size,
+                            message.status_message(),
+                        )
+                    })
+                    .transpose()
+                {
+                    Ok(rendered_status) => rendered_status,
+                    Err(_) => return,
+                };
+                targets.push((*pid, (target, transient_message.clone(), rendered_status)));
             }
             targets
         };
@@ -137,11 +154,18 @@ impl RequestHandler {
             if &active.session_name != session_name || active.suspended {
                 continue;
             }
-            let Some(target) = target_by_pid.remove(pid) else {
+            let Some((mut target, transient_message, rendered_status)) = target_by_pid.remove(pid)
+            else {
                 continue;
             };
             active.render_generation = active.render_generation.saturating_add(1);
             active.render_refresh_pending = false;
+            super::compose_transient_message_refresh(
+                active,
+                transient_message.as_ref(),
+                rendered_status,
+                &mut target.render_frame,
+            );
             if !enqueue_tracked_render_control(active, AttachControl::switch(target)) {
                 stale_clients.push(active.identity(*pid));
             }
@@ -277,6 +301,7 @@ impl RequestHandler {
                         active.mode_tree_state_id,
                         active.mode_tree.is_some(),
                         active.key_table_name.clone(),
+                        super::transient_message_render_snapshot(active),
                     )
                 })
         };
@@ -287,6 +312,7 @@ impl RequestHandler {
             mode_tree_state_id,
             mode_tree_active,
             key_table,
+            transient_message,
         )) = prompt
         else {
             return false;
@@ -295,7 +321,7 @@ impl RequestHandler {
             let state = self.state.lock().await;
             let _lock_span = crate::perf_instrument::span("state_lock_hold")
                 .with_str("site", "attach_refresh_client_target");
-            super::attach_render_target_for_session_with_prompt(
+            let target = match super::attach_render_target_for_session_with_prompt(
                 &state,
                 session_name,
                 attached_count,
@@ -306,10 +332,28 @@ impl RequestHandler {
                     render_size: Some(client_size),
                     socket_path: &self.socket_path(),
                 },
-            )
-            .ok()
+            ) {
+                Ok(target) => target,
+                Err(_) => return false,
+            };
+            let rendered_status = match transient_message
+                .as_ref()
+                .map(|message| {
+                    super::render_status_message_for_attached_size(
+                        &state,
+                        session_name,
+                        client_size,
+                        message.status_message(),
+                    )
+                })
+                .transpose()
+            {
+                Ok(rendered_status) => rendered_status,
+                Err(_) => return false,
+            };
+            Some((target, rendered_status))
         };
-        let Some(mut target) = target else {
+        let Some((mut target, rendered_status)) = target else {
             return false;
         };
         if mode_tree_active {
@@ -325,6 +369,12 @@ impl RequestHandler {
                     && !active.suspended =>
             {
                 active.render_generation = active.render_generation.saturating_add(1);
+                super::compose_transient_message_refresh(
+                    active,
+                    transient_message.as_ref(),
+                    rendered_status,
+                    &mut target.render_frame,
+                );
                 let delivered =
                     enqueue_tracked_render_control(active, AttachControl::switch(target));
                 (delivered, (!delivered).then(|| active.identity(attach_pid)))
@@ -439,6 +489,7 @@ impl RequestHandler {
                         active.mode_tree_state_id,
                         active.mode_tree.is_some(),
                         active.key_table_name.clone(),
+                        super::transient_message_render_snapshot(active),
                     )
                 })
         };
@@ -449,6 +500,7 @@ impl RequestHandler {
             mode_tree_state_id,
             mode_tree_active,
             key_table,
+            transient_message,
         )) = prompt
         else {
             return;
@@ -457,7 +509,7 @@ impl RequestHandler {
             let state = self.state.lock().await;
             let _lock_span = crate::perf_instrument::span("state_lock_hold")
                 .with_str("site", "attach_refresh_client_base_target");
-            super::attach_render_target_for_session_with_prompt(
+            let target = match super::attach_render_target_for_session_with_prompt(
                 &state,
                 session_name,
                 attached_count,
@@ -468,10 +520,28 @@ impl RequestHandler {
                     render_size: Some(client_size),
                     socket_path: &self.socket_path(),
                 },
-            )
-            .ok()
+            ) {
+                Ok(target) => target,
+                Err(_) => return,
+            };
+            let rendered_status = match transient_message
+                .as_ref()
+                .map(|message| {
+                    super::render_status_message_for_attached_size(
+                        &state,
+                        session_name,
+                        client_size,
+                        message.status_message(),
+                    )
+                })
+                .transpose()
+            {
+                Ok(rendered_status) => rendered_status,
+                Err(_) => return,
+            };
+            Some((target, rendered_status))
         };
-        let Some(mut target) = target else {
+        let Some((mut target, rendered_status)) = target else {
             return;
         };
         if mode_tree_active {
@@ -482,6 +552,12 @@ impl RequestHandler {
         let stale_client = match active_attach.by_pid.get_mut(&attach_pid) {
             Some(active) if &active.session_name == session_name && !active.suspended => {
                 active.render_generation = active.render_generation.saturating_add(1);
+                super::compose_transient_message_refresh(
+                    active,
+                    transient_message.as_ref(),
+                    rendered_status,
+                    &mut target.render_frame,
+                );
                 (!enqueue_tracked_render_control(active, AttachControl::switch(target)))
                     .then(|| active.identity(attach_pid))
             }
@@ -518,43 +594,6 @@ impl RequestHandler {
             self.refresh_attached_session(&session_name).await;
         }
         self.refresh_all_control_sessions().await;
-    }
-
-    pub(in crate::handler) async fn refresh_persistent_overlays_for_session(
-        &self,
-        session_name: &rmux_proto::SessionName,
-    ) {
-        let (mode_tree_pids, overlay_pids) = {
-            let active_attach = self.active_attach.lock().await;
-            let mode_tree_pids = active_attach
-                .by_pid
-                .iter()
-                .filter_map(|(pid, active)| {
-                    (&active.session_name == session_name
-                        && !active.suspended
-                        && active.mode_tree.is_some())
-                    .then_some(*pid)
-                })
-                .collect::<Vec<_>>();
-            let overlay_pids = active_attach
-                .by_pid
-                .iter()
-                .filter_map(|(pid, active)| {
-                    (&active.session_name == session_name
-                        && !active.suspended
-                        && active.overlay.is_some())
-                    .then_some(*pid)
-                })
-                .collect::<Vec<_>>();
-            (mode_tree_pids, overlay_pids)
-        };
-
-        for attach_pid in mode_tree_pids {
-            let _ = self.refresh_mode_tree_overlay_if_active(attach_pid).await;
-        }
-        for attach_pid in overlay_pids {
-            let _ = self.refresh_interactive_overlay_if_active(attach_pid).await;
-        }
     }
 }
 

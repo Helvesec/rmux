@@ -39,7 +39,10 @@ use super::{
 };
 use crate::client_flags::ClientFlags;
 use crate::handler::overlay_support::AttachedOverlayInput;
-use crate::handler::{attach_support::ActiveAttachIdentity, prepare_lifecycle_event};
+use crate::handler::{
+    attach_support::{ActiveAttachIdentity, TransientMessageInput},
+    prepare_lifecycle_event,
+};
 use crate::input_keys::{decode_extended_key, decode_mouse, ExtendedKeyDecode, MouseDecode};
 use crate::key_table::{
     decode_attached_key, default_key_table_name, lookup_attached_key_table_binding,
@@ -522,6 +525,11 @@ impl RequestHandler {
         let windows_console_key = windows_console_key
             .filter(|_| pending_input.is_empty() && !bytes.is_empty())
             .map(windows_console_key_event);
+        let initial_transient_prefix = self
+            .take_transient_terminal_prefix_for_identity(identity)
+            .await;
+        let mut has_transient_terminal_prefix = !initial_transient_prefix.is_empty();
+        pending_input.extend(initial_transient_prefix);
         let mut forwarded_to_pane = false;
         #[cfg(windows)]
         let try_plain_fast_path = windows_console_key.is_none();
@@ -548,6 +556,28 @@ impl RequestHandler {
             return Ok(AttachedLiveInputStep::Complete(false));
         }
         self.clear_attached_focus_alerts(identity).await;
+        match self
+            .handle_ignored_transient_message_input_for_identity(identity, pending_input, bytes)
+            .await
+        {
+            TransientMessageInput::Inactive => {}
+            TransientMessageInput::Consumed => {
+                return Ok(AttachedLiveInputStep::Complete(false));
+            }
+            TransientMessageInput::TerminalControls(controls) => {
+                return Ok(AttachedLiveInputStep::Complete(
+                    self.handle_transient_terminal_controls(identity, controls)
+                        .await?,
+                ));
+            }
+            TransientMessageInput::Dismissed(_) => {
+                debug_assert!(
+                    false,
+                    "ignore-only transient input cannot dismiss a message"
+                );
+                return Ok(AttachedLiveInputStep::Complete(false));
+            }
+        }
         if self
             .attached_modal_surface_active_for_identity(identity)
             .await
@@ -559,11 +589,53 @@ impl RequestHandler {
                     .await;
             }
         }
-        if let Some(step) = self
-            .handle_attached_modal_input_step(identity, pending_input, bytes)
-            .await?
+        let pending_was_empty = pending_input.is_empty();
+        match self
+            .handle_transient_message_input_for_identity(identity, pending_input, bytes)
+            .await
         {
-            return Ok(step);
+            // The timer may expire between the first residual-prefix drain
+            // and this identity-guarded mutation. Pull the prefix once more
+            // before ordinary decoding so a split terminal response remains
+            // contiguous across the expiry boundary.
+            TransientMessageInput::Inactive => {
+                let residual = self
+                    .take_transient_terminal_prefix_for_identity(identity)
+                    .await;
+                has_transient_terminal_prefix |= !residual.is_empty();
+                pending_input.extend(residual);
+            }
+            TransientMessageInput::Consumed => {
+                return Ok(AttachedLiveInputStep::Complete(false));
+            }
+            TransientMessageInput::TerminalControls(controls) => {
+                return Ok(AttachedLiveInputStep::Complete(
+                    self.handle_transient_terminal_controls(identity, controls)
+                        .await?,
+                ));
+            }
+            TransientMessageInput::Dismissed(rerouted)
+                if pending_was_empty && rerouted.as_slice() == bytes =>
+            {
+                // Continue in this same step. Besides avoiding a second
+                // parse, this preserves the native Windows KEY_EVENT that
+                // belongs to these exact bytes.
+                debug_assert!(pending_input.is_empty());
+            }
+            TransientMessageInput::Dismissed(bytes) => {
+                return Ok(AttachedLiveInputStep::Reroute {
+                    bytes,
+                    forwarded: false,
+                });
+            }
+        }
+        if !has_transient_terminal_prefix {
+            if let Some(step) = self
+                .handle_attached_modal_input_step(identity, pending_input, bytes)
+                .await?
+            {
+                return Ok(step);
+            }
         }
         let (target, target_session_id) = self
             .attached_input_target_identity(identity)
@@ -1253,6 +1325,35 @@ impl RequestHandler {
         pending_input: &mut Vec<u8>,
         bytes: &[u8],
     ) -> io::Result<Option<AttachedLiveInputStep>> {
+        match self
+            .handle_transient_message_input_for_identity(identity, pending_input, bytes)
+            .await
+        {
+            TransientMessageInput::Inactive => {
+                let residual = self
+                    .take_transient_terminal_prefix_for_identity(identity)
+                    .await;
+                if !residual.is_empty() {
+                    pending_input.extend(residual);
+                    return Ok(None);
+                }
+            }
+            TransientMessageInput::Consumed => {
+                return Ok(Some(AttachedLiveInputStep::Complete(false)));
+            }
+            TransientMessageInput::TerminalControls(controls) => {
+                return Ok(Some(AttachedLiveInputStep::Complete(
+                    self.handle_transient_terminal_controls(identity, controls)
+                        .await?,
+                )));
+            }
+            TransientMessageInput::Dismissed(bytes) => {
+                return Ok(Some(AttachedLiveInputStep::Reroute {
+                    bytes,
+                    forwarded: false,
+                }));
+            }
+        }
         if self.prompt_active_for_identity(identity).await {
             let remaining = self
                 .handle_attached_prompt_input(identity, pending_input, bytes)
@@ -1284,6 +1385,73 @@ impl RequestHandler {
             return Ok(Some(attached_mode_input_step(remaining)));
         }
         Ok(None)
+    }
+
+    pub(super) async fn handle_transient_terminal_controls(
+        &self,
+        identity: ActiveAttachIdentity,
+        controls: Vec<Vec<u8>>,
+    ) -> io::Result<bool> {
+        let mut forwarded = false;
+        for bytes in controls {
+            // Hooks emitted by one report may switch the client, pane, or
+            // terminal mode. Match the ordinary live path by re-resolving
+            // before every subsequent report in the same input chunk.
+            let (target, _) = self
+                .attached_input_target_identity(identity)
+                .await
+                .map_err(io_other)?;
+            let forward_focus =
+                self.target_pane_mode(&target).await.map_err(io_other)? & mode::MODE_FOCUSON != 0;
+            let decoded = decode_focus_event(&bytes).map_or_else(
+                || decode_attached_terminal_control_after_append(&bytes, false, 0),
+                |event| TerminalResponseDecode::Matched {
+                    size: bytes.len(),
+                    event: Some(event),
+                },
+            );
+            match decoded {
+                TerminalResponseDecode::PaneBound { .. } => {
+                    // Without a pane-originated outer-terminal query token,
+                    // `CSI ... R` is ambiguous with xterm modified F-keys
+                    // (for example Shift-F3 is `CSI 1;2 R`). Under `-N` it
+                    // must remain ignored like every other key press.
+                }
+                TerminalResponseDecode::PaletteResponse { index, .. } => {
+                    forwarded |= self
+                        .write_attached_palette_response_for_identity(identity, index, &bytes)
+                        .await?;
+                }
+                TerminalResponseDecode::ClipboardResponse {
+                    selection, content, ..
+                } => {
+                    forwarded |= self
+                        .handle_attached_clipboard_response(identity, selection, content)
+                        .await?;
+                }
+                TerminalResponseDecode::Matched {
+                    event: Some(event), ..
+                } => {
+                    if forward_focus
+                        && matches!(
+                            event,
+                            TerminalControlEvent::FocusIn | TerminalControlEvent::FocusOut
+                        )
+                    {
+                        self.write_attached_target_bytes_for_identity(identity, &bytes)
+                            .await?;
+                        forwarded = true;
+                    }
+                    self.handle_attached_terminal_control_event(identity, &target, event)
+                        .await;
+                }
+                TerminalResponseDecode::Matched { event: None, .. } => {}
+                TerminalResponseDecode::NotResponse | TerminalResponseDecode::Partial => {
+                    debug_assert!(false, "transient input emitted an unexpected control");
+                }
+            }
+        }
+        Ok(forwarded)
     }
 
     async fn handle_attached_modal_palette_input(
@@ -1497,6 +1665,7 @@ impl RequestHandler {
             || active.mode_tree.is_some()
             || active.overlay.is_some()
             || active.display_panes.is_some()
+            || active.transient_message.is_some()
             || active.key_table_name.is_some()
         {
             return Ok(None);
@@ -1526,7 +1695,8 @@ impl RequestHandler {
             && active.prompt.is_none()
             && active.mode_tree.is_none()
             && active.overlay.is_none()
-            && active.display_panes.is_none())
+            && active.display_panes.is_none()
+            && active.transient_message.is_none())
     }
 
     async fn attached_modal_surface_active_for_identity(
@@ -1548,6 +1718,7 @@ impl RequestHandler {
             || active.mode_tree.is_some()
             || active.overlay.is_some()
             || active.display_panes.is_some()
+            || active.transient_message.is_some()
     }
 
     async fn attached_key_table_active(&self, identity: ActiveAttachIdentity) -> bool {

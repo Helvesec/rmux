@@ -1014,6 +1014,8 @@ fn cross_section_requests() -> Vec<Request> {
             message: Some("#{client_name}".to_owned()),
             target_client: Some("=".to_owned()),
             empty_target_context: false,
+            duration_ms: None,
+            ignore_input: false,
         })),
         Request::SendKeysExt2(Box::new(SendKeysExt2Request {
             target: Some(pane.clone()),

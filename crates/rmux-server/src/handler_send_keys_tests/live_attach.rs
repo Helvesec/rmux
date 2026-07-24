@@ -2710,6 +2710,178 @@ async fn live_attach_theme_reports_emit_client_theme_hooks() {
 }
 
 #[tokio::test]
+async fn display_message_ignore_keys_keeps_streamed_focus_and_theme_protocol_live() {
+    // Oracle: tmux 3.7b keeps terminal protocol outside `display-message -N`.
+    // Focus survives fragmentation and neighboring ignored keys; theme
+    // reports still trigger their hook.
+    let handler = RequestHandler::new();
+    let alpha = session_name("display-message-ignore-protocol");
+    let requester_pid = std::process::id();
+
+    create_quiet_input_session(&handler, &alpha).await;
+    set_global_hook(
+        &handler,
+        HookName::ClientDarkTheme,
+        "set-buffer -a -b display-theme dark,",
+    )
+    .await;
+    let mut lifecycle = handler.subscribe_lifecycle_events();
+    let (control_tx, _control_rx) = mpsc::unbounded_channel();
+    handler
+        .register_attach(requester_pid, alpha.clone(), control_tx)
+        .await;
+    {
+        let mut state = handler.state.lock().await;
+        state
+            .append_bytes_to_pane_transcript_for_test(&alpha, 0, 0, b"\x1b[?1004h")
+            .expect("focus mode transcript update");
+        let transcript = state
+            .transcript_handle(&PaneTarget::with_window(alpha.clone(), 0, 0))
+            .expect("focus transcript");
+        assert_ne!(
+            transcript.lock().expect("focus transcript lock").mode() & mode::MODE_FOCUSON,
+            0,
+            "focus mode must be active before the ignored message"
+        );
+    }
+    let response = handler
+        .handle(Request::DisplayMessageExt(Box::new(
+            DisplayMessageExtRequest {
+                target: None,
+                print: false,
+                message: Some("ignore keys".to_owned()),
+                target_client: Some(requester_pid.to_string()),
+                empty_target_context: false,
+                duration_ms: Some(rmux_proto::DisplayMessageDurationMillis::new(1_000)),
+                ignore_input: true,
+            },
+        )))
+        .await;
+    assert!(matches!(response, Response::DisplayMessage(_)));
+
+    let expected = b"\x1b[O\x1b[I";
+    let capture =
+        RawPaneInputProbe::start(&handler, &alpha, "display-ignore-protocol", expected.len()).await;
+    let mut pending_input = Vec::new();
+    for input in [
+        b"x\x1b".as_slice(),
+        b"[".as_slice(),
+        b"O".as_slice(),
+        b"\x1b[Iy\x1b[?997;".as_slice(),
+        b"1n\x1b[12;".as_slice(),
+        b"40R\x1b[1;2R".as_slice(),
+    ] {
+        handler
+            .handle_attached_live_input_inner(requester_pid, &mut pending_input, input)
+            .await
+            .expect("ignored input stream");
+    }
+    capture.finish(&handler, &alpha).await;
+    capture.assert_contents(&handler, expected).await;
+    drain_lifecycle_hooks(&handler, &mut lifecycle).await;
+    wait_for_buffer(&handler, "display-theme", "dark,").await;
+    assert!(handler
+        .active_attach
+        .lock()
+        .await
+        .by_pid
+        .get(&requester_pid)
+        .is_some_and(|active| active.transient_message.is_some()));
+}
+
+#[tokio::test]
+async fn display_message_ignore_protocol_reloads_target_after_each_focus_hook() {
+    let handler = RequestHandler::new();
+    let alpha = session_name("display-ignore-focus-switch");
+    let requester_pid = std::process::id();
+    create_send_keys_test_session(&handler, &alpha).await;
+    assert!(matches!(
+        handler
+            .handle(Request::SplitWindow(SplitWindowRequest {
+                target: SplitWindowTarget::Session(alpha.clone()),
+                direction: SplitDirection::Horizontal,
+                before: false,
+                environment: None,
+            }))
+            .await,
+        Response::SplitWindow(_)
+    ));
+    let first = PaneTarget::with_window(alpha.clone(), 0, 0);
+    let second = PaneTarget::with_window(alpha.clone(), 0, 1);
+    assert!(matches!(
+        handler
+            .handle(Request::SelectPane(Box::new(SelectPaneRequest {
+                target: first.clone(),
+                title: None,
+                style: None,
+                input_disabled: None,
+                preserve_zoom: false,
+            })))
+            .await,
+        Response::SelectPane(_)
+    ));
+    {
+        let mut state = handler.state.lock().await;
+        state
+            .append_bytes_to_pane_transcript_for_test(&alpha, 0, 1, b"\x1b[?1004h")
+            .expect("second pane enables focus reporting");
+        state.start_pane_input_capture_for_test(&first);
+        state.start_pane_input_capture_for_test(&second);
+    }
+    set_global_hook(
+        &handler,
+        HookName::ClientFocusIn,
+        &format!("select-pane -t {}:0.1", alpha.as_str()),
+    )
+    .await;
+    let lifecycle_events = handler
+        .take_lifecycle_dispatch_receiver()
+        .expect("lifecycle dispatch receiver activates once");
+    let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel();
+    let lifecycle_handler = handler.clone();
+    let lifecycle_task = tokio::spawn(async move {
+        lifecycle_handler
+            .consume_lifecycle_hooks(lifecycle_events, shutdown_rx)
+            .await;
+    });
+    let (control_tx, _control_rx) = mpsc::unbounded_channel();
+    handler
+        .register_attach(requester_pid, alpha.clone(), control_tx)
+        .await;
+    assert!(matches!(
+        handler
+            .handle(Request::DisplayMessageExt(Box::new(
+                DisplayMessageExtRequest {
+                    target: Some(Target::Session(alpha.clone())),
+                    print: false,
+                    message: Some("ignore keys".to_owned()),
+                    target_client: Some(requester_pid.to_string()),
+                    empty_target_context: false,
+                    duration_ms: Some(rmux_proto::DisplayMessageDurationMillis::new(1_000)),
+                    ignore_input: true,
+                },
+            )))
+            .await,
+        Response::DisplayMessage(_)
+    ));
+
+    handler
+        .handle_attached_live_input_for_test(requester_pid, b"\x1b[I\x1b[O")
+        .await
+        .expect("focus controls survive ignored input");
+    {
+        let state = handler.state.lock().await;
+        assert_eq!(state.pane_input_capture_for_test(&first), Some(Vec::new()));
+        assert_eq!(
+            state.pane_input_capture_for_test(&second),
+            Some(b"\x1b[O".to_vec())
+        );
+    }
+    let _ = shutdown_tx.send(());
+    lifecycle_task.await.expect("lifecycle task joins");
+}
+
+#[tokio::test]
 async fn live_attach_focus_sequences_forward_when_pane_focus_mode_is_enabled() {
     let handler = RequestHandler::new();
     let alpha = session_name("alpha");

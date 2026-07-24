@@ -70,18 +70,31 @@ fn display_message_rejects_multiple_message_arguments() {
 }
 
 #[test]
-fn display_message_rejects_unimplemented_delay_and_no_format_flags() {
-    for (arguments, flag) in [
-        (&["display-message", "-d0", "-p", "hello"][..], "-d"),
-        (&["display-message", "-pN", "hello"][..], "-N"),
+fn display_message_accepts_tmux_delay_and_ignore_input_flags() {
+    let cli = parse_args(&["display-message", "-d0", "-pN", "hello"]).unwrap();
+    match cli.command.expect("parsed command") {
+        super::super::Command::DisplayMessage(args) => {
+            assert_eq!(args.delay.as_deref(), Some("0"));
+            assert!(args.print);
+            assert!(args.ignore_input);
+        }
+        _ => panic!("expected DisplayMessage command"),
+    }
+}
+
+#[test]
+fn display_message_rejects_invalid_tmux_delays() {
+    for (delay, expected) in [
+        ("-1", "delay too small"),
+        ("4294967296", "delay too large"),
+        ("1 ", "delay invalid"),
+        ("1.0", "delay invalid"),
     ] {
-        let error = parse_args(arguments).unwrap_err();
-        assert_eq!(error.kind(), clap::error::ErrorKind::UnknownArgument);
+        let error = parse_args(&["display-message", "-d", delay, "-p", "hello"]).unwrap_err();
+        assert_eq!(error.kind(), clap::error::ErrorKind::InvalidValue);
         assert!(
-            error
-                .to_string()
-                .contains(&format!("command display-message: unknown flag {flag}")),
-            "unexpected error for {arguments:?}: {error}"
+            error.to_string().contains(expected),
+            "unexpected error for {delay:?}: {error}"
         );
     }
 }

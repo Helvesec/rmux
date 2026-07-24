@@ -183,13 +183,23 @@ impl RequestHandler {
         requester_pid: u32,
         invocation: &QueueInvocation,
     ) -> Option<QueuedDisplayTargetClient> {
-        let QueueInvocation::Request(Request::DisplayMessageExt(request)) = invocation else {
-            return None;
+        let target_client = match invocation {
+            QueueInvocation::Request(Request::DisplayMessage(_)) => None,
+            QueueInvocation::Request(Request::DisplayMessageExt(request)) => {
+                request.target_client.as_deref()
+            }
+            _ => return None,
         };
-        let target_client = request.target_client.as_deref()?;
+        if target_client.is_none() {
+            return current_expected_attach_identity().map(QueuedDisplayTargetClient::Attached);
+        }
         Some(
             match self
-                .find_target_attach_client_identity(requester_pid, target_client, "display-message")
+                .find_target_attach_client_identity(
+                    requester_pid,
+                    target_client.expect("target client was checked above"),
+                    "display-message",
+                )
                 .await
             {
                 Ok(Some(identity)) => QueuedDisplayTargetClient::Attached(identity),

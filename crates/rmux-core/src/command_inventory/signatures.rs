@@ -53,7 +53,7 @@ pub(super) const LIST_COMMAND_SIGNATURES: &[(&str, &str)] = &[
     ),
     (
         "display-message",
-        "(display) [-aCIlpv] [-c target-client] [-F format] [-t target-pane] [message]",
+        "(display) [-aCIlNpv] [-c target-client] [-d delay] [-F format] [-t target-pane] [message]",
     ),
     (
         "display-popup",

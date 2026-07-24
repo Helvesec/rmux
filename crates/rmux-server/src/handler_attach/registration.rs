@@ -252,6 +252,8 @@ impl RequestHandler {
                     mode_tree_frame: None,
                     overlay: None,
                     display_panes: None,
+                    transient_message: None,
+                    transient_terminal_prefix: Vec::new(),
                 },
             ) {
                 active_attach.forget_attached_client_windows(requester_pid);

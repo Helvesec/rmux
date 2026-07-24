@@ -10,7 +10,6 @@ use rmux_proto::{CommandOutput, OptionName, RmuxError};
 use crate::handler_support::attached_client_required;
 use crate::key_table::effective_client_key_table_name;
 use crate::outer_terminal::OuterTerminal;
-use crate::pane_io::AttachControl;
 use crate::pane_terminals::{session_not_found, HandlerState};
 use crate::server_access::current_owner_uid;
 use crate::terminal::{base_process_environment, base_process_environment_display_only};
@@ -199,7 +198,14 @@ impl RequestHandler {
         session_name: &rmux_proto::SessionName,
     ) -> Result<(), RmuxError> {
         let attached_count = self.attached_count(session_name).await;
-        let (prompt, terminal_context, client_size, key_table) = {
+        let (
+            prompt,
+            terminal_context,
+            client_size,
+            key_table,
+            current_attach_id,
+            current_session_id,
+        ) = {
             let active_attach = self.active_attach.lock().await;
             let active = active_attach
                 .by_pid
@@ -209,6 +215,9 @@ impl RequestHandler {
                         && &active.session_name == session_name
                 })
                 .ok_or_else(|| attached_client_required("refresh-client"))?;
+            if active.transient_message.is_some() {
+                return Ok(());
+            }
             (
                 active
                     .prompt
@@ -217,6 +226,8 @@ impl RequestHandler {
                 active.terminal_context.clone(),
                 active.client_size,
                 active.key_table_name.clone(),
+                active.id,
+                active.session_id,
             )
         };
         let socket_path = self.socket_path();
@@ -226,6 +237,9 @@ impl RequestHandler {
                 .sessions
                 .session(session_name)
                 .ok_or_else(|| session_not_found(session_name))?;
+            if session.id() != current_session_id {
+                return Err(attached_client_required("refresh-client"));
+            }
             let key_table = effective_client_key_table_name(&state, session, key_table.as_deref());
             let session = attach_support::sized_session(session, Some(client_size));
             let outer_terminal = OuterTerminal::resolve(&state.options, terminal_context);
@@ -243,22 +257,14 @@ impl RequestHandler {
             );
             outer_terminal.wrap_render_frame(&frame)
         };
-        match expected_attach_id {
-            Some(attach_id) => {
-                self.send_attach_control_for_client_identity(
-                    attach_pid,
-                    attach_id,
-                    AttachControl::Write(bytes),
-                    "refresh-client",
-                )
-                .await?;
-            }
-            None => {
-                self.send_attach_control(attach_pid, AttachControl::Write(bytes), "refresh-client")
-                    .await?;
-            }
-        }
-        Ok(())
+        self.send_attached_status_if_unobscured(
+            attach_pid,
+            current_attach_id,
+            session_name,
+            current_session_id,
+            bytes,
+        )
+        .await
     }
 }
 

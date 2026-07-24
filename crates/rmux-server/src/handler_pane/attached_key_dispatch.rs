@@ -13,7 +13,6 @@ use crate::key_table::{
     step03_prefix_binding, Step03PrefixBinding, COPY_MODE_TABLE, COPY_MODE_VI_TABLE, PREFIX_TABLE,
 };
 use crate::pane_terminals::session_not_found;
-use crate::renderer;
 
 #[path = "attached_key_dispatch/commands.rs"]
 mod commands;
@@ -478,24 +477,23 @@ impl RequestHandler {
         );
 
         let message = attached_status_message_for_error(error);
-        let (overlay_frame, clear_frame, duration) = {
+        let duration = {
             let mut state = self.state.lock().await;
             state.add_message(message.clone());
             let Some(session) = state.sessions.session(session_name) else {
                 return;
             };
-            let mut overlay_frame =
-                renderer::render_display_panes_clear(session, &state.options, &state);
-            overlay_frame.extend_from_slice(
-                renderer::render_status_message(session, &state.options, &message).as_slice(),
-            );
-            let clear_frame = renderer::render_display_panes_clear(session, &state.options, &state);
-            let duration = display_time(&state.options, session_name);
-            (overlay_frame, clear_frame, duration)
+            let _ = session;
+            display_time(&state.options, session_name)
         };
 
         let _ = self
-            .send_attached_overlay(session_name, overlay_frame, clear_frame, duration)
+            .send_attached_overlay(
+                session_name,
+                message,
+                (!duration.is_zero()).then_some(duration),
+                crate::handler::attach_support::TransientMessageInputPolicy::DismissAndForward,
+            )
             .await;
     }
 

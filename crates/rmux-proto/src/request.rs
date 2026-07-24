@@ -13,7 +13,10 @@ mod compat;
 
 #[path = "request/display.rs"]
 mod display;
-pub use display::{DisplayMessageExtRequest, DisplayMessageRequest};
+pub use display::{
+    DisplayMessageDurationMillis, DisplayMessageDurationParseError, DisplayMessageExtRequest,
+    DisplayMessageRequest,
+};
 
 #[path = "request/show.rs"]
 mod show;

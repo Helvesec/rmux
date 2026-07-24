@@ -8,9 +8,9 @@ use rmux_core::events::OutputCursorItem;
 use rmux_core::{OptionStore, PaneGeometry, TerminalPassthrough};
 use rmux_proto::{
     encode_attach_message, AttachFrameDecoder, AttachMessage, AttachShellCommand,
-    AttachedKeystroke, BindKeyRequest, KeyDispatched, KillSessionRequest, NewSessionRequest,
-    OptionName, PaneTarget, Request, Response, ScopeSelector, SessionName, SetOptionMode,
-    TerminalSize, WaitForMode, WaitForRequest,
+    AttachedKeystroke, BindKeyRequest, DisplayMessageExtRequest, KeyDispatched, KillSessionRequest,
+    NewSessionRequest, OptionName, PaneTarget, Request, Response, ScopeSelector, SessionName,
+    SetOptionMode, Target, TerminalSize, WaitForMode, WaitForRequest,
 };
 use rmux_pty::PtyPair;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -644,6 +644,9 @@ impl PendingEscapeSchedulerFixture {
             }))
             .await;
         assert!(matches!(created, Response::NewSession(_)), "{created:?}");
+        handler
+            .wait_for_pane_startup_to_finish_for_test(&target)
+            .await;
         let escape_time = handler
             .handle(Request::SetOption(rmux_proto::SetOptionRequest {
                 scope: rmux_proto::ScopeSelector::Global,
@@ -757,6 +760,65 @@ impl PendingEscapeSchedulerFixture {
             .expect("attach task join");
         assert!(result.is_ok(), "attach exits cleanly after prefix-d");
     }
+}
+
+async fn arm_ignored_display_message(fixture: &PendingEscapeSchedulerFixture, duration_ms: u32) {
+    let response = fixture
+        .handler
+        .handle(Request::DisplayMessageExt(Box::new(
+            DisplayMessageExtRequest {
+                target: Some(Target::Pane(fixture.target.clone())),
+                print: false,
+                message: Some("ignore input".to_owned()),
+                target_client: Some(std::process::id().to_string()),
+                empty_target_context: false,
+                duration_ms: Some(rmux_proto::DisplayMessageDurationMillis::new(duration_ms)),
+                ignore_input: true,
+            },
+        )))
+        .await;
+    assert!(
+        matches!(response, Response::DisplayMessage(_)),
+        "{response:?}"
+    );
+}
+
+#[tokio::test]
+async fn ignored_display_message_expiry_flushes_a_lone_retained_csi() {
+    let mut fixture = PendingEscapeSchedulerFixture::start("display-ignore-expiry-lone-csi").await;
+    arm_ignored_display_message(&fixture, 40).await;
+    fixture.send(AttachMessage::Data(b"\x1b[".to_vec())).await;
+
+    let captured = fixture
+        .wait_for_capture(
+            |captured| captured == b"\x1b[",
+            "ignored CSI after message and escape expiry",
+        )
+        .await;
+    assert_eq!(captured, b"\x1b[");
+    fixture.finish().await;
+}
+
+#[tokio::test]
+async fn ignored_display_message_keeps_csi_contiguous_across_expiry() {
+    let mut fixture =
+        PendingEscapeSchedulerFixture::start("display-ignore-expiry-completed-csi").await;
+    arm_ignored_display_message(&fixture, 40).await;
+    fixture.send(AttachMessage::Data(b"\x1b[".to_vec())).await;
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    fixture.send(AttachMessage::Data(b"A".to_vec())).await;
+
+    let captured = fixture
+        .wait_for_capture(
+            |captured| matches!(captured, b"\x1b[A" | b"\x1bOA"),
+            "ignored CSI completed after message expiry",
+        )
+        .await;
+    assert!(
+        matches!(captured.as_slice(), b"\x1b[A" | b"\x1bOA"),
+        "the split Up key must remain one contiguous key in either cursor-key mode"
+    );
+    fixture.finish().await;
 }
 
 #[tokio::test]

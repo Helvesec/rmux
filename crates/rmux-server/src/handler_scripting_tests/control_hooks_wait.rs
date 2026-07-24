@@ -65,24 +65,43 @@ async fn parsed_queue_display_message_rejects_multiple_message_arguments() {
 }
 
 #[tokio::test]
-async fn parsed_queue_display_message_rejects_inert_delay_and_no_format_flags() {
+async fn parsed_queue_display_message_accepts_delay_and_ignore_input_flags() {
     let handler = RequestHandler::new();
 
-    for (command, flag) in [
-        ("display-message -d0 -p hello", "-d"),
-        ("display-message -pN hello", "-N"),
+    for command in [
+        "display-message -d0 -p hello",
+        "display-message -pN hello",
+        "display-message -pd1 hello",
     ] {
         let parsed = CommandParser::new()
             .parse(command)
             .expect("generic command parser preserves display-message flags");
+        let output = handler
+            .execute_parsed_commands_for_test(std::process::id(), parsed)
+            .await
+            .expect("tmux display-message timing flags execute");
+        assert_eq!(output.stdout(), b"hello\n");
+    }
+}
+
+#[tokio::test]
+async fn parsed_queue_display_message_reports_tmux_delay_errors() {
+    let handler = RequestHandler::new();
+
+    for (value, expected) in [
+        ("-1", "delay too small"),
+        ("4294967296", "delay too large"),
+        ("1 ", "delay invalid"),
+        ("1.0", "delay invalid"),
+    ] {
+        let parsed = CommandParser::new()
+            .parse(&format!("display-message -d '{value}' -p hello"))
+            .expect("generic command parser preserves display-message delay");
         let error = handler
             .execute_parsed_commands_for_test(std::process::id(), parsed)
             .await
-            .expect_err("unimplemented display-message flag must be rejected");
-        assert_eq!(
-            error,
-            rmux_proto::RmuxError::Server(format!("command display-message: unknown flag {flag}"))
-        );
+            .expect_err("invalid display-message delay must fail");
+        assert_eq!(error, rmux_proto::RmuxError::Server(expected.to_owned()));
     }
 }
 

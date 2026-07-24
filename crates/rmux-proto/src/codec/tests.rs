@@ -312,6 +312,8 @@ fn every_request_variant_round_trips_through_the_frame_codec() {
             message: Some("#{client_name}".to_owned()),
             target_client: Some("=".to_owned()),
             empty_target_context: false,
+            duration_ms: None,
+            ignore_input: false,
         })),
         Request::SendKeysExt2(Box::new(SendKeysExt2Request {
             target: Some(PaneTarget::with_window(beta.clone(), 0, 1)),

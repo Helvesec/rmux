@@ -92,10 +92,13 @@ async fn compact_hidden_select_pane_style_executes_from_source_file() {
 }
 
 #[tokio::test]
-async fn source_file_rejects_unimplemented_display_message_flags() {
+async fn source_file_executes_display_message_delay_and_ignore_input_flags() {
     let handler = RequestHandler::new();
-    let root = temp_root("display-message-inert-flags");
-    write_config(&root.join("display.conf"), "display-message -d0 -p hello\n");
+    let root = temp_root("display-message-timing-flags");
+    write_config(
+        &root.join("display.conf"),
+        "display-message -d0 -pN hello\n",
+    );
 
     let response = handler
         .handle(source_file_request(
@@ -105,10 +108,16 @@ async fn source_file_rejects_unimplemented_display_message_flags() {
         .await;
     fs::remove_dir_all(root).expect("remove display-message source root");
 
-    let diagnostic = source_file_stdout_failure(response);
-    assert!(
-        diagnostic.contains("display.conf:1: command display-message: unknown flag -d"),
-        "unexpected source diagnostic: {diagnostic}"
+    let Response::SourceFile(response) = response else {
+        panic!("expected successful source-file response");
+    };
+    assert_eq!(response.exit_status(), None);
+    assert_eq!(
+        response
+            .command_output()
+            .expect("display-message -p output")
+            .stdout(),
+        b"hello\n"
     );
 }
 

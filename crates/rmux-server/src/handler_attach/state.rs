@@ -15,6 +15,7 @@ use super::super::scripting_support::{
     rename_pane_target_session, rename_window_target_session, QueueExecutionContext,
 };
 use super::super::{RequesterOrigin, StableTargetIdentity};
+use super::transient_message::TransientMessageInputState;
 use crate::client_flags::ClientFlags;
 use crate::handler_support::{ambiguous_attached_client, attached_client_required};
 use crate::mouse::ClientMouseState;
@@ -77,6 +78,8 @@ pub(in crate::handler) struct ActiveAttach {
     pub(in crate::handler) mode_tree_frame: Option<Vec<u8>>,
     pub(in crate::handler) overlay: Option<ClientOverlayState>,
     pub(in crate::handler) display_panes: Option<DisplayPanesClientState>,
+    pub(in crate::handler) transient_message: Option<TransientMessageInputState>,
+    pub(in crate::handler) transient_terminal_prefix: Vec<u8>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -370,22 +373,6 @@ impl ActiveAttachState {
             .get(&attach_pid)
             .map(|active| active.last_session.clone().zip(active.last_session_id))
             .ok_or_else(|| rmux_proto::RmuxError::Server("attached client disappeared".to_owned()))
-    }
-
-    pub(in crate::handler) fn session_for_attached_client(
-        &self,
-        requester_pid: u32,
-        command_name: &str,
-    ) -> Result<Option<rmux_proto::SessionName>, rmux_proto::RmuxError> {
-        if self.by_pid.is_empty() {
-            return Ok(None);
-        }
-
-        let attach_pid = self.resolve_attached_client_pid(requester_pid, command_name)?;
-        Ok(self
-            .by_pid
-            .get(&attach_pid)
-            .map(|active| active.session_name.clone()))
     }
 
     pub(in crate::handler) fn current_session_candidate(

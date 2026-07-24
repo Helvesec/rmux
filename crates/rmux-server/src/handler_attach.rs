@@ -32,6 +32,22 @@ struct AttachControlIdentityExpectation {
     mode_tree_requester: Option<super::mode_tree_support::ModeTreeActionIdentity>,
 }
 
+struct AttachedOverlayIdentityExpectation {
+    identity: Option<ActiveAttachIdentity>,
+    session_name: Option<SessionName>,
+    session_id: Option<SessionId>,
+    client_size: Option<TerminalSize>,
+}
+
+struct AttachedOverlayDelivery {
+    status_message: String,
+    status_frame: Vec<u8>,
+    frame: Vec<u8>,
+    clear_frame: Vec<u8>,
+    duration: Option<Duration>,
+    input_policy: TransientMessageInputPolicy,
+}
+
 #[cfg(test)]
 #[derive(Debug, Default)]
 pub(in crate::handler) struct AttachControlIdentityPause {
@@ -81,6 +97,55 @@ async fn pause_after_attach_control_identity_capture(attach_pid: u32) {
     pause.release.notified().await;
 }
 
+#[cfg(test)]
+#[derive(Debug, Default)]
+pub(in crate::handler) struct TransientRestoreCommitPause {
+    pub(in crate::handler) reached: tokio::sync::Notify,
+    pub(in crate::handler) release: tokio::sync::Notify,
+}
+
+#[cfg(test)]
+static TRANSIENT_RESTORE_COMMIT_PAUSE: std::sync::Mutex<
+    Vec<(u32, std::sync::Arc<TransientRestoreCommitPause>)>,
+> = std::sync::Mutex::new(Vec::new());
+
+#[cfg(test)]
+pub(in crate::handler) fn install_transient_restore_commit_pause(
+    attach_pid: u32,
+) -> std::sync::Arc<TransientRestoreCommitPause> {
+    let pause = std::sync::Arc::new(TransientRestoreCommitPause::default());
+    let mut installed = TRANSIENT_RESTORE_COMMIT_PAUSE
+        .lock()
+        .expect("transient restore pause lock");
+    if let Some((_, current)) = installed
+        .iter_mut()
+        .find(|(paused_pid, _)| *paused_pid == attach_pid)
+    {
+        *current = pause.clone();
+    } else {
+        installed.push((attach_pid, pause.clone()));
+    }
+    pause
+}
+
+#[cfg(test)]
+async fn pause_before_transient_restore_commit(attach_pid: u32) {
+    let pause = {
+        let mut installed = TRANSIENT_RESTORE_COMMIT_PAUSE
+            .lock()
+            .expect("transient restore pause lock");
+        installed
+            .iter()
+            .position(|(paused_pid, _)| *paused_pid == attach_pid)
+            .map(|index| installed.swap_remove(index).1)
+    };
+    let Some(pause) = pause else {
+        return;
+    };
+    pause.reached.notify_one();
+    pause.release.notified().await;
+}
+
 #[path = "handler_attach/key_table.rs"]
 mod key_table;
 #[path = "handler_attach/refresh.rs"]
@@ -97,6 +162,8 @@ mod session_destroy;
 mod state;
 #[path = "handler_attach/switch_commit.rs"]
 mod switch_commit;
+#[path = "handler_attach/transient_message.rs"]
+mod transient_message;
 
 pub(crate) use crate::client_flags::ClientFlags;
 pub(in crate::handler) use key_table::AttachedKeyTableCommit;
@@ -112,6 +179,11 @@ pub(super) use state::{
 pub(crate) use state::{ActiveAttachIdentity, AttachRegistration};
 pub(in crate::handler) use switch_commit::{
     AttachedSwitchCommitOutcome, AttachedSwitchCommitRequest, AttachedSwitchCommittedTarget,
+};
+pub(in crate::handler) use transient_message::{
+    append_transient_message_frame, cancel_transient_message, compose_transient_message_refresh,
+    transient_message_render_snapshot, TransientMessageInput, TransientMessageInputPolicy,
+    TransientMessageRenderSnapshot, TransientMessageRestoreGuard,
 };
 
 impl RequestHandler {
@@ -400,6 +472,45 @@ impl RequestHandler {
             },
         )
         .await
+    }
+
+    pub(super) async fn send_attached_status_if_unobscured(
+        &self,
+        attach_pid: u32,
+        expected_attach_id: u64,
+        expected_session_name: &SessionName,
+        expected_session_id: SessionId,
+        bytes: Vec<u8>,
+    ) -> Result<(), rmux_proto::RmuxError> {
+        let mut active_attach = self.active_attach.lock().await;
+        let Some(active) = active_attach.by_pid.get_mut(&attach_pid) else {
+            return Err(attached_client_required("refresh-client"));
+        };
+        if active.id != expected_attach_id
+            || &active.session_name != expected_session_name
+            || active.session_id != expected_session_id
+            || active.closing.load(Ordering::SeqCst)
+        {
+            return Err(attached_client_required("refresh-client"));
+        }
+        if active.transient_message.is_some() {
+            return Ok(());
+        }
+        if let Err(error) = active.control_tx.send(AttachControl::Write(bytes)) {
+            if error.is_full() {
+                active.closing.store(true, Ordering::SeqCst);
+            }
+            active_attach.remove_attached_client(attach_pid);
+            self.bump_active_attach_epoch();
+            return if error.is_full() {
+                Err(rmux_proto::RmuxError::Server(
+                    "attached client is not draining updates".to_owned(),
+                ))
+            } else {
+                Err(attached_client_required("refresh-client"))
+            };
+        }
+        Ok(())
     }
 
     async fn send_attach_control_with_expected_identity(
@@ -716,133 +827,234 @@ impl RequestHandler {
     pub(super) async fn send_attached_overlay(
         &self,
         session_name: &rmux_proto::SessionName,
-        overlay_frame: Vec<u8>,
-        clear_frame: Vec<u8>,
-        duration: Duration,
+        status_message: String,
+        duration: Option<Duration>,
+        input_policy: TransientMessageInputPolicy,
     ) -> bool {
-        let handler = self.clone();
-        let session_name = session_name.clone();
-        let mut active_attach = self.active_attach.lock().await;
+        let identities = {
+            let active_attach = self.active_attach.lock().await;
+            active_attach
+                .by_pid
+                .iter()
+                .filter(|(_, active)| active.session_name == *session_name && !active.suspended)
+                .map(|(pid, active)| active.identity(*pid))
+                .collect::<Vec<_>>()
+        };
         let mut delivered = false;
-        let mut removed_pids = Vec::new();
-
-        active_attach.by_pid.retain(|pid, active| {
-            if active.session_name != session_name || active.suspended {
-                return true;
-            }
-
-            active.overlay_generation = active.overlay_generation.saturating_add(1);
-            let render_generation = active.render_generation;
-            let overlay_generation = active.overlay_generation;
-            if active
-                .control_tx
-                .send(AttachControl::Overlay(OverlayFrame::new(
-                    overlay_frame.clone(),
-                    render_generation,
-                    overlay_generation,
-                )))
-                .is_err()
-            {
-                removed_pids.push(*pid);
-                return false;
-            }
-
-            let control_tx = active.control_tx.clone();
-            let clear_frame = clear_frame.clone();
-            let handler = handler.clone();
-            let session_name = session_name.clone();
-            tokio::spawn(async move {
-                sleep(duration).await;
-                let _ = control_tx.send(AttachControl::Overlay(OverlayFrame::new(
-                    clear_frame,
-                    render_generation,
-                    overlay_generation,
-                )));
-                handler
-                    .refresh_persistent_overlays_for_session(&session_name)
-                    .await;
-            });
-            delivered = true;
-            true
-        });
-        let removed_any = !removed_pids.is_empty();
-        for pid in removed_pids {
-            active_attach.forget_attached_client_windows(pid);
+        for identity in identities {
+            delivered |= self
+                .send_attached_overlay_to_client_identity(
+                    identity,
+                    Some(identity.session_id()),
+                    status_message.clone(),
+                    duration,
+                    input_policy,
+                )
+                .await;
         }
-        if removed_any {
-            drop(active_attach);
-            self.bump_active_attach_epoch();
-        }
-
         delivered
     }
 
-    pub(super) async fn send_attached_overlay_to_client(
+    pub(super) async fn send_attached_overlay_to_session_identity(
         &self,
-        attach_pid: u32,
-        overlay_frame: Vec<u8>,
-        clear_frame: Vec<u8>,
-        duration: Duration,
+        session_name: &rmux_proto::SessionName,
+        session_id: SessionId,
+        status_message: String,
+        duration: Option<Duration>,
+        input_policy: TransientMessageInputPolicy,
     ) -> bool {
-        self.send_attached_overlay_to_client_guarded(
-            attach_pid,
-            None,
-            None,
-            overlay_frame,
-            clear_frame,
-            duration,
-        )
-        .await
+        let identities = {
+            let active_attach = self.active_attach.lock().await;
+            active_attach
+                .by_pid
+                .iter()
+                .filter(|(_, active)| {
+                    active.session_name == *session_name
+                        && active.session_id == session_id
+                        && !active.suspended
+                })
+                .map(|(pid, active)| active.identity(*pid))
+                .collect::<Vec<_>>()
+        };
+        let mut delivered = false;
+        for identity in identities {
+            delivered |= self
+                .send_attached_overlay_to_client_identity(
+                    identity,
+                    Some(session_id),
+                    status_message.clone(),
+                    duration,
+                    input_policy,
+                )
+                .await;
+        }
+        delivered
     }
 
     pub(super) async fn send_attached_overlay_to_client_identity(
         &self,
         identity: ActiveAttachIdentity,
         expected_session_id: Option<SessionId>,
-        overlay_frame: Vec<u8>,
-        clear_frame: Vec<u8>,
-        duration: Duration,
+        status_message: String,
+        duration: Option<Duration>,
+        input_policy: TransientMessageInputPolicy,
     ) -> bool {
-        self.send_attached_overlay_to_client_guarded(
-            identity.attach_pid(),
-            Some(identity),
-            expected_session_id,
-            overlay_frame,
-            clear_frame,
-            duration,
-        )
-        .await
+        for _ in 0..3 {
+            let client = {
+                let active_attach = self.active_attach.lock().await;
+                active_attach
+                    .by_pid
+                    .get(&identity.attach_pid())
+                    .filter(|active| {
+                        identity.matches_active(active)
+                            && expected_session_id
+                                .is_none_or(|session_id| active.session_id == session_id)
+                            && !active.suspended
+                    })
+                    .map(|active| (active.session_name.clone(), active.client_size))
+            };
+            let Some((session_name, client_size)) = client else {
+                return false;
+            };
+            let rendered = {
+                let state = self.state.lock().await;
+                if expected_session_id.is_some_and(|expected| {
+                    state
+                        .sessions
+                        .session(&session_name)
+                        .is_none_or(|session| session.id() != expected)
+                }) {
+                    return false;
+                }
+                render_status_overlay_for_attached_size(
+                    &state,
+                    &session_name,
+                    client_size,
+                    &status_message,
+                )
+                .ok()
+            };
+            let Some(rendered) = rendered else {
+                return false;
+            };
+            let refresh_session_name = session_name.clone();
+            if self
+                .send_attached_overlay_to_client_guarded(
+                    identity.attach_pid(),
+                    AttachedOverlayIdentityExpectation {
+                        identity: Some(identity),
+                        session_name: Some(session_name),
+                        session_id: expected_session_id,
+                        client_size: Some(client_size),
+                    },
+                    AttachedOverlayDelivery {
+                        status_message: status_message.clone(),
+                        status_frame: rendered.status_frame,
+                        frame: rendered.overlay_frame,
+                        clear_frame: rendered.clear_frame,
+                        duration,
+                        input_policy,
+                    },
+                )
+                .await
+            {
+                self.refresh_persistent_surfaces_after_transient(
+                    identity,
+                    &refresh_session_name,
+                    expected_session_id.unwrap_or(identity.session_id()),
+                )
+                .await;
+                return true;
+            }
+        }
+        false
+    }
+
+    async fn refresh_persistent_surfaces_after_transient(
+        &self,
+        identity: ActiveAttachIdentity,
+        session_name: &SessionName,
+        session_id: SessionId,
+    ) {
+        let _ = self
+            .refresh_clock_overlay_for_client_identity(
+                identity.attach_pid(),
+                identity.attach_id(),
+                session_name,
+            )
+            .await;
+        let _ = self
+            .refresh_display_panes_overlay_for_client_identity(
+                identity.attach_pid(),
+                identity.attach_id(),
+                session_name,
+            )
+            .await;
+        let _ = self
+            .refresh_interactive_overlay_for_session_identity(identity, session_name, session_id)
+            .await;
+        let _ = self
+            .refresh_mode_tree_overlay_for_client_identity(
+                identity.attach_pid(),
+                identity.attach_id(),
+                session_name,
+            )
+            .await;
     }
 
     async fn send_attached_overlay_to_client_guarded(
         &self,
         attach_pid: u32,
-        expected_identity: Option<ActiveAttachIdentity>,
-        expected_session_id: Option<SessionId>,
-        overlay_frame: Vec<u8>,
-        clear_frame: Vec<u8>,
-        duration: Duration,
+        expected: AttachedOverlayIdentityExpectation,
+        delivery: AttachedOverlayDelivery,
     ) -> bool {
+        let AttachedOverlayDelivery {
+            status_message,
+            status_frame,
+            frame,
+            clear_frame,
+            duration,
+            input_policy,
+        } = delivery;
         let handler = self.clone();
         let mut active_attach = self.active_attach.lock().await;
         let Some(active) = active_attach.by_pid.get_mut(&attach_pid) else {
             return false;
         };
         if active.suspended
-            || expected_identity.is_some_and(|identity| !identity.matches_active(active))
-            || expected_session_id.is_some_and(|session_id| active.session_id != session_id)
+            || expected
+                .identity
+                .is_some_and(|identity| !identity.matches_active(active))
+            || expected
+                .session_name
+                .as_ref()
+                .is_some_and(|session_name| active.session_name != *session_name)
+            || expected
+                .session_id
+                .is_some_and(|session_id| active.session_id != session_id)
+            || expected
+                .client_size
+                .is_some_and(|client_size| active.client_size != client_size)
         {
             return false;
         }
 
-        let session_name = active.session_name.clone();
         active.overlay_generation = active.overlay_generation.saturating_add(1);
         let render_generation = active.render_generation;
         let overlay_generation = active.overlay_generation;
+        let identity = transient_message::active_attach_identity(attach_pid, active);
+        let expiry_cancelled = transient_message::arm_transient_message(
+            active,
+            status_message,
+            status_frame,
+            clear_frame.clone(),
+            input_policy,
+            duration.is_some(),
+        );
         if active
             .control_tx
             .send(AttachControl::Overlay(OverlayFrame::new(
-                overlay_frame,
+                frame,
                 render_generation,
                 overlay_generation,
             )))
@@ -853,18 +1065,18 @@ impl RequestHandler {
             return false;
         }
 
-        let control_tx = active.control_tx.clone();
-        tokio::spawn(async move {
-            sleep(duration).await;
-            let _ = control_tx.send(AttachControl::Overlay(OverlayFrame::new(
-                clear_frame,
-                render_generation,
-                overlay_generation,
-            )));
-            handler
-                .refresh_persistent_overlays_for_session(&session_name)
-                .await;
-        });
+        if let (Some(duration), Some(expiry_cancelled)) = (duration, expiry_cancelled) {
+            tokio::spawn(async move {
+                tokio::select! {
+                    _ = sleep(duration) => {
+                        handler
+                            .expire_transient_message_for_identity(identity, overlay_generation)
+                            .await;
+                    }
+                    _ = expiry_cancelled => {}
+                }
+            });
+        }
         true
     }
 }
@@ -883,6 +1095,8 @@ fn reset_interactive_attach_state_for_session_switch(
         .persistent_overlay_epoch
         .store(active.mode_tree_state_id, Ordering::SeqCst);
     active.overlay_generation = active.overlay_generation.saturating_add(1);
+    active.transient_message = None;
+    active.transient_terminal_prefix.clear();
     active.overlay_state_id = active.overlay_state_id.saturating_add(1);
     active.overlay.take()
 }
@@ -1020,6 +1234,44 @@ pub(super) fn attach_render_target_for_session_with_prompt(
             socket_path: request.socket_path,
         },
     )
+}
+
+pub(super) fn render_status_message_for_attached_size(
+    state: &HandlerState,
+    session_name: &rmux_proto::SessionName,
+    render_size: TerminalSize,
+    message: &str,
+) -> Result<Vec<u8>, rmux_proto::RmuxError> {
+    render_status_overlay_for_attached_size(state, session_name, render_size, message)
+        .map(|frames| frames.status_frame)
+}
+
+struct StatusOverlayFrames {
+    overlay_frame: Vec<u8>,
+    clear_frame: Vec<u8>,
+    status_frame: Vec<u8>,
+}
+
+fn render_status_overlay_for_attached_size(
+    state: &HandlerState,
+    session_name: &rmux_proto::SessionName,
+    render_size: TerminalSize,
+    message: &str,
+) -> Result<StatusOverlayFrames, rmux_proto::RmuxError> {
+    let canonical_session = state
+        .sessions
+        .session(session_name)
+        .ok_or_else(|| session_not_found(session_name))?;
+    let session = attach_render_session(canonical_session, Some(render_size), None, None, None)?;
+    let clear_frame = renderer::render_display_panes_clear(session.as_ref(), &state.options, state);
+    let status_frame = renderer::render_status_message(session.as_ref(), &state.options, message);
+    let mut overlay_frame = clear_frame.clone();
+    overlay_frame.extend_from_slice(&status_frame);
+    Ok(StatusOverlayFrames {
+        overlay_frame,
+        clear_frame,
+        status_frame,
+    })
 }
 
 pub(super) struct AttachRenderTargetRequest<'a> {
@@ -1934,6 +2186,8 @@ mod tests {
             mode_tree_frame: Some(b"stale-tree-frame".to_vec()),
             overlay: None,
             display_panes: None,
+            transient_message: None,
+            transient_terminal_prefix: Vec::new(),
         };
 
         let overlay = reset_interactive_attach_state_for_session_switch(&mut active);

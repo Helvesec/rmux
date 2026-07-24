@@ -264,21 +264,25 @@ impl RequestHandler {
             expected_attach_id,
             session_name,
             None,
+            None,
         )
         .await
+        .map(|_| ())
     }
 
-    pub(in crate::handler) async fn refresh_clock_overlay_for_session_identity(
+    pub(in crate::handler) async fn refresh_clock_overlay_for_session_identity_guarded(
         &self,
         identity: super::attach_support::ActiveAttachIdentity,
         session_name: &SessionName,
         session_id: rmux_proto::SessionId,
-    ) -> Result<(), RmuxError> {
+        restore_guard: Option<super::attach_support::TransientMessageRestoreGuard>,
+    ) -> Result<bool, RmuxError> {
         self.refresh_clock_overlay_with_expected_identity(
             identity.attach_pid(),
             identity.attach_id(),
             session_name,
             Some(session_id),
+            restore_guard,
         )
         .await
     }
@@ -289,7 +293,8 @@ impl RequestHandler {
         expected_attach_id: u64,
         session_name: &SessionName,
         expected_session_id: Option<rmux_proto::SessionId>,
-    ) -> Result<(), RmuxError> {
+        restore_guard: Option<super::attach_support::TransientMessageRestoreGuard>,
+    ) -> Result<bool, RmuxError> {
         let frame = {
             let state = self.state.lock().await;
             let Some(session) = state.sessions.session(session_name) else {
@@ -315,21 +320,24 @@ impl RequestHandler {
                     && (expected_session_id.is_none() || active.prompt.is_none())
                     && !active.suspended
                     && !active.closing.load(std::sync::atomic::Ordering::SeqCst)
+                    && restore_guard.is_none_or(|guard| guard.matches(active))
             })
             .ok_or_else(|| attached_client_required("refresh-client"))?;
-        let Some(frame) = frame else {
-            return Ok(());
+        let Some(mut frame) = frame else {
+            return Ok(false);
         };
         if active.mode_tree.is_some() {
-            return Ok(());
+            return Ok(false);
         }
 
+        crate::handler::attach_support::append_transient_message_frame(active, &mut frame);
         active.overlay_generation = active.overlay_generation.saturating_add(1);
         let overlay =
             OverlayFrame::persistent(frame, active.render_generation, active.overlay_generation);
         active
             .control_tx
             .send(AttachControl::Overlay(overlay))
+            .map(|_| true)
             .map_err(|_| attached_client_required("refresh-client"))
     }
 

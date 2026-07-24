@@ -41,8 +41,16 @@ fn run_display_message_json_inner(
     let target =
         resolve_display_message_target(&mut connection, socket_path, args.target.as_deref())?;
     let message = display_message_template(&args)?;
-    let response = if args.target_client.is_some() {
-        connection.display_message_ext(target, true, message, args.target_client)
+    let duration_ms = display_message_duration(&args)?;
+    let response = if args.target_client.is_some() || duration_ms.is_some() || args.ignore_input {
+        connection.display_message_with_options(
+            target,
+            true,
+            message,
+            args.target_client,
+            duration_ms,
+            args.ignore_input,
+        )
     } else {
         connection.display_message(target, true, message)
     }
@@ -74,8 +82,16 @@ fn run_display_message_direct(
     let target =
         resolve_display_message_target(&mut connection, socket_path, args.target.as_deref())?;
     let message = display_message_template(&args)?;
-    let response = if args.target_client.is_some() {
-        connection.display_message_ext(target, args.print, message, args.target_client)
+    let duration_ms = display_message_duration(&args)?;
+    let response = if args.target_client.is_some() || duration_ms.is_some() || args.ignore_input {
+        connection.display_message_with_options(
+            target,
+            args.print,
+            message,
+            args.target_client,
+            duration_ms,
+            args.ignore_input,
+        )
     } else {
         connection.display_message(target, args.print, message)
     }
@@ -122,6 +138,16 @@ fn display_message_template(args: &DisplayMessageArgs) -> Result<Option<String>,
         .format
         .clone()
         .or_else(|| (!args.message.is_empty()).then(|| args.message.join(" "))))
+}
+
+fn display_message_duration(
+    args: &DisplayMessageArgs,
+) -> Result<Option<rmux_proto::DisplayMessageDurationMillis>, ExitFailure> {
+    args.delay.as_deref().map(str::parse).transpose().map_err(
+        |error: rmux_proto::DisplayMessageDurationParseError| {
+            ExitFailure::new(1, error.to_string())
+        },
+    )
 }
 
 fn trim_one_trailing_newline(value: &str) -> &str {

@@ -55,6 +55,10 @@ pub(in crate::handler) use pane_attached_input::bracketed_paste::{
     strip_bracketed_paste_markers, strip_bracketed_paste_markers_after_append,
 };
 pub(super) use pane_attached_input::retain_partial_attached_escape_input;
+pub(in crate::handler) use pane_attached_input::{
+    decode_attached_terminal_control_after_append, decode_pane_bound_terminal_string,
+    PaneBoundTerminalStringDecode, TerminalResponseDecode,
+};
 pub(super) use pane_by_id::resolve_pane_target_ref;
 #[cfg(windows)]
 pub(in crate::handler) use pane_deferred_wait::format_references_pane_pid;

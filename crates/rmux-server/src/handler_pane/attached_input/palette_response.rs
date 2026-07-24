@@ -22,7 +22,7 @@ enum OpaqueInputSpan {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(super) enum PaneBoundTerminalStringDecode {
+pub(in crate::handler) enum PaneBoundTerminalStringDecode {
     Matched { size: usize },
     Partial,
     NotString,
@@ -302,7 +302,9 @@ fn opaque_input_span(input: &[u8]) -> Option<OpaqueInputSpan> {
     }
 }
 
-pub(super) fn decode_pane_bound_terminal_string(input: &[u8]) -> PaneBoundTerminalStringDecode {
+pub(in crate::handler) fn decode_pane_bound_terminal_string(
+    input: &[u8],
+) -> PaneBoundTerminalStringDecode {
     let (body_start, bell_terminated) = if input.starts_with(b"\x1b]") {
         (2, true)
     } else if input.starts_with(b"\x1bP")

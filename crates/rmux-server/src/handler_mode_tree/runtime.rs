@@ -218,8 +218,9 @@ impl RequestHandler {
         &self,
         attach_pid: u32,
     ) -> Result<(), RmuxError> {
-        self.refresh_mode_tree_overlay_with_expected_identity(attach_pid, None, None, None)
+        self.refresh_mode_tree_overlay_with_expected_identity(attach_pid, None, None, None, None)
             .await
+            .map(|_| ())
     }
 
     pub(super) async fn refresh_mode_tree_overlay_for_action_identity(
@@ -231,8 +232,10 @@ impl RequestHandler {
             Some(identity),
             None,
             None,
+            None,
         )
         .await
+        .map(|_| ())
     }
 
     pub(in crate::handler) async fn refresh_mode_tree_overlay_for_client_identity(
@@ -260,16 +263,19 @@ impl RequestHandler {
             Some(identity),
             Some(session_name),
             None,
+            None,
         )
         .await
+        .map(|_| ())
     }
 
-    pub(in crate::handler) async fn refresh_mode_tree_overlay_for_session_identity(
+    pub(in crate::handler) async fn refresh_mode_tree_overlay_for_session_identity_guarded(
         &self,
         identity: super::super::attach_support::ActiveAttachIdentity,
         session_name: &SessionName,
         session_id: rmux_proto::SessionId,
-    ) -> Result<(), RmuxError> {
+        restore_guard: Option<super::super::attach_support::TransientMessageRestoreGuard>,
+    ) -> Result<bool, RmuxError> {
         let mode_tree_identity = {
             let active_attach = self.active_attach.lock().await;
             let active = active_attach
@@ -279,6 +285,7 @@ impl RequestHandler {
                     identity.matches_active_session(active, session_name, session_id)
                         && !active.suspended
                         && !active.closing.load(std::sync::atomic::Ordering::SeqCst)
+                        && restore_guard.is_none_or(|guard| guard.matches(active))
                 })
                 .ok_or_else(|| attached_client_required("refresh-client"))?;
             ModeTreeActionIdentity::new(identity.attach_pid(), active.id, active.mode_tree_state_id)
@@ -288,6 +295,7 @@ impl RequestHandler {
             Some(mode_tree_identity),
             Some(session_name),
             Some(session_id),
+            restore_guard,
         )
         .await
     }
@@ -298,7 +306,8 @@ impl RequestHandler {
         expected_identity: Option<ModeTreeActionIdentity>,
         expected_session_name: Option<&SessionName>,
         expected_session_id: Option<rmux_proto::SessionId>,
-    ) -> Result<(), RmuxError> {
+        restore_guard: Option<super::super::attach_support::TransientMessageRestoreGuard>,
+    ) -> Result<bool, RmuxError> {
         let (mut mode, mode_tree_state_id) = {
             let active_attach = self.active_attach.lock().await;
             let active = active_attach
@@ -313,10 +322,11 @@ impl RequestHandler {
                         &active.session_name == expected_session_name && !active.suspended
                     }) && expected_session_id.is_none_or(|expected| active.session_id == expected)
                         && (expected_session_id.is_none() || active.prompt.is_none())
+                        && restore_guard.is_none_or(|guard| guard.matches(active))
                 })
                 .ok_or_else(|| RmuxError::Server("attached client disappeared".to_owned()))?;
             let Some(mode) = active.mode_tree.clone() else {
-                return Ok(());
+                return Ok(false);
             };
             (mode, active.mode_tree_state_id)
         };
@@ -341,7 +351,7 @@ impl RequestHandler {
             render_mode_tree_overlay(&state, &mode, &build)
         };
 
-        {
+        let any_delivered = {
             let mut active_attach = self.active_attach.lock().await;
             if expected_identity.is_some_and(|expected| {
                 active_attach.by_pid.get(&attach_pid).is_none_or(|active| {
@@ -354,18 +364,22 @@ impl RequestHandler {
                         || (expected_session_id.is_some() && active.prompt.is_some())
                         || (expected_session_name.is_some() && active.suspended)
                         || active.closing.load(std::sync::atomic::Ordering::SeqCst)
+                        || restore_guard.is_some_and(|guard| !guard.matches(active))
                 })
             }) {
                 return Err(attached_client_required("choose-buffer"));
             }
             let mut expected_identity_delivered = None;
+            let mut any_delivered = false;
             active_attach.by_pid.retain(|pid, active| {
                 if active.session_name != session_name
                     || active.session_id != mode.session_id
+                    || (restore_guard.is_some() && *pid != attach_pid)
                     || expected_session_id.is_some_and(|expected| active.session_id != expected)
                     || (expected_session_id.is_some() && active.prompt.is_some())
                     || active.mode_tree.is_none()
                     || active.mode_tree_state_id != mode_tree_state_id
+                    || restore_guard.is_some_and(|guard| !guard.matches(active))
                 {
                     return true;
                 }
@@ -373,17 +387,23 @@ impl RequestHandler {
                 if active.suspended {
                     return true;
                 }
+                let mut rendered_overlay = overlay.clone();
+                crate::handler::attach_support::append_transient_message_frame(
+                    active,
+                    &mut rendered_overlay,
+                );
                 active.overlay_generation = active.overlay_generation.saturating_add(1);
                 active.mode_tree_frame = Some(overlay.clone());
                 let delivered = active
                     .control_tx
                     .send(AttachControl::Overlay(OverlayFrame::persistent_with_state(
-                        overlay.clone(),
+                        rendered_overlay,
                         active.render_generation,
                         active.overlay_generation,
                         active.mode_tree_state_id,
                     )))
                     .is_ok();
+                any_delivered |= delivered;
                 if *pid == attach_pid && expected_session_name.is_some() {
                     expected_identity_delivered = Some(delivered);
                 }
@@ -392,11 +412,12 @@ impl RequestHandler {
             if expected_session_name.is_some() && expected_identity_delivered != Some(true) {
                 return Err(attached_client_required("refresh-client"));
             }
-        }
+            any_delivered
+        };
         if expected_session_id.is_none() {
             self.refresh_control_session(&session_name).await;
         }
-        Ok(())
+        Ok(any_delivered)
     }
 
     #[cfg_attr(not(test), allow(dead_code))]
@@ -435,20 +456,13 @@ impl RequestHandler {
 
     pub(super) async fn show_mode_tree_help(&self, attach_pid: u32) -> Result<(), RmuxError> {
         let session_name = self.attached_session_name(attach_pid).await?;
-        let (overlay_frame, clear_frame, duration) = {
-            let state = self.state.lock().await;
-            let session = state
-                .sessions
-                .session(&session_name)
-                .ok_or_else(|| session_not_found(&session_name))?;
-            (
-                crate::renderer::render_status_message(session, &state.options, MODE_TREE_HELP),
-                crate::renderer::render_status_message(session, &state.options, ""),
-                std::time::Duration::from_millis(1200),
-            )
-        };
         let _ = self
-            .send_attached_overlay(&session_name, overlay_frame, clear_frame, duration)
+            .send_attached_overlay(
+                &session_name,
+                MODE_TREE_HELP.to_owned(),
+                Some(std::time::Duration::from_millis(1200)),
+                crate::handler::attach_support::TransientMessageInputPolicy::DismissAndForward,
+            )
             .await;
         Ok(())
     }

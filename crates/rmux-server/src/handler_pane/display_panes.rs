@@ -8,7 +8,8 @@ use rmux_proto::{
 
 use super::super::{
     attach_support::{
-        attach_target_for_session, ActiveAttachIdentity, DisplayPanesClientState, DisplayPanesLabel,
+        append_transient_message_frame, attach_target_for_session, ActiveAttachIdentity,
+        DisplayPanesClientState, DisplayPanesLabel,
     },
     prompt_support::{substitute_prompt_template, PromptInputEvent},
     scripting_support::{command_parser_from_state, queued_command_context, QueueExecutionContext},
@@ -329,6 +330,7 @@ impl RequestHandler {
                 clear_frame
             };
         frame.extend_from_slice(&overlay_frame);
+        append_transient_message_frame(active, &mut frame);
 
         let delivered = active
             .control_tx
@@ -355,21 +357,25 @@ impl RequestHandler {
             expected_attach_id,
             session_name,
             None,
+            None,
         )
         .await
+        .map(|_| ())
     }
 
-    pub(in crate::handler) async fn refresh_display_panes_overlay_for_session_identity(
+    pub(in crate::handler) async fn refresh_display_panes_overlay_for_session_identity_guarded(
         &self,
         identity: ActiveAttachIdentity,
         session_name: &rmux_proto::SessionName,
         session_id: rmux_proto::SessionId,
-    ) -> Result<(), RmuxError> {
+        restore_guard: Option<crate::handler::attach_support::TransientMessageRestoreGuard>,
+    ) -> Result<bool, RmuxError> {
         self.refresh_display_panes_overlay_with_expected_identity(
             identity.attach_pid(),
             identity.attach_id(),
             session_name,
             Some(session_id),
+            restore_guard,
         )
         .await
     }
@@ -380,7 +386,8 @@ impl RequestHandler {
         expected_attach_id: u64,
         session_name: &rmux_proto::SessionName,
         expected_session_id: Option<rmux_proto::SessionId>,
-    ) -> Result<(), RmuxError> {
+        restore_guard: Option<crate::handler::attach_support::TransientMessageRestoreGuard>,
+    ) -> Result<bool, RmuxError> {
         let expected_state_id = {
             let active_attach = self.active_attach.lock().await;
             let active = active_attach
@@ -393,10 +400,11 @@ impl RequestHandler {
                         && (expected_session_id.is_none() || active.prompt.is_none())
                         && !active.suspended
                         && !active.closing.load(std::sync::atomic::Ordering::SeqCst)
+                        && restore_guard.is_none_or(|guard| guard.matches(active))
                 })
                 .ok_or_else(|| attached_client_required("refresh-client"))?;
             let Some(display_panes) = active.display_panes.as_ref() else {
-                return Ok(());
+                return Ok(false);
             };
             display_panes.id
         };
@@ -426,6 +434,7 @@ impl RequestHandler {
                     && (expected_session_id.is_none() || active.prompt.is_none())
                     && !active.suspended
                     && !active.closing.load(std::sync::atomic::Ordering::SeqCst)
+                    && restore_guard.is_none_or(|guard| guard.matches(active))
             })
             .ok_or_else(|| attached_client_required("refresh-client"))?;
         if active
@@ -433,7 +442,7 @@ impl RequestHandler {
             .as_ref()
             .is_none_or(|display_panes| display_panes.id != expected_state_id)
         {
-            return Ok(());
+            return Ok(false);
         }
 
         active.overlay_generation = active.overlay_generation.saturating_add(1);
@@ -444,6 +453,7 @@ impl RequestHandler {
                 clear_frame
             };
         frame.extend_from_slice(&overlay_frame);
+        append_transient_message_frame(active, &mut frame);
         active
             .control_tx
             .send(AttachControl::Overlay(OverlayFrame::new(
@@ -451,6 +461,7 @@ impl RequestHandler {
                 active.render_generation,
                 active.overlay_generation,
             )))
+            .map(|_| true)
             .map_err(|_| attached_client_required("refresh-client"))
     }
 
@@ -561,8 +572,10 @@ impl RequestHandler {
             let overlay = if send_clear {
                 active.overlay_generation = active.overlay_generation.saturating_add(1);
                 let frame = if let Some(overlay) = active.overlay.as_ref() {
+                    let mut frame = overlay.render();
+                    append_transient_message_frame(active, &mut frame);
                     OverlayFrame::persistent(
-                        overlay.render(),
+                        frame,
                         active.render_generation,
                         active.overlay_generation,
                     )
@@ -571,6 +584,7 @@ impl RequestHandler {
                 {
                     let mut frame = clear_frame;
                     frame.extend_from_slice(mode_tree_frame);
+                    append_transient_message_frame(active, &mut frame);
                     OverlayFrame::persistent_with_state(
                         frame,
                         active.render_generation,
@@ -578,6 +592,8 @@ impl RequestHandler {
                         active.mode_tree_state_id,
                     )
                 } else {
+                    let mut clear_frame = clear_frame;
+                    append_transient_message_frame(active, &mut clear_frame);
                     OverlayFrame::new(
                         clear_frame,
                         active.render_generation,

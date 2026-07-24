@@ -2,7 +2,7 @@ use rmux_proto::{OptionName, RmuxError, SessionId, SessionName};
 use tokio::sync::oneshot;
 use tracing::warn;
 
-use super::super::attach_support::ActiveAttachIdentity;
+use super::super::attach_support::{cancel_transient_message, ActiveAttachIdentity};
 use super::super::control_support::ManagedClient;
 use super::super::scripting_support::{
     command_parser_from_state, ParsedPromptHistoryCommand, PromptHistoryAction, QueueCommandAction,
@@ -213,6 +213,7 @@ impl RequestHandler {
             if active.prompt.is_some() {
                 return Ok(false);
             }
+            cancel_transient_message(active);
             active.prompt = Some(prompt);
             active.overlay_generation = active.overlay_generation.saturating_add(1);
             (

@@ -20,7 +20,7 @@ use super::pane_prompt_input::{
 };
 use super::{io_other, resolve_input_target, AttachedKeyDispatch};
 use crate::client_flags::ClientFlags;
-use crate::handler::attach_support::ActiveAttachIdentity;
+use crate::handler::attach_support::{ActiveAttachIdentity, TransientMessageInput};
 use crate::handler::overlay_support::AttachedOverlayInput;
 use crate::input_keys::{decode_extended_key, decode_mouse, ExtendedKeyDecode, MouseDecode};
 use crate::key_table::{decode_attached_key, AttachedKeyDecode};
@@ -48,12 +48,18 @@ mod synchronized;
 #[path = "attached_input/terminal_response.rs"]
 mod terminal_response;
 
+pub(in crate::handler) use palette_response::{
+    decode_pane_bound_terminal_string, PaneBoundTerminalStringDecode,
+};
 pub(in crate::handler) use retained::{
     retain_partial_attached_control_input, retain_partial_attached_escape_input,
 };
 use synchronized::{
     prepare_attached_bracketed_paste_forwards, prepare_attached_key_forwards,
     write_prepared_attached_pane_forwards,
+};
+pub(in crate::handler) use terminal_response::{
+    decode_attached_terminal_control_after_append, TerminalResponseDecode,
 };
 
 fn ensure_session_identity(
@@ -828,6 +834,35 @@ impl RequestHandler {
                     &completed_paste,
                 )
                 .await;
+        }
+
+        match self
+            .handle_transient_message_input_for_identity(identity, pending_input, &[])
+            .await
+        {
+            // The message may have expired before this identity-guarded
+            // operation. Continue with the ordinary flush rules so retained
+            // bytes are neither dropped nor left stuck.
+            TransientMessageInput::Inactive => {
+                let residual = self
+                    .take_transient_terminal_prefix_for_identity(identity)
+                    .await;
+                if !residual.is_empty() {
+                    pending_input.extend(residual);
+                    return Ok(false);
+                }
+            }
+            TransientMessageInput::Consumed => return Ok(false),
+            TransientMessageInput::TerminalControls(controls) => {
+                return self
+                    .handle_transient_terminal_controls(identity, controls)
+                    .await;
+            }
+            TransientMessageInput::Dismissed(bytes) => {
+                return self
+                    .handle_attached_live_input_inner_for_identity(identity, pending_input, &bytes)
+                    .await;
+            }
         }
 
         if pending_input.first() == Some(&b'\x1b')

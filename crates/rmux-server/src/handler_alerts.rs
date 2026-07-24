@@ -7,7 +7,6 @@ use tokio::task::JoinHandle;
 
 use super::{RequestHandler, UnsequencedLifecycleEvent};
 use crate::pane_io::AttachControl;
-use crate::renderer;
 
 #[path = "handler_alerts/automatic_names.rs"]
 mod automatic_names;
@@ -173,27 +172,13 @@ impl RequestHandler {
     }
 
     async fn show_alert_message(&self, plan: &AlertPlan) {
-        let (overlay_frame, clear_frame, duration) = {
+        let duration = {
             let state = self.state.lock().await;
             let Some(session) = state.sessions.session_by_id(plan.session_id) else {
                 return;
             };
             let session_name = session.name().clone();
-            let overlay_frame = {
-                let mut frame =
-                    renderer::render_display_panes_clear(session, &state.options, &state);
-                frame.extend_from_slice(
-                    renderer::render_status_message(session, &state.options, &plan.message_text)
-                        .as_slice(),
-                );
-                frame
-            };
-            let clear_frame = renderer::render_display_panes_clear(session, &state.options, &state);
-            (
-                overlay_frame,
-                clear_frame,
-                display_time(&state.options, &session_name),
-            )
+            display_time(&state.options, &session_name)
         };
 
         // Log for a still-live session even when no client can display the overlay,
@@ -205,15 +190,14 @@ impl RequestHandler {
             }
             state.add_message(plan.message_text.clone());
         }
-        self.send_alert_overlay(plan.session_id, overlay_frame, clear_frame, duration)
+        self.send_alert_overlay(plan.session_id, plan.message_text.clone(), duration)
             .await;
     }
 
     async fn send_alert_overlay(
         &self,
         session_id: SessionId,
-        overlay_frame: Vec<u8>,
-        clear_frame: Vec<u8>,
+        message: String,
         duration: std::time::Duration,
     ) {
         let state = self.state.lock().await;
@@ -225,7 +209,12 @@ impl RequestHandler {
             return;
         };
         let _ = self
-            .send_attached_overlay(&session_name, overlay_frame, clear_frame, duration)
+            .send_attached_overlay(
+                &session_name,
+                message,
+                (!duration.is_zero()).then_some(duration),
+                crate::handler::attach_support::TransientMessageInputPolicy::DismissAndForward,
+            )
             .await;
     }
 

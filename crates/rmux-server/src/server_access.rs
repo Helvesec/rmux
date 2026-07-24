@@ -782,6 +782,8 @@ mod tests {
             message: Some("#{client_name}".to_owned()),
             target_client: Some("=".to_owned()),
             empty_target_context: false,
+            duration_ms: None,
+            ignore_input: false,
         }));
 
         assert_eq!(
@@ -811,6 +813,8 @@ mod tests {
                 message: Some("visible overlay".to_owned()),
                 target_client: Some("=".to_owned()),
                 empty_target_context: false,
+                duration_ms: None,
+                ignore_input: false,
             },
         )));
         assert_read_only_rejected(Request::DisplayPanes(Box::new(DisplayPanesRequest {

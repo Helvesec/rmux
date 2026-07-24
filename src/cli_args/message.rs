@@ -8,7 +8,8 @@ pub(crate) struct DisplayMessageArgs {
     pub(crate) target_client: Option<String>,
     #[arg(short = 't', allow_hyphen_values = true)]
     pub(crate) target: Option<String>,
-    #[arg(short = 'd', allow_hyphen_values = true, hide = true)]
+    /// Display the message for this many milliseconds; zero waits for input.
+    #[arg(short = 'd', allow_hyphen_values = true)]
     pub(crate) delay: Option<String>,
     #[arg(short = 'F', allow_hyphen_values = true)]
     pub(crate) format: Option<String>,
@@ -23,8 +24,9 @@ pub(crate) struct DisplayMessageArgs {
     pub(crate) stdin: bool,
     #[arg(short = 'l', action = ArgAction::SetTrue, conflicts_with = "json")]
     pub(crate) literal: bool,
-    #[arg(short = 'N', action = ArgAction::SetTrue, hide = true)]
-    pub(crate) no_format: bool,
+    /// Ignore key presses until a positive display delay expires.
+    #[arg(short = 'N', action = ArgAction::SetTrue)]
+    pub(crate) ignore_input: bool,
     #[arg(short = 'p', action = ArgAction::SetTrue, conflicts_with = "json")]
     pub(crate) print: bool,
     #[arg(short = 'v', action = ArgAction::SetTrue, conflicts_with = "json")]
@@ -45,17 +47,12 @@ impl QueuedCommand for DisplayMessageArgs {
 
 impl DisplayMessageArgs {
     pub(crate) fn validate(self) -> Result<Self, clap::Error> {
-        if self.delay.is_some() {
-            return Err(clap::Error::raw(
-                clap::error::ErrorKind::UnknownArgument,
-                "command display-message: unknown flag -d",
-            ));
-        }
-        if self.no_format {
-            return Err(clap::Error::raw(
-                clap::error::ErrorKind::UnknownArgument,
-                "command display-message: unknown flag -N",
-            ));
+        if let Some(delay) = self.delay.as_deref() {
+            delay
+                .parse::<rmux_proto::DisplayMessageDurationMillis>()
+                .map_err(|error| {
+                    clap::Error::raw(clap::error::ErrorKind::InvalidValue, error.to_string())
+                })?;
         }
         if self.message.len() > 1 {
             return Err(clap::Error::raw(
