@@ -17,7 +17,8 @@ mod windows {
     };
     use rmux_sdk::{
         EnsureSession, EnsureSessionPolicy, PaneOutputChunk, PaneOutputStart, PaneOutputStream,
-        PaneProcessState,
+        PaneProcessState, PaneRecoveryEvent, PaneRecoveryStream, PaneSurfaceEvent,
+        PaneSurfaceStream,
     };
     use tokio::time::{sleep, timeout, Instant};
 
@@ -109,10 +110,18 @@ mod windows {
         assert!(session.is_listed().await?);
 
         let pane = session.pane(0, 0);
+        let mut recovery = pane.recover_output().await?;
+        expect_initial_recovery(&mut recovery).await?;
+        let mut surface = pane.surface_stream().await?;
+        expect_initial_surface(&mut surface).await?;
         let mut output = pane.output_stream_starting_at(PaneOutputStart::Now).await?;
         pane.send_text(cmd_echo_text(MARKER)).await?;
         wait_for_output_marker(&mut output, MARKER.as_bytes()).await?;
+        wait_for_recovery_marker(&mut recovery, MARKER.as_bytes()).await?;
+        wait_for_surface_marker(&mut surface, MARKER).await?;
         drop(output);
+        drop(recovery);
+        drop(surface);
         pane.wait_for_text(MARKER).await?;
         assert!(pane.snapshot().await?.visible_text().contains(MARKER));
 
@@ -239,6 +248,94 @@ mod windows {
                 }
                 Some(_) => {}
                 None => return Err("pane output stream closed before markers appeared".into()),
+            }
+        }
+    }
+
+    async fn expect_initial_recovery(stream: &mut PaneRecoveryStream) -> TestResult {
+        match timeout(DEFAULT_TIMEOUT, stream.next()).await?? {
+            Some(PaneRecoveryEvent::Rebase(_)) => Ok(()),
+            Some(event) => {
+                Err(format!("recoverable stream did not begin with a rebase: {event:?}").into())
+            }
+            None => Err("recoverable stream closed before its initial rebase".into()),
+        }
+    }
+
+    async fn expect_initial_surface(stream: &mut PaneSurfaceStream) -> TestResult {
+        match timeout(DEFAULT_TIMEOUT, stream.next()).await?? {
+            Some(PaneSurfaceEvent::Reset(_)) => Ok(()),
+            Some(event) => {
+                Err(format!("surface stream did not begin with a reset: {event:?}").into())
+            }
+            None => Err("surface stream closed before its initial reset".into()),
+        }
+    }
+
+    async fn wait_for_recovery_marker(
+        stream: &mut PaneRecoveryStream,
+        marker: &[u8],
+    ) -> TestResult {
+        let deadline = Instant::now() + DEFAULT_TIMEOUT;
+        let mut observed = Vec::new();
+        loop {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                return Err("recoverable stream did not emit smoke marker".into());
+            }
+            match timeout(remaining, stream.next()).await?? {
+                Some(PaneRecoveryEvent::Bytes { bytes, .. }) => {
+                    observed.extend_from_slice(&bytes);
+                    if observed
+                        .windows(marker.len())
+                        .any(|window| window == marker)
+                    {
+                        return Ok(());
+                    }
+                    if observed.len() > OUTPUT_BUDGET {
+                        let overflow = observed.len() - OUTPUT_BUDGET;
+                        observed.drain(..overflow);
+                    }
+                }
+                Some(PaneRecoveryEvent::Rebase(_) | PaneRecoveryEvent::Lifecycle(_)) => {}
+                Some(PaneRecoveryEvent::End(reason)) => {
+                    return Err(format!(
+                        "recoverable stream ended before smoke marker: {reason:?}"
+                    )
+                    .into());
+                }
+                Some(event) => {
+                    return Err(format!("unexpected recoverable stream event: {event:?}").into());
+                }
+                None => return Err("recoverable stream closed before smoke marker".into()),
+            }
+        }
+    }
+
+    async fn wait_for_surface_marker(stream: &mut PaneSurfaceStream, marker: &str) -> TestResult {
+        let deadline = Instant::now() + DEFAULT_TIMEOUT;
+        loop {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                return Err("surface stream did not emit smoke marker".into());
+            }
+            match timeout(remaining, stream.next()).await?? {
+                Some(PaneSurfaceEvent::Reset(frame) | PaneSurfaceEvent::Patch(frame))
+                    if frame.snapshot.grid.visible_text().contains(marker) =>
+                {
+                    return Ok(());
+                }
+                Some(PaneSurfaceEvent::Reset(_) | PaneSurfaceEvent::Patch(_))
+                | Some(PaneSurfaceEvent::Lifecycle(_)) => {}
+                Some(PaneSurfaceEvent::End(reason)) => {
+                    return Err(
+                        format!("surface stream ended before smoke marker: {reason:?}").into(),
+                    );
+                }
+                Some(event) => {
+                    return Err(format!("unexpected surface stream event: {event:?}").into());
+                }
+                None => return Err("surface stream closed before smoke marker".into()),
             }
         }
     }
