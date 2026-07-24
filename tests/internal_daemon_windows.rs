@@ -217,10 +217,10 @@ fn start_server_with_captured_output_returns_after_spawning_windows_daemon(
 #[test]
 fn seamless_upgrade_restarts_idle_stale_windows_daemon() -> Result<(), Box<dyn Error>> {
     let _guard = env_lock().lock().expect("lock env");
-    let socket_path =
-        socket_path_for_label(format!("seamless-upgrade-windows-{}", std::process::id()))?;
-    let mut old_daemon = spawn_hidden_daemon(&socket_path)?;
-    let old_connection = match wait_for_connection(&socket_path, &mut old_daemon) {
+    let label = format!("seamless-upgrade-windows-{}", std::process::id());
+    let old_socket_path = socket_path_for_label(&label)?;
+    let mut old_daemon = spawn_hidden_daemon(&old_socket_path)?;
+    let old_connection = match wait_for_connection(&old_socket_path, &mut old_daemon) {
         Ok(connection) => connection,
         Err(error) => {
             let _ = old_daemon.kill();
@@ -230,7 +230,7 @@ fn seamless_upgrade_restarts_idle_stale_windows_daemon() -> Result<(), Box<dyn E
     };
     drop(old_connection);
 
-    let status = run_client_as_newer_version(&socket_path, &["start-server"])?;
+    let status = run_client_as_newer_version(&old_socket_path, &["start-server"])?;
     assert!(
         status.success(),
         "newer client failed against idle stale daemon: status={:?}",
@@ -238,7 +238,12 @@ fn seamless_upgrade_restarts_idle_stale_windows_daemon() -> Result<(), Box<dyn E
     );
 
     wait_for_child_exit(&mut old_daemon)?;
-    let output = run_rmux_command(&socket_path, &["list-sessions"])?;
+    let replacement_socket_path = socket_path_for_label(&label)?;
+    assert_ne!(
+        replacement_socket_path, old_socket_path,
+        "seamless upgrade must publish a fresh private endpoint generation"
+    );
+    let output = run_rmux_command(&replacement_socket_path, &["list-sessions"])?;
     assert!(
         output.status.success(),
         "new daemon did not serve detached RPC after seamless upgrade: status={:?}\nstdout={}\nstderr={}",
@@ -246,7 +251,7 @@ fn seamless_upgrade_restarts_idle_stale_windows_daemon() -> Result<(), Box<dyn E
         String::from_utf8_lossy(&output.stdout),
         String::from_utf8_lossy(&output.stderr)
     );
-    let output = run_rmux_command(&socket_path, &["kill-server"])?;
+    let output = run_rmux_command(&replacement_socket_path, &["kill-server"])?;
     assert!(
         output.status.success(),
         "new daemon did not accept kill-server after seamless upgrade: status={:?}\nstdout={}\nstderr={}",
@@ -254,7 +259,7 @@ fn seamless_upgrade_restarts_idle_stale_windows_daemon() -> Result<(), Box<dyn E
         String::from_utf8_lossy(&output.stdout),
         String::from_utf8_lossy(&output.stderr)
     );
-    wait_for_daemon_process_absent(&socket_path)?;
+    wait_for_daemon_process_absent(&replacement_socket_path)?;
     Ok(())
 }
 
