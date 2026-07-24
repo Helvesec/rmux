@@ -123,8 +123,8 @@ impl RequestHandler {
                 reset,
                 frame_lifecycle_revision,
             };
-            (
-                key,
+            let refresh = (
+                key.clone(),
                 token,
                 pending,
                 epoch,
@@ -135,7 +135,11 @@ impl RequestHandler {
                 frame_lifecycle_revision,
                 limit,
                 source_batch_limited,
-            )
+            );
+            if observed > 0 {
+                subscriptions.note_pane_drain_progress(&key, now);
+            }
+            refresh
         };
 
         let (
@@ -376,6 +380,12 @@ fn deliver_surface_latest(
             || (stream.end_reason.is_some() && !finish_after_end);
         (events, limited, finish_after_end)
     };
+    if events
+        .iter()
+        .any(|event| !matches!(event, PaneStreamEvent::End(_)))
+    {
+        subscriptions.note_pane_drain_progress(&key, Instant::now());
+    }
     if finish_after_end {
         subscriptions.remove_subscription(subscription_id);
     }

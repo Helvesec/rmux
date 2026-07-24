@@ -237,6 +237,7 @@ impl RequestHandler {
                 });
             }
             let _ = subscriptions.registry.touch(request.subscription_id, now);
+            let pane = record.pane().clone();
 
             let Some(receiver) = subscriptions.receivers.get_mut(&request.subscription_id) else {
                 subscriptions.remove_subscription(request.subscription_id);
@@ -247,6 +248,9 @@ impl RequestHandler {
 
             let items = receiver.try_recv_batch(limit);
             let cursor = cursor_dto(receiver.cursor());
+            if !items.is_empty() {
+                subscriptions.note_pane_drain_progress(&pane, now);
+            }
             (items, cursor, limit)
         };
 
@@ -352,7 +356,7 @@ impl RequestHandler {
                 .lock()
                 .expect("subscription registry mutex must not be poisoned");
             subscriptions.mark_pane_streams_ending(&pane, PaneStreamEndReason::PaneRemoved);
-            subscriptions.begin_pane_drain(pane.clone(), source)
+            subscriptions.begin_pane_drain(pane.clone(), source, Instant::now())
         };
         if should_watch {
             self.watch_exited_pane_drain(pane);

@@ -255,6 +255,7 @@ impl RequestHandler {
                 end_reason,
             )),
         );
+        subscriptions.note_pane_drain_progress(&current_key, Instant::now());
         subscriptions.raw_rebases.insert(current_key, cached_rebase);
         response
     }
@@ -395,23 +396,24 @@ impl RequestHandler {
                     }
                 }
             }
-            (
-                reason.map(|reason| {
-                    let token = stream
-                        .begin_rebase()
-                        .expect("checked pane stream is not already rebasing");
-                    (
-                        key,
-                        token,
-                        reason,
-                        stream.epoch.saturating_add(1),
-                        stream.include_snapshot,
-                        stream.receiver.observed_process_exit_revision(),
-                    )
-                }),
-                reason.is_none() && (observed == limit || reached_frame_limit),
-                finish_after_end,
-            )
+            let rebase = reason.map(|reason| {
+                let token = stream
+                    .begin_rebase()
+                    .expect("checked pane stream is not already rebasing");
+                (
+                    key.clone(),
+                    token,
+                    reason,
+                    stream.epoch.saturating_add(1),
+                    stream.include_snapshot,
+                    stream.receiver.observed_process_exit_revision(),
+                )
+            });
+            let reached_limit = reason.is_none() && (observed == limit || reached_frame_limit);
+            if observed > 0 {
+                subscriptions.note_pane_drain_progress(&key, now);
+            }
+            (rebase, reached_limit, finish_after_end)
         };
 
         let Some((key, token, reason, epoch, include_snapshot, observed_process_exit_revision)) =
@@ -517,6 +519,7 @@ impl RequestHandler {
         if !finished {
             return stream_cursor_response(request.subscription_id, Vec::new(), false);
         }
+        subscriptions.note_pane_drain_progress(&current_key, Instant::now());
         subscriptions.raw_rebases.insert(
             current_key,
             Arc::new(CachedRawRebase {

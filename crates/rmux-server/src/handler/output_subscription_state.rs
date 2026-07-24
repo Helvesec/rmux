@@ -1,4 +1,4 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -46,7 +46,7 @@ pub(crate) struct OutputSubscriptionState {
     next_surface_initialization_token: u64,
     raw_initializations: HashMap<PaneOutputSubscriptionKey, PaneStreamInitialization>,
     next_raw_initialization_token: u64,
-    draining_panes: HashSet<PaneOutputSubscriptionKey>,
+    draining_pane_progress: HashMap<PaneOutputSubscriptionKey, Instant>,
     draining_stream_sources: HashMap<PaneOutputSubscriptionKey, PaneStreamSource>,
 }
 
@@ -65,7 +65,7 @@ impl std::fmt::Debug for OutputSubscriptionState {
             )
             .field("raw_rebase_count", &self.raw_rebases.len())
             .field("raw_initialization_count", &self.raw_initializations.len())
-            .field("draining_pane_count", &self.draining_panes.len())
+            .field("draining_pane_count", &self.draining_pane_progress.len())
             .field(
                 "draining_stream_source_count",
                 &self.draining_stream_sources.len(),
@@ -87,7 +87,7 @@ impl OutputSubscriptionState {
             next_surface_initialization_token: 0,
             raw_initializations: HashMap::new(),
             next_raw_initialization_token: 0,
-            draining_panes: HashSet::new(),
+            draining_pane_progress: HashMap::new(),
             draining_stream_sources: HashMap::new(),
         }
     }
@@ -150,7 +150,7 @@ impl OutputSubscriptionState {
         self.cancel_surface_initialization(pane);
         self.raw_rebases.remove(pane);
         self.cancel_raw_initialization(pane);
-        self.draining_panes.remove(pane);
+        self.draining_pane_progress.remove(pane);
         self.draining_stream_sources.remove(pane);
         removed_any
     }
@@ -160,7 +160,6 @@ impl OutputSubscriptionState {
         previous: &PaneOutputSubscriptionKey,
         current: PaneOutputSubscriptionKey,
     ) {
-        let was_draining = self.draining_panes.remove(previous);
         let _ = self.registry.rekey_pane(previous, current.clone());
         if let Some(driver) = self.surface_drivers.remove(previous) {
             self.surface_drivers.insert(current.clone(), driver);
@@ -176,12 +175,13 @@ impl OutputSubscriptionState {
             self.raw_initializations
                 .insert(current.clone(), initialization);
         }
+        if let Some(progress) = self.draining_pane_progress.remove(previous) {
+            self.draining_pane_progress
+                .insert(current.clone(), progress);
+        }
         if let Some(mut source) = self.draining_stream_sources.remove(previous) {
             source.key = current.clone();
             self.draining_stream_sources.insert(current.clone(), source);
-        }
-        if was_draining {
-            self.draining_panes.insert(current);
         }
     }
 
@@ -189,6 +189,7 @@ impl OutputSubscriptionState {
         &mut self,
         pane: PaneOutputSubscriptionKey,
         source: Option<PaneStreamSource>,
+        now: Instant,
     ) -> bool {
         if self.registry.ids_for_pane(&pane).is_empty() {
             return false;
@@ -196,8 +197,18 @@ impl OutputSubscriptionState {
         if let Some(source) = source {
             self.draining_stream_sources.insert(pane.clone(), source);
         }
-        self.draining_panes.insert(pane);
+        self.draining_pane_progress.insert(pane.clone(), now);
         true
+    }
+
+    pub(in crate::handler) fn note_pane_drain_progress(
+        &mut self,
+        pane: &PaneOutputSubscriptionKey,
+        now: Instant,
+    ) {
+        if let Some(last_progress) = self.draining_pane_progress.get_mut(pane) {
+            *last_progress = (*last_progress).max(now);
+        }
     }
 
     pub(in crate::handler) fn draining_stream_source(
@@ -220,7 +231,7 @@ impl OutputSubscriptionState {
     }
 
     pub(super) fn pane_is_draining(&self, pane: &PaneOutputSubscriptionKey) -> bool {
-        self.draining_panes.contains(pane)
+        self.draining_pane_progress.contains_key(pane)
     }
 
     pub(super) fn pane_drain_idle_for(
@@ -228,13 +239,9 @@ impl OutputSubscriptionState {
         pane: &PaneOutputSubscriptionKey,
         now: Instant,
     ) -> Option<Duration> {
-        let last_seen = self
-            .registry
-            .ids_for_pane(pane)
-            .into_iter()
-            .filter_map(|id| self.registry.get(id).map(|record| record.last_seen()))
-            .max()?;
-        Some(now.saturating_duration_since(last_seen))
+        self.draining_pane_progress
+            .get(pane)
+            .map(|last_progress| now.saturating_duration_since(*last_progress))
     }
 
     pub(in crate::handler) fn is_empty(&self) -> bool {
@@ -427,7 +434,7 @@ impl OutputSubscriptionState {
 
     fn discard_drain_if_unused(&mut self, pane: &PaneOutputSubscriptionKey) {
         if self.registry.ids_for_pane(pane).is_empty() {
-            self.draining_panes.remove(pane);
+            self.draining_pane_progress.remove(pane);
             self.draining_stream_sources.remove(pane);
         }
     }
@@ -485,7 +492,7 @@ impl OutputSubscriptionState {
         for mode in [PaneStreamMode::Raw, PaneStreamMode::Surface] {
             self.end_pane_streams(pane, mode, PaneStreamEndReason::PaneRemoved, now);
         }
-        self.draining_panes.remove(pane);
+        self.draining_pane_progress.remove(pane);
         self.draining_stream_sources.remove(pane);
     }
 }

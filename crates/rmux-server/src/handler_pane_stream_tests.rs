@@ -1086,6 +1086,64 @@ async fn natural_pane_exit_drains_raw_and_surface_streams_before_end() {
 }
 
 #[tokio::test]
+async fn idle_before_exit_does_not_consume_the_pane_stream_drain_window() {
+    let handler = RequestHandler::new();
+    let (target, output, transcript) = test_pane(&handler).await;
+    let raw = subscribe(&handler, &target, PaneStreamMode::Raw).await;
+    let surface = subscribe(&handler, &target, PaneStreamMode::Surface).await;
+    let key = handler
+        .pane_output_subscription_key_for_test(raw.subscription_id)
+        .expect("subscription key");
+
+    tokio::time::sleep(Duration::from_millis(2_100)).await;
+    transcript
+        .lock()
+        .expect("transcript lock")
+        .append_bytes(b"idle-tail");
+    output.send(b"idle-tail".to_vec());
+    output.send(Vec::new());
+    handler
+        .state
+        .lock()
+        .await
+        .mark_pane_dead_without_exit_details(&target)
+        .expect("mark pane naturally exited");
+    handler
+        .handle_pane_exit_event(PaneExitEvent::eof_published(
+            target.session_name().clone(),
+            key.pane_id(),
+            None,
+        ))
+        .await;
+
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    let raw_events = cursor_until_unlimited(&handler, raw.subscription_id, 1).await;
+    assert!(matches!(
+        raw_events.as_slice(),
+        [
+            PaneStreamEvent::RawBytes(bytes),
+            PaneStreamEvent::Lifecycle(PaneStreamLifecycleEvent::ProcessExited { .. }),
+            PaneStreamEvent::End(PaneStreamEndReason::PaneRemoved),
+        ] if bytes.bytes == b"idle-tail"
+    ));
+    let surface_events = cursor_until_unlimited(&handler, surface.subscription_id, 1).await;
+    assert!(matches!(
+        surface_events.as_slice(),
+        [
+            PaneStreamEvent::SurfacePatch(frame),
+            PaneStreamEvent::Lifecycle(PaneStreamLifecycleEvent::ProcessExited { .. }),
+            PaneStreamEvent::End(PaneStreamEndReason::PaneRemoved),
+        ] if frame
+            .snapshot
+            .cells
+            .iter()
+            .map(|cell| cell.text.as_str())
+            .collect::<String>()
+            .contains("idle-tail")
+    ));
+}
+
+#[tokio::test]
 async fn reserved_surface_subscription_keeps_exit_reason_when_initialization_finishes() {
     let handler = RequestHandler::new();
     let (target, _, _) = test_pane(&handler).await;

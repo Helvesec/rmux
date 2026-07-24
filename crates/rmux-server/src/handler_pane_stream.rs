@@ -547,6 +547,7 @@ impl RequestHandler {
                 end_reason,
             }),
         );
+        subscriptions.note_pane_drain_progress(&current_key, Instant::now());
         drop(subscriptions);
         let response = subscribe_response(
             subscription_id,
@@ -607,6 +608,7 @@ impl RequestHandler {
                 end_reason,
             }),
         );
+        subscriptions.note_pane_drain_progress(&current_key, Instant::now());
         drop(subscriptions);
         let response = subscribe_response(
             subscription_id,

@@ -425,7 +425,7 @@ async fn empty_server_shutdown_waits_for_exited_pane_subscription_drain() {
 }
 
 #[test]
-fn exited_pane_drain_idle_tracks_subscription_touch() {
+fn exited_pane_drain_idle_tracks_explicit_progress_not_subscription_touch() {
     let mut subscriptions = OutputSubscriptionState::new(SubscriptionLimits::default());
     let pane = PaneOutputSubscriptionKey::new(
         SessionName::new("runtime").expect("valid session name"),
@@ -437,7 +437,7 @@ fn exited_pane_drain_idle_tracks_subscription_touch() {
         .subscribe(5, pane.clone(), created)
         .expect("subscription is within limits");
 
-    assert!(subscriptions.begin_pane_drain(pane.clone(), None));
+    assert!(subscriptions.begin_pane_drain(pane.clone(), None, created));
     assert_eq!(
         subscriptions.pane_drain_idle_for(&pane, created),
         Some(Duration::ZERO)
@@ -448,6 +448,12 @@ fn exited_pane_drain_idle_tracks_subscription_touch() {
         .registry
         .touch(record.id(), touched)
         .expect("subscription should still be live");
+    assert_eq!(
+        subscriptions.pane_drain_idle_for(&pane, touched + Duration::from_millis(25)),
+        Some(Duration::from_millis(5_025))
+    );
+
+    subscriptions.note_pane_drain_progress(&pane, touched);
     assert_eq!(
         subscriptions.pane_drain_idle_for(&pane, touched + Duration::from_millis(25)),
         Some(Duration::from_millis(25))
