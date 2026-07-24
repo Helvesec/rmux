@@ -619,6 +619,17 @@ if [[ ! -f $body ]]; then
   printf 'HTTP/2.0 404 Not Found\nContent-Type: application/json\n\n{}\n'
   exit 1
 fi
+if [[ $endpoint == */git/ref/tags/v0.9.1 && ${FAKE_REF_VISIBILITY_MISSES:-0} -gt 0 ]]; then
+  seen=0
+  if [[ -f $FAKE_VISIBILITY_STATE ]]; then
+    read -r seen < "$FAKE_VISIBILITY_STATE"
+  fi
+  if (( seen < FAKE_REF_VISIBILITY_MISSES )); then
+    printf '%s\n' "$((seen + 1))" > "$FAKE_VISIBILITY_STATE"
+    printf 'HTTP/2.0 404 Not Found\nContent-Type: application/json\n\n{}\n'
+    exit 1
+  fi
+fi
 printf 'HTTP/2.0 200 OK\nContent-Type: application/json\n\n'
 cat "$body"
 "#,
@@ -677,7 +688,8 @@ exec "$REAL_GIT" "$@"
         .expect("git path UTF-8")
         .trim()
         .to_owned();
-    let invoke_created = |verified: &str| {
+    let visibility_state = fixture.root.join("ref-visibility-count");
+    let invoke_created = |verified: &str, visibility_misses: &str| {
         run(Command::new(&driver)
             .args(&args)
             .env("PATH", &path)
@@ -685,15 +697,17 @@ exec "$REAL_GIT" "$@"
             .env("FAKE_REF_JSON", &ref_json)
             .env("FAKE_TAG_JSON", &tag_json)
             .env("FAKE_GITHUB_VERIFIED", verified)
+            .env("FAKE_REF_VISIBILITY_MISSES", visibility_misses)
+            .env("FAKE_VISIBILITY_STATE", &visibility_state)
             .env("RMUX_RELEASE_APP_ID", "4339867")
             .env("RMUX_RELEASE_APP_TOKEN", "fixture-installation-token"))
     };
-    let unverified = invoke_created("false");
+    let unverified = invoke_created("false", "0");
     assert!(!unverified.status.success());
     assert!(stderr(&unverified).contains("GitHub did not verify the tag signature"));
     fs::remove_file(&ref_json).expect("reset fake ref");
     fs::remove_file(&tag_json).expect("reset fake tag");
-    let created = invoke_created("true");
+    let created = invoke_created("true", "1");
     assert!(created.status.success(), "{}", stderr(&created));
     let created_json: serde_json::Value =
         serde_json::from_slice(&created.stdout).expect("created JSON");

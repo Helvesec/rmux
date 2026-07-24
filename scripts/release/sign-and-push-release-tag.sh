@@ -238,7 +238,20 @@ push_status=$?
 set -e
 
 created_ref=$temporary/created-ref.json
-if ! api_get "repos/$repository/git/ref/tags/$release_ref" "$created_ref"; then
+created_ref_visible=false
+for delay in 0 1 2 4 8 10; do
+  if (( delay > 0 )); then
+    sleep "$delay"
+  fi
+  if api_get "repos/$repository/git/ref/tags/$release_ref" "$created_ref"; then
+    created_ref_visible=true
+    break
+  else
+    visibility_status=$?
+    [[ $visibility_status -eq 4 ]] || exit "$visibility_status"
+  fi
+done
+if [[ $created_ref_visible != true ]]; then
   echo 'release tag creation was not observable after the create-only request' >&2
   exit 1
 fi

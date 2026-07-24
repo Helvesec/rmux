@@ -35,6 +35,43 @@ fn result_attestation_uses_algorithm_qualified_subject_digest() {
     assert!(RESULT_ACTION.contains("subject-digest: ${{ steps.predicate.outputs.subject_digest }}"));
 }
 
+#[test]
+fn rc_apt_policy_result_uses_an_exact_allowlisted_producer() {
+    assert_fixture(
+        r#"
+import sys
+sys.path.insert(0, 'scripts/release')
+
+from downstream_result import validate_producer
+
+base = {
+    'run_id': 51,
+    'run_attempt': 1,
+    'workflow_id': 316435347,
+    'runner_group_id': 0,
+    'runner_group_name': 'GitHub Actions',
+    'runner_image': 'ubuntu-22.04',
+}
+for workflow_path in (
+    '.github/workflows/release-linux-repository-publish.yml',
+    '.github/workflows/release-policy-channel.yml',
+):
+    producer = {**base, 'workflow_path': workflow_path}
+    if validate_producer(producer, 'apt_rpm') != producer:
+        raise SystemExit(f'APT/RPM producer was not preserved: {workflow_path}')
+
+forged = {**base, 'workflow_path': '.github/workflows/release-receipt.yml'}
+try:
+    validate_producer(forged, 'apt_rpm')
+except ValueError as error:
+    if 'not allowlisted' not in str(error):
+        raise
+else:
+    raise SystemExit('forged APT/RPM producer was accepted')
+"#,
+    );
+}
+
 const FIXTURE: &str = r#"
 import argparse
 import copy
