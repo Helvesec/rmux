@@ -567,9 +567,12 @@ fn tmux_compat_control_commands_do_not_refresh_client_activity_when_frozen_tmux_
         "display-message -p 'activity=#{client_activity}'\n",
     );
     let second = "display-message -p 'activity=#{client_activity}'\n";
-    let delay = Duration::from_millis(1_200);
-    let tmux_run = run_tmux_control_mode_delayed(&harness, &tmux_binary, first, delay, second)?;
-    let rmux_run = run_rmux_control_mode_delayed(&harness, first, delay, second)?;
+    let stages = [
+        (first, Duration::from_millis(1_200)),
+        (second, Duration::ZERO),
+    ];
+    let tmux_run = run_tmux_control_mode_staged(&harness, &tmux_binary, &stages)?;
+    let rmux_run = run_rmux_control_mode_staged(&harness, &stages)?;
     assert_eq!(tmux_run.status_code, Some(0));
     assert_eq!(rmux_run.status_code, Some(0));
     assert!(tmux_run.stderr.is_empty(), "{:?}", tmux_run.stderr);
@@ -597,6 +600,122 @@ fn tmux_compat_control_commands_do_not_refresh_client_activity_when_frozen_tmux_
         timestamp(&tmux_activity[0]).abs_diff(timestamp(&rmux_activity[0])) <= 30,
         "tmux and rmux registration timestamps use different epochs: tmux={tmux_activity:?}, rmux={rmux_activity:?}"
     );
+
+    Ok(())
+}
+
+#[test]
+fn tmux_compat_control_geometry_survives_policy_switches_when_frozen_tmux_is_available(
+) -> Result<(), Box<dyn Error>> {
+    let harness = TmuxCompatHarness::new("tmux-compat-control-geometry-policy-switch")?;
+    let Some(tmux_binary) = frozen_tmux_or_skip(&harness)? else {
+        return Ok(());
+    };
+    let _guard = pty_tmux_compat_lock();
+    let config = tmux_compat_config();
+
+    // Frozen tmux 3.7b oracle, measured 2026-07-25. Disabling the status line
+    // isolates the reported control geometry from visible-content row accounting.
+    for argv in [
+        ["new-session", "-d", "-s", "source", "-x", "83", "-y", "27"].as_slice(),
+        ["new-session", "-d", "-s", "normal", "-x", "79", "-y", "23"].as_slice(),
+        ["new-session", "-d", "-s", "manual", "-x", "73", "-y", "19"].as_slice(),
+        ["set-option", "-t", "source", "status", "off"].as_slice(),
+        ["set-option", "-t", "normal", "status", "off"].as_slice(),
+        ["set-option", "-t", "manual", "status", "off"].as_slice(),
+        [
+            "set-option",
+            "-w",
+            "-t",
+            "source:0",
+            "window-size",
+            "manual",
+        ]
+        .as_slice(),
+        [
+            "set-option",
+            "-w",
+            "-t",
+            "normal:0",
+            "window-size",
+            "largest",
+        ]
+        .as_slice(),
+        [
+            "set-option",
+            "-w",
+            "-t",
+            "manual:0",
+            "window-size",
+            "manual",
+        ]
+        .as_slice(),
+    ] {
+        let run = harness.run_pair_with(&tmux_binary, argv, config.clone())?;
+        assert_quiet_success(&run);
+    }
+
+    let mut rmux_normal = spawn_rmux_attached_input_client(&harness, "normal")?;
+    let mut rmux_manual = spawn_rmux_attached_input_client(&harness, "manual")?;
+    let mut tmux_normal = spawn_tmux_attached_input_client(&harness, &tmux_binary, "normal")?;
+    let mut tmux_manual = spawn_tmux_attached_input_client(&harness, &tmux_binary, "manual")?;
+    let _attached = wait_for_pair_run(
+        &harness,
+        &tmux_binary,
+        &["list-clients", "-F", "#{session_name}|#{client_flags}"],
+        config,
+        Duration::from_secs(5),
+        |run| {
+            let ready = |output: String| {
+                let lines = output.lines().collect::<Vec<_>>();
+                lines.len() == 2 && lines.iter().all(|line| !line.contains("ignore-size"))
+            };
+            ready(run.tmux.stdout_string()) && ready(run.rmux.stdout_string())
+        },
+    )?;
+    let first = concat!(
+        "attach-session -t source\n",
+        "refresh-client -C 101x31\n",
+        "display-message -p 'refreshed=#{session_name}|#{window_width}x#{window_height}|#{client_width}x#{client_height}'\n",
+        "list-clients -t source -F 'listed=#{session_name}|#{client_width}x#{client_height}|#{client_control_mode}'\n",
+        "switch-client -t normal\n",
+    );
+    let second = concat!(
+        "display-message -p 'normal=#{session_name}|#{window_width}x#{window_height}|#{client_width}x#{client_height}'\n",
+        "switch-client -t manual\n",
+    );
+    let third = "display-message -p 'manual=#{session_name}|#{window_width}x#{window_height}|#{client_width}x#{client_height}'\n";
+    // Keep stdin open between switches so tmux can commit its deferred client
+    // session change and policy resize before the next format probe runs.
+    let stages = [
+        (first, Duration::from_millis(200)),
+        (second, Duration::from_millis(200)),
+        (third, Duration::ZERO),
+    ];
+    let tmux_run = run_tmux_control_mode_staged(&harness, &tmux_binary, &stages)?;
+    let rmux_run = run_rmux_control_mode_staged(&harness, &stages)?;
+    assert_eq!(tmux_run.status_code, Some(0));
+    assert_eq!(rmux_run.status_code, Some(0));
+    assert!(tmux_run.stderr.is_empty(), "{:?}", tmux_run.stderr);
+    assert!(rmux_run.stderr.is_empty(), "{:?}", rmux_run.stderr);
+
+    let tmux_lines = extract_control_frame_payload_lines(&tmux_run.stdout);
+    let rmux_lines = extract_control_frame_payload_lines(&rmux_run.stdout);
+    assert_eq!(rmux_lines, tmux_lines);
+    assert_eq!(
+        tmux_lines,
+        vec![
+            "refreshed=source|83x27|101x",
+            "listed=source|101x|1",
+            "normal=normal|101x31|101x",
+            "manual=manual|73x19|101x",
+        ]
+    );
+
+    rmux_normal.assert_running("rmux normal")?;
+    rmux_manual.assert_running("rmux manual")?;
+    tmux_normal.assert_running("tmux normal")?;
+    tmux_manual.assert_running("tmux manual")?;
 
     Ok(())
 }
