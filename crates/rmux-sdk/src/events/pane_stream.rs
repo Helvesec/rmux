@@ -104,12 +104,12 @@ impl<T> RecoverablePaneStream<T> {
             response => return Err(unexpected_response("subscribe-pane-stream", response)),
         };
         let subscription_id = response.subscription_id;
-        let initial = map_event(response.event)?;
         let transport = transport.reusable();
         let drop_guard = DropGuard::best_effort(
             transport.clone(),
             Request::UnsubscribePaneStream(UnsubscribePaneStreamRequest { subscription_id }),
         );
+        let initial = map_event(response.event)?;
         Ok(Self {
             inner: PaneStreamSubscription {
                 transport,

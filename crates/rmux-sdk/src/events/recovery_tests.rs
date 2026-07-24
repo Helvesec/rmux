@@ -5,10 +5,11 @@ use std::time::Duration;
 use rmux_proto::{
     encode_frame, FrameDecoder, HasSessionRequest, HasSessionResponse, PaneOutputSubscriptionId,
     PaneRawBytes, PaneRawRebase as ProtoRebase, PaneRawRebaseReason as ProtoReason,
-    PaneRecoveryCoverage as ProtoCoverage, PaneStreamCursorRequest, PaneStreamCursorResponse,
-    PaneStreamEndReason, PaneStreamEvent, PaneStreamMode, PaneTarget, PaneTargetRef, Request,
-    Response, SessionName, SubscribePaneStreamRequest, SubscribePaneStreamResponse,
-    UnsubscribePaneStreamRequest, UnsubscribePaneStreamResponse,
+    PaneRecoveryCoverage as ProtoCoverage, PaneSnapshotCursor, PaneSnapshotResponse,
+    PaneStreamCursorRequest, PaneStreamCursorResponse, PaneStreamEndReason, PaneStreamEvent,
+    PaneStreamMode, PaneTarget, PaneTargetRef, Request, Response, SessionName,
+    SubscribePaneStreamRequest, SubscribePaneStreamResponse, UnsubscribePaneStreamRequest,
+    UnsubscribePaneStreamResponse,
 };
 use tokio::io::{AsyncReadExt, AsyncWriteExt, DuplexStream};
 
@@ -118,6 +119,83 @@ async fn serve_subscribe(server: &mut DuplexStream) {
         })),
     )
     .await;
+}
+
+#[tokio::test]
+async fn invalid_initial_event_unsubscribes_the_reserved_recovery_stream() {
+    let (client, mut server) = tokio::io::duplex(64 * 1024);
+    let transport = TransportClient::spawn(client);
+    let shared_transport = transport.clone();
+    let open = tokio::spawn(async move {
+        PaneRecoveryStream::open(
+            transport,
+            PaneTargetRef::slot(target()),
+            PaneRecoveryOptions::default(),
+        )
+        .await
+    });
+
+    assert!(matches!(
+        read_request(&mut server).await,
+        Request::SubscribePaneStream(_)
+    ));
+    let mut invalid_rebase = rebase(1, ProtoReason::Initial);
+    invalid_rebase.snapshot = Some(PaneSnapshotResponse {
+        cols: 1,
+        rows: 1,
+        cells: Vec::new(),
+        cursor: PaneSnapshotCursor {
+            row: 0,
+            col: 0,
+            visible: true,
+            style: 0,
+        },
+        revision: 1,
+    });
+    write_response(
+        &mut server,
+        Response::SubscribePaneStream(Box::new(SubscribePaneStreamResponse {
+            subscription_id: subscription_id(),
+            target: target(),
+            pane_id: PaneId::new(1),
+            event: PaneStreamEvent::RawRebase(Box::new(invalid_rebase)),
+        })),
+    )
+    .await;
+    let error = open
+        .await
+        .expect("stream open task joins")
+        .expect_err("surface event must be rejected by a raw recovery stream");
+    assert!(
+        error
+            .to_string()
+            .contains("pane-snapshot response had malformed row-major cell shape"),
+        "unexpected error: {error}"
+    );
+
+    assert_eq!(
+        tokio::time::timeout(Duration::from_secs(1), read_request(&mut server))
+            .await
+            .expect("invalid initial event must schedule cleanup"),
+        Request::UnsubscribePaneStream(UnsubscribePaneStreamRequest {
+            subscription_id: subscription_id(),
+        })
+    );
+    write_response(
+        &mut server,
+        Response::UnsubscribePaneStream(UnsubscribePaneStreamResponse {
+            subscription_id: subscription_id(),
+            removed: true,
+        }),
+    )
+    .await;
+    assert!(
+        tokio::time::timeout(Duration::from_millis(30), read_request(&mut server))
+            .await
+            .is_err(),
+        "invalid initial event must emit exactly one unsubscribe"
+    );
+    drop(shared_transport);
 }
 
 #[tokio::test]
