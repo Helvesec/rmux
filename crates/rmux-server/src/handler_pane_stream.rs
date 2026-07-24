@@ -339,7 +339,10 @@ impl RequestHandler {
                 )
             }
             PaneStreamMode::Surface => {
-                let fingerprint = PaneSurfaceFingerprint::capture(captured.seed.screen());
+                let fingerprint = PaneSurfaceFingerprint::capture(
+                    captured.seed.screen(),
+                    captured.seed.dynamic_colors(),
+                );
                 let frame = match materialize_surface_frame(
                     self,
                     source.key.pane_id(),

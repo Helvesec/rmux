@@ -45,12 +45,12 @@ pub use pane::{
     PaneRecentOutput, PaneRecoveryCoverage, PaneSnapshotCell, PaneSnapshotCursor,
     PaneSnapshotResponse, PaneStateClosedReason, PaneStateCursorResponse, PaneStateEventDto,
     PaneStateLagResponse, PaneStateSnapshot, PaneStreamCursorResponse, PaneStreamEndReason,
-    PaneStreamEvent, PaneStreamLifecycleEvent, PaneSurfaceFrame, PaneSurfaceSnapshot,
-    PipePaneResponse, ResizePaneResponse, RespawnPaneResponse, SelectPaneResponse,
-    SendKeysResponse, SplitWindowIdentityResponse, SplitWindowResponse,
-    SubscribePaneOutputResponse, SubscribePaneStateResponse, SubscribePaneStreamResponse,
-    SwapPaneResponse, UnsubscribePaneOutputResponse, UnsubscribePaneStateResponse,
-    UnsubscribePaneStreamResponse,
+    PaneStreamEvent, PaneStreamLifecycleEvent, PaneSurfaceDynamicColors, PaneSurfaceFrame,
+    PaneSurfaceHyperlink, PaneSurfaceSnapshot, PipePaneResponse, ResizePaneResponse,
+    RespawnPaneResponse, SelectPaneResponse, SendKeysResponse, SplitWindowIdentityResponse,
+    SplitWindowResponse, SubscribePaneOutputResponse, SubscribePaneStateResponse,
+    SubscribePaneStreamResponse, SwapPaneResponse, UnsubscribePaneOutputResponse,
+    UnsubscribePaneStateResponse, UnsubscribePaneStreamResponse,
 };
 
 #[path = "response/client.rs"]

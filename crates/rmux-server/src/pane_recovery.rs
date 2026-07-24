@@ -1,7 +1,7 @@
 use std::collections::VecDeque;
 use std::ops::Range;
 
-use rmux_core::input::mode;
+use rmux_core::input::{mode, OscColourSlot};
 use rmux_core::{render_dec_modes_for_snapshot, GridRenderOptions, RecoveryRowRenderer, Screen};
 use rmux_proto::{RmuxError, DEFAULT_MAX_FRAME_LENGTH};
 
@@ -35,6 +35,7 @@ pub(crate) const MAX_RECOVERY_TYPED_SNAPSHOT_CELLS: usize = 96 * 1024;
 /// Owned terminal state copied at an atomic pane boundary.
 pub(crate) struct PaneRecoverySeed {
     screen: Screen,
+    dynamic_colors: PaneDynamicColors,
     keyframe: PaneRecoveryKeyframe,
     history_size: usize,
     history_bytes: usize,
@@ -48,6 +49,7 @@ pub(crate) struct PaneRecoverySeed {
 /// have been released.
 pub(crate) struct PaneRecoveryDraft {
     projection: Screen,
+    dynamic_colors: PaneDynamicColors,
     metadata_complete: bool,
     pending_bytes: Vec<u8>,
     active_cell_state: Vec<u8>,
@@ -57,6 +59,29 @@ pub(crate) struct PaneRecoveryDraft {
     history_size: usize,
     history_bytes: usize,
     output_sequence: u64,
+}
+
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub(crate) struct PaneDynamicColors {
+    pub(crate) foreground: Option<String>,
+    pub(crate) background: Option<String>,
+    pub(crate) cursor: Option<String>,
+}
+
+impl PaneDynamicColors {
+    pub(crate) fn capture(transcript: &PaneTranscript) -> Self {
+        Self {
+            foreground: transcript
+                .dynamic_colour(OscColourSlot::Foreground)
+                .map(str::to_owned),
+            background: transcript
+                .dynamic_colour(OscColourSlot::Background)
+                .map(str::to_owned),
+            cursor: transcript
+                .dynamic_colour(OscColourSlot::Cursor)
+                .map(str::to_owned),
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -100,6 +125,7 @@ impl PaneRecoveryDraft {
             transcript.saved_cell_state_ansi_bounded(MAX_RECOVERY_HYPERLINK_ENTRY_BYTES);
         Ok(Self {
             projection,
+            dynamic_colors: PaneDynamicColors::capture(transcript),
             metadata_complete: viewport_metadata_complete
                 && active_cell_complete
                 && saved_cell_complete,
@@ -140,6 +166,7 @@ impl PaneRecoveryDraft {
         );
         Ok(PaneRecoverySeed {
             screen,
+            dynamic_colors: self.dynamic_colors,
             keyframe,
             history_size: self.history_size,
             history_bytes: self.history_bytes,
@@ -157,6 +184,10 @@ impl PaneRecoverySeed {
 
     pub(crate) const fn screen(&self) -> &Screen {
         &self.screen
+    }
+
+    pub(crate) const fn dynamic_colors(&self) -> &PaneDynamicColors {
+        &self.dynamic_colors
     }
 
     pub(crate) const fn output_sequence(&self) -> u64 {

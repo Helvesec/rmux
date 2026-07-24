@@ -19,7 +19,7 @@
 
 use rmux_proto::TerminalSize;
 
-use crate::input::{InputParser, InputState};
+use crate::input::{InputParser, InputState, OscColourSlot};
 use crate::screen::Screen;
 use crate::terminal_passthrough::TerminalPassthrough;
 use crate::utf8::Utf8Config;
@@ -213,6 +213,10 @@ impl TerminalParser {
 
     pub(crate) fn recovery_parser_state_ansi(&self) -> Vec<u8> {
         self.parser.recovery_dynamic_colours_ansi()
+    }
+
+    pub(crate) fn dynamic_colour(&self, slot: OscColourSlot) -> Option<&str> {
+        self.parser.osc_colour(slot)
     }
 
     fn cell_state_ansi(&self, cell: &crate::input::CellState) -> Vec<u8> {

@@ -514,6 +514,123 @@ async fn surface_subscribers_share_one_driver_and_receive_the_same_frame() {
 }
 
 #[tokio::test]
+async fn surface_exposes_hyperlink_uris_and_dynamic_colors() {
+    let handler = RequestHandler::new();
+    let (target, output, transcript) = test_pane(&handler).await;
+    let payload = concat!(
+        "\u{1b}]10;rgb:1111/2222/3333\u{1b}\\",
+        "\u{1b}]11;#102030\u{1b}\\",
+        "\u{1b}]12;rgb:aaaa/bbbb/cccc\u{1b}\\",
+        "\u{1b}]8;id=docs;https://example.test/docs\u{1b}\\",
+        "X",
+        "\u{1b}]8;;\u{1b}\\"
+    )
+    .as_bytes();
+    transcript
+        .lock()
+        .expect("transcript lock")
+        .append_bytes(payload);
+    output.send(payload.to_vec());
+
+    let subscribed = subscribe(&handler, &target, PaneStreamMode::Surface).await;
+    let frame = surface_frame(&subscribed.event).expect("initial surface reset");
+    let linked = frame
+        .snapshot
+        .cells
+        .iter()
+        .find(|cell| cell.text == "X")
+        .expect("linked visible cell");
+
+    assert_ne!(linked.link, 0);
+    assert_eq!(frame.snapshot.hyperlinks.len(), 1);
+    assert_eq!(frame.snapshot.hyperlinks[0].id, linked.link);
+    assert_eq!(
+        frame.snapshot.hyperlinks[0].uri,
+        "https://example.test/docs"
+    );
+    assert_eq!(
+        frame.snapshot.dynamic_colors.foreground.as_deref(),
+        Some("rgb:1111/2222/3333")
+    );
+    assert_eq!(
+        frame.snapshot.dynamic_colors.background.as_deref(),
+        Some("#102030")
+    );
+    assert_eq!(
+        frame.snapshot.dynamic_colors.cursor.as_deref(),
+        Some("rgb:aaaa/bbbb/cccc")
+    );
+    assert!(frame.snapshot.metadata_complete);
+}
+
+#[tokio::test]
+async fn surface_dynamic_color_only_output_emits_a_patch() {
+    let handler = RequestHandler::new();
+    let (target, output, transcript) = test_pane(&handler).await;
+    let subscribed = subscribe(&handler, &target, PaneStreamMode::Surface).await;
+    let payload = b"\x1b]10;#abcdef\x1b\\";
+
+    transcript
+        .lock()
+        .expect("transcript lock")
+        .append_bytes(payload);
+    output.send(payload.to_vec());
+
+    let events = cursor(&handler, subscribed.subscription_id).await;
+    let frame = events
+        .iter()
+        .find_map(surface_frame)
+        .expect("dynamic colour change must update the surface");
+    assert!(matches!(
+        events.first(),
+        Some(PaneStreamEvent::SurfacePatch(_))
+    ));
+    assert_eq!(
+        frame.snapshot.dynamic_colors.foreground.as_deref(),
+        Some("#abcdef")
+    );
+
+    let reset = b"\x1b]110\x1b\\";
+    transcript
+        .lock()
+        .expect("transcript lock")
+        .append_bytes(reset);
+    output.send(reset.to_vec());
+    let reset_events = cursor(&handler, subscribed.subscription_id).await;
+    let reset_frame = reset_events
+        .iter()
+        .find_map(surface_frame)
+        .expect("dynamic colour reset must update the surface");
+    assert_eq!(reset_frame.snapshot.dynamic_colors.foreground, None);
+}
+
+#[tokio::test]
+async fn surface_marks_omitted_hyperlink_metadata_incomplete() {
+    let handler = RequestHandler::new();
+    let (target, output, transcript) = test_pane(&handler).await;
+    let uri = format!("https://example.test/{}", "x".repeat(600));
+    let payload = format!("\u{1b}]8;;{uri}\u{1b}\\X\u{1b}]8;;\u{1b}\\");
+    transcript
+        .lock()
+        .expect("transcript lock")
+        .append_bytes(payload.as_bytes());
+    output.send(payload.into_bytes());
+
+    let subscribed = subscribe(&handler, &target, PaneStreamMode::Surface).await;
+    let frame = surface_frame(&subscribed.event).expect("initial surface reset");
+    let linked = frame
+        .snapshot
+        .cells
+        .iter()
+        .find(|cell| cell.text == "X")
+        .expect("linked visible cell");
+
+    assert_ne!(linked.link, 0);
+    assert!(frame.snapshot.hyperlinks.is_empty());
+    assert!(!frame.snapshot.metadata_complete);
+}
+
+#[tokio::test]
 async fn reserved_surface_subscriber_keeps_the_shared_driver_alive() {
     let handler = RequestHandler::new();
     let (target, _, _) = test_pane(&handler).await;

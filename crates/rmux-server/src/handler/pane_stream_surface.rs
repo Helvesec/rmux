@@ -386,9 +386,11 @@ fn surface_content_equal(
     current.cols == next.cols
         && current.rows == next.rows
         && current.cells == next.cells
+        && current.hyperlinks == next.hyperlinks
         && current.cursor == next.cursor
         && current.title == next.title
         && current.path == next.path
+        && current.dynamic_colors == next.dynamic_colors
         && current.metadata_complete == next.metadata_complete
         && current.mode_bits == next.mode_bits
         && current.alternate == next.alternate

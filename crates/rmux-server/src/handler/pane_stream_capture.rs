@@ -1,14 +1,16 @@
+use std::collections::BTreeSet;
 use std::sync::Arc;
 
 use rmux_core::input::mode;
 use rmux_core::PaneId;
 use rmux_proto::{
     PaneRawRebase, PaneRawRebaseReason, PaneRecoveryCoverage, PaneSnapshotCursor,
-    PaneSnapshotResponse, PaneSurfaceFrame, PaneSurfaceSnapshot, RmuxError,
+    PaneSnapshotResponse, PaneSurfaceDynamicColors, PaneSurfaceFrame, PaneSurfaceHyperlink,
+    PaneSurfaceSnapshot, RmuxError,
 };
 
 use crate::pane_io::{PaneBoundary, PaneInvalidationReason, PaneOutputReceiver};
-use crate::pane_recovery::{PaneRecoveryDraft, PaneRecoverySeed};
+use crate::pane_recovery::{PaneDynamicColors, PaneRecoveryDraft, PaneRecoverySeed};
 
 use super::super::pane_support::{
     collect_cells, compute_snapshot_fingerprint, cursor_coord_to_u16,
@@ -64,7 +66,8 @@ pub(in crate::handler) fn capture_surface_source(
             .transcript
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        let fingerprint = PaneSurfaceFingerprint::capture(transcript.screen());
+        let dynamic_colors = PaneDynamicColors::capture(&transcript);
+        let fingerprint = PaneSurfaceFingerprint::capture(transcript.screen(), &dynamic_colors);
         let seed =
             (force || &fingerprint != previous).then(|| PaneRecoveryDraft::capture(&transcript));
         (fingerprint, seed)
@@ -127,6 +130,7 @@ pub(in crate::handler) fn materialize_surface_frame(
     let history_size = seed.history_size();
     let history_bytes = seed.history_bytes();
     let cells = collect_cells(screen, size.cols, size.rows, history_size)?;
+    let (hyperlinks, hyperlinks_complete) = collect_surface_hyperlinks(screen, &cells);
     let (cursor_x, cursor_y) = screen.cursor_position();
     let (scroll_top, scroll_bottom) = screen.scroll_region();
     let cursor = PaneSnapshotCursor {
@@ -154,10 +158,16 @@ pub(in crate::handler) fn materialize_surface_frame(
             cols: size.cols,
             rows: size.rows,
             cells,
+            hyperlinks,
             cursor,
             title: screen.title().to_owned(),
             path: screen.path().to_owned(),
-            metadata_complete: seed.metadata_complete(),
+            dynamic_colors: PaneSurfaceDynamicColors {
+                foreground: seed.dynamic_colors().foreground.clone(),
+                background: seed.dynamic_colors().background.clone(),
+                cursor: seed.dynamic_colors().cursor.clone(),
+            },
+            metadata_complete: seed.metadata_complete() && hyperlinks_complete,
             mode_bits: screen.mode(),
             alternate: seed.alternate(),
             scroll_top,
@@ -167,6 +177,31 @@ pub(in crate::handler) fn materialize_surface_frame(
             revision: grid_revision,
         },
     }))
+}
+
+fn collect_surface_hyperlinks(
+    screen: &rmux_core::Screen,
+    cells: &[rmux_proto::PaneSnapshotCell],
+) -> (Vec<PaneSurfaceHyperlink>, bool) {
+    let ids = cells
+        .iter()
+        .filter_map(|cell| (cell.link != 0).then_some(cell.link))
+        .collect::<BTreeSet<_>>();
+    let mut complete = true;
+    let hyperlinks = ids
+        .into_iter()
+        .filter_map(|id| {
+            let Some(uri) = screen.hyperlink_uri(id) else {
+                complete = false;
+                return None;
+            };
+            Some(PaneSurfaceHyperlink {
+                id,
+                uri: uri.to_owned(),
+            })
+        })
+        .collect();
+    (hyperlinks, complete)
 }
 
 fn materialize_typed_snapshot(

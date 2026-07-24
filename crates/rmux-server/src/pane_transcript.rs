@@ -4,8 +4,8 @@ use std::time::{Duration, Instant};
 use crate::clock_mode::{ClockModeState, CLOCK_MODE_NAME};
 use crate::copy_mode::{CopyModeRenderSnapshot, CopyModeState, CopyModeSummary};
 use rmux_core::{
-    style::Style, GridRenderOptions, Screen, ScreenCaptureRange, TerminalPaletteIndex,
-    TerminalPassthrough, TerminalScreen, Utf8Config,
+    input::OscColourSlot, style::Style, GridRenderOptions, Screen, ScreenCaptureRange,
+    TerminalPaletteIndex, TerminalPassthrough, TerminalScreen, Utf8Config,
 };
 use rmux_proto::TerminalSize;
 
@@ -407,6 +407,10 @@ impl PaneTranscript {
 
     pub(crate) fn recovery_parser_state_ansi(&self) -> Vec<u8> {
         self.terminal.recovery_parser_state_ansi()
+    }
+
+    pub(crate) fn dynamic_colour(&self, slot: OscColourSlot) -> Option<&str> {
+        self.terminal.dynamic_colour(slot)
     }
 
     pub(crate) fn clear_history(&mut self, reset_hyperlinks: bool) {

@@ -7,11 +7,11 @@ use crate::RmuxError;
 /// Magic byte that identifies versioned RMUX detached RPC frames.
 pub const RMUX_FRAME_MAGIC: u8 = 0x52;
 /// Current detached RPC wire version.
-pub const RMUX_WIRE_VERSION: u32 = 7;
+pub const RMUX_WIRE_VERSION: u32 = 8;
 
 /// Supported detached RPC wire-version range for this build.
 ///
-/// The RMUX 0.9 release line uses an exact hard-cut envelope: frames decode only
+/// The RMUX 0.10 release line uses an exact hard-cut envelope: frames decode only
 /// when their wire version equals [`RMUX_WIRE_VERSION`]. Compatibility ranges in
 /// later handshake DTOs are advisory and only apply after this envelope has decoded.
 pub const SUPPORTED_WIRE_VERSION: RangeInclusive<u32> = RMUX_WIRE_VERSION..=RMUX_WIRE_VERSION;

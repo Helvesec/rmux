@@ -208,9 +208,9 @@ fn release_line_changelog_records_the_exact_detached_wire_version() {
         .split_whitespace()
         .collect::<Vec<_>>()
         .join(" ");
-    assert_eq!(rmux_proto::RMUX_WIRE_VERSION, 7);
+    assert_eq!(rmux_proto::RMUX_WIRE_VERSION, 8);
     assert!(
-        current_release.contains("wire version 5 to wire version 7"),
+        current_release.contains("wire version 5 to wire version 8"),
         "{current_version} changelog must record the current detached wire cut"
     );
     assert!(

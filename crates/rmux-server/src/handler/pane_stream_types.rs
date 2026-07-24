@@ -7,6 +7,7 @@ use rmux_proto::{
 };
 
 use crate::pane_io::{PaneBoundary, PaneObservationItem, PaneOutputReceiver};
+use crate::pane_recovery::PaneDynamicColors;
 
 #[derive(Debug)]
 pub(in crate::handler) struct RawPaneStream {
@@ -125,10 +126,14 @@ pub(in crate::handler) struct PaneSurfaceFingerprint {
     history_size: usize,
     history_bytes: usize,
     metadata_revision: u64,
+    dynamic_colors: PaneDynamicColors,
 }
 
 impl PaneSurfaceFingerprint {
-    pub(in crate::handler) fn capture(screen: &rmux_core::Screen) -> Self {
+    pub(in crate::handler) fn capture(
+        screen: &rmux_core::Screen,
+        dynamic_colors: &PaneDynamicColors,
+    ) -> Self {
         let size = screen.size();
         Self {
             size,
@@ -145,6 +150,7 @@ impl PaneSurfaceFingerprint {
             history_size: screen.history_size(),
             history_bytes: screen.history_bytes(),
             metadata_revision: screen.metadata_revision(),
+            dynamic_colors: dynamic_colors.clone(),
         }
     }
 }

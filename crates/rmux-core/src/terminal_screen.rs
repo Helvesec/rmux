@@ -5,6 +5,7 @@
 
 use rmux_proto::TerminalSize;
 
+use crate::input::OscColourSlot;
 use crate::screen::Screen;
 use crate::terminal::TerminalParser;
 use crate::terminal_passthrough::TerminalPassthrough;
@@ -150,6 +151,12 @@ impl TerminalScreen {
     #[must_use]
     pub fn recovery_parser_state_ansi(&self) -> Vec<u8> {
         self.parser.recovery_parser_state_ansi()
+    }
+
+    /// Returns an application-defined OSC 10/11/12 colour.
+    #[must_use]
+    pub fn dynamic_colour(&self, slot: OscColourSlot) -> Option<&str> {
+        self.parser.dynamic_colour(slot)
     }
 
     /// Returns whether the parser ground timeout is currently armed.

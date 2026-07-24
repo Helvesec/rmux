@@ -21,6 +21,9 @@ const SPLIT_WINDOW_IDENTITY_REQUEST_V5: &[u8] = include_bytes!(
 const SUBSCRIBE_PANE_STREAM_REQUEST_V6: &[u8] = include_bytes!(
     "../../../tests/reference/wire/v6/ledger-v1-current-wire/subscribe_pane_stream_request.bin"
 );
+const PANE_STREAM_CURSOR_RESPONSE_V7: &[u8] = include_bytes!(
+    "../../../tests/reference/wire/v7/ledger-v1-current-wire/pane_stream_cursor_response.bin"
+);
 
 #[test]
 fn v1_has_session_request_fixture_is_rejected_by_current_wire() {
@@ -67,9 +70,15 @@ fn last_distributed_v5_split_identity_fixture_is_rejected_by_current_wire() {
 }
 
 #[test]
-fn original_v6_pane_stream_fixture_is_rejected_by_v7() {
+fn original_v6_pane_stream_fixture_is_rejected_by_v8() {
     assert_wire_envelope(SUBSCRIBE_PANE_STREAM_REQUEST_V6, 6);
     assert_wire_is_unsupported(decode_frame::<Request>(SUBSCRIBE_PANE_STREAM_REQUEST_V6), 6);
+}
+
+#[test]
+fn original_v7_surface_fixture_is_rejected_by_v8() {
+    assert_wire_envelope(PANE_STREAM_CURSOR_RESPONSE_V7, 7);
+    assert_wire_is_unsupported(decode_frame::<Response>(PANE_STREAM_CURSOR_RESPONSE_V7), 7);
 }
 
 #[derive(Serialize)]
@@ -82,8 +91,8 @@ struct UnreleasedV6DisplayMessageExtRequest {
 }
 
 #[test]
-fn unreleased_v6_display_message_layout_is_rejected_after_v7_cut() {
-    assert_eq!(RMUX_WIRE_VERSION, 7);
+fn unreleased_v6_display_message_layout_is_rejected_after_v8_cut() {
+    assert_eq!(RMUX_WIRE_VERSION, 8);
     let target = Some(Target::Session(
         SessionName::new("alpha").expect("valid session name"),
     ));
@@ -113,7 +122,7 @@ fn unreleased_v6_display_message_layout_is_rejected_after_v7_cut() {
         })
         .expect("unreleased v6 request serializes"),
     );
-    let mut frame = vec![RMUX_FRAME_MAGIC, 7];
+    let mut frame = vec![RMUX_FRAME_MAGIC, 8];
     frame.extend_from_slice(
         &u32::try_from(payload.len())
             .expect("test payload fits u32")
@@ -142,6 +151,11 @@ fn complete_last_distributed_v5_fixture_ledger_is_preserved() {
 #[test]
 fn complete_original_v6_fixture_ledger_is_preserved() {
     assert_complete_fixture_ledger(6, 31);
+}
+
+#[test]
+fn complete_original_v7_fixture_ledger_is_preserved() {
+    assert_complete_fixture_ledger(7, 31);
 }
 
 fn assert_complete_fixture_ledger(version: u32, expected_count: usize) {

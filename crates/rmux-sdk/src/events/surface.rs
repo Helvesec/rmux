@@ -1,5 +1,6 @@
 //! Authoritative structured pane surfaces for non-emulator consumers.
 
+use std::collections::BTreeMap;
 use std::error::Error;
 use std::fmt;
 
@@ -21,11 +22,17 @@ use crate::{PaneSnapshot, Result, RmuxError};
 pub struct PaneSurfaceSnapshot {
     /// Visible row-major pane grid and cursor.
     pub grid: PaneSnapshot,
+    /// Hyperlink IDs aligned one-for-one with `grid.cells`.
+    pub cell_hyperlink_ids: Vec<Option<u32>>,
     /// Terminal title.
     pub title: String,
     /// Terminal-reported working-directory path.
     pub path: String,
-    /// Whether title, path and hyperlink metadata was represented completely.
+    /// OSC 8 target URIs keyed by `cell_hyperlink_ids`.
+    pub hyperlinks: BTreeMap<u32, String>,
+    /// Application-defined OSC 10/11/12 colours.
+    pub dynamic_colors: PaneSurfaceDynamicColors,
+    /// Whether title, path, and visible-cell hyperlink metadata is complete.
     pub metadata_complete: bool,
     /// Raw terminal mode bitset.
     pub mode_bits: u32,
@@ -39,6 +46,38 @@ pub struct PaneSurfaceSnapshot {
     pub history_size: u64,
     /// Bytes retained by the daemon's history representation.
     pub history_bytes: u64,
+}
+
+impl PaneSurfaceSnapshot {
+    /// Returns the hyperlink ID at a visible row and column.
+    #[must_use]
+    pub fn hyperlink_id_at(&self, row: u16, col: u16) -> Option<u32> {
+        if row >= self.grid.rows || col >= self.grid.cols {
+            return None;
+        }
+        let index = usize::from(row)
+            .saturating_mul(usize::from(self.grid.cols))
+            .saturating_add(usize::from(col));
+        self.cell_hyperlink_ids.get(index).copied().flatten()
+    }
+
+    /// Returns the OSC 8 URI at a visible row and column.
+    #[must_use]
+    pub fn hyperlink_uri_at(&self, row: u16, col: u16) -> Option<&str> {
+        self.hyperlink_id_at(row, col)
+            .and_then(|id| self.hyperlinks.get(&id).map(String::as_str))
+    }
+}
+
+/// Application-defined OSC 10/11/12 colours.
+#[derive(Debug, Default, Clone, PartialEq, Eq, Hash)]
+pub struct PaneSurfaceDynamicColors {
+    /// OSC 10 default foreground colour.
+    pub foreground: Option<String>,
+    /// OSC 11 default background colour.
+    pub background: Option<String>,
+    /// OSC 12 cursor colour.
+    pub cursor: Option<String>,
 }
 
 /// A self-contained pane surface frame.
@@ -191,6 +230,13 @@ pub enum PaneSurfaceApplyError {
     },
     /// The frame's row-major grid shape was invalid.
     InvalidShape(crate::PaneSnapshotShapeError),
+    /// Hyperlink IDs were not aligned one-for-one with the grid cells.
+    InvalidHyperlinkShape {
+        /// Number of IDs required by the grid.
+        expected: usize,
+        /// Number of IDs carried by the surface.
+        actual: usize,
+    },
     /// An event arrived after a terminal end.
     AlreadyEnded(PaneStreamEndReason),
 }
@@ -228,6 +274,10 @@ impl fmt::Display for PaneSurfaceApplyError {
                 "surface output boundary regressed from {current_sequence} to {received_sequence}"
             ),
             Self::InvalidShape(error) => write!(formatter, "invalid surface grid: {error}"),
+            Self::InvalidHyperlinkShape { expected, actual } => write!(
+                formatter,
+                "surface carries {actual} hyperlink IDs for {expected} grid cells"
+            ),
             Self::AlreadyEnded(reason) => {
                 write!(formatter, "surface stream already ended with {reason:?}")
             }
@@ -283,7 +333,13 @@ fn validate_frame(frame: &PaneSurfaceFrame) -> std::result::Result<(), PaneSurfa
         .snapshot
         .grid
         .validate_shape()
-        .map_err(PaneSurfaceApplyError::InvalidShape)
+        .map_err(PaneSurfaceApplyError::InvalidShape)?;
+    let expected = frame.snapshot.grid.cells.len();
+    let actual = frame.snapshot.cell_hyperlink_ids.len();
+    if actual != expected {
+        return Err(PaneSurfaceApplyError::InvalidHyperlinkShape { expected, actual });
+    }
+    Ok(())
 }
 
 fn validate_output_boundary(
@@ -327,6 +383,24 @@ fn frame_from_proto(value: ProtoFrame) -> Result<PaneSurfaceFrame> {
 }
 
 fn snapshot_from_proto(value: ProtoSnapshot) -> Result<PaneSurfaceSnapshot> {
+    let mut hyperlinks = BTreeMap::new();
+    for hyperlink in value.hyperlinks {
+        if hyperlink.id == 0 {
+            return Err(invalid_surface_metadata(
+                "pane surface hyperlink ID must be non-zero",
+            ));
+        }
+        if hyperlinks.insert(hyperlink.id, hyperlink.uri).is_some() {
+            return Err(invalid_surface_metadata(
+                "pane surface hyperlink IDs must be unique",
+            ));
+        }
+    }
+    let cell_hyperlink_ids = value
+        .cells
+        .iter()
+        .map(|cell| (cell.link != 0).then_some(cell.link))
+        .collect::<Vec<_>>();
     let grid = PaneSnapshot {
         cols: value.cols,
         rows: value.rows,
@@ -339,10 +413,27 @@ fn snapshot_from_proto(value: ProtoSnapshot) -> Result<PaneSurfaceSnapshot> {
             "pane surface response had malformed row-major cell shape: {error}"
         )))
     })?;
+    if value.metadata_complete
+        && cell_hyperlink_ids
+            .iter()
+            .filter_map(|id| *id)
+            .any(|id| !hyperlinks.contains_key(&id))
+    {
+        return Err(invalid_surface_metadata(
+            "complete pane surface metadata omitted a visible hyperlink",
+        ));
+    }
     Ok(PaneSurfaceSnapshot {
         grid,
+        cell_hyperlink_ids,
         title: value.title,
         path: value.path,
+        hyperlinks,
+        dynamic_colors: PaneSurfaceDynamicColors {
+            foreground: value.dynamic_colors.foreground,
+            background: value.dynamic_colors.background,
+            cursor: value.dynamic_colors.cursor,
+        },
         metadata_complete: value.metadata_complete,
         mode_bits: value.mode_bits,
         alternate: value.alternate,
@@ -353,6 +444,10 @@ fn snapshot_from_proto(value: ProtoSnapshot) -> Result<PaneSurfaceSnapshot> {
     })
 }
 
+fn invalid_surface_metadata(message: &str) -> RmuxError {
+    RmuxError::protocol(rmux_proto::RmuxError::Server(message.to_owned()))
+}
+
 fn wrong_projection() -> RmuxError {
     RmuxError::protocol(rmux_proto::RmuxError::Server(
         "rmux daemon sent a raw event to a surface stream".to_owned(),
@@ -360,114 +455,5 @@ fn wrong_projection() -> RmuxError {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::{PaneCursor, PaneSnapshot};
-
-    fn frame(epoch: u64, revision: u64) -> PaneSurfaceFrame {
-        frame_at(epoch, revision, revision)
-    }
-
-    fn frame_at(epoch: u64, revision: u64, next_output_sequence: u64) -> PaneSurfaceFrame {
-        PaneSurfaceFrame {
-            epoch,
-            revision,
-            next_output_sequence,
-            snapshot: PaneSurfaceSnapshot {
-                grid: PaneSnapshot::new(0, 0, Vec::new(), PaneCursor::default())
-                    .expect("zero-sized grid")
-                    .with_revision(revision),
-                title: String::new(),
-                path: String::new(),
-                metadata_complete: true,
-                mode_bits: 0,
-                alternate: false,
-                scroll_top: 0,
-                scroll_bottom: 0,
-                history_size: 0,
-                history_bytes: 0,
-            },
-        }
-    }
-
-    #[test]
-    fn reducer_requires_reset_then_monotone_same_epoch_patches() {
-        let mut state = PaneSurfaceState::default();
-        assert_eq!(
-            state.apply(&PaneSurfaceEvent::Patch(frame(1, 1))),
-            Err(PaneSurfaceApplyError::PatchBeforeReset)
-        );
-        assert_eq!(state.apply(&PaneSurfaceEvent::Reset(frame(1, 1))), Ok(true));
-        assert_eq!(
-            state.apply(&PaneSurfaceEvent::Patch(frame(1, 1))),
-            Err(PaneSurfaceApplyError::StaleRevision {
-                current_revision: 1,
-                received_revision: 1,
-            })
-        );
-        assert_eq!(
-            state.apply(&PaneSurfaceEvent::Patch(frame(2, 2))),
-            Err(PaneSurfaceApplyError::EpochMismatch {
-                current_epoch: 1,
-                received_epoch: 2,
-            })
-        );
-        assert_eq!(state.apply(&PaneSurfaceEvent::Patch(frame(1, 2))), Ok(true));
-        assert_eq!(state.frame(), Some(&frame(1, 2)));
-    }
-
-    #[test]
-    fn reducer_accepts_new_epoch_reset_and_rejects_events_after_end() {
-        let mut state = PaneSurfaceState::default();
-        state
-            .apply(&PaneSurfaceEvent::Reset(frame(1, 1)))
-            .expect("initial reset");
-        state
-            .apply(&PaneSurfaceEvent::Reset(frame(2, 2)))
-            .expect("new epoch reset");
-        state
-            .apply(&PaneSurfaceEvent::End(PaneStreamEndReason::PaneRemoved))
-            .expect("end");
-        assert_eq!(state.ended(), Some(PaneStreamEndReason::PaneRemoved));
-        assert_eq!(
-            state.apply(&PaneSurfaceEvent::Lifecycle(
-                PaneStreamLifecycleEvent::ProcessExited {
-                    output_sequence: None,
-                }
-            )),
-            Err(PaneSurfaceApplyError::AlreadyEnded(
-                PaneStreamEndReason::PaneRemoved
-            ))
-        );
-    }
-
-    #[test]
-    fn reducer_rejects_output_boundary_regressions_across_patches_and_resets() {
-        let mut patch_state = PaneSurfaceState::default();
-        patch_state
-            .apply(&PaneSurfaceEvent::Reset(frame_at(1, 1, 8)))
-            .expect("initial reset");
-        assert_eq!(
-            patch_state.apply(&PaneSurfaceEvent::Patch(frame_at(1, 2, 7))),
-            Err(PaneSurfaceApplyError::OutputSequenceRegressed {
-                current_sequence: 8,
-                received_sequence: 7,
-            })
-        );
-        patch_state
-            .apply(&PaneSurfaceEvent::Patch(frame_at(1, 2, 8)))
-            .expect("a frame can advance without new raw output");
-
-        let mut reset_state = PaneSurfaceState::default();
-        reset_state
-            .apply(&PaneSurfaceEvent::Reset(frame_at(1, 1, 8)))
-            .expect("initial reset");
-        assert_eq!(
-            reset_state.apply(&PaneSurfaceEvent::Reset(frame_at(2, 2, 7))),
-            Err(PaneSurfaceApplyError::OutputSequenceRegressed {
-                current_sequence: 8,
-                received_sequence: 7,
-            })
-        );
-    }
-}
+#[path = "surface_tests.rs"]
+mod tests;

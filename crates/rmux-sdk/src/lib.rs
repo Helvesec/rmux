@@ -100,8 +100,9 @@ pub use events::{
     PaneOutputStart, PaneOutputStream, PanePermissionScope, PaneRecentOutput,
     PaneRecoveryApplyError, PaneRecoveryEvent, PaneRecoveryOptions, PaneRecoveryRebase,
     PaneRecoveryRebaseReason, PaneRecoveryState, PaneRecoveryStream, PaneRenderStream,
-    PaneStreamEndReason, PaneStreamLifecycleEvent, PaneSurfaceApplyError, PaneSurfaceEvent,
-    PaneSurfaceFrame, PaneSurfaceSnapshot, PaneSurfaceState, PaneSurfaceStream, RenderUpdate,
+    PaneStreamEndReason, PaneStreamLifecycleEvent, PaneSurfaceApplyError, PaneSurfaceDynamicColors,
+    PaneSurfaceEvent, PaneSurfaceFrame, PaneSurfaceSnapshot, PaneSurfaceState, PaneSurfaceStream,
+    RenderUpdate,
 };
 pub use extract::{CollectedPaneOutput, PaneTextMatch};
 pub use handles::{

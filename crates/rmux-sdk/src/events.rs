@@ -31,8 +31,8 @@ pub use streams::{
     PaneOutputStream, PaneRecentOutput,
 };
 pub use surface::{
-    PaneSurfaceApplyError, PaneSurfaceEvent, PaneSurfaceFrame, PaneSurfaceSnapshot,
-    PaneSurfaceState, PaneSurfaceStream,
+    PaneSurfaceApplyError, PaneSurfaceDynamicColors, PaneSurfaceEvent, PaneSurfaceFrame,
+    PaneSurfaceSnapshot, PaneSurfaceState, PaneSurfaceStream,
 };
 pub use types::{
     PaneCommandStatus, PaneCommandSummary, PaneDisconnectReason, PaneEvent, PaneExitReason,

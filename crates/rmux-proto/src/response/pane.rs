@@ -563,6 +563,26 @@ pub struct PaneRawBytes {
     pub bytes: Vec<u8>,
 }
 
+/// One OSC 8 hyperlink referenced by a structured pane surface.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PaneSurfaceHyperlink {
+    /// Non-zero hyperlink inner ID stored by visible cells.
+    pub id: u32,
+    /// OSC 8 target URI associated with `id`.
+    pub uri: String,
+}
+
+/// Application-defined OSC 10/11/12 colours.
+#[derive(Debug, Default, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PaneSurfaceDynamicColors {
+    /// OSC 10 default foreground colour, when defined by the application.
+    pub foreground: Option<String>,
+    /// OSC 11 default background colour, when defined by the application.
+    pub background: Option<String>,
+    /// OSC 12 cursor colour, when defined by the application.
+    pub cursor: Option<String>,
+}
+
 /// Authoritative structured pane state.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PaneSurfaceSnapshot {
@@ -572,13 +592,17 @@ pub struct PaneSurfaceSnapshot {
     pub rows: u16,
     /// Row-major visible cells, exactly `cols * rows` long.
     pub cells: Vec<PaneSnapshotCell>,
+    /// URI metadata keyed by the non-zero hyperlink IDs stored in `cells`.
+    pub hyperlinks: Vec<PaneSurfaceHyperlink>,
     /// Current cursor state.
     pub cursor: PaneSnapshotCursor,
     /// Terminal title observed at this boundary.
     pub title: String,
     /// Terminal-reported working-directory path.
     pub path: String,
-    /// Whether terminal-controlled title/path/hyperlink metadata was copied
+    /// Application-defined OSC 10/11/12 colours.
+    pub dynamic_colors: PaneSurfaceDynamicColors,
+    /// Whether title, path, and visible-cell hyperlink metadata was copied
     /// completely into this transport-bounded snapshot.
     pub metadata_complete: bool,
     /// Raw terminal mode bitset.
