@@ -504,6 +504,31 @@ async fn stopped_listener_rotates_away_from_preclaimed_old_generation() -> std::
 }
 
 #[tokio::test]
+async fn stopped_generation_never_adopts_a_stale_candidate_nonce() -> std::io::Result<()> {
+    let label = format!("generation-stopped-stale-{}", std::process::id());
+    let first = endpoint_for_label(&label)?;
+    let first_path = first.as_path().to_path_buf();
+    drop(LocalListener::bind(&first)?);
+
+    let second = endpoint_for_label(&label)?;
+    let second_path = second.as_path().to_path_buf();
+    assert_ne!(second_path, first_path);
+    drop(LocalListener::bind(&second)?);
+
+    let replacement = reserve_managed_endpoint_start(&first_path)?;
+    assert!(replacement.is_owner());
+    assert_ne!(replacement.endpoint().as_path(), first_path);
+    assert_ne!(replacement.endpoint().as_path(), second_path);
+
+    let stale_error = LocalListener::bind(&first)
+        .expect_err("a stale stopped generation must not become current again");
+    assert_eq!(stale_error.kind(), ErrorKind::PermissionDenied);
+    let replacement_listener = LocalListener::bind(replacement.endpoint())?;
+    drop(replacement_listener);
+    Ok(())
+}
+
+#[tokio::test]
 async fn concurrent_restart_reservation_rejects_the_abandoned_child_generation(
 ) -> std::io::Result<()> {
     let label = format!("generation-restart-reservation-{}", std::process::id());

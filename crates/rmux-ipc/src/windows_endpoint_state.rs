@@ -24,7 +24,7 @@ use windows_sys::Win32::System::IO::OVERLAPPED;
 use crate::endpoint::{current_integrity_label, pipe_component, LocalEndpoint, PIPE_PREFIX};
 use crate::windows_endpoint_legacy;
 use crate::windows_endpoint_naming::{
-    endpoint_key, pipe_path, random_nonce, random_nonce_away_from,
+    endpoint_key, pipe_path, random_nonce, random_nonce_excluding,
 };
 use crate::windows_endpoint_record::{
     is_lower_hex, parse as parse_record, serialize as serialize_record, EndpointPhase,
@@ -107,7 +107,7 @@ pub(crate) fn endpoint_for_label(
             ));
         }
         Some(mut record) => {
-            record.nonce = random_nonce_away_from(Some(&record.nonce))?;
+            record.nonce = random_nonce_excluding(&[&record.nonce])?;
             record
         }
         None => EndpointRecord {
@@ -177,11 +177,7 @@ pub fn reserve_managed_endpoint_start(
     }
 
     if decision == ReservationDecision::Rotate {
-        record.nonce = if record.nonce == components.nonce {
-            random_nonce()?
-        } else {
-            components.nonce.clone()
-        };
+        record.nonce = random_nonce_excluding(&[&record.nonce, &components.nonce])?;
     }
     record.phase = EndpointPhase::Starting;
     record.process = requester;

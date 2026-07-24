@@ -42,10 +42,10 @@ pub(crate) fn random_nonce() -> io::Result<String> {
     Ok(encode_hex(&nonce))
 }
 
-pub(crate) fn random_nonce_away_from(rejected: Option<&str>) -> io::Result<String> {
+pub(crate) fn random_nonce_excluding(rejected: &[&str]) -> io::Result<String> {
     loop {
         let nonce = random_nonce()?;
-        if rejected != Some(nonce.as_str()) {
+        if !rejected.contains(&nonce.as_str()) {
             return Ok(nonce);
         }
     }
