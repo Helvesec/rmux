@@ -193,6 +193,16 @@ runs:
         test -f windows-nextest.tar.zst.sha256
         sha256sum --check windows-nextest.tar.zst.sha256
 
+    - name: Tolerate unavailable Windows revocation servers
+      if: runner.os == 'Windows' && inputs.smoke-kind != 'runtime'
+      shell: pwsh
+      run: |
+        $curlHome = Join-Path $env:RUNNER_TEMP "rmux-curl"
+        New-Item -ItemType Directory -Force -Path $curlHome | Out-Null
+        "ssl-revoke-best-effort" |
+          Set-Content -LiteralPath (Join-Path $curlHome ".curlrc") -Encoding ascii
+        "CURL_HOME=$curlHome" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+
     - name: Install cargo-nextest for persisted Windows test drivers
       if: runner.os == 'Windows' && inputs.smoke-kind != 'runtime'
       uses: taiki-e/install-action@c7eb1735f09259a5035e8e5d44b1406b1cddc0fb # v2.83.0

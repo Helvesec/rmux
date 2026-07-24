@@ -1,5 +1,7 @@
 const VERIFIER: &str = include_str!("../scripts/verify-package-windows.ps1");
 const NEXTEST_SMOKE: &str = include_str!("../scripts/run-nextest-package-smoke.ps1");
+const CI: &str = include_str!("../.github/workflows/ci.yml");
+const CANONICAL_SMOKE: &str = include_str!("../.github/actions/canonical-smoke/action.yml");
 
 fn function_body<'a>(source: &'a str, name: &str, next_name: &str) -> &'a str {
     source
@@ -128,6 +130,30 @@ fn release_package_metadata_is_bound_to_the_expected_commit() {
         assert!(
             release_gate.contains(required),
             "release metadata binding lost {required:?}"
+        );
+    }
+}
+
+#[test]
+fn windows_nextest_downloads_tolerate_only_offline_revocation_services() {
+    assert_eq!(
+        CI.matches("Tolerate unavailable Windows revocation servers")
+            .count(),
+        3
+    );
+    assert_eq!(
+        CANONICAL_SMOKE
+            .matches("Tolerate unavailable Windows revocation servers")
+            .count(),
+        1
+    );
+
+    for source in [CI, CANONICAL_SMOKE] {
+        assert!(source.contains("\"ssl-revoke-best-effort\""));
+        assert!(source.contains("\"CURL_HOME=$curlHome\""));
+        assert!(
+            !source.contains("ssl-no-revoke"),
+            "known certificate revocations must remain enforced"
         );
     }
 }
