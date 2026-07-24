@@ -40,6 +40,8 @@ pub(in crate::handler) use types::{
 };
 use types::{PaneStreamSource, PaneSurfaceFingerprint, RawPaneStream, SurfacePaneStream};
 
+pub(super) const MAX_SOURCE_CAPTURE_ATTEMPTS: usize = 4;
+
 struct SurfaceInitializationGuard {
     subscriptions: Weak<StdMutex<OutputSubscriptionState>>,
     token: u64,
@@ -273,7 +275,13 @@ impl RequestHandler {
             None
         };
 
-        let captured = capture_source(&source);
+        let (source, captured) = match self.capture_current_stream_source(source).await {
+            Ok(captured) => captured,
+            Err(error) => {
+                self.remove_reserved_stream(subscription_id);
+                return Response::Error(ErrorResponse { error });
+            }
+        };
         let response = match request.mode {
             PaneStreamMode::Raw => {
                 let rebase = match materialize_raw_rebase(
@@ -624,6 +632,27 @@ impl RequestHandler {
         stream_source_for_target(&state, target)
     }
 
+    async fn capture_current_stream_source(
+        &self,
+        mut source: PaneStreamSource,
+    ) -> Result<(PaneStreamSource, CapturedPaneBoundary), RmuxError> {
+        for _ in 0..MAX_SOURCE_CAPTURE_ATTEMPTS {
+            let captured = capture_source(&source);
+            if captured.boundary.generation == source.generation {
+                return Ok((source, captured));
+            }
+            source = self
+                .resolve_stream_source_for_pane(
+                    source.key.pane_id(),
+                    source.key.runtime_session_name(),
+                )
+                .await?;
+        }
+        Err(RmuxError::Server(
+            "pane process changed repeatedly while capturing stream state".to_owned(),
+        ))
+    }
+
     fn remove_reserved_stream(&self, subscription_id: rmux_proto::PaneOutputSubscriptionId) {
         self.subscriptions
             .lock()
@@ -678,11 +707,13 @@ fn stream_source_for_target(
         target.pane_index(),
     )?;
     let transcript = state.transcript_handle(&target)?;
+    let generation = output.current_generation();
     Ok(PaneStreamSource {
         target,
         key,
         output,
         transcript,
+        generation,
     })
 }
 

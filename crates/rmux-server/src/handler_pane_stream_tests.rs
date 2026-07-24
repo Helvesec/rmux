@@ -48,6 +48,26 @@ async fn test_pane(
     (target, output, transcript)
 }
 
+#[tokio::test]
+async fn capture_retries_when_the_resolved_process_generation_changes() {
+    let handler = RequestHandler::new();
+    let (target, output, _) = test_pane(&handler).await;
+    let source = {
+        let state = handler.state.lock().await;
+        super::stream_source_for_target(&state, target).expect("stream source")
+    };
+    let next_generation = source.generation.saturating_add(1);
+    output.set_generation(next_generation);
+
+    let (source, captured) = handler
+        .capture_current_stream_source(source)
+        .await
+        .expect("stale source is re-resolved");
+
+    assert_eq!(source.generation, next_generation);
+    assert_eq!(captured.boundary.generation, next_generation);
+}
+
 async fn subscribe(
     handler: &RequestHandler,
     target: &PaneTarget,

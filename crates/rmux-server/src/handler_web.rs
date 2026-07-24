@@ -558,24 +558,37 @@ impl RequestHandler {
         &self,
         target: &PaneTargetRef,
     ) -> Result<(WebPaneSnapshot, PaneOutputReceiver), RmuxError> {
-        let (pane_output, transcript) = {
-            let state = self.state.lock().await;
-            let target = resolve_pane_target_ref(&state, target)?;
-            let pane_output = state.pane_output_for_target(
-                target.session_name(),
-                target.window_index(),
-                target.pane_index(),
-            )?;
-            let transcript = state.transcript_handle(&target)?;
-            (pane_output, transcript)
-        };
-        let (boundary, seed, output) = pane_output.capture_with_observer(|| {
-            let transcript = match transcript.lock() {
-                Ok(transcript) => transcript,
-                Err(poisoned) => poisoned.into_inner(),
+        let mut captured = None;
+        for _ in 0..super::pane_stream_support::MAX_SOURCE_CAPTURE_ATTEMPTS {
+            let (pane_output, transcript, generation) = {
+                let state = self.state.lock().await;
+                let target = resolve_pane_target_ref(&state, target)?;
+                let pane_output = state.pane_output_for_target(
+                    target.session_name(),
+                    target.window_index(),
+                    target.pane_index(),
+                )?;
+                let transcript = state.transcript_handle(&target)?;
+                let generation = pane_output.current_generation();
+                (pane_output, transcript, generation)
             };
-            PaneRecoverySeed::capture(&transcript)
-        });
+            let candidate = pane_output.capture_with_observer(|| {
+                let transcript = match transcript.lock() {
+                    Ok(transcript) => transcript,
+                    Err(poisoned) => poisoned.into_inner(),
+                };
+                PaneRecoverySeed::capture(&transcript)
+            });
+            if candidate.0.generation == generation {
+                captured = Some(candidate);
+                break;
+            };
+        }
+        let Some((boundary, seed, output)) = captured else {
+            return Err(RmuxError::Server(
+                "pane process changed repeatedly while capturing web state".to_owned(),
+            ));
+        };
         let keyframe = seed.keyframe();
         let screen = seed.screen();
         let size = screen.size();

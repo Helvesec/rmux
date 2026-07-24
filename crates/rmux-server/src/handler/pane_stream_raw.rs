@@ -123,20 +123,25 @@ impl RequestHandler {
 
         let mut rebase_guard =
             RawRebaseGuard::new(&self.subscriptions, request.subscription_id, token, reason);
-        let source = match self
-            .resolve_stream_source_for_pane(key.pane_id(), key.runtime_session_name())
-            .await
-        {
-            Ok(source) => source,
-            Err(_) => {
-                events.push(PaneStreamEvent::End(PaneStreamEndReason::PaneRemoved));
-                self.finish_stream_after_end(request.subscription_id);
-                return stream_cursor_response(request.subscription_id, events, false);
-            }
-        };
-        let (rebase, mut receiver, boundary) =
+        let mut captured = None;
+        for _ in 0..super::MAX_SOURCE_CAPTURE_ATTEMPTS {
+            let source = match self
+                .resolve_stream_source_for_pane(key.pane_id(), key.runtime_session_name())
+                .await
+            {
+                Ok(source) => source,
+                Err(_) => {
+                    events.push(PaneStreamEvent::End(PaneStreamEndReason::PaneRemoved));
+                    self.finish_stream_after_end(request.subscription_id);
+                    return stream_cursor_response(request.subscription_id, events, false);
+                }
+            };
             match self.cached_or_captured_raw_rebase(&source, epoch, reason, include_snapshot) {
-                Ok(result) => result,
+                Ok(result) if result.2.generation == source.generation => {
+                    captured = Some(result);
+                    break;
+                }
+                Ok(_) => {}
                 Err(_error) => {
                     self.finish_stream_after_end(request.subscription_id);
                     return stream_cursor_response(
@@ -145,7 +150,16 @@ impl RequestHandler {
                         false,
                     );
                 }
-            };
+            }
+        }
+        let Some((rebase, mut receiver, boundary)) = captured else {
+            self.finish_stream_after_end(request.subscription_id);
+            return stream_cursor_response(
+                request.subscription_id,
+                vec![PaneStreamEvent::End(PaneStreamEndReason::ProjectionFailed)],
+                false,
+            );
+        };
         receiver.preserve_process_exits_since(observed_process_exit_revision);
         if let Err(error) = validate_raw_rebase_size(&rebase) {
             self.finish_stream_after_end(request.subscription_id);

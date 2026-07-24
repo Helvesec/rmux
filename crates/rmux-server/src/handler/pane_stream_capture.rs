@@ -23,7 +23,7 @@ pub(in crate::handler) struct CapturedPaneBoundary {
 }
 
 pub(in crate::handler) struct CapturedSurfaceBoundary {
-    pub(in crate::handler) next_output_sequence: u64,
+    pub(in crate::handler) boundary: PaneBoundary,
     pub(in crate::handler) fingerprint: PaneSurfaceFingerprint,
     pub(in crate::handler) seed: Option<PaneRecoverySeed>,
     pub(in crate::handler) receiver: PaneOutputReceiver,
@@ -60,7 +60,7 @@ pub(in crate::handler) fn capture_surface_source(
         (fingerprint, seed)
     });
     CapturedSurfaceBoundary {
-        next_output_sequence: boundary.next_output_sequence,
+        boundary,
         fingerprint: captured.0,
         seed: captured.1,
         receiver,

@@ -148,21 +148,36 @@ impl RequestHandler {
         ) = refresh;
         let mut refresh_guard =
             SurfaceRefreshGuard::new(&self.subscriptions, key.pane_id(), token, pending);
-        let source = match self
-            .resolve_stream_source_for_pane(key.pane_id(), key.runtime_session_name())
-            .await
-        {
-            Ok(source) => source,
-            Err(_) => {
-                self.finish_stream_after_end(request.subscription_id);
-                return stream_cursor_response(
-                    request.subscription_id,
-                    vec![PaneStreamEvent::End(PaneStreamEndReason::PaneRemoved)],
-                    false,
-                );
+        let mut captured = None;
+        for _ in 0..super::MAX_SOURCE_CAPTURE_ATTEMPTS {
+            let source = match self
+                .resolve_stream_source_for_pane(key.pane_id(), key.runtime_session_name())
+                .await
+            {
+                Ok(source) => source,
+                Err(_) => {
+                    self.finish_stream_after_end(request.subscription_id);
+                    return stream_cursor_response(
+                        request.subscription_id,
+                        vec![PaneStreamEvent::End(PaneStreamEndReason::PaneRemoved)],
+                        false,
+                    );
+                }
+            };
+            let candidate = capture_surface_source(&source, &previous_fingerprint, reset);
+            if candidate.boundary.generation == source.generation {
+                captured = Some(candidate);
+                break;
             }
+        }
+        let Some(mut captured) = captured else {
+            self.finish_stream_after_end(request.subscription_id);
+            return stream_cursor_response(
+                request.subscription_id,
+                vec![PaneStreamEvent::End(PaneStreamEndReason::ProjectionFailed)],
+                false,
+            );
         };
-        let mut captured = capture_surface_source(&source, &previous_fingerprint, reset);
         captured
             .receiver
             .preserve_process_exits_since(observed_process_exit_revision);
@@ -198,7 +213,7 @@ impl RequestHandler {
             key.pane_id(),
             epoch,
             revision,
-            captured.next_output_sequence,
+            captured.boundary.next_output_sequence,
             seed,
         ) {
             Ok(frame) => frame,

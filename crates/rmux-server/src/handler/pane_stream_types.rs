@@ -277,4 +277,5 @@ pub(in crate::handler) struct PaneStreamSource {
     pub(in crate::handler) key: PaneOutputSubscriptionKey,
     pub(in crate::handler) output: crate::pane_io::PaneOutputSender,
     pub(in crate::handler) transcript: crate::pane_transcript::SharedPaneTranscript,
+    pub(in crate::handler) generation: u64,
 }
