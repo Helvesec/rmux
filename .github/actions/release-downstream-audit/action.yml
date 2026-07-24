@@ -12,6 +12,14 @@ inputs:
     description: Downstream GitHub App private key
     required: true
 
+outputs:
+  artifact-id:
+    description: Exact downstream authority audit artifact ID
+    value: ${{ steps.audit-upload.outputs.artifact-id }}
+  artifact-digest:
+    description: Exact downstream authority audit artifact digest
+    value: sha256:${{ steps.audit-upload.outputs.artifact-digest }}
+
 runs:
   using: composite
   steps:
@@ -59,7 +67,8 @@ runs:
             --installation "$root/installation.json"
         done
 
-    - name: Upload exact downstream audit fixtures
+    - id: audit-upload
+      name: Upload exact downstream audit fixtures
       uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
       with:
         name: rmux-downstream-authority-${{ inputs.expected-source-sha }}-${{ github.run_id }}
