@@ -74,6 +74,7 @@ struct DestroySwitchPlans {
 pub(in crate::handler) struct PreparedAttachedDestroySwitches {
     source_session_id: SessionId,
     plans: Vec<DestroySwitchPlan>,
+    control_target_session_ids: Vec<SessionId>,
     pub(in crate::handler) control_lifecycle_events: Vec<super::super::QueuedLifecycleEvent>,
 }
 
@@ -90,9 +91,16 @@ impl RequestHandler {
         let control_lifecycle_events = self
             .prepare_control_destroy_switch_plans(session_id, switch_plans.control)
             .await;
+        let mut control_target_session_ids = control_lifecycle_events
+            .iter()
+            .filter_map(|event| event.control_session_identity)
+            .collect::<Vec<_>>();
+        control_target_session_ids.sort_unstable();
+        control_target_session_ids.dedup();
         PreparedAttachedDestroySwitches {
             source_session_id: session_id,
             plans: switch_plans.attached,
+            control_target_session_ids,
             control_lifecycle_events,
         }
     }
@@ -107,6 +115,11 @@ impl RequestHandler {
         );
         self.apply_attached_destroy_switch_plans(prepared.source_session_id, prepared.plans)
             .await;
+        for target_session_id in prepared.control_target_session_ids {
+            let _ = self
+                .reconcile_attached_session_identity_size_and_emit(target_session_id)
+                .await;
+        }
     }
 
     #[cfg_attr(not(test), allow(dead_code))]

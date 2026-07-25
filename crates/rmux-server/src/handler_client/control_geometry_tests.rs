@@ -4,8 +4,9 @@ use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
 
 use rmux_proto::{
-    ControlMode, NewSessionRequest, OptionName, Request, Response, ScopeSelector, SessionName,
-    SetOptionMode, SetOptionRequest, SwitchClientRequest, TerminalSize, WindowTarget,
+    ControlMode, KillSessionRequest, NewSessionRequest, OptionName, Request, Response,
+    ScopeSelector, SessionName, SetOptionMode, SetOptionRequest, SwitchClientRequest, TerminalSize,
+    WindowTarget,
 };
 use tokio::sync::mpsc;
 
@@ -291,6 +292,59 @@ async fn switching_control_client_reconciles_the_source_session_geometry() {
 }
 
 #[tokio::test]
+async fn destroyed_control_session_rehome_reconciles_target_geometry_like_tmux37() {
+    let handler = RequestHandler::new();
+    let target = session_name("control-destroy-rehome-target");
+    let source = session_name("control-destroy-rehome-source");
+    create_session(
+        &handler,
+        target.clone(),
+        TerminalSize { cols: 60, rows: 20 },
+    )
+    .await;
+    create_session(&handler, source.clone(), INITIAL_SIZE).await;
+    set_window_size_policy(&handler, &target, "latest").await;
+    set_detach_on_destroy(&handler, &source, "off").await;
+
+    let requester_pid = std::process::id();
+    let (_control_id, _control_events) =
+        register_control_client_with_id(&handler, requester_pid, &source).await;
+    let control_size = TerminalSize {
+        cols: 101,
+        rows: 41,
+    };
+    let refreshed = handler
+        .handle(Request::RefreshClient(Box::new(
+            refresh_client_size_request(requester_pid, control_size),
+        )))
+        .await;
+    assert!(
+        matches!(refreshed, Response::RefreshClient(_)),
+        "{refreshed:?}"
+    );
+
+    let killed = handler
+        .handle(Request::KillSession(KillSessionRequest {
+            target: source,
+            kill_all_except_target: false,
+            clear_alerts: false,
+            kill_group: false,
+        }))
+        .await;
+
+    assert!(matches!(killed, Response::KillSession(_)), "{killed:?}");
+    assert_eq!(session_size(&handler, &target).await, control_size);
+    let active_control = handler.active_control.lock().await;
+    assert_eq!(
+        active_control
+            .by_pid
+            .get(&requester_pid)
+            .and_then(|active| active.session_name.as_ref()),
+        Some(&target)
+    );
+}
+
+#[tokio::test]
 async fn attached_arrival_and_departure_keep_control_geometry_in_every_automatic_policy() {
     // Frozen tmux 3.7b oracle, 2026-07-25: a control client remains a
     // window-size candidate while an ordinary attach arrives and after it
@@ -503,6 +557,18 @@ async fn set_window_size_policy(handler: &RequestHandler, session: &SessionName,
             scope: ScopeSelector::Window(WindowTarget::with_window(session.clone(), 0)),
             option: OptionName::WindowSize,
             value: policy.to_owned(),
+            mode: SetOptionMode::Replace,
+        }))
+        .await;
+    assert!(matches!(response, Response::SetOption(_)), "{response:?}");
+}
+
+async fn set_detach_on_destroy(handler: &RequestHandler, session: &SessionName, value: &str) {
+    let response = handler
+        .handle(Request::SetOption(SetOptionRequest {
+            scope: ScopeSelector::Session(session.clone()),
+            option: OptionName::DetachOnDestroy,
+            value: value.to_owned(),
             mode: SetOptionMode::Replace,
         }))
         .await;

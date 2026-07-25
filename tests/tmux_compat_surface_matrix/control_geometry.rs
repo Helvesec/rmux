@@ -84,6 +84,60 @@ fn tmux_compat_control_geometry_survives_attach_and_control_departures_when_froz
 }
 
 #[test]
+fn tmux_compat_destroy_rehome_reconciles_control_geometry_when_frozen_tmux_is_available(
+) -> Result<(), Box<dyn Error>> {
+    let harness = TmuxCompatHarness::new("tmux-compat-control-destroy-rehome-geometry")?;
+    let Some(tmux_binary) = frozen_tmux_or_skip(&harness)? else {
+        return Ok(());
+    };
+    let _guard = pty_tmux_compat_lock();
+    let config = config();
+
+    for argv in [
+        ["new-session", "-d", "-s", "target", "-x", "60", "-y", "20"].as_slice(),
+        ["new-session", "-d", "-s", "source"].as_slice(),
+        ["set-option", "-t", "target", "status", "off"].as_slice(),
+        ["set-option", "-t", "source", "status", "off"].as_slice(),
+        ["set-option", "-w", "-t", "target", "window-size", "latest"].as_slice(),
+        ["set-option", "-g", "detach-on-destroy", "off"].as_slice(),
+    ] {
+        let run = harness.run_pair_with(&tmux_binary, argv, config.clone())?;
+        assert_quiet_success(&run);
+    }
+
+    let mut tmux_command = tmux_control_mode_command(&harness, &tmux_binary, &[], &[])?;
+    tmux_command.args(["attach-session", "-t", "source"]);
+    let mut tmux_control = LiveControlClient::spawn(tmux_command)?;
+    let mut rmux_command = rmux_control_mode_command(&harness, &[], &[])?;
+    rmux_command.args(["attach-session", "-t", "source"]);
+    let mut rmux_control = LiveControlClient::spawn(rmux_command)?;
+    tmux_control.send("refresh-client -C 101x41\n")?;
+    rmux_control.send("refresh-client -C 101x41\n")?;
+    wait_for_state(
+        &harness,
+        &tmux_binary,
+        "source",
+        &[size(101, 41)],
+        size(101, 41),
+        config.clone(),
+    )?;
+
+    tmux_control.send("kill-session -t source\n")?;
+    rmux_control.send("kill-session -t source\n")?;
+    wait_for_state(
+        &harness,
+        &tmux_binary,
+        "target",
+        &[size(101, 41)],
+        size(101, 41),
+        config,
+    )?;
+    tmux_control.assert_running("tmux rehomed control")?;
+    rmux_control.assert_running("rmux rehomed control")?;
+    Ok(())
+}
+
+#[test]
 fn tmux_compat_control_switch_reconciles_source_geometry_when_frozen_tmux_is_available(
 ) -> Result<(), Box<dyn Error>> {
     let harness = TmuxCompatHarness::new("tmux-compat-control-switch-source-geometry")?;
