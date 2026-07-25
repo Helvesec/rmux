@@ -8,6 +8,7 @@ param(
 
 $ErrorActionPreference = "Stop"
 
+$env:RUST_MIN_STACK = "8388608"
 $env:CARGO_TARGET_DIR = $TargetDir
 if (-not $env:CARGO_INCREMENTAL) {
     $env:CARGO_INCREMENTAL = "0"
@@ -218,6 +219,7 @@ Write-Host "cargo-build-jobs=$env:CARGO_BUILD_JOBS"
 Write-Host "cargo-profile-dev-debug=$env:CARGO_PROFILE_DEV_DEBUG"
 Write-Host "cargo-profile-dev-build-override-debug=$env:CARGO_PROFILE_DEV_BUILD_OVERRIDE_DEBUG"
 Write-Host "cargo-profile-test-debug=$env:CARGO_PROFILE_TEST_DEBUG"
+Write-Host "rust-min-stack=$env:RUST_MIN_STACK"
 Write-Host "rustflags=$env:RUSTFLAGS"
 Step "formatting" { Run "cargo" @("fmt", "--all", "--check") }
 Step "platform cfg budget" { Check-CfgBudgets }

@@ -185,7 +185,10 @@ esac
 export CARGO_TARGET_DIR="$target_dir"
 export CARGO_INCREMENTAL="${CARGO_INCREMENTAL:-0}"
 export CARGO_BUILD_JOBS="${CARGO_BUILD_JOBS:-1}"
+export RUST_MIN_STACK=8388608
 export RMUX_REQUIRE_TMUX=1
+
+printf 'rust-min-stack=%s\n' "$RUST_MIN_STACK"
 
 if section_enabled static; then
   run_step "release versions" scripts/check-release-versions.sh

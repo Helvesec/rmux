@@ -893,6 +893,21 @@ fn xterm_oracle_inputs_and_filter_are_release_policy() {
 }
 
 #[test]
+fn release_review_gates_match_daemon_stack_budget() {
+    let unix = include_str!("../scripts/release-review-gate.sh");
+    let windows = include_str!("../scripts/release-review-gate-windows.ps1");
+    let daemon_runtime = include_str!("../src/server_runtime.rs");
+
+    assert!(unix.contains("export RUST_MIN_STACK=8388608"));
+    assert!(unix.contains("printf 'rust-min-stack=%s\\n' \"$RUST_MIN_STACK\""));
+    assert!(windows.contains("$env:RUST_MIN_STACK = \"8388608\""));
+    assert!(windows.contains("Write-Host \"rust-min-stack=$env:RUST_MIN_STACK\""));
+    assert!(
+        daemon_runtime.contains("const DAEMON_WORKER_THREAD_STACK_SIZE: usize = 8 * 1024 * 1024;")
+    );
+}
+
+#[test]
 fn ci_keeps_release_only_work_behind_the_protected_fast_lane() {
     let ci = include_str!("../.github/workflows/ci.yml");
     assert!(ci.contains("release_qualification:"));
