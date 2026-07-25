@@ -232,12 +232,14 @@ impl RequestHandler {
                 };
                 match super::super::attach_support::resize_control_session_for_client(
                     &mut state,
-                    &active_attach,
-                    &active_control,
-                    control_pid,
+                    super::super::attach_support::ControlResizeClient::new(
+                        &active_attach,
+                        &active_control,
+                        control_pid,
+                        size,
+                    ),
                     session_name,
                     session_id,
-                    size,
                 ) {
                     Ok(target) => {
                         let active = active_control

@@ -8,7 +8,7 @@ use rmux_proto::{
 
 use crate::pane_io::AttachControl;
 
-use super::super::RequestHandler;
+use super::super::{client_support::SwitchTargetSelection, RequestHandler};
 
 #[path = "resize_policy/identity.rs"]
 mod identity;
@@ -51,52 +51,49 @@ impl AttachedSizeSelection {
 
 pub(in crate::handler) const ATTACHED_SIZE_RECONCILE_ATTEMPTS: usize = 4;
 
+#[derive(Clone, Copy)]
+pub(in crate::handler) struct ControlResizeClient<'a> {
+    active_attach: &'a super::ActiveAttachState,
+    active_control: &'a super::super::ActiveControlState,
+    control_pid: u32,
+    client_size: TerminalSize,
+}
+
+impl<'a> ControlResizeClient<'a> {
+    pub(in crate::handler) const fn new(
+        active_attach: &'a super::ActiveAttachState,
+        active_control: &'a super::super::ActiveControlState,
+        control_pid: u32,
+        client_size: TerminalSize,
+    ) -> Self {
+        Self {
+            active_attach,
+            active_control,
+            control_pid,
+            client_size,
+        }
+    }
+}
+
 pub(in crate::handler) fn resize_control_session_for_client(
     state: &mut crate::pane_terminals::HandlerState,
-    active_attach: &super::ActiveAttachState,
-    active_control: &super::super::ActiveControlState,
-    control_pid: u32,
+    client: ControlResizeClient<'_>,
     session_name: &SessionName,
     expected_session_id: SessionId,
-    client_size: TerminalSize,
 ) -> Result<Option<WindowTarget>, RmuxError> {
-    let (window_index, current_size, selected_size) = {
-        let session = state
-            .sessions
-            .session(session_name)
-            .filter(|session| session.id() == expected_session_id)
-            .ok_or_else(|| crate::pane_terminals::session_not_found(session_name))?;
-        let window_index = session.active_window_index();
-        let policy = policy_from_option_value(state.options.resolve_for_window(
-            session_name,
-            window_index,
-            OptionName::WindowSize,
-        ));
-        let aggressive_resize = state.options.resolve_for_window(
-            session_name,
-            window_index,
-            OptionName::AggressiveResize,
-        ) == Some("on");
-        let linked_sessions =
-            linked_session_identities(state, session_name, window_index, aggressive_resize);
-        let mut candidates =
-            attached_size_candidates(active_attach, &linked_sessions, Some(client_size));
-        if matches!(
-            policy,
-            AttachedWindowSizePolicy::Largest | AttachedWindowSizePolicy::Smallest
-        ) {
-            candidates.extend(control_size_candidates(
-                active_control,
-                &linked_sessions,
-                control_pid,
-            ));
-        }
-        (
-            window_index,
-            session.window().size(),
-            selected_attached_size(policy, &candidates),
-        )
-    };
+    let window_index = state
+        .sessions
+        .session(session_name)
+        .filter(|session| session.id() == expected_session_id)
+        .ok_or_else(|| crate::pane_terminals::session_not_found(session_name))?
+        .active_window_index();
+    let (current_size, selected_size) = control_resize_selection(
+        state,
+        client,
+        session_name,
+        expected_session_id,
+        window_index,
+    )?;
     let Some(selected_size) = selected_size else {
         return Ok(None);
     };
@@ -116,6 +113,101 @@ pub(in crate::handler) fn resize_control_session_for_client(
         session_name.clone(),
         window_index,
     )))
+}
+
+pub(in crate::handler) fn switch_control_session_for_client(
+    state: &mut crate::pane_terminals::HandlerState,
+    client: ControlResizeClient<'_>,
+    session_name: &SessionName,
+    expected_session_id: SessionId,
+    selection: Option<&SwitchTargetSelection>,
+) -> Result<(Option<WindowTarget>, Vec<SessionName>), RmuxError> {
+    let window_index = match selection {
+        Some(selection) => selection.window_target().window_index(),
+        None => state
+            .sessions
+            .session(session_name)
+            .filter(|session| session.id() == expected_session_id)
+            .ok_or_else(|| crate::pane_terminals::session_not_found(session_name))?
+            .active_window_index(),
+    };
+    let (current_size, selected_size) = control_resize_selection(
+        state,
+        client,
+        session_name,
+        expected_session_id,
+        window_index,
+    )?;
+    let resized_target = selected_size
+        .filter(|selected_size| *selected_size != current_size)
+        .map(|_| WindowTarget::with_window(session_name.clone(), window_index));
+    if selection.is_none() && resized_target.is_none() {
+        return Ok((None, Vec::new()));
+    }
+
+    let (_, refresh_sessions) = state.mutate_session_and_resize_window_terminal_with_family(
+        session_name,
+        window_index,
+        |session| {
+            if session.id() != expected_session_id {
+                return Err(crate::pane_terminals::session_not_found(session_name));
+            }
+            if let Some(selection) = selection {
+                selection.apply_to_session(session)?;
+            }
+            if let Some(selected_size) = selected_size {
+                session.resize_window(window_index, selected_size)?;
+            }
+            Ok(())
+        },
+    )?;
+    Ok((resized_target, refresh_sessions))
+}
+
+fn control_resize_selection(
+    state: &crate::pane_terminals::HandlerState,
+    client: ControlResizeClient<'_>,
+    session_name: &SessionName,
+    expected_session_id: SessionId,
+    window_index: u32,
+) -> Result<(TerminalSize, Option<TerminalSize>), RmuxError> {
+    let session = state
+        .sessions
+        .session(session_name)
+        .filter(|session| session.id() == expected_session_id)
+        .ok_or_else(|| crate::pane_terminals::session_not_found(session_name))?;
+    let current_size = session
+        .window_at(window_index)
+        .ok_or_else(|| RmuxError::invalid_target(window_index.to_string(), "window not found"))?
+        .size();
+    let policy = policy_from_option_value(state.options.resolve_for_window(
+        session_name,
+        window_index,
+        OptionName::WindowSize,
+    ));
+    let aggressive_resize =
+        state
+            .options
+            .resolve_for_window(session_name, window_index, OptionName::AggressiveResize)
+            == Some("on");
+    let linked_sessions =
+        linked_session_identities(state, session_name, window_index, aggressive_resize);
+    let mut candidates = attached_size_candidates(
+        client.active_attach,
+        &linked_sessions,
+        Some(client.client_size),
+    );
+    if matches!(
+        policy,
+        AttachedWindowSizePolicy::Largest | AttachedWindowSizePolicy::Smallest
+    ) {
+        candidates.extend(control_size_candidates(
+            client.active_control,
+            &linked_sessions,
+            client.control_pid,
+        ));
+    }
+    Ok((current_size, selected_attached_size(policy, &candidates)))
 }
 
 fn control_size_candidates<'a>(

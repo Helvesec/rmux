@@ -10,7 +10,8 @@ use rmux_proto::{SessionId, TerminalSize};
 use tokio::sync::{mpsc, watch};
 
 use super::{
-    attach_support::resize_control_session_for_client, client_support::SwitchTargetSelection,
+    attach_support::{switch_control_session_for_client, ControlResizeClient},
+    client_support::SwitchTargetSelection,
     current_client_activity_timestamp, update_environment_from_client, QueuedLifecycleEvent,
     RequestHandler,
 };
@@ -1189,7 +1190,7 @@ impl RequestHandler {
         };
         let active_attach = self.active_attach.lock().await;
         let mut active_control = self.active_control.lock().await;
-        let Some(active) = active_control.by_pid.get_mut(&requester_pid) else {
+        let Some(active) = active_control.by_pid.get(&requester_pid) else {
             return Err(attached_client_required(command_name));
         };
         if expected_control_id.is_some_and(|expected| active.id != expected)
@@ -1209,47 +1210,44 @@ impl RequestHandler {
             cols: active.client_width,
             rows: active.client_height,
         };
-        let (previous, delivered) = update_control_session(
-            active,
-            next_session_name.clone(),
-            next_session_id,
-            pane_sequences,
-        );
-        if !delivered {
-            return Err(attached_client_required(command_name));
-        }
+        let prepared_update =
+            prepare_control_session_update(active, next_session_name.clone(), pane_sequences)
+                .ok_or_else(|| attached_client_required(command_name))?;
+        let (resized_target, refresh_sessions) = if exact_client_identity {
+            let (session_name, session_id) = next_session_name
+                .as_ref()
+                .zip(next_session_id)
+                .expect("switch-client always carries a target session identity");
+            switch_control_session_for_client(
+                &mut state,
+                ControlResizeClient::new(
+                    &active_attach,
+                    &active_control,
+                    requester_pid,
+                    control_size,
+                ),
+                session_name,
+                session_id,
+                target_selection.as_ref(),
+            )?
+        } else {
+            (None, Vec::new())
+        };
         if let (Some(session_name), Some(client_environment)) =
             (next_session_name.as_ref(), client_environment)
         {
             update_environment_from_client(&mut state, session_name, client_environment);
         }
-        let refresh_sessions = if let Some(selection) = target_selection.as_ref() {
-            selection
-                .apply_to_state(&mut state)
-                .expect("prevalidated switch selection remains applicable while locked")
-        } else {
-            Vec::new()
-        };
-        let resized_target = if exact_client_identity {
-            next_session_name
-                .as_ref()
-                .zip(next_session_id)
-                .map(|(session_name, session_id)| {
-                    resize_control_session_for_client(
-                        &mut state,
-                        &active_attach,
-                        &active_control,
-                        requester_pid,
-                        session_name,
-                        session_id,
-                        control_size,
-                    )
-                })
-                .transpose()?
-                .flatten()
-        } else {
-            None
-        };
+        let active = active_control
+            .by_pid
+            .get_mut(&requester_pid)
+            .expect("validated control client remains locked");
+        let previous = commit_control_session_update(
+            active,
+            next_session_name.clone(),
+            next_session_id,
+            prepared_update,
+        );
         if touch_attached {
             let session_name = next_session_name
                 .as_ref()
@@ -1802,16 +1800,44 @@ impl RequestHandler {
     }
 }
 
-fn update_control_session(
+struct PreparedControlSessionUpdate {
+    event: ControlServerEvent,
+    permit: mpsc::OwnedPermit<ControlServerEvent>,
+}
+
+fn prepare_control_session_update(
+    active: &ActiveControl,
+    next_session_name: Option<rmux_proto::SessionName>,
+    pane_sequences: Option<Vec<(u32, u64)>>,
+) -> Option<PreparedControlSessionUpdate> {
+    if active.closing.load(Ordering::SeqCst) {
+        return None;
+    }
+    let event = match (next_session_name, pane_sequences) {
+        (Some(session_name), Some(pane_sequences)) => ControlServerEvent::SessionChangedAt {
+            session_name,
+            pane_sequences,
+        },
+        (next_session_name, None) => ControlServerEvent::SessionChanged(next_session_name),
+        (None, Some(_)) => unreachable!("pane cursors require a control session"),
+    };
+    let permit = match active.event_tx.clone().try_reserve_owned() {
+        Ok(permit) => permit,
+        Err(_) => {
+            active.closing.store(true, Ordering::SeqCst);
+            return None;
+        }
+    };
+    Some(PreparedControlSessionUpdate { event, permit })
+}
+
+fn commit_control_session_update(
     active: &mut ActiveControl,
     next_session_name: Option<rmux_proto::SessionName>,
     next_session_id: Option<SessionId>,
-    pane_sequences: Option<Vec<(u32, u64)>>,
-) -> (Option<rmux_proto::SessionName>, bool) {
+    prepared: PreparedControlSessionUpdate,
+) -> Option<rmux_proto::SessionName> {
     let previous = active.session_name.clone();
-    let previous_session_id = active.session_id;
-    let previous_last_session = active.last_session.clone();
-    let previous_last_session_id = active.last_session_id;
     if let (Some(previous_session), Some(previous_session_id), Some(next_session), Some(next_id)) = (
         previous.as_ref(),
         active.session_id,
@@ -1825,22 +1851,26 @@ fn update_control_session(
     }
     active.session_name = next_session_name.clone();
     active.session_id = next_session_id;
-    let event = match (next_session_name, pane_sequences) {
-        (Some(session_name), Some(pane_sequences)) => ControlServerEvent::SessionChangedAt {
-            session_name,
-            pane_sequences,
-        },
-        (next_session_name, None) => ControlServerEvent::SessionChanged(next_session_name),
-        (None, Some(_)) => unreachable!("pane cursors require a control session"),
+    let _ = prepared.permit.send(prepared.event);
+    previous
+}
+
+fn update_control_session(
+    active: &mut ActiveControl,
+    next_session_name: Option<rmux_proto::SessionName>,
+    next_session_id: Option<SessionId>,
+    pane_sequences: Option<Vec<(u32, u64)>>,
+) -> (Option<rmux_proto::SessionName>, bool) {
+    let previous = active.session_name.clone();
+    let Some(prepared) =
+        prepare_control_session_update(active, next_session_name.clone(), pane_sequences)
+    else {
+        return (previous, false);
     };
-    let delivered = try_send_control_event(active, event);
-    if !delivered {
-        active.session_name = previous.clone();
-        active.session_id = previous_session_id;
-        active.last_session = previous_last_session;
-        active.last_session_id = previous_last_session_id;
-    }
-    (previous, delivered)
+    (
+        commit_control_session_update(active, next_session_name, next_session_id, prepared),
+        true,
+    )
 }
 
 fn current_pane_output_sequences(

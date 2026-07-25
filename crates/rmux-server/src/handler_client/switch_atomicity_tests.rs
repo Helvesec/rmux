@@ -846,6 +846,185 @@ async fn closed_control_switch_preserves_environment_selection_and_touch() {
 }
 
 #[tokio::test]
+async fn control_switch_resize_failure_preserves_session_identity_and_event_stream() {
+    let handler = RequestHandler::new();
+    let alpha = session_name("switch-atomic-resize-alpha");
+    let beta = session_name("switch-atomic-resize-beta");
+    create_session(&handler, alpha.clone()).await;
+    create_session(&handler, beta.clone()).await;
+    let target_window = create_runtime_window(&handler, &beta).await;
+    let (alpha_id, before_session) = {
+        let state = handler.state.lock().await;
+        (
+            state.sessions.session(&alpha).expect("alpha exists").id(),
+            state.sessions.session(&beta).expect("beta exists").clone(),
+        )
+    };
+    let before_terminal_size = pane_terminal_size(&handler, &beta, target_window).await;
+    let control_pid = 94_500;
+    let (event_tx, mut event_rx) = mpsc::channel(CONTROL_SERVER_EVENT_CAPACITY);
+    let control_id = handler
+        .register_control_with_closing(
+            control_pid,
+            ControlModeUpgrade {
+                mode: ControlMode::Plain,
+                terminal_context: crate::outer_terminal::OuterTerminalContext::default(),
+                initial_command_count: 0,
+            },
+            event_tx,
+            Arc::new(AtomicBool::new(false)),
+        )
+        .await;
+    handler
+        .set_control_session(control_pid, Some(alpha.clone()))
+        .await
+        .expect("initial control session set succeeds");
+    assert!(matches!(
+        event_rx.try_recv(),
+        Ok(ControlServerEvent::SessionChanged(Some(_))
+            | ControlServerEvent::SessionChangedAt { .. })
+    ));
+    {
+        let mut active_control = handler.active_control.lock().await;
+        let active = active_control
+            .by_pid
+            .get_mut(&control_pid)
+            .expect("control client remains registered");
+        active.client_width = SWITCH_SIZE.cols;
+        active.client_height = SWITCH_SIZE.rows;
+    }
+    handler.state.lock().await.fail_next_resize_for_test();
+
+    let response = handler
+        .handle_switch_client_ext3(
+            control_pid,
+            switch_request(format!("{beta}:{target_window}")),
+        )
+        .await;
+    assert!(matches!(response, Response::Error(_)), "{response:?}");
+
+    {
+        let state = handler.state.lock().await;
+        assert_eq!(state.sessions.session(&beta), Some(&before_session));
+    }
+    assert_eq!(
+        pane_terminal_size(&handler, &beta, target_window).await,
+        before_terminal_size
+    );
+    {
+        let active_control = handler.active_control.lock().await;
+        let active = active_control
+            .by_pid
+            .get(&control_pid)
+            .expect("failed switch preserves control registration");
+        assert_eq!(active.id, control_id);
+        assert_eq!(active.session_name.as_ref(), Some(&alpha));
+        assert_eq!(active.session_id, Some(alpha_id));
+        assert_eq!(active.last_session, None);
+        assert_eq!(active.last_session_id, None);
+    }
+    assert!(matches!(
+        event_rx.try_recv(),
+        Err(mpsc::error::TryRecvError::Empty)
+    ));
+}
+
+#[tokio::test]
+async fn control_switch_success_commits_environment_touch_selection_and_event() {
+    let handler = RequestHandler::new();
+    let alpha = session_name("switch-success-control-alpha");
+    let beta = session_name("switch-success-control-beta");
+    create_session(&handler, alpha.clone()).await;
+    create_session(&handler, beta.clone()).await;
+    let target_window = create_runtime_window(&handler, &beta).await;
+    let requester = spawn_environment_child("switch-success-control-after").await;
+    let control_pid = requester.0.id();
+    let (event_tx, mut event_rx) = mpsc::channel(CONTROL_SERVER_EVENT_CAPACITY);
+    let control_id = handler
+        .register_control_with_closing(
+            control_pid,
+            ControlModeUpgrade {
+                mode: ControlMode::Plain,
+                terminal_context: crate::outer_terminal::OuterTerminalContext::default(),
+                initial_command_count: 0,
+            },
+            event_tx,
+            Arc::new(AtomicBool::new(false)),
+        )
+        .await;
+    handler
+        .set_control_session(control_pid, Some(alpha.clone()))
+        .await
+        .expect("initial control session set succeeds");
+    assert!(event_rx.try_recv().is_ok());
+    {
+        let mut state = handler.state.lock().await;
+        state.environment.set(
+            ScopeSelector::Session(beta.clone()),
+            "DISPLAY".to_owned(),
+            "switch-success-control-before".to_owned(),
+        );
+        assert_eq!(
+            state
+                .sessions
+                .session(&beta)
+                .expect("beta exists")
+                .last_attached_at(),
+            None
+        );
+    }
+    {
+        let mut active_control = handler.active_control.lock().await;
+        let active = active_control
+            .by_pid
+            .get_mut(&control_pid)
+            .expect("control client remains registered");
+        active.client_width = SWITCH_SIZE.cols;
+        active.client_height = SWITCH_SIZE.rows;
+    }
+
+    let response = handler
+        .handle_switch_client_ext3(
+            control_pid,
+            switch_request(format!("{beta}:{target_window}")),
+        )
+        .await;
+    assert!(
+        matches!(response, Response::SwitchClient(_)),
+        "{response:?}"
+    );
+    assert!(matches!(
+        event_rx.try_recv(),
+        Ok(ControlServerEvent::SessionChanged(Some(ref session_name))
+            | ControlServerEvent::SessionChangedAt {
+                ref session_name,
+                ..
+            }) if session_name == &beta
+    ));
+    {
+        let state = handler.state.lock().await;
+        let target = state.sessions.session(&beta).expect("beta survives");
+        assert_eq!(target.active_window_index(), target_window);
+        assert_eq!(target.window().size(), SWITCH_SIZE);
+        assert!(target.last_attached_at().is_some());
+        assert_eq!(
+            state.environment.session_value(&beta, "DISPLAY"),
+            Some("switch-success-control-after")
+        );
+    }
+    {
+        let active_control = handler.active_control.lock().await;
+        let active = active_control
+            .by_pid
+            .get(&control_pid)
+            .expect("control client remains registered");
+        assert_eq!(active.id, control_id);
+        assert_eq!(active.session_name.as_ref(), Some(&beta));
+        assert_eq!(active.last_session.as_ref(), Some(&alpha));
+    }
+}
+
+#[tokio::test]
 async fn attach_identity_replacement_after_size_selection_commits_no_target_mutation() {
     let handler = RequestHandler::new();
     let alpha = session_name("switch-atomic-replace-alpha");
