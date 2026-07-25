@@ -10,7 +10,9 @@ use rmux_proto::{
 };
 
 use crate::pane_io::{PaneBoundary, PaneInvalidationReason, PaneOutputReceiver};
-use crate::pane_recovery::{PaneDynamicColors, PaneRecoveryDraft, PaneRecoverySeed};
+use crate::pane_recovery::{
+    PaneDynamicColors, PaneProjectionSeed, PaneRecoveryDraft, PaneRecoverySeed,
+};
 
 use super::super::pane_support::{
     collect_cells, compute_snapshot_fingerprint, cursor_coord_to_u16,
@@ -28,7 +30,7 @@ pub(in crate::handler) struct CapturedPaneBoundary {
 pub(in crate::handler) struct CapturedSurfaceBoundary {
     pub(in crate::handler) boundary: PaneBoundary,
     pub(in crate::handler) fingerprint: PaneSurfaceFingerprint,
-    pub(in crate::handler) seed: Option<PaneRecoverySeed>,
+    pub(in crate::handler) seed: Option<PaneProjectionSeed>,
     pub(in crate::handler) receiver: PaneOutputReceiver,
 }
 
@@ -58,7 +60,7 @@ fn capture_source_with_materializer(
 
 pub(in crate::handler) fn capture_surface_source(
     source: &PaneStreamSource,
-    previous: &PaneSurfaceFingerprint,
+    previous: Option<&PaneSurfaceFingerprint>,
     force: bool,
 ) -> Result<CapturedSurfaceBoundary, RmuxError> {
     let (boundary, captured, receiver) = source.output.capture_with_observer(|| {
@@ -68,15 +70,11 @@ pub(in crate::handler) fn capture_surface_source(
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         let dynamic_colors = PaneDynamicColors::capture(&transcript);
         let fingerprint = PaneSurfaceFingerprint::capture(transcript.screen(), &dynamic_colors);
-        let seed =
-            (force || &fingerprint != previous).then(|| PaneRecoveryDraft::capture(&transcript));
+        let seed = (force || previous != Some(&fingerprint))
+            .then(|| PaneProjectionSeed::capture(&transcript));
         (fingerprint, seed)
     });
-    let seed = captured
-        .1
-        .transpose()?
-        .map(PaneRecoveryDraft::materialize)
-        .transpose()?;
+    let seed = captured.1.transpose()?;
     Ok(CapturedSurfaceBoundary {
         boundary,
         fingerprint: captured.0,
@@ -123,11 +121,10 @@ pub(in crate::handler) fn materialize_surface_frame(
     surface_revision: u64,
     minimum_snapshot_revision: u64,
     next_output_sequence: u64,
-    seed: &PaneRecoverySeed,
+    seed: &PaneProjectionSeed,
 ) -> Result<Arc<PaneSurfaceFrame>, RmuxError> {
     let screen = seed.screen();
     let size = screen.size();
-    validate_recovery_snapshot_geometry(size.cols, size.rows)?;
     let history_size = seed.history_size();
     let history_bytes = seed.history_bytes();
     let cells = collect_cells(screen, size.cols, size.rows, history_size)?;
@@ -283,7 +280,11 @@ mod tests {
     use rmux_core::PaneId;
     use rmux_proto::{PaneTarget, SessionName, TerminalSize};
 
-    use super::{capture_source_with_materializer, PaneRecoveryDraft, PaneStreamSource};
+    use super::{
+        capture_source_with_materializer, materialize_surface_frame, PaneRecoveryDraft,
+        PaneStreamSource,
+    };
+    use crate::handler::RequestHandler;
     use crate::pane_io;
     use crate::pane_transcript::PaneTranscript;
 
@@ -353,5 +354,28 @@ mod tests {
             captured.receiver.try_recv().is_none(),
             "captured receiver must not duplicate the post-boundary event"
         );
+    }
+
+    #[test]
+    fn surface_projection_uses_its_encoded_frame_budget_not_the_raw_snapshot_budget() {
+        let size = TerminalSize {
+            cols: 1024,
+            rows: 256,
+        };
+        let cells = usize::from(size.cols) * usize::from(size.rows);
+        assert_eq!(cells, rmux_proto::DEFAULT_MAX_DETACHED_FRAME_LENGTH / 32);
+
+        let mut transcript = PaneTranscript::new(0, size);
+        let bytes = vec![b'x'; cells];
+        transcript.append_bytes(&bytes);
+        let seed =
+            super::PaneProjectionSeed::capture(&transcript).expect("capture bounded surface");
+        let frame =
+            materialize_surface_frame(&RequestHandler::new(), PaneId::new(1), 1, 1, 1, 0, &seed)
+                .expect("materialize surface beyond the raw combined-snapshot budget");
+
+        assert_eq!(frame.snapshot.cells.len(), cells);
+        super::super::validate_surface_frame_size(&frame)
+            .expect("surface remains below the detached response cap");
     }
 }

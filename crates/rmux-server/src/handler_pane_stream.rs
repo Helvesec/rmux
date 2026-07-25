@@ -27,7 +27,7 @@ mod types;
 
 use capture::{
     capture_source, capture_surface_source, materialize_raw_rebase, materialize_surface_frame,
-    raw_reason, CapturedPaneBoundary,
+    raw_reason, CapturedPaneBoundary, CapturedSurfaceBoundary,
 };
 use protocol::{
     not_owned_error, owned_stream, owned_stream_record, reserved_stream_key_if_owned,
@@ -309,15 +309,15 @@ impl RequestHandler {
             None
         };
 
-        let (source, captured) = match self.capture_current_stream_source(source).await {
-            Ok(captured) => captured,
-            Err(error) => {
-                self.remove_reserved_stream(subscription_id);
-                return Response::Error(ErrorResponse { error });
-            }
-        };
         let response = match request.mode {
             PaneStreamMode::Raw => {
+                let (source, captured) = match self.capture_current_stream_source(source).await {
+                    Ok(captured) => captured,
+                    Err(error) => {
+                        self.remove_reserved_stream(subscription_id);
+                        return Response::Error(ErrorResponse { error });
+                    }
+                };
                 let rebase = match materialize_raw_rebase(
                     self,
                     source.key.pane_id(),
@@ -340,10 +340,17 @@ impl RequestHandler {
                 )
             }
             PaneStreamMode::Surface => {
-                let fingerprint = PaneSurfaceFingerprint::capture(
-                    captured.seed.screen(),
-                    captured.seed.dynamic_colors(),
-                );
+                let (source, captured) =
+                    match self.capture_current_surface_stream_source(source).await {
+                        Ok(captured) => captured,
+                        Err(error) => {
+                            self.remove_reserved_stream(subscription_id);
+                            return Response::Error(ErrorResponse { error });
+                        }
+                    };
+                let Some(seed) = captured.seed.as_ref() else {
+                    unreachable!("forced initial surface capture must materialize a projection");
+                };
                 let frame = match materialize_surface_frame(
                     self,
                     source.key.pane_id(),
@@ -351,7 +358,7 @@ impl RequestHandler {
                     1,
                     1,
                     captured.boundary.next_output_sequence,
-                    &captured.seed,
+                    seed,
                 ) {
                     Ok(frame) => frame,
                     Err(error) => {
@@ -365,7 +372,7 @@ impl RequestHandler {
                     source,
                     captured.receiver,
                     frame,
-                    fingerprint,
+                    captured.fingerprint,
                 )
             }
         };
@@ -666,6 +673,27 @@ impl RequestHandler {
         }
         Err(RmuxError::Server(
             "pane process changed repeatedly while capturing stream state".to_owned(),
+        ))
+    }
+
+    async fn capture_current_surface_stream_source(
+        &self,
+        mut source: PaneStreamSource,
+    ) -> Result<(PaneStreamSource, CapturedSurfaceBoundary), RmuxError> {
+        for _ in 0..MAX_SOURCE_CAPTURE_ATTEMPTS {
+            let captured = capture_surface_source(&source, None, true)?;
+            if captured.boundary.generation == source.generation {
+                return Ok((source, captured));
+            }
+            source = self
+                .resolve_stream_source_for_pane(
+                    source.key.pane_id(),
+                    source.key.runtime_session_name(),
+                )
+                .await?;
+        }
+        Err(RmuxError::Server(
+            "pane process changed repeatedly while capturing surface state".to_owned(),
         ))
     }
 

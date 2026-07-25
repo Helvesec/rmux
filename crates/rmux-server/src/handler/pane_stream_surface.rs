@@ -177,17 +177,18 @@ impl RequestHandler {
                     );
                 }
             };
-            let candidate = match capture_surface_source(&source, &previous_fingerprint, reset) {
-                Ok(candidate) => candidate,
-                Err(_) => {
-                    self.finish_stream_after_end(request.subscription_id);
-                    return stream_cursor_response(
-                        request.subscription_id,
-                        vec![PaneStreamEvent::End(PaneStreamEndReason::ProjectionFailed)],
-                        false,
-                    );
-                }
-            };
+            let candidate =
+                match capture_surface_source(&source, Some(&previous_fingerprint), reset) {
+                    Ok(candidate) => candidate,
+                    Err(_) => {
+                        self.finish_stream_after_end(request.subscription_id);
+                        return stream_cursor_response(
+                            request.subscription_id,
+                            vec![PaneStreamEvent::End(PaneStreamEndReason::ProjectionFailed)],
+                            false,
+                        );
+                    }
+                };
             if candidate.boundary.generation == source.generation {
                 captured = Some(candidate);
                 break;

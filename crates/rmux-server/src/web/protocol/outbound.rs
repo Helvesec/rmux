@@ -293,6 +293,7 @@ mod tests {
         WS_RESIZE_NOTIFY, WS_SESSION_PANE_FRAME, WS_SESSION_VIEW, WS_SNAPSHOT_FULL,
     };
     use crate::handler::{TestWebSessionView, WebPaneSnapshot, WebSessionPaneView};
+    use crate::pane_recovery::MAX_RECOVERY_KEYFRAME_BYTES;
     use crate::web::protocol::{PANE_FRAME_CAPABILITY, PANE_RECOVERY_COVERAGE_CAPABILITY};
     use crate::web::stream_sanitizer::WebTerminalSanitizer;
     use crate::web::{WebShareConnectionCounts, WebShareRevokeReason};
@@ -568,8 +569,8 @@ mod tests {
     }
 
     #[test]
-    fn web_payload_builders_reject_oversized_single_frames() {
-        let pane_snapshot = WebPaneSnapshot {
+    fn web_payload_builders_admit_maximum_recovery_and_reject_oversized_frames() {
+        let mut pane_snapshot = WebPaneSnapshot {
             cols: 8,
             rows: 2,
             output_sequence: 0,
@@ -585,9 +586,15 @@ mod tests {
             history_rows_total: 0,
             history_rows_included: 0,
             metadata_complete: true,
-            recovery_keyframe: Some(vec![b'x'; WEB_OUTBOUND_BYTES_MAX]),
+            recovery_keyframe: Some(vec![b'x'; MAX_RECOVERY_KEYFRAME_BYTES]),
         };
         let mut sanitizer = WebTerminalSanitizer::default();
+        assert!(
+            pane_snapshot_payload(&pane_snapshot, &mut sanitizer, true).is_some(),
+            "the largest accepted recovery keyframe must fit with Web coverage metadata"
+        );
+
+        pane_snapshot.recovery_keyframe = Some(vec![b'x'; WEB_OUTBOUND_BYTES_MAX]);
         assert!(pane_snapshot_payload(&pane_snapshot, &mut sanitizer, false).is_none());
 
         let size = TerminalSize { cols: 80, rows: 24 };

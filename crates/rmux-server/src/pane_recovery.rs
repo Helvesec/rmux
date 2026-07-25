@@ -3,7 +3,7 @@ use std::ops::Range;
 
 use rmux_core::input::{mode, OscColourSlot};
 use rmux_core::{render_dec_modes_for_snapshot, GridRenderOptions, RecoveryRowRenderer, Screen};
-use rmux_proto::{RmuxError, DEFAULT_MAX_FRAME_LENGTH};
+use rmux_proto::{RmuxError, DEFAULT_MAX_DETACHED_FRAME_LENGTH, DEFAULT_MAX_FRAME_LENGTH};
 
 use crate::pane_transcript::PaneTranscript;
 
@@ -16,9 +16,11 @@ const ALT_SCREEN_NO_CURSOR_PREFIX: &[u8] =
 const RESET_RENDITION: &[u8] = b"\x1b[0m\x1b]8;;\x1b\\";
 const ROW_RESET: &[u8] = b"\x1b[0m\x1b]8;;\x1b\\";
 
-/// The WebShare queue is capped at two detached frames. Keep enough headroom
-/// for its opcode, sanitizer state and the companion session-view frame.
-pub(crate) const MAX_RECOVERY_KEYFRAME_BYTES: usize = 2 * DEFAULT_MAX_FRAME_LENGTH - 128 * 1024;
+/// A pane-scoped WebShare snapshot shares the two-MiB outbound budget with
+/// its opcode and sanitizer state. The sanitizer never expands its input, so
+/// 4 KiB leaves bounded framing headroom while retaining the largest common
+/// typed viewport.
+pub(crate) const MAX_RECOVERY_KEYFRAME_BYTES: usize = 2 * DEFAULT_MAX_FRAME_LENGTH - 4 * 1024;
 const MAX_RECOVERY_VIEWPORT_CELLS: usize = 128 * 1024;
 const MAX_RECOVERY_COLS: usize = 4096;
 const MAX_RECOVERY_ROWS: usize = 2048;
@@ -31,12 +33,19 @@ const MAX_RECOVERY_DRAFT_HISTORY_BYTES: usize = MAX_RECOVERY_KEYFRAME_BYTES;
 // leave more than two MiB of detached-frame headroom for a recovery keyframe,
 // bincode headers and lifecycle companions.
 pub(crate) const MAX_RECOVERY_TYPED_SNAPSHOT_CELLS: usize = 96 * 1024;
+const MAX_RECOVERY_SURFACE_CELLS: usize = DEFAULT_MAX_DETACHED_FRAME_LENGTH / 32;
 
 /// Owned terminal state copied at an atomic pane boundary.
 pub(crate) struct PaneRecoverySeed {
+    projection: PaneProjectionSeed,
+    keyframe: PaneRecoveryKeyframe,
+}
+
+/// Transport-bounded logical pane state shared by structured projections.
+pub(crate) struct PaneProjectionSeed {
     screen: Screen,
     dynamic_colors: PaneDynamicColors,
-    keyframe: PaneRecoveryKeyframe,
+    metadata_complete: bool,
     history_size: usize,
     history_bytes: usize,
     alternate: bool,
@@ -175,21 +184,29 @@ impl PaneRecoveryDraft {
                 result => result,
             }
         }?;
-        let (screen, _) = self.projection.clone_recovery_viewport_bounded(
+        Ok(PaneRecoverySeed {
+            projection: self.into_projection(),
+            keyframe,
+        })
+    }
+
+    fn into_projection(self) -> PaneProjectionSeed {
+        let alternate = self.projection.is_alternate();
+        let (screen, metadata_complete) = self.projection.clone_recovery_viewport_bounded(
             MAX_RECOVERY_STRING_BYTES,
             MAX_RECOVERY_TITLE_STACK_BYTES,
             MAX_RECOVERY_HYPERLINK_ENTRY_BYTES,
             MAX_RECOVERY_HYPERLINK_TOTAL_BYTES,
         );
-        Ok(PaneRecoverySeed {
+        PaneProjectionSeed {
             screen,
             dynamic_colors: self.dynamic_colors,
-            keyframe,
+            metadata_complete: self.metadata_complete && metadata_complete,
             history_size: self.history_size,
             history_bytes: self.history_bytes,
-            alternate: self.projection.is_alternate(),
+            alternate,
             output_sequence: self.output_sequence,
-        })
+        }
     }
 }
 
@@ -197,6 +214,53 @@ impl PaneRecoverySeed {
     #[cfg(test)]
     pub(crate) fn capture(transcript: &PaneTranscript) -> Result<Self, RmuxError> {
         PaneRecoveryDraft::capture(transcript)?.materialize()
+    }
+
+    pub(crate) const fn screen(&self) -> &Screen {
+        self.projection.screen()
+    }
+
+    pub(crate) const fn output_sequence(&self) -> u64 {
+        self.projection.output_sequence()
+    }
+
+    pub(crate) const fn history_size(&self) -> usize {
+        self.projection.history_size()
+    }
+
+    pub(crate) const fn history_bytes(&self) -> usize {
+        self.projection.history_bytes()
+    }
+
+    pub(crate) const fn alternate(&self) -> bool {
+        self.projection.alternate()
+    }
+
+    pub(crate) fn keyframe(&self) -> PaneRecoveryKeyframe {
+        self.keyframe.clone()
+    }
+}
+
+impl PaneProjectionSeed {
+    pub(crate) fn capture(transcript: &PaneTranscript) -> Result<Self, RmuxError> {
+        let source = transcript.screen();
+        validate_surface_geometry(source)?;
+        let alternate = source.is_alternate();
+        let (screen, metadata_complete) = source.clone_recovery_viewport_bounded(
+            MAX_RECOVERY_STRING_BYTES,
+            MAX_RECOVERY_TITLE_STACK_BYTES,
+            MAX_RECOVERY_HYPERLINK_ENTRY_BYTES,
+            MAX_RECOVERY_HYPERLINK_TOTAL_BYTES,
+        );
+        Ok(Self {
+            screen,
+            dynamic_colors: PaneDynamicColors::capture(transcript),
+            metadata_complete,
+            history_size: source.history_size(),
+            history_bytes: source.history_bytes(),
+            alternate,
+            output_sequence: transcript.output_sequence(),
+        })
     }
 
     pub(crate) const fn screen(&self) -> &Screen {
@@ -224,11 +288,7 @@ impl PaneRecoverySeed {
     }
 
     pub(crate) const fn metadata_complete(&self) -> bool {
-        self.keyframe.metadata_complete
-    }
-
-    pub(crate) fn keyframe(&self) -> PaneRecoveryKeyframe {
-        self.keyframe.clone()
+        self.metadata_complete
     }
 }
 
@@ -352,6 +412,19 @@ pub(crate) fn validate_recovery_geometry(screen: &Screen) -> Result<(), RmuxErro
     {
         return Err(RmuxError::Server(format!(
             "recovery viewport {cols}x{rows} exceeds the supported geometry cap ({MAX_RECOVERY_COLS} columns, {MAX_RECOVERY_ROWS} rows, {MAX_RECOVERY_VIEWPORT_CELLS} cells)"
+        )));
+    }
+    Ok(())
+}
+
+fn validate_surface_geometry(screen: &Screen) -> Result<(), RmuxError> {
+    let size = screen.size();
+    let cells = usize::from(size.cols)
+        .checked_mul(usize::from(size.rows))
+        .ok_or_else(|| RmuxError::Server("surface dimensions overflow".to_owned()))?;
+    if size.cols == 0 || size.rows == 0 || cells > MAX_RECOVERY_SURFACE_CELLS {
+        return Err(RmuxError::Server(format!(
+            "surface grid has {cells} cells, exceeding the {MAX_RECOVERY_SURFACE_CELLS}-cell transport cap"
         )));
     }
     Ok(())
@@ -1004,6 +1077,26 @@ mod tests {
             PaneRecoverySeed::capture(&transcript),
             Err(RmuxError::Server(message)) if message.contains("geometry cap")
         ));
+    }
+
+    #[test]
+    fn maximum_typed_geometry_with_maximum_cell_text_remains_recoverable() {
+        let size = TerminalSize {
+            cols: 384,
+            rows: 256,
+        };
+        let cell = "a\u{301}\u{301}\u{301}\u{301}\u{301}\u{301}\u{301}\u{301}\u{301}\u{301}";
+        assert_eq!(cell.len(), 21);
+        let cells = usize::from(size.cols) * usize::from(size.rows);
+        assert_eq!(cells, MAX_RECOVERY_TYPED_SNAPSHOT_CELLS);
+
+        let mut transcript = PaneTranscript::new(0, size);
+        transcript.append_bytes(cell.repeat(cells).as_bytes());
+
+        let keyframe = PaneRecoverySeed::capture(&transcript)
+            .expect("accepted typed recovery geometry must fit its keyframe")
+            .keyframe();
+        assert!(keyframe.bytes.len() <= MAX_RECOVERY_KEYFRAME_BYTES);
     }
 
     #[test]
