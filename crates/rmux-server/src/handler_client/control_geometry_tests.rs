@@ -5,9 +5,9 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use rmux_proto::{
-    ControlMode, KillSessionRequest, NewSessionRequest, OptionName, Request, Response,
-    ScopeSelector, SessionName, SetOptionMode, SetOptionRequest, SwitchClientRequest, TerminalSize,
-    WindowTarget,
+    ControlMode, DetachClientRequest, KillSessionRequest, NewSessionRequest, OptionName, Request,
+    Response, ScopeSelector, SessionName, SetOptionMode, SetOptionRequest, SwitchClientRequest,
+    TerminalSize, WindowTarget,
 };
 use tokio::sync::mpsc;
 
@@ -488,6 +488,210 @@ async fn switching_attached_client_notifies_the_source_session_layout_change_lik
 }
 
 #[tokio::test]
+async fn attached_client_departure_notifies_the_surviving_control_layout_change_like_tmux37() {
+    // Frozen tmux 3.7b oracle, measured 2026-07-25 on a session holding a
+    // 101x41 PTY-attached client and a 60x20 control client, `window-size
+    // largest`. When the PTY client's process dies, the control client
+    // receives
+    //     %client-detached /dev/ttys007
+    //     %layout-change @0 a1dd,60x20,0,0,0 a1dd,60x20,0,0,0 *
+    // in that order: tmux reports the loss immediately and the resize it
+    // causes on the next server loop.
+    let handler = RequestHandler::new();
+    let session = session_name("attach-departure-notify");
+    create_session(&handler, session.clone(), INITIAL_SIZE).await;
+    set_window_size_policy(&handler, &session, "largest").await;
+
+    let departing_pid = std::process::id();
+    let surviving_pid = departing_pid.saturating_add(1);
+    let departing_size = TerminalSize {
+        cols: 101,
+        rows: 41,
+    };
+    let surviving_size = TerminalSize { cols: 60, rows: 20 };
+    let (attach_id, _attach_events) =
+        register_attached_client(&handler, departing_pid, &session, departing_size).await;
+    let (_control_id, mut control_events) =
+        register_control_client_with_id(&handler, surviving_pid, &session).await;
+    let response = handler
+        .handle(Request::RefreshClient(Box::new(
+            refresh_client_size_request(surviving_pid, surviving_size),
+        )))
+        .await;
+    assert!(
+        matches!(response, Response::RefreshClient(_)),
+        "{response:?}"
+    );
+    assert_eq!(session_size(&handler, &session).await, departing_size);
+    let layout_prefix = format!(
+        "%layout-change @{} ",
+        active_window_id(&handler, &session).await
+    );
+    settle_control_notifications(&mut control_events).await;
+
+    handler.finish_attach(departing_pid, attach_id).await;
+
+    assert_eq!(
+        session_size(&handler, &session).await,
+        surviving_size,
+        "the session must fall back to its surviving control client's geometry"
+    );
+    let lines = collect_control_notifications_through(&mut control_events, &layout_prefix).await;
+    let layout_index = lines
+        .iter()
+        .position(|line| line.starts_with(&layout_prefix))
+        .expect("the surviving control client must be told the window shrank");
+    assert_eq!(
+        layout_change_geometry(&lines[layout_index]).as_deref(),
+        Some("60x20"),
+        "{:?}",
+        lines[layout_index]
+    );
+    let detached_index = lines
+        .iter()
+        .position(|line| line.starts_with("%client-detached "))
+        .expect("the surviving control client must be told the other client left");
+    assert!(
+        detached_index < layout_index,
+        "tmux 3.7b reports a lost client before the resize it causes: {lines:?}"
+    );
+}
+
+#[tokio::test]
+async fn detach_client_notifies_the_surviving_control_layout_change_like_tmux37() {
+    // Same oracle session as the departure test, but the 101x41 client leaves
+    // through `detach-client`. tmux 3.7b, measured 2026-07-25, then sends
+    //     %layout-change @0 a1dd,60x20,0,0,0 a1dd,60x20,0,0,0 *
+    //     %client-detached /dev/ttys007
+    // - the opposite order, because the command queue applies the resize before
+    // the client is actually lost.
+    let handler = RequestHandler::new();
+    let session = session_name("detach-client-notify");
+    create_session(&handler, session.clone(), INITIAL_SIZE).await;
+    set_window_size_policy(&handler, &session, "largest").await;
+
+    let detaching_pid = std::process::id();
+    let surviving_pid = detaching_pid.saturating_add(1);
+    let detaching_size = TerminalSize {
+        cols: 101,
+        rows: 41,
+    };
+    let surviving_size = TerminalSize { cols: 60, rows: 20 };
+    let (_attach_id, _attach_events) =
+        register_attached_client(&handler, detaching_pid, &session, detaching_size).await;
+    let (_control_id, mut control_events) =
+        register_control_client_with_id(&handler, surviving_pid, &session).await;
+    let response = handler
+        .handle(Request::RefreshClient(Box::new(
+            refresh_client_size_request(surviving_pid, surviving_size),
+        )))
+        .await;
+    assert!(
+        matches!(response, Response::RefreshClient(_)),
+        "{response:?}"
+    );
+    assert_eq!(session_size(&handler, &session).await, detaching_size);
+    let layout_prefix = format!(
+        "%layout-change @{} ",
+        active_window_id(&handler, &session).await
+    );
+    settle_control_notifications(&mut control_events).await;
+
+    // `detach-client` sends the terminal control message and then reconciles;
+    // the client is only unregistered when its connection finishes, so the
+    // reconcile has to see the departure itself.
+    let response = handler
+        .handle(Request::DetachClient(DetachClientRequest))
+        .await;
+    assert!(
+        matches!(response, Response::DetachClient(_)),
+        "{response:?}"
+    );
+
+    assert_eq!(
+        session_size(&handler, &session).await,
+        surviving_size,
+        "the session must fall back to its surviving control client's geometry"
+    );
+    let lines = collect_control_notifications_through(&mut control_events, &layout_prefix).await;
+    let layout_index = lines
+        .iter()
+        .position(|line| line.starts_with(&layout_prefix))
+        .expect("the surviving control client must be told the window shrank");
+    assert_eq!(
+        layout_change_geometry(&lines[layout_index]).as_deref(),
+        Some("60x20"),
+        "{:?}",
+        lines[layout_index]
+    );
+}
+
+#[tokio::test]
+async fn window_keyed_reconcile_notifies_control_clients_like_tmux37() {
+    // The window-keyed reconcile is the one kill-window, kill-session,
+    // link/move/swap/unlink-window and pane kill-by-id use for the windows that
+    // survive them. tmux 3.7b's `resize_window()` notifies
+    // `window-layout-changed` and then `window-resized` for every applied
+    // resize, so a control client on that window always receives
+    //     %layout-change @0 a1dd,60x20,0,0,0 a1dd,60x20,0,0,0 *
+    // (measured 2026-07-25; identical line to the departure oracle, which
+    // reaches the same 60x20 geometry).
+    let handler = RequestHandler::new();
+    let session = session_name("window-reconcile-notify");
+    create_session(&handler, session.clone(), INITIAL_SIZE).await;
+    set_window_size_policy(&handler, &session, "largest").await;
+
+    let control_pid = std::process::id();
+    let control_size = TerminalSize { cols: 60, rows: 20 };
+    let (_control_id, mut control_events) =
+        register_control_client_with_id(&handler, control_pid, &session).await;
+    let response = handler
+        .handle(Request::RefreshClient(Box::new(
+            refresh_client_size_request(control_pid, control_size),
+        )))
+        .await;
+    assert!(
+        matches!(response, Response::RefreshClient(_)),
+        "{response:?}"
+    );
+    assert_eq!(session_size(&handler, &session).await, control_size);
+    let layout_prefix = format!(
+        "%layout-change @{} ",
+        active_window_id(&handler, &session).await
+    );
+
+    // Stand in for the departed client whose geometry the window still carries.
+    force_window_size(
+        &handler,
+        &session,
+        0,
+        TerminalSize {
+            cols: 101,
+            rows: 41,
+        },
+    )
+    .await;
+    settle_control_notifications(&mut control_events).await;
+
+    handler
+        .reconcile_attached_window_size_and_emit(&WindowTarget::with_window(session.clone(), 0))
+        .await
+        .expect("the window reconcile succeeds");
+
+    assert_eq!(session_size(&handler, &session).await, control_size);
+    let lines = collect_control_notifications_through(&mut control_events, &layout_prefix).await;
+    let layout = lines
+        .iter()
+        .find(|line| line.starts_with(&layout_prefix))
+        .expect("the control client must be told the window was resized");
+    assert_eq!(
+        layout_change_geometry(layout).as_deref(),
+        Some("60x20"),
+        "{layout}"
+    );
+}
+
+#[tokio::test]
 async fn destroyed_control_session_rehome_reconciles_target_geometry_like_tmux37() {
     let handler = RequestHandler::new();
     let target = session_name("control-destroy-rehome-target");
@@ -852,6 +1056,22 @@ async fn control_client_size(handler: &RequestHandler, requester_pid: u32) -> Te
         cols: active.client_width,
         rows: active.client_height,
     }
+}
+
+/// Puts a window back at a geometry no live client asks for, standing in for
+/// the client whose departure the reconcile has to notice.
+async fn force_window_size(
+    handler: &RequestHandler,
+    session: &SessionName,
+    window_index: u32,
+    size: TerminalSize,
+) {
+    let mut state = handler.state.lock().await;
+    state
+        .mutate_session_and_resize_window_terminal(session, window_index, |session| {
+            session.resize_window(window_index, size)
+        })
+        .expect("test window resize succeeds");
 }
 
 async fn session_size(handler: &RequestHandler, session: &SessionName) -> TerminalSize {

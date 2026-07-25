@@ -379,13 +379,45 @@ impl RequestHandler {
         Ok(None)
     }
 
+    /// Publishes what tmux publishes for a window that really did change size.
+    ///
+    /// tmux 3.7b's `resize_window()` runs `window-layout-changed` and then
+    /// `window-resized` for every applied resize, and only the former reaches
+    /// control clients (as `%layout-change`). Measured 2026-07-25 on a source
+    /// session holding a 101x41 PTY client and a 60x20 control client with
+    /// `window-size largest`: after `detach-client` on the PTY client, the
+    /// control client receives
+    ///     %layout-change @0 a1dd,60x20,0,0,0 a1dd,60x20,0,0,0 *
+    /// then `%client-detached /dev/ttys007`; when the PTY client's process dies
+    /// instead, the same `%layout-change` arrives after `%client-detached`.
+    /// Both tickets are reserved under one state lock so they publish in tmux's
+    /// order.
+    pub(in crate::handler) async fn emit_applied_window_resize(&self, target: WindowTarget) {
+        let (layout_changed, resized) = {
+            let mut state = self.state.lock().await;
+            (
+                crate::handler::prepare_lifecycle_event(
+                    &mut state,
+                    &LifecycleEvent::WindowLayoutChanged {
+                        target: target.clone(),
+                    },
+                ),
+                crate::handler::prepare_lifecycle_event(
+                    &mut state,
+                    &LifecycleEvent::WindowResized { target },
+                ),
+            )
+        };
+        self.emit_prepared(layout_changed).await;
+        self.emit_prepared(resized).await;
+    }
+
     pub(in crate::handler) async fn reconcile_attached_session_size_and_emit(
         &self,
         session_name: &SessionName,
     ) -> Result<(), RmuxError> {
         if let Some(target) = self.reconcile_attached_session_size(session_name).await? {
-            self.emit_without_attached_refresh(LifecycleEvent::WindowResized { target })
-                .await;
+            self.emit_applied_window_resize(target).await;
         }
         Ok(())
     }
@@ -447,8 +479,7 @@ impl RequestHandler {
         target: &WindowTarget,
     ) -> Result<(), RmuxError> {
         if let Some(target) = self.reconcile_attached_window_size(target).await? {
-            self.emit_without_attached_refresh(LifecycleEvent::WindowResized { target })
-                .await;
+            self.emit_applied_window_resize(target).await;
         }
         Ok(())
     }

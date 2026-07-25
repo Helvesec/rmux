@@ -335,7 +335,7 @@ impl RequestHandler {
                 .await;
             }
             if let Ok(Some(target)) = self.reconcile_attached_session_size(&session_name).await {
-                self.emit(LifecycleEvent::WindowResized { target }).await;
+                self.emit_applied_window_resize(target).await;
             }
             self.destroy_unattached_sessions(vec![(session_name, session_id)])
                 .await;
