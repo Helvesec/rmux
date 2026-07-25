@@ -14,6 +14,33 @@ fn function_body<'a>(source: &'a str, name: &str, next_name: &str) -> &'a str {
 }
 
 #[test]
+fn package_verifier_tolerates_process_exit_during_cleanup() {
+    let stop = function_body(VERIFIER, "Stop-ProcessIfRunning", "Remove-PackageDaemon");
+    assert!(stop.contains("$Process.HasExited"));
+    assert!(stop.contains("$Process.Kill()"));
+    assert!(stop.contains("catch [System.InvalidOperationException]"));
+    assert!(
+        stop.matches("$Process.HasExited").count() >= 2,
+        "cleanup must recheck process exit after a raced Kill"
+    );
+    assert_eq!(
+        VERIFIER.matches(".Kill()").count(),
+        1,
+        "all verifier cleanup paths must use the race-safe helper"
+    );
+    for caller in [
+        "Stop-ProcessIfRunning $Daemon.Process",
+        "Stop-ProcessIfRunning $process",
+        "Stop-ProcessIfRunning $concurrentInstaller",
+    ] {
+        assert!(
+            VERIFIER.contains(caller),
+            "Windows package cleanup lost {caller}"
+        );
+    }
+}
+
+#[test]
 fn archived_package_smokes_list_exactly_one_test_before_running() {
     for required in [
         "\"nextest\", \"list\"",

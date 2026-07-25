@@ -126,16 +126,30 @@ function NewPackagePipeName([string]$Binary, [string]$Label) {
     return $pipePath
 }
 
+function Stop-ProcessIfRunning([System.Diagnostics.Process]$Process) {
+    $Process.Refresh()
+    if ($Process.HasExited) {
+        return
+    }
+
+    try {
+        $Process.Kill()
+    } catch [System.InvalidOperationException] {
+        $Process.Refresh()
+        if ($Process.HasExited) {
+            return
+        }
+        throw
+    }
+    $Process.WaitForExit()
+}
+
 function Remove-PackageDaemon([object]$Daemon) {
     if ($null -eq $Daemon) {
         return
     }
     try {
-        $Daemon.Process.Refresh()
-        if (-not $Daemon.Process.HasExited) {
-            $Daemon.Process.Kill()
-            $Daemon.Process.WaitForExit()
-        }
+        Stop-ProcessIfRunning $Daemon.Process
     } finally {
         $Daemon.Process.Dispose()
         Remove-Item -Force -LiteralPath $Daemon.Stdout -ErrorAction SilentlyContinue
@@ -173,11 +187,7 @@ function Start-PackageDaemon([string]$DaemonBinary, [string]$PipePath, [string[]
             -PassThru
 
         if (-not $readyEvent.WaitOne(15000)) {
-            $process.Refresh()
-            if (-not $process.HasExited) {
-                $process.Kill()
-                $process.WaitForExit()
-            }
+            Stop-ProcessIfRunning $process
             $details = if (Test-Path -LiteralPath $stderr) {
                 Get-Content -LiteralPath $stderr -Raw
             } else {
@@ -735,15 +745,13 @@ function AssertArchiveInstallerTransaction([string]$InstallScript, [string]$Pack
         }
 
         if ($null -ne $concurrentFailure) {
-            if ($null -ne $concurrentInstaller -and -not $concurrentInstaller.HasExited) {
-                $concurrentInstaller.Kill()
-                $concurrentInstaller.WaitForExit()
+            if ($null -ne $concurrentInstaller) {
+                Stop-ProcessIfRunning $concurrentInstaller
             }
             Fail $concurrentFailure
         }
         if (-not $concurrentInstaller.WaitForExit(15000)) {
-            $concurrentInstaller.Kill()
-            $concurrentInstaller.WaitForExit()
+            Stop-ProcessIfRunning $concurrentInstaller
             Fail "contending installer did not finish after the transaction lock was released"
         }
         $concurrentInstaller.WaitForExit()
