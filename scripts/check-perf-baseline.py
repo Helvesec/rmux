@@ -20,6 +20,13 @@ REQUIRED_TARGETS = {
 }
 GIT_SHA_RE = re.compile(r"^[0-9a-f]{40}$")
 FINGERPRINT_RE = re.compile(r"^[0-9A-Za-z._:-]{8,128}$")
+EXPECTED_RELEASE_TAG = "v0.9.0"
+EXPECTED_RELEASE_COMMIT = "b2f80522bae2927e22d81e5c902b727623f934d0"
+EXPECTED_RMUX_VERSION = "rmux 0.9.0"
+EXPECTED_GENERATOR = "scripts/perf-bench.sh"
+EXPECTED_INVOCATION = (
+    f"baseline:release-0.9.0:{EXPECTED_RELEASE_COMMIT}"
+)
 PERSONAL_HOME_RE = re.compile(
     r"(?:/(?:home|Users)/[^/\s\"']+(?:/|$)|[A-Za-z]:\\Users\\[^\\\s\"']+(?:\\|$))"
 )
@@ -143,6 +150,12 @@ def validate(path: Path, expected_platform: str | None) -> int:
     versions = payload.get("versions")
     if not isinstance(versions, dict) or not versions.get("rmux") or not versions.get("tmux"):
         return fail(f"{path}: missing rmux/tmux version stamp")
+    if (
+        versions.get("rmux") != EXPECTED_RMUX_VERSION
+        or source_binary.get("version") != EXPECTED_RMUX_VERSION
+        or source_binary.get("configuration") != "release"
+    ):
+        return fail(f"{path}: baseline was not rebuilt from the v0.9.0 release binary")
     git = payload.get("git")
     if not isinstance(git, dict):
         return fail(f"{path}: missing git stamp")
@@ -152,10 +165,35 @@ def validate(path: Path, expected_platform: str | None) -> int:
     describe = str(git.get("describe", ""))
     if not describe:
         return fail(f"{path}: missing git describe stamp")
+    if commit != EXPECTED_RELEASE_COMMIT or describe != EXPECTED_RELEASE_TAG:
+        return fail(
+            f"{path}: baseline must be recorded from exact release tag "
+            f"{EXPECTED_RELEASE_TAG} ({EXPECTED_RELEASE_COMMIT})"
+        )
     if describe.endswith("-dirty") or git.get("dirty") is True:
         return fail(f"{path}: baseline was recorded from a dirty worktree")
     if expected_platform == "darwin" and git.get("dirty") is not False:
         return fail(f"{path}: Darwin baseline is missing an explicit clean-worktree stamp")
+    source_git = source.get("git")
+    if not isinstance(source_git, dict):
+        return fail(f"{path}: source artifact is missing git identity")
+    if (
+        str(source_git.get("commit", "")).lower() != commit
+        or str(source_git.get("describe", "")) != describe
+        or source_git.get("dirty") is not False
+    ):
+        return fail(f"{path}: baseline/source git identities do not match")
+    provenance = source.get("provenance")
+    if not isinstance(provenance, dict):
+        return fail(f"{path}: source artifact is missing provenance")
+    if str(provenance.get("expected_git_commit", "")).lower() != commit:
+        return fail(f"{path}: source provenance does not match baseline commit")
+    if (
+        provenance.get("generator") != EXPECTED_GENERATOR
+        or provenance.get("invocation") != EXPECTED_INVOCATION
+        or provenance.get("build_mode") != "rebuilt"
+    ):
+        return fail(f"{path}: source provenance is not an exact release rebuild")
     environment = payload.get("environment")
     if not isinstance(environment, dict):
         return fail(f"{path}: missing environment stamp")
@@ -178,6 +216,8 @@ def validate(path: Path, expected_platform: str | None) -> int:
         return fail(
             f"{path}: source platform {source_platform or '<missing>'!r} does not match baseline {platform!r}"
         )
+    if str(provenance.get("expected_platform", "")).lower() != platform:
+        return fail(f"{path}: source provenance platform does not match baseline")
 
     print(f"perf-baseline={path} targets={len(REQUIRED_TARGETS)}")
     return 0

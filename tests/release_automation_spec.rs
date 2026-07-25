@@ -1821,6 +1821,8 @@ fn perf_current_and_darwin_baseline_validation_fail_closed_on_identity_drift() {
     assert!(baseline_check.contains("does not match expected"));
     assert!(baseline_check.contains("personal home path leaked"));
     assert!(baseline_check.contains("must be repository-relative"));
+    assert!(baseline_check.contains("baseline must be recorded from exact release tag"));
+    assert!(baseline_check.contains("baseline/source git identities do not match"));
     assert!(baseline_generator.contains("write_portable_source"));
     assert!(baseline_generator.contains("python3 scripts/check-perf-baseline.py"));
     assert!(baseline_generator.contains("\"$json_path\""));
@@ -1835,6 +1837,20 @@ fn perf_current_and_darwin_baseline_validation_fail_closed_on_identity_drift() {
             include_str!("../benches/perf/baselines/release-0.9.0-linux.json"),
         ),
     ] {
+        let baseline_json: serde_json::Value =
+            serde_json::from_str(baseline).expect("perf baseline JSON");
+        assert_eq!(
+            baseline_json["git"]["commit"], "b2f80522bae2927e22d81e5c902b727623f934d0",
+            "{name} perf baseline is not anchored to the v0.9.0 commit"
+        );
+        assert_eq!(
+            baseline_json["git"]["describe"], "v0.9.0",
+            "{name} perf baseline is not anchored to the v0.9.0 tag"
+        );
+        assert_eq!(
+            baseline_json["source"]["git"], baseline_json["git"],
+            "{name} baseline/source git identities differ"
+        );
         assert!(
             !baseline.contains("/Users/") && !baseline.contains("/home/"),
             "{name} perf baseline leaked a personal home path"
@@ -1844,6 +1860,80 @@ fn perf_current_and_darwin_baseline_validation_fail_closed_on_identity_drift() {
     assert!(gate.contains("run this mandatory comparison on the baseline owner host"));
     assert!(gate.contains("perf-gate=portable-budget enforcement=absolute-budgets"));
     assert!(gate.contains("scripts/check-perf-current.py"));
+}
+
+#[test]
+#[cfg(unix)]
+fn perf_baseline_validator_rejects_relabelled_or_reused_artifacts() {
+    let root = temp_dir("perf-baseline-provenance");
+    let fixture = root.join("baseline.json");
+    let original: serde_json::Value =
+        serde_json::from_str(include_str!("../benches/perf/baselines/release-0.9.0.json"))
+            .expect("perf baseline JSON");
+    fs::write(
+        &fixture,
+        serde_json::to_vec(&original).expect("serialize perf baseline"),
+    )
+    .expect("write perf baseline fixture");
+    let fixture_arg = fixture.to_string_lossy().into_owned();
+    let accepted = run(
+        "scripts/check-perf-baseline.py",
+        &[&fixture_arg, "--expected-platform", "darwin"],
+    );
+    assert!(accepted.status.success(), "{}", stderr(&accepted));
+
+    for (label, pointer, replacement) in [
+        (
+            "stale invocation",
+            "/source/provenance/invocation",
+            serde_json::json!("baseline:release-0.9.0:8df9d92300000000000000000000000000000000"),
+        ),
+        (
+            "wrong generator",
+            "/source/provenance/generator",
+            serde_json::json!("other-generator"),
+        ),
+        (
+            "reused build",
+            "/source/provenance/build_mode",
+            serde_json::json!("reused"),
+        ),
+        (
+            "wrong source platform",
+            "/source/provenance/expected_platform",
+            serde_json::json!("linux"),
+        ),
+        (
+            "stale source binary",
+            "/source/binary/version",
+            serde_json::json!("rmux 0.8.0"),
+        ),
+        (
+            "stale wrapper version",
+            "/versions/rmux",
+            serde_json::json!("rmux 0.8.0"),
+        ),
+    ] {
+        let mut mutated = original.clone();
+        *mutated
+            .pointer_mut(pointer)
+            .unwrap_or_else(|| panic!("missing JSON pointer {pointer}")) = replacement;
+        fs::write(
+            &fixture,
+            serde_json::to_vec(&mutated).expect("serialize mutated perf baseline"),
+        )
+        .expect("write mutated perf baseline fixture");
+        let rejected = run(
+            "scripts/check-perf-baseline.py",
+            &[&fixture_arg, "--expected-platform", "darwin"],
+        );
+        assert!(
+            !rejected.status.success(),
+            "{label} unexpectedly passed validation"
+        );
+    }
+
+    fs::remove_dir_all(root).expect("remove perf baseline fixture");
 }
 
 #[test]
