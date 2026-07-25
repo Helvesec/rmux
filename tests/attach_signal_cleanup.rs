@@ -26,6 +26,8 @@ const SIGNAL_EXIT_TIMEOUT: Duration = Duration::from_secs(5);
 const HELPER_ENV: &str = "RMUX_ATTACH_BACKPRESSURE_HELPER";
 const HELPER_KIND_ENV: &str = "RMUX_ATTACH_BACKPRESSURE_KIND";
 const HELPER_READY_ENV: &str = "RMUX_ATTACH_BACKPRESSURE_READY";
+const INHERITED_IGNORED_HELPER_ENV: &str = "RMUX_ATTACH_INHERITED_IGNORED_HELPER";
+const INHERITED_IGNORED_SIGNAL_ENV: &str = "RMUX_ATTACH_INHERITED_IGNORED_SIGNAL";
 const BACKPRESSURE_PAYLOAD_LEN: usize = 512 * 1024;
 
 #[test]
@@ -46,6 +48,19 @@ fn sigint_during_attach_restores_terminal_before_termination() -> Result<(), Box
 #[test]
 fn sigquit_during_attach_restores_terminal_before_termination() -> Result<(), Box<dyn Error>> {
     assert_attach_signal_cleanup(libc::SIGQUIT, "sigquit")
+}
+
+#[test]
+fn inherited_ignored_signals_still_terminate_attach_by_signal() -> Result<(), Box<dyn Error>> {
+    for (signal, shell_signal) in [
+        (libc::SIGTERM, "TERM"),
+        (libc::SIGHUP, "HUP"),
+        (libc::SIGINT, "INT"),
+        (libc::SIGQUIT, "QUIT"),
+    ] {
+        assert_inherited_ignored_signal_cleanup(signal, shell_signal)?;
+    }
+    Ok(())
 }
 
 #[test]
@@ -110,6 +125,17 @@ fn attach_output_backpressure_subprocess_helper() -> Result<(), Box<dyn Error>> 
     Ok(())
 }
 
+#[test]
+#[ignore = "subprocess helper for inherited ignored attach signals"]
+fn inherited_ignored_signal_subprocess_helper() -> Result<(), Box<dyn Error>> {
+    if std::env::var_os(INHERITED_IGNORED_HELPER_ENV).is_none() {
+        return Ok(());
+    }
+
+    let signal = std::env::var(INHERITED_IGNORED_SIGNAL_ENV)?.parse::<i32>()?;
+    assert_attach_signal_cleanup(signal, &format!("ignored-{signal}"))
+}
+
 fn assert_attach_signal_cleanup(signal: i32, label: &str) -> Result<(), Box<dyn Error>> {
     let harness = CliHarness::new(&format!("attach-{label}-cleanup"))?;
     let _daemon = harness.start_hidden_daemon()?;
@@ -127,6 +153,38 @@ fn assert_attach_signal_cleanup(signal: i32, label: &str) -> Result<(), Box<dyn 
         "attach must preserve termination by the received signal: {status}"
     );
     attach.assert_restored()?;
+    Ok(())
+}
+
+fn assert_inherited_ignored_signal_cleanup(
+    signal: i32,
+    shell_signal: &str,
+) -> Result<(), Box<dyn Error>> {
+    let output = Command::new("/bin/sh")
+        .args([
+            "-c",
+            "trap '' \"$1\"; shift; exec \"$@\"",
+            "sh",
+            shell_signal,
+        ])
+        .arg(std::env::current_exe()?)
+        .args([
+            "--exact",
+            "inherited_ignored_signal_subprocess_helper",
+            "--ignored",
+            "--nocapture",
+        ])
+        .env(INHERITED_IGNORED_HELPER_ENV, "1")
+        .env(INHERITED_IGNORED_SIGNAL_ENV, signal.to_string())
+        .output()?;
+
+    assert!(
+        output.status.success(),
+        "attach launched with inherited SIG_IGN for {shell_signal} failed: status={} stdout={:?} stderr={:?}",
+        output.status,
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
     Ok(())
 }
 

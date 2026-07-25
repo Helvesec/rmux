@@ -65,7 +65,7 @@ impl AttachTerminationGuard {
         Ok(())
     }
 
-    fn restore_handlers(&mut self) -> io::Result<Option<i32>> {
+    fn restore_handlers(&mut self) -> io::Result<Option<(i32, bool)>> {
         if !self.armed {
             return Ok(None);
         }
@@ -85,7 +85,16 @@ impl AttachTerminationGuard {
         if let Some(error) = restore_error {
             return Err(error);
         }
-        Ok((observed > 0).then_some(observed))
+        Ok((observed > 0).then(|| {
+            let inherited_ignored = TERMINATION_SIGNALS
+                .into_iter()
+                .zip(self.previous_actions.iter())
+                .find_map(|(signal, previous)| {
+                    (signal == observed).then_some(previous.sa_sigaction == libc::SIG_IGN)
+                })
+                .unwrap_or(false);
+            (observed, inherited_ignored)
+        }))
     }
 }
 
@@ -238,9 +247,22 @@ fn restore_handler(signal: i32, previous: &libc::sigaction) -> io::Result<()> {
     }
 }
 
-fn raise_signal(signal: i32) -> io::Result<()> {
+fn raise_signal((signal, inherited_ignored): (i32, bool)) -> io::Result<()> {
+    if inherited_ignored {
+        let previous = unsafe {
+            // SAFETY: `signal` is one of the four supported termination
+            // signals. The default disposition is installed immediately
+            // before re-emitting it, so `signal`'s legacy restart semantics
+            // cannot affect later process behavior.
+            libc::signal(signal, libc::SIG_DFL)
+        };
+        if previous == libc::SIG_ERR {
+            return Err(io::Error::last_os_error());
+        }
+    }
     let result = unsafe {
-        // SAFETY: The signal was captured from the kernel as SIGHUP or SIGTERM.
+        // SAFETY: The signal was captured from the kernel as one of the four
+        // supported attach termination signals.
         libc::raise(signal)
     };
     if result == 0 {
