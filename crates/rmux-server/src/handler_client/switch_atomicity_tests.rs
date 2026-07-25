@@ -292,6 +292,56 @@ fn switch_request(target: String) -> SwitchClientExt3Request {
 }
 
 #[tokio::test]
+async fn control_switch_accepts_the_canonical_list_clients_name() {
+    let handler = RequestHandler::new();
+    let alpha = session_name("switch-canonical-control-alpha");
+    let beta = session_name("switch-canonical-control-beta");
+    create_session(&handler, alpha.clone()).await;
+    create_session(&handler, beta.clone()).await;
+    let control_pid = 94_450;
+    let (event_tx, mut event_rx) = mpsc::channel(CONTROL_SERVER_EVENT_CAPACITY);
+    let _control_id = handler
+        .register_control_with_closing(
+            control_pid,
+            ControlModeUpgrade {
+                mode: ControlMode::Plain,
+                terminal_context: crate::outer_terminal::OuterTerminalContext::default(),
+                initial_command_count: 0,
+            },
+            event_tx,
+            Arc::new(AtomicBool::new(false)),
+        )
+        .await;
+    handler
+        .set_control_session(control_pid, Some(alpha))
+        .await
+        .expect("initial control session set succeeds");
+    assert!(matches!(
+        event_rx.try_recv(),
+        Ok(ControlServerEvent::SessionChanged(Some(_))
+            | ControlServerEvent::SessionChangedAt { .. })
+    ));
+
+    let mut request = switch_request(beta.to_string());
+    request.target_client = Some(format!("client-{control_pid}"));
+    let response = handler
+        .handle_switch_client_ext3(control_pid, request)
+        .await;
+    assert!(
+        matches!(response, Response::SwitchClient(_)),
+        "{response:?}"
+    );
+    let active_control = handler.active_control.lock().await;
+    assert_eq!(
+        active_control
+            .by_pid
+            .get(&control_pid)
+            .and_then(|active| active.session_name.as_ref()),
+        Some(&beta)
+    );
+}
+
+#[tokio::test]
 async fn closed_attach_switch_rolls_back_environment_geometry_selection_touch_and_runtime() {
     let handler = RequestHandler::new();
     let alpha = session_name("switch-atomic-attach-alpha");

@@ -22,7 +22,7 @@ use super::super::{
     attach_support::{
         AttachedSwitchCommitOutcome, AttachedSwitchCommitRequest, AttachedSwitchCommittedTarget,
     },
-    attached_client_matches_target, client_environment_snapshot,
+    attached_client_matches_target, client_environment_snapshot, control_client_target_pid,
     control_support::{current_control_queue_identity, ManagedClient},
     normalize_target_client, parse_session_sort_order, switch_client_target_find_type,
     switch_target_selector_count, with_visible_pane_bases, RequestHandler, SessionSortOrder,
@@ -873,7 +873,7 @@ impl RequestHandler {
                 });
             }
         }
-        if let Ok(pid) = target_client.parse::<u32>() {
+        if let Some(pid) = control_client_target_pid(target_client) {
             let active_control = self.active_control.lock().await;
             if let Some(active) = active_control.by_pid.get(&pid) {
                 if active.closing.load(Ordering::SeqCst) {

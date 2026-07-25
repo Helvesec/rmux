@@ -549,6 +549,60 @@ fn tmux_compat_list_clients_control_mode_flags_when_frozen_tmux_is_available(
 }
 
 #[test]
+fn tmux_compat_switch_client_round_trips_the_listed_control_name_when_frozen_tmux_is_available(
+) -> Result<(), Box<dyn Error>> {
+    let harness = TmuxCompatHarness::new("tmux-compat-switch-listed-control-client")?;
+    let Some(tmux_binary) = frozen_tmux_or_skip(&harness)? else {
+        return Ok(());
+    };
+    let config = tmux_compat_config();
+    for session in ["alpha", "beta"] {
+        let create = harness.run_pair_with(
+            &tmux_binary,
+            &["new-session", "-d", "-s", session],
+            config.clone(),
+        )?;
+        assert_quiet_success(&create);
+    }
+
+    let mut tmux_control =
+        LiveControlClient::spawn(tmux_control_mode_command(&harness, &tmux_binary, &[], &[])?)?;
+    let mut rmux_control =
+        LiveControlClient::spawn(rmux_control_mode_command(&harness, &[], &[])?)?;
+    tmux_control.send("attach-session -t alpha\n")?;
+    rmux_control.send("attach-session -t alpha\n")?;
+
+    let listed = wait_for_pair_run(
+        &harness,
+        &tmux_binary,
+        &["list-clients", "-t", "alpha", "-F", "#{client_name}"],
+        config.clone(),
+        Duration::from_secs(5),
+        |run| {
+            run.tmux.stdout_string().trim().starts_with("client-")
+                && run.rmux.stdout_string().trim().starts_with("client-")
+        },
+    )?;
+    assert_success_without_stderr(&listed);
+    let tmux_name = listed.tmux.stdout_string().trim().to_owned();
+    let rmux_name = listed.rmux.stdout_string().trim().to_owned();
+    tmux_control.send(&format!("switch-client -c {tmux_name} -t beta\n"))?;
+    rmux_control.send(&format!("switch-client -c {rmux_name} -t beta\n"))?;
+
+    let switched = wait_for_pair_run(
+        &harness,
+        &tmux_binary,
+        &["list-clients", "-t", "beta", "-F", "#{session_name}"],
+        config,
+        Duration::from_secs(5),
+        |run| run.tmux.stdout_string() == "beta\n" && run.rmux.stdout_string() == "beta\n",
+    )?;
+    assert_success_without_stderr(&switched);
+    assert_eq!(switched.rmux.stdout, switched.tmux.stdout);
+    Ok(())
+}
+
+#[test]
 fn tmux_compat_control_commands_do_not_refresh_client_activity_when_frozen_tmux_is_available(
 ) -> Result<(), Box<dyn Error>> {
     let harness = TmuxCompatHarness::new("tmux-compat-control-client-activity")?;
