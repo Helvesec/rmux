@@ -74,19 +74,17 @@ pub(crate) fn main() {
                 .map(|()| 0)
                 .map_err(|error| error.to_string())
         }
-        TinyInvocation::Direct(command) => {
-            match command.runtime_alias_requires_full_helper(&args) {
-                Ok(true) => {
-                    trace_fallback("runtime command-alias");
-                    exec_full_helper(&args)
-                }
-                Ok(false) => {
-                    trace_direct(command.name());
-                    command.run(&args)
-                }
-                Err(error) => Err(error),
+        TinyInvocation::Direct(command) => match command.runtime_alias_dispatch(&args) {
+            Ok(RuntimeAliasDispatch::FullHelper) => {
+                trace_fallback("runtime command-alias");
+                exec_full_helper(&args)
             }
-        }
+            Ok(RuntimeAliasDispatch::Direct(mut command_connection)) => {
+                trace_direct(command.name());
+                command.run(&args, &mut command_connection)
+            }
+            Err(error) => Err(error),
+        },
         TinyInvocation::Fallback => {
             trace_fallback("unsupported invocation");
             exec_full_helper(&args)
@@ -108,6 +106,48 @@ enum TinyInvocation {
     Version,
     Direct(Box<TinyCommand>),
     Fallback,
+}
+
+enum RuntimeAliasDispatch {
+    FullHelper,
+    Direct(TinyCommandConnection),
+}
+
+#[derive(Debug)]
+struct TinyCommandConnection<C = Connection> {
+    socket_path: PathBuf,
+    connection: Option<C>,
+}
+
+impl<C> TinyCommandConnection<C> {
+    fn disconnected(socket_path: &Path) -> Self {
+        Self {
+            socket_path: socket_path.to_path_buf(),
+            connection: None,
+        }
+    }
+
+    fn reusable(socket_path: &Path, connection: C) -> Self {
+        Self {
+            socket_path: socket_path.to_path_buf(),
+            connection: Some(connection),
+        }
+    }
+
+    fn take_reusable(&mut self, socket_path: &Path) -> Option<C> {
+        (self.socket_path == socket_path)
+            .then(|| self.connection.take())
+            .flatten()
+    }
+}
+
+impl TinyCommandConnection {
+    fn connect(&mut self, socket_path: &Path) -> Result<Connection, String> {
+        if let Some(connection) = self.take_reusable(socket_path) {
+            return Ok(connection);
+        }
+        connect(socket_path).map_err(|error| client_error(socket_path, error))
+    }
 }
 
 enum TinyCommand {
@@ -671,23 +711,29 @@ impl TinyCommand {
         }
     }
 
-    fn run(self, original_args: &[OsString]) -> Result<i32, String> {
+    fn run(
+        self,
+        original_args: &[OsString],
+        command_connection: &mut TinyCommandConnection,
+    ) -> Result<i32, String> {
         match self {
             Self::StartServer { socket_path } => run_start_server(&socket_path),
-            Self::ListSessions { socket_path } => run_list_sessions(&socket_path),
+            Self::ListSessions { socket_path } => {
+                run_list_sessions(&socket_path, command_connection)
+            }
             Self::HasSession {
                 socket_path,
                 request,
-            } => run_has_session(original_args, &socket_path, request),
+            } => run_has_session(original_args, &socket_path, request, command_connection),
             Self::ListWindows {
                 socket_path,
                 request,
-            } => run_list_windows(original_args, &socket_path, request),
+            } => run_list_windows(original_args, &socket_path, request, command_connection),
             Self::ListPanes {
                 socket_path,
                 request,
-            } => run_list_panes(original_args, &socket_path, request),
-            Self::KillServer { socket_path } => run_kill_server(&socket_path),
+            } => run_list_panes(original_args, &socket_path, request, command_connection),
+            Self::KillServer { socket_path } => run_kill_server(&socket_path, command_connection),
             Self::CapturePane {
                 socket_path,
                 request,
@@ -696,6 +742,7 @@ impl TinyCommand {
                 &socket_path,
                 "capture-pane",
                 RetryPolicy::DecodeOrEof,
+                command_connection,
                 |connection| connection.capture_pane_target_action(request),
             ),
             Self::AttachSession {
@@ -714,13 +761,14 @@ impl TinyCommand {
                     &socket_path,
                     "split-window",
                     RetryPolicy::DecodeOnly,
+                    command_connection,
                     |connection| connection.split_window_target_action(request),
                 )
             }
             Self::NewWindow {
                 socket_path,
                 request,
-            } => run_new_window(original_args, &socket_path, request),
+            } => run_new_window(original_args, &socket_path, request, command_connection),
             Self::NewSession {
                 socket_path,
                 request,
@@ -728,33 +776,33 @@ impl TinyCommand {
             Self::KillSession {
                 socket_path,
                 request,
-            } => run_kill_session(original_args, &socket_path, request),
+            } => run_kill_session(original_args, &socket_path, request, command_connection),
             Self::ShowOptions {
                 socket_path,
                 request,
                 command_name,
-            } => run_show_options(&socket_path, request, command_name),
+            } => run_show_options(&socket_path, request, command_name, command_connection),
             Self::RenameWindow {
                 socket_path,
                 request,
-            } => run_rename_window(original_args, &socket_path, request),
+            } => run_rename_window(original_args, &socket_path, request, command_connection),
             Self::SelectWindow {
                 socket_path,
                 request,
-            } => run_select_window(original_args, &socket_path, request),
+            } => run_select_window(original_args, &socket_path, request, command_connection),
             Self::KillPane {
                 socket_path,
                 request,
-            } => run_kill_pane(original_args, &socket_path, request),
+            } => run_kill_pane(original_args, &socket_path, request, command_connection),
             Self::JoinPane {
                 socket_path,
                 request,
-            } => run_join_pane(original_args, &socket_path, request),
+            } => run_join_pane(original_args, &socket_path, request, command_connection),
             Self::SetOption {
                 socket_path,
                 request,
                 command_name,
-            } => run_set_option(&socket_path, request, command_name),
+            } => run_set_option(&socket_path, request, command_name, command_connection),
             Self::ResizePane {
                 socket_path,
                 request,
@@ -763,27 +811,28 @@ impl TinyCommand {
                 &socket_path,
                 "resize-pane",
                 RetryPolicy::DecodeOnly,
+                command_connection,
                 |connection| connection.resize_pane_target_action(request),
             ),
             Self::DisplayMessage {
                 socket_path,
                 request,
-            } => run_display_message(original_args, &socket_path, request),
+            } => run_display_message(original_args, &socket_path, request, command_connection),
             Self::SendKeys {
                 socket_path,
                 request,
-            } => run_send_keys(&socket_path, request),
+            } => run_send_keys(&socket_path, request, command_connection),
             Self::SourceFile {
                 socket_path,
                 request,
-            } => run_source_file(&socket_path, request),
+            } => run_source_file(&socket_path, request, command_connection),
         }
     }
 
-    fn runtime_alias_requires_full_helper(
+    fn runtime_alias_dispatch(
         &self,
         original_args: &[OsString],
-    ) -> Result<bool, String> {
+    ) -> Result<RuntimeAliasDispatch, String> {
         let arguments = tiny_invoked_command_arguments(original_args)
             .ok_or_else(|| "tiny command invocation contains invalid UTF-8".to_owned())?;
         if arguments.is_empty() {
@@ -792,22 +841,33 @@ impl TinyCommand {
         let socket_path = self.socket_path();
         let mut connection = match connect_or_absent(socket_path) {
             Ok(ConnectResult::Connected(connection)) => connection,
-            Ok(ConnectResult::Absent) => return Ok(self.starts_server()),
+            Ok(ConnectResult::Absent) if self.starts_server() => {
+                return Ok(RuntimeAliasDispatch::FullHelper);
+            }
+            Ok(ConnectResult::Absent) => {
+                return Ok(RuntimeAliasDispatch::Direct(
+                    TinyCommandConnection::disconnected(socket_path),
+                ));
+            }
             Err(error)
                 if self.is_kill_server()
                     && legacy_shutdown_fallback_wire_version(&error).is_some() =>
             {
-                return Ok(false);
+                return Ok(RuntimeAliasDispatch::Direct(
+                    TinyCommandConnection::disconnected(socket_path),
+                ));
             }
             Err(error) => return Err(client_error(socket_path, error)),
         };
         let canonical = match expand_runtime_command_segment(&mut connection, &arguments) {
             Ok(Some(canonical)) => canonical,
             Ok(None) => {
-                return self.legacy_alias_requires_full_helper(&mut connection, &arguments[0]);
+                return self.legacy_alias_dispatch(connection, &arguments[0]);
             }
             Err(error) if self.is_kill_server() && error.previous_wire_version().is_some() => {
-                return Ok(false);
+                return Ok(RuntimeAliasDispatch::Direct(
+                    TinyCommandConnection::disconnected(socket_path),
+                ));
             }
             Err(error) => return Err(format!("{}: {error}", socket_path.display())),
         };
@@ -823,14 +883,18 @@ impl TinyCommand {
                 .parse_one_group(&canonical)
                 .map_err(|error| error.to_string())?
         };
-        Ok(local.commands() != server.commands() || local.assignments() != server.assignments())
+        if local.commands() != server.commands() || local.assignments() != server.assignments() {
+            Ok(RuntimeAliasDispatch::FullHelper)
+        } else {
+            Ok(self.direct_alias_dispatch(connection))
+        }
     }
 
-    fn legacy_alias_requires_full_helper(
+    fn legacy_alias_dispatch(
         &self,
-        connection: &mut Connection,
+        mut connection: Connection,
         command_name: &str,
-    ) -> Result<bool, String> {
+    ) -> Result<RuntimeAliasDispatch, String> {
         let response = connection
             .show_options(
                 OptionScopeSelector::ServerGlobal,
@@ -848,7 +912,9 @@ impl TinyCommand {
             Response::Error(error)
                 if self.is_kill_server() && previous_wire_error(&error.error).is_some() =>
             {
-                return Ok(false);
+                return Ok(RuntimeAliasDispatch::Direct(
+                    TinyCommandConnection::disconnected(self.socket_path()),
+                ));
             }
             Response::Error(error) => {
                 return Err(tmux_cli_error_message("show-options", &error.error));
@@ -860,9 +926,24 @@ impl TinyCommand {
                 ));
             }
         };
-        Ok(definitions
+        if definitions
             .iter()
-            .any(|definition| definition_matches_name(definition, command_name)))
+            .any(|definition| definition_matches_name(definition, command_name))
+        {
+            Ok(RuntimeAliasDispatch::FullHelper)
+        } else {
+            Ok(self.direct_alias_dispatch(connection))
+        }
+    }
+
+    fn direct_alias_dispatch(&self, connection: Connection) -> RuntimeAliasDispatch {
+        let command_connection = if self.starts_server() {
+            // Startup paths must keep their stronger socket and server-freshness validation.
+            TinyCommandConnection::disconnected(self.socket_path())
+        } else {
+            TinyCommandConnection::reusable(self.socket_path(), connection)
+        };
+        RuntimeAliasDispatch::Direct(command_connection)
     }
 
     const fn is_kill_server(&self) -> bool {
@@ -973,8 +1054,11 @@ fn run_start_server(socket_path: &Path) -> Result<i32, String> {
     Ok(0)
 }
 
-fn run_list_sessions(socket_path: &Path) -> Result<i32, String> {
-    let mut connection = connect(socket_path).map_err(|error| client_error(socket_path, error))?;
+fn run_list_sessions(
+    socket_path: &Path,
+    command_connection: &mut TinyCommandConnection,
+) -> Result<i32, String> {
+    let mut connection = command_connection.connect(socket_path)?;
     let response = connection
         .list_sessions(ListSessionsRequest {
             format: None,
@@ -990,8 +1074,9 @@ fn run_has_session(
     original_args: &[OsString],
     socket_path: &Path,
     request: TinyHasSession,
+    command_connection: &mut TinyCommandConnection,
 ) -> Result<i32, String> {
-    let mut connection = connect(socket_path).map_err(|error| client_error(socket_path, error))?;
+    let mut connection = command_connection.connect(socket_path)?;
     let response = connection
         .has_session(request.target)
         .map_err(|error| error.to_string())?;
@@ -1006,8 +1091,9 @@ fn run_list_windows(
     original_args: &[OsString],
     socket_path: &Path,
     request: TinyListWindows,
+    command_connection: &mut TinyCommandConnection,
 ) -> Result<i32, String> {
-    let mut connection = connect(socket_path).map_err(|error| client_error(socket_path, error))?;
+    let mut connection = command_connection.connect(socket_path)?;
     let response = connection
         .list_windows(request.target, None)
         .map_err(|error| error.to_string())?;
@@ -1021,8 +1107,9 @@ fn run_list_panes(
     original_args: &[OsString],
     socket_path: &Path,
     request: TinyListPanes,
+    command_connection: &mut TinyCommandConnection,
 ) -> Result<i32, String> {
-    let mut connection = connect(socket_path).map_err(|error| client_error(socket_path, error))?;
+    let mut connection = command_connection.connect(socket_path)?;
     match request {
         TinyListPanes::AllSessions => run_list_panes_all_sessions(&mut connection),
         TinyListPanes::Target {
@@ -1126,9 +1213,16 @@ fn resolve_active_window_index(
 }
 
 #[cfg(windows)]
-fn run_kill_server(socket_path: &Path) -> Result<i32, String> {
-    let (mut connection, selected_socket_path) = connect_for_server_shutdown(socket_path)
-        .map_err(|error| client_error(socket_path, error))?;
+fn run_kill_server(
+    socket_path: &Path,
+    command_connection: &mut TinyCommandConnection,
+) -> Result<i32, String> {
+    let (mut connection, selected_socket_path) = match command_connection.take_reusable(socket_path)
+    {
+        Some(connection) => (connection, socket_path.to_path_buf()),
+        None => connect_for_server_shutdown(socket_path)
+            .map_err(|error| client_error(socket_path, error))?,
+    };
     match probe_kill_server_compatible(&mut connection) {
         Ok(()) => {}
         Err(error) if kill_server_connection_closed(&error) => {
@@ -1166,8 +1260,11 @@ fn probe_kill_server_compatible(connection: &mut Connection) -> Result<(), Clien
 }
 
 #[cfg(not(windows))]
-fn run_kill_server(socket_path: &Path) -> Result<i32, String> {
-    let mut connection = connect(socket_path).map_err(|error| client_error(socket_path, error))?;
+fn run_kill_server(
+    socket_path: &Path,
+    command_connection: &mut TinyCommandConnection,
+) -> Result<i32, String> {
+    let mut connection = command_connection.connect(socket_path)?;
     match connection.kill_server() {
         Ok(response) => {
             let code = write_response_output_or_error(response, "kill-server")?;
@@ -1194,8 +1291,9 @@ fn run_display_message(
     original_args: &[OsString],
     socket_path: &Path,
     request: TinyDisplayMessage,
+    command_connection: &mut TinyCommandConnection,
 ) -> Result<i32, String> {
-    let mut connection = connect(socket_path).map_err(|error| client_error(socket_path, error))?;
+    let mut connection = command_connection.connect(socket_path)?;
     let target = request.target;
     let has_explicit_target = target.is_some();
     let response = connection
@@ -1207,8 +1305,12 @@ fn run_display_message(
     write_response_output_or_error(response, "display-message")
 }
 
-fn run_send_keys(socket_path: &Path, request: TinySendKeys) -> Result<i32, String> {
-    let mut connection = connect(socket_path).map_err(|error| client_error(socket_path, error))?;
+fn run_send_keys(
+    socket_path: &Path,
+    request: TinySendKeys,
+    command_connection: &mut TinyCommandConnection,
+) -> Result<i32, String> {
+    let mut connection = command_connection.connect(socket_path)?;
     let response = connection
         .resolve_target(
             Some(request.raw_target),
@@ -1242,9 +1344,10 @@ fn run_new_window(
     original_args: &[OsString],
     socket_path: &Path,
     request: TinyNewWindow,
+    command_connection: &mut TinyCommandConnection,
 ) -> Result<i32, String> {
     let start_directory = request.start_directory.or_else(|| env::current_dir().ok());
-    let mut connection = connect(socket_path).map_err(|error| client_error(socket_path, error))?;
+    let mut connection = command_connection.connect(socket_path)?;
     let response = connection
         .new_window_at_with_environment(
             request.target,
@@ -1267,8 +1370,9 @@ fn run_kill_session(
     original_args: &[OsString],
     socket_path: &Path,
     request: TinyKillSession,
+    command_connection: &mut TinyCommandConnection,
 ) -> Result<i32, String> {
-    let mut connection = connect(socket_path).map_err(|error| client_error(socket_path, error))?;
+    let mut connection = command_connection.connect(socket_path)?;
     let response = connection
         .kill_session(KillSessionRequest {
             target: request.target,
@@ -1287,8 +1391,9 @@ fn run_show_options(
     socket_path: &Path,
     request: TinyShowOptions,
     command_name: &'static str,
+    command_connection: &mut TinyCommandConnection,
 ) -> Result<i32, String> {
-    let mut connection = connect(socket_path).map_err(|error| client_error(socket_path, error))?;
+    let mut connection = command_connection.connect(socket_path)?;
     let response = connection
         .show_options(request.scope, None, false, false, false)
         .map_err(|error| error.to_string())?;
@@ -1299,8 +1404,9 @@ fn run_rename_window(
     original_args: &[OsString],
     socket_path: &Path,
     request: TinyRenameWindow,
+    command_connection: &mut TinyCommandConnection,
 ) -> Result<i32, String> {
-    let mut connection = connect(socket_path).map_err(|error| client_error(socket_path, error))?;
+    let mut connection = command_connection.connect(socket_path)?;
     let response = connection
         .rename_window(request.target, request.name.replace('\\', r"\\"))
         .map_err(|error| error.to_string())?;
@@ -1314,8 +1420,9 @@ fn run_select_window(
     original_args: &[OsString],
     socket_path: &Path,
     request: TinySelectWindow,
+    command_connection: &mut TinyCommandConnection,
 ) -> Result<i32, String> {
-    let mut connection = connect(socket_path).map_err(|error| client_error(socket_path, error))?;
+    let mut connection = command_connection.connect(socket_path)?;
     let response = connection
         .select_window(request.target)
         .map_err(|error| error.to_string())?;
@@ -1329,8 +1436,9 @@ fn run_kill_pane(
     original_args: &[OsString],
     socket_path: &Path,
     request: TinyKillPane,
+    command_connection: &mut TinyCommandConnection,
 ) -> Result<i32, String> {
-    let mut connection = connect(socket_path).map_err(|error| client_error(socket_path, error))?;
+    let mut connection = command_connection.connect(socket_path)?;
     let response = connection
         .kill_pane(request.target)
         .map_err(|error| error.to_string())?;
@@ -1344,8 +1452,9 @@ fn run_join_pane(
     original_args: &[OsString],
     socket_path: &Path,
     request: TinyJoinPane,
+    command_connection: &mut TinyCommandConnection,
 ) -> Result<i32, String> {
-    let mut connection = connect(socket_path).map_err(|error| client_error(socket_path, error))?;
+    let mut connection = command_connection.connect(socket_path)?;
     let response = connection
         .join_pane(JoinPaneRequest {
             source: request.source,
@@ -1367,8 +1476,9 @@ fn run_set_option(
     socket_path: &Path,
     request: TinySetOption,
     command_name: &'static str,
+    command_connection: &mut TinyCommandConnection,
 ) -> Result<i32, String> {
-    let mut connection = connect(socket_path).map_err(|error| client_error(socket_path, error))?;
+    let mut connection = command_connection.connect(socket_path)?;
     let response = connection
         .set_option_by_name(
             request.scope,
@@ -1383,8 +1493,12 @@ fn run_set_option(
     write_response_output_or_error(response, command_name)
 }
 
-fn run_source_file(socket_path: &Path, request: TinySourceFile) -> Result<i32, String> {
-    let mut connection = connect(socket_path).map_err(|error| client_error(socket_path, error))?;
+fn run_source_file(
+    socket_path: &Path,
+    request: TinySourceFile,
+    command_connection: &mut TinyCommandConnection,
+) -> Result<i32, String> {
+    let mut connection = command_connection.connect(socket_path)?;
     let response = connection
         .source_file(request.paths, false, false, false, false, None, None)
         .map_err(|error| error.to_string())?;
@@ -1534,9 +1648,10 @@ fn run_target_action(
     socket_path: &Path,
     command: &str,
     retry_policy: RetryPolicy,
+    command_connection: &mut TinyCommandConnection,
     send: impl FnOnce(&mut rmux_client::Connection) -> Result<Response, ClientError>,
 ) -> Result<i32, String> {
-    let mut connection = connect(socket_path).map_err(|error| client_error(socket_path, error))?;
+    let mut connection = command_connection.connect(socket_path)?;
     let response = send(&mut connection);
     if response_needs_full_helper(&response, retry_policy) {
         return exec_full_helper(original_args);

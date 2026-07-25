@@ -28,6 +28,10 @@ use rmux_proto::{
     SourceFileResponse, CONTROL_CONTROL_END, CONTROL_CONTROL_START, RMUX_FRAME_MAGIC,
     RMUX_WIRE_VERSION,
 };
+#[cfg(all(feature = "tiny-cli", not(debug_assertions)))]
+use rmux_proto::{
+    CAPABILITY_CLI_RUNTIME_COMMAND_EXPANSION, INTERNAL_RUNTIME_COMMAND_EXPANSION_PATH,
+};
 use rmux_pty::TerminalSize;
 
 const ATTACH_TIMEOUT: Duration = Duration::from_secs(5);
@@ -302,12 +306,19 @@ fn spawn_same_wire_server_without_runtime_expansion(
     let _ = fs::remove_file(socket_path);
     let listener = UnixListener::bind(socket_path)?;
     Ok(thread::spawn(move || {
-        drop(serve_same_wire_handshake_and_alias_snapshot(
-            &listener,
-            Vec::new(),
-        )?);
+        let command_stream = serve_same_wire_handshake_and_alias_snapshot(&listener, Vec::new())?;
 
-        let (mut command_stream, request) = accept_current_wire_request(&listener)?;
+        #[cfg(all(feature = "tiny-cli", not(debug_assertions)))]
+        let (mut command_stream, request) = {
+            let mut command_stream = command_stream;
+            let request = read_current_wire_request(&mut command_stream)?;
+            (command_stream, request)
+        };
+        #[cfg(not(all(feature = "tiny-cli", not(debug_assertions))))]
+        let (mut command_stream, request) = {
+            drop(command_stream);
+            accept_current_wire_request(&listener)?
+        };
         if !matches!(request, Request::ListSessions(_)) {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
@@ -317,6 +328,66 @@ fn spawn_same_wire_server_without_runtime_expansion(
         command_stream.write_all(
             &encode_frame(&Response::ListSessions(ListSessionsResponse {
                 output: CommandOutput::from_stdout("legacy-compatible\n"),
+            }))
+            .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?,
+        )?;
+        Ok(())
+    }))
+}
+
+#[cfg(all(feature = "tiny-cli", not(debug_assertions)))]
+fn spawn_runtime_expansion_server_expecting_one_connection(
+    socket_path: &Path,
+) -> io::Result<JoinHandle<io::Result<()>>> {
+    prepare_fake_server_socket_parent(socket_path)?;
+    let _ = fs::remove_file(socket_path);
+    let listener = UnixListener::bind(socket_path)?;
+    Ok(thread::spawn(move || {
+        let (mut stream, request) = accept_current_wire_request(&listener)?;
+        if !matches!(request, Request::Handshake(_)) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("expected capability handshake, got {request:?}"),
+            ));
+        }
+        stream.write_all(
+            &encode_frame(&Response::Handshake(HandshakeResponse {
+                wire_version: RMUX_WIRE_VERSION,
+                capabilities: vec![CAPABILITY_CLI_RUNTIME_COMMAND_EXPANSION.to_owned()],
+            }))
+            .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?,
+        )?;
+
+        let request = read_current_wire_request(&mut stream)?;
+        let Request::SourceFile(request) = request else {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("expected runtime command expansion, got {request:?}"),
+            ));
+        };
+        if request.paths != [INTERNAL_RUNTIME_COMMAND_EXPANSION_PATH] {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("unexpected runtime expansion request: {request:?}"),
+            ));
+        }
+        stream.write_all(
+            &encode_frame(&Response::SourceFile(SourceFileResponse::from_output(
+                CommandOutput::from_stdout("list-sessions"),
+            )))
+            .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?,
+        )?;
+
+        let request = read_current_wire_request(&mut stream)?;
+        if !matches!(request, Request::ListSessions(_)) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("expected direct list-sessions on first connection, got {request:?}"),
+            ));
+        }
+        stream.write_all(
+            &encode_frame(&Response::ListSessions(ListSessionsResponse {
+                output: CommandOutput::from_stdout("one-connection\n"),
             }))
             .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?,
         )?;
@@ -446,6 +517,31 @@ fn same_wire_daemon_without_runtime_expansion_keeps_direct_cli_compatible(
     assert_eq!(stdout(&output), "legacy-compatible\n");
     assert!(stderr(&output).is_empty());
     server.join().expect("fake same-wire server should exit")?;
+    Ok(())
+}
+
+#[cfg(all(feature = "tiny-cli", not(debug_assertions)))]
+#[test]
+fn tiny_runtime_alias_probe_and_direct_command_use_one_server_connection(
+) -> Result<(), Box<dyn Error>> {
+    let harness = CliHarness::new("tiny-runtime-alias-one-connection")?;
+    let server = spawn_runtime_expansion_server_expecting_one_connection(harness.socket_path())?;
+
+    let output = harness.run_with(&["list-sessions"], |command| {
+        command.env("RMUX_TINY_TRACE", "1");
+    })?;
+    let server_result = server.join().expect("single-accept fake server exits");
+
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "stdout={:?} stderr={:?} server={server_result:?}",
+        stdout(&output),
+        stderr(&output),
+    );
+    assert_eq!(stdout(&output), "one-connection\n");
+    assert!(stderr(&output).contains("rmux tiny: direct: list-sessions"));
+    server_result?;
     Ok(())
 }
 

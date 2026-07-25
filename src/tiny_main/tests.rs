@@ -115,6 +115,17 @@ fn tiny_start_server_inventory_covers_every_cold_alias_entry_path() {
 }
 
 #[test]
+fn reusable_tiny_connection_is_scoped_to_one_matching_socket() {
+    let socket_path = Path::new("/tmp/rmux-tiny-live.sock");
+    let other_socket_path = Path::new("/tmp/rmux-tiny-other.sock");
+    let mut connection = TinyCommandConnection::reusable(socket_path, 7_u8);
+
+    assert_eq!(connection.take_reusable(other_socket_path), None);
+    assert_eq!(connection.take_reusable(socket_path), Some(7));
+    assert_eq!(connection.take_reusable(socket_path), None);
+}
+
+#[test]
 fn long_version_stays_on_full_helper_path_for_tmux_compatibility() {
     assert_tiny_fallback(&["rmux", "--version"]);
 }
