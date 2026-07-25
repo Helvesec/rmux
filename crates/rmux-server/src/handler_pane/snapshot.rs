@@ -173,11 +173,30 @@ impl RequestHandler {
         pane_id: PaneId,
         fingerprint: u64,
     ) -> u64 {
+        self.assign_pane_snapshot_revision_at_least(pane_id, fingerprint, 0)
+    }
+
+    /// Assigns a pane snapshot revision that is never below `minimum`.
+    ///
+    /// Callers that must publish a strictly newer revision than one they
+    /// already emitted (surface stream resets) raise the floor here instead
+    /// of clamping the returned value, so the raised revision is recorded in
+    /// the registry. `PaneSurfaceSnapshot::revision` and
+    /// `PaneSnapshotResponse::revision` are documented as one shared
+    /// monotonic counter; a floor applied outside the registry would let the
+    /// snapshot endpoint hand back a revision below one the surface stream
+    /// already published.
+    pub(in crate::handler) fn assign_pane_snapshot_revision_at_least(
+        &self,
+        pane_id: PaneId,
+        fingerprint: u64,
+        minimum: u64,
+    ) -> u64 {
         let mut revisions = self
             .pane_snapshot_revisions
             .lock()
             .expect("pane snapshot revision mutex must not be poisoned");
-        revisions.revision_for(pane_id, fingerprint)
+        revisions.revision_for_at_least(pane_id, fingerprint, minimum)
     }
 
     /// Drains a pending pane snapshot revision that is now eligible to be
@@ -336,25 +355,33 @@ struct PaneSnapshotRevisionState {
 }
 
 impl PaneSnapshotRevisionRegistry {
+    #[cfg(test)]
     fn revision_for(&mut self, pane_id: PaneId, fingerprint: u64) -> u64 {
-        let Some(state) = self.panes.get_mut(&pane_id) else {
-            self.panes.insert(
-                pane_id,
-                PaneSnapshotRevisionState {
-                    fingerprint,
-                    revision: 1,
-                },
-            );
-            return 1;
-        };
+        self.revision_for_at_least(pane_id, fingerprint, 0)
+    }
 
-        if state.fingerprint == fingerprint {
-            return state.revision;
+    /// Returns this pane's revision for `fingerprint`, raised to `minimum`.
+    ///
+    /// Identical observable state keeps its revision; a changed fingerprint
+    /// advances it. A `minimum` above the resulting value is stored, not just
+    /// returned, so every later read of this pane's revision — from the
+    /// snapshot endpoint, a raw rebase, or another surface frame — stays at or
+    /// above a revision that has already been published.
+    fn revision_for_at_least(&mut self, pane_id: PaneId, fingerprint: u64, minimum: u64) -> u64 {
+        let revision = match self.panes.get(&pane_id) {
+            Some(state) if state.fingerprint == fingerprint => state.revision,
+            Some(state) => state.revision.saturating_add(1),
+            None => 1,
         }
-
-        state.fingerprint = fingerprint;
-        state.revision = state.revision.saturating_add(1);
-        state.revision
+        .max(minimum);
+        self.panes.insert(
+            pane_id,
+            PaneSnapshotRevisionState {
+                fingerprint,
+                revision,
+            },
+        );
+        revision
     }
 
     fn forget(&mut self, pane_id: PaneId) {
@@ -568,6 +595,39 @@ mod tests {
             registry.revision_for(pane_id, 10),
             3,
             "returning to prior content is still a new transition",
+        );
+    }
+
+    #[test]
+    fn pane_snapshot_revision_floor_is_recorded_not_just_returned() {
+        // The surface stream raises the floor so a reset republishes a strictly
+        // newer revision even when the pane state is byte-identical. The raised
+        // value must be stored: the snapshot endpoint reads the same registry
+        // with the same fingerprint straight afterwards, and returning the
+        // pre-floor revision there would walk the shared counter backwards.
+        let mut registry = PaneSnapshotRevisionRegistry::default();
+        let pane_id = PaneId::new(6);
+
+        assert_eq!(registry.revision_for(pane_id, 10), 1);
+        assert_eq!(
+            registry.revision_for_at_least(pane_id, 10, 2),
+            2,
+            "an identical reset publishes a strictly newer revision",
+        );
+        assert_eq!(
+            registry.revision_for(pane_id, 10),
+            2,
+            "a later reader of the identical state must not fall back to 1",
+        );
+        assert_eq!(
+            registry.revision_for(pane_id, 11),
+            3,
+            "the next real transition advances past the floored revision",
+        );
+        assert_eq!(
+            registry.revision_for_at_least(pane_id, 12, 1),
+            4,
+            "a floor below the assigned revision never pulls it down",
         );
     }
 

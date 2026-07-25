@@ -147,9 +147,11 @@ pub(in crate::handler) fn materialize_surface_frame(
         history_bytes,
         pane_id.as_u32(),
     );
-    let grid_revision = handler
-        .assign_pane_snapshot_revision(pane_id, fingerprint)
-        .max(minimum_snapshot_revision);
+    let grid_revision = handler.assign_pane_snapshot_revision_at_least(
+        pane_id,
+        fingerprint,
+        minimum_snapshot_revision,
+    );
     Ok(Arc::new(PaneSurfaceFrame {
         epoch,
         revision: surface_revision,

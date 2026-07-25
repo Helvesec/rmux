@@ -4,10 +4,10 @@ use std::time::{Duration, Instant};
 use rmux_core::events::SubscriptionLimits;
 use rmux_proto::{
     NewSessionExtRequest, PaneRawRebase, PaneRawRebaseReason, PaneRecoveryCoverage,
-    PaneStreamCursorRequest, PaneStreamEndReason, PaneStreamEvent, PaneStreamLifecycleEvent,
-    PaneStreamMode, PaneSurfaceFrame, PaneTarget, PaneTargetRef, RenameSessionRequest, Request,
-    Response, SessionName, SplitDirection, SplitWindowRequest, SplitWindowTarget,
-    SubscribePaneStreamRequest, SubscribePaneStreamResponse, TerminalSize,
+    PaneSnapshotRequest, PaneStreamCursorRequest, PaneStreamEndReason, PaneStreamEvent,
+    PaneStreamLifecycleEvent, PaneStreamMode, PaneSurfaceFrame, PaneTarget, PaneTargetRef,
+    RenameSessionRequest, Request, Response, SessionName, SplitDirection, SplitWindowRequest,
+    SplitWindowTarget, SubscribePaneStreamRequest, SubscribePaneStreamResponse, TerminalSize,
     UnsubscribePaneStreamRequest, DEFAULT_MAX_DETACHED_FRAME_LENGTH,
 };
 
@@ -843,6 +843,72 @@ async fn surface_noop_mutation_is_silent_but_resize_resets_epoch() {
         events.first(),
         Some(PaneStreamEvent::SurfaceReset(_))
     ));
+}
+
+#[tokio::test]
+async fn identical_reset_does_not_regress_the_shared_pane_snapshot_revision() {
+    let handler = RequestHandler::new();
+    let (target, output, transcript) = test_pane(&handler).await;
+    let surface = subscribe(&handler, &target, PaneStreamMode::Surface).await;
+    let initial = surface_frame(&surface.event)
+        .expect("surface subscription starts with a frame")
+        .snapshot
+        .revision;
+
+    // `clear_pane_history` reports a transcript mutation unconditionally, so a
+    // pane whose scrollback is already empty is invalidated without any
+    // observable state changing. tmux 3.7b behaves the same way: the grid,
+    // cursor and history counters are identical across `clear-history` on an
+    // empty-history pane (.rmux-audit/tmux-3.7b-identical-reset.txt).
+    output.mutate_transcript(
+        &transcript,
+        PaneInvalidationReason::ClearHistory,
+        |transcript| {
+            transcript.clear_history(false);
+            ((), true)
+        },
+    );
+
+    let published = cursor(&handler, surface.subscription_id)
+        .await
+        .iter()
+        .find_map(surface_frame)
+        .expect("an identical reset still republishes the surface")
+        .snapshot
+        .revision;
+    assert!(
+        published > initial,
+        "reset frame revision {published} must advance past {initial}"
+    );
+
+    // `PaneSurfaceSnapshot::revision` and `PaneSnapshotResponse::revision` are
+    // documented as one shared monotonic counter, so no snapshot reader may
+    // hand back a revision below one the surface stream already published.
+    let response = handler
+        .handle(Request::PaneSnapshot(PaneSnapshotRequest {
+            target: target.clone(),
+        }))
+        .await;
+    let Response::PaneSnapshot(snapshot) = response else {
+        panic!("unexpected snapshot response: {response:?}");
+    };
+    assert!(
+        snapshot.revision >= published,
+        "pane snapshot revision regressed from {published} to {}",
+        snapshot.revision
+    );
+
+    let raw = subscribe_with_snapshot(&handler, &target, PaneStreamMode::Raw, true).await;
+    let rebased = raw_rebase(&raw.event)
+        .expect("raw subscription starts with a rebase")
+        .snapshot
+        .as_ref()
+        .expect("include_snapshot materializes a typed snapshot")
+        .revision;
+    assert!(
+        rebased >= published,
+        "raw rebase snapshot revision regressed from {published} to {rebased}"
+    );
 }
 
 #[tokio::test]
