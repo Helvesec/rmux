@@ -520,14 +520,7 @@ impl RequestHandler {
                 .contains(super::attach_support::ClientFlags::IGNORESIZE);
             let client_size_changed = active.client_size != size;
             let geometry_changed = client_size_changed || active.client_pixels != geometry.pixels;
-            let size_sequence = if geometry_changed {
-                let size_sequence = active_attach.next_size_sequence;
-                active_attach.next_size_sequence =
-                    active_attach.next_size_sequence.saturating_add(1);
-                Some(size_sequence)
-            } else {
-                None
-            };
+            let size_sequence = geometry_changed.then(|| self.next_client_size_sequence());
             let active = active_attach
                 .by_pid
                 .get_mut(&attach_pid)

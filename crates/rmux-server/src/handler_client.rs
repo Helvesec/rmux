@@ -576,6 +576,7 @@ impl RequestHandler {
                 return Err(crate::pane_terminals::session_not_found(session_name));
             }
             let active_attach = self.active_attach.lock().await;
+            let active_control = self.active_control.lock().await;
             if let Some((attach_pid, attach_id)) = expected_attach_identity {
                 if active_attach
                     .by_pid
@@ -588,6 +589,7 @@ impl RequestHandler {
             if !self.attached_size_selection_is_current(
                 &state,
                 &active_attach,
+                &active_control,
                 session_name,
                 &selection,
                 switch_window_target.is_none(),
@@ -629,6 +631,7 @@ impl RequestHandler {
                     },
                 ),
             };
+            drop(active_control);
             drop(active_attach);
             return result;
         }

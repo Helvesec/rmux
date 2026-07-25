@@ -25,7 +25,6 @@ use crate::pane_io::{AttachControl, AttachControlSender};
 #[derive(Debug, Default)]
 pub(in crate::handler) struct ActiveAttachState {
     pub(in crate::handler) next_id: u64,
-    pub(in crate::handler) next_size_sequence: u64,
     pub(in crate::handler) by_pid: HashMap<u32, ActiveAttach>,
     pub(in crate::handler) active_client_by_window:
         HashMap<rmux_proto::SessionName, HashMap<u32, u32>>,

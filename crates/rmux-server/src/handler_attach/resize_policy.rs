@@ -27,6 +27,25 @@ struct AttachedSizeCandidate {
     sequence: u64,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ControlSizeCandidate {
+    pid: u32,
+    control_id: u64,
+    session_name: SessionName,
+    session_id: SessionId,
+    size: TerminalSize,
+    sequence: u64,
+}
+
+impl ControlSizeCandidate {
+    const fn size_candidate(&self) -> AttachedSizeCandidate {
+        AttachedSizeCandidate {
+            size: self.size,
+            sequence: self.sequence,
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub(in crate::handler) struct AttachedSizeSelection {
     pub(in crate::handler) selected_size: Option<TerminalSize>,
@@ -38,6 +57,7 @@ pub(in crate::handler) struct AttachedSizeSelection {
     linked_sessions: HashSet<(SessionName, SessionId)>,
     active_attach_epoch: u64,
     incoming_client_size: Option<TerminalSize>,
+    control_candidates: Vec<ControlSizeCandidate>,
 }
 
 impl AttachedSizeSelection {
@@ -57,6 +77,7 @@ pub(in crate::handler) struct ControlResizeClient<'a> {
     active_control: &'a super::super::ActiveControlState,
     control_pid: u32,
     client_size: TerminalSize,
+    size_sequence: u64,
 }
 
 impl<'a> ControlResizeClient<'a> {
@@ -65,12 +86,14 @@ impl<'a> ControlResizeClient<'a> {
         active_control: &'a super::super::ActiveControlState,
         control_pid: u32,
         client_size: TerminalSize,
+        size_sequence: u64,
     ) -> Self {
         Self {
             active_attach,
             active_control,
             control_pid,
             client_size,
+            size_sequence,
         }
     }
 }
@@ -192,34 +215,35 @@ fn control_resize_selection(
             == Some("on");
     let linked_sessions =
         linked_session_identities(state, session_name, window_index, aggressive_resize);
-    let mut candidates = attached_size_candidates(
+    let candidates = attached_size_candidates(
         client.active_attach,
         &linked_sessions,
-        Some(client.client_size),
+        Some(AttachedSizeCandidate {
+            size: client.client_size,
+            sequence: client.size_sequence,
+        }),
     );
-    if matches!(
-        policy,
-        AttachedWindowSizePolicy::Largest | AttachedWindowSizePolicy::Smallest
-    ) {
-        candidates.extend(control_size_candidates(
-            client.active_control,
-            &linked_sessions,
-            client.control_pid,
-        ));
-    }
-    Ok((current_size, selected_attached_size(policy, &candidates)))
+    let control_candidates = control_size_candidates(
+        client.active_control,
+        &linked_sessions,
+        Some(client.control_pid),
+    );
+    Ok((
+        current_size,
+        selected_client_size(policy, candidates, &control_candidates),
+    ))
 }
 
-fn control_size_candidates<'a>(
-    active_control: &'a super::super::ActiveControlState,
-    linked_sessions: &'a HashSet<(SessionName, SessionId)>,
-    current_pid: u32,
-) -> impl Iterator<Item = AttachedSizeCandidate> + 'a {
-    active_control
+fn control_size_candidates(
+    active_control: &super::super::ActiveControlState,
+    linked_sessions: &HashSet<(SessionName, SessionId)>,
+    excluded_pid: Option<u32>,
+) -> Vec<ControlSizeCandidate> {
+    let mut candidates = active_control
         .by_pid
         .iter()
-        .filter(move |(pid, active)| {
-            **pid != current_pid
+        .filter(|(pid, active)| {
+            Some(**pid) != excluded_pid
                 && !active.closing.load(Ordering::Acquire)
                 && active
                     .session_name
@@ -231,15 +255,36 @@ fn control_size_candidates<'a>(
                         })
                     })
         })
-        .map(|(_, active)| AttachedSizeCandidate {
-            size: TerminalSize {
-                cols: active.client_width,
-                rows: active.client_height,
-            },
-            // Largest/smallest ignore ordering. Latest intentionally uses only
-            // the reporting control client as tmux's newest size candidate.
-            sequence: 0,
+        .filter_map(|(&pid, active)| {
+            let (session_name, session_id) = active.session_name.clone().zip(active.session_id)?;
+            Some(ControlSizeCandidate {
+                pid,
+                control_id: active.id,
+                session_name,
+                session_id,
+                size: TerminalSize {
+                    cols: active.client_width,
+                    rows: active.client_height,
+                },
+                sequence: active.size_sequence,
+            })
         })
+        .collect::<Vec<_>>();
+    candidates.sort_by_key(|candidate| (candidate.pid, candidate.control_id));
+    candidates
+}
+
+fn selected_client_size(
+    policy: AttachedWindowSizePolicy,
+    mut attached_candidates: Vec<AttachedSizeCandidate>,
+    control_candidates: &[ControlSizeCandidate],
+) -> Option<TerminalSize> {
+    attached_candidates.extend(
+        control_candidates
+            .iter()
+            .map(ControlSizeCandidate::size_candidate),
+    );
+    selected_attached_size(policy, &attached_candidates)
 }
 
 impl RequestHandler {
@@ -295,9 +340,11 @@ impl RequestHandler {
                 return Ok(None);
             }
             let active_attach = self.active_attach.lock().await;
+            let active_control = self.active_control.lock().await;
             if !self.attached_size_selection_is_current(
                 &state,
                 &active_attach,
+                &active_control,
                 session_name,
                 &selection,
                 true,
@@ -322,6 +369,7 @@ impl RequestHandler {
                 session.resize_active_window_terminal(selected_size);
                 Ok(())
             })?;
+            drop(active_control);
             drop(active_attach);
             return Ok(Some(WindowTarget::with_window(
                 session_name.clone(),
@@ -353,9 +401,11 @@ impl RequestHandler {
                 return Ok(None);
             }
             let active_attach = self.active_attach.lock().await;
+            let active_control = self.active_control.lock().await;
             if !self.attached_size_selection_is_current(
                 &state,
                 &active_attach,
+                &active_control,
                 target.session_name(),
                 &selection,
                 false,
@@ -385,6 +435,7 @@ impl RequestHandler {
                     Ok(())
                 },
             )?;
+            drop(active_control);
             drop(active_attach);
             return Ok(Some(target.clone()));
         }
@@ -461,14 +512,25 @@ impl RequestHandler {
             )
         };
 
-        let (candidates, active_attach_epoch) = {
+        let incoming_candidate = incoming_client_size.map(|size| AttachedSizeCandidate {
+            size,
+            sequence: self.current_client_size_sequence(),
+        });
+        let (candidates, control_candidates, active_attach_epoch) = {
             let active_attach = self.active_attach.lock().await;
+            let active_control = self.active_control.lock().await;
             let candidates =
-                attached_size_candidates(&active_attach, &linked_sessions, incoming_client_size);
-            (candidates, self.active_attach_epoch.load(Ordering::Acquire))
+                attached_size_candidates(&active_attach, &linked_sessions, incoming_candidate);
+            let control_candidates =
+                control_size_candidates(&active_control, &linked_sessions, None);
+            (
+                candidates,
+                control_candidates,
+                self.active_attach_epoch.load(Ordering::Acquire),
+            )
         };
         Ok(AttachedSizeSelection {
-            selected_size: selected_attached_size(policy, &candidates),
+            selected_size: selected_client_size(policy, candidates, &control_candidates),
             session_id,
             active_window_index,
             active_window_id,
@@ -477,6 +539,7 @@ impl RequestHandler {
             linked_sessions,
             active_attach_epoch,
             incoming_client_size,
+            control_candidates,
         })
     }
 
@@ -520,14 +583,25 @@ impl RequestHandler {
                 window.id(),
             )
         };
-        let (candidates, active_attach_epoch) = {
+        let incoming_candidate = incoming_client_size.map(|size| AttachedSizeCandidate {
+            size,
+            sequence: self.current_client_size_sequence(),
+        });
+        let (candidates, control_candidates, active_attach_epoch) = {
             let active_attach = self.active_attach.lock().await;
+            let active_control = self.active_control.lock().await;
             let candidates =
-                attached_size_candidates(&active_attach, &linked_sessions, incoming_client_size);
-            (candidates, self.active_attach_epoch.load(Ordering::Acquire))
+                attached_size_candidates(&active_attach, &linked_sessions, incoming_candidate);
+            let control_candidates =
+                control_size_candidates(&active_control, &linked_sessions, None);
+            (
+                candidates,
+                control_candidates,
+                self.active_attach_epoch.load(Ordering::Acquire),
+            )
         };
         Ok(AttachedSizeSelection {
-            selected_size: selected_attached_size(policy, &candidates),
+            selected_size: selected_client_size(policy, candidates, &control_candidates),
             session_id,
             active_window_index: target.window_index(),
             active_window_id: window_id,
@@ -536,6 +610,7 @@ impl RequestHandler {
             linked_sessions,
             active_attach_epoch,
             incoming_client_size,
+            control_candidates,
         })
     }
 
@@ -543,6 +618,7 @@ impl RequestHandler {
         &self,
         state: &crate::pane_terminals::HandlerState,
         active_attach: &super::ActiveAttachState,
+        active_control: &super::super::ActiveControlState,
         session_name: &SessionName,
         selection: &AttachedSizeSelection,
         require_active_window: bool,
@@ -569,6 +645,14 @@ impl RequestHandler {
             selection.active_window_index,
             OptionName::AggressiveResize,
         ) == Some("on");
+        let current_control_candidates =
+            control_size_candidates(active_control, &selection.linked_sessions, None);
+        let incoming_candidate = selection
+            .incoming_client_size
+            .map(|size| AttachedSizeCandidate {
+                size,
+                sequence: self.current_client_size_sequence(),
+            });
         policy == selection.policy
             && aggressive_resize == selection.aggressive_resize
             && linked_session_identities(
@@ -577,13 +661,15 @@ impl RequestHandler {
                 selection.active_window_index,
                 aggressive_resize,
             ) == selection.linked_sessions
-            && selected_attached_size(
+            && current_control_candidates == selection.control_candidates
+            && selected_client_size(
                 policy,
-                &attached_size_candidates(
+                attached_size_candidates(
                     active_attach,
                     &selection.linked_sessions,
-                    selection.incoming_client_size,
+                    incoming_candidate,
                 ),
+                &current_control_candidates,
             ) == selection.selected_size
     }
 
@@ -670,7 +756,7 @@ impl RequestHandler {
 fn attached_size_candidates(
     active_attach: &super::ActiveAttachState,
     linked_sessions: &HashSet<(SessionName, SessionId)>,
-    incoming_client_size: Option<TerminalSize>,
+    incoming_client: Option<AttachedSizeCandidate>,
 ) -> Vec<AttachedSizeCandidate> {
     let mut candidates = active_attach
         .by_pid
@@ -686,11 +772,8 @@ fn attached_size_candidates(
             sequence: active.size_sequence,
         })
         .collect::<Vec<_>>();
-    if let Some(size) = incoming_client_size {
-        candidates.push(AttachedSizeCandidate {
-            size,
-            sequence: active_attach.next_size_sequence,
-        });
+    if let Some(incoming_client) = incoming_client {
+        candidates.push(incoming_client);
     }
     candidates
 }

@@ -230,6 +230,7 @@ impl RequestHandler {
                         error: attached_client_required("refresh-client"),
                     });
                 };
+                let size_sequence = self.next_client_size_sequence();
                 match super::super::attach_support::resize_control_session_for_client(
                     &mut state,
                     super::super::attach_support::ControlResizeClient::new(
@@ -237,6 +238,7 @@ impl RequestHandler {
                         &active_control,
                         control_pid,
                         size,
+                        size_sequence,
                     ),
                     session_name,
                     session_id,
@@ -248,6 +250,7 @@ impl RequestHandler {
                             .expect("validated control client remains locked");
                         active.client_width = size.cols;
                         active.client_height = size.rows;
+                        active.size_sequence = size_sequence;
                         target
                     }
                     Err(error) => return Response::Error(ErrorResponse { error }),

@@ -66,6 +66,7 @@ pub(super) struct ActiveControl {
     pub(super) activity_at: i64,
     pub(super) client_width: u16,
     pub(super) client_height: u16,
+    pub(super) size_sequence: u64,
     pub(super) session_name: Option<rmux_proto::SessionName>,
     pub(super) session_id: Option<SessionId>,
     pub(super) last_session: Option<rmux_proto::SessionName>,
@@ -443,6 +444,7 @@ impl RequestHandler {
                         activity_at: current_client_activity_timestamp(),
                         client_width: DEFAULT_CONTROL_CLIENT_WIDTH,
                         client_height: DEFAULT_CONTROL_CLIENT_HEIGHT,
+                        size_sequence: 0,
                         session_name: None,
                         session_id: None,
                         last_session: None,
@@ -580,6 +582,9 @@ impl RequestHandler {
             self.emit_prepared(event).await;
         }
         if let Some(session_identity) = removed_session {
+            let _ = self
+                .reconcile_attached_session_identity_size_and_emit(session_identity.1)
+                .await;
             self.destroy_unattached_sessions(vec![session_identity])
                 .await;
         }
@@ -1096,6 +1101,7 @@ impl RequestHandler {
             .name()
             .clone();
         let pane_sequences = current_pane_output_sequences(&state, &target_session_name).ok()?;
+        let size_sequence = self.next_client_size_sequence();
         let mut active_control = self.active_control.lock().await;
         let active = active_control
             .by_pid
@@ -1114,6 +1120,7 @@ impl RequestHandler {
         if !delivered {
             return None;
         }
+        active.size_sequence = size_sequence;
         state
             .sessions
             .session_mut(&target_session_name)
@@ -1210,6 +1217,9 @@ impl RequestHandler {
             cols: active.client_width,
             rows: active.client_height,
         };
+        let size_sequence = next_session_name
+            .as_ref()
+            .map(|_| self.next_client_size_sequence());
         let prepared_update =
             prepare_control_session_update(active, next_session_name.clone(), pane_sequences)
                 .ok_or_else(|| attached_client_required(command_name))?;
@@ -1225,6 +1235,7 @@ impl RequestHandler {
                     &active_control,
                     requester_pid,
                     control_size,
+                    size_sequence.expect("switch-client carries a target session"),
                 ),
                 session_name,
                 session_id,
@@ -1248,6 +1259,9 @@ impl RequestHandler {
             next_session_id,
             prepared_update,
         );
+        if let Some(size_sequence) = size_sequence {
+            active.size_sequence = size_sequence;
+        }
         if touch_attached {
             let session_name = next_session_name
                 .as_ref()
@@ -1341,6 +1355,7 @@ impl RequestHandler {
         } else {
             Some(current_pane_output_sequences(&state, session_name)?)
         };
+        let size_sequence = self.next_client_size_sequence();
 
         let delivered = {
             let active = active_control
@@ -1358,6 +1373,11 @@ impl RequestHandler {
         if !delivered {
             return Err(attached_client_required("control session"));
         }
+        active_control
+            .by_pid
+            .get_mut(&identity.requester_pid())
+            .expect("delivered control client remains registered while locked")
+            .size_sequence = size_sequence;
         state
             .sessions
             .session_mut(session_name)
@@ -1782,6 +1802,7 @@ impl RequestHandler {
             .expect("test control identity remains registered");
         active.session_name = Some(session_name);
         active.session_id = Some(session_id);
+        active.size_sequence = self.next_client_size_sequence();
     }
 
     async fn take_startup_config_error_notifications(&self) -> Vec<String> {

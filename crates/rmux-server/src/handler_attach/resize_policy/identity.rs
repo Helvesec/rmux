@@ -9,8 +9,9 @@ use super::super::super::{
     prepare_lifecycle_event_if_enabled, QueuedLifecycleEvent, RequestHandler,
 };
 use super::{
-    attached_size_candidates, linked_session_identities, policy_from_option_value,
-    selected_attached_size, AttachedSizeSelection, ATTACHED_SIZE_RECONCILE_ATTEMPTS,
+    attached_size_candidates, control_size_candidates, linked_session_identities,
+    policy_from_option_value, selected_client_size, AttachedSizeSelection,
+    ATTACHED_SIZE_RECONCILE_ATTEMPTS,
 };
 
 impl RequestHandler {
@@ -73,9 +74,11 @@ impl RequestHandler {
                 continue;
             }
             let active_attach = self.active_attach.lock().await;
+            let active_control = self.active_control.lock().await;
             if !self.attached_size_selection_is_current(
                 &state,
                 &active_attach,
+                &active_control,
                 target.session_name(),
                 &selection,
                 false,
@@ -105,6 +108,7 @@ impl RequestHandler {
                     Ok(())
                 },
             )?;
+            drop(active_control);
             drop(active_attach);
             let event = LifecycleEvent::WindowResized { target };
             let prepared_event = prepare_lifecycle_event_if_enabled(&mut state, &event);
@@ -142,13 +146,20 @@ impl RequestHandler {
             );
             (target, policy, aggressive_resize, linked_sessions)
         };
-        let (candidates, active_attach_epoch) = {
+        let (candidates, control_candidates, active_attach_epoch) = {
             let active_attach = self.active_attach.lock().await;
+            let active_control = self.active_control.lock().await;
             let candidates = attached_size_candidates(&active_attach, &linked_sessions, None);
-            (candidates, self.active_attach_epoch.load(Ordering::Acquire))
+            let control_candidates =
+                control_size_candidates(&active_control, &linked_sessions, None);
+            (
+                candidates,
+                control_candidates,
+                self.active_attach_epoch.load(Ordering::Acquire),
+            )
         };
         let selection = AttachedSizeSelection {
-            selected_size: selected_attached_size(policy, &candidates),
+            selected_size: selected_client_size(policy, candidates, &control_candidates),
             session_id,
             active_window_index: target.window_index(),
             active_window_id: window_id,
@@ -157,6 +168,7 @@ impl RequestHandler {
             linked_sessions,
             active_attach_epoch,
             incoming_client_size: None,
+            control_candidates,
         };
         Some((target, selection))
     }

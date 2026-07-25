@@ -129,6 +129,7 @@ impl RequestHandler {
 
             let mut state = self.state.lock().await;
             let mut active_attach = self.active_attach.lock().await;
+            let active_control = self.active_control.lock().await;
             let active = active_attach.by_pid.get(&attach_pid).filter(|active| {
                 active.id == expected_attach_id
                     && request
@@ -157,6 +158,7 @@ impl RequestHandler {
             if !self.attached_size_selection_is_current(
                 &state,
                 &active_attach,
+                &active_control,
                 &request.session_name,
                 &size_selection,
                 switch_window_target.is_none(),
@@ -424,6 +426,7 @@ impl RequestHandler {
             active.session_name = request.session_name.clone();
             active.session_id = request.session_id;
 
+            drop(active_control);
             drop(active_attach);
             drop(state);
             if let Some(effects) = mode_tree_effects {

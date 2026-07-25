@@ -196,8 +196,7 @@ async fn attached_size_selection_retries_after_the_captured_window_is_killed() {
         .expect("initial attached resize succeeds");
     {
         let mut active_attach = handler.active_attach.lock().await;
-        let size_sequence = active_attach.next_size_sequence;
-        active_attach.next_size_sequence = size_sequence.saturating_add(1);
+        let size_sequence = handler.next_client_size_sequence();
         let active = active_attach
             .by_pid
             .get_mut(&attach_pid)
@@ -381,8 +380,7 @@ async fn attached_candidate_cannot_change_between_final_validation_and_apply() {
         let mutation = tokio::spawn(async move {
             let mut active_attach = mutation_handler.active_attach.lock().await;
             acquired_after_lock.store(true, std::sync::atomic::Ordering::Release);
-            let size_sequence = active_attach.next_size_sequence;
-            active_attach.next_size_sequence = size_sequence.saturating_add(1);
+            let size_sequence = mutation_handler.next_client_size_sequence();
             let active = active_attach
                 .by_pid
                 .get_mut(&attach_pid)
@@ -429,8 +427,7 @@ async fn set_attached_candidate_size(
     size: TerminalSize,
 ) {
     let mut active_attach = handler.active_attach.lock().await;
-    let size_sequence = active_attach.next_size_sequence;
-    active_attach.next_size_sequence = size_sequence.saturating_add(1);
+    let size_sequence = handler.next_client_size_sequence();
     let active = active_attach
         .by_pid
         .get_mut(&attach_pid)

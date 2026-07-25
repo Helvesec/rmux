@@ -1604,8 +1604,7 @@ mod tests {
         size: TerminalSize,
     ) {
         let mut active_attach = handler.active_attach.lock().await;
-        let size_sequence = active_attach.next_size_sequence;
-        active_attach.next_size_sequence = size_sequence.saturating_add(1);
+        let size_sequence = handler.next_client_size_sequence();
         let active = active_attach
             .by_pid
             .get_mut(&attach_pid)

@@ -269,8 +269,15 @@ pub(super) struct PtyAttachedClient {
 }
 
 impl PtyAttachedClient {
-    pub(super) fn spawn(mut command: Command) -> Result<Self, Box<dyn Error>> {
-        let pty = PtyPair::open_with_size(PtyTerminalSize { cols: 80, rows: 24 })?;
+    pub(super) fn spawn(command: Command) -> Result<Self, Box<dyn Error>> {
+        Self::spawn_with_size(command, PtyTerminalSize { cols: 80, rows: 24 })
+    }
+
+    pub(super) fn spawn_with_size(
+        mut command: Command,
+        size: PtyTerminalSize,
+    ) -> Result<Self, Box<dyn Error>> {
+        let pty = PtyPair::open_with_size(size)?;
         let master = File::from(pty.master().try_clone()?.into_owned_fd()?);
         let _terminal = File::from(pty.slave().try_clone()?.into_owned_fd());
         // SAFETY: fcntl is called on a valid file descriptor obtained from the PTY master.
@@ -392,6 +399,18 @@ pub(super) fn spawn_rmux_attached_input_client(
     harness: &TmuxCompatHarness,
     session_name: &str,
 ) -> Result<PtyAttachedClient, Box<dyn Error>> {
+    spawn_rmux_attached_input_client_at_size(
+        harness,
+        session_name,
+        PtyTerminalSize { cols: 80, rows: 24 },
+    )
+}
+
+pub(super) fn spawn_rmux_attached_input_client_at_size(
+    harness: &TmuxCompatHarness,
+    session_name: &str,
+    size: PtyTerminalSize,
+) -> Result<PtyAttachedClient, Box<dyn Error>> {
     let home = harness.tmpdir().join("home");
     let xdg = harness.tmpdir().join("xdg");
     fs::create_dir_all(&home)?;
@@ -408,13 +427,27 @@ pub(super) fn spawn_rmux_attached_input_client(
         .env("LC_CTYPE", "C.UTF-8")
         .env_remove("RMUX")
         .args(["attach-session", "-t", session_name]);
-    PtyAttachedClient::spawn(command)
+    PtyAttachedClient::spawn_with_size(command, size)
 }
 
 pub(super) fn spawn_tmux_attached_input_client(
     harness: &TmuxCompatHarness,
     tmux_binary: &Path,
     session_name: &str,
+) -> Result<PtyAttachedClient, Box<dyn Error>> {
+    spawn_tmux_attached_input_client_at_size(
+        harness,
+        tmux_binary,
+        session_name,
+        PtyTerminalSize { cols: 80, rows: 24 },
+    )
+}
+
+pub(super) fn spawn_tmux_attached_input_client_at_size(
+    harness: &TmuxCompatHarness,
+    tmux_binary: &Path,
+    session_name: &str,
+    size: PtyTerminalSize,
 ) -> Result<PtyAttachedClient, Box<dyn Error>> {
     let mut command = Command::new(tmux_binary);
     command
@@ -427,7 +460,7 @@ pub(super) fn spawn_tmux_attached_input_client(
         .arg("-S")
         .arg(harness.tmux_socket_path())
         .args(["attach-session", "-t", session_name]);
-    PtyAttachedClient::spawn(command)
+    PtyAttachedClient::spawn_with_size(command, size)
 }
 
 pub(super) struct AttachedClientDeadline {

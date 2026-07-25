@@ -40,7 +40,7 @@ async fn refresh_client_control_size_respects_window_size_policy_like_tmux37() {
         let session = session_name(&format!("control-refresh-{policy}"));
         create_session(&handler, session.clone(), INITIAL_SIZE).await;
         set_window_size_policy(&handler, &session, policy).await;
-        let _attach_events = register_attached_client(
+        let (_attach_id, _attach_events) = register_attached_client(
             &handler,
             92_200 + index as u32,
             &session,
@@ -48,7 +48,8 @@ async fn refresh_client_control_size_respects_window_size_policy_like_tmux37() {
         )
         .await;
         let requester_pid = std::process::id();
-        let _events = register_control_client(&handler, requester_pid, &session).await;
+        let (_control_id, _events) =
+            register_control_client_with_id(&handler, requester_pid, &session).await;
 
         let response = handler
             .handle(Request::RefreshClient(Box::new(
@@ -81,7 +82,8 @@ async fn switch_control_client_reapplies_reported_size_like_tmux37() {
     let source = session_name("control-switch-source");
     create_session(&handler, source.clone(), INITIAL_SIZE).await;
     let requester_pid = std::process::id();
-    let _events = register_control_client(&handler, requester_pid, &source).await;
+    let (_control_id, _events) =
+        register_control_client_with_id(&handler, requester_pid, &source).await;
     let refreshed = handler
         .handle(Request::RefreshClient(Box::new(
             refresh_client_size_request(requester_pid, CONTROL_SIZE),
@@ -104,7 +106,7 @@ async fn switch_control_client_reapplies_reported_size_like_tmux37() {
         let target = session_name(&format!("control-switch-{policy}"));
         create_session(&handler, target.clone(), TARGET_SIZE).await;
         set_window_size_policy(&handler, &target, policy).await;
-        let _attach_events = register_attached_client(
+        let (_attach_id, _attach_events) = register_attached_client(
             &handler,
             92_300 + index as u32,
             &target,
@@ -145,8 +147,10 @@ async fn control_clients_share_largest_and_smallest_size_candidates_like_tmux37(
         set_window_size_policy(&handler, &session, policy).await;
         let first_pid = 92_400 + index as u32 * 2;
         let second_pid = first_pid + 1;
-        let _first_events = register_control_client(&handler, first_pid, &session).await;
-        let _second_events = register_control_client(&handler, second_pid, &session).await;
+        let (_first_id, _first_events) =
+            register_control_client_with_id(&handler, first_pid, &session).await;
+        let (_second_id, _second_events) =
+            register_control_client_with_id(&handler, second_pid, &session).await;
 
         for (pid, size) in [(first_pid, first_size), (second_pid, second_size)] {
             let response = handler
@@ -166,6 +170,197 @@ async fn control_clients_share_largest_and_smallest_size_candidates_like_tmux37(
             "{policy}"
         );
     }
+}
+
+#[tokio::test]
+async fn attached_arrival_and_departure_keep_control_geometry_in_every_automatic_policy() {
+    // Frozen tmux 3.7b oracle, 2026-07-25: a control client remains a
+    // window-size candidate while an ordinary attach arrives and after it
+    // departs. Latest follows arrival order; largest/smallest aggregate both.
+    for (index, (policy, control_size, attach_size, attached_size)) in [
+        ("latest", CONTROL_SIZE, TARGET_SIZE, TARGET_SIZE),
+        ("largest", CONTROL_SIZE, TARGET_SIZE, CONTROL_SIZE),
+        ("smallest", TARGET_SIZE, CONTROL_SIZE, TARGET_SIZE),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let handler = RequestHandler::new();
+        let session = session_name(&format!("control-attach-{policy}"));
+        create_session(&handler, session.clone(), INITIAL_SIZE).await;
+        set_window_size_policy(&handler, &session, policy).await;
+        let control_pid = 92_500 + index as u32 * 2;
+        let attach_pid = control_pid + 1;
+        let (_control_id, _control_events) =
+            register_control_client_with_id(&handler, control_pid, &session).await;
+        let refreshed = handler
+            .handle(Request::RefreshClient(Box::new(
+                refresh_client_size_request(control_pid, control_size),
+            )))
+            .await;
+        assert!(
+            matches!(refreshed, Response::RefreshClient(_)),
+            "{refreshed:?}"
+        );
+
+        let (attach_id, _attach_events) =
+            register_attached_client(&handler, attach_pid, &session, attach_size).await;
+        handler
+            .reconcile_attached_session_size_and_emit(&session)
+            .await
+            .expect("ordinary attach arrival reconciles mixed client geometry");
+        assert_eq!(
+            session_size(&handler, &session).await,
+            attached_size,
+            "{policy} after ordinary attach"
+        );
+
+        handler.finish_attach(attach_pid, attach_id).await;
+        assert_eq!(
+            session_size(&handler, &session).await,
+            control_size,
+            "{policy} after ordinary detach"
+        );
+    }
+}
+
+#[tokio::test]
+async fn control_departure_reconciles_surviving_control_geometry() {
+    // Frozen tmux 3.7b oracle, 2026-07-25: removing the winning control
+    // candidate restores the surviving control for latest/largest/smallest.
+    for (index, (policy, first_size, second_size, removed_first, expected_size)) in [
+        ("latest", CONTROL_SIZE, TARGET_SIZE, false, CONTROL_SIZE),
+        ("largest", CONTROL_SIZE, TARGET_SIZE, true, TARGET_SIZE),
+        ("smallest", TARGET_SIZE, CONTROL_SIZE, true, CONTROL_SIZE),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let handler = RequestHandler::new();
+        let session = session_name(&format!("control-depart-{policy}"));
+        create_session(&handler, session.clone(), INITIAL_SIZE).await;
+        set_window_size_policy(&handler, &session, policy).await;
+        let first_pid = 92_600 + index as u32 * 2;
+        let second_pid = first_pid + 1;
+        let (first_id, _first_events) =
+            register_control_client_with_id(&handler, first_pid, &session).await;
+        let (second_id, _second_events) =
+            register_control_client_with_id(&handler, second_pid, &session).await;
+        for (pid, size) in [(first_pid, first_size), (second_pid, second_size)] {
+            let response = handler
+                .handle(Request::RefreshClient(Box::new(
+                    refresh_client_size_request(pid, size),
+                )))
+                .await;
+            assert!(
+                matches!(response, Response::RefreshClient(_)),
+                "{response:?}"
+            );
+        }
+
+        let (removed_pid, removed_id) = if removed_first {
+            (first_pid, first_id)
+        } else {
+            (second_pid, second_id)
+        };
+        handler.finish_control(removed_pid, removed_id).await;
+        assert_eq!(
+            session_size(&handler, &session).await,
+            expected_size,
+            "{policy} after control departure"
+        );
+    }
+}
+
+#[tokio::test]
+async fn window_size_option_reconciliation_includes_control_candidates() {
+    let handler = RequestHandler::new();
+    let session = session_name("control-option-reconcile");
+    create_session(&handler, session.clone(), INITIAL_SIZE).await;
+    let control_pid = 92_650;
+    let (_control_id, _control_events) =
+        register_control_client_with_id(&handler, control_pid, &session).await;
+    let refreshed = handler
+        .handle(Request::RefreshClient(Box::new(
+            refresh_client_size_request(control_pid, CONTROL_SIZE),
+        )))
+        .await;
+    assert!(
+        matches!(refreshed, Response::RefreshClient(_)),
+        "{refreshed:?}"
+    );
+    let (_attach_id, _attach_events) =
+        register_attached_client(&handler, 92_651, &session, TARGET_SIZE).await;
+
+    for (policy, expected_size) in [
+        ("largest", CONTROL_SIZE),
+        ("smallest", TARGET_SIZE),
+        ("latest", TARGET_SIZE),
+    ] {
+        set_window_size_policy(&handler, &session, policy).await;
+        assert_eq!(
+            session_size(&handler, &session).await,
+            expected_size,
+            "{policy} option reconciliation"
+        );
+    }
+}
+
+#[tokio::test]
+async fn control_resize_racing_reconcile_cannot_apply_a_stale_geometry() {
+    let handler = RequestHandler::new();
+    let session = session_name("control-resize-selection-race");
+    create_session(&handler, session.clone(), INITIAL_SIZE).await;
+    set_window_size_policy(&handler, &session, "largest").await;
+    let (_attach_id, _attach_events) =
+        register_attached_client(&handler, 92_700, &session, INITIAL_SIZE).await;
+    let control_pid = 92_701;
+    let (_control_id, _control_events) =
+        register_control_client_with_id(&handler, control_pid, &session).await;
+    let refreshed = handler
+        .handle(Request::RefreshClient(Box::new(
+            refresh_client_size_request(control_pid, CONTROL_SIZE),
+        )))
+        .await;
+    assert!(
+        matches!(refreshed, Response::RefreshClient(_)),
+        "{refreshed:?}"
+    );
+
+    let pause = handler.install_attached_size_selection_pause();
+    let reconcile_handler = handler.clone();
+    let reconcile_session = session.clone();
+    let reconcile = tokio::spawn(async move {
+        reconcile_handler
+            .reconcile_attached_session_size(&reconcile_session)
+            .await
+    });
+    pause.reached.notified().await;
+
+    let newest_size = TerminalSize {
+        cols: 120,
+        rows: 45,
+    };
+    let refreshed = handler
+        .handle(Request::RefreshClient(Box::new(
+            refresh_client_size_request(control_pid, newest_size),
+        )))
+        .await;
+    assert!(
+        matches!(refreshed, Response::RefreshClient(_)),
+        "{refreshed:?}"
+    );
+    pause.release.notify_one();
+
+    reconcile
+        .await
+        .expect("reconcile task joins")
+        .expect("reconcile succeeds");
+    assert_eq!(
+        session_size(&handler, &session).await,
+        newest_size,
+        "a selection predating the control resize must be retried"
+    );
 }
 
 fn session_name(value: &str) -> SessionName {
@@ -196,13 +391,13 @@ async fn set_window_size_policy(handler: &RequestHandler, session: &SessionName,
     assert!(matches!(response, Response::SetOption(_)), "{response:?}");
 }
 
-async fn register_control_client(
+async fn register_control_client_with_id(
     handler: &RequestHandler,
     requester_pid: u32,
     session: &SessionName,
-) -> mpsc::Receiver<ControlServerEvent> {
+) -> (u64, mpsc::Receiver<ControlServerEvent>) {
     let (event_tx, event_rx) = mpsc::channel(CONTROL_SERVER_EVENT_CAPACITY);
-    handler
+    let control_id = handler
         .register_control_with_closing(
             requester_pid,
             ControlModeUpgrade {
@@ -218,7 +413,7 @@ async fn register_control_client(
         .set_control_session(requester_pid, Some(session.clone()))
         .await
         .expect("set control session");
-    event_rx
+    (control_id, event_rx)
 }
 
 async fn register_attached_client(
@@ -226,14 +421,13 @@ async fn register_attached_client(
     requester_pid: u32,
     session: &SessionName,
     size: TerminalSize,
-) -> mpsc::UnboundedReceiver<crate::pane_io::AttachControl> {
+) -> (u64, mpsc::UnboundedReceiver<crate::pane_io::AttachControl>) {
     let (control_tx, control_rx) = mpsc::unbounded_channel();
-    handler
+    let attach_id = handler
         .register_attach(requester_pid, session.clone(), control_tx)
         .await;
     let mut active_attach = handler.active_attach.lock().await;
-    let size_sequence = active_attach.next_size_sequence;
-    active_attach.next_size_sequence = size_sequence.saturating_add(1);
+    let size_sequence = handler.next_client_size_sequence();
     let active = active_attach
         .by_pid
         .get_mut(&requester_pid)
@@ -242,7 +436,7 @@ async fn register_attached_client(
     active.size_sequence = size_sequence;
     drop(active_attach);
     handler.bump_active_attach_epoch();
-    control_rx
+    (attach_id, control_rx)
 }
 
 fn refresh_client_size_request(
