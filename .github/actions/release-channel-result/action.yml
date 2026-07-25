@@ -14,6 +14,9 @@ inputs:
   release-ref: {required: true}
   producer-workflow-path: {required: true}
   producer-workflow-id: {required: false, default: "316435347"}
+  producer-head-sha: {required: false, default: ""}
+  producer-source-ref: {required: false, default: ""}
+  attestation-signer-workflow-path: {required: false, default: ""}
   runner-image: {required: true}
 
 outputs:
@@ -38,6 +41,9 @@ runs:
         RMUX_TARGET_EVIDENCE: ${{ inputs.target-evidence }}
         RMUX_PRODUCER_WORKFLOW_PATH: ${{ inputs.producer-workflow-path }}
         RMUX_PRODUCER_WORKFLOW_ID: ${{ inputs.producer-workflow-id }}
+        RMUX_PRODUCER_HEAD_SHA: ${{ inputs.producer-head-sha }}
+        RMUX_PRODUCER_SOURCE_REF: ${{ inputs.producer-source-ref }}
+        RMUX_ATTESTATION_SIGNER_WORKFLOW_PATH: ${{ inputs.attestation-signer-workflow-path }}
         RMUX_RUNNER_IMAGE: ${{ inputs.runner-image }}
       run: |
         set -euo pipefail
@@ -52,6 +58,19 @@ runs:
         test -f "$root/plan/receipt-reference.json"
         test -f "$RMUX_TARGET_EVIDENCE"
         [[ "$RMUX_PRODUCER_WORKFLOW_ID" =~ ^[1-9][0-9]*$ ]]
+        producer_head_sha="${RMUX_PRODUCER_HEAD_SHA:-${{ inputs.source-sha }}}"
+        producer_source_ref="${RMUX_PRODUCER_SOURCE_REF:-refs/tags/${{ inputs.release-ref }}}"
+        attestation_signer="${RMUX_ATTESTATION_SIGNER_WORKFLOW_PATH:-$RMUX_PRODUCER_WORKFLOW_PATH}"
+        [[ "$producer_head_sha" =~ ^[0-9a-f]{40}$ ]]
+        [[ "$producer_source_ref" =~ ^refs/(heads|tags)/[A-Za-z0-9._/-]+$ ]]
+        [[ "$attestation_signer" =~ ^\.github/workflows/release-[a-z0-9-]+\.yml$ ]]
+        if [ -n "$RMUX_PRODUCER_HEAD_SHA$RMUX_PRODUCER_SOURCE_REF$RMUX_ATTESTATION_SIGNER_WORKFLOW_PATH" ]; then
+          test -n "$RMUX_PRODUCER_HEAD_SHA"
+          test -n "$RMUX_PRODUCER_SOURCE_REF"
+          test -n "$RMUX_ATTESTATION_SIGNER_WORKFLOW_PATH"
+          test "$GITHUB_SHA" = "$producer_head_sha"
+          test "$GITHUB_REF" = "$producer_source_ref"
+        fi
         python3 - "$GITHUB_RUN_ID" "$RMUX_PRODUCER_WORKFLOW_ID" \
           "$RMUX_PRODUCER_WORKFLOW_PATH" "$RMUX_RUNNER_IMAGE" \
           "$root/result-producer.json" <<'PY'
@@ -93,6 +112,9 @@ runs:
         digest="$(sha256sum < "$RMUX_TARGET_EVIDENCE" | cut -d' ' -f1)"
         echo "subject_digest=sha256:$digest" >> "$GITHUB_OUTPUT"
         echo "observed_at=$observed_at" >> "$GITHUB_OUTPUT"
+        echo "producer_head_sha=$producer_head_sha" >> "$GITHUB_OUTPUT"
+        echo "producer_source_ref=$producer_source_ref" >> "$GITHUB_OUTPUT"
+        echo "attestation_signer=$attestation_signer" >> "$GITHUB_OUTPUT"
 
     - id: attestation
       name: Attest the exact downstream target observation
@@ -143,7 +165,7 @@ runs:
         --repository "$GITHUB_REPOSITORY" --run-id "$GITHUB_RUN_ID"
         --artifact-id "${{ steps.result-upload.outputs.artifact-id }}"
         --name "rmux-downstream-${{ inputs.channel }}-result-${{ inputs.source-sha }}-${{ inputs.release-id }}"
-        --expected-source-sha "${{ inputs.source-sha }}" --max-attempts 6
+        --expected-source-sha "${{ steps.predicate.outputs.producer_head_sha }}" --max-attempts 6
         --retry-delay-seconds 2
         > "$RMUX_PREPARED_ROOT/result-artifact.json"
 
@@ -160,7 +182,9 @@ runs:
           --predicate "$root/downstream-channel-result-predicate.json"
           --attestation-id "${{ steps.attestation.outputs.attestation-id }}"
           --attestation-bundle "$root/result-bundle/downstream-channel-result.sigstore.json"
-          --bundle-artifact "$root/result-artifact.json" --created-at "$created_at"
+          --bundle-artifact "$root/result-artifact.json"
+          --artifact-source-sha "${{ steps.predicate.outputs.producer_head_sha }}"
+          --created-at "$created_at"
         )
         scripts/release/channel-result.py create-envelope "${common[@]}" \
           --output "$root/downstream-channel-result-envelope.json"
@@ -187,7 +211,7 @@ runs:
         --repository "$GITHUB_REPOSITORY" --run-id "$GITHUB_RUN_ID"
         --artifact-id "${{ steps.envelope-upload.outputs.artifact-id }}"
         --name "rmux-downstream-${{ inputs.channel }}-result-envelope-${{ inputs.source-sha }}-${{ inputs.release-id }}"
-        --expected-source-sha "${{ inputs.source-sha }}" --max-attempts 6
+        --expected-source-sha "${{ steps.predicate.outputs.producer_head_sha }}" --max-attempts 6
         --retry-delay-seconds 2
         > "$RMUX_PREPARED_ROOT/envelope-artifact.json"
 
@@ -214,6 +238,9 @@ runs:
         --predicate "$RMUX_PREPARED_ROOT/downstream-channel-result-predicate.json"
         --envelope "$RMUX_PREPARED_ROOT/downstream-channel-result-envelope.json"
         --source-sha "${{ inputs.source-sha }}" --release-ref "${{ inputs.release-ref }}"
+        --producer-source-sha "${{ steps.predicate.outputs.producer_head_sha }}"
+        --producer-source-ref "${{ steps.predicate.outputs.producer_source_ref }}"
+        --attestation-signer-workflow "${{ steps.predicate.outputs.attestation_signer }}"
         --channel "${{ inputs.channel }}"
 
     - name: Create and verify the exact result reference
@@ -230,6 +257,7 @@ runs:
           --envelope "$root/downstream-channel-result-envelope.json"
           --predicate-artifact "$root/result-artifact.json"
           --envelope-artifact "$root/envelope-artifact.json"
+          --artifact-source-sha "${{ steps.predicate.outputs.producer_head_sha }}"
           --verified-at "$verified_at"
         )
         scripts/release/channel-result-reference.py create "${common[@]}" \

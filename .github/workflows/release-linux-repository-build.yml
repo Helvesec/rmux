@@ -4,6 +4,8 @@ on:
   workflow_call:
     inputs:
       receipt_run_id: {required: true, type: string}
+      plan_artifact_id: {required: false, type: string, default: ""}
+      plan_artifact_digest: {required: false, type: string, default: ""}
       payload_artifact_id: {required: true, type: string}
       payload_artifact_digest: {required: true, type: string}
       expected_source_sha: {required: true, type: string}
@@ -22,6 +24,8 @@ on:
         required: false
       RMUX_RPM_REPO_GPG_KEY:
         required: false
+      RMUX_DOWNSTREAM_APP_PRIVATE_KEY:
+        required: false
     outputs:
       repository_artifact_id:
         value: ${{ jobs.build.outputs.repository_artifact_id }}
@@ -30,6 +34,8 @@ on:
   workflow_dispatch:
     inputs:
       receipt_run_id: {required: true, type: string}
+      plan_artifact_id: {required: true, type: string}
+      plan_artifact_digest: {required: true, type: string}
       payload_artifact_id: {required: true, type: string}
       payload_artifact_digest: {required: true, type: string}
       expected_source_sha: {required: true, type: string}
@@ -52,6 +58,8 @@ jobs:
       repository_artifact_digest: sha256:${{ steps.upload.outputs.artifact-digest }}
     env:
       RMUX_RECEIPT_RUN_ID: ${{ inputs.receipt_run_id }}
+      RMUX_PLAN_ARTIFACT_ID: ${{ inputs.plan_artifact_id }}
+      RMUX_PLAN_ARTIFACT_DIGEST: ${{ inputs.plan_artifact_digest }}
       RMUX_PAYLOAD_ARTIFACT_ID: ${{ inputs.payload_artifact_id }}
       RMUX_PAYLOAD_ARTIFACT_DIGEST: ${{ inputs.payload_artifact_digest }}
       RMUX_SOURCE_SHA: ${{ inputs.expected_source_sha }}
@@ -73,6 +81,11 @@ jobs:
           [[ "$RMUX_RELEASE_REF" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]
           if test "$GITHUB_RUN_ID" != "$RMUX_RECEIPT_RUN_ID"; then
             test "$GITHUB_REF" = "refs/heads/main"
+            [[ "$RMUX_PLAN_ARTIFACT_ID" =~ ^[1-9][0-9]*$ ]]
+            [[ "$RMUX_PLAN_ARTIFACT_DIGEST" =~ ^sha256:[0-9a-f]{64}$ ]]
+          else
+            test -z "$RMUX_PLAN_ARTIFACT_ID"
+            test -z "$RMUX_PLAN_ARTIFACT_DIGEST"
           fi
 
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
@@ -80,15 +93,12 @@ jobs:
           persist-credentials: false
 
       - name: Verify exact APT/RPM payload artifact identity
+        if: github.run_id == inputs.receipt_run_id
         shell: bash
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
-          mode=(--allow-completed-failed-run)
-          if test "$GITHUB_RUN_ID" = "$RMUX_RECEIPT_RUN_ID"; then
-            mode=(--allow-running-current-run)
-          fi
           scripts/release/actions-artifact.py verify \
             --repository "$GITHUB_REPOSITORY" --run-id "$RMUX_RECEIPT_RUN_ID" \
             --artifact-id "$RMUX_PAYLOAD_ARTIFACT_ID" \
@@ -98,24 +108,30 @@ jobs:
             --expected-workflow-id 316435347 \
             --expected-workflow-path .github/workflows/release-receipt.yml \
             --expected-event workflow_dispatch --expected-head-branch "$RMUX_RELEASE_REF" \
-            "${mode[@]}" --max-attempts 1
+            --allow-running-current-run --max-attempts 1
 
-      - name: Preserve protected recovery metadata generator
-        shell: bash
-        run: |
-          set -euo pipefail
-          generator="$RUNNER_TEMP/rmux-recovery-generate-apt-repository.sh"
-          rm -f "$generator"
-          if test "$GITHUB_RUN_ID" != "$RMUX_RECEIPT_RUN_ID"; then
-            install -m 0755 scripts/generate-apt-repository.sh "$generator"
-          fi
+      - id: recovery
+        name: Authorize failed-receipt recovery before constructing signed bytes
+        if: github.run_id != inputs.receipt_run_id
+        uses: ./.github/actions/release-linux-repository-recovery-authorize
+        with:
+          receipt-run-id: ${{ inputs.receipt_run_id }}
+          plan-artifact-id: ${{ inputs.plan_artifact_id }}
+          plan-artifact-digest: ${{ inputs.plan_artifact_digest }}
+          payload-artifact-id: ${{ inputs.payload_artifact_id }}
+          payload-artifact-digest: ${{ inputs.payload_artifact_digest }}
+          source-sha: ${{ inputs.expected_source_sha }}
+          release-id: ${{ inputs.release_id }}
+          release-ref: ${{ inputs.release_ref }}
 
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
+        if: github.run_id == inputs.receipt_run_id
         with:
           ref: ${{ inputs.expected_source_sha }}
           persist-credentials: false
 
       - name: Download only the exact APT/RPM payload artifact ID
+        if: github.run_id == inputs.receipt_run_id
         uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
         with:
           artifact-ids: ${{ inputs.payload_artifact_id }}
@@ -166,17 +182,18 @@ jobs:
         run: |
           set -euo pipefail
           root="$RUNNER_TEMP/rmux-linux-repository"
+          input="$root/input"
+          if test "$GITHUB_RUN_ID" != "$RMUX_RECEIPT_RUN_ID"; then
+            input="${{ steps.recovery.outputs.payload-root }}"
+          fi
           version="${RMUX_RELEASE_REF#v}"
           apt_generator="scripts/generate-apt-repository.sh"
-          if test -x "$RUNNER_TEMP/rmux-recovery-generate-apt-repository.sh"; then
-            apt_generator="$RUNNER_TEMP/rmux-recovery-generate-apt-repository.sh"
-          fi
           git clone --depth 1 --branch main \
             https://github.com/Helvesec/rmux-packages.git "$root/history"
           base="$(git -C "$root/history" rev-parse HEAD)"
           printf '%s\n' "$base" > "$root/PACKAGE_REPOSITORY_BASE"
           mkdir "$root/packages" "$root/output"
-          find "$root/input" -maxdepth 1 -type f \( -name '*.deb' -o -name '*.rpm' \) \
+          find "$input" -maxdepth 1 -type f \( -name '*.deb' -o -name '*.rpm' \) \
             -exec cp -- {} "$root/packages/" \;
           test "$(find "$root/packages" -maxdepth 1 -type f | wc -l)" -eq 4
           scripts/retain-linux-package-history.py \
@@ -219,6 +236,22 @@ jobs:
           test -s "$root/debian/dists/stable/InRelease"
           test -s "$root/rpm/repodata/repomd.xml.asc"
 
+      - name: Bind a manual signer artifact to its original failed receipt
+        if: github.run_id != inputs.receipt_run_id
+        shell: bash
+        run: >-
+          scripts/release/linux_repository_recovery.py create-manifest
+          --run-id "$GITHUB_RUN_ID" --protected-main-sha "$GITHUB_SHA"
+          --receipt-run-id "$RMUX_RECEIPT_RUN_ID"
+          --plan-artifact-id "$RMUX_PLAN_ARTIFACT_ID"
+          --plan-artifact-digest "$RMUX_PLAN_ARTIFACT_DIGEST"
+          --payload-artifact-id "$RMUX_PAYLOAD_ARTIFACT_ID"
+          --payload-artifact-digest "$RMUX_PAYLOAD_ARTIFACT_DIGEST"
+          --source-sha "$RMUX_SOURCE_SHA" --release-id "$RMUX_RELEASE_ID"
+          --release-ref "$RMUX_RELEASE_REF"
+          --repository-base "$RUNNER_TEMP/rmux-linux-repository/output/PACKAGE_REPOSITORY_BASE"
+          --output "$RUNNER_TEMP/rmux-linux-repository/output/LINUX_REPOSITORY_RECOVERY.json"
+
       - id: upload
         name: Upload the exact signed repository tree
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
@@ -228,3 +261,30 @@ jobs:
           if-no-files-found: error
           retention-days: 7
           compression-level: 0
+
+  publish-recovery:
+    name: Publish only this run's authorized recovery artifact
+    needs: build
+    if: inputs.plan_artifact_id != ''
+    uses: ./.github/workflows/release-linux-repository-publish.yml
+    permissions:
+      actions: read
+      attestations: write
+      contents: read
+      id-token: write
+    secrets:
+      RMUX_DOWNSTREAM_APP_PRIVATE_KEY: ${{ secrets.RMUX_DOWNSTREAM_APP_PRIVATE_KEY }}
+    with:
+      receipt_run_id: ${{ inputs.receipt_run_id }}
+      plan_artifact_id: ${{ inputs.plan_artifact_id }}
+      plan_artifact_digest: ${{ inputs.plan_artifact_digest }}
+      payload_artifact_id: ${{ inputs.payload_artifact_id }}
+      payload_artifact_digest: ${{ inputs.payload_artifact_digest }}
+      repository_artifact_id: ${{ needs.build.outputs.repository_artifact_id }}
+      repository_artifact_digest: ${{ needs.build.outputs.repository_artifact_digest }}
+      repository_artifact_run_id: ${{ github.run_id }}
+      repository_artifact_source_sha: ${{ github.sha }}
+      expected_source_sha: ${{ inputs.expected_source_sha }}
+      release_id: ${{ inputs.release_id }}
+      release_ref: ${{ inputs.release_ref }}
+      recovery_mode: true

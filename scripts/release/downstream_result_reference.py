@@ -30,6 +30,7 @@ from downstream_result import (
     validate_mutation_state,
     validate_producer,
     validate_remote_identity,
+    validate_result_artifact_source,
     validate_target_evidence,
 )
 from downstream_result_document import validate_envelope, validate_predicate
@@ -184,6 +185,7 @@ def create_reference(
     predicate_artifact_path: Path,
     envelope_artifact_path: Path,
     verified_at: str,
+    artifact_source_sha: str | None = None,
 ) -> dict[str, Any]:
     for path, label in (
         (request_path, "channel request"),
@@ -207,10 +209,16 @@ def create_reference(
     channel = predicate["channel"]
     release = predicate["release"]
     run_id = predicate["producer"]["run_id"]
+    artifact_source_sha = validate_result_artifact_source(
+        artifact_source_sha or source_sha,
+        channel=channel,
+        release_source_sha=source_sha,
+        producer=predicate["producer"],
+    )
     predicate_artifact = artifact_reference(
         read_object(predicate_artifact_path, "predicate artifact metadata"),
         expected_name=f"rmux-downstream-{channel}-result-{source_sha}-{release['id']}",
-        source_sha=source_sha,
+        source_sha=artifact_source_sha,
         run_id=run_id,
     )
     envelope_artifact = artifact_reference(
@@ -218,7 +226,7 @@ def create_reference(
         expected_name=(
             f"rmux-downstream-{channel}-result-envelope-{source_sha}-{release['id']}"
         ),
-        source_sha=source_sha,
+        source_sha=artifact_source_sha,
         run_id=run_id,
     )
     if envelope["result_bundle"] != predicate_artifact:

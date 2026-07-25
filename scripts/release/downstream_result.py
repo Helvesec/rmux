@@ -33,6 +33,8 @@ REMOTE_MUTATION_STATES = {"submitted", "pending-moderation", "public-live"}
 NO_MUTATION_STATES = {"blocked", "denied-by-policy", "prepared"}
 OBSERVED_TARGET_STATES = REMOTE_MUTATION_STATES | {"no-op-exact"}
 RETRYABLE_STATES = {"prepared", "failed-transient"}
+LINUX_RECOVERY_PRODUCER = ".github/workflows/release-linux-repository-build.yml"
+LINUX_RECOVERY_SIGNER = ".github/workflows/release-linux-repository-publish.yml"
 
 
 def result_state(value: Any) -> str:
@@ -69,9 +71,12 @@ def validate_producer(value: Any, channel: str) -> dict[str, Any]:
     if not isinstance(workflows, dict):
         raise ValueError("result producer workflow allowlist is missing")
     expected_workflow_id = workflows.get(value["workflow_path"])
-    if (
-        type(expected_workflow_id) is not int
-        or positive(value["workflow_id"], "result workflow ID") != expected_workflow_id
+    derived = _result_contract().get("derived_producer_workflows", {}).get(channel)
+    if not isinstance(derived, list) or not all(isinstance(item, str) for item in derived):
+        raise ValueError("derived result producer workflow allowlist is missing")
+    workflow_id = positive(value["workflow_id"], "result workflow ID")
+    if value["workflow_path"] not in derived and (
+        type(expected_workflow_id) is not int or workflow_id != expected_workflow_id
     ):
         raise ValueError("result producer workflow is not allowlisted for its channel")
     expected_image = "windows-latest" if channel == "chocolatey" else "ubuntu-22.04"
@@ -84,6 +89,17 @@ def validate_producer(value: Any, channel: str) -> dict[str, Any]:
     ):
         raise ValueError("result producer is not the expected GitHub-hosted runner")
     return value
+
+
+def validate_result_artifact_source(
+    value: Any, *, channel: str, release_source_sha: str, producer: dict[str, Any]
+) -> str:
+    source_sha = match(value, SHA40, "result artifact source SHA")
+    if source_sha != release_source_sha and (
+        channel != "apt_rpm" or producer.get("workflow_path") != LINUX_RECOVERY_PRODUCER
+    ):
+        raise ValueError("result artifact source differs from its release")
+    return source_sha
 
 
 def validate_mutation_state(

@@ -21,6 +21,7 @@ def arguments(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--envelope", type=Path, required=True)
     parser.add_argument("--predicate-artifact", type=Path, required=True)
     parser.add_argument("--envelope-artifact", type=Path, required=True)
+    parser.add_argument("--artifact-source-sha")
     parser.add_argument("--verified-at", required=True)
 
 
@@ -45,6 +46,7 @@ def main() -> int:
         predicate_artifact_path=args.predicate_artifact,
         envelope_artifact_path=args.envelope_artifact,
         verified_at=args.verified_at,
+        artifact_source_sha=args.artifact_source_sha,
     )
     if args.command == "create":
         write_reference(args.output, expected)

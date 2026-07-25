@@ -13,6 +13,7 @@ inputs:
   source-sha: {required: true}
   release-id: {required: true}
   release-ref: {required: true}
+  receipt-run-lifecycle: {required: false, default: active-current}
 
 outputs:
   root:
@@ -42,6 +43,7 @@ runs:
         RMUX_SOURCE_SHA: ${{ inputs.source-sha }}
         RMUX_RELEASE_ID: ${{ inputs.release-id }}
         RMUX_RELEASE_REF: ${{ inputs.release-ref }}
+        RMUX_RECEIPT_RUN_LIFECYCLE: ${{ inputs.receipt-run-lifecycle }}
       run: |
         set -euo pipefail
         test "$GITHUB_REPOSITORY" = "Helvesec/rmux"
@@ -55,6 +57,13 @@ runs:
         [[ "$RMUX_PAYLOAD_ARTIFACT_DIGEST" =~ ^sha256:[0-9a-f]{64}$ ]]
         [[ "$RMUX_SOURCE_SHA" =~ ^[0-9a-f]{40}$ ]]
         [[ "$RMUX_RELEASE_REF" =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-rc\.[0-9]+)?$ ]]
+        [[ "$RMUX_RECEIPT_RUN_LIFECYCLE" =~ ^(active-current|completed-failure)$ ]]
+        if [ "$RMUX_RECEIPT_RUN_LIFECYCLE" = completed-failure ]; then
+          test "$RMUX_CHANNEL" = apt_rpm
+          test "$GITHUB_RUN_ID" != "$RMUX_RECEIPT_RUN_ID"
+          test "$GITHUB_EVENT_NAME" = workflow_dispatch
+          test "$GITHUB_REF" = refs/heads/main
+        fi
         if [ "$RMUX_CHANNEL" = rmux_io ]; then
           [[ "$RMUX_PRE_SITE_ARTIFACT_ID" =~ ^[1-9][0-9]*$ ]]
           [[ "$RMUX_PRE_SITE_ARTIFACT_DIGEST" =~ ^sha256:[0-9a-f]{64}$ ]]
@@ -84,9 +93,14 @@ runs:
         RMUX_SOURCE_SHA: ${{ inputs.source-sha }}
         RMUX_RELEASE_ID: ${{ inputs.release-id }}
         RMUX_RELEASE_REF: ${{ inputs.release-ref }}
+        RMUX_RECEIPT_RUN_LIFECYCLE: ${{ inputs.receipt-run-lifecycle }}
       run: |
         set -euo pipefail
         scripts/release/assert-release-capability.py downstream_channels
+        mode=(--allow-running-current-run)
+        if [ "$RMUX_RECEIPT_RUN_LIFECYCLE" = completed-failure ]; then
+          mode=(--allow-completed-failed-run)
+        fi
         scripts/release/actions-artifact.py verify \
           --repository "$GITHUB_REPOSITORY" --run-id "$RMUX_RECEIPT_RUN_ID" \
           --artifact-id "$RMUX_PLAN_ARTIFACT_ID" \
@@ -96,7 +110,7 @@ runs:
           --expected-workflow-id 316435347 \
           --expected-workflow-path .github/workflows/release-receipt.yml \
           --expected-event workflow_dispatch --expected-head-branch "$RMUX_RELEASE_REF" \
-          --allow-running-current-run \
+          "${mode[@]}" \
           --max-attempts 1
         scripts/release/actions-artifact.py verify \
           --repository "$GITHUB_REPOSITORY" --run-id "$RMUX_RECEIPT_RUN_ID" \
@@ -107,7 +121,7 @@ runs:
           --expected-workflow-id 316435347 \
           --expected-workflow-path .github/workflows/release-receipt.yml \
           --expected-event workflow_dispatch --expected-head-branch "$RMUX_RELEASE_REF" \
-          --allow-running-current-run \
+          "${mode[@]}" \
           --max-attempts 1
 
     - name: Verify the exact pre-site summary identity
@@ -181,6 +195,7 @@ runs:
         RMUX_RECEIPT_RUN_ID: ${{ inputs.receipt-run-id }}
         RMUX_PAYLOAD_ARTIFACT_ID: ${{ inputs.payload-artifact-id }}
         RMUX_SOURCE_SHA: ${{ inputs.source-sha }}
+        RMUX_RECEIPT_RUN_LIFECYCLE: ${{ inputs.receipt-run-lifecycle }}
       run: |
         set -euo pipefail
         root="${{ steps.paths.outputs.root }}"
@@ -190,7 +205,11 @@ runs:
           --name "rmux-downstream-$RMUX_CHANNEL-payload-$RMUX_SOURCE_SHA-${{ inputs.release-id }}" \
           --expected-source-sha "$RMUX_SOURCE_SHA" --max-attempts 1 \
           --include-retention > "$root/payload-artifact.json"
-        python3 - "$GITHUB_RUN_ID" "$RMUX_CHANNEL" "$root/producer.json" <<'PY'
+        producer_run_id="$GITHUB_RUN_ID"
+        if [ "$RMUX_RECEIPT_RUN_LIFECYCLE" = completed-failure ]; then
+          producer_run_id="$RMUX_RECEIPT_RUN_ID"
+        fi
+        python3 - "$producer_run_id" "$RMUX_CHANNEL" "$root/producer.json" <<'PY'
         import json, pathlib, sys
         run_id, channel, output_path = sys.argv[1:]
         job_workflow_path = (

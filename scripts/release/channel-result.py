@@ -24,6 +24,7 @@ from downstream_result import (
     result_state,
     validate_mutation_state,
     validate_producer,
+    validate_result_artifact_source,
     validate_target_evidence,
 )
 from downstream_result_reference import artifact_reference
@@ -99,10 +100,16 @@ def expected_envelope(args: argparse.Namespace) -> dict[str, Any]:
         f"rmux-downstream-{predicate['channel']}-result-"
         f"{predicate['source_git_sha']}-{predicate['release']['id']}"
     )
+    artifact_source_sha = validate_result_artifact_source(
+        getattr(args, "artifact_source_sha", None) or predicate["source_git_sha"],
+        channel=predicate["channel"],
+        release_source_sha=predicate["source_git_sha"],
+        producer=predicate["producer"],
+    )
     result_bundle = artifact_reference(
         read_object(args.bundle_artifact, "result bundle artifact"),
         expected_name=expected_name,
-        source_sha=predicate["source_git_sha"],
+        source_sha=artifact_source_sha,
         run_id=predicate["producer"]["run_id"],
     )
     created = timestamp(args.created_at, "result envelope created_at")
@@ -148,6 +155,7 @@ def envelope_arguments(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--attestation-id", required=True)
     parser.add_argument("--attestation-bundle", type=Path, required=True)
     parser.add_argument("--bundle-artifact", type=Path, required=True)
+    parser.add_argument("--artifact-source-sha")
     parser.add_argument("--created-at", required=True)
 
 

@@ -122,6 +122,19 @@
       "web_share": {".github/workflows/release-owned-repository-channel.yml": 316435347},
       "winget": {".github/workflows/release-policy-channel.yml": 316435347}
     },
+    "derived_producer_workflows": {
+      "apt_rpm": [".github/workflows/release-linux-repository-build.yml"],
+      "chocolatey": [],
+      "crates_io": [],
+      "homebrew_core": [],
+      "homebrew_tap": [],
+      "rmux_io": [],
+      "scoop": [],
+      "snap_candidate": [],
+      "snap_stable": [],
+      "web_share": [],
+      "winget": []
+    },
     "target_policies": {
       "apt_rpm": {"allowed_hosts": ["github.com", "packages.rmux.io"], "commit_sha_required": true},
       "chocolatey": {"allowed_hosts": ["community.chocolatey.org"], "commit_sha_required": false},

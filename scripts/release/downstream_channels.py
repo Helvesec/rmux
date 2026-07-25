@@ -318,6 +318,15 @@ def load_contract() -> dict[str, Any]:
         or result_evidence.get("final_result_count") != 11
         or result_evidence.get("rmux_io_pre_site_digest_field")
         != "pre_site_summary_sha256"
+        or result_evidence.get("derived_producer_workflows")
+        != {
+            channel: (
+                [".github/workflows/release-linux-repository-build.yml"]
+                if channel == "apt_rpm"
+                else []
+            )
+            for channel in CHANNELS
+        }
     ):
         raise ValueError("downstream channel contract is not fail-closed")
     return contract

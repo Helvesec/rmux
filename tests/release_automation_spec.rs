@@ -2477,6 +2477,11 @@ fn linux_repository_history_is_authenticated_before_retention() {
     assert!(!rejected_downgrade.status.success());
     assert!(stderr(&rejected_downgrade).contains("refusing to replace newer APT release"));
 
+    let rejected_republication = run_retention("0.8.0", "amd64", "x86_64", false, false);
+    assert!(!rejected_republication.status.success());
+    assert!(stderr(&rejected_republication)
+        .contains("published APT repository already contains current release 0.8.0"));
+
     fs::remove_file(staging.join("rmux_0.8.0_amd64.deb"))
         .expect("remove accepted retained package");
     fs::write(&apt_package, b"tampered").expect("tamper retained Debian package");

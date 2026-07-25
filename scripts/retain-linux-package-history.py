@@ -341,6 +341,10 @@ def latest_predecessor(
         raise HistoryError(
             f"refusing to replace newer {manager} release {newer[-1]} with {current}"
         )
+    if current in versions:
+        raise HistoryError(
+            f"published {manager} repository already contains current release {current}"
+        )
     predecessors = [version for version in versions if version < current]
     return max(predecessors, default=None)
 

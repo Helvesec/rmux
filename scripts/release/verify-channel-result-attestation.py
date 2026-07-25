@@ -11,9 +11,11 @@ from pathlib import Path
 
 from downstream_channels import (
     RESULT_PREDICATE_TYPE,
+    SHA40,
     file_hash,
     read_object,
 )
+from downstream_result import LINUX_RECOVERY_PRODUCER, LINUX_RECOVERY_SIGNER
 from downstream_result_document import validate_envelope, validate_predicate
 
 REPOSITORY = "Helvesec/rmux"
@@ -62,7 +64,27 @@ def verify(args: argparse.Namespace) -> None:
         or envelope["attestation"]["bundle_sha256"] != file_hash(bundle_path)
     ):
         raise ValueError("channel result identity differs from exact local bytes")
-    signer_path = predicate["producer"]["workflow_path"]
+    producer_path = predicate["producer"]["workflow_path"]
+    producer_source_sha = getattr(args, "producer_source_sha", None) or args.source_sha
+    producer_source_ref = (
+        getattr(args, "producer_source_ref", None) or f"refs/tags/{args.release_ref}"
+    )
+    signer_path = getattr(args, "attestation_signer_workflow", None) or producer_path
+    if SHA40.fullmatch(producer_source_sha) is None:
+        raise ValueError("channel result producer source SHA is not canonical")
+    if producer_path == LINUX_RECOVERY_PRODUCER:
+        if (
+            predicate["channel"] != "apt_rpm"
+            or signer_path != LINUX_RECOVERY_SIGNER
+            or producer_source_ref != "refs/heads/main"
+        ):
+            raise ValueError("Linux recovery attestation producer identity changed")
+    elif (
+        producer_source_sha != args.source_sha
+        or producer_source_ref != f"refs/tags/{args.release_ref}"
+        or signer_path != producer_path
+    ):
+        raise ValueError("channel result attestation producer differs from its release")
     command = [
         str(gh),
         "attestation",
@@ -75,11 +97,11 @@ def verify(args: argparse.Namespace) -> None:
         "--signer-workflow",
         f"{REPOSITORY}/{signer_path}",
         "--signer-digest",
-        args.source_sha,
+        producer_source_sha,
         "--source-digest",
-        args.source_sha,
+        producer_source_sha,
         "--source-ref",
-        f"refs/tags/{args.release_ref}",
+        producer_source_ref,
         "--predicate-type",
         RESULT_PREDICATE_TYPE,
         "--deny-self-hosted-runners",
@@ -140,6 +162,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--envelope", type=Path, required=True)
     parser.add_argument("--source-sha", required=True)
     parser.add_argument("--release-ref", required=True)
+    parser.add_argument("--producer-source-sha")
+    parser.add_argument("--producer-source-ref")
+    parser.add_argument("--attestation-signer-workflow")
     parser.add_argument("--channel", required=True)
     return parser.parse_args()
 

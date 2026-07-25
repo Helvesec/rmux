@@ -132,6 +132,14 @@ RESULT_PRODUCERS = {
     "web_share": {".github/workflows/release-owned-repository-channel.yml": 316435347},
     "winget": {".github/workflows/release-policy-channel.yml": 316435347},
 }
+DERIVED_RESULT_PRODUCERS = {
+    channel: (
+        [".github/workflows/release-linux-repository-build.yml"]
+        if channel == "apt_rpm"
+        else []
+    )
+    for channel in CHANNELS
+}
 
 
 def _read(path: Path) -> dict[str, Any]:
@@ -269,6 +277,7 @@ def _validate_channel_contract(release: Path, policy: dict[str, Any]) -> None:
         or result.get("final_result_count") != len(CHANNELS)
         or result.get("rmux_io_pre_site_digest_field") != "pre_site_summary_sha256"
         or result.get("producer_workflows") != RESULT_PRODUCERS
+        or result.get("derived_producer_workflows") != DERIVED_RESULT_PRODUCERS
     ):
         raise ValueError("downstream result evidence readiness changed")
     channels = contract.get("channels")
