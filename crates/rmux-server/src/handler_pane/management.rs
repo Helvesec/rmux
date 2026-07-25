@@ -6,7 +6,8 @@ use rmux_proto::{
 
 use super::super::{
     attach_support::SessionDetachOnDestroy, client_environment_snapshot, client_spawn_environment,
-    scripting_support::render_start_directory_template, RequestHandler,
+    scripting_support::render_start_directory_template,
+    subscription_support::capture_pane_stream_sources, RequestHandler,
 };
 use crate::hook_runtime::PendingInlineHookFormat;
 use crate::pane_io::AttachControl;
@@ -282,9 +283,15 @@ impl RequestHandler {
             let removed_subscription_keys = state
                 .pane_output_subscription_keys_for_kill(&request.target, request.kill_all_except)
                 .unwrap_or_default();
+            let removed_stream_sources =
+                capture_pane_stream_sources(&state, &removed_subscription_keys);
             let timer_mutation = self.plan_all_window_mutation_silence_timers_locked(&state);
             match state.kill_pane_with_options(request.target, request.kill_all_except) {
                 Ok(result) => {
+                    self.stage_removed_pane_stream_sources(
+                        &removed_subscription_keys,
+                        removed_stream_sources,
+                    );
                     state.retire_removed_lifecycle_targets();
                     self.apply_window_mutation_silence_timers_and_arm_all_locked(
                         &state,

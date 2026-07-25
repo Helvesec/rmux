@@ -1519,23 +1519,207 @@ async fn pane_kill_ref_emits_closed_for_pane_state_subscribers() {
     assert_closed_event(&handler, 97, subscription_id, pane_id).await;
 }
 
+#[tokio::test]
+async fn pane_exit_emits_closed_for_pane_state_subscribers() {
+    let handler = RequestHandler::new();
+    let (session, split_target, split_pane_id) =
+        create_session_with_split_pane(&handler, "pane-state-pane-exit").await;
+    let subscription_id = subscribe(&handler, 108, split_target.clone(), false, false).await;
+
+    let generation = mark_pane_exited(&handler, &split_target).await;
+    handler
+        .handle_pane_exit_event(PaneExitEvent::eof_published(
+            session.clone(),
+            split_pane_id,
+            Some(generation),
+        ))
+        .await;
+
+    assert_eq!(window_pane_count(&handler, &session).await, 1);
+    assert_closed_event_with_reason(
+        &handler,
+        108,
+        subscription_id,
+        split_pane_id,
+        PaneStateClosedReason::Exited,
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn pane_exit_retries_a_failed_teardown_and_still_emits_closed() {
+    let handler = RequestHandler::new();
+    let (session, split_target, split_pane_id) =
+        create_session_with_split_pane(&handler, "pane-state-pane-exit-retry").await;
+    let subscription_id = subscribe(&handler, 109, split_target.clone(), false, false).await;
+    let mut lifecycle_events = handler.subscribe_lifecycle_events();
+
+    let generation = mark_pane_exited(&handler, &split_target).await;
+    handler.state.lock().await.fail_next_resize_for_test();
+    handler
+        .handle_pane_exit_event(PaneExitEvent::eof_published(
+            session.clone(),
+            split_pane_id,
+            Some(generation),
+        ))
+        .await;
+
+    assert_closed_event_with_reason(
+        &handler,
+        109,
+        subscription_id,
+        split_pane_id,
+        PaneStateClosedReason::Exited,
+    )
+    .await;
+    assert!(
+        exited_pane_ids(&mut lifecycle_events).contains(&split_pane_id.as_u32()),
+        "a transient teardown failure must not swallow PaneExited"
+    );
+    assert_eq!(
+        window_pane_count(&handler, &session).await,
+        1,
+        "a transient teardown failure must not leave the exited pane in the window"
+    );
+}
+
+#[tokio::test]
+async fn pane_exit_falls_back_to_kept_dead_when_the_teardown_keeps_failing() {
+    let handler = RequestHandler::new();
+    let (session, split_target, split_pane_id) =
+        create_session_with_split_pane(&handler, "pane-state-pane-exit-stuck").await;
+    let subscription_id = subscribe(&handler, 110, split_target.clone(), false, false).await;
+
+    let generation = mark_pane_exited(&handler, &split_target).await;
+    handler.state.lock().await.fail_resizes_for_test(usize::MAX);
+    // Auto-advance the retry backoff instead of sleeping through the budget.
+    tokio::time::pause();
+    handler
+        .handle_pane_exit_event(PaneExitEvent::eof_published(
+            session.clone(),
+            split_pane_id,
+            Some(generation),
+        ))
+        .await;
+    tokio::time::resume();
+
+    assert_eq!(window_pane_count(&handler, &session).await, 2);
+    assert_closed_event_with_reason(
+        &handler,
+        110,
+        subscription_id,
+        split_pane_id,
+        PaneStateClosedReason::DiedKept,
+    )
+    .await;
+}
+
+async fn create_session_with_split_pane(
+    handler: &RequestHandler,
+    name: &str,
+) -> (SessionName, PaneTarget, PaneId) {
+    let (session, _target, _pane_id) = create_session_with_pane(handler, name).await;
+    handler.wait_for_initial_panes_for_test().await;
+    let split = handler
+        .handle(Request::SplitWindow(SplitWindowRequest {
+            target: SplitWindowTarget::Session(session.clone()),
+            direction: SplitDirection::Vertical,
+            before: false,
+            environment: None,
+        }))
+        .await;
+    let split_target = match split {
+        Response::SplitWindow(response) => response.pane,
+        response => panic!("expected split-window success, got {response:?}"),
+    };
+    let split_pane_id = {
+        let state = handler.state.lock().await;
+        state
+            .sessions
+            .session(&session)
+            .and_then(|session| session.window_at(0))
+            .and_then(|window| window.pane(split_target.pane_index()))
+            .map(|pane| pane.id())
+            .expect("split pane exists")
+    };
+    (session, split_target, split_pane_id)
+}
+
+async fn mark_pane_exited(handler: &RequestHandler, target: &PaneTarget) -> u64 {
+    let mut state = handler.state.lock().await;
+    let pane_id = state
+        .sessions
+        .session(target.session_name())
+        .and_then(|session| session.window_at(target.window_index()))
+        .and_then(|window| window.pane(target.pane_index()))
+        .map(|pane| pane.id())
+        .expect("target pane exists");
+    let generation = state.pane_output_generation_for_target(target, pane_id);
+    state
+        .mark_pane_dead_without_exit_details(target)
+        .expect("mark pane dead");
+    generation
+}
+
+fn exited_pane_ids(
+    events: &mut tokio::sync::broadcast::Receiver<crate::handler::QueuedLifecycleEvent>,
+) -> Vec<u32> {
+    std::iter::from_fn(|| events.try_recv().ok())
+        .filter_map(|event| match event.event {
+            rmux_core::LifecycleEvent::PaneExited { pane_id, .. } => pane_id,
+            _ => None,
+        })
+        .collect()
+}
+
+async fn window_pane_count(handler: &RequestHandler, session: &SessionName) -> usize {
+    let state = handler.state.lock().await;
+    state
+        .sessions
+        .session(session)
+        .and_then(|session| session.window_at(0))
+        .map(|window| window.pane_count())
+        .expect("window exists")
+}
+
 async fn assert_closed_event(
     handler: &RequestHandler,
     connection_id: u64,
     subscription_id: rmux_proto::PaneStateSubscriptionId,
     pane_id: PaneId,
 ) {
+    assert_closed_event_with_reason(
+        handler,
+        connection_id,
+        subscription_id,
+        pane_id,
+        PaneStateClosedReason::Killed,
+    )
+    .await;
+}
+
+async fn assert_closed_event_with_reason(
+    handler: &RequestHandler,
+    connection_id: u64,
+    subscription_id: rmux_proto::PaneStateSubscriptionId,
+    pane_id: PaneId,
+    expected_reason: PaneStateClosedReason,
+) {
     match read_cursor(handler, connection_id, subscription_id, 0).await {
         Response::PaneStateCursor(response) => {
             assert_eq!(response.events.len(), 1);
-            assert!(matches!(
-                &response.events[0],
-                PaneStateEventDto::Closed {
-                    pane_id: event_pane_id,
-                    reason: PaneStateClosedReason::Killed,
-                    ..
-                } if *event_pane_id == pane_id
-            ));
+            assert!(
+                matches!(
+                    &response.events[0],
+                    PaneStateEventDto::Closed {
+                        pane_id: event_pane_id,
+                        reason,
+                        ..
+                    } if *event_pane_id == pane_id && *reason == expected_reason
+                ),
+                "{:?}",
+                response.events
+            );
         }
         response => panic!("pane-state cursor failed: {response:?}"),
     }

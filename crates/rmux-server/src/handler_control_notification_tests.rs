@@ -3,6 +3,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use super::RequestHandler;
+use crate::client_names::control_client_name;
 use crate::control::{ControlModeUpgrade, ControlServerEvent, CONTROL_SERVER_EVENT_CAPACITY};
 use crate::pane_io::AttachControl;
 use rmux_core::LifecycleEvent;
@@ -222,7 +223,8 @@ async fn full_control_server_event_queue_defers_removal_until_transport_finishes
         LifecycleEvent::ClientDetached {
             session_name,
             client_name: Some(client_name),
-        } if session_name == attached_session && client_name == requester_pid.to_string()
+        } if session_name == attached_session
+            && client_name == control_client_name(requester_pid)
     ));
 }
 
@@ -265,6 +267,30 @@ async fn dispatch_as(handler: &RequestHandler, requester_pid: u32, request: Requ
     }
 
     outcome.response
+}
+
+/// Returns the `#{client_name}` `list-clients` reports for `pid`.
+async fn listed_client_name(handler: &RequestHandler, pid: u32) -> String {
+    let response = handler
+        .handle(Request::ListClients(Box::new(
+            rmux_proto::ListClientsRequest {
+                format: Some("#{client_pid}|#{client_name}".to_owned()),
+                target_session: None,
+                filter: None,
+                sort_order: None,
+                reversed: false,
+            },
+        )))
+        .await;
+    let Response::ListClients(response) = response else {
+        panic!("expected list-clients response");
+    };
+    let prefix = format!("{pid}|");
+    String::from_utf8(response.output.stdout().to_vec())
+        .expect("list-clients output is utf-8")
+        .lines()
+        .find_map(|line| line.strip_prefix(&prefix).map(str::to_owned))
+        .expect("list-clients reports the client")
 }
 
 async fn prepared_client_session_changed(
@@ -328,9 +354,83 @@ async fn control_switch_client_sends_self_and_other_session_notifications() {
     );
     assert_eq!(
         drain_control_notifications(&mut other_rx),
-        vec![format!("%client-session-changed 101 ${beta_id} {beta}")]
+        vec![format!(
+            "%client-session-changed client-101 ${beta_id} {beta}"
+        )]
     );
     assert!(drain_control_notifications(&mut detached_rx).is_empty());
+}
+
+/// Frozen tmux 3.7b, measured 2026-07-25 with two `-C` clients (pids
+/// 74711/74712) on session `alpha`: after 74711 runs `switch-client -t beta`
+/// and then detaches, the surviving client is told
+///
+///     %client-session-changed client-74711 $1 beta
+///     %client-detached client-74711
+///
+/// The token is the same name `list-clients -F '#{client_name}'` reports for
+/// that client. A frontend keys its client table on that name, so the two
+/// surfaces must never spell the same client differently.
+#[tokio::test]
+async fn control_notifications_name_clients_the_way_list_clients_does() {
+    let handler = RequestHandler::new();
+    let alpha = session_name("alpha");
+    let beta = session_name("beta");
+    new_session(&handler, &alpha).await;
+    new_session(&handler, &beta).await;
+
+    let switching_pid = 74_711;
+    let mut switching_rx =
+        register_control_client(&handler, switching_pid, Some(alpha.clone())).await;
+    let mut watching_rx = register_control_client(&handler, 74_712, Some(alpha.clone())).await;
+    let _ = drain_control_notifications(&mut switching_rx);
+    let _ = drain_control_notifications(&mut watching_rx);
+
+    let listed = listed_client_name(&handler, switching_pid).await;
+    assert_eq!(listed, format!("client-{switching_pid}"));
+
+    let response = dispatch_as(
+        &handler,
+        switching_pid,
+        Request::SwitchClient(SwitchClientRequest {
+            target: beta.clone(),
+        }),
+    )
+    .await;
+    assert_eq!(
+        response,
+        Response::SwitchClient(rmux_proto::SwitchClientResponse {
+            session_name: beta.clone(),
+        })
+    );
+
+    let beta_id = session_id(&handler, &beta).await;
+    assert_eq!(
+        drain_control_notifications(&mut watching_rx),
+        vec![format!(
+            "%client-session-changed {listed} ${beta_id} {beta}"
+        )]
+    );
+    assert_eq!(
+        drain_control_notifications(&mut switching_rx),
+        vec![format!("%session-changed ${beta_id} {beta}")],
+        "the switching client still recognises its own move"
+    );
+
+    let response = dispatch_as(
+        &handler,
+        switching_pid,
+        Request::DetachClient(DetachClientRequest),
+    )
+    .await;
+    assert_eq!(
+        response,
+        Response::DetachClient(rmux_proto::DetachClientResponse)
+    );
+    assert_eq!(
+        drain_control_notifications(&mut watching_rx),
+        vec![format!("%client-detached {listed}")]
+    );
 }
 
 #[tokio::test]
@@ -1042,7 +1142,7 @@ async fn control_detach_exits_self_and_notifies_other_controls() {
     assert!(matches!(self_events[0], ControlServerEvent::Exit(None)));
     assert_eq!(
         drain_control_notifications(&mut other_rx),
-        vec!["%client-detached 810".to_owned()]
+        vec!["%client-detached client-810".to_owned()]
     );
 }
 
@@ -1121,7 +1221,7 @@ async fn exact_client_attached_event_follows_rename_and_name_reuse_by_session_id
 
     let mut events = handler.subscribe_lifecycle_events();
     handler
-        .emit_client_attached_identity(9_901, original, original_id)
+        .emit_client_attached_identity(control_client_name(9_901), original, original_id)
         .await;
     let queued = events
         .recv()
@@ -1167,12 +1267,12 @@ async fn client_session_changed_notification_follows_rename_not_reused_name() {
     let _ = drain_control_notifications(&mut observer_rx);
 
     handler
-        .emit_client_session_changed(9_902, original, original_id)
+        .emit_client_session_changed(control_client_name(9_902), original, original_id)
         .await;
     assert_eq!(
         drain_control_notifications(&mut observer_rx),
         vec![format!(
-            "%client-session-changed 9902 ${} {renamed}",
+            "%client-session-changed client-9902 ${} {renamed}",
             original_id.as_u32()
         )]
     );
@@ -1199,7 +1299,7 @@ async fn deactivated_lifecycle_dispatch_still_delivers_control_effects() {
             &mut state,
             &LifecycleEvent::ClientSessionChanged {
                 session_name: attached.clone(),
-                client_name: Some("9910".to_owned()),
+                client_name: Some(control_client_name(9_910)),
             },
         );
         queued.control_session_identity = Some(attached_id);
@@ -1217,7 +1317,7 @@ async fn deactivated_lifecycle_dispatch_still_delivers_control_effects() {
     handler.emit_prepared(queued.clone()).await;
 
     let expected = vec![format!(
-        "%client-session-changed 9910 ${} {attached}",
+        "%client-session-changed client-9910 ${} {attached}",
         attached_id.as_u32()
     )];
     assert_eq!(drain_control_notifications(&mut observer_rx), expected);

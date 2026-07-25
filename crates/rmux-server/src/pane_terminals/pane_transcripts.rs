@@ -522,12 +522,20 @@ impl HandlerState {
             .copy_mode_render_snapshot()
     }
 
+    /// Renders a copy-mode pane under the bounded Web recovery budgets.
+    ///
+    /// Metadata that does not fit the budgets (over-long titles, an oversized
+    /// hyperlink table) is dropped from the bounded clone, exactly like the
+    /// non-copy-mode [`Self::pane_recovery_screen`], and is never a reason to
+    /// fail the render: the Web session view reports the gap through
+    /// `PaneScrollbackView::metadata_complete`. Only the geometry cap, which
+    /// no bounded frame can satisfy, is an error.
     #[cfg(feature = "web")]
     pub(crate) fn pane_copy_mode_recovery_snapshot(
         &self,
         session_name: &SessionName,
         pane_id: PaneId,
-    ) -> Result<Option<(crate::copy_mode::CopyModeRenderSnapshot, bool)>, RmuxError> {
+    ) -> Result<Option<crate::copy_mode::CopyModeRenderSnapshot>, RmuxError> {
         let Some(window_index) = self
             .sessions
             .session(session_name)

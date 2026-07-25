@@ -10,6 +10,7 @@ use super::pane_support::{
 use super::prompt_support::{decode_prompt_key, PromptInputEvent};
 use super::scripting_support::{QueueCommandAction, QueueExecutionContext};
 use super::RequestHandler;
+use crate::client_names::attached_client_name;
 use crate::input_keys::{decode_mouse, MouseDecode};
 use crate::key_table::{decode_attached_key, AttachedKeyDecode};
 use crate::pane_io::{AttachControl, OverlayFrame};
@@ -641,7 +642,7 @@ impl RequestHandler {
         if client_size_changed {
             let event = LifecycleEvent::ClientResized {
                 session_name: resized_session.clone(),
-                client_name: Some(attach_pid.to_string()),
+                client_name: Some(attached_client_name(attach_pid)),
             };
             if let Some(identity) = expected_identity {
                 let prepared = {

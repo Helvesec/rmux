@@ -1,5 +1,5 @@
 use std::collections::HashMap;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::time::Duration;
 
 use rmux_os::identity::UserIdentity;
@@ -7,6 +7,7 @@ use rmux_os::process;
 use rmux_proto::request::SwitchClientExt3Request;
 use rmux_proto::{CommandOutput, OptionName, RmuxError};
 
+use crate::client_names::attached_client_tty_path;
 use crate::handler_support::attached_client_required;
 use crate::key_table::effective_client_key_table_name;
 use crate::outer_terminal::OuterTerminal;
@@ -24,6 +25,7 @@ mod list_clients;
 #[path = "handler_client_runtime/requester_access.rs"]
 mod requester_access;
 
+pub(in crate::handler) use crate::client_names::{attached_client_name, control_client_name};
 pub(in crate::handler) use list_clients::ListClientSnapshot;
 
 pub(in crate::handler) const LIST_CLIENTS_TEMPLATE: &str = "#{client_name}: #{session_name} [#{client_width}x#{client_height} #{client_termname}]#{?#{==:#{client_uid},#{uid}},, [user #{?client_user,#{client_user},#{client_uid}}]}#{?client_flags, (#{client_flags}),}";
@@ -473,20 +475,6 @@ pub(in crate::handler) fn attached_client_matches_target(
         .strip_prefix("/dev")
         .ok()
         .is_some_and(|stripped| stripped == Path::new(target_client))
-}
-
-fn attached_client_tty_path(attach_pid: u32) -> Option<PathBuf> {
-    rmux_os::process::fd_path(attach_pid, 0)
-}
-
-pub(in crate::handler) fn attached_client_name(attach_pid: u32) -> String {
-    attached_client_tty_path(attach_pid)
-        .map(|path| path.to_string_lossy().into_owned())
-        .unwrap_or_else(|| attach_pid.to_string())
-}
-
-pub(in crate::handler) fn control_client_name(control_pid: u32) -> String {
-    format!("client-{control_pid}")
 }
 
 pub(in crate::handler) fn control_client_target_pid(target: &str) -> Option<u32> {

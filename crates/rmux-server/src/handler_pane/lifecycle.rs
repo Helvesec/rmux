@@ -6,6 +6,7 @@ use rmux_proto::{OptionName, PaneStateClosedReason, PaneTarget, RmuxError, Targe
 
 use super::super::{
     attach_support::SessionDetachOnDestroy,
+    defer_lifecycle_event,
     exited_output_support::RetainedExitedPaneIdentities,
     pane_stream_support::{stream_source_for_target, PaneStreamSource},
     prepare_lifecycle_event,
@@ -23,10 +24,26 @@ use tracing::warn;
 const PANE_EXIT_STATUS_RETRY_DELAY: Duration = Duration::from_millis(10);
 const PANE_EXIT_STATUS_LONG_RETRY_DELAY: Duration = Duration::from_millis(250);
 const PANE_EXIT_STATUS_FAST_RETRY_ATTEMPTS: usize = 20;
+const PANE_EXIT_TEARDOWN_RETRY_ATTEMPTS: usize = 32;
 const DEAD_PANE_OUTPUT_DRAIN_TIMEOUT: Duration = Duration::from_millis(250);
 
+/// Outcome of one attempt to plan an exited pane's teardown under the state
+/// lock.
+enum PaneExitAttempt {
+    /// The teardown committed; the plan is published outside the lock.
+    Planned(Box<PaneExitPlan>),
+    /// The child's exit is not observable yet, so nothing has been torn down.
+    ExitPending,
+    /// The pane's process is gone but the model teardown failed. The state was
+    /// rolled back, so the attempt can be repeated; the payload is the terminal
+    /// fallback to commit once the retry budget is spent.
+    TeardownFailed {
+        prepare_dead: bool,
+        output_generation: u64,
+    },
+}
+
 enum PaneExitPlan {
-    Ignore,
     KeepDead {
         prepare_dead: bool,
         output_generation: u64,
@@ -153,8 +170,9 @@ impl RequestHandler {
             .await;
         let mut output = Some(output);
         let mut attempts = 0;
+        let mut teardown_failures = 0;
         let plan = loop {
-            let plan = {
+            let attempt = 'attempt: {
                 let mut state = self.state.lock().await;
                 let Some(runtime_session_name) = state.resolve_pane_event_runtime_session(
                     &event.session_name,
@@ -184,12 +202,13 @@ impl RequestHandler {
                     };
 
                 if let Some(metadata) = metadata {
+                    let output_generation =
+                        state.pane_output_generation(&runtime_session_name, event.pane_id);
                     if should_keep_dead_pane(&state, &target, metadata) {
-                        Some(PaneExitPlan::KeepDead {
+                        PaneExitAttempt::Planned(Box::new(PaneExitPlan::KeepDead {
                             prepare_dead: !was_dead,
-                            output_generation: state
-                                .pane_output_generation(&runtime_session_name, event.pane_id),
-                        })
+                            output_generation,
+                        }))
                     } else {
                         let Some(session) = state.sessions.session(target.session_name()) else {
                             return;
@@ -219,10 +238,13 @@ impl RequestHandler {
                         let window_id = window.id();
                         let window_name = window.name().unwrap_or_default().to_owned();
                         let _ = (session, window);
-                        let lifecycle_batch =
+                        let mut lifecycle_batch =
                             KillPaneLifecycleBatch::capture(&state, &target, false);
-                        let pane_event = prepare_lifecycle_event(
-                            &mut state,
+                        // Deferred, not dispatched: a failed teardown is retried,
+                        // and re-preparing the event would consume one-shot hooks
+                        // for an attempt that never commits.
+                        let deferred_pane_event = defer_lifecycle_event(
+                            &state,
                             &LifecycleEvent::PaneExited {
                                 target: target.clone(),
                                 pane_id: Some(pane_id),
@@ -244,14 +266,20 @@ impl RequestHandler {
                                 match state.sessions.remove_session(target.session_name()) {
                                     Ok(removed_session) => removed_session,
                                     Err(error) => {
-                                        warn!(
-                                            session = %target.session_name(),
-                                            pane_id = event.pane_id.as_u32(),
-                                            "failed to remove exited pane session: {error}"
+                                        warn_pane_exit_teardown_failure(
+                                            teardown_failures,
+                                            target.session_name(),
+                                            event.pane_id,
+                                            &error,
                                         );
-                                        return;
+                                        break 'attempt PaneExitAttempt::TeardownFailed {
+                                            prepare_dead: !was_dead,
+                                            output_generation,
+                                        };
                                     }
                                 };
+                            let pane_event =
+                                lifecycle_batch.prepare_deferred(&mut state, deferred_pane_event);
                             if let Some(source) =
                                 output.as_ref().and_then(ExitedPaneOutput::stream_source)
                             {
@@ -301,7 +329,7 @@ impl RequestHandler {
                                 Vec::new(),
                                 &[],
                             );
-                            Some(PaneExitPlan::RemoveSession {
+                            PaneExitAttempt::Planned(Box::new(PaneExitPlan::RemoveSession {
                                 runtime_session_name,
                                 runtime_session_id,
                                 session_name: target.session_name().clone(),
@@ -318,12 +346,14 @@ impl RequestHandler {
                                     .take()
                                     .expect("pane exit output is consumed by one committed plan"),
                                 metadata,
-                            })
+                            }))
                         } else {
                             let timer_mutation =
                                 self.plan_all_window_mutation_silence_timers_locked(&state);
                             match state.kill_pane(target.clone()) {
                                 Ok(result) => {
+                                    let pane_event = lifecycle_batch
+                                        .prepare_deferred(&mut state, deferred_pane_event);
                                     if let Some(source) =
                                         output.as_ref().and_then(ExitedPaneOutput::stream_source)
                                     {
@@ -396,7 +426,7 @@ impl RequestHandler {
                                             )
                                         })
                                         .collect();
-                                    Some(PaneExitPlan::RemovePane {
+                                    PaneExitAttempt::Planned(Box::new(PaneExitPlan::RemovePane {
                                         runtime_session_name,
                                         runtime_session_id,
                                         target_session_id,
@@ -412,27 +442,53 @@ impl RequestHandler {
                                             "pane exit output is consumed by one committed plan",
                                         ),
                                         metadata,
-                                    })
+                                    }))
                                 }
                                 Err(error) => {
-                                    warn!(
-                                        session = %target.session_name(),
-                                        pane_id = event.pane_id.as_u32(),
-                                        "failed to remove exited pane: {error}"
+                                    warn_pane_exit_teardown_failure(
+                                        teardown_failures,
+                                        target.session_name(),
+                                        event.pane_id,
+                                        &error,
                                     );
-                                    Some(PaneExitPlan::Ignore)
+                                    PaneExitAttempt::TeardownFailed {
+                                        prepare_dead: !was_dead,
+                                        output_generation,
+                                    }
                                 }
                             }
                         }
                     }
                 } else {
-                    None
+                    PaneExitAttempt::ExitPending
                 }
             };
 
-            match plan {
-                Some(plan) => break plan,
-                None => {
+            match attempt {
+                PaneExitAttempt::Planned(plan) => break *plan,
+                PaneExitAttempt::TeardownFailed {
+                    prepare_dead,
+                    output_generation,
+                } => {
+                    // kill_pane rolls its own mutations back, so the pane is
+                    // still whole and the attempt can simply be repeated. The
+                    // process is already gone, so giving up would strand the
+                    // pane in the model with no terminal event for the journal,
+                    // the SDK or lifecycle subscribers. Once the budget is
+                    // spent, commit the kept-dead representation instead: the
+                    // pane stays visible, but it is honestly marked dead and
+                    // every subscriber observes it closing.
+                    let delay = pane_exit_retry_delay(teardown_failures);
+                    teardown_failures = teardown_failures.saturating_add(1);
+                    if teardown_failures >= PANE_EXIT_TEARDOWN_RETRY_ATTEMPTS {
+                        break PaneExitPlan::KeepDead {
+                            prepare_dead,
+                            output_generation,
+                        };
+                    }
+                    tokio::time::sleep(delay).await;
+                }
+                PaneExitAttempt::ExitPending => {
                     // Linux can publish PTY EOF while the session leader keeps
                     // running with all three standard descriptors redirected.
                     // The reader owns Unix's only pane-exit notification, so a
@@ -445,11 +501,7 @@ impl RequestHandler {
                     if !cfg!(unix) && attempts >= PANE_EXIT_STATUS_FAST_RETRY_ATTEMPTS {
                         return;
                     }
-                    let delay = if attempts < PANE_EXIT_STATUS_FAST_RETRY_ATTEMPTS {
-                        PANE_EXIT_STATUS_RETRY_DELAY
-                    } else {
-                        PANE_EXIT_STATUS_LONG_RETRY_DELAY
-                    };
+                    let delay = pane_exit_retry_delay(attempts);
                     attempts = attempts.saturating_add(1);
                     tokio::time::sleep(delay).await;
                 }
@@ -463,7 +515,6 @@ impl RequestHandler {
         self.pause_after_pane_exit_commit().await;
 
         match plan {
-            PaneExitPlan::Ignore => {}
             PaneExitPlan::KeepDead {
                 prepare_dead,
                 output_generation,
@@ -780,6 +831,32 @@ async fn wait_for_pane_output_eof(output_rx: Option<PaneOutputReceiver>) -> bool
     })
     .await
     .is_ok()
+}
+
+fn pane_exit_retry_delay(attempts: usize) -> Duration {
+    if attempts < PANE_EXIT_STATUS_FAST_RETRY_ATTEMPTS {
+        PANE_EXIT_STATUS_RETRY_DELAY
+    } else {
+        PANE_EXIT_STATUS_LONG_RETRY_DELAY
+    }
+}
+
+/// Logs the first failure of a retried teardown, then stays quiet so a pane
+/// that keeps failing cannot flood the log for the whole retry budget.
+fn warn_pane_exit_teardown_failure(
+    teardown_failures: usize,
+    session_name: &rmux_proto::SessionName,
+    pane_id: rmux_core::PaneId,
+    error: &RmuxError,
+) {
+    if teardown_failures > 0 {
+        return;
+    }
+    warn!(
+        session = %session_name,
+        pane_id = pane_id.as_u32(),
+        "failed to remove exited pane, retrying: {error}"
+    );
 }
 
 fn should_keep_dead_pane(

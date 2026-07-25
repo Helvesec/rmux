@@ -539,6 +539,11 @@ impl HandlerState {
 
     #[cfg(test)]
     pub(crate) fn fail_next_resize_for_test(&mut self) {
-        self.terminals.fail_next_resize_for_test();
+        self.fail_resizes_for_test(1);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn fail_resizes_for_test(&mut self, count: usize) {
+        self.terminals.fail_resizes_for_test(count);
     }
 }

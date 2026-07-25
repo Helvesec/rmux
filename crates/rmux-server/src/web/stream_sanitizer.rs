@@ -3,13 +3,20 @@
 //! Visual OSC commands on the allowlist survive. Clipboard OSC 52, unknown
 //! OSC commands, and every APC/DCS/PM/SOS string (including Kitty graphics and
 //! SIXEL) are dropped rather than delegated to browser-terminal behavior.
+//!
+//! A control is recognized exactly where the viewer recognizes one. The viewer
+//! decodes the stream as UTF-8, so a C1 control only exists in its encoded
+//! `0xc2 0x80..=0x9f` form. A bare 8-bit `0x80..=0x9f` byte is invalid UTF-8:
+//! the browser, rmux's own emulator and tmux all render it as U+FFFD. Reading
+//! such a byte as an OSC/DCS/PM/APC/SOS introducer — or as a string terminator
+//! — would delete pane output the owner can plainly see, so bare C1 bytes are
+//! forwarded as the data bytes they are.
 
 const MAX_BUFFERED_OSC_BYTES: usize = 1024 * 1024;
 
 #[derive(Debug, Default)]
 pub(crate) struct WebTerminalSanitizer {
     state: State,
-    utf8_continuations: u8,
     pending_c2: bool,
 }
 
@@ -37,39 +44,35 @@ impl WebTerminalSanitizer {
 
     pub(crate) fn reset(&mut self) {
         self.state = State::Ground;
-        self.utf8_continuations = 0;
         self.pending_c2 = false;
     }
 
     fn push_byte(&mut self, byte: u8, output: &mut Vec<u8>) {
+        // `0xc2` is the only lead byte that can encode a C1 control, and it can
+        // never be a UTF-8 continuation byte, so one byte of lookahead decides
+        // whether a control code point is on the wire.
         if self.pending_c2 {
             self.pending_c2 = false;
-            if (0x80..=0x9f).contains(&byte) {
-                self.utf8_continuations = 0;
-                self.process_byte(InputByte::encoded_c1(byte), output);
-                return;
+            match byte {
+                0x80..=0x9f => {
+                    self.process_byte(InputByte::encoded_c1(byte), output);
+                    return;
+                }
+                // A complete two-byte character: both halves stay adjacent.
+                0xa0..=0xbf => self.process_byte(InputByte::plain(0xc2), output),
+                // A truncated sequence. Forwarding the orphaned lead byte would
+                // let a later `0x80..=0x9f` byte recombine with it once this
+                // boundary deletes what sat between them — a C1 control the
+                // pane never emitted and the owner's screen never shows.
+                _ => {}
             }
-            self.process_byte(InputByte::plain(0xc2, false), output);
-            self.utf8_continuations = 0;
         }
         if byte == 0xc2 {
             self.pending_c2 = true;
             return;
         }
 
-        let standalone_control = if self.utf8_continuations > 0 {
-            if byte & 0xc0 == 0x80 {
-                self.utf8_continuations -= 1;
-                false
-            } else {
-                self.utf8_continuations = utf8_continuations(byte);
-                true
-            }
-        } else {
-            self.utf8_continuations = utf8_continuations(byte);
-            self.utf8_continuations == 0
-        };
-        self.process_byte(InputByte::plain(byte, standalone_control), output);
+        self.process_byte(InputByte::plain(byte), output);
     }
 
     fn process_byte(&mut self, input: InputByte, output: &mut Vec<u8>) {
@@ -129,16 +132,16 @@ impl WebTerminalSanitizer {
 #[derive(Clone, Copy)]
 struct InputByte {
     byte: u8,
+    /// The byte is the trailing half of a `0xc2 0x80..=0x9f` sequence, i.e. a
+    /// C1 code point the viewer's UTF-8 decoder really produces.
     encoded_c1: bool,
-    standalone_control: bool,
 }
 
 impl InputByte {
-    const fn plain(byte: u8, standalone_control: bool) -> Self {
+    const fn plain(byte: u8) -> Self {
         Self {
             byte,
             encoded_c1: false,
-            standalone_control,
         }
     }
 
@@ -146,7 +149,6 @@ impl InputByte {
         Self {
             byte,
             encoded_c1: true,
-            standalone_control: true,
         }
     }
 
@@ -165,7 +167,7 @@ fn ground(input: InputByte, output: &mut Vec<u8>) -> State {
     }
     match input.byte {
         0x1b => State::Escape,
-        0x18 | 0x1a if input.standalone_control => State::Ground,
+        0x18 | 0x1a => State::Ground,
         _ => {
             input.append_to(output);
             State::Ground
@@ -177,10 +179,8 @@ fn escape_sequence(input: InputByte, output: &mut Vec<u8>) -> State {
     if cancelled(input) {
         return State::Ground;
     }
-    if input.standalone_control && input.byte != 0x1b {
-        if let Some(state) = string_introducer(input) {
-            return state;
-        }
+    if let Some(state) = string_introducer(input) {
+        return state;
     }
     match input.byte {
         b']' => State::Osc {
@@ -201,7 +201,11 @@ fn escape_sequence(input: InputByte, output: &mut Vec<u8>) -> State {
 }
 
 fn string_introducer(input: InputByte) -> Option<State> {
-    if !input.standalone_control {
+    // Only a decoded C1 code point introduces a control string. A bare
+    // `0x90`/`0x98`/`0x9d`/`0x9e`/`0x9f` byte is invalid UTF-8 that the viewer
+    // renders as U+FFFD, so opening a string here would silently discard every
+    // following byte of ordinary pane output.
+    if !input.encoded_c1 {
         return None;
     }
     match input.byte {
@@ -222,32 +226,24 @@ fn string_introducer(input: InputByte) -> Option<State> {
 }
 
 fn cancelled(input: InputByte) -> bool {
-    input.standalone_control && matches!(input.byte, 0x18 | 0x1a)
+    // CAN and SUB are C0 bytes: they are never part of a UTF-8 sequence, so the
+    // viewer always sees them as controls.
+    !input.encoded_c1 && matches!(input.byte, 0x18 | 0x1a)
 }
 
 fn string_ended(input: InputByte, escaped: bool, bell_terminates: bool) -> bool {
-    (input.standalone_control && input.byte == 0x9c)
+    // A bare `0x9c` is data, not ST: the viewer keeps the string open, so
+    // ending it here would forward its tail as visible text.
+    (input.encoded_c1 && input.byte == 0x9c)
         || (escaped && input.byte == b'\\')
         || (bell_terminates && input.byte == 0x07)
 }
 
-const fn utf8_continuations(byte: u8) -> u8 {
-    match byte {
-        0xc2..=0xdf => 1,
-        0xe0..=0xef => 2,
-        0xf0..=0xf4 => 3,
-        _ => 0,
-    }
-}
-
 fn allowed_osc(sequence: &[u8]) -> bool {
-    let payload = if sequence.starts_with(b"\x1b]") {
-        &sequence[2..]
-    } else if sequence.first() == Some(&0x9d) {
-        &sequence[1..]
-    } else if sequence.starts_with(&[0xc2, 0x9d]) {
-        &sequence[2..]
-    } else {
+    let Some(payload) = sequence
+        .strip_prefix(b"\x1b]".as_slice())
+        .or_else(|| sequence.strip_prefix([0xc2, 0x9d].as_slice()))
+    else {
         return false;
     };
     let code_end = payload
@@ -256,7 +252,6 @@ fn allowed_osc(sequence: &[u8]) -> bool {
         .position(|(index, byte)| {
             *byte == b';'
                 || *byte == 0x07
-                || *byte == 0x9c
                 || *byte == 0x1b
                 || (*byte == 0xc2 && payload.get(index + 1) == Some(&0x9c))
         })
@@ -298,10 +293,7 @@ fn allowed_hyperlink(payload: &[u8]) -> bool {
 fn strip_osc_terminator(mut payload: &[u8]) -> &[u8] {
     if payload.ends_with(b"\x1b\\") || payload.ends_with(&[0xc2, 0x9c]) {
         payload = &payload[..payload.len() - 2];
-    } else if payload
-        .last()
-        .is_some_and(|byte| matches!(byte, 0x07 | 0x9c))
-    {
+    } else if payload.last() == Some(&0x07) {
         payload = &payload[..payload.len() - 1];
     }
     payload
@@ -384,12 +376,120 @@ mod tests {
     }
 
     #[test]
-    fn c1_string_forms_follow_the_same_policy() {
+    fn bare_c1_bytes_are_data_and_never_introduce_a_control_string() {
+        // Invalid UTF-8 for the viewer, so none of these open a string. tmux
+        // 3.7b and rmux's own emulator both render each byte as U+FFFD, which
+        // is exactly what the browser's UTF-8 decoder produces from them.
         let input = b"a\x9d52;c;Zm9v\x9cb\x9fGkitty\x9cc\x90qsixel\x9cd";
         for split in 0..=input.len() {
             assert_eq!(
                 sanitize(&[&input[..split], &input[split..]]),
-                b"abcd",
+                input.as_slice(),
+                "split {split}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_bare_c1_byte_never_swallows_the_rest_of_a_pane_stream() {
+        // `cat` of a binary file, then ordinary shell output. Before the fix
+        // the viewer received the first chunk's prefix and nothing else.
+        let chunks: [&[u8]; 3] = [
+            b"$ cat logo.bin\r\n\x9f\x8a\x00PNG",
+            b"\r\n$ echo hello\r\nhello\r\n$ ",
+            b"date\r\nFri Jul 25 12:00:00 CEST 2026\r\n$ ",
+        ];
+        assert_eq!(sanitize(&chunks), chunks.concat());
+    }
+
+    #[test]
+    fn every_bare_c1_byte_reaches_the_viewer_unchanged() {
+        for byte in 0x80..=0x9f_u8 {
+            let input = [b'A', byte, b'B', b'C', b'\r', b'\n'];
+            for split in 0..=input.len() {
+                assert_eq!(
+                    sanitize(&[&input[..split], &input[split..]]),
+                    input.as_slice(),
+                    "byte {byte:#04x}, split {split}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn a_bare_c1_terminator_cannot_end_a_string_the_viewer_keeps_open() {
+        // The viewer decodes 0x9c as U+FFFD and keeps buffering the OSC, so
+        // treating it as ST would forward the clipboard tail as visible text.
+        let input = b"a\x1b]52;c;Zm9vYmFy\x9cdGFpbA==\x07b";
+        for split in 0..=input.len() {
+            assert_eq!(
+                sanitize(&[&input[..split], &input[split..]]),
+                b"ab",
+                "split {split}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_bare_c1_byte_inside_an_allowed_osc_stays_part_of_its_payload() {
+        let input = b"a\x1b]2;ti\x9ctle\x07b";
+        for split in 0..=input.len() {
+            assert_eq!(
+                sanitize(&[&input[..split], &input[split..]]),
+                input.as_slice(),
+                "split {split}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_bare_c1_byte_inside_an_osc_identifier_fails_closed() {
+        // The viewer's OSC identifier would be `2<U+FFFD>` — not a number, so
+        // its parser aborts the string. Forwarding it would be a divergence.
+        let input = b"a\x1b]2\x9c;title\x07b";
+        for split in 0..=input.len() {
+            assert_eq!(
+                sanitize(&[&input[..split], &input[split..]]),
+                b"ab",
+                "split {split}"
+            );
+        }
+    }
+
+    #[test]
+    fn an_orphaned_c2_lead_byte_cannot_be_recombined_into_a_forged_c1_control() {
+        // The input holds no C1 control: `0xc2` is a truncated lead and `0x9f`
+        // is invalid UTF-8. Forwarding the lead byte after deleting what sat
+        // between them would hand the viewer a real U+009F APC introducer and
+        // swallow the rest of the pane's output.
+        for input in [
+            b"A\xc2\x18\x9fplain text".as_slice(),
+            b"A\xc2\x1b]52;c;Zm9v\x07\x9fplain text".as_slice(),
+            b"A\xc2\x1b\x1b\x9fplain text".as_slice(),
+        ] {
+            for split in 0..=input.len() {
+                let output = sanitize(&[&input[..split], &input[split..]]);
+                assert!(
+                    !output
+                        .windows(2)
+                        .any(|pair| pair[0] == 0xc2 && (0x80..=0x9f).contains(&pair[1])),
+                    "split {split}: forged C1 control in {output:02x?}"
+                );
+                assert!(
+                    output.ends_with(b"plain text"),
+                    "split {split}: pane output must survive, got {output:02x?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn a_complete_two_byte_character_keeps_both_halves() {
+        let input = "A\u{a0}\u{ff}B".as_bytes();
+        for split in 0..=input.len() {
+            assert_eq!(
+                sanitize(&[&input[..split], &input[split..]]),
+                input,
                 "split {split}"
             );
         }

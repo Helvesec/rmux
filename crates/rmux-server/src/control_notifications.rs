@@ -2,6 +2,7 @@ use rmux_core::formats::FormatContext;
 use rmux_core::{encode_paste_bytes, LifecycleEvent, Session, Window};
 use rmux_proto::{octal_escape, SessionId, SessionName, WindowTarget};
 
+use crate::client_names::is_control_client_name;
 use crate::format_runtime::{render_runtime_template, RuntimeFormatContext};
 use crate::pane_terminals::HandlerState;
 
@@ -264,12 +265,11 @@ fn client_session_changed_notifications(
     let Some(session) = resolve_event_session(state, session_name, session_id) else {
         return Vec::new();
     };
-    let switched_pid = client_name.parse::<u32>().ok();
     let session_identity = session_identity(session);
 
     session_scoped_clients(clients)
         .map(|(pid, _session_name)| {
-            let self_change = switched_pid.is_some_and(|switched_pid| switched_pid == pid);
+            let self_change = is_control_client_name(client_name, pid);
             let line = if self_change {
                 format!("%session-changed {session_identity}")
             } else {

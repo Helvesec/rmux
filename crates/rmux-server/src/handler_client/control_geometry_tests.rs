@@ -244,6 +244,145 @@ async fn control_clients_share_largest_and_smallest_size_candidates_like_tmux37(
 }
 
 #[tokio::test]
+async fn undeclared_control_client_never_shrinks_an_attached_session_like_tmux37() {
+    // tmux 3.7b oracle, measured 2026-07-25 with a live 200x50 PTY client on a
+    // 200x50 session, then `tmux -C attach -t main` and no `refresh-client -C`:
+    //
+    //   window-size   before   after
+    //   latest        200x49   200x49
+    //   largest       200x49   200x49
+    //   smallest      200x49   200x49
+    //   manual        200x50   200x50
+    //
+    // `ignore_client_size()` skips a CLIENT_CONTROL client that has no
+    // CLIENT_SIZECHANGED, so the 80x24 placeholder a control client starts with
+    // is not a size candidate. rmux used to hand it to the policy and crushed
+    // the session to the placeholder under latest and smallest.
+    // Probe: .rmux-audit/control-attach-8023/probe_ctl_attach_shrink.py
+    for (index, policy) in ["latest", "largest", "smallest", "manual"]
+        .into_iter()
+        .enumerate()
+    {
+        let handler = RequestHandler::new();
+        let session = session_name(&format!("control-undeclared-attached-{policy}"));
+        create_session(&handler, session.clone(), INITIAL_SIZE).await;
+        set_window_size_policy(&handler, &session, policy).await;
+        let attach_pid = 92_700 + index as u32 * 2;
+        let control_pid = attach_pid + 1;
+        let (_attach_id, _attach_events) =
+            register_attached_client(&handler, attach_pid, &session, CONTROL_SIZE).await;
+        handler
+            .reconcile_attached_session_size_and_emit(&session)
+            .await
+            .expect("the ordinary client owns the session geometry");
+        let expected_size = if policy == "manual" {
+            INITIAL_SIZE
+        } else {
+            CONTROL_SIZE
+        };
+        assert_eq!(
+            session_size(&handler, &session).await,
+            expected_size,
+            "{policy} before the control client arrives"
+        );
+
+        let (_control_id, _control_events) =
+            register_control_client_with_id(&handler, control_pid, &session).await;
+        handler
+            .reconcile_attached_session_size_and_emit(&session)
+            .await
+            .expect("a control arrival reconciles the session geometry");
+
+        assert_eq!(
+            session_size(&handler, &session).await,
+            expected_size,
+            "{policy}: a control client that never ran refresh-client -C must not resize"
+        );
+    }
+}
+
+#[tokio::test]
+async fn undeclared_control_client_alone_never_resizes_the_session_like_tmux37() {
+    // tmux 3.7b oracle, measured 2026-07-25: a 200x50 session with no other
+    // client at all keeps 200x50 under every `window-size` value when a control
+    // client attaches without declaring a size. With no ordinary client to
+    // outvote it the placeholder also won `largest`, so this cell is the one
+    // that pins the rule for every automatic policy.
+    // Probe: .rmux-audit/control-attach-8023/probe_ctl_only_client.py
+    for (index, policy) in ["latest", "largest", "smallest", "manual"]
+        .into_iter()
+        .enumerate()
+    {
+        let handler = RequestHandler::new();
+        let session = session_name(&format!("control-undeclared-alone-{policy}"));
+        create_session(&handler, session.clone(), CONTROL_SIZE).await;
+        set_window_size_policy(&handler, &session, policy).await;
+        let control_pid = 92_720 + index as u32;
+        let (_control_id, _control_events) =
+            register_control_client_with_id(&handler, control_pid, &session).await;
+        handler
+            .reconcile_attached_session_size_and_emit(&session)
+            .await
+            .expect("a control arrival reconciles the session geometry");
+
+        assert_eq!(
+            session_size(&handler, &session).await,
+            CONTROL_SIZE,
+            "{policy}: the session keeps its own geometry, the control client owns none"
+        );
+    }
+}
+
+#[tokio::test]
+async fn undeclared_control_client_switch_never_resizes_the_target_like_tmux37() {
+    // The same rule on the switch-client path, which feeds the reporting
+    // client's own size straight into the policy instead of going through the
+    // candidate list. tmux 3.7b, 2026-07-25: a control client that never ran
+    // `refresh-client -C` leaves the destination session's geometry alone.
+    for (index, policy) in ["latest", "largest", "smallest", "manual"]
+        .into_iter()
+        .enumerate()
+    {
+        let handler = RequestHandler::new();
+        let source = session_name(&format!("control-undeclared-switch-source-{policy}"));
+        create_session(&handler, source.clone(), INITIAL_SIZE).await;
+        let (_control_id, _control_events) =
+            register_control_client_with_id(&handler, std::process::id(), &source).await;
+
+        let target = session_name(&format!("control-undeclared-switch-target-{policy}"));
+        create_session(&handler, target.clone(), INITIAL_SIZE).await;
+        set_window_size_policy(&handler, &target, policy).await;
+        let (_attach_id, _attach_events) =
+            register_attached_client(&handler, 92_740 + index as u32, &target, CONTROL_SIZE).await;
+        handler
+            .reconcile_attached_session_size_and_emit(&target)
+            .await
+            .expect("the ordinary client owns the destination geometry");
+        let expected_size = if policy == "manual" {
+            INITIAL_SIZE
+        } else {
+            CONTROL_SIZE
+        };
+
+        let response = handler
+            .handle(Request::SwitchClient(SwitchClientRequest {
+                target: target.clone(),
+            }))
+            .await;
+        assert!(
+            matches!(response, Response::SwitchClient(_)),
+            "{response:?}"
+        );
+
+        assert_eq!(
+            session_size(&handler, &target).await,
+            expected_size,
+            "{policy}: switching an undeclared control client must not resize the target"
+        );
+    }
+}
+
+#[tokio::test]
 async fn switching_control_client_reconciles_the_source_session_geometry() {
     let handler = RequestHandler::new();
     let source = session_name("control-switch-reconcile-source");
@@ -1217,6 +1356,132 @@ async fn control_resize_racing_reconcile_cannot_apply_a_stale_geometry() {
         newest_size,
         "a selection predating the control resize must be retried"
     );
+}
+
+/// Frozen tmux 3.7b oracle, 2026-07-25, `tmux -C attach-session` fed one
+/// command per flush:
+///
+/// ```text
+/// %begin 1785012377 305 1
+/// %end 1785012377 305 1
+/// %layout-change @0 c33d,130x46,0,0,0 c33d,130x46,0,0,0 *
+/// ```
+///
+/// tmux flushes the notification for a resize its command applied before it
+/// reads the next command, so a control frontend never has to send an
+/// unrelated command to learn the new geometry. RMUX keeps that guarantee with
+/// the applied-window-resize backstop, which used to run only for requests
+/// arriving on a plain socket connection — a control client's own command
+/// stream, a multi-command CLI invocation, a hook, a key binding and the
+/// identity-checked choose-tree / web-share dispatch all bypass
+/// `dispatch_for_connection`.
+async fn assert_queued_command_publishes_a_pending_window_resize(
+    session_suffix: &str,
+    control_pid: u32,
+    run_queue: impl AsyncFnOnce(&RequestHandler, u32, SessionName),
+) {
+    let handler = RequestHandler::new();
+    let session = session_name(&format!("queued-resize-backstop-{session_suffix}"));
+    create_session(&handler, session.clone(), INITIAL_SIZE).await;
+    let (_control_id, mut events) =
+        register_control_client_with_id(&handler, control_pid, &session).await;
+    let _ = settle_control_notifications(&mut events).await;
+
+    // A geometry write that reached the chokepoint without publishing at its
+    // own ordering point: exactly what the backstop exists to catch.
+    force_window_size(&handler, &session, 0, TARGET_SIZE).await;
+
+    run_queue(&handler, control_pid, session.clone()).await;
+
+    let lines = settle_control_notifications(&mut events).await;
+    let geometry = lines
+        .iter()
+        .filter(|line| line.starts_with("%layout-change"))
+        .filter_map(|line| layout_change_geometry(line))
+        .collect::<Vec<_>>();
+    assert_eq!(
+        geometry,
+        vec![format!("{}x{}", TARGET_SIZE.cols, TARGET_SIZE.rows)],
+        "the queued command must publish the pending resize exactly once; got {lines:?}"
+    );
+    assert!(
+        handler
+            .state
+            .lock()
+            .await
+            .take_applied_window_resizes()
+            .is_empty(),
+        "the queued command must leave the geometry queue empty"
+    );
+}
+
+#[tokio::test]
+async fn a_control_queue_command_publishes_a_pending_applied_window_resize() {
+    assert_queued_command_publishes_a_pending_window_resize(
+        "control",
+        92_800,
+        async |handler: &RequestHandler, control_pid: u32, _session: SessionName| {
+            let parsed = handler
+                .parse_control_commands("list-sessions")
+                .await
+                .expect("list-sessions parses");
+            let result = handler.execute_control_commands(control_pid, parsed).await;
+            assert!(result.error.is_none(), "{:?}", result.error);
+        },
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn a_detached_queue_command_publishes_a_pending_applied_window_resize() {
+    // The detached queue is what runs a multi-command CLI invocation, a hook
+    // body and a key binding, none of which reach `dispatch_for_connection`.
+    assert_queued_command_publishes_a_pending_window_resize(
+        "detached",
+        92_810,
+        async |handler: &RequestHandler, _control_pid: u32, _session: SessionName| {
+            let parsed = handler
+                .parse_control_commands("list-sessions")
+                .await
+                .expect("list-sessions parses");
+            handler
+                .execute_parsed_commands_for_test(92_811, parsed)
+                .await
+                .expect("list-sessions succeeds");
+        },
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn an_identity_checked_dispatch_publishes_a_pending_applied_window_resize() {
+    // choose-tree's kill actions (handler_mode_tree/tree_kill.rs) and the
+    // web-share request path run their hooks through `finish_identity_dispatch`
+    // instead of `dispatch_for_connection`.
+    assert_queued_command_publishes_a_pending_window_resize(
+        "identity",
+        92_820,
+        async |handler: &RequestHandler, control_pid: u32, session: SessionName| {
+            let session_id = handler
+                .state
+                .lock()
+                .await
+                .sessions
+                .session(&session)
+                .expect("session remains present")
+                .id();
+            let response = crate::handler::dispatch_with_expected_session_identity(
+                handler,
+                control_pid,
+                session.clone(),
+                session_id,
+                Request::HasSession(rmux_proto::HasSessionRequest { target: session }),
+            )
+            .await;
+            assert!(matches!(response, Response::HasSession(_)), "{response:?}");
+        },
+    )
+    .await;
 }
 
 fn session_name(value: &str) -> SessionName {

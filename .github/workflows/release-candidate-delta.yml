@@ -163,7 +163,7 @@ jobs:
       - name: Verify Nix binary version
         run: |
           set -euo pipefail
-          expected="$(python3 -c 'import pathlib,tomllib; print(tomllib.loads(pathlib.Path("Cargo.toml").read_text())["workspace"]["package"]["version"])')"
+          expected="$(python3 -c 'import pathlib,sys; sys.path.insert(0, "scripts"); import toml_reader; print(toml_reader.loads(pathlib.Path("Cargo.toml").read_text(encoding="utf-8"))["workspace"]["package"]["version"])')"
           test "$(nix run . -- -V)" = "rmux $expected"
 
   windows-ctrl-matrix:

@@ -1,9 +1,26 @@
-use crate::grid::{Grid, GridCapture, GridRenderOptions, GridStringState};
+use crate::grid::{Grid, GridCapture, GridRenderOptions, GridStringState, RenderedLineSpan};
 use crate::hyperlinks::Hyperlinks;
 use crate::style::Style;
 use crate::transcript::{resolve_screen_capture_range, ScreenCaptureRange};
 
 use super::Screen;
+
+/// One rendered recovery row: the bytes to replay, the soft-wrap flag, and the
+/// columns those bytes paint.
+///
+/// A replay places the next row either by autowrap or by an explicit line
+/// break, so the emitting side needs the painted span, not the byte length.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RecoveryRow {
+    /// Bytes that repaint the row from a fresh ANSI state.
+    pub bytes: Vec<u8>,
+    /// Whether the row soft-wraps onto the following row.
+    pub wrapped: bool,
+    /// Columns painted by the row.
+    pub span: RenderedLineSpan,
+    /// Columns a pre-wrapped wide glyph left unused at the end of the row.
+    pub trailing_reflow_gap: u32,
+}
 
 /// Bounded row renderer used to construct transport-safe recovery frames.
 ///
@@ -24,11 +41,7 @@ impl RecoveryRowRenderer<'_> {
 
     /// Renders one row of the active grid from a fresh ANSI state.
     #[must_use]
-    pub fn active_row(
-        &self,
-        absolute_y: usize,
-        options: GridRenderOptions,
-    ) -> Option<(Vec<u8>, bool)> {
+    pub fn active_row(&self, absolute_y: usize, options: GridRenderOptions) -> Option<RecoveryRow> {
         render_grid_row_independent(&self.screen.grid, &self.hyperlinks, absolute_y, options)
     }
 
@@ -40,11 +53,7 @@ impl RecoveryRowRenderer<'_> {
 
     /// Renders one row of the saved pre-alternate viewport.
     #[must_use]
-    pub fn saved_row(
-        &self,
-        absolute_y: usize,
-        options: GridRenderOptions,
-    ) -> Option<(Vec<u8>, bool)> {
+    pub fn saved_row(&self, absolute_y: usize, options: GridRenderOptions) -> Option<RecoveryRow> {
         let saved = self.screen.saved_grid.as_ref()?;
         render_grid_row_independent(&saved.grid, &self.hyperlinks, absolute_y, options)
     }
@@ -245,13 +254,18 @@ fn render_grid_row_independent(
     hyperlinks: &Hyperlinks,
     absolute_y: usize,
     options: GridRenderOptions,
-) -> Option<(Vec<u8>, bool)> {
+) -> Option<RecoveryRow> {
     let mut state = GridStringState::default();
-    let line = grid.render_absolute_line(absolute_y, options, &mut state, Some(hyperlinks))?;
-    Some((
-        line.into_bytes(),
-        grid.absolute_line_wrapped(absolute_y).unwrap_or(false),
-    ))
+    let (line, span) =
+        grid.render_absolute_line_measured(absolute_y, options, &mut state, Some(hyperlinks))?;
+    Some(RecoveryRow {
+        bytes: line.into_bytes(),
+        wrapped: grid.absolute_line_wrapped(absolute_y).unwrap_or(false),
+        span,
+        trailing_reflow_gap: grid
+            .absolute_line_trailing_reflow_gap(absolute_y)
+            .unwrap_or(0),
+    })
 }
 
 fn capture_grid_rows_independent(

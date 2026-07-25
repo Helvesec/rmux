@@ -2,6 +2,7 @@
   "schema_version": 1,
   "source": "scripts/release-review-gate-windows.ps1",
   "steps": [
+    {"name": "release TOML reader self-test", "proof": "release_delta", "evidence": "release review static section"},
     {"name": "release versions", "proof": "release_delta", "evidence": "release identity and version contract"},
     {"name": "changelog release audit", "proof": "release_delta", "evidence": "release review static section"},
     {"name": "tmux divergence ledger", "proof": "release_delta", "evidence": "release review tmux section"},
@@ -19,6 +20,7 @@
     {"name": "source/config acceptance matrix", "proof": "fast_exact", "evidence": "Windows workspace test archive and 18 slices"},
     {"name": "target/format acceptance matrix", "proof": "fast_exact", "evidence": "Windows workspace test archive and 18 slices"},
     {"name": "Windows attach stream queue regressions", "proof": "fast_exact", "evidence": "Windows workspace test archive and 18 slices"},
+    {"name": "Windows endpoint discovery and legacy shutdown", "proof": "fast_exact", "evidence": "Windows workspace test archive and 18 slices"},
     {"name": "Windows CLI queue formats", "proof": "fast_exact", "evidence": "Windows workspace test archive and 18 slices"},
     {"name": "Windows Ctrl matrix spec", "proof": "release_delta", "evidence": "PowerShell StaticMatrixSpec plus Rust test"},
     {"name": "Windows attach exit probes", "proof": "fast_exact", "evidence": "Windows workspace test archive and 18 slices"},

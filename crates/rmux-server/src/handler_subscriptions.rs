@@ -298,29 +298,72 @@ impl RequestHandler {
         let _ = self.request_shutdown_if_pending();
     }
 
-    /// Applies the complete pane-output registry delta for one committed state
-    /// mutation while the caller still owns the state lock.
-    ///
-    /// Returning whether a live record was removed lets callers retry pending
-    /// idle shutdown only after both state and registry locks have been
-    /// released.
-    pub(in crate::handler) fn apply_pane_output_subscription_reconciliation(
+    /// Publishes the capture handles of panes an explicit kill just removed,
+    /// keeping only the ones the kill actually removed. Callers capture the
+    /// sources with [`capture_pane_stream_sources`] before committing the kill
+    /// and stage them under that same state lock, mirroring the natural
+    /// pane-exit path, so cursor paths never observe a gap between live state
+    /// and the staged source.
+    pub(in crate::handler) fn stage_removed_pane_stream_sources(
         &self,
-        reconciliation: PaneOutputSubscriptionReconciliation,
-    ) -> bool {
-        let (rekeys, removals) = reconciliation.into_parts();
+        removed: &[PaneOutputSubscriptionKey],
+        sources: Vec<super::pane_stream_support::PaneStreamSource>,
+    ) {
+        if removed.is_empty() || sources.is_empty() {
+            return;
+        }
         let mut subscriptions = self
             .subscriptions
             .lock()
             .expect("subscription registry mutex must not be poisoned");
-        for (previous, current) in rekeys {
-            subscriptions.rekey_pane(&previous, current);
+        for source in sources {
+            if removed.contains(&source.key) {
+                subscriptions.stage_pane_drain_source(source.key.clone(), source);
+            }
         }
-        let mut removed_any = false;
-        for pane in removals {
-            removed_any = subscriptions.remove_pane(&pane) || removed_any;
+    }
+
+    /// Applies the complete pane-output registry delta for one committed state
+    /// mutation while the caller still owns the state lock.
+    ///
+    /// Destroyed panes start the same buffered-output drain as `kill-pane` and
+    /// natural pane exit instead of being torn down synchronously, so output a
+    /// pane already published is delivered before its subscription ends.
+    ///
+    /// Returning whether a drain started lets callers retry pending idle
+    /// shutdown only after both state and registry locks have been released.
+    pub(in crate::handler) fn apply_pane_output_subscription_reconciliation(
+        &self,
+        reconciliation: PaneOutputSubscriptionReconciliation,
+    ) -> bool {
+        let now = Instant::now();
+        let (rekeys, removals) = reconciliation.into_parts();
+        let draining = {
+            let mut subscriptions = self
+                .subscriptions
+                .lock()
+                .expect("subscription registry mutex must not be poisoned");
+            for (previous, current) in rekeys {
+                subscriptions.rekey_pane(&previous, current);
+            }
+            let mut draining = Vec::new();
+            for pane in removals {
+                subscriptions.mark_pane_streams_ending(&pane, PaneStreamEndReason::PaneRemoved);
+                if subscriptions.begin_pane_drain(pane.clone(), None, now) {
+                    draining.push(pane);
+                } else {
+                    // Nothing left to drain for this pane: release its cached
+                    // stream state and any stranded drain bookkeeping now.
+                    subscriptions.remove_pane(&pane);
+                }
+            }
+            draining
+        };
+        let drained_any = !draining.is_empty();
+        for pane in draining {
+            self.watch_exited_pane_drain(pane);
         }
-        removed_any
+        drained_any
     }
 
     pub(crate) fn rekey_pane_output_subscriptions(
@@ -478,6 +521,25 @@ fn resolve_pane_target_ref(
             ))
         }
     }
+}
+
+/// Captures the immutable stream handles of panes an explicit kill is about to
+/// remove, while the caller still owns the state lock that will commit the
+/// kill. Once the panes leave `state.sessions` the handles are unrecoverable,
+/// so a surface stream could no longer project the output that was already
+/// buffered when the kill ran.
+pub(in crate::handler) fn capture_pane_stream_sources(
+    state: &HandlerState,
+    panes: &[PaneOutputSubscriptionKey],
+) -> Vec<super::pane_stream_support::PaneStreamSource> {
+    panes
+        .iter()
+        .filter_map(|pane| {
+            let target =
+                state.pane_target_for_runtime_pane(pane.runtime_session_name(), pane.pane_id())?;
+            super::pane_stream_support::stream_source_for_target(state, target).ok()
+        })
+        .collect()
 }
 
 pub(in crate::handler) fn cursor_event_limit(

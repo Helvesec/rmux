@@ -350,7 +350,12 @@ def load_candidate_resolution(
     if not isinstance(artifacts, list) or len(artifacts) != 11:
         raise ValueError("resolution must contain exactly eleven candidate artifacts")
     specs = expected_specs(source_sha)
-    for item, spec in zip(artifacts, specs, strict=True):
+    # Pair the lengths explicitly: the zip builtin only grew a strict pairing
+    # keyword in Python 3.10, and release tooling must stay runnable on the
+    # macOS release host's system interpreter.
+    if len(specs) != len(artifacts):
+        raise ValueError("resolved artifacts do not pair with the expected specs")
+    for item, spec in zip(artifacts, specs):
         if not isinstance(item, dict):
             raise ValueError("resolved artifact must be an object")
         exact_keys(

@@ -236,17 +236,25 @@ pub fn write_windows_console_mouse_drag(
     )
 }
 
-/// Writes a Windows console key and, only when the pane console is in processed
-/// input mode, follows it with a scoped console interrupt.
+/// Writes a Windows console key and reports whether the pane console is in
+/// processed input mode, i.e. whether the caller must follow the key record
+/// with [`send_windows_console_interrupt`].
 ///
 /// Raw console/TUI applications commonly disable processed input and expect to
 /// receive Ctrl-C as a character. Cooked shells keep processed input enabled and
 /// expect Ctrl-C to interrupt the foreground program. This mirrors that native
 /// split instead of hard-coding one behavior for every Windows pane.
-pub fn write_windows_console_key_then_interrupt_if_processed(
+///
+/// The interrupt is left to the caller because the key record and the interrupt
+/// are two separate observable effects: a caller that retries a transient
+/// console failure must retry them independently. One physical Ctrl-C must
+/// produce one key record and one console interrupt — replaying the pair is
+/// observable by handlers that intentionally survive the first interrupt and
+/// can turn a single keystroke into a forced exit.
+pub fn write_windows_console_key_reporting_processed_input(
     process_id: ProcessId,
     key: WindowsConsoleKeyEvent,
-) -> io::Result<()> {
+) -> io::Result<bool> {
     let _guard = CONSOLE_ATTACH_LOCK
         .lock()
         .map_err(|_| io::Error::other("Windows console attach lock poisoned"))?;
@@ -255,13 +263,7 @@ pub fn write_windows_console_key_then_interrupt_if_processed(
     let mode = console_input_mode(handle.as_raw_handle() as HANDLE)?;
     trace_windows_key_injection(process_id, key);
     write_windows_console_key_to_handle(handle.as_raw_handle() as HANDLE, key)?;
-    if mode & ENABLE_PROCESSED_INPUT != 0 {
-        // One physical Ctrl-C must produce one console interrupt. Retrying the
-        // event here is observable by handlers that intentionally survive the
-        // first interrupt and can turn a single keystroke into a forced exit.
-        send_windows_console_interrupt_attached(process_id)?;
-    }
-    Ok(())
+    Ok(mode & ENABLE_PROCESSED_INPUT != 0)
 }
 
 /// Sends a native Ctrl-C interrupt to a Windows ConPTY child console.

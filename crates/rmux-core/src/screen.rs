@@ -22,7 +22,7 @@ mod view;
 #[path = "screen/writer.rs"]
 mod writer;
 
-pub use capture::RecoveryRowRenderer;
+pub use capture::{RecoveryRow, RecoveryRowRenderer};
 pub use view::{ScreenCellRef, ScreenCellView, ScreenLineView};
 
 pub(crate) const MAX_TERMINAL_PASSTHROUGH_EVENTS: usize = 256;

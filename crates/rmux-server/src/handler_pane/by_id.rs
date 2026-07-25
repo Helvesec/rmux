@@ -5,7 +5,10 @@ use rmux_proto::{
     WindowTarget,
 };
 
-use super::super::{attach_support::SessionDetachOnDestroy, RequestHandler};
+use super::super::{
+    attach_support::SessionDetachOnDestroy, subscription_support::capture_pane_stream_sources,
+    RequestHandler,
+};
 #[cfg(windows)]
 use super::pane_io_encoding::{
     prepare_pane_console_input_write, tokens_emulate_windows_cmd_select_all,
@@ -271,6 +274,8 @@ impl RequestHandler {
             let previous_subscription_keys = state
                 .pane_output_subscription_keys_for_kill(&target, request.kill_all_except)
                 .unwrap_or_default();
+            let previous_stream_sources =
+                capture_pane_stream_sources(&state, &previous_subscription_keys);
             let timer_mutation = self.plan_all_window_mutation_silence_timers_locked(&state);
             match state.remove_pane_alias_with_options(target.clone(), request.kill_all_except) {
                 Ok(result) => {
@@ -321,6 +326,10 @@ impl RequestHandler {
                             subscription_rekeys.push((previous_key, current_key));
                         }
                     }
+                    self.stage_removed_pane_stream_sources(
+                        &removed_subscription_keys,
+                        previous_stream_sources,
+                    );
                     #[cfg(test)]
                     super::super::pane_family_lifecycle_tests::pause_before_pane_kill_subscription_rekey(
                         &session_name,

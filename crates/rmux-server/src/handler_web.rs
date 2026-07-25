@@ -540,12 +540,16 @@ impl RequestHandler {
                 screen.mode() & mode::ALL_MOUSE_MODES != 0
             })
             .unwrap_or(false);
-        let mut frame = Vec::new();
         if !scrollback.metadata_complete {
-            return Err(RmuxError::Server(
-                "pane scroll frame metadata exceeds the bounded Web recovery contract".to_owned(),
-            ));
+            // Over-budget recovery metadata is a fidelity degrade, not a
+            // protocol error. The pane-frame opcode carries no completeness
+            // flag, so defer to the full snapshot, which renders the same
+            // scrolled rows and reports the gap through the session view's
+            // `metadata_complete`. Failing here would tear the viewer socket
+            // down with no close code.
+            return Ok(None);
         }
+        let mut frame = Vec::new();
         overlay_pane_lines(&mut frame, geometry, &scrollback.ansi_lines)?;
         let pane = WebSessionPaneView::new(
             pane.id(),
@@ -594,7 +598,11 @@ impl RequestHandler {
                 "pane process changed repeatedly while capturing web state".to_owned(),
             ));
         };
-        let seed = draft?.materialize()?;
+        // A shared pane link is a read-only *view*: the pane-scoped WebShare
+        // protocol has no scrollback at all, so the browser must receive the
+        // pane's visible state and never the rows that scrolled out of it
+        // before the link was handed out.
+        let seed = draft?.materialize_visible_only()?;
         let keyframe = seed.keyframe();
         let screen = seed.screen();
         let size = screen.size();

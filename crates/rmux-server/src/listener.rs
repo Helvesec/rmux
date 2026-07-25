@@ -13,6 +13,7 @@ use tokio::sync::{oneshot, watch};
 use tokio::task::{JoinError, JoinSet};
 use tracing::{debug, warn};
 
+use crate::client_names::attached_client_name;
 use crate::control::{self, ControlLifecycle, ControlServerEvent, ControlUpgradeInput};
 use crate::daemon::ShutdownHandle;
 use crate::handler::{
@@ -565,7 +566,7 @@ async fn serve_connection(
                     drop(detached_request_guard.take());
                     handler
                         .emit_client_attached_identity(
-                            requester.pid,
+                            attached_client_name(requester.pid),
                             session_name,
                             attach.session_id,
                         )

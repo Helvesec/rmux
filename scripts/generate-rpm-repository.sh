@@ -45,8 +45,6 @@ createrepo_cmd() {
 input_dir=""
 output_dir=""
 invocation_dir="$(pwd -P)"
-output_marker_suffix=".rmux-rpm-repository"
-output_marker_value="rmux-rpm-repository-v1"
 baseurl="${RMUX_PACKAGES_RPM_BASE_URL:-https://packages.rmux.io/rpm}"
 repo_id="${RMUX_RPM_REPO_ID:-rmux}"
 repo_name="${RMUX_RPM_REPO_NAME:-RMUX}"
@@ -367,20 +365,34 @@ except (ET.ParseError, OSError, ValueError) as error:
 PY
 fi
 
-output_marker="${output_dir}${output_marker_suffix}"
-if [ -L "$output_marker" ]; then
-  die "--output-dir has an invalid repository marker"
-elif [ -e "$output_marker" ]; then
-  [ -f "$output_marker" ] || die "--output-dir has an invalid repository marker"
-  [ "$(cat "$output_marker")" = "$output_marker_value" ] || \
-    die "--output-dir has an invalid repository marker"
-elif [ -n "$(find "$output_dir" -mindepth 1 -maxdepth 1 -print -quit)" ]; then
-  die "--output-dir is not an RMUX-managed RPM repository"
-else
-  printf '%s\n' "$output_marker_value" > "$output_marker"
+# The repository is regenerated from scratch, so --output-dir is emptied first.
+# Ownership is proven by the directory's own contents, never by a marker file:
+# every byte inside --output-dir is published verbatim to the public package
+# repository, and nothing may be written outside it.
+#
+# Two rules keep a mistyped --output-dir from costing unrelated data. A non-empty
+# directory must carry repodata/repomd.xml, which only a previous run of this
+# generator writes, so a bare repodata/, a lone rmux.repo or a foreign rmux-*.rpm
+# is refused rather than wiped. And RPM-GPG-KEY-* is deliberately NOT accepted:
+# this generator never produces those files, both release call sites export them
+# after it into a directory created fresh in the same job, and accepting them
+# would make a mistyped --output-dir of /etc/pki/rpm-gpg delete the host's RPM
+# signing keyring.
+if [ -n "$(find "$output_dir" -mindepth 1 -maxdepth 1 -print -quit)" ]; then
+  [ -f "$output_dir/repodata/repomd.xml" ] && [ ! -L "$output_dir/repodata/repomd.xml" ] || \
+    die "--output-dir is not empty and carries no RMUX-generated repodata/repomd.xml"
+  output_entries=()
+  while IFS= read -r -d '' output_entry; do
+    case "${output_entry##*/}" in
+      repodata|rmux.repo|rmux-*.rpm) ;;
+      *) die "--output-dir is not an RMUX-managed RPM repository: ${output_entry##*/}" ;;
+    esac
+    output_entries+=("$output_entry")
+  done < <(find "$output_dir" -mindepth 1 -maxdepth 1 -print0)
+  # Nothing is removed until every entry has been accepted, and only the accepted
+  # entries are removed.
+  [ "${#output_entries[@]}" -eq 0 ] || rm -rf "${output_entries[@]}"
 fi
-cd "$output_dir"
-rm -rf ./*
 
 found=0
 for rpm in "$input_dir"/rmux-*.rpm; do

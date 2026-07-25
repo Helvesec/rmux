@@ -4,6 +4,7 @@ use std::sync::atomic::Ordering;
 use rmux_proto::{OptionName, SessionId, SessionName, TerminalGeometry};
 
 use super::{AttachedSwitchCommitRequest, ClientFlags, RequestHandler};
+use crate::client_names::attached_client_name;
 use crate::pane_io::AttachControl;
 use crate::pane_terminals::HandlerState;
 
@@ -181,7 +182,7 @@ impl RequestHandler {
                 .is_ok()
             {
                 self.emit_client_session_changed(
-                    plan.attach_pid,
+                    attached_client_name(plan.attach_pid),
                     plan.target.session_name,
                     plan.target.session_id,
                 )

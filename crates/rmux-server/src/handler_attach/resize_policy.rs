@@ -6,6 +6,7 @@ use rmux_proto::{
     OptionName, RmuxError, SessionId, SessionName, TerminalSize, WindowId, WindowTarget,
 };
 
+use crate::client_names::attached_client_name;
 use crate::pane_io::AttachControl;
 
 use super::super::{client_support::SwitchTargetSelection, RequestHandler};
@@ -76,7 +77,10 @@ pub(in crate::handler) struct ControlResizeClient<'a> {
     active_attach: &'a super::ActiveAttachState,
     active_control: &'a super::super::ActiveControlState,
     control_pid: u32,
-    client_size: TerminalSize,
+    /// `None` while the client has never announced a size with
+    /// `refresh-client -C`; such a client owns no window geometry, exactly as
+    /// tmux's `ignore_client_size()` skips it.
+    declared_size: Option<TerminalSize>,
     size_sequence: u64,
 }
 
@@ -85,14 +89,14 @@ impl<'a> ControlResizeClient<'a> {
         active_attach: &'a super::ActiveAttachState,
         active_control: &'a super::super::ActiveControlState,
         control_pid: u32,
-        client_size: TerminalSize,
+        declared_size: Option<TerminalSize>,
         size_sequence: u64,
     ) -> Self {
         Self {
             active_attach,
             active_control,
             control_pid,
-            client_size,
+            declared_size,
             size_sequence,
         }
     }
@@ -223,8 +227,8 @@ fn control_resize_selection(
     let candidates = attached_size_candidates(
         client.active_attach,
         &linked_sessions,
-        Some(AttachedSizeCandidate {
-            size: client.client_size,
+        client.declared_size.map(|size| AttachedSizeCandidate {
+            size,
             sequence: client.size_sequence,
         }),
     );
@@ -239,6 +243,14 @@ fn control_resize_selection(
     ))
 }
 
+/// The control clients that own a size for the window-size policy.
+///
+/// A control client is only a candidate once it has announced a size with
+/// `refresh-client -C`: tmux 3.7b's `ignore_client_size()` skips a
+/// `CLIENT_CONTROL` client without `CLIENT_SIZECHANGED`, so a freshly attached
+/// control client — the state every control client starts in, including
+/// iTerm2's `-CC` before its first `refresh-client -C` — must not pull the
+/// session down to its 80x24 placeholder.
 fn control_size_candidates(
     active_control: &super::super::ActiveControlState,
     linked_sessions: &HashSet<(SessionName, SessionId)>,
@@ -249,6 +261,7 @@ fn control_size_candidates(
         .iter()
         .filter(|(pid, active)| {
             Some(**pid) != excluded_pid
+                && active.size_declared
                 && !active.closing.load(Ordering::Acquire)
                 && active
                     .session_name
@@ -784,7 +797,7 @@ impl RequestHandler {
         for pid in &removed {
             self.emit_without_attached_refresh(LifecycleEvent::ClientDetached {
                 session_name: session_name.clone(),
-                client_name: Some(pid.to_string()),
+                client_name: Some(attached_client_name(*pid)),
             })
             .await;
         }

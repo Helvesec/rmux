@@ -6,8 +6,12 @@ from __future__ import annotations
 import argparse
 import json
 import re
-import tomllib
+import sys
 from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+
+import toml_reader  # noqa: E402  (path bootstrap must run first)
 
 ROOT = Path(__file__).resolve().parents[2]
 SHA_RE = re.compile(r"[0-9a-f]{40}")
@@ -17,7 +21,10 @@ VERSION_RE = re.compile(r"(?P<version>[0-9]+\.[0-9]+\.[0-9]+)")
 
 def workspace_version(repository_root: Path) -> str:
     manifest_path = repository_root / "Cargo.toml"
-    manifest = tomllib.loads(manifest_path.read_text(encoding="utf-8"))
+    try:
+        manifest = toml_reader.loads(manifest_path.read_text(encoding="utf-8"))
+    except toml_reader.TOMLDecodeError as error:
+        raise ValueError(f"{manifest_path}: {error}") from error
     try:
         version = manifest["workspace"]["package"]["version"]
     except (KeyError, TypeError) as error:

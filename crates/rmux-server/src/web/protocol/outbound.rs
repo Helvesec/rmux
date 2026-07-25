@@ -529,6 +529,42 @@ mod tests {
     }
 
     #[test]
+    fn a_bare_c1_byte_in_the_live_tail_does_not_stop_the_viewer_stream() {
+        let snapshot = WebPaneSnapshot {
+            cols: 8,
+            rows: 2,
+            output_sequence: 4,
+            ansi_lines: Vec::new(),
+            cursor_row: 0,
+            cursor_col: 0,
+            cursor_visible: true,
+            mode_bits: 0,
+            cursor_style: 0,
+            alternate: false,
+            scroll_top: 0,
+            scroll_bottom: 1,
+            history_rows_total: 7,
+            history_rows_included: 3,
+            metadata_complete: false,
+            recovery_keyframe: Some(b"$ cat logo.bin\r\n".to_vec()),
+        };
+        let mut sanitizer = WebTerminalSanitizer::default();
+        let payload =
+            pane_snapshot_payload(&snapshot, &mut sanitizer, false).expect("snapshot fits");
+        assert_eq!(&payload[1..], b"$ cat logo.bin\r\n");
+
+        // The binary file's first bytes, then the shell prompt again. Every
+        // later frame used to be discarded by the sanitizer.
+        let mut binary = Vec::new();
+        sanitizer.push(b"\x9f\x8a\x00PNG\r\n$ ", &mut binary);
+        assert_eq!(binary, b"\x9f\x8a\x00PNG\r\n$ ");
+
+        let mut next = Vec::new();
+        sanitizer.push(b"echo hello\r\nhello\r\n$ ", &mut next);
+        assert_eq!(next, b"echo hello\r\nhello\r\n$ ");
+    }
+
+    #[test]
     fn pane_recovery_coverage_is_negotiated_and_atomic_with_the_snapshot() {
         let snapshot = WebPaneSnapshot {
             cols: 8,

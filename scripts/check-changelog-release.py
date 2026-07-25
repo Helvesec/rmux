@@ -5,8 +5,11 @@ from __future__ import annotations
 
 import re
 import sys
-import tomllib
 from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+
+import toml_reader  # noqa: E402  (path bootstrap must run first)
 
 
 TMUX_CLAIM = re.compile(r"\bmatches\s+tmux\b", re.IGNORECASE)
@@ -22,8 +25,11 @@ def fail(message: str) -> int:
 
 def workspace_release_heading() -> str:
     cargo_toml = REPO_ROOT / "Cargo.toml"
-    with cargo_toml.open("rb") as handle:
-        manifest = tomllib.load(handle)
+    try:
+        with cargo_toml.open("rb") as handle:
+            manifest = toml_reader.load(handle)
+    except toml_reader.TOMLDecodeError as error:
+        raise ValueError(f"{cargo_toml}: {error}") from error
     try:
         version = manifest["workspace"]["package"]["version"]
     except (KeyError, TypeError) as error:

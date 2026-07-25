@@ -1,3 +1,7 @@
+#[path = "support/python3.rs"]
+mod python3;
+
+use serde_json::{json, Value};
 use std::fs;
 use std::path::PathBuf;
 
@@ -303,7 +307,8 @@ fn receipt_is_separate_receipt_only_and_never_writes_contents() {
     assert!(RECEIPT.contains("git/tags/$tag_object_sha"));
     assert!(RECEIPT.contains("\"run_attempt\": 1"));
     assert!(RECEIPT.contains("status == \"in_progress\" and conclusion is None"));
-    assert!(RECEIPT.contains("status == \"completed\" and isinstance(conclusion, str)"));
+    assert!(RECEIPT.contains("status == \"completed\" and conclusion == \"success\""));
+    assert!(!RECEIPT.contains("isinstance(conclusion, str)"));
     assert!(!RECEIPT.contains("\"conclusion\": \"success\""));
     assert!(RECEIPT.contains("live immutable Release identity differs"));
     assert!(RECEIPT.contains("live annotated tag signature or target differs"));
@@ -320,6 +325,118 @@ fn receipt_is_separate_receipt_only_and_never_writes_contents() {
     assert!(RECEIPT.contains("signed authorization predicate differs"));
     assert!(RECEIPT.contains("${{ runner.temp }}/rmux-receipt/release-state.json"));
     assert!(!RECEIPT.contains("release_state_artifact_id"));
+}
+
+const AUTHORIZATION_RUN_ID: &str = "4242";
+const AUTHORIZATION_WORKFLOW_ID: &str = "77";
+const AUTHORIZATION_SOURCE_SHA: &str = "1234567890abcdef1234567890abcdef12345678";
+const AUTHORIZATION_GUARD_ERROR: &str = "authorization producer run identity or lifecycle differs";
+
+/// Lift the inline Python guard that re-checks the live authorization producer
+/// run out of `release-receipt.yml`, so the shipped bytes can be executed
+/// instead of merely string-matched.
+fn authorization_run_guard() -> String {
+    let lines: Vec<&str> = RECEIPT.lines().collect();
+    let start = lines
+        .iter()
+        .position(|line| line.trim() == "run_expected = {")
+        .expect("receipt declares the expected authorization producer run");
+    let end = start
+        + lines[start..]
+            .iter()
+            .position(|line| {
+                line.trim() == format!("raise SystemExit(\"{AUTHORIZATION_GUARD_ERROR}\")")
+            })
+            .expect("receipt aborts on an unexpected authorization producer run");
+    let indent = lines[start].len() - lines[start].trim_start().len();
+    lines[start..=end]
+        .iter()
+        .map(|line| line.get(indent..).unwrap_or_default())
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+fn authorization_run(status: &str, conclusion: Option<&str>) -> Value {
+    json!({
+        "id": AUTHORIZATION_RUN_ID.parse::<i64>().expect("run id"),
+        "workflow_id": AUTHORIZATION_WORKFLOW_ID.parse::<i64>().expect("workflow id"),
+        "run_attempt": 1,
+        "path": ".github/workflows/release-promote.yml",
+        "head_sha": AUTHORIZATION_SOURCE_SHA,
+        "repository": {"id": 1_239_918_790},
+        "status": status,
+        "conclusion": conclusion,
+    })
+}
+
+/// `Ok(())` when the receipt guard accepts the run, `Err(stderr)` when it aborts.
+fn authorization_run_verdict(run: &Value) -> Result<(), String> {
+    let program = format!(
+        "import json, os, sys\nrun = json.loads(sys.argv[1])\n{}\n",
+        authorization_run_guard()
+    );
+    let output = python3::command()
+        .arg("-c")
+        .arg(program)
+        .arg(run.to_string())
+        .env("RMUX_AUTHORIZATION_RUN_ID", AUTHORIZATION_RUN_ID)
+        .env("RMUX_AUTHORIZATION_WORKFLOW_ID", AUTHORIZATION_WORKFLOW_ID)
+        .env("RMUX_EXPECTED_SOURCE_SHA", AUTHORIZATION_SOURCE_SHA)
+        .current_dir(repo_root())
+        .output()
+        .expect("evaluate the receipt authorization producer run guard");
+    if output.status.success() {
+        return Ok(());
+    }
+    Err(String::from_utf8_lossy(&output.stderr).into_owned())
+}
+
+#[test]
+fn receipt_rejects_an_authorization_run_that_did_not_conclude_successfully() {
+    // Liveness: `dispatch-receipt` is the last job of release-promote.yml, so the
+    // producer run is still executing while the receipt verifies it.
+    authorization_run_verdict(&authorization_run("in_progress", None))
+        .expect("an in-progress authorization producer run must stay acceptable");
+    // Replayability: a receipt re-dispatched after the promote run finished.
+    authorization_run_verdict(&authorization_run("completed", Some("success")))
+        .expect("a successful authorization producer run must stay acceptable");
+
+    for conclusion in [
+        "failure",
+        "cancelled",
+        "timed_out",
+        "action_required",
+        "startup_failure",
+        "neutral",
+        "skipped",
+        "stale",
+    ] {
+        let error = authorization_run_verdict(&authorization_run("completed", Some(conclusion)))
+            .expect_err(&format!(
+                "a producer run that concluded {conclusion} must not authorize a receipt"
+            ));
+        assert!(
+            error.contains(AUTHORIZATION_GUARD_ERROR),
+            "{conclusion}: {error}"
+        );
+    }
+
+    let unsettled = authorization_run_verdict(&authorization_run("completed", None))
+        .expect_err("a completed run without a published conclusion must not authorize a receipt");
+    assert!(unsettled.contains(AUTHORIZATION_GUARD_ERROR), "{unsettled}");
+
+    // The lifecycle relaxation must not weaken the surrounding identity pins.
+    let mut retried = authorization_run("completed", Some("success"));
+    retried["run_attempt"] = json!(2);
+    let rerun = authorization_run_verdict(&retried)
+        .expect_err("a re-run attempt must not authorize a receipt");
+    assert!(rerun.contains(AUTHORIZATION_GUARD_ERROR), "{rerun}");
+
+    let mut foreign = authorization_run("in_progress", None);
+    foreign["repository"] = json!({"id": 1});
+    let elsewhere = authorization_run_verdict(&foreign)
+        .expect_err("a run from another repository must not authorize a receipt");
+    assert!(elsewhere.contains(AUTHORIZATION_GUARD_ERROR), "{elsewhere}");
 }
 
 #[test]

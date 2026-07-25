@@ -2104,8 +2104,10 @@ fn queued_attach_session_cleans_up_daemon_started_by_command() -> Result<(), Box
 }
 
 #[test]
-fn earlier_queued_command_does_not_consume_attach_startup_connection() -> Result<(), Box<dyn Error>>
-{
+fn queued_command_before_attach_still_cleans_up_the_started_daemon() -> Result<(), Box<dyn Error>> {
+    // `start-server` consumes the startup connection, so the attach that
+    // follows opens its own. The startup provenance still has to reach it, or
+    // the empty daemon this invocation created is left running.
     let harness = CliHarness::new("queued-command-before-attach")?;
     let _cleanup = harness.auto_start_cleanup()?;
 
@@ -2120,6 +2122,40 @@ fn earlier_queued_command_does_not_consume_attach_startup_connection() -> Result
     assert_eq!(stderr(&output).trim(), "no sessions");
     assert!(harness.pid_path().exists());
     wait_for_socket_cleanup(harness.socket_path())?;
+    Ok(())
+}
+
+#[test]
+fn queued_session_teardown_lets_the_started_daemon_exit_empty() -> Result<(), Box<dyn Error>> {
+    let harness = CliHarness::new("queued-teardown-exit-empty")?;
+    let _cleanup = harness.auto_start_cleanup()?;
+
+    let output = harness.run_with(
+        &[
+            "new-session",
+            "-d",
+            "-s",
+            "tmp",
+            ";",
+            "kill-session",
+            "-t",
+            "tmp",
+        ],
+        |command| {
+            command.env(BINARY_OVERRIDE_ENV, harness.launcher_path());
+        },
+    )?;
+
+    assert_success(&output);
+    assert!(harness.pid_path().exists());
+    // The startup connection must not outlive the command that consumed it:
+    // a second idle client connection cancels the daemon's exit-empty
+    // shutdown for good. tmux 3.7b stops its server here.
+    wait_for_socket_cleanup(harness.socket_path())?;
+
+    let listed = harness.run(&["list-sessions"])?;
+    assert_eq!(listed.status.code(), Some(1));
+    assert_absent_server_error(&listed, &harness, "list-sessions");
     Ok(())
 }
 

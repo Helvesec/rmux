@@ -1,6 +1,7 @@
 use rmux_core::LifecycleEvent;
 use rmux_proto::{HookName, SessionId, SessionName};
 
+use crate::client_names::control_client_name;
 use crate::hook_runtime::PendingInlineHookFormat;
 
 use super::super::RequestHandler;
@@ -99,7 +100,7 @@ impl RequestHandler {
             self.emit_for_session_identity(
                 LifecycleEvent::ClientSessionChanged {
                     session_name: session_name.clone(),
-                    client_name: Some(requester_pid.to_string()),
+                    client_name: Some(control_client_name(requester_pid)),
                 },
                 session_name,
                 session_id,

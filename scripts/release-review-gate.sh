@@ -25,6 +25,12 @@ Options:
   --no-tmux            Skip tmux authority checks inside the package smoke.
   -h, --help           Show this help.
 
+Requirements:
+  python3              CPython 3.9 or newer. Release tooling deliberately stays
+                       within the macOS system interpreter's feature set so the
+                       gate runs on the release host; scripts/toml_reader.py
+                       enforces that floor.
+
 Environment:
   RMUX_PERF_CURRENT_JSON  Required current-run perf JSON for release comparison.
   RMUX_PERF_AUTO_CURRENT  Set to 1 to generate current perf JSON locally.
@@ -191,6 +197,7 @@ export RMUX_REQUIRE_TMUX=1
 printf 'rust-min-stack=%s\n' "$RUST_MIN_STACK"
 
 if section_enabled static; then
+  run_step "release TOML reader self-test" python3 scripts/toml_reader.py --self-test
   run_step "release versions" scripts/check-release-versions.sh
   run_step "changelog release audit" python3 scripts/check-changelog-release.py CHANGELOG.md
   run_step "tmux divergence ledger" python3 scripts/check-tmux-release-ledger.py

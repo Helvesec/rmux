@@ -452,6 +452,48 @@ jobs:
             python "scripts/release/$script" --help >/dev/null
           done
 
+      # The release-review gate itself runs on the macOS release host, whose only
+      # interpreter is the system CPython 3.9. Nothing else in CI exercises that
+      # floor, so a 3.10+ stdlib feature used to reach the release machine as an
+      # unrunnable gate instead of a red build.
+      - name: Install the release-review gate Python floor
+        uses: actions/setup-python@e797f83bcb11b83ae66e0230d6156d7c80228e7c # v6.0.0
+        with:
+          python-version: "3.9"
+
+      - name: Validate the release-review gate on the Python floor
+        env:
+          PYTHONDONTWRITEBYTECODE: "1"
+        run: |
+          set -euo pipefail
+          python --version
+          python scripts/toml_reader.py --self-test
+          python scripts/check-changelog-release.py CHANGELOG.md
+          python scripts/check-tmux-release-ledger.py
+          python scripts/perf-diff.py --self-test
+          python scripts/check-perf-current.py --self-test
+          python - <<'PY'
+          import importlib.util
+          import pathlib
+          import sys
+
+          probed = 0
+          for path in sorted(pathlib.Path("scripts").rglob("*.py")):
+              sys.path.insert(0, str(path.parent))
+              spec = importlib.util.spec_from_file_location("release_tooling_probe", path)
+              module = importlib.util.module_from_spec(spec)
+              sys.modules[spec.name] = module
+              try:
+                  spec.loader.exec_module(module)
+              finally:
+                  del sys.modules[spec.name]
+                  sys.path.pop(0)
+              probed += 1
+          if probed < 80:
+              raise SystemExit(f"release tooling inventory collapsed to {probed} modules")
+          print(f"python-floor-import-probe=ok modules={probed}")
+          PY
+
       - name: Unsafe policy gate
         run: scripts/unsafe-check.sh
 
@@ -720,9 +762,14 @@ jobs:
           set -euo pipefail
           expected="$(python3 - <<'PY'
           import pathlib
-          import tomllib
+          import sys
 
-          manifest = tomllib.loads(pathlib.Path("Cargo.toml").read_text())
+          sys.path.insert(0, "scripts")
+          import toml_reader
+
+          manifest = toml_reader.loads(
+              pathlib.Path("Cargo.toml").read_text(encoding="utf-8")
+          )
           print(manifest["workspace"]["package"]["version"])
           PY
           )"
@@ -1403,3 +1450,6 @@ jobs:
 
       - name: Windows named-pipe IPC smoke
         run: cargo test -p rmux-ipc --locked --test named_pipe_integration -- --nocapture
+
+      - name: Windows legacy shutdown smoke
+        run: cargo test -p rmux-client --locked --test windows_legacy_shutdown -- --nocapture

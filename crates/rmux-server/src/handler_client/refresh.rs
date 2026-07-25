@@ -236,7 +236,7 @@ impl RequestHandler {
                         &active_attach,
                         &active_control,
                         control_pid,
-                        size,
+                        Some(size),
                         size_sequence,
                     ),
                     session_name,
@@ -249,6 +249,7 @@ impl RequestHandler {
                             .expect("validated control client remains locked");
                         active.client_width = size.cols;
                         active.client_height = size.rows;
+                        active.size_declared = true;
                     }
                     Err(error) => return Response::Error(ErrorResponse { error }),
                 }
@@ -272,6 +273,7 @@ impl RequestHandler {
             };
             active.client_width = size.cols;
             active.client_height = size.rows;
+            active.size_declared = true;
         } else if control_size.is_none() {
             if let Err(error) = self.refresh_control_client_for_identity(identity).await {
                 return Response::Error(ErrorResponse { error });

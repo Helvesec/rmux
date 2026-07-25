@@ -14,7 +14,7 @@ use super::super::pane_io_encoding::{
 use super::super::pane_io_encoding::{
     prepare_pane_console_input_write, should_emulate_windows_cmd_select_all,
     should_route_windows_control_as_pty_bytes, windows_console_input_for_attached_key,
-    write_windows_console_input_action_to_target_io, PaneConsoleInputWrite,
+    write_attached_windows_console_input_action_to_target_io, PaneConsoleInputWrite,
     WindowsConsoleInputAction,
 };
 
@@ -108,7 +108,7 @@ pub(super) async fn write_prepared_attached_pane_forwards(
             }
             #[cfg(windows)]
             PreparedAttachedPaneForward::WindowsConsoleKey { write, action } => {
-                write_windows_console_input_action_to_target_io(write, action).await?;
+                write_attached_windows_console_input_action_to_target_io(write, action).await?;
             }
         }
     }

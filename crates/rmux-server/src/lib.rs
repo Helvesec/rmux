@@ -13,6 +13,9 @@ mod buffer_file_io;
 #[cfg_attr(windows, allow(dead_code))]
 mod client_flags;
 #[cfg(any(unix, windows))]
+#[cfg_attr(windows, allow(dead_code))]
+mod client_names;
+#[cfg(any(unix, windows))]
 mod clipboard_protocol;
 #[cfg(any(unix, windows))]
 #[cfg_attr(windows, allow(dead_code))]
@@ -150,7 +153,9 @@ mod unix_socket_access;
 mod wait_for;
 #[cfg(all(any(unix, windows), feature = "web"))]
 mod web;
-#[cfg(windows)]
+// Console-input retry policy is plain `io::Error` logic with no Win32 calls:
+// compile it in test builds on every platform so the policy stays covered.
+#[cfg(any(windows, test))]
 mod windows_console_input;
 
 /// Fuzzing entry points for protocol parsers.

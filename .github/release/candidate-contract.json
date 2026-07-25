@@ -553,6 +553,7 @@
     "scripts/smoke-unix-deep.sh",
     "scripts/smoke-unix.sh",
     "scripts/tmux-compat-linux-check.py",
+    "scripts/toml_reader.py",
     "scripts/unsafe-check.sh",
     "scripts/validate-winget-manifest.ps1",
     "scripts/verify-debian-package.sh",

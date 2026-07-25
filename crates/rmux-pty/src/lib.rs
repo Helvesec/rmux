@@ -60,7 +60,7 @@ pub use size::{TerminalGeometry, TerminalPixels, TerminalSize};
 #[cfg(windows)]
 pub use windows_console_input::{
     send_windows_console_interrupt, write_windows_console_key, write_windows_console_key_batch,
-    write_windows_console_key_then_interrupt_if_processed, write_windows_console_mouse_drag,
+    write_windows_console_key_reporting_processed_input, write_windows_console_mouse_drag,
     WindowsConsoleKeyEvent,
 };
 

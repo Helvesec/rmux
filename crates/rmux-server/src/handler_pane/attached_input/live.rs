@@ -38,6 +38,7 @@ use super::{
     retain_partial_attached_escape_input,
 };
 use crate::client_flags::ClientFlags;
+use crate::client_names::attached_client_name;
 use crate::handler::overlay_support::AttachedOverlayInput;
 use crate::handler::{
     attach_support::{ActiveAttachIdentity, TransientMessageInput},
@@ -1775,7 +1776,7 @@ impl RequestHandler {
         if should_emit {
             self.emit(LifecycleEvent::ClientActive {
                 session_name: target.session_name().clone(),
-                client_name: Some(attach_pid.to_string()),
+                client_name: Some(attached_client_name(attach_pid)),
             })
             .await;
         }
@@ -1797,7 +1798,7 @@ impl RequestHandler {
         }
         let attach_pid = identity.attach_pid();
         let session_name = target.session_name().clone();
-        let client_name = Some(attach_pid.to_string());
+        let client_name = Some(attached_client_name(attach_pid));
         let events = match event {
             TerminalControlEvent::FocusIn => {
                 vec![

@@ -107,8 +107,30 @@ verify_index_file() {
     die "APT $label does not match its SHA-256 name"
 }
 
+release_acquire_by_hash() {
+  local release
+  release="$1"
+  awk '
+    BEGIN { seen = 0; value = "no" }
+    /^[ \t]/ { next }
+    {
+      colon = index($0, ":")
+      if (colon == 0) { next }
+      if (tolower(substr($0, 1, colon - 1)) != "acquire-by-hash") { next }
+      seen += 1
+      value = substr($0, colon + 1)
+      gsub(/^[ \t]+|[ \t\r]+$/, "", value)
+      value = tolower(value)
+    }
+    END {
+      if (seen > 1) { exit 1 }
+      print value
+    }
+  ' "$release"
+}
+
 retain_previous_by_hash() {
-  local release release_resolved architecture name relative entry digest size canonical by_hash destination
+  local release release_resolved advertised architecture name relative entry digest size canonical by_hash destination
   release="$previous_repository_dir/dists/$suite/Release"
   [ -f "$release" ] && [ ! -L "$release" ] ||
     die "authenticated previous APT Release is missing or unsafe"
@@ -116,6 +138,23 @@ retain_previous_by_hash() {
   case "$release_resolved" in
     "$previous_repository_dir"/*) ;;
     *) die "authenticated previous APT Release escaped its repository" ;;
+  esac
+  advertised="$(release_acquire_by_hash "$release")" ||
+    die "authenticated previous APT Release repeats Acquire-By-Hash"
+  case "$advertised" in
+    yes)
+      by_hash_retention="retained"
+      ;;
+    no)
+      # A publication that never advertised Acquire-By-Hash has no by-hash URL a
+      # client can still be resolving, so the first by-hash generation has
+      # nothing to retain. Its canonical indexes are still authenticated below.
+      by_hash_retention="bootstrap"
+      printf 'notice: previous APT Release does not advertise Acquire-By-Hash; publishing the first by-hash generation\n' >&2
+      ;;
+    *)
+      die "authenticated previous APT Release has an unsupported Acquire-By-Hash value: $advertised"
+      ;;
   esac
   for architecture in "${architectures[@]}"; do
     for name in Packages Packages.gz; do
@@ -128,10 +167,12 @@ retain_previous_by_hash() {
       case "$size" in *[!0-9]*|"") die "invalid previous APT size for $relative" ;; esac
 
       canonical="$previous_repository_dir/dists/$suite/$relative"
-      by_hash="$previous_repository_dir/dists/$suite/$component/binary-$architecture/by-hash/SHA256/$digest"
       verify_index_file \
         "$canonical" "$digest" "$size" "authenticated previous index $relative" \
         "$previous_repository_dir"
+      [ "$by_hash_retention" = retained ] || continue
+
+      by_hash="$previous_repository_dir/dists/$suite/$component/binary-$architecture/by-hash/SHA256/$digest"
       verify_index_file \
         "$by_hash" "$digest" "$size" "authenticated previous by-hash index $relative" \
         "$previous_repository_dir"
@@ -151,6 +192,7 @@ retain_previous_by_hash() {
 input_dir=""
 output_dir=""
 previous_repository_dir=""
+by_hash_retention="disabled"
 suite="stable"
 component="main"
 architectures=()
@@ -328,4 +370,5 @@ printf 'repository=%s\n' "$output_dir"
 printf 'suite=%s\n' "$suite"
 printf 'component=%s\n' "$component"
 printf 'architectures=%s\n' "${architectures[*]}"
+printf 'by_hash_retention=%s\n' "$by_hash_retention"
 printf 'signed=%s\n' "$([ -n "$signing_key" ] && printf true || printf false)"

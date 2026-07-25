@@ -7,6 +7,7 @@ use rmux_core::LifecycleEvent;
 #[cfg(test)]
 use tokio::sync::mpsc;
 
+use crate::client_names::attached_client_name;
 use crate::handler::{current_client_activity_timestamp, RequestHandler};
 use crate::mouse::ClientMouseState;
 #[cfg(test)]
@@ -330,7 +331,7 @@ impl RequestHandler {
             if emit_detached {
                 self.emit(LifecycleEvent::ClientDetached {
                     session_name: session_name.clone(),
-                    client_name: Some(requester_pid.to_string()),
+                    client_name: Some(attached_client_name(requester_pid)),
                 })
                 .await;
             }

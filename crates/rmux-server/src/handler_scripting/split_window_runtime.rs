@@ -33,18 +33,12 @@ impl RequestHandler {
         let (outcome, inline_hooks) =
             Box::pin(self.dispatch_captured(requester_pid, u64::from(requester_pid), request))
                 .await;
-        let inline_hook_names = inline_hooks
-            .iter()
-            .map(|pending| pending.hook)
-            .collect::<Vec<_>>();
-        self.run_inline_hooks(requester_pid, inline_hooks, Some(command_for_hooks))
-            .await;
-        self.run_request_hooks(
+        self.run_dispatched_hooks(
             requester_pid,
             &request_for_hooks,
             &outcome.response,
+            inline_hooks,
             Some(command_for_hooks),
-            &inline_hook_names,
         )
         .await;
         self.queued_split_window_action(requester_pid, command, outcome.response)

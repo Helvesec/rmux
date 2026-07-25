@@ -3,6 +3,7 @@ use rmux_core::{formats::FormatContext, Utf8Config};
 use rmux_proto::{PaneTarget, RmuxError};
 use std::collections::BTreeMap;
 
+use crate::client_names::attached_client_name;
 use crate::format_runtime::{render_runtime_template, RuntimeFormatContext};
 use crate::pane_terminals::HandlerState;
 
@@ -194,7 +195,7 @@ impl RequestHandler {
                 pid,
                 attach_id: active.id,
                 session_name: Some(active.session_name.clone()),
-                label: attached_client_label(pid),
+                label: attached_client_name(pid),
                 activity: active.activity_at,
                 width: active.client_size.cols,
                 height: active.client_size.rows,
@@ -421,12 +422,6 @@ fn local_datetime(epoch: i64) -> Option<DateTime<Local>> {
         LocalResult::Ambiguous(date_time, _) => Some(date_time),
         LocalResult::None => None,
     }
-}
-
-fn attached_client_label(attach_pid: u32) -> String {
-    rmux_os::process::fd_path(attach_pid, 0)
-        .map(|path| path.to_string_lossy().into_owned())
-        .unwrap_or_else(|| attach_pid.to_string())
 }
 
 fn mode_tree_default_selection(

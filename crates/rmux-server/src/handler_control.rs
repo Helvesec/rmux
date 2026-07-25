@@ -15,6 +15,7 @@ use super::{
     current_client_activity_timestamp, update_environment_from_client, QueuedLifecycleEvent,
     RequestHandler,
 };
+use crate::client_names::control_client_name;
 use crate::control::{ControlClientFlags, ControlModeUpgrade, ControlServerEvent};
 use crate::control_notifications::{collect_control_notifications, ControlClientSnapshot};
 use crate::handler_support::{ambiguous_attached_client, attached_client_required};
@@ -66,6 +67,17 @@ pub(super) struct ActiveControl {
     pub(super) activity_at: i64,
     pub(super) client_width: u16,
     pub(super) client_height: u16,
+    /// Whether this client ever announced a size with `refresh-client -C`.
+    ///
+    /// A control client owns no window geometry until it has: tmux 3.7b's
+    /// `ignore_client_size()` skips a `CLIENT_CONTROL` client that has no
+    /// `CLIENT_SIZECHANGED`, so `client_width`/`client_height` stay at
+    /// `DEFAULT_CONTROL_CLIENT_WIDTH`/`DEFAULT_CONTROL_CLIENT_HEIGHT` — a
+    /// placeholder for reporting only — and never reach a policy. Measured
+    /// 2026-07-25 across `window-size` latest/largest/smallest/manual: a
+    /// control client attaching to a 200x50 session leaves it at 200x50 in
+    /// tmux, whether or not another client is attached.
+    pub(super) size_declared: bool,
     pub(super) size_sequence: u64,
     pub(super) session_name: Option<rmux_proto::SessionName>,
     pub(super) session_id: Option<SessionId>,
@@ -474,6 +486,7 @@ impl RequestHandler {
                         activity_at: current_client_activity_timestamp(),
                         client_width: DEFAULT_CONTROL_CLIENT_WIDTH,
                         client_height: DEFAULT_CONTROL_CLIENT_HEIGHT,
+                        size_declared: false,
                         size_sequence: 0,
                         session_name: None,
                         session_id: None,
@@ -502,7 +515,7 @@ impl RequestHandler {
                                         &mut state,
                                         &LifecycleEvent::ClientDetached {
                                             session_name: session_name.clone(),
-                                            client_name: Some(requester_pid.to_string()),
+                                            client_name: Some(control_client_name(requester_pid)),
                                         },
                                     );
                                     event.control_session_identity = Some(*session_id);
@@ -596,7 +609,7 @@ impl RequestHandler {
                                         &mut state,
                                         &LifecycleEvent::ClientDetached {
                                             session_name: session_name.clone(),
-                                            client_name: Some(requester_pid.to_string()),
+                                            client_name: Some(control_client_name(requester_pid)),
                                         },
                                     );
                                     event.control_session_identity = Some(*session_id);
@@ -1183,7 +1196,7 @@ impl RequestHandler {
             &mut state,
             &LifecycleEvent::ClientSessionChanged {
                 session_name: target_session_name.clone(),
-                client_name: Some(requester_pid.to_string()),
+                client_name: Some(control_client_name(requester_pid)),
             },
         );
         client_session_changed.control_session_identity = Some(target_session_id);
@@ -1267,10 +1280,10 @@ impl RequestHandler {
                 .expect("a switch target selection carries a stable session identity");
             selection.validate_for_session_identity(&state, session_name, session_id)?;
         }
-        let control_size = TerminalSize {
+        let control_size = active.size_declared.then_some(TerminalSize {
             cols: active.client_width,
             rows: active.client_height,
-        };
+        });
         let previous_session_id = active.session_id;
         let size_sequence = next_session_name
             .as_ref()
@@ -1334,8 +1347,12 @@ impl RequestHandler {
             if let (Some(session_name), Some(session_id)) =
                 (next_session_name.as_ref(), next_session_id)
             {
-                self.emit_client_session_changed(requester_pid, session_name.clone(), session_id)
-                    .await;
+                self.emit_client_session_changed(
+                    control_client_name(requester_pid),
+                    session_name.clone(),
+                    session_id,
+                )
+                .await;
             }
         }
         // The destination resize was recorded by the geometry chokepoint and is
@@ -1575,7 +1592,7 @@ impl RequestHandler {
                         &mut state,
                         &LifecycleEvent::ClientDetached {
                             session_name: session_name.clone(),
-                            client_name: Some(requester_pid.to_string()),
+                            client_name: Some(control_client_name(requester_pid)),
                         },
                     );
                     event.control_session_identity = Some(session_id);
@@ -1793,7 +1810,7 @@ impl RequestHandler {
                     &mut state,
                     &LifecycleEvent::ClientDetached {
                         session_name,
-                        client_name: Some(requester_pid.to_string()),
+                        client_name: Some(control_client_name(requester_pid)),
                     },
                 );
                 event.control_session_identity = session_id;

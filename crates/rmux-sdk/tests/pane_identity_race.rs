@@ -31,6 +31,10 @@ type TestResult<T = ()> = Result<T, Box<dyn Error + Send + Sync>>;
 
 static UNIQUE_ID: AtomicUsize = AtomicUsize::new(0);
 
+/// Request timeout for tests that must distinguish a stalled render future
+/// from a transport that gives up on an unanswered cursor poll.
+const STALL_PROOF_REQUEST_TIMEOUT: Duration = Duration::from_secs(60);
+
 #[tokio::test]
 async fn stable_id_id_retries_reverse_after_inter_session_move_overlaps_scan() -> TestResult {
     let socket = TestSocket::new("id-move-race")?;
@@ -460,6 +464,172 @@ async fn render_stream_does_not_reopen_after_eof_and_reset_without_lifecycle() -
     assert_eq!(update.snapshot().revision, 42);
     assert_eq!(update.snapshot().visible_text(), "reset-only");
     assert!(render.next().await?.is_none());
+    drop(render);
+    drop(pane);
+    server.await??;
+    Ok(())
+}
+
+#[tokio::test]
+async fn render_stream_emits_the_final_frame_when_output_eof_precedes_the_debounce() -> TestResult {
+    let socket = TestSocket::new("render-eof-then-frame")?;
+    let listener = UnixListener::bind(socket.path())?;
+    let (release_end, end_released) = tokio::sync::oneshot::channel();
+    let server = tokio::spawn(async move {
+        let mut peer = accept_peer(&listener).await?;
+        expect_initial_preferred_lookup(&mut peer).await?;
+        expect_direct_beta_resolution(&mut peer).await?;
+        expect_direct_beta_resolution(&mut peer).await?;
+        expect_by_id_handshake(&mut peer).await?;
+        let output_id = expect_output_subscription(&mut peer).await?;
+        expect_direct_beta_resolution(&mut peer).await?;
+        let surface_id =
+            expect_surface_subscription(&mut peer, resolved_target(), resolved_slot(), 41, "base")
+                .await?;
+
+        // The pane process exits: the daemon publishes the zero-length output
+        // EOF first, then the last surface frame it produced.
+        let mut eof_sent = false;
+        loop {
+            match peer.expect_request().await? {
+                Request::PaneOutputCursor(request) if request.subscription_id == output_id => {
+                    write_output_eof(&mut peer, output_id, 1).await?;
+                    eof_sent = true;
+                }
+                Request::PaneStreamCursor(request) if request.subscription_id == surface_id => {
+                    if eof_sent {
+                        write_surface_cursor(&mut peer, surface_id, 42, "final").await?;
+                        break;
+                    }
+                    write_empty_surface_cursor(&mut peer, surface_id).await?;
+                }
+                request => {
+                    return Err(format!("expected render cursor request, got {request:?}").into());
+                }
+            }
+        }
+
+        // `remain-on-exit-format ""` produces no dead-pane reset, so nothing but
+        // the armed debounce can release the pending snapshot.
+        let request = peer.expect_request().await?;
+        let Request::PaneStreamCursor(request) = request else {
+            return Err(format!("expected a surface cursor poll, got {request:?}").into());
+        };
+        assert_eq!(request.subscription_id, surface_id);
+        end_released
+            .await
+            .map_err(|_| "render test completion signal dropped")?;
+        peer.write_response(Response::PaneStreamCursor(Box::new(
+            PaneStreamCursorResponse {
+                subscription_id: surface_id,
+                events: vec![PaneStreamEvent::End(
+                    rmux_proto::PaneStreamEndReason::PaneRemoved,
+                )],
+                limited: false,
+            },
+        )))
+        .await?;
+        TestResult::Ok(())
+    });
+
+    let pane = pane_by_id_with_timeout(socket.path(), STALL_PROOF_REQUEST_TIMEOUT).await?;
+    let mut render = pane
+        .render_stream()
+        .await?
+        .with_debounce(Duration::from_millis(250));
+    let started = std::time::Instant::now();
+    let update = tokio::time::timeout(Duration::from_secs(10), render.next())
+        .await
+        .map_err(|_| "render stream stalled after output EOF instead of honoring its debounce")??
+        .expect("the debounce releases the last frame after output EOF");
+    assert_eq!(update.snapshot().revision, 42);
+    assert_eq!(update.snapshot().visible_text(), "final");
+    assert!(
+        started.elapsed() < Duration::from_secs(2),
+        "the last frame must be released by the debounce, not by an unrelated timeout: {:?}",
+        started.elapsed()
+    );
+
+    // The forced emit must leave the stream usable: the surface end still ends it.
+    let _ = release_end.send(());
+    assert!(tokio::time::timeout(Duration::from_secs(10), render.next())
+        .await
+        .map_err(|_| "render stream stalled instead of observing its surface end")??
+        .is_none());
+    drop(render);
+    drop(pane);
+    server.await??;
+    Ok(())
+}
+
+#[tokio::test]
+async fn render_stream_emits_the_final_frame_when_output_eof_lands_inside_the_debounce(
+) -> TestResult {
+    let socket = TestSocket::new("render-frame-then-eof")?;
+    let listener = UnixListener::bind(socket.path())?;
+    let (finish_server, server_finished) = tokio::sync::oneshot::channel();
+    let server = tokio::spawn(async move {
+        let mut peer = accept_peer(&listener).await?;
+        expect_initial_preferred_lookup(&mut peer).await?;
+        expect_direct_beta_resolution(&mut peer).await?;
+        expect_direct_beta_resolution(&mut peer).await?;
+        expect_by_id_handshake(&mut peer).await?;
+        let output_id = expect_output_subscription(&mut peer).await?;
+        expect_direct_beta_resolution(&mut peer).await?;
+        let surface_id =
+            expect_surface_subscription(&mut peer, resolved_target(), resolved_slot(), 41, "base")
+                .await?;
+
+        // Mirror ordering: the last surface frame arms the debounce first, then
+        // the zero-length output EOF lands while that debounce is still armed.
+        let mut frame_sent = false;
+        loop {
+            match peer.expect_request().await? {
+                Request::PaneOutputCursor(request) if request.subscription_id == output_id => {
+                    if frame_sent {
+                        write_output_eof(&mut peer, output_id, 1).await?;
+                        break;
+                    }
+                    write_empty_output_cursor(&mut peer, output_id).await?;
+                }
+                Request::PaneStreamCursor(request) if request.subscription_id == surface_id => {
+                    if frame_sent {
+                        write_empty_surface_cursor(&mut peer, surface_id).await?;
+                    } else {
+                        write_surface_cursor(&mut peer, surface_id, 42, "final").await?;
+                        frame_sent = true;
+                    }
+                }
+                request => {
+                    return Err(format!("expected render cursor request, got {request:?}").into());
+                }
+            }
+        }
+
+        server_finished
+            .await
+            .map_err(|_| "render test completion signal dropped")?;
+        TestResult::Ok(())
+    });
+
+    let pane = pane_by_id_with_timeout(socket.path(), STALL_PROOF_REQUEST_TIMEOUT).await?;
+    let mut render = pane
+        .render_stream()
+        .await?
+        .with_debounce(Duration::from_millis(250));
+    let started = std::time::Instant::now();
+    let update = tokio::time::timeout(Duration::from_secs(10), render.next())
+        .await
+        .map_err(|_| "render stream stalled after output EOF instead of honoring its debounce")??
+        .expect("the debounce releases the last frame after output EOF");
+    assert_eq!(update.snapshot().revision, 42);
+    assert_eq!(update.snapshot().visible_text(), "final");
+    assert!(
+        started.elapsed() < Duration::from_secs(2),
+        "the last frame must be released by the debounce, not by an unrelated timeout: {:?}",
+        started.elapsed()
+    );
+    let _ = finish_server.send(());
     drop(render);
     drop(pane);
     server.await??;
@@ -1522,9 +1692,19 @@ async fn stable_id_state_stream_retries_a_move_after_resolution() -> TestResult 
 }
 
 async fn pane_by_id(socket_path: &Path) -> TestResult<Pane> {
+    pane_by_id_with_timeout(socket_path, Duration::from_secs(2)).await
+}
+
+/// Same handle with an explicit request timeout.
+///
+/// Stream cursor polls run under this timeout, and a timed-out poll is
+/// reported as a synthetic `TransportLost` end. Tests that must observe a
+/// stalled render future therefore need a timeout far longer than the
+/// behaviour under test, otherwise the transport masks the stall.
+async fn pane_by_id_with_timeout(socket_path: &Path, timeout: Duration) -> TestResult<Pane> {
     let rmux = RmuxBuilder::new()
         .unix_socket(socket_path)
-        .default_timeout(Duration::from_secs(2))
+        .default_timeout(timeout)
         .build();
     Ok(rmux.pane_by_id(preferred_session(), pane_id()).await?)
 }

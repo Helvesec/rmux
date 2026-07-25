@@ -23,6 +23,7 @@ use super::{
     active_session_target, current_expected_attach_identity, expected_attach_follows_registration,
     rebase_expected_attach_session_after_switch, validate_expected_attach_identity, RequestHandler,
 };
+use crate::client_names::control_client_name;
 use crate::control::ControlCommandResult;
 use crate::hook_runtime::capture_inline_hooks;
 use crate::mouse::{AttachedMouseEvent, MouseLocation};
@@ -827,7 +828,7 @@ impl RequestHandler {
         mode: QueueMode,
         expected_control_id: Option<u64>,
     ) -> Result<QueuedCommandExecution, RmuxError> {
-        QUEUED_COMMAND_CONTEXT
+        let execution = QUEUED_COMMAND_CONTEXT
             .scope(
                 context.clone(),
                 self.execute_queued_command_scoped(
@@ -838,7 +839,15 @@ impl RequestHandler {
                     expected_control_id,
                 ),
             )
-            .await
+            .await;
+        // Same applied-window-resize backstop as `run_dispatched_hooks`, for
+        // the invocations that never dispatch a `Request` (new-window,
+        // split-window, choose-tree, display-popup, source-file, ...). Every
+        // queued command therefore leaves the geometry queue empty, whether it
+        // came from a control client, a multi-command CLI invocation, a hook or
+        // a key binding.
+        self.publish_applied_window_resizes().await;
+        execution
     }
 
     #[async_recursion::async_recursion]
@@ -1105,18 +1114,12 @@ impl RequestHandler {
                     } else {
                         false
                     };
-                let inline_hook_names = inline_hooks
-                    .iter()
-                    .map(|pending| pending.hook)
-                    .collect::<Vec<_>>();
-                self.run_inline_hooks(requester_pid, inline_hooks, Some(&command_for_hooks))
-                    .await;
-                self.run_request_hooks(
+                self.run_dispatched_hooks(
                     requester_pid,
                     &request_for_hooks,
                     &outcome.response,
+                    inline_hooks,
                     Some(&command_for_hooks),
-                    &inline_hook_names,
                 )
                 .await;
                 let action = match mode {
@@ -1196,18 +1199,12 @@ impl RequestHandler {
                         } else {
                             false
                         };
-                    let inline_hook_names = inline_hooks
-                        .iter()
-                        .map(|pending| pending.hook)
-                        .collect::<Vec<_>>();
-                    self.run_inline_hooks(requester_pid, inline_hooks, Some(&command_for_hooks))
-                        .await;
-                    self.run_request_hooks(
+                    self.run_dispatched_hooks(
                         requester_pid,
                         &request_for_hooks,
                         &outcome.response,
+                        inline_hooks,
                         Some(&command_for_hooks),
-                        &inline_hook_names,
                     )
                     .await;
                     let action = match mode {
@@ -1863,7 +1860,7 @@ impl RequestHandler {
                 )
                 .await?;
                 self.emit_client_attached_identity(
-                    requester_pid,
+                    control_client_name(requester_pid),
                     response.session_name.clone(),
                     session_id,
                 )

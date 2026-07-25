@@ -267,6 +267,19 @@ impl KillPaneLifecycleBatch {
         }
     }
 
+    /// Sequences one event that was deferred before the kill, dispatching its
+    /// hooks from the same pre-kill snapshot the batch uses.
+    ///
+    /// Deferring the dispatch keeps a failed kill attempt free of side effects,
+    /// so the caller can retry it without consuming one-shot hooks.
+    pub(super) fn prepare_deferred(
+        &mut self,
+        state: &mut HandlerState,
+        deferred: DeferredLifecycleEvent,
+    ) -> QueuedLifecycleEvent {
+        prepare_deferred_lifecycle_event(state, &mut self.hook_snapshot, deferred)
+    }
+
     pub(super) fn prepare_committed(
         mut self,
         state: &mut HandlerState,

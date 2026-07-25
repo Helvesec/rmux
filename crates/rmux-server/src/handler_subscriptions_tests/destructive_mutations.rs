@@ -1,22 +1,31 @@
+use std::time::Duration;
+
 use rmux_proto::types::OptionScopeSelector;
 use rmux_proto::{
     KillSessionRequest, KillWindowRequest, LinkWindowRequest, MoveWindowRequest, MoveWindowTarget,
     NewSessionRequest, NewWindowRequest, PaneOptionSetRequest, PaneOutputCursorRequest,
-    PaneOutputSubscriptionId, PaneOutputSubscriptionStart, PaneTarget, PaneTargetRef, Request,
+    PaneOutputSubscriptionId, PaneOutputSubscriptionStart, PaneStreamCursorRequest,
+    PaneStreamEndReason, PaneStreamEvent, PaneStreamMode, PaneTarget, PaneTargetRef, Request,
     RespawnWindowRequest, Response, SessionName, SetOptionMode, SplitDirection, SplitWindowRequest,
-    SplitWindowTarget, SubscribePaneOutputRefRequest, UnlinkWindowRequest, WindowTarget,
+    SplitWindowTarget, SubscribePaneOutputRefRequest, SubscribePaneStreamRequest,
+    UnlinkWindowRequest, WindowTarget,
 };
 
 use super::RequestHandler;
 
 const CONNECTION_ID: u64 = 831;
+/// Output published to a pane after its subscription starts and before the
+/// command that destroys the pane commits.
+const PRE_DESTROY_TAIL: &[u8] = b"pre-destroy-tail";
+const DRAIN_CLOSE_TIMEOUT: Duration = Duration::from_secs(10);
 
 #[tokio::test]
-async fn kill_session_removes_destroyed_pane_output_subscription() {
+async fn kill_session_drains_then_removes_destroyed_pane_output_subscription() {
     let handler = RequestHandler::new();
     let session = create_session(&handler, "subscription-destroy-kill-session").await;
     let target = PaneTarget::with_window(session.clone(), 0, 0);
     let (subscription_id, _) = subscribe(&handler, &target).await;
+    publish_pre_destroy_tail(&handler, &target).await;
 
     let response = handler
         .handle(Request::KillSession(KillSessionRequest {
@@ -28,16 +37,17 @@ async fn kill_session_removes_destroyed_pane_output_subscription() {
         .await;
     assert!(matches!(response, Response::KillSession(_)), "{response:?}");
 
-    assert_subscription_removed(&handler, subscription_id, "kill-session").await;
+    assert_subscription_drains_then_closes(&handler, subscription_id, "kill-session").await;
 }
 
 #[tokio::test]
-async fn kill_window_removes_destroyed_pane_output_subscription() {
+async fn kill_window_drains_then_removes_destroyed_pane_output_subscription() {
     let handler = RequestHandler::new();
     let session = create_session(&handler, "subscription-destroy-kill-window").await;
     create_window(&handler, &session, 1).await;
     let target = PaneTarget::with_window(session.clone(), 1, 0);
     let (subscription_id, _) = subscribe(&handler, &target).await;
+    publish_pre_destroy_tail(&handler, &target).await;
 
     let response = handler
         .handle(Request::KillWindow(KillWindowRequest {
@@ -47,16 +57,55 @@ async fn kill_window_removes_destroyed_pane_output_subscription() {
         .await;
     assert!(matches!(response, Response::KillWindow(_)), "{response:?}");
 
-    assert_subscription_removed(&handler, subscription_id, "kill-window").await;
+    assert_subscription_drains_then_closes(&handler, subscription_id, "kill-window").await;
 }
 
 #[tokio::test]
-async fn link_window_k_removes_replaced_destination_subscription() {
+async fn kill_window_drains_buffered_raw_stream_bytes_before_the_typed_end() {
+    let handler = RequestHandler::new();
+    let session = create_session(&handler, "subscription-destroy-kill-window-raw").await;
+    create_window(&handler, &session, 1).await;
+    let target = PaneTarget::with_window(session.clone(), 1, 0);
+    let subscription_id = subscribe_raw_stream(&handler, &target).await;
+    publish_pre_destroy_tail(&handler, &target).await;
+
+    let response = handler
+        .handle(Request::KillWindow(KillWindowRequest {
+            target: WindowTarget::with_window(session, 1),
+            kill_all_others: false,
+        }))
+        .await;
+    assert!(matches!(response, Response::KillWindow(_)), "{response:?}");
+
+    let events = raw_stream_events_until_end(&handler, subscription_id).await;
+    let tail = events.iter().position(|event| {
+        matches!(event, PaneStreamEvent::RawBytes(bytes) if bytes.bytes == PRE_DESTROY_TAIL)
+    });
+    let end = events
+        .iter()
+        .position(|event| matches!(event, PaneStreamEvent::End(_)));
+    assert!(
+        matches!((tail, end), (Some(tail), Some(end)) if tail < end),
+        "kill-window must deliver output published before the pane was destroyed \
+         before the terminal stream event: {events:?}"
+    );
+    assert!(
+        matches!(
+            events.last(),
+            Some(PaneStreamEvent::End(PaneStreamEndReason::PaneRemoved))
+        ),
+        "kill-window must terminate the raw stream with PaneRemoved: {events:?}"
+    );
+}
+
+#[tokio::test]
+async fn link_window_k_drains_then_removes_replaced_destination_subscription() {
     let handler = RequestHandler::new();
     let source = create_session(&handler, "subscription-destroy-link-source").await;
     let destination = create_session(&handler, "subscription-destroy-link-destination").await;
     let destination_target = PaneTarget::with_window(destination.clone(), 0, 0);
     let (subscription_id, destination_pane_id) = subscribe(&handler, &destination_target).await;
+    publish_pre_destroy_tail(&handler, &destination_target).await;
 
     let response = handler
         .handle(Request::LinkWindow(LinkWindowRequest {
@@ -76,16 +125,17 @@ async fn link_window_k_removes_replaced_destination_subscription() {
         "link-window -k must remove the replaced stable pane identity"
     );
 
-    assert_subscription_removed(&handler, subscription_id, "link-window -k").await;
+    assert_subscription_drains_then_closes(&handler, subscription_id, "link-window -k").await;
 }
 
 #[tokio::test]
-async fn move_window_k_removes_replaced_destination_subscription() {
+async fn move_window_k_drains_then_removes_replaced_destination_subscription() {
     let handler = RequestHandler::new();
     let source = create_session(&handler, "subscription-destroy-move-source").await;
     let destination = create_session(&handler, "subscription-destroy-move-destination").await;
     let destination_target = PaneTarget::with_window(destination.clone(), 0, 0);
     let (subscription_id, destination_pane_id) = subscribe(&handler, &destination_target).await;
+    publish_pre_destroy_tail(&handler, &destination_target).await;
 
     let response = handler
         .handle(Request::MoveWindow(MoveWindowRequest {
@@ -106,16 +156,17 @@ async fn move_window_k_removes_replaced_destination_subscription() {
         "move-window -k must remove the replaced stable pane identity"
     );
 
-    assert_subscription_removed(&handler, subscription_id, "move-window -k").await;
+    assert_subscription_drains_then_closes(&handler, subscription_id, "move-window -k").await;
 }
 
 #[tokio::test]
-async fn unlink_window_k_removes_destroyed_pane_output_subscription() {
+async fn unlink_window_k_drains_then_removes_destroyed_pane_output_subscription() {
     let handler = RequestHandler::new();
     let session = create_session(&handler, "subscription-destroy-unlink").await;
     create_window(&handler, &session, 1).await;
     let target = PaneTarget::with_window(session.clone(), 1, 0);
     let (subscription_id, pane_id) = subscribe(&handler, &target).await;
+    publish_pre_destroy_tail(&handler, &target).await;
 
     let response = handler
         .handle(Request::UnlinkWindow(UnlinkWindowRequest {
@@ -134,11 +185,11 @@ async fn unlink_window_k_removes_destroyed_pane_output_subscription() {
         "unlink-window -k must remove the unshared stable pane identity"
     );
 
-    assert_subscription_removed(&handler, subscription_id, "unlink-window -k").await;
+    assert_subscription_drains_then_closes(&handler, subscription_id, "unlink-window -k").await;
 }
 
 #[tokio::test]
-async fn linked_respawn_window_removes_sibling_subscription_and_preserves_retained_receiver() {
+async fn linked_respawn_window_drains_sibling_subscription_and_preserves_retained_receiver() {
     let handler = RequestHandler::new();
     let owner = create_session(&handler, "subscription-respawn-owner").await;
     let alias = create_session(&handler, "subscription-respawn-alias").await;
@@ -165,6 +216,7 @@ async fn linked_respawn_window_removes_sibling_subscription_and_preserves_retain
         .expect("sibling pane is present in the linked alias before respawn");
     let (retained_subscription, _) = subscribe(&handler, &retained_target).await;
     let (removed_subscription, _) = subscribe(&handler, &removed_target).await;
+    publish_pre_destroy_tail(&handler, &removed_target).await;
     let option_response = handler
         .handle(Request::PaneOptionSet(PaneOptionSetRequest {
             target: PaneTargetRef::by_id(alias.clone(), removed_pane_id),
@@ -215,7 +267,12 @@ async fn linked_respawn_window_removes_sibling_subscription_and_preserves_retain
             .is_none(),
         "destroyed sibling must not remain reachable through the linked alias"
     );
-    assert_subscription_removed(&handler, removed_subscription, "respawn-window sibling").await;
+    assert_subscription_drains_then_closes(
+        &handler,
+        removed_subscription,
+        "respawn-window sibling",
+    )
+    .await;
     let stale_alias_options = {
         let state = handler.state.lock().await;
         state
@@ -381,17 +438,104 @@ async fn subscribe(
     (response.subscription_id, pane_id)
 }
 
-async fn assert_subscription_removed(
+async fn subscribe_raw_stream(
+    handler: &RequestHandler,
+    target: &PaneTarget,
+) -> PaneOutputSubscriptionId {
+    let response = handler
+        .handle_subscribe_pane_stream(
+            CONNECTION_ID,
+            SubscribePaneStreamRequest {
+                target: PaneTargetRef::slot(target.clone()),
+                mode: PaneStreamMode::Raw,
+                include_snapshot: false,
+            },
+        )
+        .await;
+    let Response::SubscribePaneStream(response) = response else {
+        panic!("raw pane stream subscription should succeed: {response:?}");
+    };
+    response.subscription_id
+}
+
+async fn publish_pre_destroy_tail(handler: &RequestHandler, target: &PaneTarget) {
+    handler
+        .send_pane_output_for_test(target, PRE_DESTROY_TAIL.to_vec())
+        .await;
+}
+
+async fn raw_stream_events_until_end(
+    handler: &RequestHandler,
+    subscription_id: PaneOutputSubscriptionId,
+) -> Vec<PaneStreamEvent> {
+    let mut events = Vec::new();
+    for _ in 0..64 {
+        let response = handler
+            .handle_pane_stream_cursor(
+                CONNECTION_ID,
+                PaneStreamCursorRequest {
+                    subscription_id,
+                    max_events: Some(32),
+                },
+            )
+            .await;
+        let Response::PaneStreamCursor(response) = response else {
+            panic!("raw stream cursor should stay readable while draining: {response:?}");
+        };
+        let ended = response
+            .events
+            .iter()
+            .any(|event| matches!(event, PaneStreamEvent::End(_)));
+        events.extend(response.events);
+        if ended {
+            return events;
+        }
+        if !response.limited {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    }
+    panic!("raw stream must reach a terminal event while draining: {events:?}");
+}
+
+/// A destroyed pane's already-published output must still reach its
+/// subscriber, exactly as it does for `kill-pane` and natural pane exit, and
+/// the subscription must be retired once the drain goes idle.
+async fn assert_subscription_drains_then_closes(
     handler: &RequestHandler,
     subscription_id: PaneOutputSubscriptionId,
     label: &str,
 ) {
+    let cursor = handler
+        .handle_pane_output_cursor(
+            CONNECTION_ID,
+            PaneOutputCursorRequest {
+                subscription_id,
+                max_events: Some(64),
+            },
+        )
+        .await;
+    let Response::PaneOutputCursor(cursor) = cursor else {
+        panic!("{label} must keep the destroyed pane's subscription readable: {cursor:?}");
+    };
     assert!(
-        handler
-            .pane_output_subscription_key_for_test(subscription_id)
-            .is_none(),
-        "{label} must remove the dead pane's registry record"
+        cursor
+            .events
+            .iter()
+            .any(|event| event.bytes == PRE_DESTROY_TAIL),
+        "{label} must drain output published before the pane was destroyed: {cursor:?}"
     );
+
+    tokio::time::timeout(DRAIN_CLOSE_TIMEOUT, async {
+        while handler
+            .pane_output_subscription_key_for_test(subscription_id)
+            .is_some()
+        {
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+    })
+    .await
+    .unwrap_or_else(|_| panic!("{label} must retire the dead pane's registry record once idle"));
+
     let cursor = handler
         .handle_pane_output_cursor(
             CONNECTION_ID,
@@ -406,7 +550,7 @@ async fn assert_subscription_removed(
             cursor,
             Response::Error(ref error) if error.error.to_string().contains("subscription not found")
         ),
-        "{label} must make the removed subscription unreadable: {cursor:?}"
+        "{label} must make the drained subscription unreadable: {cursor:?}"
     );
 }
 

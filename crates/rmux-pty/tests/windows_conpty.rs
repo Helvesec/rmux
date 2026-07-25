@@ -9,8 +9,9 @@ use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use rmux_pty::{
-    write_windows_console_key, write_windows_console_key_then_interrupt_if_processed, ChildCommand,
-    PtyMaster, PtyPair, SpawnedPty, TerminalSize, WindowsConsoleKeyEvent,
+    send_windows_console_interrupt, write_windows_console_key,
+    write_windows_console_key_reporting_processed_input, ChildCommand, PtyMaster, PtyPair,
+    SpawnedPty, TerminalSize, WindowsConsoleKeyEvent,
 };
 use windows_sys::Win32::Foundation::{CloseHandle, STILL_ACTIVE};
 use windows_sys::Win32::System::Console::{
@@ -191,10 +192,12 @@ fn conpty_processed_ctrl_c_emits_one_interrupt_per_key() -> Result<(), Box<dyn s
         String::from_utf8_lossy(&ready)
     );
 
-    write_windows_console_key_then_interrupt_if_processed(
+    if write_windows_console_key_reporting_processed_input(
         spawned.child().pid(),
         WindowsConsoleKeyEvent::ctrl_c(),
-    )?;
+    )? {
+        send_windows_console_interrupt(spawned.child().pid())?;
+    }
     let deadline = Instant::now() + Duration::from_secs(2);
     let observed = loop {
         let callbacks = read_ctrl_c_count(&count_path).unwrap_or(0);

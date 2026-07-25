@@ -548,20 +548,13 @@ async fn finish_identity_dispatch(
     outcome: HandleOutcome,
     inline_hooks: Vec<PendingInlineHook>,
 ) -> Response {
-    let inline_hook_names = inline_hooks
-        .iter()
-        .map(|pending| pending.hook)
-        .collect::<Vec<_>>();
     handler
-        .run_inline_hooks(requester_pid, inline_hooks, None)
-        .await;
-    handler
-        .run_request_hooks(
+        .run_dispatched_hooks(
             requester_pid,
             &request,
             &outcome.response,
+            inline_hooks,
             None,
-            &inline_hook_names,
         )
         .await;
     outcome.response

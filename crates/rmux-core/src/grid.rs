@@ -14,6 +14,7 @@ mod history_bytes;
 #[path = "grid/render.rs"]
 mod render;
 
+pub use cell::RenderedLineSpan;
 pub(crate) use cell::{GridCell, GridCellFlags, GridLine, GridLineFlags};
 use render::{append_cell_text, append_grid_string_code, append_hyperlink};
 
@@ -321,6 +322,14 @@ impl Grid {
             .map(|line| line.flags.contains(GridLineFlags::WRAPPED))
     }
 
+    /// Returns the columns a pre-wrapped wide glyph left unused at the end of
+    /// the absolute line.
+    #[must_use]
+    pub fn absolute_line_trailing_reflow_gap(&self, absolute_y: usize) -> Option<u32> {
+        self.absolute_line(absolute_y)
+            .map(GridLine::trailing_reflow_gap)
+    }
+
     /// Clears every history row.
     pub fn clear_history(&mut self) {
         self.history.clear();
@@ -456,6 +465,20 @@ impl Grid {
     ) -> Option<String> {
         self.absolute_line(absolute_y)
             .map(|line| line.render_with_options(self.sx as usize, options, state, hyperlinks))
+    }
+
+    /// Renders one absolute line and reports the columns it paints.
+    #[must_use]
+    pub fn render_absolute_line_measured(
+        &self,
+        absolute_y: usize,
+        options: GridRenderOptions,
+        state: &mut GridStringState,
+        hyperlinks: Option<&Hyperlinks>,
+    ) -> Option<(String, RenderedLineSpan)> {
+        self.absolute_line(absolute_y).map(|line| {
+            line.render_with_options_measured(self.sx as usize, options, state, hyperlinks)
+        })
     }
 
     pub fn append_rendered_absolute_line(

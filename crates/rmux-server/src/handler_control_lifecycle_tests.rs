@@ -1,3 +1,4 @@
+use crate::client_names::control_client_name;
 use std::collections::BTreeSet;
 use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
@@ -138,7 +139,7 @@ async fn same_pid_control_replacement_emits_one_client_detached_for_old_identity
         LifecycleEvent::ClientDetached {
             session_name,
             client_name: Some(client_name),
-        } if session_name == session && client_name == CONTROL_PID.to_string()
+        } if session_name == session && client_name == control_client_name(CONTROL_PID)
     ));
     let active_control = handler.active_control.lock().await;
     let replacement = active_control
@@ -253,7 +254,7 @@ async fn same_pid_control_replacement_destroys_the_old_unattached_session() {
                 LifecycleEvent::ClientDetached {
                     session_name: detached_session,
                     client_name: Some(client_name),
-                } if detached_session == &session && client_name == &CONTROL_PID.to_string()
+                } if detached_session == &session && client_name == &control_client_name(CONTROL_PID)
             )
             .then_some(index)
         })
@@ -319,7 +320,7 @@ async fn finished_control_identity_is_not_lost_before_same_pid_replacement() {
         LifecycleEvent::ClientDetached {
             session_name,
             client_name: Some(client_name),
-        } if session_name == session && client_name == CONTROL_PID.to_string()
+        } if session_name == session && client_name == control_client_name(CONTROL_PID)
     ));
     assert!(matches!(
         lifecycle.try_recv(),
@@ -380,7 +381,7 @@ async fn finish_control_does_not_duplicate_an_explicit_client_detached_event() {
                 LifecycleEvent::ClientDetached {
                     session_name: ref detached_session,
                     client_name: Some(ref client_name),
-                } if detached_session == &session && client_name == &CONTROL_PID.to_string()
+                } if detached_session == &session && client_name == &control_client_name(CONTROL_PID)
             )
     ));
     assert!(matches!(
@@ -449,7 +450,7 @@ async fn explicit_control_detach_claim_prevents_same_pid_replacement_duplicate()
                 LifecycleEvent::ClientDetached {
                     session_name: ref detached_session,
                     client_name: Some(ref client_name),
-                } if detached_session == &session && client_name == &CONTROL_PID.to_string()
+                } if detached_session == &session && client_name == &control_client_name(CONTROL_PID)
             )
     ));
     assert!(matches!(
@@ -509,7 +510,7 @@ async fn target_session_detach_does_not_duplicate_a_claimed_control_event() {
                 LifecycleEvent::ClientDetached {
                     session_name: detached_session,
                     client_name: Some(client_name),
-                } if detached_session == &session && client_name == &CONTROL_PID.to_string()
+                } if detached_session == &session && client_name == &control_client_name(CONTROL_PID)
             )
         })
         .collect::<Vec<_>>();
@@ -560,7 +561,10 @@ async fn target_session_detach_pins_each_control_session_identity() {
         .collect::<BTreeSet<_>>();
     assert_eq!(
         detached,
-        BTreeSet::from([FIRST_PID.to_string(), SECOND_PID.to_string()])
+        BTreeSet::from([
+            control_client_name(FIRST_PID),
+            control_client_name(SECOND_PID)
+        ])
     );
 }
 
@@ -1037,7 +1041,7 @@ async fn destroy_control_switch_queues_committed_session_change_after_target_dis
         LifecycleEvent::ClientSessionChanged {
             session_name,
             client_name: Some(client_name),
-        } if session_name == target && client_name == requester_pid.to_string()
+        } if session_name == target && client_name == control_client_name(requester_pid)
     ));
 }
 
@@ -2005,7 +2009,7 @@ async fn failed_session_exit_finishes_stale_identity_without_destroying_recreate
         LifecycleEvent::ClientDetached {
             session_name,
             client_name: Some(client_name),
-        } if session_name == alpha && client_name == requester_pid.to_string()
+        } if session_name == alpha && client_name == control_client_name(requester_pid)
     ));
     let state = handler.state.lock().await;
     assert_eq!(

@@ -890,7 +890,8 @@ async fn closed_control_switch_preserves_environment_selection_and_touch() {
         LifecycleEvent::ClientDetached {
             session_name,
             client_name: Some(client_name),
-        } if session_name == alpha && client_name == control_pid.to_string()
+        } if session_name == alpha
+            && client_name == crate::client_names::control_client_name(control_pid)
     ));
 }
 
@@ -941,6 +942,9 @@ async fn control_switch_resize_failure_preserves_session_identity_and_event_stre
             .expect("control client remains registered");
         active.client_width = SWITCH_SIZE.cols;
         active.client_height = SWITCH_SIZE.rows;
+        // A control client only owns a size once it has announced one; this
+        // stands in for the `refresh-client -C` that announced SWITCH_SIZE.
+        active.size_declared = true;
     }
     handler.state.lock().await.fail_next_resize_for_test();
 
@@ -1030,6 +1034,9 @@ async fn control_switch_success_commits_environment_touch_selection_and_event() 
             .expect("control client remains registered");
         active.client_width = SWITCH_SIZE.cols;
         active.client_height = SWITCH_SIZE.rows;
+        // A control client only owns a size once it has announced one; this
+        // stands in for the `refresh-client -C` that announced SWITCH_SIZE.
+        active.size_declared = true;
     }
 
     let response = handler

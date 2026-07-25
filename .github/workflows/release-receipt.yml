@@ -173,7 +173,7 @@ jobs:
           conclusion = run.get("conclusion")
           lifecycle_valid = (
               (status == "in_progress" and conclusion is None)
-              or (status == "completed" and isinstance(conclusion, str))
+              or (status == "completed" and conclusion == "success")
           )
           if (
               any(run.get(field) != wanted for field, wanted in run_expected.items())

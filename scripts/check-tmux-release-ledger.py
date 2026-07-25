@@ -6,8 +6,11 @@ from __future__ import annotations
 import re
 import subprocess
 import sys
-import tomllib
 from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+
+import toml_reader  # noqa: E402  (path bootstrap must run first)
 
 
 LEDGER = Path("tests/reference/tmux_compat/divergences.toml")
@@ -92,7 +95,7 @@ def validate_reference(reference: str) -> tuple[Path, str | None]:
 
 
 def load_entries() -> tuple[dict[str, object], dict[str, dict[str, object]]]:
-    payload = tomllib.loads(LEDGER.read_text(encoding="utf-8"))
+    payload = toml_reader.loads(LEDGER.read_text(encoding="utf-8"))
     raw_entries = payload.get("entry")
     if not isinstance(raw_entries, list) or not raw_entries:
         raise ValueError("entry must be a non-empty array of tables")
@@ -171,7 +174,7 @@ def validate_product_tests(
 def main() -> int:
     try:
         payload, entries = load_entries()
-    except (OSError, tomllib.TOMLDecodeError, ValueError) as error:
+    except (OSError, toml_reader.TOMLDecodeError, ValueError) as error:
         return fail(f"{LEDGER}: {error}")
 
     policy = payload.get("policy")

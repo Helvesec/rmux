@@ -742,3 +742,64 @@ async fn failed_linked_pane_kill_preserves_session_closed_one_shot() {
         Some(HookLifecycle::OneShot)
     );
 }
+
+#[tokio::test]
+async fn retried_pane_exit_teardown_dispatches_the_one_shot_pane_exited_hook_once() {
+    let handler = RequestHandler::new();
+    let session = create_session(&handler, "hook-id-pane-exit-retry").await;
+    split_session(&handler, &session).await;
+    handler.wait_for_initial_panes_for_test().await;
+    let exiting = PaneTarget::with_window(session.clone(), 0, 1);
+    // pane-exited dispatches in the scope of the pane that survives the exit.
+    let surviving = PaneTarget::with_window(session.clone(), 0, 0);
+    set_hook(
+        &handler,
+        ScopeSelector::Pane(surviving.clone()),
+        HookName::PaneExited,
+        "display-message exited-one-shot",
+        HookLifecycle::OneShot,
+    )
+    .await;
+
+    let mut events = handler.subscribe_lifecycle_events();
+    let (exiting_pane_id, generation) = {
+        let mut state = handler.state.lock().await;
+        let exiting_pane_id = pane_id(&state, &session, 0, 1);
+        let generation = state.pane_output_generation_for_target(&exiting, exiting_pane_id);
+        state
+            .mark_pane_dead_without_exit_details(&exiting)
+            .expect("mark split pane naturally exited");
+        state.fail_next_resize_for_test();
+        (exiting_pane_id, generation)
+    };
+
+    handler
+        .handle_pane_exit_event(crate::pane_io::PaneExitEvent::eof_published(
+            session.clone(),
+            exiting_pane_id,
+            Some(generation),
+        ))
+        .await;
+
+    let dispatched = std::iter::from_fn(|| events.try_recv().ok())
+        .filter(|event| matches!(event.event, LifecycleEvent::PaneExited { .. }))
+        .flat_map(|event| {
+            event
+                .hooks
+                .iter()
+                .map(|hook| hook.command().to_owned())
+                .collect::<Vec<_>>()
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        dispatched,
+        vec!["display-message exited-one-shot".to_owned()],
+        "a retried teardown must dispatch the pane-exited one-shot exactly once"
+    );
+    let state = handler.state.lock().await;
+    assert_eq!(
+        state.hooks.pane_command(&surviving, HookName::PaneExited),
+        None,
+        "the dispatched one-shot must be consumed"
+    );
+}

@@ -182,10 +182,13 @@ def validate_metadata(
         )
         for key in PLATFORMS
     )
+    # Pair the lengths explicitly: the zip builtin only grew a strict pairing
+    # keyword in Python 3.10, and release tooling must stay runnable on the
+    # macOS release host's system interpreter.
+    if len(expected_artifacts) != len(source_artifacts):
+        raise ValueError("canonical metadata artifacts do not pair with the expected set")
     ids: set[int] = set()
-    for artifact, (role, platform, name) in zip(
-        source_artifacts, expected_artifacts, strict=True
-    ):
+    for artifact, (role, platform, name) in zip(source_artifacts, expected_artifacts):
         if not isinstance(artifact, dict):
             raise ValueError("source artifact metadata must be an object")
         exact_keys(

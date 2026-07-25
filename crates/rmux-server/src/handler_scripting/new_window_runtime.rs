@@ -407,18 +407,12 @@ impl RequestHandler {
             let action = self
                 .queued_new_window_action(requester_pid, print_target, format, response.clone())
                 .await;
-            let inline_hook_names = inline_hooks
-                .iter()
-                .map(|pending| pending.hook)
-                .collect::<Vec<_>>();
-            self.run_inline_hooks(requester_pid, inline_hooks, None)
-                .await;
-            self.run_request_hooks(
+            self.run_dispatched_hooks(
                 requester_pid,
                 &request_for_hooks,
                 &response,
+                inline_hooks,
                 None,
-                &inline_hook_names,
             )
             .await;
 

@@ -1,3 +1,4 @@
+use crate::client_names::control_client_name;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
@@ -180,7 +181,7 @@ async fn failed_rename_delivery_tracks_the_committed_stable_session_until_finish
         LifecycleEvent::ClientDetached {
             session_name,
             client_name: Some(client_name),
-        } if session_name == renamed && client_name == control.pid.to_string()
+        } if session_name == renamed && client_name == control_client_name(control.pid)
     ));
 }
 
@@ -323,7 +324,7 @@ async fn failed_queue_attach_and_destroy_switch_restore_their_source_identities(
         LifecycleEvent::ClientDetached {
             session_name,
             client_name: Some(client_name),
-        } if session_name == source && client_name == switched.pid.to_string()
+        } if session_name == source && client_name == control_client_name(switched.pid)
     ));
     assert!(matches!(
         lifecycle.try_recv(),

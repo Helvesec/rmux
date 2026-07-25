@@ -119,6 +119,9 @@ def validate_summary(value: dict[str, Any]) -> dict[str, Any]:
     results = value["results"]
     if not isinstance(results, list) or len(results) != len(expected_channels):
         raise ValueError("channel summary results are not exhaustive")
+    # The exhaustiveness check above already pairs the two sequences, so a plain
+    # zip is exact here; the strict pairing keyword would need Python 3.10, and
+    # release tooling must stay runnable on the macOS release host's interpreter.
     references = [
         _validate_result_entry(
             item,
@@ -128,7 +131,7 @@ def validate_summary(value: dict[str, Any]) -> dict[str, Any]:
             receipt=receipt,
             plan_sha256=value["plan_sha256"],
         )
-        for channel, item in zip(expected_channels, results, strict=True)
+        for channel, item in zip(expected_channels, results)
     ]
     if any(
         reference["downstream_authority"] is not downstream_active

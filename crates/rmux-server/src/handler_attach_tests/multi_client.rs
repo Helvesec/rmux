@@ -1,4 +1,5 @@
 use super::*;
+use crate::client_names::attached_client_name;
 
 #[tokio::test]
 async fn attached_resize_emits_client_resized_hook_with_client_context() {
@@ -30,7 +31,10 @@ async fn attached_resize_emits_client_resized_hook_with_client_context() {
                 scope: ScopeSelector::Global,
                 hook: rmux_proto::HookName::ClientResized,
                 command: Some(
-                    "if-shell -F '#{==:#{hook_client}:#{hook_session_name},101:resize-hook}' 'set-buffer -b client-resized ok' 'set-buffer -b client-resized bad'".to_owned(),
+                    format!(
+                        "if-shell -F '#{{==:#{{hook_client}}:#{{hook_session_name}},{}:resize-hook}}' 'set-buffer -b client-resized ok' 'set-buffer -b client-resized bad'",
+                        attached_client_name(101)
+                    ),
                 ),
                 lifecycle: rmux_proto::HookLifecycle::Persistent,
                 append: false,
@@ -520,7 +524,7 @@ async fn latest_window_size_recovers_when_small_client_finishes() {
 
     handler.finish_attach(202, small_id).await;
 
-    wait_for_client_detached_event(&mut events, "202").await;
+    wait_for_client_detached_event(&mut events, &attached_client_name(202)).await;
     assert_eq!(
         attached_session_size(&handler, &session).await,
         TerminalSize {
@@ -566,7 +570,7 @@ async fn refresh_prunes_dead_attach_and_recomputes_latest_size() {
     drop(small_rx);
     handler.refresh_attached_session(&session).await;
 
-    wait_for_client_detached_event(&mut events, "202").await;
+    wait_for_client_detached_event(&mut events, &attached_client_name(202)).await;
     assert!(
         !handler.active_attach.lock().await.by_pid.contains_key(&202),
         "dead attach must be removed before size reconciliation"
@@ -616,7 +620,7 @@ async fn targeted_refresh_prunes_dead_attach_and_recomputes_latest_size() {
     drop(small_rx);
     handler.refresh_attached_client(202, &session).await;
 
-    wait_for_client_detached_event(&mut events, "202").await;
+    wait_for_client_detached_event(&mut events, &attached_client_name(202)).await;
     assert!(
         !handler.active_attach.lock().await.by_pid.contains_key(&202),
         "targeted refresh must remove dead attach clients through the shared stale-client path"
@@ -668,7 +672,7 @@ async fn targeted_base_refresh_prunes_dead_attach_and_recomputes_latest_size() {
         .refresh_attached_client_base_only(202, &session)
         .await;
 
-    wait_for_client_detached_event(&mut events, "202").await;
+    wait_for_client_detached_event(&mut events, &attached_client_name(202)).await;
     assert!(
         !handler.active_attach.lock().await.by_pid.contains_key(&202),
         "targeted base refresh must remove dead attach clients through the shared stale-client path"
@@ -842,7 +846,7 @@ async fn detach_client_recomputes_window_size_before_detached_event() {
         matches!(control, AttachControl::Detach)
     })
     .await;
-    wait_for_client_detached_event(&mut events, "202").await;
+    wait_for_client_detached_event(&mut events, &attached_client_name(202)).await;
     assert_eq!(
         attached_session_size(&handler, &session).await,
         TerminalSize {

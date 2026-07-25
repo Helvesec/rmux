@@ -2191,22 +2191,106 @@ fn rpm_repository_refuses_to_clean_unmanaged_output_directories() {
     let result = run(&root, &unmanaged);
     assert_rejected_without_removal(&result, &unmanaged_sentinel);
 
-    let managed = root.join("managed");
+    // A system RPM keyring is the shape a mistyped --output-dir most plausibly
+    // lands on: /etc/pki/rpm-gpg holds nothing but RPM-GPG-KEY-* files. This
+    // generator never writes those, so the directory must be refused, not wiped.
+    let keyring = root.join("rpm-gpg");
+    fs::create_dir_all(&keyring).expect("create keyring fixture");
+    let keyring_sentinel = keyring.join("RPM-GPG-KEY-redhat-release");
+    fs::write(&keyring_sentinel, b"keep").expect("write keyring sentinel");
+    let result = run(&root, &keyring);
+    assert_rejected_without_removal(&result, &keyring_sentinel);
+
+    // Contents that merely look plausible are not proof of a previous run: only
+    // repodata/repomd.xml, which nothing but this generator writes, unlocks the
+    // cleanup.
+    let bare_repodata = root.join("bare-repodata");
+    fs::create_dir_all(bare_repodata.join("repodata")).expect("create bare repodata fixture");
+    let bare_repodata_sentinel = bare_repodata.join("repodata/keep.txt");
+    fs::write(&bare_repodata_sentinel, b"keep").expect("write bare repodata sentinel");
+    let result = run(&root, &bare_repodata);
+    assert_rejected_without_removal(&result, &bare_repodata_sentinel);
+
+    // The published repository root is the parent of --output-dir: the build
+    // workflow generates into "$root/output/rpm" and uploads "$root/output"
+    // whole. Every entry the generator leaves behind is published verbatim, so
+    // it must create nothing beside --output-dir and no private state inside it.
+    let published_root = root.join("published");
+    let managed = published_root.join("rpm");
+    fs::create_dir_all(&published_root).expect("create published repository root");
     let first = run(&root, &managed);
     assert!(first.status.success(), "{}", stderr(&first));
-    fs::write(managed.join("stale.txt"), b"stale").expect("write managed stale file");
+    assert_eq!(
+        entry_names(&published_root),
+        vec![String::from("rpm")],
+        "the generator must not write beside --output-dir: the published repository \
+         root only admits index.html, _headers, debian/ and rpm/"
+    );
+    assert_eq!(
+        entry_names(&managed),
+        vec![
+            String::from("repodata"),
+            String::from("rmux-0.9.0-1.x86_64.rpm"),
+            String::from("rmux.repo"),
+        ],
+        "the generator must leave no private state inside the published repository"
+    );
+
+    // A directory holding a previous generation stays reusable, and the stale
+    // generation is removed rather than merged into the new one.
+    fs::write(managed.join("rmux-0.8.0-1.x86_64.rpm"), b"stale").expect("write stale generation");
     let second = run(&root, &managed);
     assert!(second.status.success(), "{}", stderr(&second));
     assert!(
-        !managed.join("stale.txt").exists(),
-        "a marked output directory must remain safely reusable"
+        !managed.join("rmux-0.8.0-1.x86_64.rpm").exists(),
+        "a managed output directory must remain safely reusable"
     );
+    assert_eq!(
+        entry_names(&published_root),
+        vec![String::from("rpm")],
+        "regenerating must not write beside --output-dir either"
+    );
+    assert_eq!(
+        entry_names(&managed),
+        vec![
+            String::from("repodata"),
+            String::from("rmux-0.9.0-1.x86_64.rpm"),
+            String::from("rmux.repo"),
+        ],
+        "regenerating must publish the new generation alone"
+    );
+
+    // Destroying and recreating the directory destroys the ownership evidence
+    // with it: the cleanup guard must never be attached to the path alone.
+    fs::remove_dir_all(&managed).expect("remove managed output directory");
+    fs::create_dir_all(managed.join("subdir"))
+        .expect("recreate output directory with foreign data");
+    let foreign_sentinel = managed.join("keep.txt");
+    fs::write(&foreign_sentinel, b"keep").expect("write foreign sentinel");
+    let recycled = run(&root, &managed);
+    assert_rejected_without_removal(&recycled, &foreign_sentinel);
     assert!(
-        !managed.join(".rmux-rpm-repository").exists(),
-        "the cleanup marker must not become a published repository file"
+        managed.join("subdir").is_dir(),
+        "the refused cleanup must leave the whole directory intact"
     );
 
     fs::remove_dir_all(root).expect("remove temp directory");
+}
+
+#[cfg(unix)]
+fn entry_names(directory: &Path) -> Vec<String> {
+    let mut names: Vec<String> = fs::read_dir(directory)
+        .expect("list directory")
+        .map(|entry| {
+            entry
+                .expect("read directory entry")
+                .file_name()
+                .to_string_lossy()
+                .into_owned()
+        })
+        .collect();
+    names.sort();
+    names
 }
 
 #[test]

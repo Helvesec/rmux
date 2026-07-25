@@ -1250,15 +1250,15 @@ async fn cancelled_surface_refresh_is_retried_after_a_pane_rekey() {
     assert_eq!(driver.pending_refresh(), Some(pending));
 }
 
-#[tokio::test]
-async fn pane_removal_drains_buffered_stream_events_before_typed_end() {
-    let handler = RequestHandler::new();
-    let (target, output, transcript) = test_pane(&handler).await;
-    let raw = subscribe(&handler, &target, PaneStreamMode::Raw).await;
-    let surface = subscribe(&handler, &target, PaneStreamMode::Surface).await;
-    let key = handler
-        .pane_output_subscription_key_for_test(raw.subscription_id)
-        .expect("subscription key");
+async fn assert_kill_drains_buffered_stream_events(
+    handler: &RequestHandler,
+    target: &PaneTarget,
+    output: &PaneOutputSender,
+    transcript: &SharedPaneTranscript,
+    kill: Request,
+) {
+    let raw = subscribe(handler, target, PaneStreamMode::Raw).await;
+    let surface = subscribe(handler, target, PaneStreamMode::Surface).await;
 
     transcript
         .lock()
@@ -1266,31 +1266,111 @@ async fn pane_removal_drains_buffered_stream_events_before_typed_end() {
         .append_bytes(b"killed-tail");
     output.send(b"killed-tail".to_vec());
 
-    handler
-        .drain_removed_pane_output_subscriptions(&[key])
+    let response = handler.handle(kill).await;
+    assert!(matches!(response, Response::KillPane(_)), "{response:?}");
+
+    let raw_events = cursor_until_unlimited(handler, raw.subscription_id, 1).await;
+    assert!(
+        matches!(
+            raw_events.as_slice(),
+            [
+                PaneStreamEvent::RawBytes(bytes),
+                PaneStreamEvent::End(PaneStreamEndReason::PaneRemoved),
+            ] if bytes.bytes == b"killed-tail"
+        ),
+        "{raw_events:?}"
+    );
+    let surface_events = cursor_until_unlimited(handler, surface.subscription_id, 1).await;
+    assert!(
+        matches!(
+            surface_events.as_slice(),
+            [
+                PaneStreamEvent::SurfacePatch(frame),
+                PaneStreamEvent::End(PaneStreamEndReason::PaneRemoved),
+            ] if frame
+                .snapshot
+                .cells
+                .iter()
+                .map(|cell| cell.text.as_str())
+                .collect::<String>()
+                .contains("killed-tail")
+        ),
+        "{surface_events:?}"
+    );
+}
+
+#[tokio::test]
+async fn kill_pane_drains_buffered_stream_events_before_typed_end() {
+    let handler = RequestHandler::new();
+    let (target, output, transcript) = test_pane(&handler).await;
+    assert_kill_drains_buffered_stream_events(
+        &handler,
+        &target,
+        &output,
+        &transcript,
+        Request::KillPane(rmux_proto::KillPaneRequest {
+            target: target.clone(),
+            kill_all_except: false,
+        }),
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn kill_pane_all_except_drains_the_removed_pane_stream() {
+    let handler = RequestHandler::new();
+    let (target, output, transcript) = test_pane(&handler).await;
+    let response = handler
+        .handle(Request::SplitWindow(SplitWindowRequest {
+            target: SplitWindowTarget::Pane(target.clone()),
+            direction: SplitDirection::Vertical,
+            before: false,
+            environment: None,
+        }))
         .await;
-    let raw_events = cursor_until_unlimited(&handler, raw.subscription_id, 1).await;
-    assert!(matches!(
-        raw_events.as_slice(),
-        [
-            PaneStreamEvent::RawBytes(bytes),
-            PaneStreamEvent::End(PaneStreamEndReason::PaneRemoved),
-        ] if bytes.bytes == b"killed-tail"
-    ));
-    let surface_events = cursor_until_unlimited(&handler, surface.subscription_id, 1).await;
-    assert!(matches!(
-        surface_events.as_slice(),
-        [
-            PaneStreamEvent::SurfacePatch(frame),
-            PaneStreamEvent::End(PaneStreamEndReason::PaneRemoved),
-        ] if frame
-            .snapshot
-            .cells
-            .iter()
-            .map(|cell| cell.text.as_str())
-            .collect::<String>()
-            .contains("killed-tail")
-    ));
+    assert!(matches!(response, Response::SplitWindow(_)), "{response:?}");
+
+    // Killing every pane except the split sibling leaves the window and the
+    // session alive, so only the removed pane's staged source can project its
+    // buffered tail.
+    assert_kill_drains_buffered_stream_events(
+        &handler,
+        &target,
+        &output,
+        &transcript,
+        Request::KillPane(rmux_proto::KillPaneRequest {
+            target: PaneTarget::with_window(target.session_name().clone(), 0, 1),
+            kill_all_except: true,
+        }),
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn pane_kill_by_id_drains_buffered_stream_events_before_typed_end() {
+    let handler = RequestHandler::new();
+    let (target, output, transcript) = test_pane(&handler).await;
+    let pane_id = {
+        let state = handler.state.lock().await;
+        state
+            .sessions
+            .session(target.session_name())
+            .and_then(|session| session.window_at(target.window_index()))
+            .and_then(|window| window.pane(target.pane_index()))
+            .map(rmux_core::Pane::id)
+            .expect("initial pane exists")
+    };
+    assert_kill_drains_buffered_stream_events(
+        &handler,
+        &target,
+        &output,
+        &transcript,
+        Request::PaneKill(rmux_proto::PaneKillRequest {
+            target: PaneTargetRef::by_id(target.session_name().clone(), pane_id),
+            kill_all_except: false,
+        }),
+    )
+    .await;
 }
 
 #[tokio::test]

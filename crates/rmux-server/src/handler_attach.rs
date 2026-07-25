@@ -1431,7 +1431,7 @@ fn attach_target_for_session_with_prompt(
     for pane in session.window().panes() {
         #[cfg(feature = "web")]
         let copy_snapshot = if options.bounded_recovery {
-            web_copy_mode_recovery_snapshot(state, session_name, pane.id())?
+            state.pane_copy_mode_recovery_snapshot(session_name, pane.id())?
         } else {
             state.pane_copy_mode_render_snapshot(session_name, pane.id())
         };
@@ -1508,7 +1508,7 @@ fn attach_target_for_session_with_prompt(
         if let Some(active_pane) = active_pane.clone() {
             #[cfg(feature = "web")]
             let copy_snapshot = if options.bounded_recovery {
-                web_copy_mode_recovery_snapshot(state, session_name, active_pane.id())?
+                state.pane_copy_mode_recovery_snapshot(session_name, active_pane.id())?
             } else {
                 state.pane_copy_mode_render_snapshot(session_name, active_pane.id())
             };
@@ -1630,21 +1630,6 @@ fn validate_attach_recovery_frame(
     #[cfg(not(feature = "web"))]
     let _ = (frame, bounded_recovery);
     Ok(())
-}
-
-#[cfg(feature = "web")]
-fn web_copy_mode_recovery_snapshot(
-    state: &HandlerState,
-    session_name: &rmux_proto::SessionName,
-    pane_id: rmux_core::PaneId,
-) -> Result<Option<crate::copy_mode::CopyModeRenderSnapshot>, rmux_proto::RmuxError> {
-    match state.pane_copy_mode_recovery_snapshot(session_name, pane_id)? {
-        Some((_, false)) => Err(rmux_proto::RmuxError::Server(
-            "copy-mode metadata exceeds the bounded Web recovery contract".to_owned(),
-        )),
-        Some((snapshot, true)) => Ok(Some(snapshot)),
-        None => Ok(None),
-    }
 }
 
 pub(super) fn sized_session(

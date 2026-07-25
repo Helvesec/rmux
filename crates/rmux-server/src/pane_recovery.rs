@@ -2,19 +2,25 @@ use std::collections::VecDeque;
 use std::ops::Range;
 
 use rmux_core::input::{mode, OscColourSlot};
-use rmux_core::{render_dec_modes_for_snapshot, GridRenderOptions, RecoveryRowRenderer, Screen};
+use rmux_core::{
+    render_dec_modes_for_snapshot, GridRenderOptions, RecoveryRow, RecoveryRowRenderer, Screen,
+};
 use rmux_proto::{RmuxError, DEFAULT_MAX_DETACHED_FRAME_LENGTH, DEFAULT_MAX_FRAME_LENGTH};
 
 use crate::pane_transcript::PaneTranscript;
 
+// Rows are painted back to back and rely on the terminal's own wrap to place a
+// soft-wrapped row's successor, so the paint enables DECAWM before the first
+// row. The pane's own mode is restored absolutely once the rows are painted.
 const RESET_PREFIX: &[u8] =
-    b"\x1b[?2026l\x1b[?1049l\x1b[?6l\x1b[r\x1b[0m\x1b]8;;\x1b\\\x1b[?25l\x1b[2J\x1b[3J\x1b[H";
+    b"\x1b[?2026l\x1b[?1049l\x1b[?6l\x1b[?7h\x1b[r\x1b[0m\x1b]8;;\x1b\\\x1b[?25l\x1b[2J\x1b[3J\x1b[H";
 const ALT_SCREEN_PREFIX: &[u8] =
-    b"\x1b[?1049h\x1b[?6l\x1b[r\x1b[0m\x1b]8;;\x1b\\\x1b[?25l\x1b[2J\x1b[H";
+    b"\x1b[?1049h\x1b[?6l\x1b[?7h\x1b[r\x1b[0m\x1b]8;;\x1b\\\x1b[?25l\x1b[2J\x1b[H";
 const ALT_SCREEN_NO_CURSOR_PREFIX: &[u8] =
-    b"\x1b[?47h\x1b[?6l\x1b[r\x1b[0m\x1b]8;;\x1b\\\x1b[?25l\x1b[2J\x1b[H";
+    b"\x1b[?47h\x1b[?6l\x1b[?7h\x1b[r\x1b[0m\x1b]8;;\x1b\\\x1b[?25l\x1b[2J\x1b[H";
 const RESET_RENDITION: &[u8] = b"\x1b[0m\x1b]8;;\x1b\\";
 const ROW_RESET: &[u8] = b"\x1b[0m\x1b]8;;\x1b\\";
+const LINE_BREAK: &[u8] = b"\r\n";
 
 /// A pane-scoped WebShare snapshot shares the two-MiB outbound budget with
 /// its opcode and sanitizer state. The sanitizer never expands its input, so
@@ -104,10 +110,96 @@ pub(crate) struct PaneRecoveryKeyframe {
     pub(crate) metadata_complete: bool,
 }
 
+/// One row of the keyframe, with the columns its bytes paint on replay.
 #[derive(Debug)]
 struct RenderedRow {
     bytes: Vec<u8>,
     wrapped: bool,
+    columns: u32,
+    leading_columns: u32,
+    trailing_reflow_gap: u32,
+}
+
+impl RenderedRow {
+    fn new(row: RecoveryRow) -> Self {
+        Self {
+            bytes: row.bytes,
+            wrapped: row.wrapped,
+            columns: row.span.columns(),
+            leading_columns: row.span.leading_columns(),
+            trailing_reflow_gap: row.trailing_reflow_gap,
+        }
+    }
+
+    /// Returns whether the replaying terminal moves `next`'s first cell onto
+    /// the following line on its own, reproducing this row exactly.
+    ///
+    /// That happens when the cell no longer fits in the columns this row
+    /// leaves free, and those free columns are precisely the gap a wide glyph
+    /// left behind when it pre-wrapped. Any other shortfall holds blanks that
+    /// belong to this row, and the terminal would paint over them.
+    fn wraps_into(&self, next: &Self, cols: u32) -> bool {
+        self.columns.saturating_add(next.leading_columns) > cols
+            && self.columns.saturating_add(self.trailing_reflow_gap) >= cols
+    }
+
+    /// Fills the row with blanks up to the terminal width.
+    ///
+    /// A soft-wrapped row that paints fewer columns than the terminal has
+    /// leaves the cursor inside the row, so the next row's cells would be
+    /// painted onto it. Only cells past the row's last used cell are missing,
+    /// and those are always default blanks, so plain spaces reproduce them.
+    fn fill_to_width(&mut self, cols: u32) {
+        let missing = cols.saturating_sub(self.columns);
+        if missing == 0 {
+            return;
+        }
+        self.bytes.extend_from_slice(RESET_RENDITION);
+        self.bytes
+            .extend(std::iter::repeat_n(b' ', missing as usize));
+        if self.columns == 0 {
+            self.leading_columns = 1;
+        }
+        self.columns = cols;
+    }
+
+    /// Returns the most bytes [`fill_to_width`](Self::fill_to_width) can add to
+    /// this row while it is being linked to its neighbours.
+    fn reserved_fill_len(&self, cols: u32) -> usize {
+        let missing = cols.saturating_sub(self.columns);
+        if missing == 0 || !(self.wrapped || self.leading_columns == 0) {
+            return 0;
+        }
+        RESET_RENDITION.len().saturating_add(missing as usize)
+    }
+}
+
+/// How much scrolled-off scrollback a recovery keyframe is allowed to replay.
+///
+/// The keyframe always carries the pane's *visible* state (main viewport, plus
+/// the saved main viewport when the pane is on the alternate screen). Scrolled-
+/// off history is extra, and only some consumers are entitled to it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum RecoveryHistoryPolicy {
+    /// Replay the newest scrollback that fits the keyframe budget. Used by the
+    /// owner-authenticated SDK raw pane streams, whose contract is the pane's
+    /// byte history and which report the achieved coverage to the caller.
+    RecentHistory,
+    /// Replay the visible state only. Used by the WebShare pane surface: that
+    /// link is a read-only *view* handed to third parties, pane scope has no
+    /// scrollback protocol at all (`PaneScroll` closes the socket with
+    /// `scroll_requires_session`), so rows that left the pane before the share
+    /// existed must never reach a viewer's browser.
+    VisibleOnly,
+}
+
+impl RecoveryHistoryPolicy {
+    fn history_budget(self, keyframe_headroom: usize) -> usize {
+        match self {
+            Self::RecentHistory => keyframe_headroom,
+            Self::VisibleOnly => 0,
+        }
+    }
 }
 
 impl PaneRecoveryDraft {
@@ -150,6 +242,21 @@ impl PaneRecoveryDraft {
     }
 
     pub(crate) fn materialize(self) -> Result<PaneRecoverySeed, RmuxError> {
+        self.materialize_with_history(RecoveryHistoryPolicy::RecentHistory)
+    }
+
+    /// Materialize a keyframe that replays the pane's visible state only.
+    ///
+    /// This is the WebShare pane-surface entry point: it must stay the only
+    /// materializer reachable from a shared link.
+    pub(crate) fn materialize_visible_only(self) -> Result<PaneRecoverySeed, RmuxError> {
+        self.materialize_with_history(RecoveryHistoryPolicy::VisibleOnly)
+    }
+
+    fn materialize_with_history(
+        self,
+        history_policy: RecoveryHistoryPolicy,
+    ) -> Result<PaneRecoverySeed, RmuxError> {
         let keyframe = {
             let renderer = self.projection.recovery_row_renderer(
                 MAX_RECOVERY_HYPERLINK_ENTRY_BYTES,
@@ -165,6 +272,7 @@ impl PaneRecoveryDraft {
                 &self.parser_state,
                 self.history_size,
                 self.metadata_complete && renderer.metadata_complete(),
+                history_policy,
             );
             match rendered {
                 Err(RmuxError::FrameTooLarge { .. }) => {
@@ -179,6 +287,7 @@ impl PaneRecoveryDraft {
                         &self.parser_state,
                         self.history_size,
                         false,
+                        history_policy,
                     )
                 }
                 result => result,
@@ -303,14 +412,26 @@ fn materialize_keyframe(
     parser_state: &[u8],
     history_rows_total: usize,
     metadata_complete: bool,
+    history_policy: RecoveryHistoryPolicy,
 ) -> Result<PaneRecoveryKeyframe, RmuxError> {
     let size = source.size();
+    let cols = u32::from(size.cols);
     let alternate = source.is_alternate();
     let captured_history_rows = source.history_size();
-    let active_visible = render_active_rows(
+    let mut active_visible = render_active_rows(
         renderer,
         captured_history_rows..captured_history_rows.saturating_add(usize::from(size.rows)),
+        cols,
     )?;
+    link_rows(&mut active_visible, cols);
+
+    let mut saved_visible = if alternate {
+        let mut rows = render_saved_rows(renderer, 0..usize::from(size.rows), cols)?;
+        link_rows(&mut rows, cols);
+        Some(rows)
+    } else {
+        None
+    };
 
     let mut prefix = Vec::new();
     prefix.extend_from_slice(RESET_PREFIX);
@@ -318,22 +439,22 @@ fn materialize_keyframe(
     append_osc_text(&mut prefix, 7, source.path());
     prefix.extend_from_slice(parser_state);
 
-    let mut mandatory_before_active = Vec::new();
-    if alternate {
-        let saved_visible = render_saved_rows(renderer, 0..usize::from(size.rows))?;
-        append_rows(&mut mandatory_before_active, &saved_visible);
+    // The saved viewport is repainted on the main screen before the alternate
+    // screen is entered, so its trailing cursor and mode bytes follow the rows.
+    let mut alternate_tail = Vec::new();
+    if let Some(saved_visible) = saved_visible.as_ref() {
         if let Some((x, y, pending_wrap)) = source.alternate_saved_cursor() {
             append_cursor_state(
-                &mut mandatory_before_active,
+                &mut alternate_tail,
                 source,
                 x,
                 y,
                 pending_wrap,
-                Some(&saved_visible),
+                Some(saved_visible),
                 None,
             );
         }
-        mandatory_before_active.extend_from_slice(if source.alternate_saved_cursor().is_some() {
+        alternate_tail.extend_from_slice(if source.alternate_saved_cursor().is_some() {
             ALT_SCREEN_PREFIX
         } else {
             ALT_SCREEN_NO_CURSOR_PREFIX
@@ -348,12 +469,22 @@ fn materialize_keyframe(
     append_active_cursor_state(&mut suffix, source, &active_visible, active_cell_state);
     suffix.extend_from_slice(pending_bytes);
 
-    let mandatory_rows_len = encoded_rows_len(&active_visible);
+    // Linking the history onto the first repainted row may still have to fill
+    // that row, so its worst case is reserved before the history is sized.
+    let first_repainted = saved_visible
+        .as_ref()
+        .map_or(active_visible.first(), |rows| rows.first());
     let mandatory_len = prefix
         .len()
-        .saturating_add(mandatory_before_active.len())
-        .saturating_add(mandatory_rows_len)
-        .saturating_add(suffix.len());
+        .saturating_add(
+            saved_visible
+                .as_ref()
+                .map_or(0, |rows| encoded_rows_len(rows)),
+        )
+        .saturating_add(alternate_tail.len())
+        .saturating_add(encoded_rows_len(&active_visible))
+        .saturating_add(suffix.len())
+        .saturating_add(first_repainted.map_or(0, |row| row.reserved_fill_len(cols)));
     if mandatory_len > MAX_RECOVERY_KEYFRAME_BYTES {
         return Err(RmuxError::FrameTooLarge {
             length: mandatory_len,
@@ -361,14 +492,16 @@ fn materialize_keyframe(
         });
     }
 
-    let history_budget = MAX_RECOVERY_KEYFRAME_BYTES - mandatory_len;
-    let history = recent_history_suffix(renderer, captured_history_rows, history_budget)?;
-    let history_boundary_len = if history.back().is_some_and(|row| !row.wrapped) {
-        2
-    } else {
-        0
-    };
-    let history_len = encoded_rows_len_deque(&history).saturating_add(history_boundary_len);
+    // Both fixes land here. The share-viewer policy bounds how much history a
+    // spectator may receive; the wrap fix needs `cols` and links the boundary
+    // row pair so a soft-wrapped row is not glued onto the next one.
+    let history_budget = history_policy.history_budget(MAX_RECOVERY_KEYFRAME_BYTES - mandatory_len);
+    let mut history = recent_history_suffix(renderer, captured_history_rows, history_budget, cols)?;
+    let first_repainted = saved_visible
+        .as_mut()
+        .map_or(active_visible.first_mut(), |rows| rows.first_mut());
+    let history_boundary = link_row_pair(history.back_mut(), first_repainted, cols);
+    let history_len = encoded_rows_len_deque(&history).saturating_add(history_boundary.len());
     if history_len > history_budget {
         return Err(RmuxError::Server(
             "recovery history accounting exceeded its byte budget".to_owned(),
@@ -378,10 +511,11 @@ fn materialize_keyframe(
     let mut bytes = Vec::with_capacity(mandatory_len.saturating_add(history_len));
     bytes.extend_from_slice(&prefix);
     append_rows_deque(&mut bytes, &history);
-    if !history.is_empty() && history.back().is_some_and(|row| !row.wrapped) {
-        bytes.extend_from_slice(b"\r\n");
+    bytes.extend_from_slice(history_boundary);
+    if let Some(saved_visible) = saved_visible.as_ref() {
+        append_rows(&mut bytes, saved_visible);
     }
-    bytes.extend_from_slice(&mandatory_before_active);
+    bytes.extend_from_slice(&alternate_tail);
     append_rows(&mut bytes, &active_visible);
     bytes.extend_from_slice(&suffix);
     debug_assert!(bytes.len() <= MAX_RECOVERY_KEYFRAME_BYTES);
@@ -433,48 +567,95 @@ fn validate_surface_geometry(screen: &Screen) -> Result<(), RmuxError> {
 fn render_active_rows(
     renderer: &RecoveryRowRenderer<'_>,
     range: Range<usize>,
+    cols: u32,
 ) -> Result<Vec<RenderedRow>, RmuxError> {
-    render_rows(range, |row| renderer.active_row(row, capture_options()))
+    render_rows(range, cols, |row| {
+        renderer.active_row(row, capture_options())
+    })
 }
 
 fn render_saved_rows(
     renderer: &RecoveryRowRenderer<'_>,
     range: Range<usize>,
+    cols: u32,
 ) -> Result<Vec<RenderedRow>, RmuxError> {
-    render_rows(range, |row| renderer.saved_row(row, capture_options()))
+    render_rows(range, cols, |row| {
+        renderer.saved_row(row, capture_options())
+    })
+}
+
+/// Places every row of a repainted run at its own terminal line.
+///
+/// Rows are painted back to back, so the replaying terminal decides where a
+/// row ends up: a soft-wrapped row hands the next row's first cell to the next
+/// line only when that cell no longer fits in the columns the row leaves free.
+/// [`link_row_pair`] restores that condition wherever the grid no longer
+/// satisfies it, which happens whenever a wrapped row was shortened after it
+/// wrapped (DCH, or a wide glyph that pre-wrapped and left a gap).
+fn link_rows(rows: &mut [RenderedRow], cols: u32) {
+    for index in 1..rows.len() {
+        let (head, tail) = rows.split_at_mut(index);
+        let _ = link_row_pair(head.last_mut(), tail.first_mut(), cols);
+    }
+}
+
+/// Links one repainted row to its successor and returns the bytes that must
+/// separate them.
+///
+/// A row that is not soft-wrapped is separated by CRLF. A soft-wrapped row is
+/// separated by nothing at all: the terminal's own wrap moves to the next line
+/// and marks the row wrapped, which is the only way a replay can reproduce the
+/// flag. That wrap needs a cell to land on, and it must not fit on the wrapped
+/// row, so both rows are filled to the full width when necessary.
+fn link_row_pair(
+    previous: Option<&mut RenderedRow>,
+    next: Option<&mut RenderedRow>,
+    cols: u32,
+) -> &'static [u8] {
+    let (Some(previous), Some(next)) = (previous, next) else {
+        return b"";
+    };
+    if !previous.wrapped {
+        return LINE_BREAK;
+    }
+    if next.leading_columns == 0 {
+        // A row that paints nothing cannot resolve a pending wrap, so the
+        // following rows would climb one line each. Filling it keeps the wrap
+        // and repaints the same blank cells.
+        next.fill_to_width(cols);
+    }
+    if !previous.wraps_into(next, cols) {
+        previous.fill_to_width(cols);
+    }
+    b""
 }
 
 fn render_rows(
     range: Range<usize>,
-    mut render: impl FnMut(usize) -> Option<(Vec<u8>, bool)>,
+    cols: u32,
+    mut render: impl FnMut(usize) -> Option<RecoveryRow>,
 ) -> Result<Vec<RenderedRow>, RmuxError> {
     let mut rows = Vec::with_capacity(range.len());
     let mut encoded_len = 0_usize;
     for row in range {
-        let Some((bytes, wrapped)) = render(row) else {
+        let Some(rendered) = render(row) else {
             return Err(RmuxError::Server(format!(
                 "terminal row {row} disappeared during recovery capture"
             )));
         };
-        let separator = if rows
-            .last()
-            .is_some_and(|previous: &RenderedRow| !previous.wrapped)
-        {
-            2
-        } else {
-            0
-        };
+        let rendered = RenderedRow::new(rendered);
         encoded_len = encoded_len
-            .saturating_add(separator)
+            .saturating_add(LINE_BREAK.len())
             .saturating_add(ROW_RESET.len())
-            .saturating_add(bytes.len());
+            .saturating_add(rendered.bytes.len())
+            .saturating_add(rendered.reserved_fill_len(cols));
         if encoded_len > MAX_RECOVERY_KEYFRAME_BYTES {
             return Err(RmuxError::FrameTooLarge {
                 length: encoded_len,
                 maximum: MAX_RECOVERY_KEYFRAME_BYTES,
             });
         }
-        rows.push(RenderedRow { bytes, wrapped });
+        rows.push(rendered);
     }
     Ok(rows)
 }
@@ -483,8 +664,9 @@ fn recent_history_suffix(
     renderer: &RecoveryRowRenderer<'_>,
     history_rows: usize,
     budget: usize,
+    cols: u32,
 ) -> Result<VecDeque<RenderedRow>, RmuxError> {
-    let mut retained = VecDeque::new();
+    let mut retained: VecDeque<RenderedRow> = VecDeque::new();
     let mut retained_len = 0_usize;
     let mut end = history_rows;
     while end > 0 {
@@ -513,11 +695,13 @@ fn recent_history_suffix(
             start -= 1;
             group_rows += 1;
         }
-        let Some((group, group_len)) =
-            render_history_group_bounded(renderer, start..end, remaining)?
+        let Some((mut group, group_len)) =
+            render_history_group_bounded(renderer, start..end, remaining, cols)?
         else {
             break;
         };
+        link_rows(&mut group, cols);
+        let _ = link_row_pair(group.last_mut(), retained.front_mut(), cols);
         for row in group.into_iter().rev() {
             retained.push_front(row);
         }
@@ -531,36 +715,29 @@ fn render_history_group_bounded(
     renderer: &RecoveryRowRenderer<'_>,
     range: Range<usize>,
     budget: usize,
+    cols: u32,
 ) -> Result<Option<(Vec<RenderedRow>, usize)>, RmuxError> {
     let mut group = Vec::new();
     let mut encoded_len = 0_usize;
     for absolute_y in range {
-        let Some((bytes, wrapped)) = renderer.active_row(absolute_y, capture_options()) else {
+        let Some(rendered) = renderer.active_row(absolute_y, capture_options()) else {
             return Err(RmuxError::Server(
                 "terminal history changed during recovery capture".to_owned(),
             ));
         };
-        let separator = if group
-            .last()
-            .is_some_and(|previous: &RenderedRow| !previous.wrapped)
-        {
-            2
-        } else {
-            0
-        };
+        let rendered = RenderedRow::new(rendered);
         let next_len = encoded_len
-            .saturating_add(separator)
+            .saturating_add(LINE_BREAK.len())
             .saturating_add(ROW_RESET.len())
-            .saturating_add(bytes.len());
+            .saturating_add(rendered.bytes.len())
+            .saturating_add(rendered.reserved_fill_len(cols));
         if next_len > budget {
             return Ok(None);
         }
         encoded_len = next_len;
-        group.push(RenderedRow { bytes, wrapped });
+        group.push(rendered);
     }
-    if group.last().is_some_and(|row| !row.wrapped) {
-        encoded_len = encoded_len.saturating_add(2);
-    }
+    encoded_len = encoded_len.saturating_add(LINE_BREAK.len());
     if encoded_len > budget {
         return Ok(None);
     }
@@ -697,25 +874,36 @@ fn append_cup(out: &mut Vec<u8>, col: u32, row: u32) {
     out.extend_from_slice(format!("\x1b[{row};{col}H").as_bytes());
 }
 
+/// Separator emitted between two rows that the terminal will not wrap itself.
+///
+/// Rows are linked by [`link_rows`] before they are appended, so a wrapped row
+/// is always followed by a row the terminal wraps onto: only an unwrapped row
+/// needs this separator.
+fn row_separator(previous: Option<&RenderedRow>) -> &'static [u8] {
+    match previous {
+        Some(previous) if previous.wrapped => b"",
+        Some(_) => LINE_BREAK,
+        None => b"",
+    }
+}
+
 fn append_rows(out: &mut Vec<u8>, rows: &[RenderedRow]) {
     for (index, row) in rows.iter().enumerate() {
-        if index > 0 && !rows[index - 1].wrapped {
-            out.extend_from_slice(b"\r\n");
-        }
+        out.extend_from_slice(row_separator(
+            index.checked_sub(1).map(|previous| &rows[previous]),
+        ));
         out.extend_from_slice(ROW_RESET);
         out.extend_from_slice(&row.bytes);
     }
 }
 
 fn append_rows_deque(out: &mut Vec<u8>, rows: &VecDeque<RenderedRow>) {
-    let mut previous_wrapped = None;
+    let mut previous = None;
     for row in rows {
-        if previous_wrapped == Some(false) {
-            out.extend_from_slice(b"\r\n");
-        }
+        out.extend_from_slice(row_separator(previous));
         out.extend_from_slice(ROW_RESET);
         out.extend_from_slice(&row.bytes);
-        previous_wrapped = Some(row.wrapped);
+        previous = Some(row);
     }
 }
 
@@ -724,25 +912,19 @@ fn encoded_rows_len(rows: &[RenderedRow]) -> usize {
         .enumerate()
         .fold(0_usize, |length, (index, row)| {
             length
-                .saturating_add(if index > 0 && !rows[index - 1].wrapped {
-                    2
-                } else {
-                    0
-                })
+                .saturating_add(
+                    row_separator(index.checked_sub(1).map(|previous| &rows[previous])).len(),
+                )
                 .saturating_add(ROW_RESET.len())
                 .saturating_add(row.bytes.len())
         })
 }
 
 fn encoded_rows_len_deque(rows: &VecDeque<RenderedRow>) -> usize {
-    let mut previous_wrapped = None;
+    let mut previous = None;
     rows.iter().fold(0_usize, |length, row| {
-        let separator = if previous_wrapped == Some(false) {
-            2
-        } else {
-            0
-        };
-        previous_wrapped = Some(row.wrapped);
+        let separator = row_separator(previous).len();
+        previous = Some(row);
         length
             .saturating_add(separator)
             .saturating_add(ROW_RESET.len())
@@ -792,6 +974,15 @@ mod tests {
     }
 
     fn recovered(initial: &[u8], tail: &[u8]) -> (TerminalScreen, TerminalScreen) {
+        recovered_after(b"", initial, tail)
+    }
+
+    /// Replays a keyframe into a terminal that already carries `stale` state.
+    fn recovered_after(
+        stale: &[u8],
+        initial: &[u8],
+        tail: &[u8],
+    ) -> (TerminalScreen, TerminalScreen) {
         let mut transcript = PaneTranscript::new(100, SIZE);
         transcript.append_bytes(initial);
         let keyframe = PaneRecoverySeed::capture(&transcript)
@@ -799,6 +990,7 @@ mod tests {
             .keyframe();
 
         let mut actual = TerminalScreen::new(SIZE, 100);
+        actual.feed(stale);
         actual.feed(&keyframe.bytes);
         actual.feed(tail);
 
@@ -806,6 +998,68 @@ mod tests {
         expected.feed(initial);
         expected.feed(tail);
         (actual, expected)
+    }
+
+    /// Renders every row over the full terminal width.
+    ///
+    /// A soft-wrapped row owns all of its columns, so the trailing cells of a
+    /// wrapped row are interior to its logical line. This view compares the
+    /// painted surface without asserting whether a blank column is a cleared
+    /// cell or a written space, which an ANSI replay cannot distinguish.
+    fn painted_rows(screen: &Screen) -> Vec<(Vec<u8>, bool)> {
+        screen.capture_transcript_rows_independent(
+            ScreenCaptureRange {
+                start: None,
+                end: None,
+                start_is_absolute: true,
+                end_is_absolute: true,
+            },
+            GridRenderOptions {
+                include_empty_cells: true,
+                ..capture_options()
+            },
+        )
+    }
+
+    fn assert_painted_surface_equal(actual: &TerminalScreen, expected: &TerminalScreen) {
+        assert_eq!(
+            painted_rows(actual.screen()),
+            painted_rows(expected.screen())
+        );
+        assert_eq!(
+            actual.screen().cursor_position(),
+            expected.screen().cursor_position()
+        );
+    }
+
+    /// Asserts that a recovered screen reflows exactly like the source screen,
+    /// which is where a lost soft-wrap flag or a misplaced row becomes visible.
+    ///
+    /// Reflow output is compared as painted columns: a blank column inside a
+    /// soft-wrapped logical line is a written space on one side and a cleared
+    /// cell on the other, because a replayed row is stored as compacted ASCII
+    /// while a row the terminal edited is stored as cells. The two paint the
+    /// same screen and both trim to the same `capture-pane` output.
+    fn assert_reflow_equal(initial: &[u8], tail: &[u8]) {
+        for cols in [4_u16, 6, 8, 10, 12, 15, 20, 24, 40] {
+            let (mut actual, mut expected) = recovered(initial, tail);
+            let resized = TerminalSize {
+                cols,
+                rows: SIZE.rows,
+            };
+            actual.resize(resized);
+            expected.resize(resized);
+            assert_eq!(
+                painted_rows(actual.screen()),
+                painted_rows(expected.screen()),
+                "reflow to {cols} columns diverged"
+            );
+            assert_eq!(
+                actual.screen().cursor_position(),
+                expected.screen().cursor_position(),
+                "reflow to {cols} columns moved the cursor"
+            );
+        }
     }
 
     fn assert_visible_equal(actual: &TerminalScreen, expected: &TerminalScreen) {
@@ -939,6 +1193,117 @@ mod tests {
     }
 
     #[test]
+    fn keyframe_keeps_a_shortened_wrapped_row_from_absorbing_the_next_row() {
+        // DCH on a soft-wrapped row leaves the row shorter than the terminal
+        // while it stays wrapped, so a replay that relies on autowrap alone
+        // paints the next row's cells onto it.
+        for initial in [
+            b"0123456789abcdefGHIJ\x1b[1;1H\x1b[3P".as_slice(),
+            b"0123456789abcdefXYZ\x1b[1;1H\x1b[4P".as_slice(),
+            b"0123456789abcdefXYZ\x1b[1;1H\x1b[1P".as_slice(),
+            b"0123456789abcdefXYZ\x1b[1;1H\x1b[16P".as_slice(),
+            b"0123456789abcdefXYZ\x1b[1;9H\x1b[3P".as_slice(),
+        ] {
+            let (actual, expected) = recovered(initial, b"");
+            assert_complete_equal(&actual, &expected);
+            assert_reflow_equal(initial, b"");
+        }
+
+        // A styled row cannot be stored as compacted ASCII, so the blanks the
+        // fill repaints stay written spaces. They paint the same screen and
+        // reflow the same way, but they are not cleared cells.
+        let styled = b"\x1b[44m0123456789abcdef\x1b[0mXYZ\x1b[1;1H\x1b[3P";
+        let (actual, expected) = recovered(styled, b"");
+        assert_painted_surface_equal(&actual, &expected);
+        assert_reflow_equal(styled, b"");
+    }
+
+    #[test]
+    fn keyframe_keeps_a_shortened_wrapped_row_from_absorbing_the_continuation_it_scrolled_into() {
+        // The same row, once in scrollback and once at the scrollback boundary,
+        // exercises the history deque and the history-to-viewport link.
+        let scrolled = b"0123456789abcdefGHIJ\x1b[1;1H\x1b[3P\x1b[6;1Hbottom\r\ntail";
+        let (actual, expected) = recovered(scrolled, b"");
+        assert_eq!(actual.screen().history_size(), 1);
+        assert_complete_equal(&actual, &expected);
+        assert_reflow_equal(scrolled, b"");
+
+        let deep = b"0123456789abcdefGHIJ\x1b[1;1H\x1b[3P\x1b[6;1Hb\r\nc\r\nd\r\ne";
+        let (actual, expected) = recovered(deep, b"");
+        assert!(actual.screen().history_size() >= 3);
+        assert_complete_equal(&actual, &expected);
+        assert_reflow_equal(deep, b"");
+    }
+
+    #[test]
+    fn keyframe_keeps_a_shortened_wrapped_saved_row_from_absorbing_the_next_row() {
+        // The saved main screen is repainted the same way before the alternate
+        // screen is entered.
+        let initial = b"0123456789abcdefGHIJ\x1b[1;1H\x1b[3P\x1b[?1049h\x1b[2J\x1b[Halt";
+        let (actual, expected) = recovered(initial, b"\x1b[?1049l");
+        assert_complete_equal(&actual, &expected);
+    }
+
+    #[test]
+    fn keyframe_reproduces_a_wide_glyph_pre_wrap_gap_without_filling_it() {
+        // A wide glyph that does not fit leaves one unused column and wraps.
+        // The replay must let the glyph pre-wrap again instead of filling the
+        // gap, or the reflowed logical line gains a space that never existed.
+        let initial = "界界界界界界界a界tail".as_bytes();
+        let (actual, expected) = recovered(initial, b"");
+        assert_complete_equal(&actual, &expected);
+        assert_reflow_equal(initial, b"");
+
+        let scrolled = "界界界界界界界a界tail\u{1b}[6;1Hb\r\nc".as_bytes();
+        let (actual, expected) = recovered(scrolled, b"");
+        assert!(actual.screen().history_size() >= 1);
+        assert_complete_equal(&actual, &expected);
+        assert_reflow_equal(scrolled, b"");
+    }
+
+    #[test]
+    fn keyframe_fills_a_shortened_wrapped_row_before_a_wide_continuation() {
+        // One free column that is *not* a pre-wrap gap must still be filled:
+        // letting the wide glyph pre-wrap into it would drop a blank the row
+        // still holds, which reflow then rewraps one column early.
+        for initial in [
+            "0123456789abcdef界tail\u{1b}[1;1H\u{1b}[1P".as_bytes(),
+            "0123456789abcdef界tail\u{1b}[1;1H\u{1b}[3P".as_bytes(),
+        ] {
+            let (actual, expected) = recovered(initial, b"");
+            assert_complete_equal(&actual, &expected);
+            assert_reflow_equal(initial, b"");
+            assert_painted_surface_equal(&actual, &expected);
+        }
+    }
+
+    #[test]
+    fn keyframe_keeps_a_wrapped_row_whose_continuation_was_erased() {
+        // `EL` on the continuation row leaves a wrapped row followed by a row
+        // that paints nothing: the pending wrap can never resolve, so every
+        // later row would climb one line.
+        let initial = b"0123456789abcdefXYZ\x1b[2;1H\x1b[K\x1b[3;1Hthird";
+        let (actual, expected) = recovered(initial, b"");
+        assert_complete_equal(&actual, &expected);
+        assert_reflow_equal(initial, b"");
+    }
+
+    #[test]
+    fn keyframe_paints_wrapped_rows_when_the_client_disabled_autowrap() {
+        // Rows are placed by the replaying terminal's own wrap, so the paint
+        // cannot inherit a client that left DECAWM off.
+        let initial = b"0123456789abcdefGHIJ\x1b[1;1H\x1b[3P";
+        let (actual, expected) = recovered_after(b"\x1b[?7lstale", initial, b"");
+        assert_complete_equal(&actual, &expected);
+
+        // A pane that itself disabled autowrap still gets its mode restored.
+        let disabled = b"\x1b[?7l0123456789abcdefGHIJ";
+        let (actual, expected) = recovered_after(b"\x1b[?7lstale", disabled, b"");
+        assert_complete_equal(&actual, &expected);
+        assert_eq!(actual.screen().mode() & mode::MODE_WRAP, 0);
+    }
+
+    #[test]
     fn keyframe_keeps_a_bounded_recent_history_suffix_in_alternate_screen() {
         let size = TerminalSize { cols: 64, rows: 4 };
         let mut transcript = PaneTranscript::new(50_000, size);
@@ -977,6 +1342,114 @@ mod tests {
             u64::try_from(recovered.screen().history_size()).unwrap_or(u64::MAX),
             keyframe.history_rows_included
         );
+    }
+
+    fn keyframes_for_both_history_policies(
+        initial: &[u8],
+    ) -> (PaneRecoveryKeyframe, PaneRecoveryKeyframe) {
+        let mut transcript = PaneTranscript::new(100, SIZE);
+        transcript.append_bytes(initial);
+        let recent = PaneRecoveryDraft::capture(&transcript)
+            .expect("capture recovery state")
+            .materialize()
+            .expect("materialize recent-history keyframe")
+            .keyframe();
+        let visible = PaneRecoveryDraft::capture(&transcript)
+            .expect("capture recovery state")
+            .materialize_visible_only()
+            .expect("materialize visible-only keyframe")
+            .keyframe();
+        (recent, visible)
+    }
+
+    fn contains_subslice(haystack: &[u8], needle: &[u8]) -> bool {
+        haystack
+            .windows(needle.len())
+            .any(|window| window == needle)
+    }
+
+    #[test]
+    fn visible_only_keyframe_drops_scrollback_but_replays_the_viewport() {
+        let initial = b"secret-token\r\nrow-0\r\nrow-1\r\nrow-2\r\nrow-3\r\nrow-4\r\nrow-5\r\nrow-6\r\nrow-7\r\nrow-8\r\nrow-9\r\n";
+        let (recent, visible) = keyframes_for_both_history_policies(initial);
+
+        // The owner-authenticated SDK contract is unchanged: it still replays
+        // the newest scrollback that fits.
+        assert!(recent.history_rows_included > 0);
+        assert!(contains_subslice(&recent.bytes, b"secret-token"));
+
+        // The shared-link surface reports the same true total and replays none
+        // of it.
+        assert_eq!(visible.history_rows_total, recent.history_rows_total);
+        assert!(visible.history_rows_total > 0);
+        assert_eq!(visible.history_rows_included, 0);
+        assert!(!contains_subslice(&visible.bytes, b"secret-token"));
+        assert!(!contains_subslice(&visible.bytes, b"row-0"));
+
+        // ... and the visible viewport still replays exactly, with no
+        // scrollback reconstructed in the viewer's emulator.
+        let mut actual = TerminalScreen::new(SIZE, 100);
+        actual.feed(&visible.bytes);
+        let mut expected = TerminalScreen::new(SIZE, 100);
+        expected.feed(initial);
+        assert_visible_equal(&actual, &expected);
+        assert_eq!(actual.screen().history_size(), 0);
+    }
+
+    #[test]
+    fn visible_only_keyframe_keeps_the_saved_main_viewport_under_alternate_screen() {
+        let initial =
+            b"secret-token\r\nmain-0\r\nmain-1\r\nmain-2\r\nmain-3\r\nmain-4\r\nmain-5\r\nmain-6\x1b[?1049h\x1b[2J\x1b[Halt-body";
+        let (_, visible) = keyframes_for_both_history_policies(initial);
+
+        assert!(visible.alternate);
+        assert_eq!(visible.history_rows_included, 0);
+        assert!(!contains_subslice(&visible.bytes, b"secret-token"));
+
+        // Leaving the alternate screen must still restore the pane's visible
+        // main viewport, which is what the keyframe exists to fix.
+        let mut actual = TerminalScreen::new(SIZE, 100);
+        actual.feed(&visible.bytes);
+        actual.feed(b"\x1b[?1049l");
+        let mut expected = TerminalScreen::new(SIZE, 100);
+        expected.feed(initial);
+        expected.feed(b"\x1b[?1049l");
+        assert_visible_equal(&actual, &expected);
+        assert_eq!(actual.screen().history_size(), 0);
+    }
+
+    #[test]
+    fn visible_only_keyframe_stays_viewport_sized_against_a_full_scrollback() {
+        let size = TerminalSize { cols: 80, rows: 24 };
+        let mut transcript = PaneTranscript::new(50_000, size);
+        let mut output = Vec::with_capacity(4 * 1024 * 1024);
+        for row in 0..40_000 {
+            writeln!(
+                output,
+                "secret-row-{row:05}-abcdefghijklmnopqrstuvwxyz-0123456789\r"
+            )
+            .expect("write history row");
+        }
+        // `clear`: the viewport is blank, every secret row lives in scrollback.
+        output.extend_from_slice(b"\x1b[H\x1b[2J");
+        transcript.append_bytes(&output);
+
+        let visible = PaneRecoveryDraft::capture(&transcript)
+            .expect("capture recovery state")
+            .materialize_visible_only()
+            .expect("materialize visible-only keyframe")
+            .keyframe();
+
+        assert!(visible.history_rows_total >= 40_000);
+        assert_eq!(visible.history_rows_included, 0);
+        assert!(!contains_subslice(&visible.bytes, b"secret-row-"));
+
+        // Geometry-independent invariant: replaying the keyframe reconstructs
+        // no scrollback at all in the viewer's emulator, so nothing the viewer
+        // can scroll back to exists.
+        let mut recovered = TerminalScreen::new(size, 50_000);
+        recovered.feed(&visible.bytes);
+        assert_eq!(recovered.screen().history_size(), 0);
     }
 
     #[test]
@@ -1332,6 +1805,37 @@ mod tests {
                 TerminalSize { cols: 6, rows: 3 },
                 "a界\u{1b}[1b".as_bytes(),
                 b"ZW".as_slice(),
+            ),
+            (
+                "dch-shortened-wrapped-row",
+                TerminalSize { cols: 16, rows: 6 },
+                b"0123456789abcdefGHIJ\x1b[1;1H\x1b[3P".as_slice(),
+                b"".as_slice(),
+            ),
+            (
+                "dch-shortened-wrapped-row-scrolled",
+                TerminalSize { cols: 16, rows: 6 },
+                b"0123456789abcdefGHIJ\x1b[1;1H\x1b[3P\x1b[6;1Hbottom\r\ntail".as_slice(),
+                b"\r\nafter".as_slice(),
+            ),
+            // A wrapped row whose continuation was erased is deliberately not
+            // an oracle vector: rmux keeps the row's soft-wrap flag where tmux
+            // 3.7b and xterm.js drop it (see
+            // .rmux-audit/h-recovery-keyframe/oracle-probe.txt), so the vector
+            // would measure that grid divergence instead of the keyframe. The
+            // keyframe's own behaviour is pinned by
+            // `keyframe_keeps_a_wrapped_row_whose_continuation_was_erased`.
+            (
+                "wide-glyph-pre-wrap-gap",
+                TerminalSize { cols: 16, rows: 6 },
+                "界界界界界界界a界tail".as_bytes(),
+                "\u{1b}[3;1H続".as_bytes(),
+            ),
+            (
+                "dch-shortened-wrapped-row-before-wide-glyph",
+                TerminalSize { cols: 16, rows: 6 },
+                "0123456789abcdef界tail\u{1b}[1;1H\u{1b}[1P".as_bytes(),
+                b"".as_slice(),
             ),
         ];
         let vectors = vectors

@@ -1,6 +1,7 @@
 use rmux_core::LifecycleEvent;
 use rmux_proto::RmuxError;
 
+use crate::client_names::attached_client_name;
 use crate::pane_io::AttachControl;
 
 use super::super::RequestHandler;
@@ -132,7 +133,7 @@ impl RequestHandler {
     async fn emit_client_detached(&self, session_name: rmux_proto::SessionName, pid: u32) {
         self.emit(LifecycleEvent::ClientDetached {
             session_name,
-            client_name: Some(pid.to_string()),
+            client_name: Some(attached_client_name(pid)),
         })
         .await;
     }

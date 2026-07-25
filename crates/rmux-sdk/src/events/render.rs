@@ -111,37 +111,29 @@ impl PaneRenderStream {
             if self.surface_closed {
                 return self.emit_ready_pending().await;
             }
-            if self.output_closed {
-                let event = self.surface.next().await?;
-                self.observe_surface(event);
-                continue;
-            }
 
+            // One wait shape for every state: an armed debounce is always part
+            // of the wait. Output EOF only removes output as a wake source —
+            // the pane can stay alive and quiet afterwards (`remain-on-exit`
+            // with an empty `remain-on-exit-format` emits no further surface
+            // event), so a wait that dropped the deadline would strand the last
+            // frame in `pending_snapshot` forever.
+            //
             // Output cursor responses precede their correlated surface wake.
             // Consume them first so a concurrent terminal surface event cannot
             // discard the final lag notice; an expired debounce still wins.
-            if let Some(deadline) = self.render_deadline {
-                tokio::select! {
-                    biased;
-                    _ = tokio::time::sleep_until(deadline) => {
-                        return self.emit_ready_pending().await;
-                    }
-                    chunk = self.output.next() => {
-                        self.observe_output(chunk?);
-                    }
-                    event = self.surface.next() => {
-                        self.observe_surface(event?);
-                    }
+            let deadline = self.render_deadline;
+            let output_open = !self.output_closed;
+            tokio::select! {
+                biased;
+                () = debounce_elapsed(deadline) => {
+                    return self.emit_ready_pending().await;
                 }
-            } else {
-                tokio::select! {
-                    biased;
-                    chunk = self.output.next() => {
-                        self.observe_output(chunk?);
-                    }
-                    event = self.surface.next() => {
-                        self.observe_surface(event?);
-                    }
+                chunk = self.output.next(), if output_open => {
+                    self.observe_output(chunk?);
+                }
+                event = self.surface.next() => {
+                    self.observe_surface(event?);
                 }
             }
         }
@@ -301,6 +293,14 @@ impl std::fmt::Debug for PaneRenderStream {
             .field("surface_epoch", &self.surface_epoch)
             .field("surface_closed", &self.surface_closed)
             .finish_non_exhaustive()
+    }
+}
+
+/// Completes when an armed debounce expires, and never when none is armed.
+async fn debounce_elapsed(deadline: Option<Instant>) {
+    match deadline {
+        Some(deadline) => tokio::time::sleep_until(deadline).await,
+        None => std::future::pending().await,
     }
 }
 

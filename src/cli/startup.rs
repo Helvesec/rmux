@@ -1,5 +1,5 @@
 use std::cell::RefCell;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::rc::Rc;
 
 use rmux_client::{
@@ -13,37 +13,77 @@ use crate::server_runtime::build_daemon_runtime;
 use super::ExitFailure;
 
 #[derive(Debug)]
-pub(in crate::cli) struct PrestartedServerConnection {
+pub(in crate::cli) struct StartServerConnection {
     pub(in crate::cli) connection: Connection,
     pub(in crate::cli) provenance: ServerConnectionProvenance,
 }
 
-/// A single prestarted connection shared by cloned per-command startup options.
-///
-/// Runtime alias resolution borrows this connection first. The first attach
-/// command then consumes the same connection, so an idle-only shutdown does
-/// not mistake a separate keepalive connection for concurrent activity.
-#[derive(Debug, Clone)]
-pub(in crate::cli) struct PrestartedConnection {
-    inner: Rc<RefCell<Option<PrestartedServerConnection>>>,
-    socket_path: std::path::PathBuf,
+#[derive(Debug)]
+struct StartupEndpointState {
+    socket_path: PathBuf,
+    connection: Option<Connection>,
+    started_by_caller: bool,
 }
 
-impl PrestartedConnection {
-    pub(in crate::cli) fn new(outcome: EnsuredServerConnection) -> Self {
-        let provenance = outcome.provenance();
-        let (connection, socket_path) = outcome.into_connection_and_socket_path();
-        Self {
-            inner: Rc::new(RefCell::new(Some(PrestartedServerConnection {
-                connection,
-                provenance,
-            }))),
+/// The daemon endpoint of one CLI invocation, shared by every cloned
+/// [`StartupOptions`].
+///
+/// Runtime alias resolution borrows the startup connection first, and the
+/// queue's first server-starting command then consumes that same connection.
+/// Nothing may keep it alive past that point: a leftover idle connection is
+/// counted as concurrent activity by the daemon and permanently cancels a
+/// queued exit-empty shutdown.
+///
+/// Two facts outlive the connection because later commands still need them:
+///
+/// * whether this invocation started the daemon, so an attach later in the
+///   same queue still cleans up the empty daemon it created;
+/// * the endpoint actually serving the daemon, which Windows rotates when
+///   auto-start replaces a stale managed generation.
+#[derive(Debug, Clone)]
+pub(in crate::cli) struct StartupEndpoint {
+    inner: Rc<RefCell<StartupEndpointState>>,
+}
+
+impl StartupEndpoint {
+    /// Records a resolved endpoint that this invocation has not connected to.
+    pub(in crate::cli) fn resolved(socket_path: PathBuf) -> Self {
+        Self::from_state(StartupEndpointState {
             socket_path,
+            connection: None,
+            started_by_caller: false,
+        })
+    }
+
+    /// Adopts the connection opened before the typed command queue is parsed.
+    pub(in crate::cli) fn prestarted(outcome: EnsuredServerConnection) -> Self {
+        let started_by_caller = started_by_caller(outcome.provenance());
+        let (connection, socket_path) = outcome.into_connection_and_socket_path();
+        Self::from_state(StartupEndpointState {
+            socket_path,
+            connection: Some(connection),
+            started_by_caller,
+        })
+    }
+
+    fn from_state(state: StartupEndpointState) -> Self {
+        Self {
+            inner: Rc::new(RefCell::new(state)),
         }
     }
 
-    pub(in crate::cli) fn socket_path(&self) -> &Path {
-        &self.socket_path
+    /// Returns the endpoint currently serving this invocation.
+    pub(in crate::cli) fn socket_path(&self) -> PathBuf {
+        self.inner.borrow().socket_path.clone()
+    }
+
+    /// Reports how the queue obtained the daemon it is talking to.
+    pub(in crate::cli) fn provenance(&self) -> ServerConnectionProvenance {
+        if self.inner.borrow().started_by_caller {
+            ServerConnectionProvenance::StartedByCaller
+        } else {
+            ServerConnectionProvenance::JoinedExisting
+        }
     }
 
     pub(in crate::cli) fn with_connection_mut<T>(
@@ -51,39 +91,62 @@ impl PrestartedConnection {
         use_connection: impl FnOnce(&mut Connection) -> T,
     ) -> T {
         let mut inner = self.inner.borrow_mut();
-        let prestarted = inner
+        let connection = inner
+            .connection
             .as_mut()
-            .expect("prestarted connection must exist during alias resolution");
-        use_connection(&mut prestarted.connection)
+            .expect("startup connection must exist during alias resolution");
+        use_connection(connection)
     }
 
-    pub(in crate::cli) fn take(&self) -> Option<PrestartedServerConnection> {
-        self.inner.borrow_mut().take()
+    /// Hands the startup connection to the first command that needs one.
+    pub(in crate::cli) fn take_connection(&self) -> Option<Connection> {
+        self.inner.borrow_mut().connection.take()
     }
+
+    /// Adopts the endpoint and provenance of a daemon started mid-queue.
+    ///
+    /// Auto-start may launch the daemon on a different endpoint than the one
+    /// resolved at process start, and the remaining commands must follow it.
+    pub(in crate::cli) fn record_ensured(
+        &self,
+        socket_path: &Path,
+        provenance: ServerConnectionProvenance,
+    ) {
+        let mut inner = self.inner.borrow_mut();
+        if inner.socket_path != socket_path {
+            inner.socket_path = socket_path.to_path_buf();
+        }
+        inner.started_by_caller |= started_by_caller(provenance);
+    }
+}
+
+const fn started_by_caller(provenance: ServerConnectionProvenance) -> bool {
+    matches!(provenance, ServerConnectionProvenance::StartedByCaller)
 }
 
 #[derive(Debug, Clone)]
 pub(in crate::cli) struct StartupOptions {
     pub(in crate::cli) no_start_server: bool,
     pub(in crate::cli) config: AutoStartConfig,
-    pub(in crate::cli) prestarted_connection: Option<PrestartedConnection>,
+    pub(in crate::cli) endpoint: StartupEndpoint,
 }
 
 impl StartupOptions {
-    pub(in crate::cli) fn new(no_start_server: bool, config: AutoStartConfig) -> Self {
+    pub(in crate::cli) fn new(
+        no_start_server: bool,
+        config: AutoStartConfig,
+        endpoint: StartupEndpoint,
+    ) -> Self {
         Self {
             no_start_server,
             config,
-            prestarted_connection: None,
+            endpoint,
         }
     }
 
-    pub(in crate::cli) fn with_prestarted_connection(
-        mut self,
-        connection: Option<PrestartedConnection>,
-    ) -> Self {
-        self.prestarted_connection = connection;
-        self
+    /// Returns the endpoint the next queued command must use.
+    pub(in crate::cli) fn socket_path(&self) -> PathBuf {
+        self.endpoint.socket_path()
     }
 
     pub(in crate::cli) fn for_command(
@@ -103,7 +166,7 @@ impl StartupOptions {
         Self {
             no_start_server: self.no_start_server || !command_has_start_server_flag,
             config,
-            prestarted_connection: self.prestarted_connection.clone(),
+            endpoint: self.endpoint.clone(),
         }
     }
 }
@@ -247,4 +310,73 @@ pub(super) fn run_foreground_server(
         })
         .map(|()| 0)
         .map_err(|error| ExitFailure::new(1, error.to_string()))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{StartupEndpoint, StartupOptions};
+    use rmux_client::{AutoStartConfig, ServerConnectionProvenance};
+    use std::path::{Path, PathBuf};
+
+    fn startup_options(socket_path: &str) -> StartupOptions {
+        StartupOptions::new(
+            false,
+            AutoStartConfig::disabled(),
+            StartupEndpoint::resolved(PathBuf::from(socket_path)),
+        )
+    }
+
+    #[test]
+    fn rotated_startup_endpoint_reaches_later_queued_commands() {
+        let startup = startup_options("/endpoint/original");
+        let starting_command = startup.for_command(true, false, None);
+        let later_command = startup.for_command(false, false, None);
+
+        starting_command.endpoint.record_ensured(
+            Path::new("/endpoint/rotated"),
+            ServerConnectionProvenance::StartedByCaller,
+        );
+
+        assert_eq!(
+            later_command.socket_path(),
+            PathBuf::from("/endpoint/rotated"),
+            "a command queued after an auto-start must follow the rotated endpoint"
+        );
+        assert_eq!(startup.socket_path(), PathBuf::from("/endpoint/rotated"));
+    }
+
+    #[test]
+    fn startup_provenance_outlives_the_command_that_consumes_the_connection() {
+        let startup = startup_options("/endpoint/original");
+        let starting_command = startup.for_command(true, false, None);
+
+        starting_command.endpoint.record_ensured(
+            Path::new("/endpoint/original"),
+            ServerConnectionProvenance::StartedByCaller,
+        );
+        assert!(starting_command.endpoint.take_connection().is_none());
+
+        let attach_command = startup.for_command(true, false, None);
+        assert_eq!(
+            attach_command.endpoint.provenance(),
+            ServerConnectionProvenance::StartedByCaller,
+            "an attach queued after the startup connection was consumed must \
+             still clean up the daemon this invocation started"
+        );
+    }
+
+    #[test]
+    fn joining_an_existing_daemon_keeps_joined_provenance() {
+        let startup = startup_options("/endpoint/original");
+
+        startup.endpoint.record_ensured(
+            Path::new("/endpoint/original"),
+            ServerConnectionProvenance::JoinedExisting,
+        );
+
+        assert_eq!(
+            startup.endpoint.provenance(),
+            ServerConnectionProvenance::JoinedExisting
+        );
+    }
 }

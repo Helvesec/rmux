@@ -51,6 +51,11 @@ const NAMED_PIPE_PENDING_INSTANCES: usize = 4;
 
 impl LocalListener {
     /// Binds a local listener.
+    ///
+    /// This is a synchronous function that builds Tokio I/O resources, so it
+    /// must be called from inside a Tokio runtime: a Unix listener and the
+    /// Windows named-pipe server instances both register with the reactor and
+    /// panic with "there is no reactor running" without one.
     pub fn bind(endpoint: &LocalEndpoint) -> io::Result<Self> {
         bind_impl(endpoint)
     }

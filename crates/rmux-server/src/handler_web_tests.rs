@@ -4,11 +4,11 @@ use rmux_core::events::SubscriptionLimits;
 use rmux_proto::WebShareCreatedResponse;
 use rmux_proto::{encode_attach_message, AttachMessage};
 use rmux_proto::{
-    CreateWebShareRequest, HookLifecycle, HookName, KillPaneRequest, KillSessionRequest,
-    LinkWindowRequest, ListWebSharesRequest, NewSessionRequest, PaneTarget, RenameSessionRequest,
-    Request, Response, ScopeSelector, SessionName, SetHookRequest, SplitDirection,
-    SplitWindowRequest, SplitWindowTarget, StopWebShareRequest, TerminalSize, WebShareScope,
-    WindowTarget,
+    CopyModeRequest, CreateWebShareRequest, HookLifecycle, HookName, KillPaneRequest,
+    KillSessionRequest, LinkWindowRequest, ListWebSharesRequest, NewSessionRequest, PaneTarget,
+    RenameSessionRequest, Request, Response, ScopeSelector, SessionName, SetHookRequest,
+    SplitDirection, SplitWindowRequest, SplitWindowTarget, StopWebShareRequest, TerminalSize,
+    WebShareScope, WindowTarget,
 };
 use tokio::io::AsyncWriteExt;
 use tokio::time::{sleep, timeout, Duration, Instant};
@@ -487,6 +487,61 @@ async fn web_pane_stream_resnapshots_instead_of_forwarding_cross_boundary_rep() 
             rmux_core::ScreenCaptureRange::default(),
             rmux_core::GridRenderOptions::default(),
         )
+    );
+}
+
+/// A pane-scoped WebShare advertises a read-only *view* of the pane and has no
+/// scrollback protocol at all (`PaneScroll` closes with `scroll_requires_session`).
+/// The recovery keyframe must therefore replay the visible viewport only: rows
+/// that already scrolled out of the pane before the link was handed out must
+/// never reach a viewer's browser scrollback.
+#[tokio::test]
+async fn web_pane_snapshot_never_replays_scrolled_off_history() {
+    let handler = RequestHandler::new();
+    let session_name = new_session(&handler, "web-pane-scrollback").await;
+    let target = PaneTarget::new(session_name.clone(), 0);
+    let (output, transcript) = {
+        let state = handler.state.lock().await;
+        (
+            state
+                .pane_output_for_target(&session_name, 0, 0)
+                .expect("pane output"),
+            state.transcript_handle(&target).expect("pane transcript"),
+        )
+    };
+    // Secret scrolls out of the 24-row viewport, then `clear` blanks the screen.
+    let mut bytes = b"AWS_SECRET_ACCESS_KEY=wJalrXUtnFEMI\r\n".to_vec();
+    for line in 0..60_u32 {
+        bytes.extend_from_slice(format!("filler {line}\r\n").as_bytes());
+    }
+    bytes.extend_from_slice(b"\x1b[H\x1b[2J");
+    crate::pane_io::publish_pane_bytes_for_test(&transcript, &output, bytes);
+
+    let pane_target = PaneTargetRef::from(target);
+    let (snapshot, _) = handler
+        .web_resnapshot(&pane_target)
+        .await
+        .expect("web pane resnapshot");
+    let keyframe = snapshot
+        .recovery_keyframe
+        .as_deref()
+        .expect("pane resnapshot includes recovery keyframe");
+
+    assert!(
+        snapshot.history_rows_total > 0,
+        "the pane must actually hold scrollback for this probe to mean anything"
+    );
+    assert!(
+        !contains_subslice(keyframe, b"AWS_SECRET_ACCESS_KEY"),
+        "scrolled-off scrollback leaked into the WebShare pane snapshot"
+    );
+    assert!(
+        !contains_subslice(keyframe, b"filler 0"),
+        "scrolled-off scrollback leaked into the WebShare pane snapshot"
+    );
+    assert_eq!(
+        snapshot.history_rows_included, 0,
+        "a web pane snapshot must report zero replayed history rows"
     );
 }
 
@@ -1499,6 +1554,169 @@ async fn web_session_operator_resize_reaches_attached_session() {
     })
     .await
     .expect("browser resize reaches the attached session");
+}
+
+fn contains_subslice(haystack: &[u8], needle: &[u8]) -> bool {
+    haystack
+        .windows(needle.len())
+        .any(|window| window == needle)
+}
+
+#[tokio::test]
+async fn web_session_pane_scroll_frame_degrades_when_recovery_metadata_is_bounded_out() {
+    let handler = RequestHandler::new();
+    let session_name = new_session(&handler, "websession-scroll-hyperlinks").await;
+    let session_id = {
+        let state = handler.state.lock().await;
+        state
+            .sessions
+            .session(&session_name)
+            .expect("session exists")
+            .id()
+    };
+    let target = PaneTarget::with_window(session_name.clone(), 0, 0);
+    handler
+        .wait_for_pane_startup_to_finish_for_test(&target)
+        .await;
+    let (pane_id, transcript) = {
+        let state = handler.state.lock().await;
+        (
+            state
+                .sessions
+                .session(&session_name)
+                .expect("session exists")
+                .window()
+                .active_pane()
+                .expect("active pane exists")
+                .id(),
+            state.transcript_handle(&target).expect("pane transcript"),
+        )
+    };
+
+    // Scrollback plus one hyperlink entry beyond the bounded Web recovery
+    // contract: an `ls --hyperlink=auto` row or a presigned object URL.
+    let mut payload = Vec::new();
+    for row in 0..60 {
+        payload.extend_from_slice(format!("line {row}\r\n").as_bytes());
+    }
+    let uri = format!(
+        "https://example.test/{}",
+        "x".repeat(crate::pane_recovery::MAX_RECOVERY_HYPERLINK_ENTRY_BYTES)
+    );
+    payload.extend_from_slice(format!("\x1b]8;;{uri}\x1b\\X\x1b]8;;\x1b\\").as_bytes());
+    transcript
+        .lock()
+        .expect("transcript lock")
+        .append_bytes(&payload);
+
+    let session_target = crate::web::WebSessionTarget::new(session_name, session_id);
+    let frame = handler
+        .web_session_pane_scroll_frame(&session_target, pane_id, 0, None)
+        .await;
+
+    // The full-snapshot twin marks the view incomplete and keeps serving; the
+    // scroll patch must fall back to it rather than fail the viewer socket.
+    let frame = frame.expect("bounded-out recovery metadata must not fail the scroll frame");
+    assert!(
+        frame.is_none(),
+        "an incomplete-metadata scroll patch must defer to a full snapshot"
+    );
+
+    // ... and that fallback must actually render the requested scroll.
+    let snapshot = handler
+        .web_session_snapshot_with_scrolls(
+            &session_target,
+            None,
+            &HashMap::from([(pane_id, 0_usize)]),
+        )
+        .await
+        .expect("the full snapshot fallback serves the same scroll");
+    assert!(!snapshot.view.metadata_complete);
+    let scrolled = snapshot
+        .view
+        .panes
+        .iter()
+        .find(|pane| pane.id == pane_id.as_u32())
+        .expect("scrolled pane is in the view");
+    assert!(scrolled.scroll_offset > 0);
+}
+
+#[tokio::test]
+async fn web_session_snapshot_degrades_for_a_copy_mode_pane_with_bounded_out_metadata() {
+    let handler = RequestHandler::new();
+    let session_name = new_session(&handler, "websession-copy-hyperlinks").await;
+    let session_id = {
+        let state = handler.state.lock().await;
+        state
+            .sessions
+            .session(&session_name)
+            .expect("session exists")
+            .id()
+    };
+    let target = PaneTarget::with_window(session_name.clone(), 0, 0);
+    handler
+        .wait_for_pane_startup_to_finish_for_test(&target)
+        .await;
+    let transcript = {
+        let state = handler.state.lock().await;
+        state.transcript_handle(&target).expect("pane transcript")
+    };
+
+    // Copy mode clones the pane screen, so the over-budget hyperlink table has
+    // to exist before the mode is entered.
+    let uri = format!(
+        "https://example.test/{}",
+        "x".repeat(crate::pane_recovery::MAX_RECOVERY_HYPERLINK_ENTRY_BYTES)
+    );
+    transcript
+        .lock()
+        .expect("transcript lock")
+        .append_bytes(format!("\x1b]8;;{uri}\x1b\\X\x1b]8;;\x1b\\").as_bytes());
+    let response = handler
+        .handle(Request::CopyMode(CopyModeRequest {
+            target: Some(target),
+            page_down: false,
+            exit_on_scroll: false,
+            hide_position: false,
+            mouse_drag_start: false,
+            cancel_mode: false,
+            scrollbar_scroll: false,
+            source: None,
+            page_up: false,
+        }))
+        .await;
+    assert!(matches!(response, Response::CopyMode(_)), "{response:?}");
+
+    let session_target = crate::web::WebSessionTarget::new(session_name, session_id);
+    let snapshot = handler
+        .web_session_snapshot(&session_target)
+        .await
+        .expect("a copy-mode pane with bounded-out metadata still snapshots");
+
+    // The non-copy-mode branch of the same render drops the over-budget
+    // metadata instead of failing; copy mode must degrade the same way and
+    // report the gap rather than fail the viewer's frame.
+    assert!(!snapshot.view.metadata_complete);
+
+    // Resetting the live pane's hyperlink storage does not reach copy mode's
+    // frozen backing screen, which is what the viewer renders, so the reported
+    // coverage must still follow the degraded render.
+    let response = handler
+        .handle(Request::ClearHistory(rmux_proto::ClearHistoryRequest {
+            target: PaneTarget::with_window(session_target.name().clone(), 0, 0),
+            reset_hyperlinks: true,
+        }))
+        .await;
+    assert!(
+        matches!(response, Response::ClearHistory(_)),
+        "{response:?}"
+    );
+    let snapshot = handler
+        .web_session_snapshot(&session_target)
+        .await
+        .expect("a copy-mode pane with bounded-out metadata still snapshots");
+
+    assert!(!snapshot.view.metadata_complete);
 }
 
 fn token_from_url(url: &str) -> String {

@@ -1,4 +1,5 @@
 use super::*;
+use crate::client_names::control_client_name;
 use crate::control::{ControlServerEvent, CONTROL_SERVER_EVENT_CAPACITY};
 use rmux_core::LifecycleEvent;
 
@@ -778,7 +779,7 @@ async fn detach_client_target_session_tracks_a_renamed_session_identity() {
                 LifecycleEvent::ClientDetached {
                     session_name,
                     client_name: Some(client_name),
-                } if session_name == &beta && client_name == &control_pid.to_string()
+                } if session_name == &beta && client_name == &control_client_name(control_pid)
             )
         })
         .expect("renamed control publishes client-detached");

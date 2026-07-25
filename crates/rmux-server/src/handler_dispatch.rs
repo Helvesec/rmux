@@ -1,3 +1,4 @@
+use rmux_core::command_parser::ParsedCommand;
 use rmux_proto::request::Request;
 use rmux_proto::{
     capabilities_for_features, ControlModeResponse, ErrorResponse, HandshakeResponse, Response,
@@ -120,8 +121,14 @@ impl RequestHandler {
         let (outcome, inline_hooks) = self
             .dispatch_captured(requester_pid, connection_id, request)
             .await;
-        self.run_dispatched_hooks(requester_pid, &request_for_hooks, &outcome, inline_hooks)
-            .await;
+        self.run_dispatched_hooks(
+            requester_pid,
+            &request_for_hooks,
+            &outcome.response,
+            inline_hooks,
+            None,
+        )
+        .await;
         outcome
     }
 
@@ -144,17 +151,32 @@ impl RequestHandler {
         if undelivered_web_share.is_some() {
             pause_after_web_share_rollback_is_armed(self).await;
         }
-        self.run_dispatched_hooks(requester_pid, &request_for_hooks, &outcome, inline_hooks)
-            .await;
+        self.run_dispatched_hooks(
+            requester_pid,
+            &request_for_hooks,
+            &outcome.response,
+            inline_hooks,
+            None,
+        )
+        .await;
         (outcome, undelivered_web_share)
     }
 
-    async fn run_dispatched_hooks(
+    /// Runs everything a dispatched request still owes once its handler
+    /// returned: the applied-window-resize backstop, then its inline and
+    /// request hooks.
+    ///
+    /// Every path that dispatches a [`Request`] must finish through here.
+    /// `queued_command` carries the parsed command when the request came from a
+    /// command queue (control mode, a multi-command CLI invocation, a hook, a
+    /// key binding) and is `None` for a plain single-request connection.
+    pub(in crate::handler) async fn run_dispatched_hooks(
         &self,
         requester_pid: u32,
         request: &Request,
-        outcome: &HandleOutcome,
+        response: &Response,
         inline_hooks: Vec<PendingInlineHook>,
+        queued_command: Option<&ParsedCommand>,
     ) {
         // Backstop for the applied-window-resize invariant: in tmux 3.7b every
         // window whose size changed has already published
@@ -166,13 +188,13 @@ impl RequestHandler {
             .iter()
             .map(|pending| pending.hook)
             .collect::<Vec<_>>();
-        self.run_inline_hooks(requester_pid, inline_hooks, None)
+        self.run_inline_hooks(requester_pid, inline_hooks, queued_command)
             .await;
         self.run_request_hooks(
             requester_pid,
             request,
-            &outcome.response,
-            None,
+            response,
+            queued_command,
             &inline_hook_names,
         )
         .await;

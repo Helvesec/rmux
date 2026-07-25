@@ -209,6 +209,7 @@ function Check-WorktreeHygiene {
     Write-Host "worktree-hygiene=ok"
 }
 
+Step "release TOML reader self-test" { Run-PythonScript "scripts\toml_reader.py" @("--self-test") }
 Step "release versions" { Check-ReleaseVersions }
 Step "changelog release audit" { Run-PythonScript "scripts\check-changelog-release.py" @("CHANGELOG.md") }
 Step "tmux divergence ledger" { Run-PythonScript "scripts\check-tmux-release-ledger.py" }
@@ -277,6 +278,12 @@ Step "Windows attach stream queue regressions" {
     Run "cargo" @("test", "-p", "rmux-client", "--locked", "blocked_console_output_does_not_block_input_forwarding", "--", "--test-threads=1")
     Assert-CargoFilter 1 @("test", "-p", "rmux-client", "--locked", "output_backpressure_keeps_local_input_and_resize_live")
     Run "cargo" @("test", "-p", "rmux-client", "--locked", "output_backpressure_keeps_local_input_and_resize_live", "--", "--test-threads=1")
+}
+Step "Windows endpoint discovery and legacy shutdown" {
+    Assert-CargoFilter 1 @("test", "-p", "rmux-ipc", "--locked", "--test", "named_pipe_integration")
+    Run "cargo" @("test", "-p", "rmux-ipc", "--locked", "--test", "named_pipe_integration", "--", "--test-threads=1")
+    Assert-CargoFilter 1 @("test", "-p", "rmux-client", "--locked", "--test", "windows_legacy_shutdown")
+    Run "cargo" @("test", "-p", "rmux-client", "--locked", "--test", "windows_legacy_shutdown", "--", "--test-threads=1")
 }
 Step "Windows CLI queue formats" {
     Assert-CargoFilter 1 @("test", "-p", "rmux", "--locked", "--test", "windows_cli_queue_formats")

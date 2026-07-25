@@ -11,6 +11,7 @@ use super::{
     terminate_overlay_job, ActiveAttachIdentity, AttachSessionSwitchRenderOptions, ClientFlags,
     RequestHandler, ATTACH_CONTROL_BACKLOG_LIMIT,
 };
+use crate::client_names::attached_client_name;
 use crate::handler::client_support::SwitchTargetSelection;
 use crate::handler::update_environment_from_client;
 use crate::outer_terminal::OuterTerminalContext;
@@ -477,8 +478,12 @@ impl RequestHandler {
         session_id: SessionId,
         previous_session_id: SessionId,
     ) {
-        self.emit_client_session_changed(attach_pid, session_name, session_id)
-            .await;
+        self.emit_client_session_changed(
+            attached_client_name(attach_pid),
+            session_name,
+            session_id,
+        )
+        .await;
         if previous_session_id != session_id {
             let _ = self
                 .reconcile_attached_session_identity_size_and_emit(previous_session_id)

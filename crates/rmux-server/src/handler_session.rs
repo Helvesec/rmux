@@ -14,6 +14,7 @@ use rmux_proto::{
     WindowTarget,
 };
 
+use crate::client_names::control_client_name;
 use crate::format_runtime::{render_runtime_template, RuntimeFormatContext};
 use crate::hook_runtime::PendingInlineHookFormat;
 use crate::pane_terminals::InitialPaneSpawnOptions;
@@ -497,7 +498,7 @@ impl RequestHandler {
                         self.emit_for_session_identity(
                             LifecycleEvent::ClientSessionChanged {
                                 session_name: session_name.clone(),
-                                client_name: Some(requester_pid.to_string()),
+                                client_name: Some(control_client_name(requester_pid)),
                             },
                             &session_name,
                             session_id,
@@ -1067,17 +1068,24 @@ impl RequestHandler {
         pane_pid: rmux_pty::ProcessId,
         action: crate::pane_terminals::DeferredInitialPaneConsoleInputAction,
     ) -> std::io::Result<()> {
-        crate::windows_console_input::write_with_transient_retry(|| match action {
+        match action {
             crate::pane_terminals::DeferredInitialPaneConsoleInputAction::Key(key) => {
-                rmux_pty::write_windows_console_key(pane_pid, key)
+                crate::windows_console_input::write_with_transient_retry(|| {
+                    rmux_pty::write_windows_console_key(pane_pid, key)
+                })
             }
             crate::pane_terminals::DeferredInitialPaneConsoleInputAction::KeyThenInterrupt(key) => {
-                rmux_pty::write_windows_console_key_then_interrupt_if_processed(pane_pid, key)
+                crate::windows_console_input::write_console_key_then_processed_interrupt(
+                    || rmux_pty::write_windows_console_key_reporting_processed_input(pane_pid, key),
+                    || rmux_pty::send_windows_console_interrupt(pane_pid),
+                )
             }
             crate::pane_terminals::DeferredInitialPaneConsoleInputAction::Interrupt => {
-                rmux_pty::send_windows_console_interrupt(pane_pid)
+                crate::windows_console_input::write_with_transient_retry(|| {
+                    rmux_pty::send_windows_console_interrupt(pane_pid)
+                })
             }
-        })
+        }
     }
 
     #[cfg(windows)]

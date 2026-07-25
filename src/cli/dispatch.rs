@@ -98,15 +98,14 @@ pub(super) fn dispatch_command_queue(
             .all(command_allows_detached_connection_reuse);
     if can_reuse_connection {
         return with_command_connection_cache(socket_path, || {
-            dispatch_commands(commands, socket_path, startup, client_terminal)
+            dispatch_commands(commands, startup, client_terminal)
         });
     }
-    dispatch_commands(commands, socket_path, startup, client_terminal)
+    dispatch_commands(commands, startup, client_terminal)
 }
 
 fn dispatch_commands(
     commands: Vec<Command>,
-    socket_path: &Path,
     startup: StartupOptions,
     client_terminal: ClientTerminalContext,
 ) -> Result<i32, ExitFailure> {
@@ -118,6 +117,12 @@ fn dispatch_commands(
         > 1;
     let mut queued_attach_session = None::<QueuedAttachSession>;
     for (index, command) in commands.iter().cloned().enumerate() {
+        // A queued command may auto-start the daemon on a different endpoint
+        // than the one resolved at process start (Windows rotates a stale
+        // managed generation), so every later command follows the daemon the
+        // queue is actually talking to.
+        let current_socket_path = startup.socket_path();
+        let socket_path = current_socket_path.as_path();
         let command_is_detach_client = matches!(&command, Command::DetachClient(_));
         let command_is_kill_server = matches!(&command, Command::KillServer);
         let queue_attach_sequence = queued_commands
