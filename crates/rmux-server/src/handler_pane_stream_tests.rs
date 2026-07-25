@@ -1629,6 +1629,172 @@ async fn raw_subscription_response_uses_rekeyed_session_after_concurrent_rename(
 }
 
 #[tokio::test]
+async fn existing_surface_response_uses_rekeyed_session_after_concurrent_rename() {
+    let handler = RequestHandler::new();
+    let (target, _, _) = test_pane(&handler).await;
+    let _active = subscribe(&handler, &target, PaneStreamMode::Surface).await;
+    let renamed_session =
+        SessionName::new("surface-stream-renamed").expect("valid renamed session name");
+    let source = {
+        let state = handler.state.lock().await;
+        super::stream_source_for_target(&state, target).expect("stream source")
+    };
+    let reserved_id = {
+        let mut subscriptions = handler.subscriptions.lock().expect("subscription lock");
+        let id = subscriptions
+            .registry
+            .subscribe(CONNECTION_ID, source.key.clone(), Instant::now())
+            .expect("surface reservation")
+            .id();
+        subscriptions.streams.insert(
+            id,
+            super::PaneStreamSubscription::reserved(PaneStreamMode::Surface),
+        );
+        id
+    };
+
+    let rename = handler
+        .handle(Request::RenameSession(RenameSessionRequest {
+            target: source.target.session_name().clone(),
+            new_name: renamed_session.clone(),
+        }))
+        .await;
+    assert!(matches!(rename, Response::RenameSession(_)), "{rename:?}");
+
+    let response = handler.finish_existing_surface_subscription(CONNECTION_ID, reserved_id, source);
+    let Response::SubscribePaneStream(response) = response else {
+        panic!("surface subscription should succeed: {response:?}");
+    };
+    assert_eq!(response.target.session_name(), &renamed_session);
+    assert_eq!(
+        handler
+            .pane_output_subscription_key_for_test(reserved_id)
+            .expect("subscription survives rename")
+            .runtime_session_name(),
+        &renamed_session
+    );
+}
+
+#[tokio::test]
+async fn waiting_surface_response_uses_rekeyed_session_after_concurrent_rename() {
+    let handler = Arc::new(RequestHandler::new());
+    let (target, _, _) = test_pane(handler.as_ref()).await;
+    let renamed_session =
+        SessionName::new("surface-wait-renamed").expect("valid renamed session name");
+    let key = {
+        let state = handler.state.lock().await;
+        state
+            .pane_output_subscription_key_for_target(&target)
+            .expect("pane output key")
+    };
+    let initialization_token = {
+        let mut subscriptions = handler.subscriptions.lock().expect("subscription lock");
+        let super::SurfaceDriverRoute::Initialize { token } =
+            subscriptions.surface_driver_route(&key)
+        else {
+            panic!("test must reserve the surface initializer");
+        };
+        token
+    };
+
+    let task_handler = Arc::clone(&handler);
+    let request_target = target.clone();
+    let task = tokio::spawn(async move {
+        task_handler
+            .handle_subscribe_pane_stream(
+                CONNECTION_ID,
+                SubscribePaneStreamRequest {
+                    target: PaneTargetRef::slot(request_target),
+                    mode: PaneStreamMode::Surface,
+                    include_snapshot: false,
+                },
+            )
+            .await
+    });
+    for _ in 0..100 {
+        if !handler
+            .subscriptions
+            .lock()
+            .expect("subscription lock")
+            .is_empty()
+        {
+            break;
+        }
+        tokio::task::yield_now().await;
+    }
+    assert!(
+        !handler
+            .subscriptions
+            .lock()
+            .expect("subscription lock")
+            .is_empty(),
+        "surface waiter must reserve its stream before the rename"
+    );
+
+    let rename = handler
+        .handle(Request::RenameSession(RenameSessionRequest {
+            target: target.session_name().clone(),
+            new_name: renamed_session.clone(),
+        }))
+        .await;
+    assert!(matches!(rename, Response::RenameSession(_)), "{rename:?}");
+    handler
+        .subscriptions
+        .lock()
+        .expect("subscription lock")
+        .finish_surface_initialization(initialization_token);
+
+    let response = tokio::time::timeout(Duration::from_secs(5), task)
+        .await
+        .expect("surface waiter must finish")
+        .expect("surface waiter task must not panic");
+    let Response::SubscribePaneStream(response) = response else {
+        panic!("surface waiter should subscribe: {response:?}");
+    };
+    assert_eq!(response.target.session_name(), &renamed_session);
+}
+
+#[tokio::test]
+async fn draining_surface_source_uses_rekeyed_session_after_concurrent_rename() {
+    let handler = RequestHandler::new();
+    let (target, _, _) = test_pane(&handler).await;
+    let renamed_session =
+        SessionName::new("surface-drain-renamed").expect("valid renamed session name");
+    let source = {
+        let state = handler.state.lock().await;
+        super::stream_source_for_target(&state, target).expect("stream source")
+    };
+    let reserved_id = {
+        let mut subscriptions = handler.subscriptions.lock().expect("subscription lock");
+        subscriptions
+            .registry
+            .subscribe(CONNECTION_ID, source.key.clone(), Instant::now())
+            .expect("surface reservation")
+            .id()
+    };
+    handler.stage_exited_pane_stream_source(source.key.clone(), source.clone());
+
+    let rename = handler
+        .handle(Request::RenameSession(RenameSessionRequest {
+            target: source.target.session_name().clone(),
+            new_name: renamed_session.clone(),
+        }))
+        .await;
+    assert!(matches!(rename, Response::RenameSession(_)), "{rename:?}");
+    let current_key = handler
+        .pane_output_subscription_key_for_test(reserved_id)
+        .expect("subscription survives rename");
+    let draining_source = handler
+        .subscriptions
+        .lock()
+        .expect("subscription lock")
+        .draining_stream_source(&current_key)
+        .expect("draining source survives rename");
+    assert_eq!(draining_source.target.session_name(), &renamed_session);
+    assert_eq!(draining_source.key, current_key);
+}
+
+#[tokio::test]
 async fn late_stream_subscriptions_are_rejected_while_an_exited_pane_drains() {
     let handler = RequestHandler::new();
     let (target, _, _) = test_pane(&handler).await;

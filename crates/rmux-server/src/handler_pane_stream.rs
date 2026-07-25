@@ -296,7 +296,7 @@ impl RequestHandler {
                         ) else {
                             return reserved_stream_lost_response();
                         };
-                        source.key = current_key;
+                        source.rekey(current_key);
                         route = subscriptions.surface_driver_route(&source.key);
                     }
                 }
@@ -514,7 +514,7 @@ impl RequestHandler {
         &self,
         connection_id: u64,
         subscription_id: rmux_proto::PaneOutputSubscriptionId,
-        source: PaneStreamSource,
+        mut source: PaneStreamSource,
     ) -> Response {
         let mut subscriptions = self
             .subscriptions
@@ -528,6 +528,7 @@ impl RequestHandler {
         ) else {
             return reserved_stream_lost_response();
         };
+        source.rekey(current_key.clone());
         let Some(driver) = subscriptions.surface_drivers.get(&current_key) else {
             subscriptions.remove_subscription(subscription_id);
             return Response::Error(ErrorResponse {
@@ -569,7 +570,7 @@ impl RequestHandler {
         &self,
         connection_id: u64,
         subscription_id: rmux_proto::PaneOutputSubscriptionId,
-        source: PaneStreamSource,
+        mut source: PaneStreamSource,
         receiver: PaneOutputReceiver,
         frame: Arc<rmux_proto::PaneSurfaceFrame>,
         fingerprint: PaneSurfaceFingerprint,
@@ -586,6 +587,7 @@ impl RequestHandler {
         ) else {
             return reserved_stream_lost_response();
         };
+        source.rekey(current_key.clone());
         let frame = if let Some(existing) = subscriptions.surface_drivers.get(&current_key) {
             Arc::clone(&existing.latest)
         } else {

@@ -212,7 +212,7 @@ impl OutputSubscriptionState {
                 .insert(current.clone(), progress);
         }
         if let Some(mut source) = self.draining_stream_sources.remove(previous) {
-            source.key = current.clone();
+            source.rekey(current.clone());
             self.draining_stream_sources.insert(current.clone(), source);
         }
     }
