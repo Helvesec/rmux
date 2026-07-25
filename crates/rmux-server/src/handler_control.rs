@@ -123,10 +123,28 @@ enum ControlOutputStart {
     Oldest,
 }
 
+/// Whether the caller wants `client-session-changed` published at the commit
+/// point, before any window geometry the session change reconciles.
+///
+/// tmux 3.7b, measured 2026-07-25 with two control clients on one session
+/// (101x41 and 60x20, `window-size largest`): after the 101x41 client runs
+/// `switch-client -t target`, the surviving client receives
+///     %client-session-changed client-71338 $1 target
+///     %layout-change @0 a1dd,60x20,0,0,0 a1dd,60x20,0,0,0 *
+/// and the switching client receives `%session-changed $1 target` before its
+/// own `%layout-change @1 ...`. Both orders come from the same notification, so
+/// it has to be published before the reconciles.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ControlSessionChangedNotice {
+    Skip,
+    Publish,
+}
+
 struct ControlSessionUpdate<'a> {
     target_selection: Option<SwitchTargetSelection>,
     client_environment: Option<&'a HashMap<String, String>>,
     output_start: ControlOutputStart,
+    session_changed_notice: ControlSessionChangedNotice,
 }
 
 impl<'a> ControlSessionUpdate<'a> {
@@ -138,6 +156,17 @@ impl<'a> ControlSessionUpdate<'a> {
             target_selection,
             client_environment,
             output_start: ControlOutputStart::Current,
+            session_changed_notice: ControlSessionChangedNotice::Skip,
+        }
+    }
+
+    fn switched(
+        target_selection: Option<SwitchTargetSelection>,
+        client_environment: Option<&'a HashMap<String, String>>,
+    ) -> Self {
+        Self {
+            session_changed_notice: ControlSessionChangedNotice::Publish,
+            ..Self::existing(target_selection, client_environment)
         }
     }
 
@@ -146,6 +175,7 @@ impl<'a> ControlSessionUpdate<'a> {
             target_selection: None,
             client_environment: None,
             output_start: ControlOutputStart::Oldest,
+            session_changed_notice: ControlSessionChangedNotice::Skip,
         }
     }
 }
@@ -1030,6 +1060,29 @@ impl RequestHandler {
         .await
     }
 
+    /// `switch-client` for a control client: same commit as
+    /// [`Self::set_control_session_for_client_identity`], but it also publishes
+    /// the `client-session-changed` notification at the commit point so it
+    /// precedes the `%layout-change` lines the reconciles produce.
+    pub(super) async fn switch_control_session_for_client_identity(
+        &self,
+        requester_pid: u32,
+        expected_control_id: u64,
+        next_session_name: rmux_proto::SessionName,
+        expected_session_id: SessionId,
+        target_selection: Option<SwitchTargetSelection>,
+        client_environment: Option<&HashMap<String, String>>,
+    ) -> Result<Option<rmux_proto::SessionName>, rmux_proto::RmuxError> {
+        self.set_control_session_with_expected_identity(
+            requester_pid,
+            Some(next_session_name),
+            Some(expected_session_id),
+            Some(expected_control_id),
+            ControlSessionUpdate::switched(target_selection, client_environment),
+        )
+        .await
+    }
+
     pub(in crate::handler) async fn set_created_control_session_for_client_identity(
         &self,
         requester_pid: u32,
@@ -1152,6 +1205,7 @@ impl RequestHandler {
             target_selection,
             client_environment,
             output_start,
+            session_changed_notice,
         } = update;
         let exact_client_identity = expected_control_id.is_some();
         let command_name = if exact_client_identity {
@@ -1276,6 +1330,14 @@ impl RequestHandler {
         drop(active_control);
         drop(active_attach);
         drop(state);
+        if session_changed_notice == ControlSessionChangedNotice::Publish {
+            if let (Some(session_name), Some(session_id)) =
+                (next_session_name.as_ref(), next_session_id)
+            {
+                self.emit_client_session_changed(requester_pid, session_name.clone(), session_id)
+                    .await;
+            }
+        }
         self.refresh_linked_window_sessions(refresh_sessions).await;
         if let Some(target) = resized_target {
             self.emit(LifecycleEvent::WindowLayoutChanged { target })

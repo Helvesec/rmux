@@ -1090,8 +1090,12 @@ impl RequestHandler {
                 pid: control_pid,
                 control_id,
             } => {
+                // The commit publishes `client-session-changed` itself, before
+                // the geometry reconciles it triggers, because tmux 3.7b
+                // reports the client move before the `%layout-change` lines it
+                // causes.
                 match self
-                    .set_control_session_for_client_identity(
+                    .switch_control_session_for_client_identity(
                         control_pid,
                         control_id,
                         session_name.clone(),
@@ -1102,12 +1106,6 @@ impl RequestHandler {
                     .await
                 {
                     Ok(_previous_session_name) => {
-                        self.emit_client_session_changed(
-                            control_pid,
-                            session_name.clone(),
-                            session_id,
-                        )
-                        .await;
                         Response::SwitchClient(SwitchClientResponse { session_name })
                     }
                     Err(error) => Response::Error(ErrorResponse { error }),

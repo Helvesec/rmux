@@ -300,10 +300,12 @@ async fn switching_control_client_notifies_the_source_session_layout_change_like
     // Frozen tmux 3.7b oracle, measured 2026-07-25 with two control clients on
     // `source` (101x41 and 60x20, window-size largest). After the 101x41 client
     // runs `switch-client -t target`, the surviving 60x20 control client of the
-    // source session receives:
+    // source session receives, in this order:
+    //     %client-session-changed client-71338 $1 target
     //     %layout-change @0 a1dd,60x20,0,0,0 a1dd,60x20,0,0,0 *
-    // The switched client, now scoped to `target`, is only told about the
-    // target window (`%layout-change @1 ...`), never about the source window.
+    // and the switched client receives `%session-changed $1 target` before its
+    // own `%layout-change @1 aefe,101x41,0,0,1 ...`. The switched client, now
+    // scoped to `target`, is never told about the source window.
     let handler = RequestHandler::new();
     let source = session_name("control-switch-notify-source");
     let target = session_name("control-switch-notify-target");
@@ -358,21 +360,49 @@ async fn switching_control_client_notifies_the_source_session_layout_change_like
     );
     assert_eq!(session_size(&handler, &source).await, surviving_size);
 
-    let notification = wait_for_control_notification(&mut surviving_events, &source_layout_prefix)
-        .await
+    let surviving_lines =
+        collect_control_notifications_through(&mut surviving_events, &source_layout_prefix).await;
+    let layout_index = surviving_lines
+        .iter()
+        .position(|line| line.starts_with(&source_layout_prefix))
         .expect("the surviving control client must be told the source window shrank");
     assert_eq!(
-        layout_change_geometry(&notification).as_deref(),
+        layout_change_geometry(&surviving_lines[layout_index]).as_deref(),
         Some("60x20"),
-        "{notification}"
+        "{:?}",
+        surviving_lines[layout_index]
+    );
+    let session_changed_index = surviving_lines
+        .iter()
+        .position(|line| line.starts_with("%client-session-changed "))
+        .expect("the surviving control client must be told the other client moved away");
+    assert!(
+        session_changed_index < layout_index,
+        "tmux 3.7b reports the client move before the layout it causes: {surviving_lines:?}"
     );
 
-    let switching_lines = settle_control_notifications(&mut switching_events).await;
+    let target_window_id = active_window_id(&handler, &target).await;
+    let target_layout_prefix = format!("%layout-change @{target_window_id} ");
+    let switching_lines =
+        collect_control_notifications_through(&mut switching_events, &target_layout_prefix).await;
     assert!(
         !switching_lines
             .iter()
             .any(|line| line.starts_with(&source_layout_prefix)),
         "the switched client left the source session and must not be told about its window: \
+         {switching_lines:?}"
+    );
+    let target_layout_index = switching_lines
+        .iter()
+        .position(|line| line.starts_with(&target_layout_prefix))
+        .expect("the switched client must be told its new window's layout");
+    let own_session_changed_index = switching_lines
+        .iter()
+        .position(|line| line.starts_with("%session-changed "))
+        .expect("the switched client must be told it changed session");
+    assert!(
+        own_session_changed_index < target_layout_index,
+        "tmux 3.7b reports %session-changed before the switched client's own layout: \
          {switching_lines:?}"
     );
 }
@@ -856,23 +886,6 @@ fn layout_change_geometry(line: &str) -> Option<String> {
         .nth(2)
         .and_then(|layout| layout.split(',').nth(1))
         .map(ToOwned::to_owned)
-}
-
-async fn wait_for_control_notification(
-    events: &mut mpsc::Receiver<ControlServerEvent>,
-    prefix: &str,
-) -> Option<String> {
-    let deadline = tokio::time::Instant::now() + CONTROL_NOTIFICATION_TIMEOUT;
-    while tokio::time::Instant::now() < deadline {
-        match tokio::time::timeout(CONTROL_NOTIFICATION_POLL, events.recv()).await {
-            Ok(Some(ControlServerEvent::Notification(line))) if line.starts_with(prefix) => {
-                return Some(line);
-            }
-            Ok(Some(_)) | Err(_) => continue,
-            Ok(None) => return None,
-        }
-    }
-    None
 }
 
 /// Collects the notifications in delivery order up to and including the first
