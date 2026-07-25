@@ -244,6 +244,17 @@ pub(crate) struct HandlerState {
     pub(crate) retained_lifecycle_targets:
         StdMutex<crate::handler::RetainedLifecycleTargetRegistry>,
     pub(crate) message_log: VecDeque<MessageEntry>,
+    /// Windows whose stored geometry this server changed and whose
+    /// `window-layout-changed` / `window-resized` notifications have not been
+    /// published yet.
+    ///
+    /// tmux 3.7b concentrates both notifications in `resize_window()`, so every
+    /// applied resize publishes them exactly once. RMUX applies window geometry
+    /// through one synchronous chokepoint
+    /// (`mutate_session_and_resize_window_terminal_with_family_if`) but has to
+    /// publish asynchronously, so the chokepoint records the applied resize here
+    /// and `RequestHandler::publish_applied_window_resizes` drains it.
+    applied_window_resizes: Vec<WindowTarget>,
     lifecycle_commit_order: crate::lifecycle_commit_order::LifecycleCommitOrder,
     status_jobs: StatusJobRuntime,
     startup_config_files: String,
@@ -346,6 +357,32 @@ pub(crate) struct UnlinkedWindowResult {
 }
 
 impl HandlerState {
+    /// Records that `target`'s stored geometry changed and still owes its
+    /// `window-layout-changed` / `window-resized` pair.
+    ///
+    /// Linked window aliases share one window identity, so the same window is
+    /// only ever recorded once per publication round.
+    pub(crate) fn record_applied_window_resize(&mut self, target: WindowTarget) {
+        if !self.applied_window_resizes.contains(&target) {
+            self.applied_window_resizes.push(target);
+        }
+    }
+
+    pub(crate) fn take_applied_window_resizes(&mut self) -> Vec<WindowTarget> {
+        std::mem::take(&mut self.applied_window_resizes)
+    }
+
+    pub(crate) fn window_size(
+        &self,
+        session_name: &SessionName,
+        window_index: u32,
+    ) -> Option<rmux_proto::TerminalSize> {
+        self.sessions
+            .session(session_name)
+            .and_then(|session| session.window_at(window_index))
+            .map(rmux_core::Window::size)
+    }
+
     pub(crate) fn reserve_lifecycle_commit_order(
         &self,
     ) -> Option<crate::lifecycle_commit_order::LifecycleCommitTicket> {

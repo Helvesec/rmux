@@ -1400,11 +1400,10 @@ impl RequestHandler {
                 Some(Target::Window(target.clone())),
                 PendingInlineHookFormat::AfterCommand,
             );
-            self.emit(LifecycleEvent::WindowLayoutChanged {
-                target: target.clone(),
-            })
-            .await;
-            self.emit(LifecycleEvent::WindowResized { target }).await;
+            // tmux 3.7b's `cmd_resize_window_exec` calls `resize_window()`
+            // unconditionally, so `resize-window` publishes even when the
+            // requested size equals the current one.
+            self.emit_applied_window_resize(target).await;
             for refresh_session in refresh_sessions {
                 self.refresh_attached_session(&refresh_session).await;
             }

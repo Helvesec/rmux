@@ -487,6 +487,208 @@ async fn switching_attached_client_notifies_the_source_session_layout_change_lik
     );
 }
 
+/// Runs the destination half of an attached `switch-client`: the switching
+/// client is the only one that changes session, and the control client that was
+/// already sitting on the destination watches its window grow.
+///
+/// Frozen tmux 3.7b oracle, measured 2026-07-25
+/// (`.rmux-audit/oracle/scenario_switch_destination.py`): with a 101x41 PTY
+/// client on `source`, a 60x20 control client on `target`, `window-size
+/// largest`, after `switch-client -c <tty> -t target` the destination window
+/// grows 60x20 -> 101x41 and the destination control client receives
+///     %client-session-changed /dev/ttys011 $1 target
+///     %layout-change @1 aefe,101x41,0,0,1 aefe,101x41,0,0,1 *
+/// in that order.
+async fn assert_switch_notifies_the_destination_layout_change(
+    handler: &RequestHandler,
+    source: &SessionName,
+    target: &SessionName,
+    switch: impl AsyncFnOnce(&RequestHandler) -> Response,
+) {
+    set_window_size_policy(handler, source, "largest").await;
+    set_window_size_policy(handler, target, "largest").await;
+
+    let switching_pid = std::process::id();
+    let destination_pid = switching_pid.saturating_add(3);
+    let switching_size = TerminalSize {
+        cols: 101,
+        rows: 41,
+    };
+    let destination_size = TerminalSize { cols: 60, rows: 20 };
+    let (_attach_id, _attach_events) =
+        register_attached_client(handler, switching_pid, source, switching_size).await;
+    let (_destination_id, mut destination_events) =
+        register_control_client_with_id(handler, destination_pid, target).await;
+    let response = handler
+        .handle(Request::RefreshClient(Box::new(
+            refresh_client_size_request(destination_pid, destination_size),
+        )))
+        .await;
+    assert!(
+        matches!(response, Response::RefreshClient(_)),
+        "{response:?}"
+    );
+    assert_eq!(session_size(handler, target).await, destination_size);
+    let target_window_id = active_window_id(handler, target).await;
+    let target_layout_prefix = format!("%layout-change @{target_window_id} ");
+    settle_control_notifications(&mut destination_events).await;
+
+    let response = switch(handler).await;
+    assert!(
+        !matches!(response, Response::Error(_)),
+        "the switch must succeed: {response:?}"
+    );
+    assert_eq!(
+        session_size(handler, target).await,
+        switching_size,
+        "the destination window must grow to the arriving client's geometry"
+    );
+
+    let lines =
+        collect_control_notifications_through(&mut destination_events, &target_layout_prefix).await;
+    let layout_index = lines
+        .iter()
+        .position(|line| line.starts_with(&target_layout_prefix))
+        .expect("the destination control client must be told its window grew");
+    assert_eq!(
+        layout_change_geometry(&lines[layout_index]).as_deref(),
+        Some("101x41"),
+        "{:?}",
+        lines[layout_index]
+    );
+    let session_changed_index = lines
+        .iter()
+        .position(|line| line.starts_with("%client-session-changed "))
+        .expect("the destination control client must be told the client arrived");
+    assert!(
+        session_changed_index < layout_index,
+        "tmux 3.7b reports the client move before the layout it causes: {lines:?}"
+    );
+}
+
+#[tokio::test]
+async fn switching_attached_client_notifies_the_destination_session_layout_change_like_tmux37() {
+    let handler = RequestHandler::new();
+    let source = session_name("attach-switch-dest-source");
+    let target = session_name("attach-switch-dest-target");
+    create_session(&handler, source.clone(), INITIAL_SIZE).await;
+    create_session(&handler, target.clone(), TARGET_SIZE).await;
+    let switch_target = target.clone();
+    assert_switch_notifies_the_destination_layout_change(
+        &handler,
+        &source,
+        &target,
+        async |handler| {
+            handler
+                .handle(Request::SwitchClient(SwitchClientRequest {
+                    target: switch_target,
+                }))
+                .await
+        },
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn attach_session_from_an_attached_client_notifies_the_destination_layout_change_like_tmux37()
+{
+    // `attach-session` issued by an already-attached client re-enters the same
+    // attached switch arm, so it owes the destination the same notification.
+    let handler = RequestHandler::new();
+    let source = session_name("attach-reattach-dest-source");
+    let target = session_name("attach-reattach-dest-target");
+    create_session(&handler, source.clone(), INITIAL_SIZE).await;
+    create_session(&handler, target.clone(), TARGET_SIZE).await;
+    let attach_target = target.clone();
+    assert_switch_notifies_the_destination_layout_change(
+        &handler,
+        &source,
+        &target,
+        async |handler| {
+            handler
+                .handle(Request::AttachSession(rmux_proto::AttachSessionRequest {
+                    target: attach_target,
+                }))
+                .await
+        },
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn attaching_client_notifies_the_destination_session_layout_change_like_tmux37() {
+    // Frozen tmux 3.7b oracle, measured 2026-07-25
+    // (`.rmux-audit/oracle/scenario_attach_destination.py`): a 60x20 control
+    // client already on `target`, `window-size largest`, watches a brand-new
+    // 101x41 PTY client attach. The window grows 60x20 -> 101x41 and the
+    // control client receives `%layout-change @0 aefd,101x41,0,0,0 ...`.
+    let handler = RequestHandler::new();
+    let target = session_name("attach-arrival-dest");
+    create_session(&handler, target.clone(), TARGET_SIZE).await;
+    set_window_size_policy(&handler, &target, "largest").await;
+
+    let control_pid = std::process::id().saturating_add(5);
+    let control_size = TerminalSize { cols: 60, rows: 20 };
+    let arriving_size = TerminalSize {
+        cols: 101,
+        rows: 41,
+    };
+    let (_control_id, mut control_events) =
+        register_control_client_with_id(&handler, control_pid, &target).await;
+    let response = handler
+        .handle(Request::RefreshClient(Box::new(
+            refresh_client_size_request(control_pid, control_size),
+        )))
+        .await;
+    assert!(
+        matches!(response, Response::RefreshClient(_)),
+        "{response:?}"
+    );
+    assert_eq!(session_size(&handler, &target).await, control_size);
+    let target_window_id = active_window_id(&handler, &target).await;
+    let target_layout_prefix = format!("%layout-change @{target_window_id} ");
+    settle_control_notifications(&mut control_events).await;
+
+    let response = handler
+        .handle(Request::AttachSessionExt2(Box::new(
+            rmux_proto::request::AttachSessionExt2Request {
+                target: Some(target.clone()),
+                target_spec: None,
+                detach_other_clients: false,
+                kill_other_clients: false,
+                read_only: false,
+                skip_environment_update: true,
+                flags: None,
+                working_directory: None,
+                client_terminal: rmux_proto::ClientTerminalContext::default(),
+                client_size: Some(arriving_size),
+            },
+        )))
+        .await;
+    assert!(
+        matches!(response, Response::AttachSession(_)),
+        "{response:?}"
+    );
+    assert_eq!(
+        session_size(&handler, &target).await,
+        arriving_size,
+        "the attached window must grow to the arriving client's geometry"
+    );
+
+    let lines =
+        collect_control_notifications_through(&mut control_events, &target_layout_prefix).await;
+    let layout_index = lines
+        .iter()
+        .position(|line| line.starts_with(&target_layout_prefix))
+        .expect("the control client must be told the attached window grew");
+    assert_eq!(
+        layout_change_geometry(&lines[layout_index]).as_deref(),
+        Some("101x41"),
+        "{:?}",
+        lines[layout_index]
+    );
+}
+
 #[tokio::test]
 async fn attached_client_departure_notifies_the_surviving_control_layout_change_like_tmux37() {
     // Frozen tmux 3.7b oracle, measured 2026-07-25 on a session holding a
@@ -741,6 +943,88 @@ async fn destroyed_control_session_rehome_reconciles_target_geometry_like_tmux37
             .get(&requester_pid)
             .and_then(|active| active.session_name.as_ref()),
         Some(&target)
+    );
+}
+
+#[tokio::test]
+async fn destroyed_session_rehome_notifies_the_attached_destination_layout_change_like_tmux37() {
+    // Frozen tmux 3.7b oracle, measured 2026-07-25
+    // (`.rmux-audit/oracle/scenario_destroy_rehome_destination.py`): `doomed`
+    // holds a 101x41 PTY client with `detach-on-destroy off`, `keep` holds a
+    // 60x20 control client, `window-size largest`. Killing `doomed` rehomes the
+    // PTY client onto `keep`, whose window grows 60x20 -> 101x41, and the
+    // destination control client receives
+    //     %client-session-changed /dev/ttys010 $0 keep
+    //     ...
+    //     %layout-change @0 aefd,101x41,0,0,0 aefd,101x41,0,0,0 *
+    let handler = RequestHandler::new();
+    let keep = session_name("rehome-dest-keep");
+    let doomed = session_name("rehome-dest-doomed");
+    create_session(&handler, keep.clone(), TARGET_SIZE).await;
+    create_session(&handler, doomed.clone(), INITIAL_SIZE).await;
+    set_window_size_policy(&handler, &keep, "largest").await;
+    set_window_size_policy(&handler, &doomed, "largest").await;
+    set_detach_on_destroy(&handler, &doomed, "off").await;
+
+    let attach_pid = std::process::id().saturating_add(7);
+    let control_pid = attach_pid.saturating_add(1);
+    let rehomed_size = TerminalSize {
+        cols: 101,
+        rows: 41,
+    };
+    let destination_size = TerminalSize { cols: 60, rows: 20 };
+    let (_attach_id, _attach_events) =
+        register_attached_client(&handler, attach_pid, &doomed, rehomed_size).await;
+    let (_control_id, mut control_events) =
+        register_control_client_with_id(&handler, control_pid, &keep).await;
+    let response = handler
+        .handle(Request::RefreshClient(Box::new(
+            refresh_client_size_request(control_pid, destination_size),
+        )))
+        .await;
+    assert!(
+        matches!(response, Response::RefreshClient(_)),
+        "{response:?}"
+    );
+    assert_eq!(session_size(&handler, &keep).await, destination_size);
+    let keep_window_id = active_window_id(&handler, &keep).await;
+    let keep_layout_prefix = format!("%layout-change @{keep_window_id} ");
+    settle_control_notifications(&mut control_events).await;
+
+    let killed = handler
+        .handle(Request::KillSession(KillSessionRequest {
+            target: doomed,
+            kill_all_except_target: false,
+            clear_alerts: false,
+            kill_group: false,
+        }))
+        .await;
+    assert!(matches!(killed, Response::KillSession(_)), "{killed:?}");
+    assert_eq!(
+        session_size(&handler, &keep).await,
+        rehomed_size,
+        "the rehome destination must grow to the arriving client's geometry"
+    );
+
+    let lines =
+        collect_control_notifications_through(&mut control_events, &keep_layout_prefix).await;
+    let layout_index = lines
+        .iter()
+        .position(|line| line.starts_with(&keep_layout_prefix))
+        .expect("the destination control client must be told the rehome grew its window");
+    assert_eq!(
+        layout_change_geometry(&lines[layout_index]).as_deref(),
+        Some("101x41"),
+        "{:?}",
+        lines[layout_index]
+    );
+    let session_changed_index = lines
+        .iter()
+        .position(|line| line.starts_with("%client-session-changed "))
+        .expect("the destination control client must be told the client arrived");
+    assert!(
+        session_changed_index < layout_index,
+        "tmux 3.7b reports the client move before the layout it causes: {lines:?}"
     );
 }
 

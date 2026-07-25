@@ -1,15 +1,14 @@
 use std::sync::atomic::Ordering;
 
-use rmux_core::LifecycleEvent;
 use rmux_proto::{OptionName, RmuxError, SessionId, WindowId, WindowTarget};
 
 use crate::pane_terminals::HandlerState;
 
-use super::super::super::{prepare_lifecycle_event, QueuedLifecycleEvent, RequestHandler};
+use super::super::super::{QueuedLifecycleEvent, RequestHandler};
 use super::{
     attached_size_candidates, control_size_candidates, linked_session_identities,
-    policy_from_option_value, selected_client_size, AttachedSizeSelection,
-    ATTACHED_SIZE_RECONCILE_ATTEMPTS,
+    policy_from_option_value, prepare_applied_window_resize_events, selected_client_size,
+    AttachedSizeSelection, ATTACHED_SIZE_RECONCILE_ATTEMPTS,
 };
 
 impl RequestHandler {
@@ -38,13 +37,15 @@ impl RequestHandler {
         session_id: SessionId,
         window_id: WindowId,
     ) -> Result<(), RmuxError> {
-        if let Some(applied) = self
+        let applied = self
             .reconcile_attached_window_identity_size(session_id, window_id)
-            .await?
-        {
-            self.pause_before_window_lifecycle_emit().await;
-            self.emit_prepared(applied.layout_changed).await;
-            self.emit_prepared(applied.resized).await;
+            .await?;
+        if applied.is_empty() {
+            return Ok(());
+        }
+        self.pause_before_window_lifecycle_emit().await;
+        for event in applied {
+            self.emit_prepared(event).await;
         }
         Ok(())
     }
@@ -53,13 +54,13 @@ impl RequestHandler {
         &self,
         session_id: SessionId,
         window_id: WindowId,
-    ) -> Result<Option<AppliedIdentityResize>, RmuxError> {
+    ) -> Result<Vec<QueuedLifecycleEvent>, RmuxError> {
         for _ in 0..ATTACHED_SIZE_RECONCILE_ATTEMPTS {
             let Some((target, selection)) = self
                 .selected_attached_window_identity_size(session_id, window_id)
                 .await
             else {
-                return Ok(None);
+                return Ok(Vec::new());
             };
             self.pause_after_attached_size_selection().await;
 
@@ -80,7 +81,7 @@ impl RequestHandler {
                 continue;
             }
             let Some(selected_size) = selection.selected_size else {
-                return Ok(None);
+                return Ok(Vec::new());
             };
             let current_size = state
                 .sessions
@@ -90,7 +91,7 @@ impl RequestHandler {
                 .expect("stable resize window identity was revalidated")
                 .size();
             if current_size == selected_size {
-                return Ok(None);
+                return Ok(Vec::new());
             }
             self.pause_before_attached_size_apply().await;
             let window_index = target.window_index();
@@ -107,22 +108,11 @@ impl RequestHandler {
             // tmux 3.7b, measured 2026-07-25: a reconcile that actually resizes
             // the window notifies the window's control clients with
             // `%layout-change` and runs `window-layout-changed` before
-            // `window-resized`. Reserve both tickets under the same state lock so
-            // the published order matches.
-            let layout_changed = prepare_lifecycle_event(
-                &mut state,
-                &LifecycleEvent::WindowLayoutChanged {
-                    target: target.clone(),
-                },
-            );
-            let resized =
-                prepare_lifecycle_event(&mut state, &LifecycleEvent::WindowResized { target });
-            return Ok(Some(AppliedIdentityResize {
-                layout_changed,
-                resized,
-            }));
+            // `window-resized`. Reserve the tickets the geometry chokepoint just
+            // recorded under the same state lock so the published order matches.
+            return Ok(prepare_applied_window_resize_events(&mut state));
         }
-        Ok(None)
+        Ok(Vec::new())
     }
 
     async fn selected_attached_window_identity_size(
@@ -177,11 +167,6 @@ impl RequestHandler {
         };
         Some((target, selection))
     }
-}
-
-struct AppliedIdentityResize {
-    layout_changed: QueuedLifecycleEvent,
-    resized: QueuedLifecycleEvent,
 }
 
 fn window_target_for_identity(

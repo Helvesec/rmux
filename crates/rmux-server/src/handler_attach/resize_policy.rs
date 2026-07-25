@@ -98,12 +98,17 @@ impl<'a> ControlResizeClient<'a> {
     }
 }
 
+/// Applies a control client's reported size to its session.
+///
+/// Any window this really resizes is recorded by the geometry chokepoint and
+/// published by `RequestHandler::publish_applied_window_resizes`; callers must
+/// never publish a layout notification of their own.
 pub(in crate::handler) fn resize_control_session_for_client(
     state: &mut crate::pane_terminals::HandlerState,
     client: ControlResizeClient<'_>,
     session_name: &SessionName,
     expected_session_id: SessionId,
-) -> Result<Option<WindowTarget>, RmuxError> {
+) -> Result<(), RmuxError> {
     let window_index = state
         .sessions
         .session(session_name)
@@ -118,10 +123,10 @@ pub(in crate::handler) fn resize_control_session_for_client(
         window_index,
     )?;
     let Some(selected_size) = selected_size else {
-        return Ok(None);
+        return Ok(());
     };
     if current_size == selected_size {
-        return Ok(None);
+        return Ok(());
     }
 
     state.mutate_session_and_resize_active_window_terminal(session_name, |session| {
@@ -131,20 +136,22 @@ pub(in crate::handler) fn resize_control_session_for_client(
         session.touch_attached();
         session.resize_active_window_terminal(selected_size);
         Ok(())
-    })?;
-    Ok(Some(WindowTarget::with_window(
-        session_name.clone(),
-        window_index,
-    )))
+    })
 }
 
+/// Moves a control client to `session_name` and applies the geometry that move
+/// implies.
+///
+/// Any window this really resizes is recorded by the geometry chokepoint and
+/// published by `RequestHandler::publish_applied_window_resizes`; callers must
+/// never publish a layout notification of their own.
 pub(in crate::handler) fn switch_control_session_for_client(
     state: &mut crate::pane_terminals::HandlerState,
     client: ControlResizeClient<'_>,
     session_name: &SessionName,
     expected_session_id: SessionId,
     selection: Option<&SwitchTargetSelection>,
-) -> Result<(Option<WindowTarget>, Vec<SessionName>), RmuxError> {
+) -> Result<Vec<SessionName>, RmuxError> {
     let window_index = match selection {
         Some(selection) => selection.window_target().window_index(),
         None => state
@@ -161,11 +168,9 @@ pub(in crate::handler) fn switch_control_session_for_client(
         expected_session_id,
         window_index,
     )?;
-    let resized_target = selected_size
-        .filter(|selected_size| *selected_size != current_size)
-        .map(|_| WindowTarget::with_window(session_name.clone(), window_index));
-    if selection.is_none() && resized_target.is_none() {
-        return Ok((None, Vec::new()));
+    let resizes = selected_size.is_some_and(|selected_size| selected_size != current_size);
+    if selection.is_none() && !resizes {
+        return Ok(Vec::new());
     }
 
     let (_, refresh_sessions) = state.mutate_session_and_resize_window_terminal_with_family(
@@ -184,7 +189,7 @@ pub(in crate::handler) fn switch_control_session_for_client(
             Ok(())
         },
     )?;
-    Ok((resized_target, refresh_sessions))
+    Ok(refresh_sessions)
 }
 
 fn control_resize_selection(
@@ -379,7 +384,8 @@ impl RequestHandler {
         Ok(None)
     }
 
-    /// Publishes what tmux publishes for a window that really did change size.
+    /// Publishes what tmux publishes for every window that really did change
+    /// size since the last publication.
     ///
     /// tmux 3.7b's `resize_window()` runs `window-layout-changed` and then
     /// `window-resized` for every applied resize, and only the former reaches
@@ -390,35 +396,38 @@ impl RequestHandler {
     ///     %layout-change @0 a1dd,60x20,0,0,0 a1dd,60x20,0,0,0 *
     /// then `%client-detached /dev/ttys007`; when the PTY client's process dies
     /// instead, the same `%layout-change` arrives after `%client-detached`.
-    /// Both tickets are reserved under one state lock so they publish in tmux's
+    /// All tickets are reserved under one state lock so they publish in tmux's
     /// order.
-    pub(in crate::handler) async fn emit_applied_window_resize(&self, target: WindowTarget) {
-        let (layout_changed, resized) = {
+    pub(in crate::handler) async fn publish_applied_window_resizes(&self) {
+        let prepared = {
             let mut state = self.state.lock().await;
-            (
-                crate::handler::prepare_lifecycle_event(
-                    &mut state,
-                    &LifecycleEvent::WindowLayoutChanged {
-                        target: target.clone(),
-                    },
-                ),
-                crate::handler::prepare_lifecycle_event(
-                    &mut state,
-                    &LifecycleEvent::WindowResized { target },
-                ),
-            )
+            prepare_applied_window_resize_events(&mut state)
         };
-        self.emit_prepared(layout_changed).await;
-        self.emit_prepared(resized).await;
+        for event in prepared {
+            self.emit_prepared(event).await;
+        }
+    }
+
+    /// Publishes `target` as an applied resize even when its stored size did not
+    /// move, for the commands whose tmux counterpart calls `resize_window()`
+    /// unconditionally (`resize-window`).
+    pub(in crate::handler) async fn emit_applied_window_resize(&self, target: WindowTarget) {
+        let prepared = {
+            let mut state = self.state.lock().await;
+            state.record_applied_window_resize(target);
+            prepare_applied_window_resize_events(&mut state)
+        };
+        for event in prepared {
+            self.emit_prepared(event).await;
+        }
     }
 
     pub(in crate::handler) async fn reconcile_attached_session_size_and_emit(
         &self,
         session_name: &SessionName,
     ) -> Result<(), RmuxError> {
-        if let Some(target) = self.reconcile_attached_session_size(session_name).await? {
-            self.emit_applied_window_resize(target).await;
-        }
+        self.reconcile_attached_session_size(session_name).await?;
+        self.publish_applied_window_resizes().await;
         Ok(())
     }
 
@@ -478,9 +487,8 @@ impl RequestHandler {
         &self,
         target: &WindowTarget,
     ) -> Result<(), RmuxError> {
-        if let Some(target) = self.reconcile_attached_window_size(target).await? {
-            self.emit_applied_window_resize(target).await;
-        }
+        self.reconcile_attached_window_size(target).await?;
+        self.publish_applied_window_resizes().await;
         Ok(())
     }
 
@@ -782,6 +790,29 @@ impl RequestHandler {
         }
         removed
     }
+}
+
+/// Reserves the `window-layout-changed` / `window-resized` pair for every
+/// window the geometry chokepoint recorded, in tmux's order, under one state
+/// lock.
+pub(in crate::handler) fn prepare_applied_window_resize_events(
+    state: &mut crate::pane_terminals::HandlerState,
+) -> Vec<crate::handler::QueuedLifecycleEvent> {
+    let targets = state.take_applied_window_resizes();
+    let mut prepared = Vec::with_capacity(targets.len().saturating_mul(2));
+    for target in targets {
+        prepared.push(crate::handler::prepare_lifecycle_event(
+            state,
+            &LifecycleEvent::WindowLayoutChanged {
+                target: target.clone(),
+            },
+        ));
+        prepared.push(crate::handler::prepare_lifecycle_event(
+            state,
+            &LifecycleEvent::WindowResized { target },
+        ));
+    }
+    prepared
 }
 
 fn attached_size_candidates(

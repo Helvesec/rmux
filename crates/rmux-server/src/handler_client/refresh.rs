@@ -1,4 +1,3 @@
-use rmux_core::LifecycleEvent;
 use rmux_proto::request::RefreshClientRequest;
 use rmux_proto::{
     ErrorResponse, RefreshClientResponse, Response, RmuxError, SessionId, TerminalSize,
@@ -216,7 +215,7 @@ impl RequestHandler {
         {
             #[cfg(windows)]
             self.wait_for_windows_deferred_all_pane_pids().await;
-            let resized_target = {
+            {
                 let mut state = self.state.lock().await;
                 let active_attach = self.active_attach.lock().await;
                 let mut active_control = self.active_control.lock().await;
@@ -243,22 +242,18 @@ impl RequestHandler {
                     session_name,
                     session_id,
                 ) {
-                    Ok(target) => {
+                    Ok(()) => {
                         let active = active_control
                             .by_pid
                             .get_mut(&control_pid)
                             .expect("validated control client remains locked");
                         active.client_width = size.cols;
                         active.client_height = size.rows;
-                        target
                     }
                     Err(error) => return Response::Error(ErrorResponse { error }),
                 }
-            };
-            if let Some(target) = resized_target {
-                self.emit(LifecycleEvent::WindowLayoutChanged { target })
-                    .await;
             }
+            self.publish_applied_window_resizes().await;
         } else if let (None, None, Some(size)) = (session_name.as_ref(), session_id, control_size) {
             let mut active_control = self.active_control.lock().await;
             let Some(active) = active_control

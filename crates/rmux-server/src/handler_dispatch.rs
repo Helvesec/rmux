@@ -156,6 +156,12 @@ impl RequestHandler {
         outcome: &HandleOutcome,
         inline_hooks: Vec<PendingInlineHook>,
     ) {
+        // Backstop for the applied-window-resize invariant: in tmux 3.7b every
+        // window whose size changed has already published
+        // `window-layout-changed` / `window-resized` by the time the command
+        // returns. Commands that publish at their own ordering point leave an
+        // empty queue here; a command that forgets is late, never silent.
+        self.publish_applied_window_resizes().await;
         let inline_hook_names = inline_hooks
             .iter()
             .map(|pending| pending.hook)

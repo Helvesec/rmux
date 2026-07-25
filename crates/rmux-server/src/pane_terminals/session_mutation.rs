@@ -1,7 +1,7 @@
 use std::collections::{HashMap, HashSet};
 
 use rmux_core::{EnvironmentStore, HookStore, OptionStore, PaneId, Session, SessionStore};
-use rmux_proto::{RmuxError, SessionName, TerminalPixels};
+use rmux_proto::{RmuxError, SessionName, TerminalPixels, WindowTarget};
 
 use super::{
     session_not_found, HandlerState, PaneExitMetadata, PaneLifecycleState, WindowLinkGroup,
@@ -22,6 +22,7 @@ pub(crate) struct SessionTransferSnapshot {
     window_link_occurrences: HashMap<WindowLinkSlot, super::WindowLinkOccurrenceId>,
     next_window_link_group_id: u64,
     next_window_link_occurrence_id: u64,
+    applied_window_resizes: Vec<WindowTarget>,
 }
 
 impl SessionTransferSnapshot {
@@ -40,6 +41,7 @@ impl SessionTransferSnapshot {
             window_link_occurrences: state.window_link_occurrences.clone(),
             next_window_link_group_id: state.next_window_link_group_id,
             next_window_link_occurrence_id: state.next_window_link_occurrence_id,
+            applied_window_resizes: state.applied_window_resizes.clone(),
         }
     }
 
@@ -57,6 +59,9 @@ impl SessionTransferSnapshot {
         state.window_link_occurrences = self.window_link_occurrences;
         state.next_window_link_group_id = self.next_window_link_group_id;
         state.next_window_link_occurrence_id = self.next_window_link_occurrence_id;
+        // A rolled-back geometry change owes no notification: restoring the
+        // session model must also retract the resizes it undid.
+        state.applied_window_resizes = self.applied_window_resizes;
     }
 }
 
@@ -111,6 +116,17 @@ impl HandlerState {
         )
     }
 
+    /// The single chokepoint through which every stored window geometry change
+    /// is committed.
+    ///
+    /// tmux 3.7b keeps the equivalent invariant inside `resize_window()`: a
+    /// window whose size actually changed always publishes
+    /// `window-layout-changed` and then `window-resized`, and control clients see
+    /// the former as `%layout-change`. Publication here is asynchronous, so a
+    /// window whose size really moved is recorded on the state and drained by
+    /// `RequestHandler::publish_applied_window_resizes`. Recording at the write
+    /// itself is what makes a silent resize impossible, no matter which command
+    /// performed it.
     pub(crate) fn mutate_session_and_resize_window_terminal_with_family_if<T, F, P>(
         &mut self,
         session_name: &SessionName,
@@ -122,6 +138,7 @@ impl HandlerState {
         F: FnOnce(&mut Session) -> Result<T, RmuxError>,
         P: FnOnce(&T) -> bool,
     {
+        let size_before = self.window_size(session_name, window_index);
         let (result, synchronized_sessions, snapshot) = self
             .mutate_session_and_synchronize_window_family_with_snapshot(
                 session_name,
@@ -130,6 +147,7 @@ impl HandlerState {
             )?;
 
         if !should_resize(&result) {
+            self.record_window_geometry_change(session_name, window_index, size_before);
             return Ok((result, synchronized_sessions));
         }
 
@@ -147,7 +165,24 @@ impl HandlerState {
         for synchronized_session in &synchronized_sessions {
             self.sync_pane_lifecycle_dimensions_for_session(synchronized_session);
         }
+        self.record_window_geometry_change(session_name, window_index, size_before);
         Ok((result, synchronized_sessions))
+    }
+
+    fn record_window_geometry_change(
+        &mut self,
+        session_name: &SessionName,
+        window_index: u32,
+        size_before: Option<rmux_proto::TerminalSize>,
+    ) {
+        let size_after = self.window_size(session_name, window_index);
+        if size_after.is_none() || size_after == size_before {
+            return;
+        }
+        self.record_applied_window_resize(WindowTarget::with_window(
+            session_name.clone(),
+            window_index,
+        ));
     }
 
     pub(crate) fn mutate_session_and_synchronize_window_family<T, F>(

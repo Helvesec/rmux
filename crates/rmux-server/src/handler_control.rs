@@ -1278,7 +1278,7 @@ impl RequestHandler {
         let prepared_update =
             prepare_control_session_update(active, next_session_name.clone(), pane_sequences)
                 .ok_or_else(|| attached_client_required(command_name))?;
-        let (resized_target, refresh_sessions) = if exact_client_identity {
+        let refresh_sessions = if exact_client_identity {
             let (session_name, session_id) = next_session_name
                 .as_ref()
                 .zip(next_session_id)
@@ -1297,7 +1297,7 @@ impl RequestHandler {
                 target_selection.as_ref(),
             )?
         } else {
-            (None, Vec::new())
+            Vec::new()
         };
         if let (Some(session_name), Some(client_environment)) =
             (next_session_name.as_ref(), client_environment)
@@ -1338,11 +1338,11 @@ impl RequestHandler {
                     .await;
             }
         }
+        // The destination resize was recorded by the geometry chokepoint and is
+        // published by `emit_client_session_changed` above (or by the dispatch
+        // backstop when this update carries no session-changed notice).
+        self.publish_applied_window_resizes().await;
         self.refresh_linked_window_sessions(refresh_sessions).await;
-        if let Some(target) = resized_target {
-            self.emit(LifecycleEvent::WindowLayoutChanged { target })
-                .await;
-        }
         if let Some(previous_session_id) =
             previous_session_id.filter(|previous| Some(*previous) != next_session_id)
         {
