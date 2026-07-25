@@ -163,10 +163,14 @@ fn tmux_compat_control_switch_reconciles_source_geometry_when_frozen_tmux_is_ava
         LiveControlClient::spawn(tmux_control_mode_command(&harness, &tmux_binary, &[], &[])?)?;
     let mut rmux_switching =
         LiveControlClient::spawn(rmux_control_mode_command(&harness, &[], &[])?)?;
-    let mut tmux_surviving =
-        LiveControlClient::spawn(tmux_control_mode_command(&harness, &tmux_binary, &[], &[])?)?;
+    let mut tmux_surviving = LiveControlClient::spawn_capturing(tmux_control_mode_command(
+        &harness,
+        &tmux_binary,
+        &[],
+        &[],
+    )?)?;
     let mut rmux_surviving =
-        LiveControlClient::spawn(rmux_control_mode_command(&harness, &[], &[])?)?;
+        LiveControlClient::spawn_capturing(rmux_control_mode_command(&harness, &[], &[])?)?;
     attach_control_pair(
         &mut tmux_switching,
         &mut rmux_switching,
@@ -188,6 +192,8 @@ fn tmux_compat_control_switch_reconciles_source_geometry_when_frozen_tmux_is_ava
         config.clone(),
     )?;
 
+    let tmux_cursor = tmux_surviving.notification_cursor();
+    let rmux_cursor = rmux_surviving.notification_cursor();
     tmux_switching.send("switch-client -t target\n")?;
     rmux_switching.send("switch-client -t target\n")?;
     let switched = wait_for_pair_run(
@@ -215,6 +221,25 @@ fn tmux_compat_control_switch_reconciles_source_geometry_when_frozen_tmux_is_ava
     )?;
     assert_success_without_stderr(&switched);
     assert_eq!(switched.rmux.stdout, switched.tmux.stdout);
+
+    // The server state is only half the contract: tmux also pushes the new
+    // source geometry to the control client that stayed behind, so a -C
+    // frontend does not keep rendering the pre-switch layout.
+    let is_shrunk_layout =
+        |line: &str| line.starts_with("%layout-change ") && line.contains(",60x20,");
+    let tmux_layout = tmux_surviving.wait_for_notification(
+        tmux_cursor,
+        Duration::from_secs(5),
+        "tmux source control",
+        is_shrunk_layout,
+    )?;
+    let rmux_layout = rmux_surviving.wait_for_notification(
+        rmux_cursor,
+        Duration::from_secs(5),
+        "rmux source control",
+        is_shrunk_layout,
+    )?;
+    assert_eq!(rmux_layout, tmux_layout);
 
     tmux_switching.assert_running("tmux switched control")?;
     rmux_switching.assert_running("rmux switched control")?;

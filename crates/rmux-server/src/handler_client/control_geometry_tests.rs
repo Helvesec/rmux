@@ -2,6 +2,7 @@ use super::*;
 
 use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
+use std::time::Duration;
 
 use rmux_proto::{
     ControlMode, KillSessionRequest, NewSessionRequest, OptionName, Request, Response,
@@ -20,6 +21,9 @@ const CONTROL_SIZE: TerminalSize = TerminalSize {
 };
 const SOURCE_ATTACHED_SIZE: TerminalSize = TerminalSize { cols: 70, rows: 20 };
 const TARGET_ATTACHED_SIZE: TerminalSize = TerminalSize { cols: 90, rows: 30 };
+const CONTROL_NOTIFICATION_TIMEOUT: Duration = Duration::from_secs(5);
+const CONTROL_NOTIFICATION_SETTLE: Duration = Duration::from_millis(250);
+const CONTROL_NOTIFICATION_POLL: Duration = Duration::from_millis(25);
 
 #[tokio::test]
 async fn refresh_client_control_size_respects_window_size_policy_like_tmux37() {
@@ -289,6 +293,88 @@ async fn switching_control_client_reconciles_the_source_session_geometry() {
     );
     assert_eq!(session_size(&handler, &source).await, surviving_size);
     assert_eq!(session_size(&handler, &target).await, switching_size);
+}
+
+#[tokio::test]
+async fn switching_control_client_notifies_the_source_session_layout_change_like_tmux37() {
+    // Frozen tmux 3.7b oracle, measured 2026-07-25 with two control clients on
+    // `source` (101x41 and 60x20, window-size largest). After the 101x41 client
+    // runs `switch-client -t target`, the surviving 60x20 control client of the
+    // source session receives:
+    //     %layout-change @0 a1dd,60x20,0,0,0 a1dd,60x20,0,0,0 *
+    // The switched client, now scoped to `target`, is only told about the
+    // target window (`%layout-change @1 ...`), never about the source window.
+    let handler = RequestHandler::new();
+    let source = session_name("control-switch-notify-source");
+    let target = session_name("control-switch-notify-target");
+    create_session(&handler, source.clone(), INITIAL_SIZE).await;
+    create_session(&handler, target.clone(), TARGET_SIZE).await;
+    set_window_size_policy(&handler, &source, "largest").await;
+    set_window_size_policy(&handler, &target, "largest").await;
+
+    let switching_pid = std::process::id();
+    let surviving_pid = switching_pid.saturating_add(1);
+    let switching_size = TerminalSize {
+        cols: 101,
+        rows: 41,
+    };
+    let surviving_size = TerminalSize { cols: 60, rows: 20 };
+    let (_switching_id, mut switching_events) =
+        register_control_client_with_id(&handler, switching_pid, &source).await;
+    let (_surviving_id, mut surviving_events) =
+        register_control_client_with_id(&handler, surviving_pid, &source).await;
+
+    for (pid, size) in [
+        (switching_pid, switching_size),
+        (surviving_pid, surviving_size),
+    ] {
+        let response = handler
+            .handle(Request::RefreshClient(Box::new(
+                refresh_client_size_request(pid, size),
+            )))
+            .await;
+        assert!(
+            matches!(response, Response::RefreshClient(_)),
+            "{response:?}"
+        );
+    }
+    assert_eq!(session_size(&handler, &source).await, switching_size);
+    let source_window_id = active_window_id(&handler, &source).await;
+    let source_layout_prefix = format!("%layout-change @{source_window_id} ");
+    // The setup resizes publish asynchronously; wait for the streams to go
+    // quiet so nothing from them is mistaken for a post-switch notification.
+    settle_control_notifications(&mut switching_events).await;
+    settle_control_notifications(&mut surviving_events).await;
+
+    let response = handler
+        .handle(Request::SwitchClient(SwitchClientRequest {
+            target: target.clone(),
+        }))
+        .await;
+
+    assert!(
+        matches!(response, Response::SwitchClient(_)),
+        "{response:?}"
+    );
+    assert_eq!(session_size(&handler, &source).await, surviving_size);
+
+    let notification = wait_for_control_notification(&mut surviving_events, &source_layout_prefix)
+        .await
+        .expect("the surviving control client must be told the source window shrank");
+    assert_eq!(
+        layout_change_geometry(&notification).as_deref(),
+        Some("60x20"),
+        "{notification}"
+    );
+
+    let switching_lines = settle_control_notifications(&mut switching_events).await;
+    assert!(
+        !switching_lines
+            .iter()
+            .any(|line| line.starts_with(&source_layout_prefix)),
+        "the switched client left the source session and must not be told about its window: \
+         {switching_lines:?}"
+    );
 }
 
 #[tokio::test]
@@ -668,4 +754,65 @@ async fn session_size(handler: &RequestHandler, session: &SessionName) -> Termin
         .expect("session remains present")
         .window()
         .size()
+}
+
+async fn active_window_id(handler: &RequestHandler, session: &SessionName) -> u32 {
+    handler
+        .state
+        .lock()
+        .await
+        .sessions
+        .session(session)
+        .expect("session remains present")
+        .window()
+        .id()
+        .as_u32()
+}
+
+/// `%layout-change @<id> <layout> <visible layout> <flags>` carries the window
+/// geometry in the second comma-separated field of the layout cell.
+fn layout_change_geometry(line: &str) -> Option<String> {
+    line.split_whitespace()
+        .nth(2)
+        .and_then(|layout| layout.split(',').nth(1))
+        .map(ToOwned::to_owned)
+}
+
+async fn wait_for_control_notification(
+    events: &mut mpsc::Receiver<ControlServerEvent>,
+    prefix: &str,
+) -> Option<String> {
+    let deadline = tokio::time::Instant::now() + CONTROL_NOTIFICATION_TIMEOUT;
+    while tokio::time::Instant::now() < deadline {
+        match tokio::time::timeout(CONTROL_NOTIFICATION_POLL, events.recv()).await {
+            Ok(Some(ControlServerEvent::Notification(line))) if line.starts_with(prefix) => {
+                return Some(line);
+            }
+            Ok(Some(_)) | Err(_) => continue,
+            Ok(None) => return None,
+        }
+    }
+    None
+}
+
+/// Collects everything the client receives until its stream stays quiet for
+/// [`CONTROL_NOTIFICATION_SETTLE`].
+async fn settle_control_notifications(
+    events: &mut mpsc::Receiver<ControlServerEvent>,
+) -> Vec<String> {
+    let mut deadline = tokio::time::Instant::now() + CONTROL_NOTIFICATION_SETTLE;
+    let mut lines = Vec::new();
+    while tokio::time::Instant::now() < deadline {
+        match tokio::time::timeout(CONTROL_NOTIFICATION_POLL, events.recv()).await {
+            Ok(Some(event)) => {
+                deadline = tokio::time::Instant::now() + CONTROL_NOTIFICATION_SETTLE;
+                if let ControlServerEvent::Notification(line) = event {
+                    lines.push(line);
+                }
+            }
+            Ok(None) => break,
+            Err(_) => continue,
+        }
+    }
+    lines
 }

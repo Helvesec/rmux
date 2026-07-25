@@ -3,11 +3,12 @@ use crate::common;
 pub(super) use std::error::Error;
 pub(super) use std::ffi::OsString;
 pub(super) use std::fs::{self, File};
-pub(super) use std::io::Write;
+pub(super) use std::io::{BufRead, BufReader, Write};
 pub(super) use std::os::fd::AsRawFd;
 pub(super) use std::path::{Path, PathBuf};
 pub(super) use std::process::{Child, Command, Stdio};
-pub(super) use std::sync::{Mutex, MutexGuard, OnceLock};
+pub(super) use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
+pub(super) use std::thread;
 pub(super) use std::time::{Duration, Instant};
 
 pub(super) use crate::common::{
@@ -988,19 +989,102 @@ pub(super) fn tmux_control_mode_command(
     Ok(command)
 }
 
+type ControlNotificationSink = Arc<Mutex<Vec<String>>>;
+
+const CONTROL_NOTIFICATION_POLL: Duration = Duration::from_millis(25);
+
 #[derive(Debug)]
 pub(super) struct LiveControlClient {
     child: Child,
+    notifications: Option<ControlNotificationSink>,
 }
 
 impl LiveControlClient {
-    pub(super) fn spawn(mut command: Command) -> Result<Self, Box<dyn Error>> {
-        let child = command
+    pub(super) fn spawn(command: Command) -> Result<Self, Box<dyn Error>> {
+        Self::spawn_with_capture(command, false)
+    }
+
+    /// Spawns a control client whose notification stream is captured so a test
+    /// can assert on what the server pushed to it.
+    pub(super) fn spawn_capturing(command: Command) -> Result<Self, Box<dyn Error>> {
+        Self::spawn_with_capture(command, true)
+    }
+
+    fn spawn_with_capture(mut command: Command, capture: bool) -> Result<Self, Box<dyn Error>> {
+        let mut child = command
             .stdin(Stdio::piped())
-            .stdout(Stdio::null())
+            .stdout(if capture {
+                Stdio::piped()
+            } else {
+                Stdio::null()
+            })
             .stderr(Stdio::null())
             .spawn()?;
-        Ok(Self { child })
+        let notifications = capture
+            .then(|| {
+                let stdout = child.stdout.take()?;
+                let sink: ControlNotificationSink = Arc::new(Mutex::new(Vec::new()));
+                let reader_sink = Arc::clone(&sink);
+                thread::spawn(move || {
+                    for line in BufReader::new(stdout).lines().map_while(Result::ok) {
+                        reader_sink
+                            .lock()
+                            .expect("control notification sink")
+                            .push(line);
+                    }
+                });
+                Some(sink)
+            })
+            .flatten();
+        Ok(Self {
+            child,
+            notifications,
+        })
+    }
+
+    /// Number of lines captured so far, usable as a cursor for
+    /// [`Self::wait_for_notification`].
+    pub(super) fn notification_cursor(&self) -> usize {
+        self.sink().lock().expect("control notification sink").len()
+    }
+
+    /// Waits for the first captured line at or after `cursor` matching
+    /// `predicate`.
+    pub(super) fn wait_for_notification(
+        &self,
+        cursor: usize,
+        timeout: Duration,
+        label: &str,
+        predicate: impl Fn(&str) -> bool,
+    ) -> Result<String, Box<dyn Error>> {
+        let deadline = Instant::now() + timeout;
+        loop {
+            let captured = self
+                .sink()
+                .lock()
+                .expect("control notification sink")
+                .clone();
+            if let Some(line) = captured[cursor.min(captured.len())..]
+                .iter()
+                .find(|line| predicate(line))
+            {
+                return Ok(line.clone());
+            }
+            if Instant::now() >= deadline {
+                return Err(format!(
+                    "{label} never reported a matching notification; captured: {:?}",
+                    &captured[cursor.min(captured.len())..]
+                )
+                .into());
+            }
+            thread::sleep(CONTROL_NOTIFICATION_POLL);
+        }
+    }
+
+    fn sink(&self) -> &ControlNotificationSink {
+        self.notifications
+            .as_ref()
+            .expect("control client was spawned without notification capture")
     }
 
     pub(super) fn send(&mut self, commands: &str) -> Result<(), Box<dyn Error>> {

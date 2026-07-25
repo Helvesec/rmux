@@ -5,9 +5,7 @@ use rmux_proto::{OptionName, RmuxError, SessionId, WindowId, WindowTarget};
 
 use crate::pane_terminals::HandlerState;
 
-use super::super::super::{
-    prepare_lifecycle_event_if_enabled, QueuedLifecycleEvent, RequestHandler,
-};
+use super::super::super::{prepare_lifecycle_event, QueuedLifecycleEvent, RequestHandler};
 use super::{
     attached_size_candidates, control_size_candidates, linked_session_identities,
     policy_from_option_value, selected_client_size, AttachedSizeSelection,
@@ -45,12 +43,8 @@ impl RequestHandler {
             .await?
         {
             self.pause_before_window_lifecycle_emit().await;
-            match applied.prepared_event {
-                Some(event) => self.emit_prepared(event).await,
-                None => {
-                    self.emit_without_attached_refresh(applied.event).await;
-                }
-            }
+            self.emit_prepared(applied.layout_changed).await;
+            self.emit_prepared(applied.resized).await;
         }
         Ok(())
     }
@@ -110,11 +104,22 @@ impl RequestHandler {
             )?;
             drop(active_control);
             drop(active_attach);
-            let event = LifecycleEvent::WindowResized { target };
-            let prepared_event = prepare_lifecycle_event_if_enabled(&mut state, &event);
+            // tmux 3.7b, measured 2026-07-25: a reconcile that actually resizes
+            // the window notifies the window's control clients with
+            // `%layout-change` and runs `window-layout-changed` before
+            // `window-resized`. Reserve both tickets under the same state lock so
+            // the published order matches.
+            let layout_changed = prepare_lifecycle_event(
+                &mut state,
+                &LifecycleEvent::WindowLayoutChanged {
+                    target: target.clone(),
+                },
+            );
+            let resized =
+                prepare_lifecycle_event(&mut state, &LifecycleEvent::WindowResized { target });
             return Ok(Some(AppliedIdentityResize {
-                event,
-                prepared_event,
+                layout_changed,
+                resized,
             }));
         }
         Ok(None)
@@ -175,8 +180,8 @@ impl RequestHandler {
 }
 
 struct AppliedIdentityResize {
-    event: LifecycleEvent,
-    prepared_event: Option<QueuedLifecycleEvent>,
+    layout_changed: QueuedLifecycleEvent,
+    resized: QueuedLifecycleEvent,
 }
 
 fn window_target_for_identity(
