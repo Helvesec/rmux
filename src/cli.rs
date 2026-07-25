@@ -519,13 +519,6 @@ fn connect_with_startserver(
     if startup.no_start_server {
         connect(socket_path).map_err(|error| ExitFailure::from_client_connect(socket_path, error))
     } else {
-        if let Some(prestarted) = startup
-            .prestarted_connection
-            .as_ref()
-            .and_then(PrestartedConnection::take)
-        {
-            return Ok(prestarted.into_connection());
-        }
         ensure_server_running_with_config(socket_path, startup.config)
             .map_err(ExitFailure::from_auto_start)
     }
