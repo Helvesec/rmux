@@ -83,6 +83,92 @@ fn tmux_compat_control_geometry_survives_attach_and_control_departures_when_froz
     Ok(())
 }
 
+#[test]
+fn tmux_compat_control_switch_reconciles_source_geometry_when_frozen_tmux_is_available(
+) -> Result<(), Box<dyn Error>> {
+    let harness = TmuxCompatHarness::new("tmux-compat-control-switch-source-geometry")?;
+    let Some(tmux_binary) = frozen_tmux_or_skip(&harness)? else {
+        return Ok(());
+    };
+    let _guard = pty_tmux_compat_lock();
+    let config = config();
+
+    for argv in [
+        ["new-session", "-d", "-s", "source"].as_slice(),
+        ["new-session", "-d", "-s", "target"].as_slice(),
+        ["set-option", "-t", "source", "status", "off"].as_slice(),
+        ["set-option", "-t", "target", "status", "off"].as_slice(),
+        ["set-option", "-w", "-t", "source", "window-size", "largest"].as_slice(),
+        ["set-option", "-w", "-t", "target", "window-size", "largest"].as_slice(),
+    ] {
+        let run = harness.run_pair_with(&tmux_binary, argv, config.clone())?;
+        assert_quiet_success(&run);
+    }
+
+    let mut tmux_switching =
+        LiveControlClient::spawn(tmux_control_mode_command(&harness, &tmux_binary, &[], &[])?)?;
+    let mut rmux_switching =
+        LiveControlClient::spawn(rmux_control_mode_command(&harness, &[], &[])?)?;
+    let mut tmux_surviving =
+        LiveControlClient::spawn(tmux_control_mode_command(&harness, &tmux_binary, &[], &[])?)?;
+    let mut rmux_surviving =
+        LiveControlClient::spawn(rmux_control_mode_command(&harness, &[], &[])?)?;
+    attach_control_pair(
+        &mut tmux_switching,
+        &mut rmux_switching,
+        "source",
+        size(101, 41),
+    )?;
+    attach_control_pair(
+        &mut tmux_surviving,
+        &mut rmux_surviving,
+        "source",
+        size(60, 20),
+    )?;
+    wait_for_state(
+        &harness,
+        &tmux_binary,
+        "source",
+        &[size(101, 41), size(60, 20)],
+        size(101, 41),
+        config.clone(),
+    )?;
+
+    tmux_switching.send("switch-client -t target\n")?;
+    rmux_switching.send("switch-client -t target\n")?;
+    let switched = wait_for_pair_run(
+        &harness,
+        &tmux_binary,
+        &[
+            "display-message",
+            "-p",
+            "-t",
+            "source",
+            "#{window_width}x#{window_height}",
+            ";",
+            "display-message",
+            "-p",
+            "-t",
+            "target",
+            "#{window_width}x#{window_height}",
+        ],
+        config,
+        Duration::from_secs(5),
+        |run| {
+            run.tmux.stdout_string() == "60x20\n101x41\n"
+                && run.rmux.stdout_string() == "60x20\n101x41\n"
+        },
+    )?;
+    assert_success_without_stderr(&switched);
+    assert_eq!(switched.rmux.stdout, switched.tmux.stdout);
+
+    tmux_switching.assert_running("tmux switched control")?;
+    rmux_switching.assert_running("rmux switched control")?;
+    tmux_surviving.assert_running("tmux source control")?;
+    rmux_surviving.assert_running("rmux source control")?;
+    Ok(())
+}
+
 fn assert_control_and_attach_departure(
     harness: &TmuxCompatHarness,
     tmux_binary: &Path,

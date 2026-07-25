@@ -173,6 +173,58 @@ async fn control_clients_share_largest_and_smallest_size_candidates_like_tmux37(
 }
 
 #[tokio::test]
+async fn switching_control_client_reconciles_the_source_session_geometry() {
+    let handler = RequestHandler::new();
+    let source = session_name("control-switch-reconcile-source");
+    let target = session_name("control-switch-reconcile-target");
+    create_session(&handler, source.clone(), INITIAL_SIZE).await;
+    create_session(&handler, target.clone(), TARGET_SIZE).await;
+    set_window_size_policy(&handler, &source, "largest").await;
+    set_window_size_policy(&handler, &target, "largest").await;
+
+    let switching_pid = std::process::id();
+    let surviving_pid = switching_pid.saturating_add(1);
+    let switching_size = TerminalSize {
+        cols: 101,
+        rows: 41,
+    };
+    let surviving_size = TerminalSize { cols: 60, rows: 20 };
+    let (_switching_id, _switching_events) =
+        register_control_client_with_id(&handler, switching_pid, &source).await;
+    let (_surviving_id, _surviving_events) =
+        register_control_client_with_id(&handler, surviving_pid, &source).await;
+
+    for (pid, size) in [
+        (switching_pid, switching_size),
+        (surviving_pid, surviving_size),
+    ] {
+        let response = handler
+            .handle(Request::RefreshClient(Box::new(
+                refresh_client_size_request(pid, size),
+            )))
+            .await;
+        assert!(
+            matches!(response, Response::RefreshClient(_)),
+            "{response:?}"
+        );
+    }
+    assert_eq!(session_size(&handler, &source).await, switching_size);
+
+    let response = handler
+        .handle(Request::SwitchClient(SwitchClientRequest {
+            target: target.clone(),
+        }))
+        .await;
+
+    assert!(
+        matches!(response, Response::SwitchClient(_)),
+        "{response:?}"
+    );
+    assert_eq!(session_size(&handler, &source).await, surviving_size);
+    assert_eq!(session_size(&handler, &target).await, switching_size);
+}
+
+#[tokio::test]
 async fn attached_arrival_and_departure_keep_control_geometry_in_every_automatic_policy() {
     // Frozen tmux 3.7b oracle, 2026-07-25: a control client remains a
     // window-size candidate while an ordinary attach arrives and after it

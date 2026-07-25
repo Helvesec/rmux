@@ -1217,6 +1217,7 @@ impl RequestHandler {
             cols: active.client_width,
             rows: active.client_height,
         };
+        let previous_session_id = active.session_id;
         let size_sequence = next_session_name
             .as_ref()
             .map(|_| self.next_client_size_sequence());
@@ -1278,6 +1279,13 @@ impl RequestHandler {
         self.refresh_linked_window_sessions(refresh_sessions).await;
         if let Some(target) = resized_target {
             self.emit(LifecycleEvent::WindowLayoutChanged { target })
+                .await;
+        }
+        if let Some(previous_session_id) =
+            previous_session_id.filter(|previous| Some(*previous) != next_session_id)
+        {
+            let _ = self
+                .reconcile_attached_session_identity_size_and_emit(previous_session_id)
                 .await;
         }
         Ok(previous)
