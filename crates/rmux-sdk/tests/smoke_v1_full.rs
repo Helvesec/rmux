@@ -186,6 +186,12 @@ async fn ci_runner_collects_initial_process_burst_oldest_without_keepalive() -> 
         .await?;
     let pane = session.pane(0, 0);
 
+    wait_for_pane_absent(&pane).await?;
+    assert!(
+        pane.id().await?.is_none(),
+        "retained-output regression requires the process pane to be absent before collection"
+    );
+
     let collected = pane
         .collect_output_until_exit_starting_at(PaneOutputStart::Oldest, OUTPUT_BUDGET)
         .await?;

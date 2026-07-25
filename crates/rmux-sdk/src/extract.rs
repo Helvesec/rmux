@@ -119,6 +119,15 @@ pub(crate) async fn collect_output_until_exit_starting_at(
     let timeout = crate::wait::resolved_wait_timeout(pane.configured_default_timeout());
     let deadline = crate::wait::wait_deadline(timeout);
     let pane = pane.begin_operation_handle();
+    if start == PaneOutputStart::Oldest {
+        return crate::wait::with_wait_deadline(
+            COLLECT_OUTPUT_UNTIL_EXIT_OPERATION,
+            timeout,
+            deadline,
+            collect_oldest_output_until_exit_without_timeout(&pane, max_bytes),
+        )
+        .await;
+    }
     let (pane, _) = crate::wait::with_wait_deadline(
         COLLECT_OUTPUT_UNTIL_EXIT_OPERATION,
         timeout,
@@ -135,20 +144,51 @@ pub(crate) async fn collect_output_until_exit_starting_at(
     .await
 }
 
+async fn collect_oldest_output_until_exit_without_timeout(
+    pane: &Pane,
+    max_bytes: usize,
+) -> Result<CollectedPaneOutput> {
+    let stream = match pane
+        .output_stream_starting_at(PaneOutputStart::Oldest)
+        .await
+    {
+        Ok(stream) => stream,
+        Err(error) if crate::handles::is_already_closed_pane_error(&error, pane.target()) => {
+            // The server owns both the live lookup and retained-output
+            // fallback for this request. Do not probe the mutable slot again
+            // after it reports no source, or a replacement could be adopted.
+            return Ok(CollectedPaneOutput::default());
+        }
+        Err(error) => return Err(error),
+    };
+    let pane = pane.clone().pin_to_id(stream.pane_id());
+    collect_open_output_until_exit(&pane, stream, max_bytes).await
+}
+
 async fn collect_output_until_exit_without_timeout(
     pane: &Pane,
     start: PaneOutputStart,
     max_bytes: usize,
 ) -> Result<CollectedPaneOutput> {
-    let mut collection = CollectedPaneOutput::default();
-    let mut stream = match pane.output_stream_starting_at(start).await {
+    let stream = match pane.output_stream_starting_at(start).await {
         Ok(stream) => stream,
         Err(error) if crate::handles::is_already_closed_pane_error(&error, pane.target()) => {
-            collection.exit_state = exit_state_after_stream_close(pane).await?;
-            return Ok(collection);
+            return Ok(CollectedPaneOutput {
+                exit_state: exit_state_after_stream_close(pane).await?,
+                ..CollectedPaneOutput::default()
+            });
         }
         Err(error) => return Err(error),
     };
+    collect_open_output_until_exit(pane, stream, max_bytes).await
+}
+
+async fn collect_open_output_until_exit(
+    pane: &Pane,
+    mut stream: crate::PaneOutputStream,
+    max_bytes: usize,
+) -> Result<CollectedPaneOutput> {
+    let mut collection = CollectedPaneOutput::default();
 
     if let crate::wait::PaneExitObservation::Exited(exit_state) =
         crate::wait::pane_exit_observation(pane).await?

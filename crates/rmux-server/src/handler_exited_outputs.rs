@@ -221,6 +221,7 @@ impl RetainedExitedPaneOutputs {
             .map(|(_target, retained)| retained.clone())
     }
 
+    #[cfg(test)]
     pub(in crate::handler) fn get_by_pane(
         &mut self,
         pane: &PaneOutputSubscriptionKey,
@@ -235,9 +236,18 @@ impl RetainedExitedPaneOutputs {
         pane_id: rmux_proto::PaneId,
         now: Instant,
     ) -> Option<RetainedExitedPaneOutput> {
+        self.get_entry_by_pane_id(pane_id, now)
+            .map(|(_target, retained)| retained)
+    }
+
+    pub(in crate::handler) fn get_entry_by_pane_id(
+        &mut self,
+        pane_id: rmux_proto::PaneId,
+        now: Instant,
+    ) -> Option<(PaneTarget, RetainedExitedPaneOutput)> {
         self.cleanup_expired(now);
-        self.by_pane.values().find_map(|(_target, retained)| {
-            (retained.pane.pane_id() == pane_id).then(|| retained.clone())
+        self.by_pane.values().find_map(|(target, retained)| {
+            (retained.pane.pane_id() == pane_id).then(|| (target.clone(), retained.clone()))
         })
     }
 
@@ -369,6 +379,7 @@ impl RequestHandler {
             .get(target, now)
     }
 
+    #[cfg(test)]
     pub(in crate::handler) fn retained_exited_pane_output_by_pane(
         &self,
         pane: &PaneOutputSubscriptionKey,
@@ -389,6 +400,17 @@ impl RequestHandler {
             .lock()
             .expect("retained exited output mutex must not be poisoned")
             .get_by_pane_id(pane_id, now)
+    }
+
+    pub(in crate::handler) fn retained_exited_pane_output_entry_by_id(
+        &self,
+        pane_id: rmux_proto::PaneId,
+        now: Instant,
+    ) -> Option<(PaneTarget, RetainedExitedPaneOutput)> {
+        self.retained_exited_outputs
+            .lock()
+            .expect("retained exited output mutex must not be poisoned")
+            .get_entry_by_pane_id(pane_id, now)
     }
 
     fn watch_retained_exited_pane_output(&self) {

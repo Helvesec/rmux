@@ -439,12 +439,11 @@ fn retained_lookup(
         PaneTargetRef::Slot(target) => Ok(handler
             .retained_exited_pane_output(target, now)
             .map(|retained| (target.clone(), retained))),
-        PaneTargetRef::Id {
-            session_name,
-            pane_id,
-        } => {
-            let pane_key = PaneOutputSubscriptionKey::new(session_name.clone(), *pane_id);
-            Ok(handler.retained_exited_pane_output_by_pane(&pane_key, now))
+        PaneTargetRef::Id { pane_id, .. } => {
+            // PaneId is daemon-global. A stable SDK handle may still carry
+            // the session name from before a rename or inter-session move,
+            // while retained output has already been rekeyed to the new name.
+            Ok(handler.retained_exited_pane_output_entry_by_id(*pane_id, now))
         }
     }
 }

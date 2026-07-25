@@ -629,7 +629,7 @@ async fn oldest_subscription_can_attach_to_retained_exited_pane_output() {
 }
 
 #[tokio::test]
-async fn oldest_subscription_by_id_can_attach_to_retained_exited_pane_output() {
+async fn oldest_subscription_by_id_follows_retained_output_across_a_stale_session_alias() {
     let handler = RequestHandler::new();
     let connection_id = 56;
     let session_name = SessionName::new("gone-by-id").expect("valid session name");
@@ -649,7 +649,10 @@ async fn oldest_subscription_by_id_can_attach_to_retained_exited_pane_output() {
         .handle_subscribe_pane_output_ref(
             connection_id,
             SubscribePaneOutputRefRequest {
-                target: PaneTargetRef::by_id(session_name, pane_id),
+                target: PaneTargetRef::by_id(
+                    SessionName::new("stale-gone-by-id").expect("valid stale session name"),
+                    pane_id,
+                ),
                 start: PaneOutputSubscriptionStart::Oldest,
             },
         )

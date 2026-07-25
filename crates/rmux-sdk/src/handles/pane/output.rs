@@ -101,7 +101,15 @@ impl Pane {
         start: PaneOutputStart,
     ) -> Result<PaneOutputStream> {
         let pane = self.begin_operation_handle();
-        let target = pane.required_resolved_proto_target_ref().await?;
+        let target = if start == PaneOutputStart::Oldest {
+            // The Oldest handler owns the live lookup and its retained-output
+            // fallback. Preserve the caller's slot or stable-id reference so
+            // an exited pane can be found after leaving the live inventory;
+            // its subscription response supplies the selected pane identity.
+            pane.proto_target_ref()
+        } else {
+            pane.required_resolved_proto_target_ref().await?
+        };
         crate::capabilities::require(&pane.transport, &[rmux_proto::CAPABILITY_SDK_PANE_BY_ID])
             .await?;
         match PaneOutputStream::open(pane.transport.clone(), target.clone(), start).await {

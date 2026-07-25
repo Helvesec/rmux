@@ -521,7 +521,7 @@ async fn collect_output_until_exit_starting_at_oldest_uses_requested_cursor() ->
     let listener = UnixListener::bind(socket.path())?;
     let server = tokio::spawn(async move {
         let mut peer = accept_peer(&listener).await?;
-        expect_output_subscription(&mut peer, PaneOutputSubscriptionStart::Oldest).await?;
+        expect_oldest_slot_subscription(&mut peer).await?;
         peer.write_response(Response::Error(ErrorResponse {
             error: ProtoError::InvalidTarget {
                 value: target().to_proto().to_string(),
@@ -529,7 +529,6 @@ async fn collect_output_until_exit_starting_at_oldest_uses_requested_cursor() ->
             },
         }))
         .await?;
-        expect_empty_session_probe(&mut peer).await?;
         TestResult::Ok(())
     });
 
@@ -539,6 +538,62 @@ async fn collect_output_until_exit_starting_at_oldest_uses_requested_cursor() ->
         .await?;
     assert!(collected.bytes.is_empty());
     assert_eq!(collected.exit_state, None);
+    drop(pane);
+    server.await??;
+    Ok(())
+}
+
+#[tokio::test]
+async fn collect_oldest_pins_exit_probe_to_subscribed_pane_after_slot_reuse() -> TestResult {
+    let socket = TestSocket::new("collect-oldest-slot-replacement")?;
+    let listener = UnixListener::bind(socket.path())?;
+    let server = tokio::spawn(async move {
+        let mut peer = accept_peer(&listener).await?;
+        expect_oldest_slot_subscription(&mut peer).await?;
+        let subscription_id = PaneOutputSubscriptionId::new(42);
+        peer.write_response(Response::SubscribePaneOutput(SubscribePaneOutputResponse {
+            subscription_id,
+            target: target().to_proto(),
+            pane_id: PaneId::new(1),
+            cursor: PaneOutputCursor {
+                next_sequence: 1,
+                missed_events: 0,
+            },
+        }))
+        .await?;
+
+        // %2 now occupies the original slot while subscribed %1 moved to
+        // pane 1. Exit observation must remain pinned to %1.
+        expect_mixed_stable_info_probe(&mut peer).await?;
+        expect_cursor(&mut peer, subscription_id).await?;
+        peer.write_response(Response::PaneOutputCursor(PaneOutputCursorResponse {
+            subscription_id,
+            cursor: PaneOutputCursor {
+                next_sequence: 3,
+                missed_events: 0,
+            },
+            events: vec![
+                PaneOutputEvent {
+                    sequence: 1,
+                    bytes: b"original-retained-output".to_vec(),
+                },
+                PaneOutputEvent {
+                    sequence: 2,
+                    bytes: Vec::new(),
+                },
+            ],
+            limited: false,
+        }))
+        .await?;
+        TestResult::Ok(())
+    });
+
+    let pane = pane_for(socket.path(), Duration::from_secs(1)).await?;
+    let collected = pane
+        .collect_output_until_exit_starting_at(PaneOutputStart::Oldest, 64)
+        .await?;
+    assert_eq!(collected.bytes, b"original-retained-output");
+    assert_eq!(collected.exit_state.and_then(|exit| exit.code), Some(7));
     drop(pane);
     server.await??;
     Ok(())
@@ -639,6 +694,23 @@ async fn expect_output_subscription(
         PaneTargetRef::by_id(session_name(), PaneId::new(1))
     );
     assert_eq!(request.start, expected_start);
+    Ok(())
+}
+
+async fn expect_oldest_slot_subscription(peer: &mut Peer) -> TestResult {
+    let request = peer.expect_request().await?;
+    let Request::Handshake(_) = request else {
+        panic!("oldest pane-output subscription must probe capability, got {request:?}");
+    };
+    peer.write_response(Response::Handshake(HandshakeResponse::current()))
+        .await?;
+
+    let request = peer.expect_request().await?;
+    let Request::SubscribePaneOutput(request) = request else {
+        panic!("oldest slot subscription must reach the daemon as a slot, got {request:?}");
+    };
+    assert_eq!(request.target, target().to_proto());
+    assert_eq!(request.start, PaneOutputSubscriptionStart::Oldest);
     Ok(())
 }
 
@@ -755,32 +827,6 @@ async fn expect_info_body(peer: &mut Peer, details_line: String) -> TestResult {
     expect_list_sessions(peer).await?;
     expect_list_windows(peer).await?;
     expect_list_panes(peer).await
-}
-
-async fn expect_empty_session_probe(peer: &mut Peer) -> TestResult {
-    for _ in 0..2 {
-        let request = peer.expect_request().await?;
-        let Request::ListPanes(request) = request else {
-            panic!("stale stable-id probe must list panes, got {request:?}");
-        };
-        assert_eq!(request.target, session_name());
-        assert_eq!(request.target_window_index, None);
-        peer.write_response(Response::ListPanes(ListPanesResponse {
-            output: CommandOutput::from_stdout(Vec::new()),
-        }))
-        .await?;
-
-        let request = peer.expect_request().await?;
-        let Request::ListSessions(request) = request else {
-            panic!("stale stable-id probe must list sessions, got {request:?}");
-        };
-        assert_list_sessions_request(&request);
-        peer.write_response(Response::ListSessions(ListSessionsResponse {
-            output: CommandOutput::from_stdout(Vec::new()),
-        }))
-        .await?;
-    }
-    Ok(())
 }
 
 async fn expect_list_sessions(peer: &mut Peer) -> TestResult {

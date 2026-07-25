@@ -20,8 +20,9 @@ use rmux_proto::{
     WindowTarget, CAPABILITY_HANDSHAKE,
 };
 use rmux_sdk::{
-    LayoutName, Pane, PaneCloseOutcome, PaneId, PaneRef, PaneStateEvent, PaneStateEventsOptions,
-    RmuxBuilder, RmuxError, SessionId, SessionName, TerminalLoadState, TerminalSizeSpec, WindowId,
+    LayoutName, Pane, PaneCloseOutcome, PaneId, PaneOutputStart, PaneRef, PaneStateEvent,
+    PaneStateEventsOptions, RmuxBuilder, RmuxError, SessionId, SessionName, TerminalLoadState,
+    TerminalSizeSpec, WindowId,
 };
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{UnixListener, UnixStream};
@@ -898,6 +899,44 @@ async fn stable_id_output_stream_retries_a_move_after_resolution() -> TestResult
 
     let pane = pane_by_id(socket.path()).await?;
     let output = pane.output_stream().await?;
+    drop(output);
+    drop(pane);
+    server.await??;
+    Ok(())
+}
+
+#[tokio::test]
+async fn stable_id_oldest_output_stream_uses_bound_identity_without_live_preflight() -> TestResult {
+    let socket = TestSocket::new("output-oldest-bound-id")?;
+    let listener = UnixListener::bind(socket.path())?;
+    let server = tokio::spawn(async move {
+        let mut peer = accept_peer(&listener).await?;
+        expect_initial_preferred_lookup(&mut peer).await?;
+        expect_by_id_handshake(&mut peer).await?;
+
+        let request = peer.expect_request().await?;
+        let Request::SubscribePaneOutputRef(request) = request else {
+            return Err(format!("expected bound-id oldest subscription, got {request:?}").into());
+        };
+        assert_eq!(request.target, preferred_target());
+        assert_eq!(request.start, PaneOutputSubscriptionStart::Oldest);
+        peer.write_response(Response::SubscribePaneOutput(SubscribePaneOutputResponse {
+            subscription_id: PaneOutputSubscriptionId::new(24),
+            target: PaneTarget::with_window(preferred_session(), 0, 0),
+            pane_id: pane_id(),
+            cursor: PaneOutputCursor {
+                next_sequence: 1,
+                missed_events: 0,
+            },
+        }))
+        .await?;
+        TestResult::Ok(())
+    });
+
+    let pane = pane_by_id(socket.path()).await?;
+    let output = pane
+        .output_stream_starting_at(PaneOutputStart::Oldest)
+        .await?;
     drop(output);
     drop(pane);
     server.await??;

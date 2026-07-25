@@ -76,7 +76,7 @@ use rmux_proto::{
 
 use crate::handles::session::unexpected_response;
 use crate::transport::{DropGuard, TransportClient};
-use crate::{Result, RmuxError};
+use crate::{PaneId, Result, RmuxError};
 
 const PANE_OUTPUT_BATCH_SIZE: u16 = 256;
 const POLL_INITIAL_DELAY: Duration = Duration::from_millis(2);
@@ -212,6 +212,7 @@ pub enum PaneLineItem {
 /// type.
 pub struct PaneOutputStream {
     inner: PaneSubscription,
+    pane_id: PaneId,
     pending: VecDeque<PaneOutputChunk>,
     next_sequence: u64,
     poll_delay: Duration,
@@ -268,10 +269,12 @@ impl PaneOutputStream {
             }
         };
 
-        let (subscription_id, next_sequence) = match response {
-            Response::SubscribePaneOutput(response) => {
-                (response.subscription_id, response.cursor.next_sequence)
-            }
+        let (subscription_id, pane_id, next_sequence) = match response {
+            Response::SubscribePaneOutput(response) => (
+                response.subscription_id,
+                response.pane_id,
+                response.cursor.next_sequence,
+            ),
             response => return Err(unexpected_response("subscribe-pane-output", response)),
         };
 
@@ -289,6 +292,7 @@ impl PaneOutputStream {
                 _drop_guard: drop_guard,
                 closed: false,
             },
+            pane_id,
             pending: VecDeque::new(),
             next_sequence,
             poll_delay: POLL_INITIAL_DELAY,
@@ -356,6 +360,10 @@ impl PaneOutputStream {
 
     pub(crate) const fn next_sequence(&self) -> u64 {
         self.next_sequence
+    }
+
+    pub(crate) const fn pane_id(&self) -> PaneId {
+        self.pane_id
     }
 
     async fn refill_once(&mut self) -> Result<RefillOutcome> {
