@@ -375,23 +375,12 @@ async fn assert_subscription_follows_transfer(case: TransferCase) {
         "{} moved pane cleanup should succeed: {killed:?}",
         case.label()
     );
-    let cursor_after_kill = handler
-        .handle_pane_output_cursor(
-            CONNECTION_ID,
-            PaneOutputCursorRequest {
-                subscription_id: subscribed.subscription_id,
-                max_events: Some(1),
-            },
-        )
-        .await;
-    assert!(
-        matches!(
-            cursor_after_kill,
-            Response::Error(ref error) if error.error.to_string().contains("subscription not found")
-        ),
-        "{} kill must clean the rekeyed record: {cursor_after_kill:?}",
-        case.label()
-    );
+    assert_killed_subscription_drains_then_expires(
+        &handler,
+        subscribed.subscription_id,
+        case.label(),
+    )
+    .await;
 }
 
 async fn create_session(handler: &RequestHandler, session_name: &SessionName) {
@@ -519,7 +508,47 @@ async fn assert_window_owner_transfer(
         matches!(killed, Response::KillPane(_)),
         "{label}: {killed:?}"
     );
-    let cursor_after_kill = handler
+    assert_killed_subscription_drains_then_expires(handler, subscription_id, label).await;
+}
+
+async fn assert_killed_subscription_drains_then_expires(
+    handler: &RequestHandler,
+    subscription_id: rmux_proto::PaneOutputSubscriptionId,
+    label: &str,
+) {
+    let pane = handler
+        .pane_output_subscription_key_for_test(subscription_id)
+        .expect("rekeyed subscription remains registered during pane-output drain");
+    assert!(
+        handler
+            .subscriptions
+            .lock()
+            .expect("subscription registry mutex must not be poisoned")
+            .pane_is_draining(&pane),
+        "{label} kill must start the rekeyed subscription drain"
+    );
+
+    let cursor_during_drain = handler
+        .handle_pane_output_cursor(
+            CONNECTION_ID,
+            PaneOutputCursorRequest {
+                subscription_id,
+                max_events: Some(1),
+            },
+        )
+        .await;
+    assert!(
+        matches!(cursor_during_drain, Response::PaneOutputCursor(_)),
+        "{label} rekeyed subscription must remain readable during pane-output drain: {cursor_during_drain:?}"
+    );
+
+    handler
+        .subscriptions
+        .lock()
+        .expect("subscription registry mutex must not be poisoned")
+        .expire_pane_drain(&pane, std::time::Instant::now());
+
+    let cursor_after_expiration = handler
         .handle_pane_output_cursor(
             CONNECTION_ID,
             PaneOutputCursorRequest {
@@ -530,10 +559,10 @@ async fn assert_window_owner_transfer(
         .await;
     assert!(
         matches!(
-            cursor_after_kill,
+            cursor_after_expiration,
             Response::Error(ref error) if error.error.to_string().contains("subscription not found")
         ),
-        "{label} kill cleans the rekeyed record: {cursor_after_kill:?}"
+        "{label} drain expiration must clean the rekeyed record: {cursor_after_expiration:?}"
     );
 }
 

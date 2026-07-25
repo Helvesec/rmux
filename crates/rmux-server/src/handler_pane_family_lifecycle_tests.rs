@@ -428,6 +428,29 @@ async fn pane_id_runtime_owner_alias_removal_rekeys_live_output_subscription() {
         matches!(removed_runtime, Response::KillPane(_)),
         "{removed_runtime:?}"
     );
+    let cursor_during_drain = handler
+        .handle_pane_output_cursor(
+            connection_id,
+            PaneOutputCursorRequest {
+                subscription_id: subscribed.subscription_id,
+                max_events: Some(8),
+            },
+        )
+        .await;
+    assert!(
+        matches!(cursor_during_drain, Response::PaneOutputCursor(_)),
+        "subscription must remain readable during pane-output drain: {cursor_during_drain:?}"
+    );
+
+    let draining_key = handler
+        .pane_output_subscription_key_for_test(subscribed.subscription_id)
+        .expect("rekeyed subscription remains registered during pane-output drain");
+    handler
+        .subscriptions
+        .lock()
+        .expect("subscription registry mutex must not be poisoned")
+        .expire_pane_drain(&draining_key, std::time::Instant::now());
+
     let closed_cursor = handler
         .handle_pane_output_cursor(
             connection_id,
@@ -438,8 +461,11 @@ async fn pane_id_runtime_owner_alias_removal_rekeys_live_output_subscription() {
         )
         .await;
     assert!(
-        matches!(closed_cursor, Response::Error(_)),
-        "{closed_cursor:?}"
+        matches!(
+            closed_cursor,
+            Response::Error(ref error) if error.error.to_string().contains("subscription not found")
+        ),
+        "expired pane-output drain must remove the subscription: {closed_cursor:?}"
     );
 }
 
