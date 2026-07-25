@@ -1,6 +1,5 @@
 use rmux_core::events::{
-    OutputSubscriptionRecord, PaneOutputSubscriptionKey, SubscriptionLimitError,
-    DEFAULT_SUBSCRIPTION_BATCH_EVENTS,
+    OutputSubscriptionRecord, PaneOutputSubscriptionKey, DEFAULT_SUBSCRIPTION_BATCH_EVENTS,
 };
 use rmux_proto::{
     ErrorResponse, PaneOutputSubscriptionId, PaneStreamCursorResponse, PaneStreamEndReason,
@@ -8,7 +7,9 @@ use rmux_proto::{
     DEFAULT_MAX_DETACHED_FRAME_LENGTH,
 };
 
-use super::super::subscription_support::OutputSubscriptionState;
+use super::super::subscription_support::{
+    OutputSubscriptionAdmissionError, OutputSubscriptionState,
+};
 use super::{PaneStreamSource, PaneStreamSubscription};
 
 const PANE_STREAM_RESPONSE_RESERVE: usize = 64 * 1024;
@@ -155,13 +156,22 @@ pub(super) fn reserved_stream_lost_response() -> Response {
     })
 }
 
-pub(super) fn stream_subscription_limit_error(error: SubscriptionLimitError) -> RmuxError {
+pub(super) fn stream_subscription_limit_error(
+    error: OutputSubscriptionAdmissionError,
+) -> RmuxError {
     match error {
-        SubscriptionLimitError::PerConnection { limit } => RmuxError::Server(format!(
+        OutputSubscriptionAdmissionError::Configured(
+            rmux_core::events::SubscriptionLimitError::PerConnection { limit },
+        ) => RmuxError::Server(format!(
             "pane stream subscription limit exceeded for connection (limit {limit})"
         )),
-        SubscriptionLimitError::PerPane { limit } => RmuxError::Server(format!(
+        OutputSubscriptionAdmissionError::Configured(
+            rmux_core::events::SubscriptionLimitError::PerPane { limit },
+        ) => RmuxError::Server(format!(
             "pane stream subscription limit exceeded for pane (limit {limit})"
+        )),
+        OutputSubscriptionAdmissionError::Global { limit } => RmuxError::Server(format!(
+            "pane stream global subscription limit exceeded (limit {limit})"
         )),
     }
 }

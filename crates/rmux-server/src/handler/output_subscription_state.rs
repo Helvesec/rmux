@@ -3,7 +3,10 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use rmux_core::{
-    events::{PaneOutputSubscriptionKey, SubscriptionLimits, SubscriptionRegistry},
+    events::{
+        OutputSubscriptionRecord, PaneOutputSubscriptionKey, SubscriptionLimitError,
+        SubscriptionLimits, SubscriptionRegistry,
+    },
     PaneId,
 };
 use rmux_proto::{
@@ -13,10 +16,24 @@ use tokio::sync::watch;
 
 use crate::pane_io::PaneOutputReceiver;
 
+#[path = "ended_pane_streams.rs"]
+mod ended_pane_streams;
+use ended_pane_streams::EndedPaneStreams;
+
 use super::super::pane_stream_support::{
     CachedRawRebase, EndedPaneStream, PaneStreamSource, PaneStreamSubscription,
     PendingSurfaceRefresh, SurfaceDriver,
 };
+
+// Raw pane output and typed pane streams share this registry and therefore one atomic budget.
+// End tombstones use the same ceiling so every simultaneously admitted stream can terminate.
+const MAX_OUTPUT_SUBSCRIPTIONS_GLOBAL: usize = 4_096;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(in crate::handler) enum OutputSubscriptionAdmissionError {
+    Configured(SubscriptionLimitError),
+    Global { limit: usize },
+}
 
 pub(in crate::handler) enum SurfaceDriverRoute {
     Ready,
@@ -39,7 +56,7 @@ pub(crate) struct OutputSubscriptionState {
     pub(in crate::handler) registry: SubscriptionRegistry,
     pub(in crate::handler) receivers: HashMap<PaneOutputSubscriptionId, PaneOutputReceiver>,
     pub(in crate::handler) streams: HashMap<PaneOutputSubscriptionId, PaneStreamSubscription>,
-    pub(in crate::handler) ended_streams: HashMap<PaneOutputSubscriptionId, EndedPaneStream>,
+    pub(in crate::handler) ended_streams: EndedPaneStreams,
     pub(in crate::handler) surface_drivers: HashMap<PaneOutputSubscriptionKey, SurfaceDriver>,
     pub(in crate::handler) raw_rebases: HashMap<PaneOutputSubscriptionKey, Arc<CachedRawRebase>>,
     surface_initializations: HashMap<PaneOutputSubscriptionKey, PaneStreamInitialization>,
@@ -80,7 +97,7 @@ impl OutputSubscriptionState {
             registry: SubscriptionRegistry::new(limits),
             receivers: HashMap::new(),
             streams: HashMap::new(),
-            ended_streams: HashMap::new(),
+            ended_streams: EndedPaneStreams::new(limits.max_per_connection()),
             surface_drivers: HashMap::new(),
             raw_rebases: HashMap::new(),
             surface_initializations: HashMap::new(),
@@ -96,10 +113,26 @@ impl OutputSubscriptionState {
         self.registry.limits()
     }
 
+    pub(in crate::handler) fn subscribe(
+        &mut self,
+        connection_id: u64,
+        pane: PaneOutputSubscriptionKey,
+        now: Instant,
+    ) -> Result<OutputSubscriptionRecord, OutputSubscriptionAdmissionError> {
+        self.cleanup_stale(now);
+        if self.registry.len() >= MAX_OUTPUT_SUBSCRIPTIONS_GLOBAL {
+            return Err(OutputSubscriptionAdmissionError::Global {
+                limit: MAX_OUTPUT_SUBSCRIPTIONS_GLOBAL,
+            });
+        }
+        self.registry
+            .subscribe(connection_id, pane, now)
+            .map_err(OutputSubscriptionAdmissionError::Configured)
+    }
+
     pub(in crate::handler) fn cleanup_stale(&mut self, now: Instant) {
         let tombstone_ttl = self.limits().stale_ttl();
-        self.ended_streams
-            .retain(|_, ended| now.saturating_duration_since(ended.ended_at) < tombstone_ttl);
+        self.ended_streams.cleanup_stale(now, tombstone_ttl);
         for record in self.registry.cleanup_stale(now) {
             if self.streams.remove(&record.id()).is_some() {
                 self.ended_streams.insert(
@@ -125,8 +158,7 @@ impl OutputSubscriptionState {
             self.discard_stream_cache_if_unused(record.pane());
             self.discard_drain_if_unused(record.pane());
         }
-        self.ended_streams
-            .retain(|_, ended| ended.connection_id != connection_id);
+        self.ended_streams.remove_connection(connection_id);
     }
 
     pub(super) fn remove_pane(&mut self, pane: &PaneOutputSubscriptionKey) -> bool {
@@ -603,5 +635,31 @@ mod tests {
         assert!(*waiter.borrow());
         assert!(!state.surface_initializations.contains_key(&previous));
         assert!(!state.surface_initializations.contains_key(&current));
+    }
+
+    #[test]
+    fn global_admission_accepts_the_limit_and_rejects_the_next_subscription() {
+        let limits = SubscriptionLimits::new(
+            MAX_OUTPUT_SUBSCRIPTIONS_GLOBAL + 1,
+            MAX_OUTPUT_SUBSCRIPTIONS_GLOBAL + 1,
+            16,
+            Duration::from_secs(60),
+        );
+        let mut state = OutputSubscriptionState::new(limits);
+        let pane = pane();
+        let now = Instant::now();
+        for connection_id in 1..=MAX_OUTPUT_SUBSCRIPTIONS_GLOBAL as u64 {
+            state
+                .subscribe(connection_id, pane.clone(), now)
+                .expect("subscription within the global limit");
+        }
+
+        assert_eq!(state.registry.len(), MAX_OUTPUT_SUBSCRIPTIONS_GLOBAL);
+        assert_eq!(
+            state.subscribe(MAX_OUTPUT_SUBSCRIPTIONS_GLOBAL as u64 + 1, pane, now),
+            Err(OutputSubscriptionAdmissionError::Global {
+                limit: MAX_OUTPUT_SUBSCRIPTIONS_GLOBAL,
+            })
+        );
     }
 }

@@ -213,12 +213,8 @@ impl RequestHandler {
                 .subscriptions
                 .lock()
                 .expect("subscription registry mutex must not be poisoned");
-            subscriptions.cleanup_stale(now);
             let subscription_id =
-                match subscriptions
-                    .registry
-                    .subscribe(connection_id, source.key.clone(), now)
-                {
+                match subscriptions.subscribe(connection_id, source.key.clone(), now) {
                     Ok(record) => record.id(),
                     Err(error) => {
                         return Response::Error(ErrorResponse {

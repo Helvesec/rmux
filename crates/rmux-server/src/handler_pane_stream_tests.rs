@@ -1,5 +1,5 @@
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use rmux_core::events::SubscriptionLimits;
 use rmux_proto::{
@@ -1725,6 +1725,47 @@ async fn stale_stream_finishes_with_subscription_expired() {
         vec![PaneStreamEvent::End(
             PaneStreamEndReason::SubscriptionExpired
         )]
+    );
+}
+
+#[tokio::test]
+async fn configured_connection_limit_preserves_every_grouped_stream_end() {
+    const CONFIGURED_LIMIT: usize = 65;
+    let handler = RequestHandler::with_owner_uid_and_subscription_limits(
+        crate::server_access::current_owner_uid(),
+        SubscriptionLimits::new(
+            CONFIGURED_LIMIT,
+            CONFIGURED_LIMIT,
+            32,
+            Duration::from_secs(60),
+        ),
+    );
+    let (target, _, _) = test_pane(&handler).await;
+    let mut subscription_ids = Vec::with_capacity(CONFIGURED_LIMIT);
+    for _ in 0..CONFIGURED_LIMIT {
+        subscription_ids.push(
+            subscribe(&handler, &target, PaneStreamMode::Raw)
+                .await
+                .subscription_id,
+        );
+    }
+    let key = handler
+        .pane_output_subscription_key_for_test(subscription_ids[0])
+        .expect("first stream key");
+    handler
+        .subscriptions
+        .lock()
+        .expect("subscription lock")
+        .end_pane_streams(
+            &key,
+            PaneStreamMode::Raw,
+            PaneStreamEndReason::PaneRemoved,
+            Instant::now(),
+        );
+
+    assert_eq!(
+        cursor(&handler, subscription_ids[0]).await,
+        vec![PaneStreamEvent::End(PaneStreamEndReason::PaneRemoved)]
     );
 }
 

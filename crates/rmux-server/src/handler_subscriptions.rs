@@ -22,7 +22,7 @@ use super::{PaneOutputSubscriptionReconciliation, RequestHandler};
 mod output_subscription_state;
 pub(crate) use output_subscription_state::OutputSubscriptionState;
 pub(in crate::handler) use output_subscription_state::{
-    RawInitializationRoute, SurfaceDriverRoute,
+    OutputSubscriptionAdmissionError, RawInitializationRoute, SurfaceDriverRoute,
 };
 
 // Keep lag diagnostics well below the detached RPC frame cap after bincode
@@ -147,11 +147,7 @@ impl RequestHandler {
             .subscriptions
             .lock()
             .expect("subscription registry mutex must not be poisoned");
-        subscriptions.cleanup_stale(now);
-        let record = match subscriptions
-            .registry
-            .subscribe(connection_id, pane_key.clone(), now)
-        {
+        let record = match subscriptions.subscribe(connection_id, pane_key.clone(), now) {
             Ok(record) => record,
             Err(error) => {
                 return Response::Error(ErrorResponse {
@@ -528,8 +524,17 @@ fn lag_dto(gap: &OutputGap) -> PaneOutputLagNotice {
     }
 }
 
-pub(in crate::handler) fn subscription_limit_error(error: SubscriptionLimitError) -> RmuxError {
-    subscription_limit_error_for("pane output", error)
+pub(in crate::handler) fn subscription_limit_error(
+    error: OutputSubscriptionAdmissionError,
+) -> RmuxError {
+    match error {
+        OutputSubscriptionAdmissionError::Configured(error) => {
+            subscription_limit_error_for("pane output", error)
+        }
+        OutputSubscriptionAdmissionError::Global { limit } => RmuxError::Server(format!(
+            "pane output global subscription limit exceeded (limit {limit})"
+        )),
+    }
 }
 
 pub(in crate::handler) fn pane_state_subscription_limit_error(
