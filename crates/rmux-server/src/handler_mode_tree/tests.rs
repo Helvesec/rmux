@@ -122,3 +122,6 @@ mod client_identity;
 
 #[path = "tests/deferred_confirmation.rs"]
 mod deferred_confirmation;
+
+#[path = "tests/switch_geometry.rs"]
+mod switch_geometry;
