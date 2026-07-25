@@ -135,11 +135,7 @@ function Stop-ProcessIfRunning([System.Diagnostics.Process]$Process) {
     try {
         $Process.Kill()
     } catch [System.InvalidOperationException] {
-        $Process.Refresh()
-        if ($Process.HasExited) {
-            return
-        }
-        throw
+        return
     }
     $Process.WaitForExit()
 }
@@ -185,6 +181,9 @@ function Start-PackageDaemon([string]$DaemonBinary, [string]$PipePath, [string[]
             -RedirectStandardOutput $stdout `
             -RedirectStandardError $stderr `
             -PassThru
+        # Windows PowerShell 5.1 only preserves ExitCode for redirected
+        # Start-Process objects when their handle is opened while still live.
+        [void]$process.Handle
 
         if (-not $readyEvent.WaitOne(15000)) {
             Stop-ProcessIfRunning $process

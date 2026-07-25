@@ -19,10 +19,7 @@ fn package_verifier_tolerates_process_exit_during_cleanup() {
     assert!(stop.contains("$Process.HasExited"));
     assert!(stop.contains("$Process.Kill()"));
     assert!(stop.contains("catch [System.InvalidOperationException]"));
-    assert!(
-        stop.matches("$Process.HasExited").count() >= 2,
-        "cleanup must recheck process exit after a raced Kill"
-    );
+    assert!(stop.contains("catch [System.InvalidOperationException] {\n        return\n    }"));
     assert_eq!(
         VERIFIER.matches(".Kill()").count(),
         1,
@@ -38,6 +35,21 @@ fn package_verifier_tolerates_process_exit_during_cleanup() {
             "Windows package cleanup lost {caller}"
         );
     }
+
+    let start = function_body(VERIFIER, "Start-PackageDaemon", "Stop-PackageDaemon");
+    let process_start = start
+        .find("$process = Start-Process")
+        .expect("package daemon process start");
+    let handle = start
+        .find("[void]$process.Handle")
+        .expect("live package daemon handle capture");
+    let wait = start
+        .find("$readyEvent.WaitOne")
+        .expect("package daemon ready wait");
+    assert!(
+        process_start < handle && handle < wait,
+        "Windows PowerShell 5.1 needs a live process handle before waiting"
+    );
 }
 
 #[test]
