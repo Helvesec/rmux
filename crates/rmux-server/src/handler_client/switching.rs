@@ -1070,14 +1070,15 @@ impl RequestHandler {
                     .await
                 {
                     Ok(AttachedSwitchCommitOutcome {
-                        previous_session_name: _previous_session_name,
+                        previous_session_id,
                         committed_target,
                     }) => {
                         record_switch_client_committed_target(client, committed_target);
-                        self.emit_client_session_changed(
+                        self.finish_attached_session_switch(
                             attach_pid,
                             session_name.clone(),
                             session_id,
+                            previous_session_id,
                         )
                         .await;
                         Response::SwitchClient(SwitchClientResponse { session_name })

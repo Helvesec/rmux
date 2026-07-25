@@ -296,28 +296,34 @@ impl RequestHandler {
         // The default choose-tree action is `switch-client -Zt`. Commit it
         // through the same atomic path so target selection, client-size
         // reconciliation, PTY rollback, and attach identity move together.
-        self.commit_attached_session_switch(
-            attach_pid,
-            expected_attach_id,
-            AttachedSwitchCommitRequest {
-                expected_current_session_id: None,
-                session_name: session_name.clone(),
-                session_id,
-                target_selection,
-                terminal_context,
-                client_geometry: TerminalGeometry {
-                    size: client_size,
-                    pixels: client_pixels,
+        let outcome = self
+            .commit_attached_session_switch(
+                attach_pid,
+                expected_attach_id,
+                AttachedSwitchCommitRequest {
+                    expected_current_session_id: None,
+                    session_name: session_name.clone(),
+                    session_id,
+                    target_selection,
+                    terminal_context,
+                    client_geometry: TerminalGeometry {
+                        size: client_size,
+                        pixels: client_pixels,
+                    },
+                    client_flags,
+                    render_stream,
+                    attached_count,
+                    client_environment: None,
                 },
-                client_flags,
-                render_stream,
-                attached_count,
-                client_environment: None,
-            },
+            )
+            .await?;
+        self.finish_attached_session_switch(
+            attach_pid,
+            session_name.clone(),
+            session_id,
+            outcome.previous_session_id,
         )
-        .await?;
-        self.emit_client_session_changed(attach_pid, session_name.clone(), session_id)
-            .await;
+        .await;
         for refresh in refresh_sessions {
             self.refresh_attached_session(&refresh).await;
         }

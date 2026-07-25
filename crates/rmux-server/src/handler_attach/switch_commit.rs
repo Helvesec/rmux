@@ -39,7 +39,10 @@ pub(in crate::handler) struct AttachedSwitchCommittedTarget {
 }
 
 pub(in crate::handler) struct AttachedSwitchCommitOutcome {
-    pub(in crate::handler) previous_session_name: SessionName,
+    /// The session the client was attached to before the switch. Kept as a
+    /// stable identity because the source session can be renamed or destroyed
+    /// while the post-switch notifications are published.
+    pub(in crate::handler) previous_session_id: SessionId,
     pub(in crate::handler) committed_target: AttachedSwitchCommittedTarget,
 }
 
@@ -398,7 +401,7 @@ impl RequestHandler {
                 .by_pid
                 .get_mut(&attach_pid)
                 .expect("committed attached identity remains present");
-            let previous_session_name = active.session_name.clone();
+            let previous_session_id = active.session_id;
             let switches_session_identity = active.session_name != request.session_name
                 || active.session_id != request.session_id;
             if switches_session_identity {
@@ -444,7 +447,7 @@ impl RequestHandler {
                 .await;
             }
             return Ok(AttachedSwitchCommitOutcome {
-                previous_session_name,
+                previous_session_id,
                 committed_target,
             });
         }
@@ -453,6 +456,34 @@ impl RequestHandler {
             "session {} active window changed during attached-size selection",
             request.session_name
         )))
+    }
+
+    /// Publishes what tmux publishes once an attached `switch-client` has
+    /// committed.
+    ///
+    /// tmux 3.7b, measured 2026-07-25 (source session with a 101x41 PTY client
+    /// and a 60x20 control client, `window-size largest`): after the PTY client
+    /// switches away, the control client that stayed on the source session
+    /// receives
+    ///     %client-session-changed /dev/ttys007 $1 target
+    ///     %layout-change @0 a1dd,60x20,0,0,0 a1dd,60x20,0,0,0 *
+    /// in that order, and the source window really does shrink to the surviving
+    /// client's geometry. The session-changed notification is therefore
+    /// published first, and only then is the source session reconciled.
+    pub(in crate::handler) async fn finish_attached_session_switch(
+        &self,
+        attach_pid: u32,
+        session_name: SessionName,
+        session_id: SessionId,
+        previous_session_id: SessionId,
+    ) {
+        self.emit_client_session_changed(attach_pid, session_name, session_id)
+            .await;
+        if previous_session_id != session_id {
+            let _ = self
+                .reconcile_attached_session_identity_size_and_emit(previous_session_id)
+                .await;
+        }
     }
 }
 

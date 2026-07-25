@@ -378,6 +378,86 @@ async fn switching_control_client_notifies_the_source_session_layout_change_like
 }
 
 #[tokio::test]
+async fn switching_attached_client_notifies_the_source_session_layout_change_like_tmux37() {
+    // Frozen tmux 3.7b oracle, measured 2026-07-25 on a source session holding
+    // a 101x41 PTY-attached client and a 60x20 control client, `window-size
+    // largest`. After the PTY client runs `switch-client -t target` the source
+    // window really shrinks to 60x20 and the surviving control client receives,
+    // in this order:
+    //     %client-session-changed /dev/ttys007 $1 target
+    //     %layout-change @0 a1dd,60x20,0,0,0 a1dd,60x20,0,0,0 *
+    let handler = RequestHandler::new();
+    let source = session_name("attach-switch-notify-source");
+    let target = session_name("attach-switch-notify-target");
+    create_session(&handler, source.clone(), INITIAL_SIZE).await;
+    create_session(&handler, target.clone(), TARGET_SIZE).await;
+    set_window_size_policy(&handler, &source, "largest").await;
+    set_window_size_policy(&handler, &target, "largest").await;
+
+    let switching_pid = std::process::id();
+    let surviving_pid = switching_pid.saturating_add(1);
+    let switching_size = TerminalSize {
+        cols: 101,
+        rows: 41,
+    };
+    let surviving_size = TerminalSize { cols: 60, rows: 20 };
+    let (_attach_id, _attach_events) =
+        register_attached_client(&handler, switching_pid, &source, switching_size).await;
+    let (_surviving_id, mut surviving_events) =
+        register_control_client_with_id(&handler, surviving_pid, &source).await;
+    let response = handler
+        .handle(Request::RefreshClient(Box::new(
+            refresh_client_size_request(surviving_pid, surviving_size),
+        )))
+        .await;
+    assert!(
+        matches!(response, Response::RefreshClient(_)),
+        "{response:?}"
+    );
+    assert_eq!(session_size(&handler, &source).await, switching_size);
+    let source_window_id = active_window_id(&handler, &source).await;
+    let source_layout_prefix = format!("%layout-change @{source_window_id} ");
+    settle_control_notifications(&mut surviving_events).await;
+
+    let response = handler
+        .handle(Request::SwitchClient(SwitchClientRequest {
+            target: target.clone(),
+        }))
+        .await;
+
+    assert!(
+        matches!(response, Response::SwitchClient(_)),
+        "{response:?}"
+    );
+    assert_eq!(
+        session_size(&handler, &source).await,
+        surviving_size,
+        "the source session must fall back to its surviving control client's geometry"
+    );
+
+    let lines =
+        collect_control_notifications_through(&mut surviving_events, &source_layout_prefix).await;
+    let layout_index = lines
+        .iter()
+        .position(|line| line.starts_with(&source_layout_prefix))
+        .expect("the surviving control client must be told the source window shrank");
+    assert_eq!(
+        layout_change_geometry(&lines[layout_index]).as_deref(),
+        Some("60x20"),
+        "{:?}",
+        lines[layout_index]
+    );
+    let session_changed_index = lines
+        .iter()
+        .position(|line| line.starts_with("%client-session-changed "))
+        .expect("the surviving control client must be told the other client moved away");
+    assert!(
+        session_changed_index < layout_index,
+        "tmux 3.7b reports the client move before the layout it causes: {lines:?}"
+    );
+}
+
+#[tokio::test]
 async fn destroyed_control_session_rehome_reconciles_target_geometry_like_tmux37() {
     let handler = RequestHandler::new();
     let target = session_name("control-destroy-rehome-target");
@@ -793,6 +873,30 @@ async fn wait_for_control_notification(
         }
     }
     None
+}
+
+/// Collects the notifications in delivery order up to and including the first
+/// line starting with `prefix`, so a test can assert on their relative order.
+async fn collect_control_notifications_through(
+    events: &mut mpsc::Receiver<ControlServerEvent>,
+    prefix: &str,
+) -> Vec<String> {
+    let deadline = tokio::time::Instant::now() + CONTROL_NOTIFICATION_TIMEOUT;
+    let mut lines = Vec::new();
+    while tokio::time::Instant::now() < deadline {
+        match tokio::time::timeout(CONTROL_NOTIFICATION_POLL, events.recv()).await {
+            Ok(Some(ControlServerEvent::Notification(line))) => {
+                let matched = line.starts_with(prefix);
+                lines.push(line);
+                if matched {
+                    return lines;
+                }
+            }
+            Ok(Some(_)) | Err(_) => continue,
+            Ok(None) => break,
+        }
+    }
+    lines
 }
 
 /// Collects everything the client receives until its stream stays quiet for
