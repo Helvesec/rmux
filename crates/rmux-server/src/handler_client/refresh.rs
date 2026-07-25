@@ -220,16 +220,12 @@ impl RequestHandler {
                 let mut state = self.state.lock().await;
                 let active_attach = self.active_attach.lock().await;
                 let mut active_control = self.active_control.lock().await;
-                let Some(active) = active_control
-                    .by_pid
-                    .get_mut(&control_pid)
-                    .filter(|active| {
-                        active.id == identity.control_id()
-                            && !active.closing.load(std::sync::atomic::Ordering::SeqCst)
-                            && active.session_name.as_ref() == Some(session_name)
-                            && active.session_id == Some(session_id)
-                    })
-                else {
+                let Some(_) = active_control.by_pid.get(&control_pid).filter(|active| {
+                    active.id == identity.control_id()
+                        && !active.closing.load(std::sync::atomic::Ordering::SeqCst)
+                        && active.session_name.as_ref() == Some(session_name)
+                        && active.session_id == Some(session_id)
+                }) else {
                     return Response::Error(ErrorResponse {
                         error: attached_client_required("refresh-client"),
                     });
@@ -237,11 +233,17 @@ impl RequestHandler {
                 match super::super::attach_support::resize_control_session_for_client(
                     &mut state,
                     &active_attach,
+                    &active_control,
+                    control_pid,
                     session_name,
                     session_id,
                     size,
                 ) {
                     Ok(target) => {
+                        let active = active_control
+                            .by_pid
+                            .get_mut(&control_pid)
+                            .expect("validated control client remains locked");
                         active.client_width = size.cols;
                         active.client_height = size.rows;
                         target

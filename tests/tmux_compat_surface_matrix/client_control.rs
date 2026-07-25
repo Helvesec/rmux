@@ -721,6 +721,129 @@ fn tmux_compat_control_geometry_survives_policy_switches_when_frozen_tmux_is_ava
 }
 
 #[test]
+fn tmux_compat_control_geometry_includes_every_control_client_when_frozen_tmux_is_available(
+) -> Result<(), Box<dyn Error>> {
+    let harness = TmuxCompatHarness::new("tmux-compat-control-geometry-multi-client")?;
+    let Some(tmux_binary) = frozen_tmux_or_skip(&harness)? else {
+        return Ok(());
+    };
+    let _guard = pty_tmux_compat_lock();
+
+    // Frozen tmux 3.7b oracle, measured 2026-07-25. Status is disabled so
+    // client rows and window rows have the same geometry accounting.
+    assert_multi_control_geometry(
+        &harness,
+        &tmux_binary,
+        "largest",
+        "100x40",
+        "60x20",
+        "100x40",
+    )?;
+    assert_multi_control_geometry(
+        &harness,
+        &tmux_binary,
+        "smallest",
+        "60x20",
+        "100x40",
+        "60x20",
+    )?;
+
+    Ok(())
+}
+
+fn assert_multi_control_geometry(
+    harness: &TmuxCompatHarness,
+    tmux_binary: &Path,
+    policy: &str,
+    first_size: &str,
+    second_size: &str,
+    expected_window_size: &str,
+) -> Result<(), Box<dyn Error>> {
+    let config = tmux_compat_config().with_timeout(Duration::from_secs(10));
+    for argv in [
+        ["new-session", "-d", "-s", policy].as_slice(),
+        ["set-option", "-t", policy, "status", "off"].as_slice(),
+        ["set-option", "-w", "-t", policy, "window-size", policy].as_slice(),
+    ] {
+        let run = harness.run_pair_with(tmux_binary, argv, config.clone())?;
+        assert_eq!(
+            run.rmux.status_code,
+            Some(0),
+            "rmux setup failed for {argv:?}: timed_out={} stderr={:?}",
+            run.rmux.timed_out,
+            run.rmux.stderr_string()
+        );
+        assert_quiet_success(&run);
+    }
+
+    let mut tmux_first =
+        LiveControlClient::spawn(tmux_control_mode_command(harness, tmux_binary, &[], &[])?)?;
+    let mut rmux_first = LiveControlClient::spawn(rmux_control_mode_command(harness, &[], &[])?)?;
+    let mut tmux_second =
+        LiveControlClient::spawn(tmux_control_mode_command(harness, tmux_binary, &[], &[])?)?;
+    let mut rmux_second = LiveControlClient::spawn(rmux_control_mode_command(harness, &[], &[])?)?;
+
+    let first_commands = format!("attach-session -t {policy}\nrefresh-client -C {first_size}\n");
+    let second_commands = format!("attach-session -t {policy}\nrefresh-client -C {second_size}\n");
+    tmux_first.send(&first_commands)?;
+    rmux_first.send(&first_commands)?;
+    tmux_second.send(&second_commands)?;
+    rmux_second.send(&second_commands)?;
+
+    let expected_widths = {
+        let width = |size: &str| {
+            size.split_once('x')
+                .expect("control geometry uses WIDTHxHEIGHT")
+                .0
+                .to_owned()
+        };
+        let mut widths = vec![width(first_size), width(second_size)];
+        widths.sort();
+        widths
+    };
+    let _clients = wait_for_pair_run(
+        harness,
+        tmux_binary,
+        &["list-clients", "-t", policy, "-F", "#{client_width}"],
+        config.clone(),
+        Duration::from_secs(5),
+        |run| {
+            let sorted_widths = |output: String| {
+                let mut widths = output.lines().map(ToOwned::to_owned).collect::<Vec<_>>();
+                widths.sort();
+                widths
+            };
+            sorted_widths(run.tmux.stdout_string()) == expected_widths
+                && sorted_widths(run.rmux.stdout_string()) == expected_widths
+        },
+    )?;
+
+    let dimensions = harness.run_pair_with(
+        tmux_binary,
+        &[
+            "display-message",
+            "-p",
+            "-t",
+            policy,
+            "#{window_width}x#{window_height}",
+        ],
+        config,
+    )?;
+    assert_success_without_stderr(&dimensions);
+    assert_eq!(dimensions.rmux.stdout, dimensions.tmux.stdout);
+    assert_eq!(
+        dimensions.tmux.stdout_string(),
+        format!("{expected_window_size}\n")
+    );
+
+    tmux_first.assert_running("tmux first")?;
+    rmux_first.assert_running("rmux first")?;
+    tmux_second.assert_running("tmux second")?;
+    rmux_second.assert_running("rmux second")?;
+    Ok(())
+}
+
+#[test]
 fn tmux_compat_attached_client_top_level_terminal_runtime_overrides_when_frozen_tmux_is_available(
 ) -> Result<(), Box<dyn Error>> {
     let harness = TmuxCompatHarness::new("tmux-compat-client-runtime-top-level-attach")?;

@@ -54,6 +54,8 @@ pub(in crate::handler) const ATTACHED_SIZE_RECONCILE_ATTEMPTS: usize = 4;
 pub(in crate::handler) fn resize_control_session_for_client(
     state: &mut crate::pane_terminals::HandlerState,
     active_attach: &super::ActiveAttachState,
+    active_control: &super::super::ActiveControlState,
+    control_pid: u32,
     session_name: &SessionName,
     expected_session_id: SessionId,
     client_size: TerminalSize,
@@ -77,13 +79,22 @@ pub(in crate::handler) fn resize_control_session_for_client(
         ) == Some("on");
         let linked_sessions =
             linked_session_identities(state, session_name, window_index, aggressive_resize);
+        let mut candidates =
+            attached_size_candidates(active_attach, &linked_sessions, Some(client_size));
+        if matches!(
+            policy,
+            AttachedWindowSizePolicy::Largest | AttachedWindowSizePolicy::Smallest
+        ) {
+            candidates.extend(control_size_candidates(
+                active_control,
+                &linked_sessions,
+                control_pid,
+            ));
+        }
         (
             window_index,
             session.window().size(),
-            selected_attached_size(
-                policy,
-                &attached_size_candidates(active_attach, &linked_sessions, Some(client_size)),
-            ),
+            selected_attached_size(policy, &candidates),
         )
     };
     let Some(selected_size) = selected_size else {
@@ -105,6 +116,38 @@ pub(in crate::handler) fn resize_control_session_for_client(
         session_name.clone(),
         window_index,
     )))
+}
+
+fn control_size_candidates<'a>(
+    active_control: &'a super::super::ActiveControlState,
+    linked_sessions: &'a HashSet<(SessionName, SessionId)>,
+    current_pid: u32,
+) -> impl Iterator<Item = AttachedSizeCandidate> + 'a {
+    active_control
+        .by_pid
+        .iter()
+        .filter(move |(pid, active)| {
+            **pid != current_pid
+                && !active.closing.load(Ordering::Acquire)
+                && active
+                    .session_name
+                    .as_ref()
+                    .zip(active.session_id)
+                    .is_some_and(|(session_name, session_id)| {
+                        linked_sessions.iter().any(|(linked_name, linked_id)| {
+                            linked_name == session_name && *linked_id == session_id
+                        })
+                    })
+        })
+        .map(|(_, active)| AttachedSizeCandidate {
+            size: TerminalSize {
+                cols: active.client_width,
+                rows: active.client_height,
+            },
+            // Largest/smallest ignore ordering. Latest intentionally uses only
+            // the reporting control client as tmux's newest size candidate.
+            sequence: 0,
+        })
 }
 
 impl RequestHandler {

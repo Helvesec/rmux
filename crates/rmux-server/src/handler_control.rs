@@ -1238,6 +1238,8 @@ impl RequestHandler {
                     resize_control_session_for_client(
                         &mut state,
                         &active_attach,
+                        &active_control,
+                        requester_pid,
                         session_name,
                         session_id,
                         control_size,

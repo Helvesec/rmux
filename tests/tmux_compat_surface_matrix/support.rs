@@ -871,7 +871,7 @@ pub(super) fn run_rmux_control_mode_staged(
     run_control_mode_client_staged(command, stages)
 }
 
-fn rmux_control_mode_command(
+pub(super) fn rmux_control_mode_command(
     harness: &TmuxCompatHarness,
     top_level_args: &[&str],
     environment: &[(&str, &str)],
@@ -924,7 +924,7 @@ pub(super) fn run_tmux_control_mode_staged(
     run_control_mode_client_staged(command, stages)
 }
 
-fn tmux_control_mode_command(
+pub(super) fn tmux_control_mode_command(
     harness: &TmuxCompatHarness,
     tmux_binary: &Path,
     top_level_args: &[&str],
@@ -953,6 +953,43 @@ fn tmux_control_mode_command(
         .arg("-S")
         .arg(harness.tmux_socket_path());
     Ok(command)
+}
+
+#[derive(Debug)]
+pub(super) struct LiveControlClient {
+    child: Child,
+}
+
+impl LiveControlClient {
+    pub(super) fn spawn(mut command: Command) -> Result<Self, Box<dyn Error>> {
+        let child = command
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()?;
+        Ok(Self { child })
+    }
+
+    pub(super) fn send(&mut self, commands: &str) -> Result<(), Box<dyn Error>> {
+        let stdin = self.child.stdin.as_mut().expect("control stdin");
+        stdin.write_all(commands.as_bytes())?;
+        stdin.flush()?;
+        Ok(())
+    }
+
+    pub(super) fn assert_running(&mut self, label: &str) -> Result<(), Box<dyn Error>> {
+        if let Some(status) = self.child.try_wait()? {
+            return Err(format!("{label} control client exited early with status {status}").into());
+        }
+        Ok(())
+    }
+}
+
+impl Drop for LiveControlClient {
+    fn drop(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
 }
 
 pub(super) fn sorted_first_words(output: &str) -> Vec<String> {

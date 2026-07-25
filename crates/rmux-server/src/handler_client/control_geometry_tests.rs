@@ -130,6 +130,44 @@ async fn switch_control_client_reapplies_reported_size_like_tmux37() {
     }
 }
 
+#[tokio::test]
+async fn control_clients_share_largest_and_smallest_size_candidates_like_tmux37() {
+    for (index, (policy, first_size, second_size, expected_size)) in [
+        ("largest", CONTROL_SIZE, TARGET_SIZE, CONTROL_SIZE),
+        ("smallest", TARGET_SIZE, CONTROL_SIZE, TARGET_SIZE),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let handler = RequestHandler::new();
+        let session = session_name(&format!("control-multi-{policy}"));
+        create_session(&handler, session.clone(), INITIAL_SIZE).await;
+        set_window_size_policy(&handler, &session, policy).await;
+        let first_pid = 92_400 + index as u32 * 2;
+        let second_pid = first_pid + 1;
+        let _first_events = register_control_client(&handler, first_pid, &session).await;
+        let _second_events = register_control_client(&handler, second_pid, &session).await;
+
+        for (pid, size) in [(first_pid, first_size), (second_pid, second_size)] {
+            let response = handler
+                .handle(Request::RefreshClient(Box::new(
+                    refresh_client_size_request(pid, size),
+                )))
+                .await;
+            assert!(
+                matches!(response, Response::RefreshClient(_)),
+                "{response:?}"
+            );
+        }
+
+        assert_eq!(
+            session_size(&handler, &session).await,
+            expected_size,
+            "{policy}"
+        );
+    }
+}
+
 fn session_name(value: &str) -> SessionName {
     SessionName::new(value).expect("valid session name")
 }
