@@ -2821,10 +2821,7 @@ async fn display_message_ignore_protocol_reloads_target_after_each_focus_hook() 
         Response::SelectPane(_)
     ));
     {
-        let mut state = handler.state.lock().await;
-        state
-            .append_bytes_to_pane_transcript_for_test(&alpha, 0, 1, b"\x1b[?1004h")
-            .expect("second pane enables focus reporting");
+        let state = handler.state.lock().await;
         state.start_pane_input_capture_for_test(&first);
         state.start_pane_input_capture_for_test(&second);
     }
@@ -2848,6 +2845,26 @@ async fn display_message_ignore_protocol_reloads_target_after_each_focus_hook() 
     handler
         .register_attach(requester_pid, alpha.clone(), control_tx)
         .await;
+    {
+        // Shell startup may enable focus reporting before the fixture takes
+        // control (notably PowerShell/PSReadLine on Windows). Pin both pane
+        // modes so this test measures target reload rather than shell policy.
+        let mut state = handler.state.lock().await;
+        state
+            .append_bytes_to_pane_transcript_for_test(&alpha, 0, 0, b"\x1b[?1004l")
+            .expect("first pane disables focus reporting");
+        state
+            .append_bytes_to_pane_transcript_for_test(&alpha, 0, 1, b"\x1b[?1004h")
+            .expect("second pane enables focus reporting");
+        for (target, expected) in [(&first, false), (&second, true)] {
+            let transcript = state.transcript_handle(target).expect("focus transcript");
+            assert_eq!(
+                transcript.lock().expect("focus transcript lock").mode() & mode::MODE_FOCUSON != 0,
+                expected,
+                "fixture must pin each pane's focus mode"
+            );
+        }
+    }
     assert!(matches!(
         handler
             .handle(Request::DisplayMessageExt(Box::new(
