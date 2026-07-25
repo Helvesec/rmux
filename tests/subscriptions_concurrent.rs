@@ -221,8 +221,9 @@ fn disconnect_ttl_and_pane_removal_cleanup_release_subscription_caps() -> Result
                 subscription_id: removed.subscription_id,
             },
         ))?,
-        Response::UnsubscribePaneOutput(response) if !response.removed
+        Response::UnsubscribePaneOutput(response) if response.removed
     ));
+    let _ = eventually_subscribes_on_connection(&mut subscribed, disconnect_target)?;
 
     Ok(())
 }
