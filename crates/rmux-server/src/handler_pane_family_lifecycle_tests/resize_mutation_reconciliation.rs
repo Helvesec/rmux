@@ -730,3 +730,73 @@ async fn hooks_disabled_resize_preserves_the_one_shot_hook() {
         "one-shot hook must be consumed by the first enabled resize"
     );
 }
+
+#[tokio::test]
+async fn named_resize_capture_guard_preserves_scope_and_lookup_errors() {
+    let handler = RequestHandler::new();
+    let missing =
+        rmux_proto::SessionName::new("resize-capture-missing").expect("valid missing session name");
+    let response = handler
+        .handle(Request::SetOptionByName(Box::new(SetOptionByNameRequest {
+            scope: OptionScopeSelector::Session(missing.clone()),
+            name: "@custom".to_owned(),
+            value: Some("value".to_owned()),
+            mode: SetOptionMode::Replace,
+            only_if_unset: false,
+            unset: false,
+            unset_pane_overrides: false,
+            format: false,
+            format_target: None,
+        })))
+        .await;
+    let Response::Error(error) = response else {
+        panic!("missing session must fail before option mutation, got {response:?}");
+    };
+    assert_eq!(
+        error.error.to_string(),
+        format!("session not found: {missing}")
+    );
+
+    let response = handler
+        .handle(Request::SetOptionByName(Box::new(SetOptionByNameRequest {
+            scope: OptionScopeSelector::WindowGlobal,
+            name: "not-an-option".to_owned(),
+            value: Some("value".to_owned()),
+            mode: SetOptionMode::Replace,
+            only_if_unset: false,
+            unset: false,
+            unset_pane_overrides: false,
+            format: false,
+            format_target: None,
+        })))
+        .await;
+    let Response::Error(error) = response else {
+        panic!("invalid option name must fail, got {response:?}");
+    };
+    assert_eq!(
+        error.error.to_string(),
+        "server error: invalid option: not-an-option"
+    );
+
+    let session = create_sized_session(&handler, "resize-capture-errors", LARGE_SIZE).await;
+    let response = handler
+        .handle(Request::SetOptionByName(Box::new(SetOptionByNameRequest {
+            scope: OptionScopeSelector::Window(WindowTarget::with_window(session, 99)),
+            name: "window-size".to_owned(),
+            value: Some("latest".to_owned()),
+            mode: SetOptionMode::Replace,
+            only_if_unset: false,
+            unset: false,
+            unset_pane_overrides: false,
+            format: false,
+            format_target: None,
+        })))
+        .await;
+    let Response::Error(error) = response else {
+        panic!("missing window must fail before resize capture, got {response:?}");
+    };
+    assert!(error
+        .error
+        .to_string()
+        .contains("window index does not exist in session"));
+}

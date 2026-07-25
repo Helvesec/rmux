@@ -1,4 +1,4 @@
-use rmux_proto::{OptionScopeSelector, RmuxError, SessionId, SessionName, WindowId};
+use rmux_proto::{OptionName, OptionScopeSelector, RmuxError, SessionId, SessionName, WindowId};
 
 use crate::pane_terminals::{session_not_found, HandlerState};
 
@@ -15,6 +15,13 @@ pub(super) enum ResizePolicyReconcileScope {
     AllSessions(Vec<StableResizeWindowIdentity>),
     Session(StableResizeWindowIdentity),
     ExactWindow(StableResizeWindowIdentity),
+}
+
+pub(super) fn named_option_requires_resize_policy_reconciliation(name: &str) -> bool {
+    matches!(
+        rmux_core::option_name_by_name(name),
+        Some(OptionName::WindowSize | OptionName::AggressiveResize)
+    )
 }
 
 impl ResizePolicyReconcileScope {
@@ -173,4 +180,34 @@ fn capture_exact_window(
             window_id: window.id(),
         },
     ))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::named_option_requires_resize_policy_reconciliation;
+
+    #[test]
+    fn resize_policy_capture_recognizes_canonical_names_and_prefixes() {
+        for name in [
+            "window-size",
+            "window-siz",
+            "aggressive-resize",
+            "aggressive-r",
+        ] {
+            assert!(
+                named_option_requires_resize_policy_reconciliation(name),
+                "{name} must capture resize-policy identity"
+            );
+        }
+    }
+
+    #[test]
+    fn resize_policy_capture_skips_user_and_non_resize_options() {
+        for name in ["@perf-probe", "status-left", "status-l"] {
+            assert!(
+                !named_option_requires_resize_policy_reconciliation(name),
+                "{name} must not capture resize-policy identity"
+            );
+        }
+    }
 }

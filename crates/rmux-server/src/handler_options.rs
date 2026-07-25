@@ -26,7 +26,9 @@ use default_shell::{validate_named_mutation, validate_typed_mutation};
 use pane_state_events::{
     pane_option_events_for_outcome, synchronize_pane_option_aliases_for_outcome,
 };
-use resize_reconciliation::ResizePolicyReconcileScope;
+use resize_reconciliation::{
+    named_option_requires_resize_policy_reconciliation, ResizePolicyReconcileScope,
+};
 use terminal_geometry::{
     resize_terminals_for_named_option_change, resize_terminals_for_option_change,
 };
@@ -221,6 +223,8 @@ impl RequestHandler {
         let mut destroy_unattached_scope = None;
         let mut resize_policy_scope = None;
         let mut linked_geometry_refreshes = Vec::new();
+        let resize_policy_requested =
+            named_option_requires_resize_policy_reconciliation(&request.name);
         let response = {
             let mut state = self.state.lock().await;
             let _mode_tree_guard = if let Some(identity) = mode_tree_identity {
@@ -238,11 +242,14 @@ impl RequestHandler {
             if let Err(error) = ensure_option_scope_exists(&state, &request.scope) {
                 return Response::Error(ErrorResponse { error });
             }
-            let candidate_resize_policy_scope =
+            let candidate_resize_policy_scope = if resize_policy_requested {
                 match ResizePolicyReconcileScope::capture(&state, &request.scope) {
-                    Ok(scope) => scope,
+                    Ok(scope) => Some(scope),
                     Err(error) => return Response::Error(ErrorResponse { error }),
-                };
+                }
+            } else {
+                None
+            };
             let socket_path = self.socket_path();
             let value = match request.value.as_deref() {
                 Some(value)
@@ -306,7 +313,7 @@ impl RequestHandler {
                             option,
                             OptionName::WindowSize | OptionName::AggressiveResize
                         ) {
-                            resize_policy_scope = Some(candidate_resize_policy_scope.clone());
+                            resize_policy_scope = candidate_resize_policy_scope;
                         }
                         if let Some(scope) = option_scope_to_legacy_scope(&request.scope) {
                             state.refresh_transcript_limits_for_scope(&scope, option);

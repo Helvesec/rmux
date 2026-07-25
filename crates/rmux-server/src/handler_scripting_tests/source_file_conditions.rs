@@ -860,3 +860,37 @@ async fn source_file_glob_expands_matching_files() {
         b"yes"
     );
 }
+
+#[tokio::test]
+async fn source_file_sets_user_and_known_non_resize_options_through_named_guard() {
+    let handler = RequestHandler::new();
+    let root = temp_root("source-file-non-resize-option-guard");
+    fs::create_dir_all(&root).expect("create temp root");
+
+    let response = handler
+        .handle(Request::SourceFile(Box::new(SourceFileRequest {
+            paths: vec!["-".to_owned()],
+            quiet: false,
+            parse_only: false,
+            verbose: false,
+            expand_paths: false,
+            target: None,
+            caller_cwd: Some(root),
+            stdin: Some(
+                "set-option -g @capture-guard first\n\
+set-option -g status-left second\n\
+show-options -gqv @capture-guard\n\
+show-options -gqv status-left\n"
+                    .to_owned(),
+            ),
+        })))
+        .await;
+
+    assert_eq!(
+        response
+            .command_output()
+            .unwrap_or_else(|| panic!("source-file option output, got {response:?}"))
+            .stdout(),
+        b"first\nsecond\n"
+    );
+}
