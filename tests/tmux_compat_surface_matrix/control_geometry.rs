@@ -169,6 +169,72 @@ fn tmux_compat_control_switch_reconciles_source_geometry_when_frozen_tmux_is_ava
     Ok(())
 }
 
+#[test]
+fn tmux_compat_latest_control_order_survives_an_older_client_resize_when_frozen_tmux_is_available(
+) -> Result<(), Box<dyn Error>> {
+    let harness = TmuxCompatHarness::new("tmux-compat-control-latest-resize-order")?;
+    let Some(tmux_binary) = frozen_tmux_or_skip(&harness)? else {
+        return Ok(());
+    };
+    let _guard = pty_tmux_compat_lock();
+    let case = GeometryCase {
+        label: "controls-latest-resize",
+        policy: "latest",
+        first: size(100, 40),
+        second: size(60, 20),
+        combined: size(60, 20),
+        remove_first: false,
+    };
+    setup_session(&harness, &tmux_binary, case)?;
+    let config = config();
+    let mut tmux_first =
+        LiveControlClient::spawn(tmux_control_mode_command(&harness, &tmux_binary, &[], &[])?)?;
+    let mut rmux_first = LiveControlClient::spawn(rmux_control_mode_command(&harness, &[], &[])?)?;
+    let mut tmux_latest =
+        LiveControlClient::spawn(tmux_control_mode_command(&harness, &tmux_binary, &[], &[])?)?;
+    let mut rmux_latest = LiveControlClient::spawn(rmux_control_mode_command(&harness, &[], &[])?)?;
+
+    attach_control_pair(&mut tmux_first, &mut rmux_first, case.label, case.first)?;
+    wait_for_state(
+        &harness,
+        &tmux_binary,
+        case.label,
+        &[case.first],
+        case.first,
+        config.clone(),
+    )?;
+    attach_control_pair(&mut tmux_latest, &mut rmux_latest, case.label, case.second)?;
+    wait_for_state(
+        &harness,
+        &tmux_binary,
+        case.label,
+        &[case.first, case.second],
+        case.combined,
+        config.clone(),
+    )?;
+
+    let resized_first = size(101, 41);
+    let refresh = format!(
+        "refresh-client -C {}x{}\n",
+        resized_first.cols, resized_first.rows
+    );
+    tmux_first.send(&refresh)?;
+    rmux_first.send(&refresh)?;
+    wait_for_state(
+        &harness,
+        &tmux_binary,
+        case.label,
+        &[resized_first, case.second],
+        case.second,
+        config,
+    )?;
+    tmux_first.assert_running("tmux older control")?;
+    rmux_first.assert_running("rmux older control")?;
+    tmux_latest.assert_running("tmux latest control")?;
+    rmux_latest.assert_running("rmux latest control")?;
+    Ok(())
+}
+
 fn assert_control_and_attach_departure(
     harness: &TmuxCompatHarness,
     tmux_binary: &Path,

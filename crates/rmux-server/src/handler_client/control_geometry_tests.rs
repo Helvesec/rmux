@@ -74,6 +74,72 @@ async fn refresh_client_control_size_respects_window_size_policy_like_tmux37() {
 }
 
 #[tokio::test]
+async fn older_control_resize_keeps_the_latest_client_order_like_tmux37() {
+    // Frozen tmux 3.7b oracle, 2026-07-25: `latest` is client arrival
+    // order. Resizing an older control client updates its reported geometry
+    // without making it the newest window-size candidate.
+    let handler = RequestHandler::new();
+    let session = session_name("control-latest-resize-order");
+    create_session(&handler, session.clone(), INITIAL_SIZE).await;
+    set_window_size_policy(&handler, &session, "latest").await;
+    let older_pid = 92_280;
+    let latest_pid = older_pid + 1;
+    let (_older_id, _older_events) =
+        register_control_client_with_id(&handler, older_pid, &session).await;
+    let older_size = TerminalSize {
+        cols: 100,
+        rows: 40,
+    };
+    let response = handler
+        .handle(Request::RefreshClient(Box::new(
+            refresh_client_size_request(older_pid, older_size),
+        )))
+        .await;
+    assert!(
+        matches!(response, Response::RefreshClient(_)),
+        "{response:?}"
+    );
+
+    let (_latest_id, _latest_events) =
+        register_control_client_with_id(&handler, latest_pid, &session).await;
+    let latest_size = TerminalSize { cols: 60, rows: 20 };
+    let response = handler
+        .handle(Request::RefreshClient(Box::new(
+            refresh_client_size_request(latest_pid, latest_size),
+        )))
+        .await;
+    assert!(
+        matches!(response, Response::RefreshClient(_)),
+        "{response:?}"
+    );
+    assert_eq!(session_size(&handler, &session).await, latest_size);
+
+    let resized_older = TerminalSize {
+        cols: 101,
+        rows: 41,
+    };
+    let response = handler
+        .handle(Request::RefreshClient(Box::new(
+            refresh_client_size_request(older_pid, resized_older),
+        )))
+        .await;
+    assert!(
+        matches!(response, Response::RefreshClient(_)),
+        "{response:?}"
+    );
+    assert_eq!(
+        control_client_size(&handler, older_pid).await,
+        resized_older,
+        "the older control still records its new geometry"
+    );
+    assert_eq!(
+        session_size(&handler, &session).await,
+        latest_size,
+        "resizing an older control must not steal latest-client ordering"
+    );
+}
+
+#[tokio::test]
 async fn switch_control_client_reapplies_reported_size_like_tmux37() {
     // Frozen tmux 3.7b oracle, 2026-07-25: after refresh-client -C 100x40,
     // switch-client chooses that geometry for latest/largest, the resident

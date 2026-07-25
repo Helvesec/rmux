@@ -220,7 +220,7 @@ impl RequestHandler {
                 let mut state = self.state.lock().await;
                 let active_attach = self.active_attach.lock().await;
                 let mut active_control = self.active_control.lock().await;
-                let Some(_) = active_control.by_pid.get(&control_pid).filter(|active| {
+                let Some(active) = active_control.by_pid.get(&control_pid).filter(|active| {
                     active.id == identity.control_id()
                         && !active.closing.load(std::sync::atomic::Ordering::SeqCst)
                         && active.session_name.as_ref() == Some(session_name)
@@ -230,7 +230,7 @@ impl RequestHandler {
                         error: attached_client_required("refresh-client"),
                     });
                 };
-                let size_sequence = self.next_client_size_sequence();
+                let size_sequence = active.size_sequence;
                 match super::super::attach_support::resize_control_session_for_client(
                     &mut state,
                     super::super::attach_support::ControlResizeClient::new(
@@ -250,7 +250,6 @@ impl RequestHandler {
                             .expect("validated control client remains locked");
                         active.client_width = size.cols;
                         active.client_height = size.rows;
-                        active.size_sequence = size_sequence;
                         target
                     }
                     Err(error) => return Response::Error(ErrorResponse { error }),
