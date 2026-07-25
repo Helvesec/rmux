@@ -1081,6 +1081,25 @@ impl LiveControlClient {
         }
     }
 
+    /// Positions, relative to `cursor`, of the first line matching `first` and
+    /// the first line matching `second`. `None` when either is absent.
+    pub(super) fn notification_index_pair(
+        &self,
+        cursor: usize,
+        first: impl Fn(&str) -> bool,
+        second: impl Fn(&str) -> bool,
+    ) -> Option<(usize, usize)> {
+        let captured = self
+            .sink()
+            .lock()
+            .expect("control notification sink")
+            .clone();
+        let tail = &captured[cursor.min(captured.len())..];
+        let first_index = tail.iter().position(|line| first(line))?;
+        let second_index = tail.iter().position(|line| second(line))?;
+        Some((first_index, second_index))
+    }
+
     fn sink(&self) -> &ControlNotificationSink {
         self.notifications
             .as_ref()

@@ -241,6 +241,29 @@ fn tmux_compat_control_switch_reconciles_source_geometry_when_frozen_tmux_is_ava
     )?;
     assert_eq!(rmux_layout, tmux_layout);
 
+    // Order matters as much as the line: tmux reports the client move first and
+    // the layout it causes second, so a -C frontend never applies the new
+    // layout to the session the client just left.
+    let tmux_order = tmux_surviving.notification_index_pair(
+        tmux_cursor,
+        |line| line.starts_with("%client-session-changed "),
+        is_shrunk_layout,
+    );
+    let rmux_order = rmux_surviving.notification_index_pair(
+        rmux_cursor,
+        |line| line.starts_with("%client-session-changed "),
+        is_shrunk_layout,
+    );
+    assert!(
+        matches!(tmux_order, Some((changed, layout)) if changed < layout),
+        "frozen tmux oracle changed: {tmux_order:?}"
+    );
+    assert!(
+        matches!(rmux_order, Some((changed, layout)) if changed < layout),
+        "rmux must report %client-session-changed before the %layout-change it causes: \
+         {rmux_order:?}"
+    );
+
     tmux_switching.assert_running("tmux switched control")?;
     rmux_switching.assert_running("rmux switched control")?;
     tmux_surviving.assert_running("tmux source control")?;
