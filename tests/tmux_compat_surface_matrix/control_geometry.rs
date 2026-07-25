@@ -272,6 +272,128 @@ fn tmux_compat_control_switch_reconciles_source_geometry_when_frozen_tmux_is_ava
 }
 
 #[test]
+fn tmux_compat_switch_notifies_the_destination_geometry_when_frozen_tmux_is_available(
+) -> Result<(), Box<dyn Error>> {
+    // The arrival half of the same contract: the client that already sits on
+    // the destination watches its window grow, and must be told, in the same
+    // order (`%client-session-changed` then `%layout-change`).
+    let harness = TmuxCompatHarness::new("tmux-compat-control-switch-destination-geometry")?;
+    let Some(tmux_binary) = frozen_tmux_or_skip(&harness)? else {
+        return Ok(());
+    };
+    let _guard = pty_tmux_compat_lock();
+    let config = config();
+
+    for argv in [
+        ["new-session", "-d", "-s", "source"].as_slice(),
+        ["new-session", "-d", "-s", "target"].as_slice(),
+        ["set-option", "-t", "source", "status", "off"].as_slice(),
+        ["set-option", "-t", "target", "status", "off"].as_slice(),
+        ["set-option", "-w", "-t", "source", "window-size", "largest"].as_slice(),
+        ["set-option", "-w", "-t", "target", "window-size", "largest"].as_slice(),
+    ] {
+        let run = harness.run_pair_with(&tmux_binary, argv, config.clone())?;
+        assert_quiet_success(&run);
+    }
+
+    let mut tmux_switching =
+        LiveControlClient::spawn(tmux_control_mode_command(&harness, &tmux_binary, &[], &[])?)?;
+    let mut rmux_switching =
+        LiveControlClient::spawn(rmux_control_mode_command(&harness, &[], &[])?)?;
+    let mut tmux_destination = LiveControlClient::spawn_capturing(tmux_control_mode_command(
+        &harness,
+        &tmux_binary,
+        &[],
+        &[],
+    )?)?;
+    let mut rmux_destination =
+        LiveControlClient::spawn_capturing(rmux_control_mode_command(&harness, &[], &[])?)?;
+    attach_control_pair(
+        &mut tmux_switching,
+        &mut rmux_switching,
+        "source",
+        size(101, 41),
+    )?;
+    attach_control_pair(
+        &mut tmux_destination,
+        &mut rmux_destination,
+        "target",
+        size(60, 20),
+    )?;
+    wait_for_state(
+        &harness,
+        &tmux_binary,
+        "target",
+        &[size(60, 20)],
+        size(60, 20),
+        config.clone(),
+    )?;
+
+    let tmux_cursor = tmux_destination.notification_cursor();
+    let rmux_cursor = rmux_destination.notification_cursor();
+    tmux_switching.send("switch-client -t target\n")?;
+    rmux_switching.send("switch-client -t target\n")?;
+    let switched = wait_for_pair_run(
+        &harness,
+        &tmux_binary,
+        &[
+            "display-message",
+            "-p",
+            "-t",
+            "target",
+            "#{window_width}x#{window_height}",
+        ],
+        config,
+        Duration::from_secs(5),
+        |run| run.tmux.stdout_string() == "101x41\n" && run.rmux.stdout_string() == "101x41\n",
+    )?;
+    assert_success_without_stderr(&switched);
+    assert_eq!(switched.rmux.stdout, switched.tmux.stdout);
+
+    let is_grown_layout =
+        |line: &str| line.starts_with("%layout-change ") && line.contains(",101x41,");
+    let tmux_layout = tmux_destination.wait_for_notification(
+        tmux_cursor,
+        Duration::from_secs(5),
+        "tmux destination control",
+        is_grown_layout,
+    )?;
+    let rmux_layout = rmux_destination.wait_for_notification(
+        rmux_cursor,
+        Duration::from_secs(5),
+        "rmux destination control",
+        is_grown_layout,
+    )?;
+    assert_eq!(rmux_layout, tmux_layout);
+
+    let tmux_order = tmux_destination.notification_index_pair(
+        tmux_cursor,
+        |line| line.starts_with("%client-session-changed "),
+        is_grown_layout,
+    );
+    let rmux_order = rmux_destination.notification_index_pair(
+        rmux_cursor,
+        |line| line.starts_with("%client-session-changed "),
+        is_grown_layout,
+    );
+    assert!(
+        matches!(tmux_order, Some((changed, layout)) if changed < layout),
+        "frozen tmux oracle changed: {tmux_order:?}"
+    );
+    assert!(
+        matches!(rmux_order, Some((changed, layout)) if changed < layout),
+        "rmux must report %client-session-changed before the %layout-change it causes: \
+         {rmux_order:?}"
+    );
+
+    tmux_switching.assert_running("tmux switched control")?;
+    rmux_switching.assert_running("rmux switched control")?;
+    tmux_destination.assert_running("tmux destination control")?;
+    rmux_destination.assert_running("rmux destination control")?;
+    Ok(())
+}
+
+#[test]
 fn tmux_compat_latest_control_order_survives_an_older_client_resize_when_frozen_tmux_is_available(
 ) -> Result<(), Box<dyn Error>> {
     let harness = TmuxCompatHarness::new("tmux-compat-control-latest-resize-order")?;
