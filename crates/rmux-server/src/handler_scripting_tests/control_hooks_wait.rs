@@ -185,6 +185,7 @@ async fn parsed_queue_display_message_targets_control_client_with_initiator_cont
         register_control_for_session(&handler, requester_pid, alpha.clone()).await;
     while events.try_recv().is_ok() {}
     let identity = ControlClientIdentity::new(requester_pid, control_id);
+    let client_name = format!("client-{requester_pid}");
     let template = "#{session_name}|#{client_session}|#{client_name}";
 
     let parsed = CommandParser::new()
@@ -200,7 +201,7 @@ async fn parsed_queue_display_message_targets_control_client_with_initiator_cont
     .expect("queued control display-message prints");
     assert_eq!(
         output.stdout(),
-        format!("{detached}|{alpha}|{requester_pid}\n").as_bytes()
+        format!("{detached}|{alpha}|{client_name}\n").as_bytes()
     );
 
     let parsed = CommandParser::new()
@@ -222,7 +223,7 @@ async fn parsed_queue_display_message_targets_control_client_with_initiator_cont
         .expect("target control client receives a message notification");
     assert_eq!(
         notification,
-        format!("%message {detached}|{alpha}|{requester_pid}")
+        format!("%message {detached}|{alpha}|{client_name}")
     );
 }
 
