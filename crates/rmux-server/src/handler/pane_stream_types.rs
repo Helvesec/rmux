@@ -195,6 +195,7 @@ impl PaneSurfaceFingerprint {
 
 #[derive(Debug)]
 pub(in crate::handler) struct SurfaceDriver {
+    generation: u64,
     pub(in crate::handler) receiver: PaneOutputReceiver,
     pub(in crate::handler) latest: Arc<PaneSurfaceFrame>,
     pub(in crate::handler) fingerprint: PaneSurfaceFingerprint,
@@ -207,6 +208,12 @@ pub(in crate::handler) struct SurfaceDriver {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(in crate::handler) struct SurfaceRefreshToken {
+    generation: u64,
+    sequence: u64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(in crate::handler) struct PendingSurfaceRefresh {
     pub(in crate::handler) reset: bool,
     pub(in crate::handler) frame_lifecycle_revision: u64,
@@ -214,11 +221,13 @@ pub(in crate::handler) struct PendingSurfaceRefresh {
 
 impl SurfaceDriver {
     pub(in crate::handler) fn new(
+        generation: u64,
         receiver: PaneOutputReceiver,
         latest: Arc<PaneSurfaceFrame>,
         fingerprint: PaneSurfaceFingerprint,
     ) -> Self {
         Self {
+            generation,
             receiver,
             revision: latest.revision,
             latest,
@@ -235,25 +244,28 @@ impl SurfaceDriver {
         self.pending_refresh
     }
 
-    pub(in crate::handler) fn begin_refresh(&mut self) -> Option<u64> {
+    pub(in crate::handler) fn begin_refresh(&mut self) -> Option<SurfaceRefreshToken> {
         if self.refreshing {
             return None;
         }
         self.refreshing = true;
         self.pending_refresh = None;
         self.refresh_token = self.refresh_token.saturating_add(1);
-        Some(self.refresh_token)
+        Some(SurfaceRefreshToken {
+            generation: self.generation,
+            sequence: self.refresh_token,
+        })
     }
 
     pub(in crate::handler) fn finish_refresh(
         &mut self,
-        token: u64,
+        token: SurfaceRefreshToken,
         receiver: PaneOutputReceiver,
         latest: Arc<PaneSurfaceFrame>,
         fingerprint: PaneSurfaceFingerprint,
         frame_lifecycle_revision: u64,
     ) -> bool {
-        if !self.refreshing || self.refresh_token != token {
+        if !self.is_current_refresh(token) {
             return false;
         }
         self.receiver = receiver;
@@ -267,11 +279,11 @@ impl SurfaceDriver {
 
     pub(in crate::handler) fn finish_unchanged_refresh(
         &mut self,
-        token: u64,
+        token: SurfaceRefreshToken,
         receiver: PaneOutputReceiver,
         fingerprint: PaneSurfaceFingerprint,
     ) -> bool {
-        if !self.refreshing || self.refresh_token != token {
+        if !self.is_current_refresh(token) {
             return false;
         }
         self.receiver = receiver;
@@ -282,10 +294,10 @@ impl SurfaceDriver {
 
     pub(in crate::handler) fn cancel_refresh(
         &mut self,
-        token: u64,
+        token: SurfaceRefreshToken,
         pending: PendingSurfaceRefresh,
     ) {
-        if !self.refreshing || self.refresh_token != token {
+        if !self.is_current_refresh(token) {
             return;
         }
         self.refreshing = false;
@@ -298,6 +310,12 @@ impl SurfaceDriver {
             },
             None => pending,
         });
+    }
+
+    fn is_current_refresh(&self, token: SurfaceRefreshToken) -> bool {
+        self.refreshing
+            && self.generation == token.generation
+            && self.refresh_token == token.sequence
     }
 }
 

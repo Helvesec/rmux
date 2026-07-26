@@ -22,7 +22,7 @@ use ended_pane_streams::EndedPaneStreams;
 
 use super::super::pane_stream_support::{
     CachedRawRebase, EndedPaneStream, PaneStreamSource, PaneStreamSubscription,
-    PendingSurfaceRefresh, SurfaceDriver,
+    PendingSurfaceRefresh, SurfaceDriver, SurfaceRefreshToken,
 };
 
 // Raw pane output and typed pane streams share this registry and therefore one atomic budget.
@@ -457,7 +457,7 @@ impl OutputSubscriptionState {
     pub(in crate::handler) fn cancel_surface_refresh(
         &mut self,
         pane_id: PaneId,
-        token: u64,
+        token: SurfaceRefreshToken,
         pending: PendingSurfaceRefresh,
     ) {
         let Some(key) = self.surface_driver_key_for_pane_id(pane_id) else {

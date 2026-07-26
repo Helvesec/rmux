@@ -7,7 +7,6 @@ use rmux_proto::{
     UnsubscribePaneStreamRequest, UnsubscribePaneStreamResponse,
 };
 
-use crate::pane_io::PaneOutputReceiver;
 use crate::pane_terminals::HandlerState;
 
 use super::pane_support::resolve_pane_target_ref;
@@ -36,11 +35,11 @@ use protocol::{
     validate_raw_rebase_size, validate_surface_frame_size, wrong_stream_mode,
 };
 use raw::{RawInitializationOutcome, RawSubscriptionStart};
+use types::SurfacePaneStream;
 pub(in crate::handler) use types::{
     CachedRawRebase, EndedPaneStream, PaneStreamSource, PaneStreamSubscription,
-    PendingSurfaceRefresh, SurfaceDriver,
+    PendingSurfaceRefresh, SurfaceDriver, SurfaceRefreshToken,
 };
-use types::{PaneSurfaceFingerprint, SurfacePaneStream};
 
 pub(super) const MAX_SOURCE_CAPTURE_ATTEMPTS: usize = 4;
 
@@ -111,7 +110,7 @@ impl Drop for StreamReservationGuard {
 struct SurfaceRefreshGuard {
     subscriptions: Weak<StdMutex<OutputSubscriptionState>>,
     pane_id: rmux_core::PaneId,
-    token: u64,
+    token: SurfaceRefreshToken,
     pending: PendingSurfaceRefresh,
     armed: bool,
 }
@@ -120,7 +119,7 @@ impl SurfaceRefreshGuard {
     fn new(
         subscriptions: &Arc<StdMutex<OutputSubscriptionState>>,
         pane_id: rmux_core::PaneId,
-        token: u64,
+        token: SurfaceRefreshToken,
         pending: PendingSurfaceRefresh,
     ) -> Self {
         Self {
@@ -265,7 +264,7 @@ impl RequestHandler {
             None
         };
 
-        let _surface_initialization = if let Some(mut route) = surface_route {
+        let surface_initialization = if let Some(mut route) = surface_route {
             loop {
                 match route {
                     SurfaceDriverRoute::Ready => {
@@ -362,14 +361,16 @@ impl RequestHandler {
                         return Response::Error(ErrorResponse { error });
                     }
                 };
-                self.finish_new_surface_subscription(
-                    connection_id,
-                    subscription_id,
-                    source,
+                let driver = SurfaceDriver::new(
+                    surface_initialization
+                        .as_ref()
+                        .expect("a new surface driver owns an initialization generation")
+                        .token,
                     captured.receiver,
                     frame,
                     captured.fingerprint,
-                )
+                );
+                self.finish_new_surface_subscription(connection_id, subscription_id, source, driver)
             }
         };
         if matches!(response, Response::SubscribePaneStream(_)) {
@@ -571,9 +572,7 @@ impl RequestHandler {
         connection_id: u64,
         subscription_id: rmux_proto::PaneOutputSubscriptionId,
         mut source: PaneStreamSource,
-        receiver: PaneOutputReceiver,
-        frame: Arc<rmux_proto::PaneSurfaceFrame>,
-        fingerprint: PaneSurfaceFingerprint,
+        driver: SurfaceDriver,
     ) -> Response {
         let mut subscriptions = self
             .subscriptions
@@ -591,10 +590,10 @@ impl RequestHandler {
         let frame = if let Some(existing) = subscriptions.surface_drivers.get(&current_key) {
             Arc::clone(&existing.latest)
         } else {
-            subscriptions.surface_drivers.insert(
-                current_key.clone(),
-                SurfaceDriver::new(receiver, Arc::clone(&frame), fingerprint),
-            );
+            let frame = Arc::clone(&driver.latest);
+            subscriptions
+                .surface_drivers
+                .insert(current_key.clone(), driver);
             frame
         };
         let lifecycle_revision = subscriptions

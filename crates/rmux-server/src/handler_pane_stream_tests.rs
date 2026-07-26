@@ -105,6 +105,52 @@ async fn capture_retries_when_the_resolved_process_generation_changes() {
     assert_eq!(captured.boundary.generation, next_generation);
 }
 
+#[tokio::test]
+async fn stale_surface_refresh_cannot_cancel_a_recreated_driver() {
+    let handler = RequestHandler::new();
+    let (target, _, _) = test_pane(&handler).await;
+    let _subscription = subscribe(&handler, &target, PaneStreamMode::Surface).await;
+
+    let mut subscriptions = handler
+        .subscriptions
+        .lock()
+        .expect("subscription registry mutex");
+    let key = subscriptions
+        .surface_drivers
+        .keys()
+        .next()
+        .expect("surface driver")
+        .clone();
+    let mut original = subscriptions
+        .surface_drivers
+        .remove(&key)
+        .expect("original surface driver");
+    let stale = original.begin_refresh().expect("original refresh");
+    let mut replacement = super::SurfaceDriver::new(
+        u64::MAX,
+        original.receiver,
+        Arc::clone(&original.latest),
+        original.fingerprint,
+    );
+    let current = replacement.begin_refresh().expect("replacement refresh");
+    let pending = super::PendingSurfaceRefresh {
+        reset: true,
+        frame_lifecycle_revision: 0,
+    };
+
+    replacement.cancel_refresh(stale, pending);
+    assert!(
+        replacement.refreshing,
+        "an old driver's token must not cancel the replacement's refresh"
+    );
+
+    replacement.cancel_refresh(current, pending);
+    assert!(
+        !replacement.refreshing,
+        "the replacement's own token must still cancel its refresh"
+    );
+}
+
 async fn subscribe(
     handler: &RequestHandler,
     target: &PaneTarget,
