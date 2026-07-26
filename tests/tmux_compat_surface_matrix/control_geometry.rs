@@ -11,6 +11,259 @@ struct GeometryCase {
 }
 
 #[test]
+fn tmux_compat_status_geometry_follows_the_row_owning_client_when_frozen_tmux_is_available(
+) -> Result<(), Box<dyn Error>> {
+    let harness = TmuxCompatHarness::new("tmux-compat-status-geometry-owner")?;
+    let Some(tmux_binary) = frozen_tmux_or_skip(&harness)? else {
+        return Ok(());
+    };
+    let _guard = pty_tmux_compat_lock();
+    let config = config();
+    let session = "status-geometry-owner";
+
+    for argv in [
+        ["new-session", "-d", "-s", session, "-x", "80", "-y", "24"].as_slice(),
+        ["set-option", "-w", "-t", session, "window-size", "largest"].as_slice(),
+        ["set-option", "-t", session, "status", "on"].as_slice(),
+    ] {
+        let run = harness.run_pair_with(&tmux_binary, argv, config.clone())?;
+        assert_quiet_success(&run);
+    }
+
+    let mut tmux_control = LiveControlClient::spawn_capturing(tmux_control_mode_command(
+        &harness,
+        &tmux_binary,
+        &[],
+        &[],
+    )?)?;
+    let mut rmux_control =
+        LiveControlClient::spawn_capturing(rmux_control_mode_command(&harness, &[], &[])?)?;
+    attach_control_pair(&mut tmux_control, &mut rmux_control, session, size(60, 20))?;
+    wait_for_state(
+        &harness,
+        &tmux_binary,
+        session,
+        &[size(60, 20)],
+        size(60, 20),
+        config.clone(),
+    )?;
+
+    let tmux_cursor = tmux_control.notification_cursor();
+    let rmux_cursor = rmux_control.notification_cursor();
+    let tmux_pty =
+        spawn_tmux_attached_input_client_at_size(&harness, &tmux_binary, session, size(101, 41))?;
+    let rmux_pty = spawn_rmux_attached_input_client_at_size(&harness, session, size(101, 41))?;
+    wait_for_state(
+        &harness,
+        &tmux_binary,
+        session,
+        &[size(60, 20), size(101, 41)],
+        size(101, 40),
+        config.clone(),
+    )?;
+
+    let pty_layout = |line: &str| line.starts_with("%layout-change ") && line.contains(",101x40,");
+    let tmux_layout = tmux_control.wait_for_notification(
+        tmux_cursor,
+        Duration::from_secs(5),
+        "tmux status geometry control",
+        pty_layout,
+    )?;
+    let rmux_layout = rmux_control.wait_for_notification(
+        rmux_cursor,
+        Duration::from_secs(5),
+        "rmux status geometry control",
+        pty_layout,
+    )?;
+    assert_eq!(rmux_layout, tmux_layout);
+
+    let status_three = harness.run_pair_with(
+        &tmux_binary,
+        &["set-option", "-t", session, "status", "3"],
+        config.clone(),
+    )?;
+    assert_quiet_success(&status_three);
+    wait_for_state(
+        &harness,
+        &tmux_binary,
+        session,
+        &[size(60, 20), size(101, 41)],
+        size(101, 38),
+        config.clone(),
+    )?;
+
+    drop(tmux_pty);
+    drop(rmux_pty);
+    wait_for_state(
+        &harness,
+        &tmux_binary,
+        session,
+        &[size(60, 20)],
+        size(60, 20),
+        config.clone(),
+    )?;
+
+    tmux_control.send("refresh-client -C 100x40\n")?;
+    rmux_control.send("refresh-client -C 100x40\n")?;
+    let tmux_small_pty =
+        spawn_tmux_attached_input_client_at_size(&harness, &tmux_binary, session, size(70, 20))?;
+    let rmux_small_pty = spawn_rmux_attached_input_client_at_size(&harness, session, size(70, 20))?;
+    wait_for_state(
+        &harness,
+        &tmux_binary,
+        session,
+        &[size(100, 40), size(70, 20)],
+        size(100, 40),
+        config.clone(),
+    )?;
+
+    let status_one = harness.run_pair_with(
+        &tmux_binary,
+        &["set-option", "-t", session, "status", "on"],
+        config.clone(),
+    )?;
+    assert_quiet_success(&status_one);
+    wait_for_state(
+        &harness,
+        &tmux_binary,
+        session,
+        &[size(100, 40), size(70, 20)],
+        size(100, 40),
+        config.clone(),
+    )?;
+
+    drop(tmux_small_pty);
+    drop(rmux_small_pty);
+
+    tmux_control.send("refresh-client -C 101x20\n")?;
+    rmux_control.send("refresh-client -C 101x20\n")?;
+    wait_for_state(
+        &harness,
+        &tmux_binary,
+        session,
+        &[size(101, 20)],
+        size(101, 20),
+        config.clone(),
+    )?;
+    let tmux_tied_pty =
+        spawn_tmux_attached_input_client_at_size(&harness, &tmux_binary, session, size(101, 21))?;
+    let rmux_tied_pty = spawn_rmux_attached_input_client_at_size(&harness, session, size(101, 21))?;
+    wait_for_state(
+        &harness,
+        &tmux_binary,
+        session,
+        &[size(101, 20), size(101, 21)],
+        size(101, 20),
+        config.clone(),
+    )?;
+
+    let status_three = harness.run_pair_with(
+        &tmux_binary,
+        &["set-option", "-t", session, "status", "3"],
+        config.clone(),
+    )?;
+    assert_quiet_success(&status_three);
+    wait_for_state(
+        &harness,
+        &tmux_binary,
+        session,
+        &[size(101, 20), size(101, 21)],
+        size(101, 20),
+        config,
+    )?;
+
+    drop(tmux_tied_pty);
+    drop(rmux_tied_pty);
+    tmux_control.assert_running("tmux status geometry control")?;
+    rmux_control.assert_running("rmux status geometry control")?;
+    Ok(())
+}
+
+#[test]
+fn tmux_compat_detached_window_retains_pty_content_geometry_when_frozen_tmux_is_available(
+) -> Result<(), Box<dyn Error>> {
+    let harness = TmuxCompatHarness::new("tmux-compat-detached-pty-content-geometry")?;
+    let Some(tmux_binary) = frozen_tmux_or_skip(&harness)? else {
+        return Ok(());
+    };
+    let _guard = pty_tmux_compat_lock();
+    let config = config();
+    let session = "detached-pty-content";
+
+    for argv in [
+        ["new-session", "-d", "-s", session, "-x", "80", "-y", "24"].as_slice(),
+        ["set-option", "-w", "-t", session, "window-size", "latest"].as_slice(),
+        ["set-option", "-t", session, "status", "3"].as_slice(),
+    ] {
+        let run = harness.run_pair_with(&tmux_binary, argv, config.clone())?;
+        assert_quiet_success(&run);
+    }
+
+    let tmux_pty =
+        spawn_tmux_attached_input_client_at_size(&harness, &tmux_binary, session, size(101, 41))?;
+    let rmux_pty = spawn_rmux_attached_input_client_at_size(&harness, session, size(101, 41))?;
+    wait_for_state(
+        &harness,
+        &tmux_binary,
+        session,
+        &[size(101, 41)],
+        size(101, 38),
+        config.clone(),
+    )?;
+
+    drop(tmux_pty);
+    drop(rmux_pty);
+    wait_for_state(&harness, &tmux_binary, session, &[], size(101, 38), config)?;
+    Ok(())
+}
+
+#[test]
+fn tmux_compat_explicit_window_size_remains_content_based_when_frozen_tmux_is_available(
+) -> Result<(), Box<dyn Error>> {
+    let harness = TmuxCompatHarness::new("tmux-compat-explicit-content-geometry")?;
+    let Some(tmux_binary) = frozen_tmux_or_skip(&harness)? else {
+        return Ok(());
+    };
+    let _guard = pty_tmux_compat_lock();
+    let config = config();
+    let session = "explicit-content";
+
+    for argv in [
+        ["new-session", "-d", "-s", session, "-x", "80", "-y", "24"].as_slice(),
+        ["set-option", "-t", session, "status", "on"].as_slice(),
+        ["resize-window", "-t", session, "-x", "90", "-y", "30"].as_slice(),
+    ] {
+        let run = harness.run_pair_with(&tmux_binary, argv, config.clone())?;
+        assert_quiet_success(&run);
+    }
+
+    for status in ["on", "3"] {
+        let set_status = harness.run_pair_with(
+            &tmux_binary,
+            &["set-option", "-t", session, "status", status],
+            config.clone(),
+        )?;
+        assert_quiet_success(&set_status);
+        let geometry = harness.run_pair_with(
+            &tmux_binary,
+            &[
+                "display-message",
+                "-p",
+                "-t",
+                session,
+                "#{window_width}x#{window_height}",
+            ],
+            config.clone(),
+        )?;
+        assert_success_without_stderr(&geometry);
+        assert_eq!(geometry.tmux.stdout_string(), "90x30\n");
+        assert_eq!(geometry.rmux.stdout, geometry.tmux.stdout);
+    }
+
+    Ok(())
+}
+
+#[test]
 fn tmux_compat_control_geometry_survives_attach_and_control_departures_when_frozen_tmux_is_available(
 ) -> Result<(), Box<dyn Error>> {
     let harness = TmuxCompatHarness::new("tmux-compat-control-geometry-lifecycle")?;

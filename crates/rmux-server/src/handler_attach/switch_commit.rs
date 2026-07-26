@@ -261,8 +261,7 @@ impl RequestHandler {
                     render_stream: request.render_stream,
                     selection: request.target_selection.as_ref(),
                     window_size_override: size_selection
-                        .selected_size
-                        .map(|size| (window_target.window_index(), size)),
+                        .render_override(window_target.window_index()),
                 },
             )?;
             let snapshot = SessionTransferSnapshot::capture(&state);
@@ -284,9 +283,7 @@ impl RequestHandler {
                 window_target.window_index(),
                 |session| {
                     session.touch_attached();
-                    if let Some(selected_size) = size_selection.selected_size {
-                        session.resize_window(window_target.window_index(), selected_size)?;
-                    }
+                    size_selection.apply_to_window(session, window_target.window_index())?;
                     if let Some(selection) = request.target_selection.as_ref() {
                         selection.apply_to_session(session)?;
                     }

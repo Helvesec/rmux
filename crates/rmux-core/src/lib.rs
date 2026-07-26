@@ -105,8 +105,9 @@ pub use transcript::{ScreenCaptureRange, Transcript};
 pub use utf8::{text_width, truncate_right_to_width, truncate_to_width, Utf8Config};
 pub use vis::encode_paste_bytes;
 pub use window::{
-    AlertFlags, Window, WindowPaneActivity, WINDOW_ACTIVITY, WINDOW_ALERTFLAGS, WINDOW_BELL,
-    WINDOW_SILENCE, WINLINK_ACTIVITY, WINLINK_ALERTFLAGS, WINLINK_BELL, WINLINK_SILENCE,
+    AlertFlags, Window, WindowPaneActivity, WindowSizeBasis, WINDOW_ACTIVITY, WINDOW_ALERTFLAGS,
+    WINDOW_BELL, WINDOW_SILENCE, WINLINK_ACTIVITY, WINLINK_ALERTFLAGS, WINLINK_BELL,
+    WINLINK_SILENCE,
 };
 
 /// Returns whether `text` matches the tmux-style glob `pattern`.

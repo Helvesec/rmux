@@ -5,7 +5,7 @@ use rmux_core::{
         is_truthy, render_list_panes_line, FormatContext, DEFAULT_DISPLAY_MESSAGE_FORMAT,
         DEFAULT_LIST_PANES_SESSION_FORMAT, DEFAULT_LIST_PANES_WINDOW_FORMAT,
     },
-    PaneId,
+    PaneId, WindowSizeBasis,
 };
 use rmux_proto::{
     CommandOutput, DisplayMessageResponse, ErrorResponse, ListPanesResponse, Response, RmuxError,
@@ -602,9 +602,6 @@ impl RequestHandler {
             }
             if uses_lone_session_print_context {
                 context = context.without_session_size();
-                if format_client_snapshot.is_none() {
-                    context = context.with_unclipped_geometry();
-                }
             }
             context = context.with_named_value(
                 "socket_path",
@@ -846,7 +843,6 @@ pub(in crate::handler) fn display_message_context<'a>(
     match target {
         Target::Session(_) => {
             let window = session.window();
-            let use_unclipped_geometry = attached_count == 0 && window.pane_count() == 1;
             let mut context = FormatContext::from_session(session)
                 .with_session_attached(attached_count)
                 .with_window(active_window, window, true, false);
@@ -860,9 +856,6 @@ pub(in crate::handler) fn display_message_context<'a>(
             if let Some(pane) = window.active_pane() {
                 runtime = runtime.with_pane(pane);
             }
-            if use_unclipped_geometry {
-                runtime = runtime.with_unclipped_geometry();
-            }
             Ok((session, runtime))
         }
         Target::Window(target) => {
@@ -873,7 +866,6 @@ pub(in crate::handler) fn display_message_context<'a>(
                     "window index does not exist in session",
                 )
             })?;
-            let use_unclipped_geometry = attached_count == 0 && window.pane_count() == 1;
             let mut context = FormatContext::from_session(session)
                 .with_session_attached(attached_count)
                 .with_window(
@@ -892,9 +884,6 @@ pub(in crate::handler) fn display_message_context<'a>(
             if let Some(pane) = window.active_pane() {
                 runtime = runtime.with_pane(pane);
             }
-            if use_unclipped_geometry {
-                runtime = runtime.with_unclipped_geometry();
-            }
             Ok((session, runtime))
         }
         Target::Pane(target) => {
@@ -912,7 +901,6 @@ pub(in crate::handler) fn display_message_context<'a>(
                     "pane index does not exist in session",
                 )
             })?;
-            let use_unclipped_geometry = attached_count == 0 && window.pane_count() == 1;
             let context = FormatContext::from_session(session)
                 .with_session_attached(attached_count)
                 .with_window(
@@ -922,14 +910,11 @@ pub(in crate::handler) fn display_message_context<'a>(
                     Some(window_index) == last_window,
                 )
                 .with_pane(pane, pane_index == window.active_pane_index());
-            let mut runtime = RuntimeFormatContext::new(context)
+            let runtime = RuntimeFormatContext::new(context)
                 .with_state(state)
                 .with_session(session)
                 .with_window(window_index, window)
                 .with_pane(pane);
-            if use_unclipped_geometry {
-                runtime = runtime.with_unclipped_geometry();
-            }
             Ok((session, runtime))
         }
     }
@@ -1050,7 +1035,13 @@ fn collect_list_pane_output_with_selection(
     } else {
         DEFAULT_LIST_PANES_SESSION_FORMAT
     }));
-    let fast_format = if attached_count == 0 && !structured {
+    let fast_format = if attached_count == 0
+        && !structured
+        && session
+            .windows()
+            .values()
+            .all(|window| window.size_basis() == WindowSizeBasis::Content)
+    {
         format.and_then(DefaultListPanesFormat::from_format)
     } else {
         None
@@ -1094,15 +1085,12 @@ fn collect_list_pane_output_with_selection(
                 stdout.pop();
             }
             let context = window_context.clone().with_pane(pane, pane_active);
-            let mut runtime = RuntimeFormatContext::new(context)
+            let runtime = RuntimeFormatContext::new(context)
                 .with_state(state)
                 .with_socket_path(socket_path)
                 .with_session(session)
                 .with_window(*window_index, window)
                 .with_pane(pane);
-            if attached_count == 0 {
-                runtime = runtime.with_unclipped_geometry();
-            }
             if let Some(filter) = filter {
                 let expanded = render_runtime_template(filter, &runtime, false);
                 if !is_truthy(&expanded) {

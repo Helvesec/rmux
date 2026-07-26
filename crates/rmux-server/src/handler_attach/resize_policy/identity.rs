@@ -80,17 +80,14 @@ impl RequestHandler {
             ) {
                 continue;
             }
-            let Some(selected_size) = selection.selected_size else {
+            if selection.selected_size().is_none() {
                 return Ok(Vec::new());
-            };
-            let current_size = state
+            }
+            let session = state
                 .sessions
                 .session(target.session_name())
-                .expect("stable resize session identity was revalidated")
-                .window_at(target.window_index())
-                .expect("stable resize window identity was revalidated")
-                .size();
-            if current_size == selected_size {
+                .expect("stable resize session identity was revalidated");
+            if selection.matches_window(session, target.window_index()) {
                 return Ok(Vec::new());
             }
             self.pause_before_attached_size_apply().await;
@@ -98,10 +95,7 @@ impl RequestHandler {
             state.mutate_session_and_resize_window_terminal(
                 target.session_name(),
                 window_index,
-                |session| {
-                    session.resize_window(window_index, selected_size)?;
-                    Ok(())
-                },
+                |session| selection.apply_to_window(session, window_index),
             )?;
             drop(active_control);
             drop(active_attach);
@@ -120,7 +114,7 @@ impl RequestHandler {
         session_id: SessionId,
         window_id: WindowId,
     ) -> Option<(WindowTarget, AttachedSizeSelection)> {
-        let (target, policy, aggressive_resize, linked_sessions) = {
+        let (target, policy, status, aggressive_resize, linked_sessions) = {
             let state = self.state.lock().await;
             let target = window_target_for_identity(&state, session_id, window_id)?;
             let policy = policy_from_option_value(state.options.resolve_for_window(
@@ -139,7 +133,11 @@ impl RequestHandler {
                 target.window_index(),
                 aggressive_resize,
             );
-            (target, policy, aggressive_resize, linked_sessions)
+            let status = state
+                .options
+                .resolve(Some(target.session_name()), OptionName::Status)
+                .map(str::to_owned);
+            (target, policy, status, aggressive_resize, linked_sessions)
         };
         let (candidates, control_candidates, active_attach_epoch) = {
             let active_attach = self.active_attach.lock().await;
@@ -154,11 +152,17 @@ impl RequestHandler {
             )
         };
         let selection = AttachedSizeSelection {
-            selected_size: selected_client_size(policy, candidates, &control_candidates),
+            selected_size: selected_client_size(
+                policy,
+                candidates,
+                &control_candidates,
+                status.as_deref(),
+            ),
             session_id,
             active_window_index: target.window_index(),
             active_window_id: window_id,
             policy,
+            status,
             aggressive_resize,
             linked_sessions,
             active_attach_epoch,

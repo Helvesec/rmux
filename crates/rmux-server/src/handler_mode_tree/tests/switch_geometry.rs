@@ -17,9 +17,10 @@ const NOTIFICATION_SETTLE: Duration = Duration::from_millis(250);
 /// Frozen tmux 3.7b oracle, measured 2026-07-25
 /// (`.rmux-audit/oracle/scenario_switch_destination.py`): a 101x41 client
 /// switching onto a session whose only other client is a 60x20 control client
-/// grows the destination window to 101x41, and that control client receives
+/// stores the 101x41 terminal size while the default one-line status leaves a
+/// 101x40 content layout, and that control client receives
 ///     %client-session-changed <client> $1 target
-///     %layout-change @1 aefe,101x41,0,0,1 aefe,101x41,0,0,1 *
+///     %layout-change @1 aefe,101x40,0,0,1 aefe,101x40,0,0,1 *
 /// in that order. `choose-tree` reaches `switch-client -Zt` through its own
 /// action path, so it is asserted separately from the command form.
 #[tokio::test]
@@ -139,7 +140,7 @@ async fn choose_tree_switch_notifies_the_destination_session_layout_change_like_
             .split_whitespace()
             .nth(2)
             .and_then(|layout| layout.split(',').nth(1)),
-        Some("101x41"),
+        Some("101x40"),
         "{:?}",
         lines[layout_index]
     );

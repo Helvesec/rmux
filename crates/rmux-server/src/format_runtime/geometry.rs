@@ -1,4 +1,4 @@
-use rmux_core::{OptionStore, Pane, PaneGeometry, Session, Window};
+use rmux_core::{OptionStore, Pane, PaneGeometry, Session, Window, WindowSizeBasis};
 use rmux_proto::{OptionName, ResizePaneAdjustment, TerminalSize};
 
 use crate::pane_visible_geometry::{clip_pane_geometry, visible_pane_content_geometry};
@@ -9,12 +9,9 @@ use super::RuntimeFormatContext;
 impl RuntimeFormatContext<'_> {
     pub(super) fn visible_session_snapshot(&self) -> Option<Session> {
         let mut session = self.session?.clone();
-        if !self.use_unclipped_geometry {
-            let size =
-                visible_session_size(self.option_store(), &session, self.session_attached_count());
-            if size != session.window().size() {
-                session.resize_terminal(size);
-            }
+        let size = visible_session_size(self.option_store(), &session);
+        if size != session.window().size() {
+            session.resize_terminal(size);
         }
         Some(session)
     }
@@ -43,12 +40,9 @@ impl RuntimeFormatContext<'_> {
                 ResizePaneAdjustment::Zoom,
             );
         }
-        if !self.use_unclipped_geometry {
-            let size =
-                visible_session_size(self.option_store(), &session, self.session_attached_count());
-            if size != session.window().size() {
-                session.resize_terminal(size);
-            }
+        let size = visible_session_size(self.option_store(), &session);
+        if size != session.window().size() {
+            session.resize_terminal(size);
         }
         let window_index = self
             .window_index
@@ -110,16 +104,13 @@ impl RuntimeFormatContext<'_> {
     }
 }
 
-fn visible_session_size(
-    options: Option<&OptionStore>,
-    session: &Session,
-    attached_count: usize,
-) -> TerminalSize {
-    let size = session.window().size();
+fn visible_session_size(options: Option<&OptionStore>, session: &Session) -> TerminalSize {
+    let window = session.window();
+    let size = window.size();
     if size.cols == 0 || size.rows == 0 {
         return size;
     }
-    if attached_count == 0 {
+    if window.size_basis() == WindowSizeBasis::Content {
         return size;
     }
 
@@ -139,11 +130,35 @@ fn visible_session_size(
 #[cfg(test)]
 mod tests {
     use super::visible_session_size;
-    use rmux_core::{OptionStore, Session};
+    use rmux_core::{OptionStore, Session, WindowSizeBasis};
     use rmux_proto::{OptionName, ScopeSelector, SessionName, SetOptionMode, TerminalSize};
 
     #[test]
     fn visible_session_size_uses_multi_line_status_rows() {
+        let alpha = SessionName::new("alpha").expect("valid session name");
+        let mut session = Session::new(alpha.clone(), TerminalSize { cols: 80, rows: 24 });
+        session
+            .window_at_mut(0)
+            .expect("initial window")
+            .set_size_basis(WindowSizeBasis::Terminal);
+        let mut options = OptionStore::default();
+        options
+            .set(
+                ScopeSelector::Session(alpha),
+                OptionName::Status,
+                "3".to_owned(),
+                SetOptionMode::Replace,
+            )
+            .expect("session status set succeeds");
+
+        assert_eq!(
+            visible_session_size(Some(&options), &session),
+            TerminalSize { cols: 80, rows: 21 }
+        );
+    }
+
+    #[test]
+    fn visible_session_size_keeps_content_based_rows() {
         let alpha = SessionName::new("alpha").expect("valid session name");
         let session = Session::new(alpha.clone(), TerminalSize { cols: 80, rows: 24 });
         let mut options = OptionStore::default();
@@ -157,8 +172,8 @@ mod tests {
             .expect("session status set succeeds");
 
         assert_eq!(
-            visible_session_size(Some(&options), &session, 1),
-            TerminalSize { cols: 80, rows: 21 }
+            visible_session_size(Some(&options), &session),
+            TerminalSize { cols: 80, rows: 24 }
         );
     }
 }

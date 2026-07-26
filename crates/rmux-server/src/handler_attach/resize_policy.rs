@@ -1,18 +1,22 @@
 use std::collections::HashSet;
 use std::sync::atomic::Ordering;
 
-use rmux_core::LifecycleEvent;
+use rmux_core::{LifecycleEvent, Session, WindowSizeBasis};
 use rmux_proto::{
     OptionName, RmuxError, SessionId, SessionName, TerminalSize, WindowId, WindowTarget,
 };
 
 use crate::client_names::attached_client_name;
 use crate::pane_io::AttachControl;
+use crate::status_lines::content_rows_for_status;
 
 use super::super::{client_support::SwitchTargetSelection, RequestHandler};
 
 #[path = "resize_policy/identity.rs"]
 mod identity;
+#[cfg(test)]
+#[path = "resize_policy/tests.rs"]
+mod tests;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(in crate::handler) enum AttachedWindowSizePolicy {
@@ -25,7 +29,9 @@ pub(in crate::handler) enum AttachedWindowSizePolicy {
 #[derive(Debug, Clone, Copy)]
 struct AttachedSizeCandidate {
     size: TerminalSize,
+    stored_rows: u16,
     sequence: u64,
+    basis: WindowSizeBasis,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -42,18 +48,64 @@ impl ControlSizeCandidate {
     const fn size_candidate(&self) -> AttachedSizeCandidate {
         AttachedSizeCandidate {
             size: self.size,
+            stored_rows: self.size.rows,
             sequence: self.sequence,
+            basis: WindowSizeBasis::Content,
         }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct SelectedWindowSize {
+    stored_size: TerminalSize,
+    basis: WindowSizeBasis,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct SelectedContentSize {
+    size: TerminalSize,
+    row_basis: WindowSizeBasis,
+    stored_rows: u16,
+}
+
+impl SelectedWindowSize {
+    const fn size(self) -> TerminalSize {
+        self.stored_size
+    }
+
+    fn matches_window(self, session: &Session, window_index: u32) -> bool {
+        session.window_at(window_index).is_some_and(|window| {
+            window.size() == self.stored_size && window.size_basis() == self.basis
+        })
+    }
+
+    fn apply_to_window(self, session: &mut Session, window_index: u32) -> Result<(), RmuxError> {
+        session.resize_window(window_index, self.stored_size)?;
+        session
+            .window_at_mut(window_index)
+            .expect("resized window remains present")
+            .set_size_basis(self.basis);
+        Ok(())
+    }
+
+    fn apply_to_active_window(self, session: &mut Session) {
+        let active_window_index = session.active_window_index();
+        session.resize_active_window_terminal(self.stored_size);
+        session
+            .window_at_mut(active_window_index)
+            .expect("active window remains present")
+            .set_size_basis(self.basis);
     }
 }
 
 #[derive(Debug, Clone)]
 pub(in crate::handler) struct AttachedSizeSelection {
-    pub(in crate::handler) selected_size: Option<TerminalSize>,
+    selected_size: Option<SelectedWindowSize>,
     pub(in crate::handler) session_id: SessionId,
     active_window_index: u32,
     active_window_id: WindowId,
     policy: AttachedWindowSizePolicy,
+    status: Option<String>,
     aggressive_resize: bool,
     linked_sessions: HashSet<(SessionName, SessionId)>,
     active_attach_epoch: u64,
@@ -67,6 +119,41 @@ impl AttachedSizeSelection {
             && session
                 .window_at(self.active_window_index)
                 .is_some_and(|window| window.id() == self.active_window_id)
+    }
+
+    pub(in crate::handler) fn selected_size(&self) -> Option<TerminalSize> {
+        self.selected_size.map(SelectedWindowSize::size)
+    }
+
+    pub(in crate::handler) fn render_override(
+        &self,
+        window_index: u32,
+    ) -> Option<super::AttachWindowSizeOverride> {
+        self.selected_size.map(|selected| {
+            super::AttachWindowSizeOverride::new(window_index, selected.stored_size, selected.basis)
+        })
+    }
+
+    pub(in crate::handler) fn matches_window(&self, session: &Session, window_index: u32) -> bool {
+        self.selected_size
+            .is_none_or(|selected| selected.matches_window(session, window_index))
+    }
+
+    pub(in crate::handler) fn apply_to_window(
+        &self,
+        session: &mut Session,
+        window_index: u32,
+    ) -> Result<(), RmuxError> {
+        match self.selected_size {
+            Some(selected) => selected.apply_to_window(session, window_index),
+            None => Ok(()),
+        }
+    }
+
+    pub(in crate::handler) fn apply_to_active_window(&self, session: &mut Session) {
+        if let Some(selected) = self.selected_size {
+            selected.apply_to_active_window(session);
+        }
     }
 }
 
@@ -138,7 +225,7 @@ pub(in crate::handler) fn resize_control_session_for_client(
             return Err(crate::pane_terminals::session_not_found(session_name));
         }
         session.touch_attached();
-        session.resize_active_window_terminal(selected_size);
+        selected_size.apply_to_active_window(session);
         Ok(())
     })
 }
@@ -188,7 +275,7 @@ pub(in crate::handler) fn switch_control_session_for_client(
                 selection.apply_to_session(session)?;
             }
             if let Some(selected_size) = selected_size {
-                session.resize_window(window_index, selected_size)?;
+                selected_size.apply_to_window(session, window_index)?;
             }
             Ok(())
         },
@@ -202,21 +289,27 @@ fn control_resize_selection(
     session_name: &SessionName,
     expected_session_id: SessionId,
     window_index: u32,
-) -> Result<(TerminalSize, Option<TerminalSize>), RmuxError> {
+) -> Result<(SelectedWindowSize, Option<SelectedWindowSize>), RmuxError> {
     let session = state
         .sessions
         .session(session_name)
         .filter(|session| session.id() == expected_session_id)
         .ok_or_else(|| crate::pane_terminals::session_not_found(session_name))?;
-    let current_size = session
+    let current_window = session
         .window_at(window_index)
-        .ok_or_else(|| RmuxError::invalid_target(window_index.to_string(), "window not found"))?
-        .size();
+        .ok_or_else(|| RmuxError::invalid_target(window_index.to_string(), "window not found"))?;
+    let current_size = SelectedWindowSize {
+        stored_size: current_window.size(),
+        basis: current_window.size_basis(),
+    };
     let policy = policy_from_option_value(state.options.resolve_for_window(
         session_name,
         window_index,
         OptionName::WindowSize,
     ));
+    let status = state
+        .options
+        .resolve(Some(session_name), OptionName::Status);
     let aggressive_resize =
         state
             .options
@@ -229,7 +322,9 @@ fn control_resize_selection(
         &linked_sessions,
         client.declared_size.map(|size| AttachedSizeCandidate {
             size,
+            stored_rows: size.rows,
             sequence: client.size_sequence,
+            basis: WindowSizeBasis::Content,
         }),
     );
     let control_candidates = control_size_candidates(
@@ -239,7 +334,7 @@ fn control_resize_selection(
     );
     Ok((
         current_size,
-        selected_client_size(policy, candidates, &control_candidates),
+        selected_client_size(policy, candidates, &control_candidates, status),
     ))
 }
 
@@ -296,13 +391,27 @@ fn selected_client_size(
     policy: AttachedWindowSizePolicy,
     mut attached_candidates: Vec<AttachedSizeCandidate>,
     control_candidates: &[ControlSizeCandidate],
-) -> Option<TerminalSize> {
+    status: Option<&str>,
+) -> Option<SelectedWindowSize> {
     attached_candidates.extend(
         control_candidates
             .iter()
             .map(ControlSizeCandidate::size_candidate),
     );
-    selected_attached_size(policy, &attached_candidates)
+    for candidate in &mut attached_candidates {
+        if candidate.basis == WindowSizeBasis::Terminal {
+            candidate.size.rows = content_rows_for_status(status, candidate.size.rows);
+        }
+    }
+    let selected = selected_attached_size(policy, &attached_candidates)?;
+    let stored_size = TerminalSize {
+        cols: selected.size.cols,
+        rows: selected.stored_rows,
+    };
+    Some(SelectedWindowSize {
+        stored_size,
+        basis: selected.row_basis,
+    })
 }
 
 impl RequestHandler {
@@ -369,22 +478,19 @@ impl RequestHandler {
             ) {
                 continue;
             }
-            let Some(selected_size) = selection.selected_size else {
+            if selection.selected_size.is_none() {
                 return Ok(None);
-            };
-            if state
+            }
+            let session = state
                 .sessions
                 .session(session_name)
-                .expect("stable attached-size selection was revalidated")
-                .window()
-                .size()
-                == selected_size
-            {
+                .expect("stable attached-size selection was revalidated");
+            if selection.matches_window(session, selection.active_window_index) {
                 return Ok(None);
             }
             self.pause_before_attached_size_apply().await;
             state.mutate_session_and_resize_active_window_terminal(session_name, |session| {
-                session.resize_active_window_terminal(selected_size);
+                selection.apply_to_active_window(session);
                 Ok(())
             })?;
             drop(active_control);
@@ -466,17 +572,14 @@ impl RequestHandler {
             ) {
                 continue;
             }
-            let Some(selected_size) = selection.selected_size else {
+            if selection.selected_size.is_none() {
                 return Ok(None);
-            };
-            let current_size = state
+            }
+            let session = state
                 .sessions
                 .session(target.session_name())
-                .expect("stable attached-size session was revalidated")
-                .window_at(target.window_index())
-                .expect("stable window selection was revalidated")
-                .size();
-            if current_size == selected_size {
+                .expect("stable attached-size session was revalidated");
+            if selection.matches_window(session, target.window_index()) {
                 return Ok(None);
             }
             self.pause_before_attached_size_apply().await;
@@ -484,10 +587,7 @@ impl RequestHandler {
             state.mutate_session_and_resize_window_terminal(
                 target.session_name(),
                 window_index,
-                |session| {
-                    session.resize_window(window_index, selected_size)?;
-                    Ok(())
-                },
+                |session| selection.apply_to_window(session, window_index),
             )?;
             drop(active_control);
             drop(active_attach);
@@ -527,6 +627,7 @@ impl RequestHandler {
     ) -> Result<AttachedSizeSelection, RmuxError> {
         let (
             policy,
+            status,
             aggressive_resize,
             linked_sessions,
             session_id,
@@ -551,6 +652,10 @@ impl RequestHandler {
             ) == Some("on");
             (
                 policy,
+                state
+                    .options
+                    .resolve(Some(session_name), OptionName::Status)
+                    .map(str::to_owned),
                 aggressive_resize,
                 linked_session_identities(
                     &state,
@@ -566,7 +671,9 @@ impl RequestHandler {
 
         let incoming_candidate = incoming_client_size.map(|size| AttachedSizeCandidate {
             size,
+            stored_rows: size.rows,
             sequence: self.current_client_size_sequence(),
+            basis: WindowSizeBasis::Terminal,
         });
         let (candidates, control_candidates, active_attach_epoch) = {
             let active_attach = self.active_attach.lock().await;
@@ -582,11 +689,17 @@ impl RequestHandler {
             )
         };
         Ok(AttachedSizeSelection {
-            selected_size: selected_client_size(policy, candidates, &control_candidates),
+            selected_size: selected_client_size(
+                policy,
+                candidates,
+                &control_candidates,
+                status.as_deref(),
+            ),
             session_id,
             active_window_index,
             active_window_id,
             policy,
+            status,
             aggressive_resize,
             linked_sessions,
             active_attach_epoch,
@@ -600,7 +713,7 @@ impl RequestHandler {
         target: &WindowTarget,
         incoming_client_size: Option<TerminalSize>,
     ) -> Result<AttachedSizeSelection, RmuxError> {
-        let (policy, aggressive_resize, linked_sessions, session_id, window_id) = {
+        let (policy, status, aggressive_resize, linked_sessions, session_id, window_id) = {
             let state = self.state.lock().await;
             let session = state
                 .sessions
@@ -624,6 +737,10 @@ impl RequestHandler {
             ) == Some("on");
             (
                 policy,
+                state
+                    .options
+                    .resolve(Some(target.session_name()), OptionName::Status)
+                    .map(str::to_owned),
                 aggressive_resize,
                 linked_session_identities(
                     &state,
@@ -637,7 +754,9 @@ impl RequestHandler {
         };
         let incoming_candidate = incoming_client_size.map(|size| AttachedSizeCandidate {
             size,
+            stored_rows: size.rows,
             sequence: self.current_client_size_sequence(),
+            basis: WindowSizeBasis::Terminal,
         });
         let (candidates, control_candidates, active_attach_epoch) = {
             let active_attach = self.active_attach.lock().await;
@@ -653,11 +772,17 @@ impl RequestHandler {
             )
         };
         Ok(AttachedSizeSelection {
-            selected_size: selected_client_size(policy, candidates, &control_candidates),
+            selected_size: selected_client_size(
+                policy,
+                candidates,
+                &control_candidates,
+                status.as_deref(),
+            ),
             session_id,
             active_window_index: target.window_index(),
             active_window_id: window_id,
             policy,
+            status,
             aggressive_resize,
             linked_sessions,
             active_attach_epoch,
@@ -692,6 +817,9 @@ impl RequestHandler {
             selection.active_window_index,
             OptionName::WindowSize,
         ));
+        let status = state
+            .options
+            .resolve(Some(session_name), OptionName::Status);
         let aggressive_resize = state.options.resolve_for_window(
             session_name,
             selection.active_window_index,
@@ -703,9 +831,12 @@ impl RequestHandler {
             .incoming_client_size
             .map(|size| AttachedSizeCandidate {
                 size,
+                stored_rows: size.rows,
                 sequence: self.current_client_size_sequence(),
+                basis: WindowSizeBasis::Terminal,
             });
         policy == selection.policy
+            && status == selection.status.as_deref()
             && aggressive_resize == selection.aggressive_resize
             && linked_session_identities(
                 state,
@@ -722,6 +853,7 @@ impl RequestHandler {
                     incoming_candidate,
                 ),
                 &current_control_candidates,
+                status,
             ) == selection.selected_size
     }
 
@@ -844,7 +976,9 @@ fn attached_size_candidates(
         })
         .map(|active| AttachedSizeCandidate {
             size: active.client_size,
+            stored_rows: active.client_size.rows,
             sequence: active.size_sequence,
+            basis: WindowSizeBasis::Terminal,
         })
         .collect::<Vec<_>>();
     if let Some(incoming_client) = incoming_client {
@@ -937,26 +1071,50 @@ fn policy_from_option_value(value: Option<&str>) -> AttachedWindowSizePolicy {
 fn selected_attached_size(
     policy: AttachedWindowSizePolicy,
     candidates: &[AttachedSizeCandidate],
-) -> Option<TerminalSize> {
+) -> Option<SelectedContentSize> {
     match policy {
         AttachedWindowSizePolicy::Manual => None,
         AttachedWindowSizePolicy::Latest => candidates
             .iter()
             .max_by_key(|candidate| candidate.sequence)
-            .map(|candidate| candidate.size),
-        AttachedWindowSizePolicy::Largest => candidates
-            .iter()
-            .map(|candidate| candidate.size)
-            .reduce(|selected, size| TerminalSize {
-                cols: selected.cols.max(size.cols),
-                rows: selected.rows.max(size.rows),
+            .map(|candidate| SelectedContentSize {
+                size: candidate.size,
+                row_basis: candidate.basis,
+                stored_rows: candidate.stored_rows,
             }),
-        AttachedWindowSizePolicy::Smallest => candidates
-            .iter()
-            .map(|candidate| candidate.size)
-            .reduce(|selected, size| TerminalSize {
-                cols: selected.cols.min(size.cols),
-                rows: selected.rows.min(size.rows),
-            }),
+        AttachedWindowSizePolicy::Largest => selected_extreme_attached_size(candidates, u16::max),
+        AttachedWindowSizePolicy::Smallest => selected_extreme_attached_size(candidates, u16::min),
     }
+}
+
+fn selected_extreme_attached_size(
+    candidates: &[AttachedSizeCandidate],
+    select: impl Fn(u16, u16) -> u16,
+) -> Option<SelectedContentSize> {
+    let first = candidates.first()?;
+    let size = candidates
+        .iter()
+        .skip(1)
+        .fold(first.size, |selected, candidate| TerminalSize {
+            cols: select(selected.cols, candidate.size.cols),
+            rows: select(selected.rows, candidate.size.rows),
+        });
+    let row_basis = if candidates.iter().any(|candidate| {
+        candidate.size.rows == size.rows && candidate.basis == WindowSizeBasis::Content
+    }) {
+        WindowSizeBasis::Content
+    } else {
+        WindowSizeBasis::Terminal
+    };
+    let stored_rows = candidates
+        .iter()
+        .filter(|candidate| candidate.size.rows == size.rows && candidate.basis == row_basis)
+        .map(|candidate| candidate.stored_rows)
+        .reduce(select)
+        .expect("the selected row has at least one owning candidate");
+    Some(SelectedContentSize {
+        size,
+        row_basis,
+        stored_rows,
+    })
 }

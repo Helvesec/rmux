@@ -1,6 +1,8 @@
 use std::collections::{HashMap, HashSet};
 
-use rmux_core::{EnvironmentStore, HookStore, OptionStore, PaneId, Session, SessionStore};
+use rmux_core::{
+    EnvironmentStore, HookStore, OptionStore, PaneId, Session, SessionStore, WindowSizeBasis,
+};
 use rmux_proto::{RmuxError, SessionName, TerminalPixels, WindowTarget};
 
 use super::{
@@ -138,7 +140,7 @@ impl HandlerState {
         F: FnOnce(&mut Session) -> Result<T, RmuxError>,
         P: FnOnce(&T) -> bool,
     {
-        let size_before = self.window_size(session_name, window_index);
+        let geometry_before = self.window_geometry_basis(session_name, window_index);
         let (result, synchronized_sessions, snapshot) = self
             .mutate_session_and_synchronize_window_family_with_snapshot(
                 session_name,
@@ -147,7 +149,7 @@ impl HandlerState {
             )?;
 
         if !should_resize(&result) {
-            self.record_window_geometry_change(session_name, window_index, size_before);
+            self.record_window_geometry_change(session_name, window_index, geometry_before);
             return Ok((result, synchronized_sessions));
         }
 
@@ -165,7 +167,7 @@ impl HandlerState {
         for synchronized_session in &synchronized_sessions {
             self.sync_pane_lifecycle_dimensions_for_session(synchronized_session);
         }
-        self.record_window_geometry_change(session_name, window_index, size_before);
+        self.record_window_geometry_change(session_name, window_index, geometry_before);
         Ok((result, synchronized_sessions))
     }
 
@@ -173,16 +175,27 @@ impl HandlerState {
         &mut self,
         session_name: &SessionName,
         window_index: u32,
-        size_before: Option<rmux_proto::TerminalSize>,
+        geometry_before: Option<(rmux_proto::TerminalSize, WindowSizeBasis)>,
     ) {
-        let size_after = self.window_size(session_name, window_index);
-        if size_after.is_none() || size_after == size_before {
+        let geometry_after = self.window_geometry_basis(session_name, window_index);
+        if geometry_after.is_none() || geometry_after == geometry_before {
             return;
         }
         self.record_applied_window_resize(WindowTarget::with_window(
             session_name.clone(),
             window_index,
         ));
+    }
+
+    fn window_geometry_basis(
+        &self,
+        session_name: &SessionName,
+        window_index: u32,
+    ) -> Option<(rmux_proto::TerminalSize, WindowSizeBasis)> {
+        self.sessions
+            .session(session_name)
+            .and_then(|session| session.window_at(window_index))
+            .map(|window| (window.size(), window.size_basis()))
     }
 
     pub(crate) fn mutate_session_and_synchronize_window_family<T, F>(

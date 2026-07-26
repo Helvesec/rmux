@@ -83,14 +83,11 @@ impl RequestHandler {
             if current_session_name != session_name {
                 continue;
             }
-            let mut runtime = format_context_for_target(
+            let runtime = format_context_for_target(
                 &state,
                 &rmux_proto::Target::Session(session_name.clone()),
                 attached_count,
             )?;
-            if attached_count == 0 {
-                runtime = runtime.with_unclipped_geometry();
-            }
             let expanded =
                 render_runtime_template(template.unwrap_or(NEW_SESSION_TEMPLATE), &runtime, false);
             return Ok((

@@ -5,7 +5,7 @@ use std::sync::Mutex as StdMutex;
 
 use rmux_core::{
     BufferStore, EnvironmentStore, HookStore, KeyBindingStore, OptionStore, PaneGeometry, PaneId,
-    Session, SessionStore,
+    Session, SessionStore, WindowSizeBasis,
 };
 use rmux_proto::{
     KillPaneResponse, KillWindowResponse, OptionName, PaneTarget, ProcessCommand, RmuxError,
@@ -372,17 +372,6 @@ impl HandlerState {
         std::mem::take(&mut self.applied_window_resizes)
     }
 
-    pub(crate) fn window_size(
-        &self,
-        session_name: &SessionName,
-        window_index: u32,
-    ) -> Option<rmux_proto::TerminalSize> {
-        self.sessions
-            .session(session_name)
-            .and_then(|session| session.window_at(window_index))
-            .map(rmux_core::Window::size)
-    }
-
     pub(crate) fn reserve_lifecycle_commit_order(
         &self,
     ) -> Option<crate::lifecycle_commit_order::LifecycleCommitTicket> {
@@ -596,15 +585,15 @@ fn pane_terminal_geometry_for_session(
 }
 
 fn session_content_rows(session: &Session, options: &OptionStore, window_index: u32) -> u16 {
-    let size = session
+    let window = session
         .window_at(window_index)
-        .map(|window| window.size())
-        .unwrap_or_else(|| session.window().size());
+        .unwrap_or_else(|| session.window());
+    let size = window.size();
     if size.cols == 0 || size.rows == 0 {
         return size.rows;
     }
 
-    if session.last_attached_at().is_none() {
+    if window.size_basis() == WindowSizeBasis::Content {
         return size.rows;
     }
 
@@ -626,7 +615,7 @@ mod tests {
         pane_terminal_geometry_for_session, session_content_rows, HandlerState,
         InitialPaneSpawnOptions,
     };
-    use rmux_core::{PaneGeometry, Session};
+    use rmux_core::{PaneGeometry, Session, WindowSizeBasis};
     use rmux_proto::{
         HookLifecycle, HookName, OptionName, PaneTarget, RmuxError, ScopeSelector, SessionName,
         SetOptionMode, TerminalSize, WindowTarget,
@@ -637,10 +626,13 @@ mod tests {
     }
 
     #[test]
-    fn attached_session_content_rows_use_multi_line_status() {
+    fn terminal_sized_session_content_rows_use_multi_line_status() {
         let alpha = session_name("alpha");
         let mut session = Session::new(alpha.clone(), TerminalSize { cols: 80, rows: 24 });
-        session.touch_attached();
+        session
+            .window_at_mut(0)
+            .expect("initial window")
+            .set_size_basis(WindowSizeBasis::Terminal);
         let mut state = HandlerState::default();
 
         state
@@ -674,6 +666,25 @@ mod tests {
                 SetOptionMode::Replace,
             )
             .expect("session status set succeeds");
+        assert_eq!(session_content_rows(&session, &state.options, 0), 24);
+    }
+
+    #[test]
+    fn content_sized_session_does_not_reserve_status_rows_after_attach() {
+        let alpha = session_name("alpha");
+        let mut session = Session::new(alpha.clone(), TerminalSize { cols: 80, rows: 24 });
+        session.touch_attached();
+        let mut state = HandlerState::default();
+        state
+            .options
+            .set(
+                ScopeSelector::Session(alpha),
+                OptionName::Status,
+                "3".to_owned(),
+                SetOptionMode::Replace,
+            )
+            .expect("session status set succeeds");
+
         assert_eq!(session_content_rows(&session, &state.options, 0), 24);
     }
 

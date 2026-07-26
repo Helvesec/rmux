@@ -1,4 +1,4 @@
-use rmux_core::{OptionStore, Session};
+use rmux_core::{OptionStore, Session, WindowSizeBasis};
 use rmux_proto::{
     KillWindowResponse, LastWindowResponse, NewWindowResponse, NextWindowResponse, OptionName,
     PaneId, PreviousWindowResponse, RenameWindowResponse, RmuxError, ScopeSelector,
@@ -473,6 +473,10 @@ impl HandlerState {
                 window_index,
                 rmux_proto::TerminalSize { cols: sx, rows: sy },
             )?;
+            session
+                .window_at_mut(window_index)
+                .expect("resized window remains present")
+                .set_size_basis(WindowSizeBasis::Content);
 
             Ok(rmux_proto::ResizeWindowResponse {
                 target: request.target.clone(),

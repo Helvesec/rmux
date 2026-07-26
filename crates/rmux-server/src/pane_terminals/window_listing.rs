@@ -182,17 +182,15 @@ fn collect_window_entries(
             if let Some(pane) = window.active_pane() {
                 context = context.with_window_pane(window, pane);
             }
-            let mut runtime = RuntimeFormatContext::new(context)
+            let runtime = RuntimeFormatContext::new(context)
                 .with_state(state)
                 .with_socket_path(socket_path)
                 .with_session(session)
                 .with_window(*window_index, window);
-            if let Some(pane) = window.active_pane() {
-                runtime = runtime.with_pane(pane);
-            }
-            if attached_count == 0 {
-                runtime = runtime.with_unclipped_geometry();
-            }
+            let runtime = match window.active_pane() {
+                Some(pane) => runtime.with_pane(pane),
+                None => runtime,
+            };
             if let Some(filter) = filter {
                 let expanded = render_runtime_template(filter, &runtime, false);
                 if !is_truthy(&expanded) {

@@ -67,26 +67,40 @@ impl RequestHandler {
         terminal_context: OuterTerminalContext,
         flags: super::ClientFlags,
     ) -> u64 {
-        self.register_attach_with_access(
-            requester_pid,
-            session_name,
-            None,
-            AttachRegistration {
-                control_tx,
-                control_backlog: Arc::new(AtomicUsize::new(0)),
-                closing,
-                persistent_overlay_epoch: Arc::new(AtomicU64::new(0)),
-                terminal_context,
-                flags,
-                render_stream: false,
-                uid: current_owner_uid(),
-                user: self.server_owner_identity(),
-                can_write: true,
-                client_size: None,
-            },
-        )
-        .await
-        .expect("test attach registration session must remain current")
+        let registered_session = session_name.clone();
+        let tracks_geometry = !flags.contains(super::ClientFlags::IGNORESIZE);
+        let attach_id = self
+            .register_attach_with_access(
+                requester_pid,
+                session_name,
+                None,
+                AttachRegistration {
+                    control_tx,
+                    control_backlog: Arc::new(AtomicUsize::new(0)),
+                    closing,
+                    persistent_overlay_epoch: Arc::new(AtomicU64::new(0)),
+                    terminal_context,
+                    flags,
+                    render_stream: false,
+                    uid: current_owner_uid(),
+                    user: self.server_owner_identity(),
+                    can_write: true,
+                    client_size: None,
+                },
+            )
+            .await
+            .expect("test attach registration session must remain current");
+        if tracks_geometry {
+            let mut state = self.state.lock().await;
+            if let Some(session) = state.sessions.session_mut(&registered_session) {
+                let active_window_index = session.active_window_index();
+                session
+                    .window_at_mut(active_window_index)
+                    .expect("registered attach session retains its active window")
+                    .set_size_basis(rmux_core::WindowSizeBasis::Terminal);
+            }
+        }
+        attach_id
     }
 
     #[cfg(test)]

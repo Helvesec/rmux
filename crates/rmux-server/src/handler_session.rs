@@ -1651,17 +1651,15 @@ impl RequestHandler {
                 if let Some(pane) = active_window.active_pane() {
                     context = context.with_window_pane(active_window, pane);
                 }
-                let mut runtime = RuntimeFormatContext::new(context)
+                let runtime = RuntimeFormatContext::new(context)
                     .with_state(&state)
                     .with_socket_path(&socket_path)
                     .with_session(session)
                     .with_window(active_window_index, active_window);
-                if let Some(pane) = active_window.active_pane() {
-                    runtime = runtime.with_pane(pane);
-                }
-                if attached_count == 0 {
-                    runtime = runtime.with_unclipped_geometry();
-                }
+                let runtime = match active_window.active_pane() {
+                    Some(pane) => runtime.with_pane(pane),
+                    None => runtime,
+                };
                 if let Some(filter) = request.filter.as_deref() {
                     let expanded = render_runtime_template(filter, &runtime, false);
                     if !is_truthy(&expanded) {

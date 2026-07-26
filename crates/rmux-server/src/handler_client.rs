@@ -614,19 +614,14 @@ impl RequestHandler {
                     target.window_index(),
                     |session| {
                         session.touch_attached();
-                        if let Some(selected_size) = selection.selected_size {
-                            session.resize_window(target.window_index(), selected_size)?;
-                        }
-                        Ok(())
+                        selection.apply_to_window(session, target.window_index())
                     },
                 ),
                 None => state.mutate_session_and_resize_active_window_terminal(
                     session_name,
                     |session| {
                         session.touch_attached();
-                        if let Some(selected_size) = selection.selected_size {
-                            session.resize_active_window_terminal(selected_size);
-                        }
+                        selection.apply_to_active_window(session);
                         Ok(())
                     },
                 ),

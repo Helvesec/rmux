@@ -43,7 +43,6 @@ pub(crate) struct RuntimeFormatContext<'a> {
     pane: Option<&'a Pane>,
     client_size: Option<TerminalSize>,
     hide_session_size: bool,
-    use_unclipped_geometry: bool,
 }
 
 impl<'a> RuntimeFormatContext<'a> {
@@ -61,7 +60,6 @@ impl<'a> RuntimeFormatContext<'a> {
             pane: None,
             client_size: None,
             hide_session_size: false,
-            use_unclipped_geometry: false,
         }
     }
 
@@ -102,11 +100,6 @@ impl<'a> RuntimeFormatContext<'a> {
 
     pub(crate) fn without_session_size(mut self) -> Self {
         self.hide_session_size = true;
-        self
-    }
-
-    pub(crate) fn with_unclipped_geometry(mut self) -> Self {
-        self.use_unclipped_geometry = true;
         self
     }
 

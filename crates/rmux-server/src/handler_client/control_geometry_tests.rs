@@ -704,12 +704,13 @@ async fn switching_attached_client_notifies_the_source_session_layout_change_lik
 /// already sitting on the destination watches its window grow.
 ///
 /// Frozen tmux 3.7b oracle, measured 2026-07-25
-/// (`.rmux-audit/oracle/scenario_switch_destination.py`): with a 101x41 PTY
-/// client on `source`, a 60x20 control client on `target`, `window-size
-/// largest`, after `switch-client -c <tty> -t target` the destination window
-/// grows 60x20 -> 101x41 and the destination control client receives
+/// (`.rmux-audit/oracle/scenario_switch_destination.py` plus the status matrix):
+/// with a 101x41 PTY client on `source`, a 60x20 control client on `target`,
+/// default one-line status and `window-size largest`, after
+/// `switch-client -c <tty> -t target` the destination window grows
+/// 60x20 -> 101x40 and the destination control client receives
 ///     %client-session-changed /dev/ttys011 $1 target
-///     %layout-change @1 aefe,101x41,0,0,1 aefe,101x41,0,0,1 *
+///     %layout-change @1 aefe,101x40,0,0,1 aefe,101x40,0,0,1 *
 /// in that order.
 async fn assert_switch_notifies_the_destination_layout_change(
     handler: &RequestHandler,
@@ -764,7 +765,7 @@ async fn assert_switch_notifies_the_destination_layout_change(
         .expect("the destination control client must be told its window grew");
     assert_eq!(
         layout_change_geometry(&lines[layout_index]).as_deref(),
-        Some("101x41"),
+        Some("101x40"),
         "{:?}",
         lines[layout_index]
     );
@@ -830,10 +831,11 @@ async fn attach_session_from_an_attached_client_notifies_the_destination_layout_
 #[tokio::test]
 async fn attaching_client_notifies_the_destination_session_layout_change_like_tmux37() {
     // Frozen tmux 3.7b oracle, measured 2026-07-25
-    // (`.rmux-audit/oracle/scenario_attach_destination.py`): a 60x20 control
-    // client already on `target`, `window-size largest`, watches a brand-new
-    // 101x41 PTY client attach. The window grows 60x20 -> 101x41 and the
-    // control client receives `%layout-change @0 aefd,101x41,0,0,0 ...`.
+    // (`.rmux-audit/oracle/scenario_attach_destination.py` plus the status
+    // matrix): a 60x20 control client already on `target`, default one-line
+    // status and `window-size largest`, watches a brand-new 101x41 PTY client
+    // attach. The window grows 60x20 -> 101x40 and the control client receives
+    // `%layout-change @0 aefd,101x40,0,0,0 ...`.
     let handler = RequestHandler::new();
     let target = session_name("attach-arrival-dest");
     create_session(&handler, target.clone(), TARGET_SIZE).await;
@@ -895,7 +897,7 @@ async fn attaching_client_notifies_the_destination_session_layout_change_like_tm
         .expect("the control client must be told the attached window grew");
     assert_eq!(
         layout_change_geometry(&lines[layout_index]).as_deref(),
-        Some("101x41"),
+        Some("101x40"),
         "{:?}",
         lines[layout_index]
     );
@@ -1164,11 +1166,12 @@ async fn destroyed_session_rehome_notifies_the_attached_destination_layout_chang
     // (`.rmux-audit/oracle/scenario_destroy_rehome_destination.py`): `doomed`
     // holds a 101x41 PTY client with `detach-on-destroy off`, `keep` holds a
     // 60x20 control client, `window-size largest`. Killing `doomed` rehomes the
-    // PTY client onto `keep`, whose window grows 60x20 -> 101x41, and the
+    // PTY client onto `keep`, whose default-status window grows
+    // 60x20 -> 101x40, and the
     // destination control client receives
     //     %client-session-changed /dev/ttys010 $0 keep
     //     ...
-    //     %layout-change @0 aefd,101x41,0,0,0 aefd,101x41,0,0,0 *
+    //     %layout-change @0 aefd,101x40,0,0,0 aefd,101x40,0,0,0 *
     let handler = RequestHandler::new();
     let keep = session_name("rehome-dest-keep");
     let doomed = session_name("rehome-dest-doomed");
@@ -1226,7 +1229,7 @@ async fn destroyed_session_rehome_notifies_the_attached_destination_layout_chang
         .expect("the destination control client must be told the rehome grew its window");
     assert_eq!(
         layout_change_geometry(&lines[layout_index]).as_deref(),
-        Some("101x41"),
+        Some("101x40"),
         "{:?}",
         lines[layout_index]
     );
