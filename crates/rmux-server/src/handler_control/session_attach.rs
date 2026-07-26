@@ -98,35 +98,29 @@ impl RequestHandler {
         requester_pid: u32,
         session_name: &SessionName,
         session_id: SessionId,
-    ) -> bool {
-        if let Some(identity) = current_control_queue_identity(requester_pid) {
-            return self
-                .attach_control_session_for_queue(identity, session_name, Some(session_id))
-                .await
-                .unwrap_or(false);
-        }
-
-        let control_identity = {
+    ) {
+        let control_identity = if let Some(identity) = current_control_queue_identity(requester_pid)
+        {
+            identity
+        } else {
             let active_control = self.active_control.lock().await;
             let Some(active) = active_control
                 .by_pid
                 .get(&requester_pid)
                 .filter(|active| !active.closing.load(std::sync::atomic::Ordering::SeqCst))
             else {
-                return false;
+                return;
             };
             ControlClientIdentity::new(requester_pid, active.id)
         };
-        self.set_control_session_for_client_identity(
-            requester_pid,
-            control_identity.control_id(),
-            session_name.clone(),
-            session_id,
-            None,
-            None,
-        )
-        .await
-        .is_ok()
+        let _ = self
+            .attach_existing_control_session_for_client_identity(
+                requester_pid,
+                control_identity.control_id(),
+                session_name.clone(),
+                session_id,
+            )
+            .await;
     }
 
     async fn created_session_window_id(

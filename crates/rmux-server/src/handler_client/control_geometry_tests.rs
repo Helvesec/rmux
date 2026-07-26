@@ -4,6 +4,7 @@ use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
 use std::time::Duration;
 
+use rmux_core::command_parser::CommandParser;
 use rmux_proto::{
     ControlMode, DetachClientRequest, KillSessionRequest, NewSessionRequest, OptionName, Request,
     Response, ScopeSelector, SessionName, SetOptionMode, SetOptionRequest, SwitchClientRequest,
@@ -201,6 +202,78 @@ async fn switch_control_client_reapplies_reported_size_like_tmux37() {
             "{policy}"
         );
     }
+}
+
+#[tokio::test]
+async fn new_session_attach_existing_reconciles_control_geometry_like_tmux37() {
+    let handler = RequestHandler::new();
+    let source = session_name("control-new-session-attach-source");
+    let target = session_name("control-new-session-attach-target");
+    create_session(&handler, source.clone(), INITIAL_SIZE).await;
+    create_session(&handler, target.clone(), TARGET_SIZE).await;
+    set_window_size_policy(&handler, &source, "largest").await;
+    set_window_size_policy(&handler, &target, "largest").await;
+
+    let switching_pid = 92_350;
+    let surviving_pid = switching_pid + 1;
+    let (switching_id, mut switching_events) =
+        register_control_client_with_id(&handler, switching_pid, &source).await;
+    let (_surviving_id, mut surviving_events) =
+        register_control_client_with_id(&handler, surviving_pid, &source).await;
+    for (pid, size) in [
+        (switching_pid, CONTROL_SIZE),
+        (surviving_pid, SOURCE_ATTACHED_SIZE),
+    ] {
+        let response = handler
+            .handle(Request::RefreshClient(Box::new(
+                refresh_client_size_request(pid, size),
+            )))
+            .await;
+        assert!(
+            matches!(response, Response::RefreshClient(_)),
+            "{response:?}"
+        );
+    }
+    assert_eq!(session_size(&handler, &source).await, CONTROL_SIZE);
+    let source_layout_prefix = format!(
+        "%layout-change @{} ",
+        active_window_id(&handler, &source).await
+    );
+    settle_control_notifications(&mut switching_events).await;
+    settle_control_notifications(&mut surviving_events).await;
+
+    let commands = CommandParser::new()
+        .parse(&format!("new-session -A -s {target}"))
+        .expect("new-session -A parses");
+    let result = handler
+        .execute_control_commands_identity(switching_pid, switching_id, commands)
+        .await;
+
+    assert!(result.error.is_none(), "{:?}", result.error);
+    assert_eq!(
+        session_size(&handler, &source).await,
+        SOURCE_ATTACHED_SIZE,
+        "the source must fall back to its surviving control client"
+    );
+    assert_eq!(
+        session_size(&handler, &target).await,
+        CONTROL_SIZE,
+        "the destination must adopt the arriving control client's size"
+    );
+    let lines =
+        collect_control_notifications_through(&mut surviving_events, &source_layout_prefix).await;
+    let changed = lines
+        .iter()
+        .position(|line| line.starts_with("%client-session-changed "))
+        .expect("the surviving client is told that the other client moved");
+    let resized = lines
+        .iter()
+        .position(|line| line.starts_with(&source_layout_prefix))
+        .expect("the surviving client is told that the source resized");
+    assert!(
+        changed < resized,
+        "tmux 3.7b reports the client move before its source resize: {lines:?}"
+    );
 }
 
 #[tokio::test]

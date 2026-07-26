@@ -14,7 +14,6 @@ use rmux_proto::{
     WindowTarget,
 };
 
-use crate::client_names::control_client_name;
 use crate::format_runtime::{render_runtime_template, RuntimeFormatContext};
 use crate::hook_runtime::PendingInlineHookFormat;
 use crate::pane_terminals::InitialPaneSpawnOptions;
@@ -487,24 +486,12 @@ impl RequestHandler {
                             return Response::Error(ErrorResponse { error });
                         }
                     }
-                    if self
-                        .prepare_existing_session_control_attach(
-                            requester_pid,
-                            &session_name,
-                            session_id,
-                        )
-                        .await
-                    {
-                        self.emit_for_session_identity(
-                            LifecycleEvent::ClientSessionChanged {
-                                session_name: session_name.clone(),
-                                client_name: Some(control_client_name(requester_pid)),
-                            },
-                            &session_name,
-                            session_id,
-                        )
-                        .await;
-                    }
+                    self.prepare_existing_session_control_attach(
+                        requester_pid,
+                        &session_name,
+                        session_id,
+                    )
+                    .await;
                     self.queue_suppressed_inline_hook(
                         HookName::AfterNewSession,
                         PendingInlineHookFormat::AfterCommand,

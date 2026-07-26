@@ -150,6 +150,7 @@ enum ControlOutputStart {
 enum ControlSessionChangedNotice {
     Skip,
     Publish,
+    PublishIfChanged,
 }
 
 struct ControlSessionUpdate<'a> {
@@ -179,6 +180,13 @@ impl<'a> ControlSessionUpdate<'a> {
         Self {
             session_changed_notice: ControlSessionChangedNotice::Publish,
             ..Self::existing(target_selection, client_environment)
+        }
+    }
+
+    fn attached_existing() -> Self {
+        Self {
+            session_changed_notice: ControlSessionChangedNotice::PublishIfChanged,
+            ..Self::existing(None, None)
         }
     }
 
@@ -1054,29 +1062,10 @@ impl RequestHandler {
         .await
     }
 
-    pub(super) async fn set_control_session_for_client_identity(
-        &self,
-        requester_pid: u32,
-        expected_control_id: u64,
-        next_session_name: rmux_proto::SessionName,
-        expected_session_id: SessionId,
-        target_selection: Option<SwitchTargetSelection>,
-        client_environment: Option<&HashMap<String, String>>,
-    ) -> Result<Option<rmux_proto::SessionName>, rmux_proto::RmuxError> {
-        self.set_control_session_with_expected_identity(
-            requester_pid,
-            Some(next_session_name),
-            Some(expected_session_id),
-            Some(expected_control_id),
-            ControlSessionUpdate::existing(target_selection, client_environment),
-        )
-        .await
-    }
-
     /// `switch-client` for a control client: same commit as
-    /// [`Self::set_control_session_for_client_identity`], but it also publishes
-    /// the `client-session-changed` notification at the commit point so it
-    /// precedes the `%layout-change` lines the reconciles produce.
+    /// the regular identity-checked control-session update, with the
+    /// `client-session-changed` notification published at the commit point so
+    /// it precedes the `%layout-change` lines the reconciles produce.
     pub(super) async fn switch_control_session_for_client_identity(
         &self,
         requester_pid: u32,
@@ -1092,6 +1081,23 @@ impl RequestHandler {
             Some(expected_session_id),
             Some(expected_control_id),
             ControlSessionUpdate::switched(target_selection, client_environment),
+        )
+        .await
+    }
+
+    pub(in crate::handler) async fn attach_existing_control_session_for_client_identity(
+        &self,
+        requester_pid: u32,
+        expected_control_id: u64,
+        next_session_name: rmux_proto::SessionName,
+        expected_session_id: SessionId,
+    ) -> Result<Option<rmux_proto::SessionName>, rmux_proto::RmuxError> {
+        self.set_control_session_with_expected_identity(
+            requester_pid,
+            Some(next_session_name),
+            Some(expected_session_id),
+            Some(expected_control_id),
+            ControlSessionUpdate::attached_existing(),
         )
         .await
     }
@@ -1284,6 +1290,8 @@ impl RequestHandler {
             cols: active.client_width,
             rows: active.client_height,
         });
+        let session_changed =
+            active.session_name != next_session_name || active.session_id != next_session_id;
         let previous_session_id = active.session_id;
         let size_sequence = next_session_name
             .as_ref()
@@ -1343,7 +1351,10 @@ impl RequestHandler {
         drop(active_control);
         drop(active_attach);
         drop(state);
-        if session_changed_notice == ControlSessionChangedNotice::Publish {
+        if session_changed_notice == ControlSessionChangedNotice::Publish
+            || (session_changed_notice == ControlSessionChangedNotice::PublishIfChanged
+                && session_changed)
+        {
             if let (Some(session_name), Some(session_id)) =
                 (next_session_name.as_ref(), next_session_id)
             {
