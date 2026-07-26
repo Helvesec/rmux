@@ -417,10 +417,11 @@ fn materialize_keyframe(
     let size = source.size();
     let cols = u32::from(size.cols);
     let alternate = source.is_alternate();
-    let captured_history_rows = source.history_size();
+    let active_history_rows = source.history_size();
+    let recovery_history_rows = renderer.recovery_history_size();
     let mut active_visible = render_active_rows(
         renderer,
-        captured_history_rows..captured_history_rows.saturating_add(usize::from(size.rows)),
+        active_history_rows..active_history_rows.saturating_add(usize::from(size.rows)),
         cols,
     )?;
     link_rows(&mut active_visible, cols);
@@ -496,7 +497,7 @@ fn materialize_keyframe(
     // spectator may receive; the wrap fix needs `cols` and links the boundary
     // row pair so a soft-wrapped row is not glued onto the next one.
     let history_budget = history_policy.history_budget(MAX_RECOVERY_KEYFRAME_BYTES - mandatory_len);
-    let mut history = recent_history_suffix(renderer, captured_history_rows, history_budget, cols)?;
+    let mut history = recent_history_suffix(renderer, recovery_history_rows, history_budget, cols)?;
     let first_repainted = saved_visible
         .as_mut()
         .map_or(active_visible.first_mut(), |rows| rows.first_mut());
@@ -525,7 +526,12 @@ fn materialize_keyframe(
         rows: size.rows,
         bytes,
         alternate,
-        history_rows_total: u64::try_from(history_rows_total).unwrap_or(u64::MAX),
+        history_rows_total: u64::try_from(adjust_history_total(
+            history_rows_total,
+            active_history_rows,
+            recovery_history_rows,
+        ))
+        .unwrap_or(u64::MAX),
         history_rows_included: u64::try_from(history.len()).unwrap_or(u64::MAX),
         metadata_complete,
     })
@@ -720,7 +726,7 @@ fn render_history_group_bounded(
     let mut group = Vec::new();
     let mut encoded_len = 0_usize;
     for absolute_y in range {
-        let Some(rendered) = renderer.active_row(absolute_y, capture_options()) else {
+        let Some(rendered) = renderer.recovery_history_row(absolute_y, capture_options()) else {
             return Err(RmuxError::Server(
                 "terminal history changed during recovery capture".to_owned(),
             ));
@@ -742,6 +748,14 @@ fn render_history_group_bounded(
         return Ok(None);
     }
     Ok(Some((group, encoded_len)))
+}
+
+fn adjust_history_total(total: usize, captured: usize, recovered: usize) -> usize {
+    if recovered >= captured {
+        total.saturating_add(recovered - captured)
+    } else {
+        total.saturating_sub(captured - recovered)
+    }
 }
 
 fn append_title_state(out: &mut Vec<u8>, screen: &Screen) {
@@ -1135,6 +1149,54 @@ mod tests {
         let initial = b"main\x1b[?1049h\x1b[2J\x1b[Halt";
         let (actual, expected) = recovered(initial, b"\x1b[?1049lX");
         assert_visible_equal(&actual, &expected);
+    }
+
+    #[test]
+    fn keyframe_preserves_saved_main_after_resize_in_alternate_screen() {
+        let initial = b"main-0\r\nmain-1\r\nmain-2\r\nmain-3\r\nmain-4\x1b[?1049h\x1b[2J\x1b[Halt";
+        for resized in [
+            TerminalSize { cols: 20, rows: 9 },
+            TerminalSize { cols: 12, rows: 4 },
+        ] {
+            let mut transcript = PaneTranscript::new(100, SIZE);
+            transcript.append_bytes(initial);
+            transcript.resize(resized);
+            transcript.append_bytes(b"\x1b[2;2Htail");
+            let keyframe = PaneRecoverySeed::capture(&transcript)
+                .expect("capture resized alternate-screen recovery state")
+                .keyframe();
+
+            let mut actual = TerminalScreen::new(resized, 100);
+            actual.feed(&keyframe.bytes);
+            actual.feed(b"\x1b[?1049lX");
+
+            let mut expected = TerminalScreen::new(SIZE, 100);
+            expected.feed(initial);
+            expected.resize(resized);
+            expected.feed(b"\x1b[2;2Htail");
+            expected.feed(b"\x1b[?1049lX");
+
+            assert_complete_equal(&actual, &expected);
+            assert_eq!(
+                keyframe.history_rows_total,
+                u64::try_from(expected.screen().history_size()).unwrap_or(u64::MAX)
+            );
+
+            let visible = PaneRecoveryDraft::capture(&transcript)
+                .expect("capture visible-only resized alternate-screen state")
+                .materialize_visible_only()
+                .expect("materialize visible-only resized alternate-screen state")
+                .keyframe();
+            let mut visible_actual = TerminalScreen::new(resized, 100);
+            visible_actual.feed(&visible.bytes);
+            visible_actual.feed(b"\x1b[?1049lX");
+            assert_visible_equal(&visible_actual, &expected);
+            assert_eq!(visible_actual.screen().history_size(), 0);
+            assert_eq!(
+                visible.history_rows_total,
+                u64::try_from(expected.screen().history_size()).unwrap_or(u64::MAX)
+            );
+        }
     }
 
     #[test]

@@ -1,5 +1,6 @@
 use crate::grid::{Grid, GridCapture, GridRenderOptions, GridStringState, RenderedLineSpan};
 use crate::hyperlinks::Hyperlinks;
+use crate::input::ScreenWriter;
 use crate::style::Style;
 use crate::transcript::{resolve_screen_capture_range, ScreenCaptureRange};
 
@@ -28,6 +29,7 @@ pub struct RecoveryRow {
 /// cannot clone an unbounded OSC 8 URI from terminal-controlled state.
 pub struct RecoveryRowRenderer<'a> {
     screen: &'a Screen,
+    saved_grid: Option<Grid>,
     hyperlinks: Hyperlinks,
     metadata_complete: bool,
 }
@@ -54,8 +56,34 @@ impl RecoveryRowRenderer<'_> {
     /// Renders one row of the saved pre-alternate viewport.
     #[must_use]
     pub fn saved_row(&self, absolute_y: usize, options: GridRenderOptions) -> Option<RecoveryRow> {
-        let saved = self.screen.saved_grid.as_ref()?;
-        render_grid_row_independent(&saved.grid, &self.hyperlinks, absolute_y, options)
+        let saved = self.saved_grid.as_ref()?;
+        render_grid_row_independent(
+            saved,
+            &self.hyperlinks,
+            saved.hsize().saturating_add(absolute_y),
+            options,
+        )
+    }
+
+    /// Returns the history rows that belong to the reconstructed main screen.
+    #[must_use]
+    pub fn recovery_history_size(&self) -> usize {
+        self.saved_grid
+            .as_ref()
+            .map_or_else(|| self.screen.grid.hsize(), Grid::hsize)
+    }
+
+    /// Renders one history row from the reconstructed main screen.
+    #[must_use]
+    pub fn recovery_history_row(
+        &self,
+        absolute_y: usize,
+        options: GridRenderOptions,
+    ) -> Option<RecoveryRow> {
+        let grid = self.saved_grid.as_ref().unwrap_or(&self.screen.grid);
+        (absolute_y < grid.hsize())
+            .then(|| render_grid_row_independent(grid, &self.hyperlinks, absolute_y, options))
+            .flatten()
     }
 }
 
@@ -70,11 +98,24 @@ impl Screen {
         let (hyperlinks, metadata_complete) = self
             .hyperlinks
             .clone_bounded(max_hyperlink_entry_bytes, max_hyperlink_total_bytes);
+        let saved_grid = self.recovery_saved_grid();
         RecoveryRowRenderer {
             screen: self,
+            saved_grid,
             hyperlinks,
             metadata_complete,
         }
+    }
+
+    fn recovery_saved_grid(&self) -> Option<Grid> {
+        let saved_rows = usize::try_from(self.saved_grid.as_ref()?.grid.sy()).unwrap_or(usize::MAX);
+        let restore_cursor = self.alternate_saved_cursor().is_some();
+        let mut restored = self.clone();
+        restored
+            .grid
+            .set_hlimit(restored.grid.hsize().saturating_add(saved_rows));
+        restored.alternate_off(crate::input::COLOUR_DEFAULT, restore_cursor);
+        Some(restored.grid)
     }
 
     #[cfg_attr(not(test), allow(dead_code))]
