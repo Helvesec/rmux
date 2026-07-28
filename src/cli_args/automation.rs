@@ -4,6 +4,15 @@ use clap::{ArgAction, Args};
 
 use super::{parse_session_name, parse_target_spec, TargetSpec};
 
+/// Shared help text for every flag parsed by [`parse_duration`].
+///
+/// `parse_duration` deliberately rejects bare integers so that `--timeout 8000`
+/// can never be silently read as either 8 seconds or 8000 seconds. The help
+/// output has to say so, otherwise the requirement is only discoverable by
+/// hitting the error.
+pub(crate) const DURATION_HELP: &str =
+    "Duration with an explicit unit: ms, s, or m (for example 500ms, 8s, 2m)";
+
 #[derive(Debug, Clone, Args)]
 pub(crate) struct WaitPaneArgs {
     #[arg(short = 't', long = "target", value_parser = parse_target_spec, allow_hyphen_values = true)]
@@ -16,11 +25,11 @@ pub(crate) struct WaitPaneArgs {
     pub(crate) visible_text: Option<String>,
     #[arg(long = "quiet", action = ArgAction::SetTrue)]
     pub(crate) quiet: bool,
-    #[arg(long = "stable-for", value_parser = parse_duration)]
+    #[arg(long = "stable-for", value_parser = parse_duration, value_name = "DURATION", help = DURATION_HELP)]
     pub(crate) stable_for: Option<Duration>,
     #[arg(long = "pane-exit", action = ArgAction::SetTrue)]
     pub(crate) pane_exit: bool,
-    #[arg(long = "timeout", value_parser = parse_duration)]
+    #[arg(long = "timeout", value_parser = parse_duration, value_name = "DURATION", help = DURATION_HELP)]
     pub(crate) timeout: Option<Duration>,
     #[arg(long = "json", action = ArgAction::SetTrue)]
     pub(crate) json: bool,
@@ -235,7 +244,7 @@ pub(crate) struct WithSessionArgs {
     pub(crate) session_name: rmux_proto::SessionName,
     #[arg(long = "kill-on-owner-exit", action = ArgAction::SetTrue)]
     pub(crate) kill_on_owner_exit: bool,
-    #[arg(long = "ttl", value_parser = parse_duration, default_value = "30s")]
+    #[arg(long = "ttl", value_parser = parse_duration, default_value = "30s", value_name = "DURATION", help = DURATION_HELP)]
     pub(crate) ttl: Duration,
     #[arg(allow_hyphen_values = true, trailing_var_arg = true)]
     pub(crate) command: Vec<String>,
@@ -263,7 +272,10 @@ pub(crate) fn parse_duration(value: &str) -> Result<Duration, String> {
     } else if let Some(number) = value.strip_suffix('m') {
         (number, 60_000)
     } else {
-        return Err("duration requires an explicit unit: ms, s, or m".to_owned());
+        return Err(
+            "duration requires an explicit unit: ms, s, or m (for example 500ms, 8s, 2m)"
+                .to_owned(),
+        );
     };
     if number.is_empty() || number.starts_with('-') {
         return Err("duration must be positive".to_owned());

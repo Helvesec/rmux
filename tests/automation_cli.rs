@@ -158,6 +158,179 @@ fn nonzero_pane_base_index_preserves_targeted_automation_and_percent_resize(
     Ok(())
 }
 
+/// Regression guard for automation targets under `base-index 1` +
+/// `pane-base-index 1`.
+///
+/// The extension commands resolve a slot target by listing the window's panes
+/// and matching `#{pane_index}`, which is rendered in *display* space. Before
+/// the `#{pane-base-index}` offset was applied, the internal pane index was
+/// compared against the display index directly, so every extension command
+/// failed with `unable to resolve pane id for target <session>:<window>.0` the
+/// moment either base index was non-zero — including when the caller passed a
+/// fully explicit `session:window.pane` slot or a `%id`. The tmux-compatible
+/// surface (`capture-pane`) resolves server-side and was unaffected, which is
+/// why the break only showed up in the rmux-specific commands.
+///
+/// The existing `nonzero_pane_base_index_*` test pins `pane-base-index` alone;
+/// this one pins both indices at once and covers all three target spellings,
+/// including a bare session target which must land on the ACTIVE pane rather
+/// than the first one.
+#[test]
+fn base_index_one_resolves_every_automation_target_spelling() -> Result<(), Box<dyn Error>> {
+    let harness = CliHarness::new("automation-base-index-one")?;
+    let _daemon = harness.start_hidden_daemon()?;
+
+    assert_success(&harness.run(&["set-option", "-g", "base-index", "1"])?);
+    assert_success(&harness.run(&["set-window-option", "-g", "pane-base-index", "1"])?);
+    assert_success(&harness.run(&["new-session", "-d", "-s", "alpha", "-x", "80", "-y", "24"])?);
+
+    // Both indices must actually be shifted, otherwise the test would pass
+    // vacuously against the zero-based layout.
+    let listed = harness.run(&[
+        "list-panes",
+        "-a",
+        "-F",
+        "#{session_name}:#{window_index}.#{pane_index}",
+    ])?;
+    assert_ok(&listed);
+    assert_eq!(stdout(&listed).trim(), "alpha:1.1");
+
+    assert_success(&harness.run(&["split-window", "-h", "-t", "alpha:1.1"])?);
+    assert_success(&harness.run(&[
+        "send-keys",
+        "-t",
+        "alpha:1.1",
+        "--wait-next-text",
+        "PANE_ONE_MARKER",
+        "--timeout",
+        "5s",
+        "--",
+        "printf PANE_ONE_MARKER",
+        "Enter",
+    ])?);
+    assert_success(&harness.run(&[
+        "send-keys",
+        "-t",
+        "alpha:1.2",
+        "--wait-next-text",
+        "PANE_TWO_MARKER",
+        "--timeout",
+        "5s",
+        "--",
+        "printf PANE_TWO_MARKER",
+        "Enter",
+    ])?);
+
+    let pane_one_id = pane_id(&harness, "alpha:1", 1)?;
+    let pane_two_id = pane_id(&harness, "alpha:1", 2)?;
+
+    // Explicit slot targets must address the pane the user named, and a `%id`
+    // must agree with the slot that reported it.
+    for (target, expected, unexpected) in [
+        ("alpha:1.1", "PANE_ONE_MARKER", "PANE_TWO_MARKER"),
+        ("alpha:1.2", "PANE_TWO_MARKER", "PANE_ONE_MARKER"),
+        (pane_one_id.as_str(), "PANE_ONE_MARKER", "PANE_TWO_MARKER"),
+        (pane_two_id.as_str(), "PANE_TWO_MARKER", "PANE_ONE_MARKER"),
+        // `split-window -h` leaves the new pane active, so a bare session
+        // target resolves to pane 2 — never to display index 0, which does not
+        // exist under `pane-base-index 1`.
+        ("alpha", "PANE_TWO_MARKER", "PANE_ONE_MARKER"),
+    ] {
+        let snapshot = run_json(&harness, &["pane-snapshot", "-t", target, "--json"])?;
+        assert_eq!(
+            snapshot["ok"], true,
+            "pane-snapshot -t {target}: {snapshot}"
+        );
+        let text = snapshot["text"]
+            .as_str()
+            .ok_or_else(|| format!("pane-snapshot -t {target} returned no text: {snapshot}"))?;
+        assert!(
+            text.contains(expected),
+            "pane-snapshot -t {target}: {text:?}"
+        );
+        assert!(
+            !text.contains(unexpected),
+            "pane-snapshot -t {target} addressed the wrong pane: {text:?}"
+        );
+
+        let waited = run_json(
+            &harness,
+            &[
+                "wait-pane",
+                "-t",
+                target,
+                "--text",
+                expected,
+                "--timeout",
+                "5s",
+                "--json",
+            ],
+        )?;
+        assert_eq!(waited["ok"], true, "wait-pane -t {target}: {waited}");
+
+        let located = run_json(
+            &harness,
+            &["locator", "-t", target, "--get-by-text", expected, "--json"],
+        )?;
+        assert_eq!(located["ok"], true, "locator -t {target}: {located}");
+        assert!(
+            located["count"].as_u64().unwrap_or_default() >= 1,
+            "locator -t {target}: {located}"
+        );
+
+        assert_ok(&harness.run(&[
+            "expect-pane",
+            "-t",
+            target,
+            "--get-by-text",
+            expected,
+            "--visible",
+        ])?);
+    }
+
+    Ok(())
+}
+
+/// `parse_duration` rejects bare integers on purpose, so `--help` has to say
+/// which units are accepted — otherwise the requirement is only discoverable by
+/// triggering the error.
+#[test]
+fn duration_flags_document_their_required_unit() -> Result<(), Box<dyn Error>> {
+    let harness = CliHarness::new("automation-duration-help")?;
+
+    for command in ["wait-pane", "send-keys"] {
+        let help = harness.run(&[command, "--help"])?;
+        assert_ok(&help);
+        let help = stdout(&help);
+        assert!(
+            help.contains("--timeout <DURATION>"),
+            "{command} --help should name the duration value: {help}"
+        );
+        assert!(
+            help.contains("ms, s, or m"),
+            "{command} --help should state the accepted units: {help}"
+        );
+    }
+
+    let rejected = harness.run(&[
+        "wait-pane",
+        "-t",
+        "alpha:1.1",
+        "--text",
+        "marker",
+        "--timeout",
+        "8000",
+    ])?;
+    assert_ne!(rejected.status.code(), Some(0));
+    assert!(
+        stderr(&rejected).contains("for example 500ms, 8s, 2m"),
+        "the rejection should show a usable example: {}",
+        stderr(&rejected)
+    );
+
+    Ok(())
+}
+
 #[test]
 fn automation_slot_lookup_preserves_list_panes_hook_family() -> Result<(), Box<dyn Error>> {
     let harness = CliHarness::new("automation-slot-lookup-hook")?;
@@ -1062,6 +1235,31 @@ fn pane_width(output: &str, pane_index: u32) -> Result<u16, Box<dyn Error>> {
         .find_map(|line| line.strip_prefix(&prefix))
         .ok_or_else(|| format!("pane {pane_index} missing from {output:?}"))?;
     Ok(width.parse()?)
+}
+
+/// Like [`assert_success`], but for commands that legitimately write to stdout.
+fn assert_ok(output: &std::process::Output) {
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "expected successful command\nstdout:\n{}\nstderr:\n{}",
+        stdout(output),
+        stderr(output)
+    );
+    assert!(stderr(output).is_empty(), "stderr should be empty");
+}
+
+/// Looks up the stable `%id` of a pane by its *display* index in `window`.
+fn pane_id(harness: &CliHarness, window: &str, pane_index: u32) -> Result<String, Box<dyn Error>> {
+    let output = harness.run(&["list-panes", "-t", window, "-F", "#{pane_index} #{pane_id}"])?;
+    assert_ok(&output);
+    let output = stdout(&output);
+    let prefix = format!("{pane_index} ");
+    output
+        .lines()
+        .find_map(|line| line.strip_prefix(&prefix))
+        .map(str::to_owned)
+        .ok_or_else(|| format!("pane {pane_index} missing from {output:?}").into())
 }
 
 fn run_json(harness: &CliHarness, args: &[&str]) -> Result<Value, Box<dyn Error>> {

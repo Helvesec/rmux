@@ -1,6 +1,6 @@
 use clap::{ArgAction, Args};
 
-use super::automation::{parse_duration, SendKeysWaitMode};
+use super::automation::{parse_duration, SendKeysWaitMode, DURATION_HELP};
 use super::{parse_target_spec, TargetSpec};
 
 #[derive(Debug, Clone, Args)]
@@ -37,9 +37,9 @@ pub(crate) struct SendKeysArgs {
     pub(crate) wait_next_text: Option<String>,
     #[arg(long = "wait-pane-exit", action = ArgAction::SetTrue)]
     pub(crate) wait_pane_exit: bool,
-    #[arg(long = "stable-for", value_parser = parse_duration)]
+    #[arg(long = "stable-for", value_parser = parse_duration, value_name = "DURATION", help = DURATION_HELP)]
     pub(crate) stable_for: Option<std::time::Duration>,
-    #[arg(long = "timeout", value_parser = parse_duration)]
+    #[arg(long = "timeout", value_parser = parse_duration, value_name = "DURATION", help = DURATION_HELP)]
     pub(crate) timeout: Option<std::time::Duration>,
     #[arg(allow_hyphen_values = true, trailing_var_arg = true)]
     pub(crate) keys: Vec<String>,
