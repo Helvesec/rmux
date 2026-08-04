@@ -163,6 +163,53 @@ fn downstream_caller_guard_rejects_relative_and_absolute_targets() {
     ));
 }
 
+#[test]
+fn protected_environment_secrets_are_not_shadowed_by_reusable_inputs() {
+    let workflows = repo_root().join(".github/workflows");
+    for (filename, secret) in [
+        ("release-chocolatey-channel.yml", "CHOCOLATEY_API_KEY"),
+        (
+            "release-linux-repository-publish.yml",
+            "RMUX_DOWNSTREAM_APP_PRIVATE_KEY",
+        ),
+        (
+            "release-owned-repository-channel.yml",
+            "RMUX_DOWNSTREAM_APP_PRIVATE_KEY",
+        ),
+        ("release-snap-channel.yml", "SNAPCRAFT_STORE_CREDENTIALS"),
+    ] {
+        let text = fs::read_to_string(workflows.join(filename)).expect("read workflow");
+        let workflow_call = text
+            .split("\npermissions: {}\n")
+            .next()
+            .expect("workflow_call boundary");
+        assert!(text.contains("environment: release"));
+        assert!(!workflow_call.contains("\n    secrets:\n"));
+        assert!(text.contains(&format!("secrets.{secret}")));
+    }
+
+    let build = fs::read_to_string(workflows.join("release-linux-repository-build.yml"))
+        .expect("read Linux repository build");
+    let workflow_call = build
+        .split("\n  workflow_dispatch:\n")
+        .next()
+        .expect("Linux workflow_call boundary");
+    assert!(!workflow_call.contains("\n    secrets:\n"));
+    assert!(!build.contains(
+        "RMUX_DOWNSTREAM_APP_PRIVATE_KEY: ${{ secrets.RMUX_DOWNSTREAM_APP_PRIVATE_KEY }}"
+    ));
+    for secret in [
+        "RMUX_APT_GPG_PRIVATE_KEY",
+        "RMUX_APT_GPG_KEY",
+        "RMUX_RPM_GPG_PRIVATE_KEY",
+        "RMUX_RPM_GPG_KEY",
+        "RMUX_RPM_REPO_GPG_PRIVATE_KEY",
+        "RMUX_RPM_REPO_GPG_KEY",
+    ] {
+        assert!(build.contains(&format!("secrets.{secret}")));
+    }
+}
+
 #[cfg(unix)]
 #[test]
 fn downstream_workflow_entry_points_are_executable() {

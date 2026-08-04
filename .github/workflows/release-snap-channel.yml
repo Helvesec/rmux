@@ -11,10 +11,6 @@ on:
       expected_source_sha: {required: true, type: string}
       release_id: {required: true, type: string}
       release_ref: {required: true, type: string}
-    secrets:
-      SNAPCRAFT_STORE_CREDENTIALS:
-        required: false
-
 permissions: {}
 
 jobs:

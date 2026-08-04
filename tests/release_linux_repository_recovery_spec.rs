@@ -130,9 +130,11 @@ fn manual_recovery_is_same_run_revalidated_and_canonically_sealed() {
     assert!(BUILD.contains("environment: release"));
     assert!(BUILD.contains("attestations: write"));
     assert!(BUILD.contains("id-token: write"));
-    assert!(BUILD.contains(
+    assert!(!BUILD.contains(
         "RMUX_DOWNSTREAM_APP_PRIVATE_KEY: ${{ secrets.RMUX_DOWNSTREAM_APP_PRIVATE_KEY }}"
     ));
+    assert!(PUBLISH.contains("environment: release-publication"));
+    assert!(PUBLISH.contains("private-key: ${{ secrets.RMUX_DOWNSTREAM_APP_PRIVATE_KEY }}"));
 
     assert_eq!(
         PUBLISH

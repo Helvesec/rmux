@@ -16,10 +16,6 @@ on:
       release_id: {required: true, type: string}
       release_ref: {required: true, type: string}
       recovery_mode: {required: false, type: boolean, default: false}
-    secrets:
-      RMUX_DOWNSTREAM_APP_PRIVATE_KEY:
-        required: false
-
 permissions: {}
 
 jobs:

@@ -11,21 +11,6 @@ on:
       expected_source_sha: {required: true, type: string}
       release_id: {required: true, type: string}
       release_ref: {required: true, type: string}
-    secrets:
-      RMUX_APT_GPG_PRIVATE_KEY:
-        required: false
-      RMUX_APT_GPG_KEY:
-        required: false
-      RMUX_RPM_GPG_PRIVATE_KEY:
-        required: false
-      RMUX_RPM_GPG_KEY:
-        required: false
-      RMUX_RPM_REPO_GPG_PRIVATE_KEY:
-        required: false
-      RMUX_RPM_REPO_GPG_KEY:
-        required: false
-      RMUX_DOWNSTREAM_APP_PRIVATE_KEY:
-        required: false
     outputs:
       repository_artifact_id:
         value: ${{ jobs.build.outputs.repository_artifact_id }}
@@ -271,8 +256,6 @@ jobs:
       attestations: write
       contents: read
       id-token: write
-    secrets:
-      RMUX_DOWNSTREAM_APP_PRIVATE_KEY: ${{ secrets.RMUX_DOWNSTREAM_APP_PRIVATE_KEY }}
     with:
       receipt_run_id: ${{ inputs.receipt_run_id }}
       plan_artifact_id: ${{ inputs.plan_artifact_id }}

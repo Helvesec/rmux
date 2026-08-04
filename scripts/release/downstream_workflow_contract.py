@@ -115,7 +115,7 @@ def _validate_reusable_workflow(path: Path, *, require_repository_guard: bool) -
         raise ValueError(f"{path.name} does not reject external callers")
 
 
-def _validate_worker_secret_declarations(root: Path) -> None:
+def _validate_worker_environment_secrets(root: Path) -> None:
     workflows = root / ".github/workflows"
     expected = {
         "release-chocolatey-channel.yml": ("CHOCOLATEY_API_KEY",),
@@ -134,12 +134,11 @@ def _validate_worker_secret_declarations(root: Path) -> None:
     for name, secret_names in expected.items():
         text = (workflows / name).read_text(encoding="utf-8")
         call = text.split("\n  workflow_dispatch:", 1)[0]
-        if "\n    secrets:\n" not in call:
-            raise ValueError(f"{name} does not declare protected environment secrets")
+        if "\n    secrets:\n" in call:
+            raise ValueError(
+                f"{name} shadows its protected environment secrets with workflow_call secrets"
+            )
         for secret_name in secret_names:
-            declaration = f"      {secret_name}:\n        required: false"
-            if call.count(declaration) != 1:
-                raise ValueError(f"{name} lost secret declaration {secret_name}")
             if text.count(f"secrets.{secret_name}") < 1:
                 raise ValueError(f"{name} no longer consumes secret {secret_name}")
 
@@ -355,7 +354,6 @@ def _validate_linux_repository_recovery(root: Path) -> None:
         "linux_repository_recovery.py create-manifest",
         "attestations: write",
         "id-token: write",
-        "RMUX_DOWNSTREAM_APP_PRIVATE_KEY: ${{ secrets.RMUX_DOWNSTREAM_APP_PRIVATE_KEY }}",
     )
     if any(build.count(value) != 1 for value in build_required):
         raise ValueError("Linux repository recovery lost its same-run artifact route")
@@ -368,6 +366,13 @@ def _validate_linux_repository_recovery(root: Path) -> None:
         )
     if "secrets: inherit" in build or "secrets: inherit" in publish:
         raise ValueError("Linux repository recovery exposes inherited secrets")
+    if (
+        "RMUX_DOWNSTREAM_APP_PRIVATE_KEY: ${{ secrets.RMUX_DOWNSTREAM_APP_PRIVATE_KEY }}"
+        in build
+    ):
+        raise ValueError(
+            "Linux repository build shadows the publisher environment secret"
+        )
     construction_gate = build.find(
         "uses: ./.github/actions/release-linux-repository-recovery-authorize"
     )
@@ -639,7 +644,7 @@ def validate_downstream_workflows(root: Path) -> None:
         )
     for path in _worker_paths(root):
         _validate_reusable_workflow(path, require_repository_guard=False)
-    _validate_worker_secret_declarations(root)
+    _validate_worker_environment_secrets(root)
     _validate_callers(root, paths)
     main = paths[0].read_text(encoding="utf-8")
     _validate_receipt_origin(main)
