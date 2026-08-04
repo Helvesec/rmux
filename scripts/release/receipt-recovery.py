@@ -272,6 +272,10 @@ def verify_failed_downstream_artifacts(
             f"rmux-downstream-{channel}-result-{args.source_sha}-{args.release_id}"
             for channel in POST_MUTATION_RESULT_CHANNELS
         )
+        expected_names.update(
+            f"rmux-downstream-{channel}-result-envelope-{args.source_sha}-{args.release_id}"
+            for channel in POST_MUTATION_RESULT_CHANNELS
+        )
     by_name: dict[str, dict[str, Any]] = {}
     for artifact in artifacts:
         if not isinstance(artifact, dict) or not isinstance(artifact.get("name"), str):

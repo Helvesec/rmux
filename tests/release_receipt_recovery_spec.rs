@@ -342,8 +342,11 @@ fn post_mutation_failure_artifacts() -> (Value, u64) {
     for name in [
         format!("rmux-downstream-apt_rpm-signed-{SOURCE}-{RELEASE_ID}"),
         format!("rmux-downstream-homebrew_tap-result-{SOURCE}-{RELEASE_ID}"),
+        format!("rmux-downstream-homebrew_tap-result-envelope-{SOURCE}-{RELEASE_ID}"),
         format!("rmux-downstream-scoop-result-{SOURCE}-{RELEASE_ID}"),
+        format!("rmux-downstream-scoop-result-envelope-{SOURCE}-{RELEASE_ID}"),
         format!("rmux-downstream-web_share-result-{SOURCE}-{RELEASE_ID}"),
+        format!("rmux-downstream-web_share-result-envelope-{SOURCE}-{RELEASE_ID}"),
     ] {
         artifacts.push(json!({
             "id": receipt_id + artifacts.len() as u64,
@@ -534,6 +537,36 @@ fn protected_main_recovery_accepts_only_the_exact_post_mutation_seal_failure() {
         String::from_utf8_lossy(&output.stdout),
         String::from_utf8_lossy(&output.stderr)
     );
+}
+
+#[test]
+fn protected_main_recovery_rejects_missing_post_mutation_result_envelope() {
+    let root = fixture_root("post-mutation-missing-envelope");
+    let (mut artifacts, receipt_id) = post_mutation_failure_artifacts();
+    let entries = artifacts["artifacts"]
+        .as_array_mut()
+        .expect("artifacts array");
+    entries.retain(|artifact| {
+        artifact["name"] != format!("rmux-downstream-scoop-result-envelope-{SOURCE}-{RELEASE_ID}")
+    });
+    artifacts["total_count"] = json!(entries.len());
+    let output = run_recovery(
+        &root,
+        failed_run(FAILED_CONTROL, "main", "failure"),
+        post_mutation_failure_jobs(),
+        artifacts,
+        json!({
+            "total_count": 1,
+            "artifacts": [{
+                "id": receipt_id,
+                "name": format!("rmux-publication-receipt-{SOURCE}-{RELEASE_ID}"),
+                "expired": false,
+                "workflow_run": {"id": FAILED_RUN},
+            }],
+        }),
+    );
+    fs::remove_dir_all(&root).expect("remove fixture root");
+    assert!(!output.status.success());
 }
 
 #[test]
