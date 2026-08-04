@@ -55,7 +55,6 @@ jobs:
 
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
         with:
-          ref: ${{ inputs.expected_source_sha }}
           persist-credentials: false
 
       - name: Verify exact plan artifact identity
@@ -67,11 +66,11 @@ jobs:
             --repository "$GITHUB_REPOSITORY" --run-id "$RMUX_RECEIPT_RUN_ID" \
             --artifact-id "$RMUX_PLAN_ARTIFACT_ID" \
             --name "rmux-downstream-plan-$RMUX_EXPECTED_SOURCE_SHA-$RMUX_RELEASE_ID" \
-            --expected-source-sha "$RMUX_EXPECTED_SOURCE_SHA" \
+            --expected-source-sha "$GITHUB_SHA" \
             --expected-digest "$RMUX_PLAN_ARTIFACT_DIGEST" \
             --expected-workflow-id 316435347 \
             --expected-workflow-path .github/workflows/release-receipt.yml \
-            --expected-event workflow_dispatch --expected-head-branch "$RMUX_RELEASE_REF" \
+            --expected-event workflow_dispatch --expected-head-branch "$GITHUB_REF_NAME" \
             --allow-running-current-run \
             --max-attempts 1
 

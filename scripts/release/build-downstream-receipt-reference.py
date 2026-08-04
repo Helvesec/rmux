@@ -116,7 +116,11 @@ def build(args: argparse.Namespace) -> None:
         or predicate.get("downstream_authority") is not True
         or predicate.get("repository_id") != REPOSITORY_ID
         or predicate.get("source_git_sha") != args.source_sha
-        or receipt != expected_receipt
+        or not isinstance(receipt, dict)
+        or any(
+            receipt.get(field) != wanted for field, wanted in expected_receipt.items()
+        )
+        or set(receipt) - set(expected_receipt) - {"recovery"}
         or not isinstance(release, dict)
     ):
         raise ValueError("publication receipt predicate identity differs")

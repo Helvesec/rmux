@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import re
 import sys
 from pathlib import Path
 from typing import Any
@@ -13,6 +14,7 @@ from downstream_channels import (
     REPOSITORY_ID,
     RUNNER_IMAGES,
     SAFE_NAME,
+    SHA40,
     SHA256,
     canonical_hash,
     contract_channels,
@@ -37,6 +39,7 @@ PRODUCER_WORKFLOW_ID = 316435347
 PRODUCER_WORKFLOW_PATH = ".github/workflows/release-receipt.yml"
 DEFAULT_PRODUCER_JOB_WORKFLOW_PATH = ".github/workflows/release-downstream-prepare.yml"
 RMUX_IO_PRODUCER_JOB_WORKFLOW_PATH = ".github/workflows/release-rmux-io-payload.yml"
+SOURCE_REF = re.compile(r"refs/(?:heads|tags)/[A-Za-z0-9._/-]+")
 
 
 def payload_contract() -> dict[str, Any]:
@@ -71,20 +74,22 @@ def payload_contract() -> dict[str, Any]:
 def validate_producer(value: Any, channel: str) -> dict[str, Any]:
     if not isinstance(value, dict):
         raise ValueError("payload producer must be an object")
-    exact_keys(
-        value,
-        {
-            "run_id",
-            "run_attempt",
-            "workflow_id",
-            "workflow_path",
-            "job_workflow_path",
-            "runner_group_id",
-            "runner_group_name",
-            "runner_image",
-        },
-        "payload producer",
-    )
+    required = {
+        "run_id",
+        "run_attempt",
+        "workflow_id",
+        "workflow_path",
+        "job_workflow_path",
+        "runner_group_id",
+        "runner_group_name",
+        "runner_image",
+    }
+    optional = {"head_sha", "source_ref"}
+    actual = set(value)
+    if actual - required - optional or not required <= actual:
+        raise ValueError("payload producer keys differ")
+    if ("head_sha" in value) != ("source_ref" in value):
+        raise ValueError("payload producer Git source identity is incomplete")
     positive(value["run_id"], "payload producer run ID")
     expected_image = "ubuntu-22.04"
     expected_job_workflow_path = (
@@ -105,6 +110,13 @@ def validate_producer(value: Any, channel: str) -> dict[str, Any]:
         or value["runner_image"] != expected_image
     ):
         raise ValueError("payload producer is not the allowlisted GitHub-hosted job")
+    if "head_sha" in value and (
+        match(value["head_sha"], SHA40, "payload producer head SHA")
+        != value["head_sha"]
+        or not isinstance(value["source_ref"], str)
+        or SOURCE_REF.fullmatch(value["source_ref"]) is None
+    ):
+        raise ValueError("payload producer Git source identity changed")
     return value
 
 
@@ -455,9 +467,10 @@ def expected_documents(
     ):
         raise ValueError("payload producer differs from the exact receipt run")
     metadata = load_artifact_metadata(args.artifact_metadata)
+    producer_head_sha = producer.get("head_sha", reference["source_git_sha"])
     if (
         metadata["run_id"] != producer["run_id"]
-        or metadata["source_git_sha"] != reference["source_git_sha"]
+        or metadata["source_git_sha"] != producer_head_sha
     ):
         raise ValueError("payload artifact API identity differs from its producer")
     release = reference["release"]

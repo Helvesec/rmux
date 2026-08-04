@@ -192,28 +192,38 @@ def validate_embedded_receipt(
 ) -> dict[str, Any]:
     if not isinstance(value, dict):
         raise ValueError("embedded receipt must be an object")
-    exact_keys(
-        value,
-        {
-            "run_id",
-            "run_attempt",
-            "workflow_id",
-            "workflow_path",
-            "predicate_bundle",
-            "predicate_sha256",
-            "envelope_bundle",
-            "envelope_sha256",
-            "attestation",
-            "verified_at",
-        },
-        "embedded receipt",
+    required = set(
+        "run_id run_attempt workflow_id workflow_path predicate_bundle predicate_sha256 "
+        "envelope_bundle envelope_sha256 attestation verified_at".split()
     )
+    optional = {"recovery"}
+    actual = set(value)
+    if not required <= actual or actual - required - optional:
+        raise ValueError("embedded receipt keys differ")
     positive(value["run_id"], "receipt run ID")
     positive(value["workflow_id"], "receipt workflow ID")
     if value["run_attempt"] != 1 or value["workflow_path"] != (
         ".github/workflows/release-receipt.yml"
     ):
         raise ValueError("receipt must be an attempt-1 release-receipt run")
+    recovery = value.get("recovery")
+    if recovery is not None:
+        if not isinstance(recovery, dict):
+            raise ValueError("receipt recovery identity must be an object")
+        exact_keys(
+            recovery,
+            {"failed_run_id", "failed_conclusion", "control_sha", "control_ref"},
+            "receipt recovery identity",
+        )
+        positive(recovery["failed_run_id"], "failed receipt run ID")
+        if (
+            recovery["failed_run_id"] == value["run_id"]
+            or recovery["failed_conclusion"] != "startup_failure"
+            or match(recovery["control_sha"], SHA40, "recovery control SHA")
+            != recovery["control_sha"]
+            or recovery["control_ref"] != "refs/heads/main"
+        ):
+            raise ValueError("receipt recovery identity changed")
     predicate = validate_artifact(value["predicate_bundle"], "receipt bundle")
     envelope = validate_artifact(value["envelope_bundle"], "receipt envelope")
     expected = f"rmux-publication-receipt-{source_sha}-{release['id']}"

@@ -57,6 +57,10 @@ def verify(args: argparse.Namespace) -> None:
         raise ValueError("receipt source SHA is invalid")
     if RELEASE_REF.fullmatch(args.release_ref) is None:
         raise ValueError("receipt release ref is invalid")
+    producer_sha = args.producer_source_sha or args.source_sha
+    producer_ref = args.producer_source_ref or f"refs/tags/{args.release_ref}"
+    if SHA40.fullmatch(producer_sha) is None:
+        raise ValueError("receipt attestation producer SHA is invalid")
     predicate = read_object(predicate_path, "receipt predicate")
     validate_evidence_authority(
         predicate,
@@ -70,6 +74,21 @@ def verify(args: argparse.Namespace) -> None:
         or predicate.get("release", {}).get("ref") != args.release_ref
     ):
         raise ValueError("receipt predicate identity or authority changed")
+    recovery = predicate.get("receipt", {}).get("recovery")
+    if recovery is None:
+        if (
+            producer_sha != args.source_sha
+            or producer_ref != f"refs/tags/{args.release_ref}"
+        ):
+            raise ValueError("normal receipt attestation producer identity changed")
+    elif (
+        not isinstance(recovery, dict)
+        or recovery.get("control_sha") != producer_sha
+        or recovery.get("control_ref") != producer_ref
+        or producer_sha == args.source_sha
+        or producer_ref != "refs/heads/main"
+    ):
+        raise ValueError("recovery receipt attestation producer identity changed")
     command = [
         str(gh),
         "attestation",
@@ -82,11 +101,11 @@ def verify(args: argparse.Namespace) -> None:
         "--signer-workflow",
         SIGNER_WORKFLOW,
         "--signer-digest",
-        args.source_sha,
+        producer_sha,
         "--source-digest",
-        args.source_sha,
+        producer_sha,
         "--source-ref",
-        f"refs/tags/{args.release_ref}",
+        producer_ref,
         "--predicate-type",
         PREDICATE_TYPE,
         "--deny-self-hosted-runners",
@@ -144,6 +163,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--predicate", type=Path, required=True)
     parser.add_argument("--source-sha", required=True)
     parser.add_argument("--release-ref", required=True)
+    parser.add_argument("--producer-source-sha")
+    parser.add_argument("--producer-source-ref")
     return parser.parse_args()
 
 

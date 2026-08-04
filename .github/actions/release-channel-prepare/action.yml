@@ -98,29 +98,33 @@ runs:
         set -euo pipefail
         scripts/release/assert-release-capability.py downstream_channels
         mode=(--allow-running-current-run)
+        artifact_source_sha="$GITHUB_SHA"
+        artifact_head_branch="$GITHUB_REF_NAME"
         if [ "$RMUX_RECEIPT_RUN_LIFECYCLE" = completed-failure ]; then
           mode=(--allow-completed-failed-run)
+          artifact_source_sha="$RMUX_SOURCE_SHA"
+          artifact_head_branch="$RMUX_RELEASE_REF"
         fi
         scripts/release/actions-artifact.py verify \
           --repository "$GITHUB_REPOSITORY" --run-id "$RMUX_RECEIPT_RUN_ID" \
           --artifact-id "$RMUX_PLAN_ARTIFACT_ID" \
           --name "rmux-downstream-plan-$RMUX_SOURCE_SHA-$RMUX_RELEASE_ID" \
-          --expected-source-sha "$RMUX_SOURCE_SHA" \
+          --expected-source-sha "$artifact_source_sha" \
           --expected-digest "$RMUX_PLAN_ARTIFACT_DIGEST" \
           --expected-workflow-id 316435347 \
           --expected-workflow-path .github/workflows/release-receipt.yml \
-          --expected-event workflow_dispatch --expected-head-branch "$RMUX_RELEASE_REF" \
+          --expected-event workflow_dispatch --expected-head-branch "$artifact_head_branch" \
           "${mode[@]}" \
           --max-attempts 1
         scripts/release/actions-artifact.py verify \
           --repository "$GITHUB_REPOSITORY" --run-id "$RMUX_RECEIPT_RUN_ID" \
           --artifact-id "$RMUX_PAYLOAD_ARTIFACT_ID" \
           --name "rmux-downstream-$RMUX_CHANNEL-payload-$RMUX_SOURCE_SHA-$RMUX_RELEASE_ID" \
-          --expected-source-sha "$RMUX_SOURCE_SHA" \
+          --expected-source-sha "$artifact_source_sha" \
           --expected-digest "$RMUX_PAYLOAD_ARTIFACT_DIGEST" \
           --expected-workflow-id 316435347 \
           --expected-workflow-path .github/workflows/release-receipt.yml \
-          --expected-event workflow_dispatch --expected-head-branch "$RMUX_RELEASE_REF" \
+          --expected-event workflow_dispatch --expected-head-branch "$artifact_head_branch" \
           "${mode[@]}" \
           --max-attempts 1
 
@@ -134,11 +138,11 @@ runs:
         --repository "$GITHUB_REPOSITORY" --run-id "${{ inputs.receipt-run-id }}"
         --artifact-id "${{ inputs.pre-site-summary-artifact-id }}"
         --name "rmux-downstream-pre-site-summary-${{ inputs.source-sha }}-${{ inputs.release-id }}"
-        --expected-source-sha "${{ inputs.source-sha }}"
+        --expected-source-sha "$GITHUB_SHA"
         --expected-digest "${{ inputs.pre-site-summary-artifact-digest }}"
         --expected-workflow-id 316435347
         --expected-workflow-path .github/workflows/release-receipt.yml
-        --expected-event workflow_dispatch --expected-head-branch "${{ inputs.release-ref }}"
+        --expected-event workflow_dispatch --expected-head-branch "$GITHUB_REF_NAME"
         --allow-running-current-run --max-attempts 1
 
     - name: Download only the exact plan artifact ID
@@ -199,19 +203,26 @@ runs:
       run: |
         set -euo pipefail
         root="${{ steps.paths.outputs.root }}"
+        artifact_source_sha="$GITHUB_SHA"
+        artifact_source_ref="$GITHUB_REF"
+        if [ "$RMUX_RECEIPT_RUN_LIFECYCLE" = completed-failure ]; then
+          artifact_source_sha="$RMUX_SOURCE_SHA"
+          artifact_source_ref="refs/tags/${{ inputs.release-ref }}"
+        fi
         scripts/release/actions-artifact.py resolve-id \
           --repository "$GITHUB_REPOSITORY" --run-id "$RMUX_RECEIPT_RUN_ID" \
           --artifact-id "$RMUX_PAYLOAD_ARTIFACT_ID" \
           --name "rmux-downstream-$RMUX_CHANNEL-payload-$RMUX_SOURCE_SHA-${{ inputs.release-id }}" \
-          --expected-source-sha "$RMUX_SOURCE_SHA" --max-attempts 1 \
+          --expected-source-sha "$artifact_source_sha" --max-attempts 1 \
           --include-retention > "$root/payload-artifact.json"
         producer_run_id="$GITHUB_RUN_ID"
         if [ "$RMUX_RECEIPT_RUN_LIFECYCLE" = completed-failure ]; then
           producer_run_id="$RMUX_RECEIPT_RUN_ID"
         fi
-        python3 - "$producer_run_id" "$RMUX_CHANNEL" "$root/producer.json" <<'PY'
+        python3 - "$producer_run_id" "$RMUX_CHANNEL" "$artifact_source_sha" \
+          "$artifact_source_ref" "$root/producer.json" <<'PY'
         import json, pathlib, sys
-        run_id, channel, output_path = sys.argv[1:]
+        run_id, channel, head_sha, source_ref, output_path = sys.argv[1:]
         job_workflow_path = (
             ".github/workflows/release-rmux-io-payload.yml"
             if channel == "rmux_io"
@@ -223,6 +234,8 @@ runs:
             "workflow_id": 316435347,
             "workflow_path": ".github/workflows/release-receipt.yml",
             "job_workflow_path": job_workflow_path,
+            "head_sha": head_sha,
+            "source_ref": source_ref,
             "runner_group_id": 0,
             "runner_group_name": "GitHub Actions",
             "runner_image": "ubuntu-22.04",

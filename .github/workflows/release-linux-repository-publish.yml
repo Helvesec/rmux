@@ -82,7 +82,6 @@ jobs:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
         if: inputs.recovery_mode == false
         with:
-          ref: ${{ inputs.expected_source_sha }}
           persist-credentials: false
 
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
@@ -131,11 +130,11 @@ jobs:
           --repository "$GITHUB_REPOSITORY" --run-id "${{ inputs.receipt_run_id }}"
           --artifact-id "${{ inputs.repository_artifact_id }}"
           --name "rmux-downstream-apt_rpm-signed-${{ inputs.expected_source_sha }}-${{ inputs.release_id }}"
-          --expected-source-sha "${{ inputs.expected_source_sha }}"
+          --expected-source-sha "$GITHUB_SHA"
           --expected-digest "${{ inputs.repository_artifact_digest }}"
           --expected-workflow-id 316435347
           --expected-workflow-path .github/workflows/release-receipt.yml
-          --expected-event workflow_dispatch --expected-head-branch "${{ inputs.release_ref }}"
+          --expected-event workflow_dispatch --expected-head-branch "$GITHUB_REF_NAME"
           --allow-running-current-run --max-attempts 1
 
       - id: signer

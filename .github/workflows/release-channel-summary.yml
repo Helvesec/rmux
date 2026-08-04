@@ -37,7 +37,6 @@ jobs:
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
         with:
-          ref: ${{ inputs.expected_source_sha }}
           persist-credentials: false
 
       - id: paths
@@ -87,11 +86,11 @@ jobs:
             --repository "$GITHUB_REPOSITORY" --run-id "${{ inputs.receipt_run_id }}" \
             --artifact-id "${{ inputs.plan_artifact_id }}" \
             --name "rmux-downstream-plan-${{ inputs.expected_source_sha }}-${{ inputs.release_id }}" \
-            --expected-source-sha "${{ inputs.expected_source_sha }}" \
+            --expected-source-sha "$GITHUB_SHA" \
             --expected-digest "${{ inputs.plan_artifact_digest }}" \
             --expected-workflow-id 316435347 \
             --expected-workflow-path .github/workflows/release-receipt.yml \
-            --expected-event workflow_dispatch --expected-head-branch "${{ inputs.release_ref }}" \
+            --expected-event workflow_dispatch --expected-head-branch "$GITHUB_REF_NAME" \
             --allow-running-current-run --max-attempts 1
 
       - name: Download only the exact plan artifact ID
@@ -125,7 +124,7 @@ jobs:
             for attempt in 1 2 3 4 5 6; do
               if scripts/release/actions-artifact.py resolve \
                 --repository "$GITHUB_REPOSITORY" --run-id "${{ inputs.receipt_run_id }}" \
-                --name "$name" --expected-source-sha "${{ inputs.expected_source_sha }}" \
+                --name "$name" --expected-source-sha "$GITHUB_SHA" \
                 > "$metadata"; then
                 break
               fi
@@ -155,11 +154,11 @@ jobs:
           --repository "$GITHUB_REPOSITORY" --run-id "${{ inputs.receipt_run_id }}"
           --artifact-id "${{ inputs.pre_site_artifact_id }}"
           --name "rmux-downstream-pre-site-summary-${{ inputs.expected_source_sha }}-${{ inputs.release_id }}"
-          --expected-source-sha "${{ inputs.expected_source_sha }}"
+          --expected-source-sha "$GITHUB_SHA"
           --expected-digest "${{ inputs.pre_site_artifact_digest }}"
           --expected-workflow-id 316435347
           --expected-workflow-path .github/workflows/release-receipt.yml
-          --expected-event workflow_dispatch --expected-head-branch "${{ inputs.release_ref }}"
+          --expected-event workflow_dispatch --expected-head-branch "$GITHUB_REF_NAME"
           --allow-running-current-run --max-attempts 1
 
       - name: Download only the exact pre-site summary artifact ID

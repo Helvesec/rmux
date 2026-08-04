@@ -244,12 +244,33 @@ def receipt_identity(args: argparse.Namespace) -> dict[str, Any]:
     )
     if args.receipt_workflow_id != expected_id:
         raise ValueError("publication receipt workflow ID changed")
-    return {
+    identity = {
         "run_id": args.receipt_run_id,
         "run_attempt": 1,
         "workflow_id": args.receipt_workflow_id,
         "workflow_path": expected_path,
     }
+    recovery_values = (
+        args.recovered_from_run_id,
+        args.recovery_control_sha,
+        args.recovery_control_ref,
+    )
+    if any(value is not None for value in recovery_values):
+        if args.simulation or any(value is None for value in recovery_values):
+            raise ValueError("receipt recovery identity is incomplete")
+        positive_integer(args.recovered_from_run_id, "failed receipt run ID")
+        require_match(args.recovery_control_sha, SHA40, "recovery control SHA")
+        if args.recovery_control_ref != "refs/heads/main":
+            raise ValueError("receipt recovery must execute from protected main")
+        if args.recovered_from_run_id == args.receipt_run_id:
+            raise ValueError("receipt recovery must use a fresh run")
+        identity["recovery"] = {
+            "failed_run_id": args.recovered_from_run_id,
+            "failed_conclusion": "startup_failure",
+            "control_sha": args.recovery_control_sha,
+            "control_ref": args.recovery_control_ref,
+        }
+    return identity
 
 
 def expected_predicate(args: argparse.Namespace) -> dict[str, Any]:
@@ -459,6 +480,9 @@ def predicate_arguments(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--receipt-run-attempt", type=int, default=1)
     parser.add_argument("--receipt-workflow-id", type=int, required=True)
     parser.add_argument("--verified-at", required=True)
+    parser.add_argument("--recovered-from-run-id", type=int)
+    parser.add_argument("--recovery-control-sha")
+    parser.add_argument("--recovery-control-ref")
 
 
 def envelope_arguments(parser: argparse.ArgumentParser) -> None:

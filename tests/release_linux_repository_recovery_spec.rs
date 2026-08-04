@@ -116,7 +116,9 @@ fn manual_recovery_is_same_run_revalidated_and_canonically_sealed() {
         .expect("signed repository construction");
     assert!(build_gate < construction);
     assert!(BUILD.contains("if: github.run_id == inputs.receipt_run_id"));
-    assert!(BUILD.contains("ref: ${{ inputs.expected_source_sha }}"));
+    assert!(!BUILD.contains("ref: ${{ inputs.expected_source_sha }}"));
+    assert!(BUILD.contains("test \"$GITHUB_REF\" = \"refs/heads/main\""));
+    assert!(BUILD.contains("--expected-source-sha \"$GITHUB_SHA\""));
     assert!(
         BUILD.contains("repository_artifact_id: ${{ needs.build.outputs.repository_artifact_id }}")
     );

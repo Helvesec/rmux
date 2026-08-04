@@ -103,11 +103,11 @@ jobs:
             --repository "$GITHUB_REPOSITORY" --run-id "$RMUX_RECEIPT_RUN_ID" \
             --artifact-id "$RMUX_PAYLOAD_ARTIFACT_ID" \
             --name "rmux-downstream-apt_rpm-payload-$RMUX_SOURCE_SHA-$RMUX_RELEASE_ID" \
-            --expected-source-sha "$RMUX_SOURCE_SHA" \
+            --expected-source-sha "$GITHUB_SHA" \
             --expected-digest "$RMUX_PAYLOAD_ARTIFACT_DIGEST" \
             --expected-workflow-id 316435347 \
             --expected-workflow-path .github/workflows/release-receipt.yml \
-            --expected-event workflow_dispatch --expected-head-branch "$RMUX_RELEASE_REF" \
+            --expected-event workflow_dispatch --expected-head-branch "$GITHUB_REF_NAME" \
             --allow-running-current-run --max-attempts 1
 
       - id: recovery
@@ -127,7 +127,6 @@ jobs:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
         if: github.run_id == inputs.receipt_run_id
         with:
-          ref: ${{ inputs.expected_source_sha }}
           persist-credentials: false
 
       - name: Download only the exact APT/RPM payload artifact ID

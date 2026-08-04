@@ -38,7 +38,6 @@ runs:
         test "$GITHUB_REPOSITORY" = "Helvesec/rmux"
         test "$GITHUB_REPOSITORY_ID" = "1239918790"
         test "$GITHUB_RUN_ATTEMPT" = 1
-        test "$GITHUB_SHA" = "$RMUX_EXPECTED_SOURCE_SHA"
         for value in "$RMUX_DOWNSTREAM_AUDIT_RUN_ID" "$RMUX_DOWNSTREAM_AUDIT_WORKFLOW_ID" "$RMUX_DOWNSTREAM_AUDIT_ARTIFACT_ID"; do
           [[ "$value" =~ ^[1-9][0-9]*$ ]]
         done
@@ -46,7 +45,11 @@ runs:
         [[ "$RMUX_DOWNSTREAM_AUDIT_ARTIFACT_DIGEST" =~ ^sha256:[0-9a-f]{64}$ ]]
         [[ "$RMUX_EXPECTED_SOURCE_SHA" =~ ^[0-9a-f]{40}$ ]]
         [[ "$RMUX_RELEASE_REF" =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-rc\.[0-9]+)?$ ]]
-        test "$GITHUB_REF" = "refs/tags/$RMUX_RELEASE_REF"
+        if [ "$GITHUB_SHA" = "$RMUX_EXPECTED_SOURCE_SHA" ]; then
+          test "$GITHUB_REF" = "refs/tags/$RMUX_RELEASE_REF"
+        else
+          test "$GITHUB_REF" = refs/heads/main
+        fi
 
     - name: Verify exact downstream authority artifact identity
       shell: bash
@@ -59,12 +62,12 @@ runs:
           --run-id "${{ inputs.audit-run-id }}" \
           --artifact-id "${{ inputs.audit-artifact-id }}" \
           --name "rmux-downstream-authority-${{ inputs.expected-source-sha }}-${{ inputs.audit-run-id }}" \
-          --expected-source-sha "${{ inputs.expected-source-sha }}" \
+          --expected-source-sha "$GITHUB_SHA" \
           --expected-digest "${{ inputs.audit-artifact-digest }}" \
           --expected-workflow-id "${{ inputs.audit-workflow-id }}" \
           --expected-workflow-path .github/workflows/release-receipt.yml \
           --expected-event workflow_dispatch \
-          --expected-head-branch "${{ inputs.release-ref }}" \
+          --expected-head-branch "$GITHUB_REF_NAME" \
           --allow-running-current-run --max-attempts 1
 
     - name: Download only the exact downstream authority artifact ID

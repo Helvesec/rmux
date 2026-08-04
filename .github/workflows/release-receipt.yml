@@ -17,6 +17,10 @@ on:
         type: choice
         options: [rc, stable]
       receipt_workflow_id: {required: true, type: string}
+      failed_receipt_run_id:
+        required: false
+        type: string
+        default: ""
       snap_candidate_opt_in:
         required: false
         type: boolean
@@ -57,6 +61,7 @@ jobs:
       RMUX_RELEASE_REF: ${{ inputs.release_ref }}
       RMUX_RELEASE_KIND: ${{ inputs.release_kind }}
       RMUX_RECEIPT_WORKFLOW_ID: ${{ inputs.receipt_workflow_id }}
+      RMUX_FAILED_RECEIPT_RUN_ID: ${{ inputs.failed_receipt_run_id }}
     steps:
       - name: Reject malformed receipt inputs
         shell: bash
@@ -76,11 +81,31 @@ jobs:
             [[ "$RMUX_RELEASE_REF" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]
           fi
           test "$GITHUB_RUN_ATTEMPT" = 1
+          if [ -n "$RMUX_FAILED_RECEIPT_RUN_ID" ]; then
+            [[ "$RMUX_FAILED_RECEIPT_RUN_ID" =~ ^[1-9][0-9]*$ ]]
+            test "$GITHUB_REF" = refs/heads/main
+            test "$GITHUB_SHA" != "$RMUX_EXPECTED_SOURCE_SHA"
+          else
+            test "$GITHUB_SHA" = "$RMUX_EXPECTED_SOURCE_SHA"
+            test "$GITHUB_REF" = "refs/tags/$RMUX_RELEASE_REF"
+          fi
 
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
         with:
-          ref: ${{ inputs.expected_source_sha }}
           persist-credentials: false
+
+      - name: Verify exact failed receipt before protected-main recovery
+        if: inputs.failed_receipt_run_id != ''
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: >-
+          scripts/release/receipt-recovery.py
+          --failed-run-id "$RMUX_FAILED_RECEIPT_RUN_ID"
+          --current-run-id "$GITHUB_RUN_ID"
+          --control-sha "$GITHUB_SHA"
+          --source-sha "$RMUX_EXPECTED_SOURCE_SHA"
+          --release-id "$RMUX_RELEASE_ID"
+          --release-ref "$RMUX_RELEASE_REF"
 
       - name: Fail closed before receipt attestation
         run: scripts/release/assert-release-capability.py publication_receipt
@@ -311,6 +336,13 @@ jobs:
             --receipt-workflow-id "$RMUX_RECEIPT_WORKFLOW_ID"
             --verified-at "${{ steps.identity.outputs.verified_at }}"
           )
+          if [ -n "$RMUX_FAILED_RECEIPT_RUN_ID" ]; then
+            common+=(
+              --recovered-from-run-id "$RMUX_FAILED_RECEIPT_RUN_ID"
+              --recovery-control-sha "$GITHUB_SHA"
+              --recovery-control-ref "$GITHUB_REF"
+            )
+          fi
           python3 scripts/release/publication-receipt.py create-predicate \
             "${common[@]}" --output "$root/publication-receipt-predicate.json"
           python3 scripts/release/publication-receipt.py verify-predicate \
@@ -353,7 +385,7 @@ jobs:
             --repository "$GITHUB_REPOSITORY" --run-id "$GITHUB_RUN_ID" \
             --artifact-id "${{ steps.receipt-upload.outputs.artifact-id }}" \
             --name "rmux-publication-receipt-${{ inputs.expected_source_sha }}-${{ inputs.release_id }}" \
-            --expected-source-sha "$RMUX_EXPECTED_SOURCE_SHA" --max-attempts 6 \
+            --expected-source-sha "$GITHUB_SHA" --max-attempts 6 \
             --retry-delay-seconds 2 > "$RUNNER_TEMP/rmux-receipt/artifact.json"
           python3 - "$RUNNER_TEMP/rmux-receipt/artifact.json" "$GITHUB_OUTPUT" <<'PY'
           import json, pathlib, sys
@@ -428,6 +460,7 @@ jobs:
       artifact_digest: ${{ steps.audit.outputs.artifact-digest }}
     env:
       RMUX_EXPECTED_SOURCE_SHA: ${{ inputs.expected_source_sha }}
+      RMUX_FAILED_RECEIPT_RUN_ID: ${{ inputs.failed_receipt_run_id }}
     steps:
       - name: Reject malformed or stale audit identity
         shell: bash
@@ -436,13 +469,16 @@ jobs:
           test "$GITHUB_REPOSITORY" = "Helvesec/rmux"
           test "$GITHUB_REPOSITORY_ID" = "1239918790"
           test "$GITHUB_RUN_ATTEMPT" = 1
-          test "$GITHUB_SHA" = "$RMUX_EXPECTED_SOURCE_SHA"
           [[ "$RMUX_EXPECTED_SOURCE_SHA" =~ ^[0-9a-f]{40}$ ]]
-          [[ "$GITHUB_REF" =~ ^refs/tags/v[0-9]+\.[0-9]+\.[0-9]+(-rc\.[0-9]+)?$ ]]
+          if [ -n "$RMUX_FAILED_RECEIPT_RUN_ID" ]; then
+            test "$GITHUB_REF" = refs/heads/main
+          else
+            test "$GITHUB_SHA" = "$RMUX_EXPECTED_SOURCE_SHA"
+            [[ "$GITHUB_REF" =~ ^refs/tags/v[0-9]+\.[0-9]+\.[0-9]+(-rc\.[0-9]+)?$ ]]
+          fi
 
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
         with:
-          ref: ${{ inputs.expected_source_sha }}
           persist-credentials: false
 
       - id: audit

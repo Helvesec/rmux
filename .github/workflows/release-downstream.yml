@@ -82,7 +82,6 @@ jobs:
 
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
         with:
-          ref: ${{ inputs.expected_source_sha }}
           persist-credentials: false
 
       - name: Verify exact receipt artifacts and producer run
@@ -96,21 +95,21 @@ jobs:
             --repository "$GITHUB_REPOSITORY" --run-id "$RMUX_RECEIPT_RUN_ID" \
             --artifact-id "$RMUX_RECEIPT_ARTIFACT_ID" \
             --name "rmux-publication-receipt-$RMUX_EXPECTED_SOURCE_SHA-$RMUX_RELEASE_ID" \
-            --expected-source-sha "$RMUX_EXPECTED_SOURCE_SHA" \
+            --expected-source-sha "$GITHUB_SHA" \
             --expected-digest "$RMUX_RECEIPT_ARTIFACT_DIGEST" \
             --expected-workflow-id "$RMUX_RECEIPT_RUN_WORKFLOW_ID" \
             --expected-workflow-path .github/workflows/release-receipt.yml \
-            --expected-event workflow_dispatch --expected-head-branch "$RMUX_RELEASE_REF" \
+            --expected-event workflow_dispatch --expected-head-branch "$GITHUB_REF_NAME" \
             --allow-running-current-run --max-attempts 1 > "$root/receipt-artifact.json"
           python3 scripts/release/actions-artifact.py verify \
             --repository "$GITHUB_REPOSITORY" --run-id "$RMUX_RECEIPT_RUN_ID" \
             --artifact-id "$RMUX_RECEIPT_ENVELOPE_ARTIFACT_ID" \
             --name "rmux-publication-receipt-envelope-$RMUX_EXPECTED_SOURCE_SHA-$RMUX_RELEASE_ID" \
-            --expected-source-sha "$RMUX_EXPECTED_SOURCE_SHA" \
+            --expected-source-sha "$GITHUB_SHA" \
             --expected-digest "$RMUX_RECEIPT_ENVELOPE_ARTIFACT_DIGEST" \
             --expected-workflow-id "$RMUX_RECEIPT_RUN_WORKFLOW_ID" \
             --expected-workflow-path .github/workflows/release-receipt.yml \
-            --expected-event workflow_dispatch --expected-head-branch "$RMUX_RELEASE_REF" \
+            --expected-event workflow_dispatch --expected-head-branch "$GITHUB_REF_NAME" \
             --allow-running-current-run --max-attempts 1 > "$root/envelope-artifact.json"
 
       - name: Download only the exact receipt predicate bundle ID
@@ -154,6 +153,8 @@ jobs:
           --predicate "$RUNNER_TEMP/rmux-downstream/receipt/publication-receipt-predicate.json"
           --source-sha "$RMUX_EXPECTED_SOURCE_SHA"
           --release-ref "$RMUX_RELEASE_REF"
+          --producer-source-sha "$GITHUB_SHA"
+          --producer-source-ref "$GITHUB_REF"
 
       - name: Assert active downstream authority
         run: scripts/release/assert-release-capability.py downstream_channels
@@ -229,7 +230,6 @@ jobs:
 
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
         with:
-          ref: ${{ inputs.expected_source_sha }}
           persist-credentials: false
 
       - name: Verify exact downstream repository authority proof

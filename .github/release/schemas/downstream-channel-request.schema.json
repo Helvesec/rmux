@@ -213,6 +213,7 @@
         "run_attempt": {"const": 1},
         "workflow_id": {"$ref": "#/$defs/positive"},
         "workflow_path": {"const": ".github/workflows/release-receipt.yml"},
+        "recovery": {"type": "object", "additionalProperties": false, "required": ["failed_run_id", "failed_conclusion", "control_sha", "control_ref"], "properties": {"failed_run_id": {"$ref": "#/$defs/positive"}, "failed_conclusion": {"const": "startup_failure"}, "control_sha": {"$ref": "#/$defs/sha40"}, "control_ref": {"const": "refs/heads/main"}}},
         "predicate_bundle": {"$ref": "#/$defs/receipt_predicate_artifact"},
         "predicate_sha256": {"$ref": "#/$defs/sha256"},
         "envelope_bundle": {"$ref": "#/$defs/receipt_envelope_artifact"},

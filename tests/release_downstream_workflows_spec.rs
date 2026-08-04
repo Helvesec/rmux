@@ -492,7 +492,8 @@ fn exact_receipt_ids_digests_origin_and_documents_are_bound() {
         prepare.contains("test \"$RMUX_RECEIPT_RUN_WORKFLOW_ID\" = \"$RMUX_RECEIPT_WORKFLOW_ID\"")
     );
     assert!(prepare.contains("--expected-event workflow_dispatch"));
-    assert!(prepare.contains("--expected-head-branch \"$RMUX_RELEASE_REF\""));
+    assert!(prepare.contains("--expected-source-sha \"$GITHUB_SHA\""));
+    assert!(prepare.contains("--expected-head-branch \"$GITHUB_REF_NAME\""));
     assert_eq!(prepare.matches("artifact-ids:").count(), 2);
     assert_eq!(
         prepare

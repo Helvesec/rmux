@@ -58,8 +58,8 @@ runs:
         test -f "$root/plan/receipt-reference.json"
         test -f "$RMUX_TARGET_EVIDENCE"
         [[ "$RMUX_PRODUCER_WORKFLOW_ID" =~ ^[1-9][0-9]*$ ]]
-        producer_head_sha="${RMUX_PRODUCER_HEAD_SHA:-${{ inputs.source-sha }}}"
-        producer_source_ref="${RMUX_PRODUCER_SOURCE_REF:-refs/tags/${{ inputs.release-ref }}}"
+        producer_head_sha="${RMUX_PRODUCER_HEAD_SHA:-$GITHUB_SHA}"
+        producer_source_ref="${RMUX_PRODUCER_SOURCE_REF:-$GITHUB_REF}"
         attestation_signer="${RMUX_ATTESTATION_SIGNER_WORKFLOW_PATH:-$RMUX_PRODUCER_WORKFLOW_PATH}"
         [[ "$producer_head_sha" =~ ^[0-9a-f]{40}$ ]]
         [[ "$producer_source_ref" =~ ^refs/(heads|tags)/[A-Za-z0-9._/-]+$ ]]
@@ -68,9 +68,9 @@ runs:
           test -n "$RMUX_PRODUCER_HEAD_SHA"
           test -n "$RMUX_PRODUCER_SOURCE_REF"
           test -n "$RMUX_ATTESTATION_SIGNER_WORKFLOW_PATH"
-          test "$GITHUB_SHA" = "$producer_head_sha"
-          test "$GITHUB_REF" = "$producer_source_ref"
         fi
+        test "$GITHUB_SHA" = "$producer_head_sha"
+        test "$GITHUB_REF" = "$producer_source_ref"
         python3 - "$GITHUB_RUN_ID" "$RMUX_PRODUCER_WORKFLOW_ID" \
           "$RMUX_PRODUCER_WORKFLOW_PATH" "$RMUX_RUNNER_IMAGE" \
           "$root/result-producer.json" <<'PY'

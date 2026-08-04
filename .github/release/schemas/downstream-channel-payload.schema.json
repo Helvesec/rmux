@@ -99,6 +99,8 @@
         "workflow_id": {"const": 316435347},
         "workflow_path": {"const": ".github/workflows/release-receipt.yml"},
         "job_workflow_path": {"const": ".github/workflows/release-downstream-prepare.yml"},
+        "head_sha": {"$ref": "#/$defs/sha40"},
+        "source_ref": {"type": "string", "pattern": "^refs/(?:heads|tags)/[A-Za-z0-9._/-]+$"},
         "runner_group_id": {"const": 0},
         "runner_group_name": {"const": "GitHub Actions"},
         "runner_image": {"enum": ["ubuntu-22.04", "windows-latest"]}

@@ -517,6 +517,7 @@
     "scripts/release/publish-github-release.py",
     "scripts/release/publish-linux-repository.py",
     "scripts/release/publish-owned-repository.py",
+    "scripts/release/receipt-recovery.py",
     "scripts/release/release-tag-message.py",
     "scripts/release/release_authority.py",
     "scripts/release/release_evidence.py",
