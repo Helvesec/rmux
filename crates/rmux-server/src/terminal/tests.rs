@@ -1268,13 +1268,11 @@ fn hook_append_command(path: &Path, first: &str, second: &str) -> String {
     }
     #[cfg(windows)]
     {
-        crate::test_shell::powershell_encoded_command(&format!(
-            "[IO.File]::WriteAllText({}, {}); [IO.File]::AppendAllText({}, {})",
-            powershell_quote_path(path),
-            powershell_quote(first),
-            powershell_quote_path(path),
-            powershell_quote(second)
-        ))
+        format!(
+            r#"<nul set /p "={first}">"{}" & <nul set /p "={second}">>"{}""#,
+            path.display(),
+            path.display()
+        )
     }
 }
 
