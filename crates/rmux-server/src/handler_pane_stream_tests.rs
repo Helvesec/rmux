@@ -1563,15 +1563,49 @@ async fn natural_pane_exit_drains_raw_and_surface_streams_before_end() {
     ));
 
     let surface_events = cursor_until_unlimited(&handler, surface.subscription_id, 1).await;
-    assert!(matches!(
-        surface_events.as_slice(),
-        [
-            PaneStreamEvent::SurfacePatch(frame),
-            PaneStreamEvent::Lifecycle(PaneStreamLifecycleEvent::ProcessExited { .. }),
-            PaneStreamEvent::End(PaneStreamEndReason::PaneRemoved),
-        ] if frame.snapshot.revision > initial_surface_revision
-            && frame.next_output_sequence > tail_sequence
-    ));
+    assert_unique_pane_removed_end(&surface_events, "natural Surface exit drain");
+    assert!(
+        surface_events[..surface_events.len() - 1]
+            .iter()
+            .all(|event| matches!(
+                event,
+                PaneStreamEvent::SurfacePatch(_)
+                    | PaneStreamEvent::SurfaceReset(_)
+                    | PaneStreamEvent::Lifecycle(PaneStreamLifecycleEvent::ProcessExited { .. })
+            )),
+        "natural Surface exit drain emitted an unexpected event: {surface_events:?}"
+    );
+    let lifecycle_positions = surface_events
+        .iter()
+        .enumerate()
+        .filter_map(|(index, event)| {
+            matches!(
+                event,
+                PaneStreamEvent::Lifecycle(PaneStreamLifecycleEvent::ProcessExited { .. })
+            )
+            .then_some(index)
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        lifecycle_positions.len(),
+        1,
+        "natural Surface exit must publish one lifecycle event: {surface_events:?}"
+    );
+    let (final_surface_index, final_surface_frame) = surface_events
+        .iter()
+        .enumerate()
+        .filter_map(|(index, event)| surface_frame(event).map(|frame| (index, frame)))
+        .next_back()
+        .expect("natural Surface exit must publish its final authoritative frame");
+    assert!(
+        final_surface_index < lifecycle_positions[0],
+        "the final Surface frame must precede process exit: {surface_events:?}"
+    );
+    assert!(
+        final_surface_frame.snapshot.revision > initial_surface_revision
+            && final_surface_frame.next_output_sequence > tail_sequence,
+        "the final Surface frame must include the natural-exit tail: {surface_events:?}"
+    );
     assert!(
         handler
             .subscriptions
