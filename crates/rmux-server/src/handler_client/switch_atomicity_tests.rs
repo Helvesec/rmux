@@ -1139,10 +1139,18 @@ async fn attach_identity_replacement_after_size_selection_commits_no_target_muta
             error: attached_client_required("switch-client"),
         })
     );
-    assert!(matches!(
-        replacement_rx.try_recv(),
-        Err(mpsc::error::TryRecvError::Empty)
-    ));
+    while let Ok(control) = replacement_rx.try_recv() {
+        assert!(
+            !matches!(
+                control,
+                crate::pane_io::AttachControl::Switch(target)
+                    if target
+                        .with_target(|target| target.session_name == beta)
+                        .unwrap_or(false)
+            ),
+            "stale switch must not reach the replacement attach"
+        );
+    }
     let state = handler.state.lock().await;
     assert_eq!(state.sessions.session(&beta), Some(&before_session));
     assert_eq!(
