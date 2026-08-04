@@ -35,6 +35,7 @@ OBSERVED_TARGET_STATES = REMOTE_MUTATION_STATES | {"no-op-exact"}
 RETRYABLE_STATES = {"prepared", "failed-transient"}
 LINUX_RECOVERY_PRODUCER = ".github/workflows/release-linux-repository-build.yml"
 LINUX_RECOVERY_SIGNER = ".github/workflows/release-linux-repository-publish.yml"
+RECEIPT_RECOVERY_PRODUCER = ".github/workflows/release-receipt.yml"
 
 
 def result_state(value: Any) -> str:
@@ -98,7 +99,11 @@ def validate_result_artifact_source(
 ) -> str:
     source_sha = match(value, SHA40, "result artifact source SHA")
     if source_sha != release_source_sha and (
-        channel != "apt_rpm" or producer.get("workflow_path") != LINUX_RECOVERY_PRODUCER
+        producer.get("workflow_path") != RECEIPT_RECOVERY_PRODUCER
+        and (
+            channel != "apt_rpm"
+            or producer.get("workflow_path") != LINUX_RECOVERY_PRODUCER
+        )
     ):
         raise ValueError("result artifact source differs from its release")
     return source_sha

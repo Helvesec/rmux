@@ -10,6 +10,21 @@ from pathlib import Path
 from typing import Any
 
 from github_actions import gh_api, read_json
+from receipt_recovery_topology import (
+    ACTIVE,
+    DIRECT_SUCCESS_JOBS,
+    EARLY_SUCCESS_JOBS,
+    LEGACY_DOWNSTREAM_PREFIX,
+    LINUX_SIGNING_JOB,
+    OWNED_WRITER_JOBS,
+    PAYLOAD_CHANNELS,
+    POST_MUTATION_JOB_MAP,
+    POST_MUTATION_RESULT_CHANNELS,
+    POST_MUTATION_SKIPPED_AFTER_FAILURE,
+    PREPARATION_PREFIX,
+    PREPARATION_SUCCESS_JOBS,
+    SKIPPED_AFTER_FAILURE,
+)
 
 REPOSITORY = "Helvesec/rmux"
 REPOSITORY_ID = 1239918790
@@ -17,60 +32,6 @@ RECEIPT_WORKFLOW_ID = 316435347
 CI_WORKFLOW_ID = 277622540
 SHA40 = re.compile(r"[0-9a-f]{40}")
 RELEASE_REF = re.compile(r"v[0-9]+\.[0-9]+\.[0-9]+(?:-rc\.[0-9]+)?")
-ACTIVE = frozenset({"queued", "in_progress", "requested", "waiting", "pending"})
-DIRECT_SUCCESS_JOBS = frozenset(
-    {
-        "Verify immutable Release and create receipt",
-        "Audit live downstream repository authority",
-    }
-)
-PREPARATION_SUCCESS_JOBS = frozenset(
-    {
-        "Prepare non-authoritative downstream plan",
-        "Verify exact downstream repository authority audit",
-        "Prepare exact downstream payloads / Materialize exact channel payloads",
-    }
-)
-EARLY_SUCCESS_JOBS = DIRECT_SUCCESS_JOBS | PREPARATION_SUCCESS_JOBS
-LINUX_SIGNING_JOB = "Build exact signed Linux repository trees / Sign retained APT and RPM repository trees"
-OWNED_WRITER_JOBS = frozenset(
-    {
-        "Publish exact Homebrew tap formula / Publish owned channel homebrew_tap",
-        "Publish exact Scoop manifest / Publish owned channel scoop",
-        "Publish exact Web Share WASM bytes / Publish owned channel web_share",
-    }
-)
-SKIPPED_AFTER_FAILURE = frozenset(
-    {
-        "Build exact signed Linux repository trees / Publish only this run's authorized recovery artifact",
-        "Publish exact signed APT and RPM repositories",
-        "Publish exact crates.io package set",
-        "Record denied RC Linux repository channel",
-        "Submit exact Chocolatey package",
-        "Record disabled Snap stable channel",
-        "Record manual Homebrew Core submission",
-        "Record manual WinGet submission",
-        "Publish exact Snap candidate revisions",
-        "Aggregate ten exact pre-site results",
-        "Record blocked automated rmux.io update",
-        "Prepare manual rmux.io handoff",
-        "Aggregate all eleven exact channel results",
-    }
-)
-LEGACY_DOWNSTREAM_PREFIX = "Receipt-gated downstream publication / "
-PREPARATION_PREFIX = "Prepare receipt-gated downstream publication / "
-PAYLOAD_CHANNELS = (
-    "apt_rpm",
-    "chocolatey",
-    "crates_io",
-    "homebrew_core",
-    "homebrew_tap",
-    "scoop",
-    "snap_candidate",
-    "snap_stable",
-    "web_share",
-    "winget",
-)
 
 
 def object_fixture(path: Path | None, endpoint: str) -> dict[str, Any]:
@@ -136,7 +97,7 @@ def exact_step(steps: dict[str, str], name: str, conclusion: str, label: str) ->
 
 def canonical_failed_jobs(
     jobs: dict[str, dict[str, Any]],
-) -> dict[str, dict[str, Any]]:
+) -> tuple[dict[str, dict[str, Any]], bool]:
     downstream_jobs = (
         PREPARATION_SUCCESS_JOBS
         | {LINUX_SIGNING_JOB}
@@ -153,20 +114,41 @@ def canonical_failed_jobs(
         | OWNED_WRITER_JOBS
         | SKIPPED_AFTER_FAILURE
     )
+    post_mutation_names = (
+        DIRECT_SUCCESS_JOBS
+        | {f"{PREPARATION_PREFIX}{name}" for name in PREPARATION_SUCCESS_JOBS}
+        | set(POST_MUTATION_JOB_MAP)
+        | POST_MUTATION_SKIPPED_AFTER_FAILURE
+    )
     raw_names = set(jobs)
     if raw_names == legacy_names:
-        return {
-            name.removeprefix(LEGACY_DOWNSTREAM_PREFIX): job
-            for name, job in jobs.items()
-        }
+        return (
+            {
+                name.removeprefix(LEGACY_DOWNSTREAM_PREFIX): job
+                for name, job in jobs.items()
+            },
+            False,
+        )
     if raw_names == direct_names:
-        return {
-            name.removeprefix(PREPARATION_PREFIX): job for name, job in jobs.items()
-        }
+        return (
+            {name.removeprefix(PREPARATION_PREFIX): job for name, job in jobs.items()},
+            False,
+        )
+    if raw_names == post_mutation_names:
+        return (
+            {
+                POST_MUTATION_JOB_MAP.get(
+                    name.removeprefix(PREPARATION_PREFIX),
+                    name.removeprefix(PREPARATION_PREFIX),
+                ): job
+                for name, job in jobs.items()
+            },
+            True,
+        )
     raise ValueError("failed downstream job topology differs")
 
 
-def verify_failed_downstream_jobs(value: dict[str, Any]) -> None:
+def verify_failed_downstream_jobs(value: dict[str, Any]) -> bool:
     jobs = value.get("jobs")
     if not isinstance(jobs, list) or value.get("total_count") != len(jobs):
         raise ValueError("failed downstream job set is malformed")
@@ -178,11 +160,14 @@ def verify_failed_downstream_jobs(value: dict[str, Any]) -> None:
         if name in by_name:
             raise ValueError("failed downstream job names are not unique")
         by_name[name] = job
-    by_name = canonical_failed_jobs(by_name)
+    by_name, post_mutation = canonical_failed_jobs(by_name)
     for name in EARLY_SUCCESS_JOBS:
         if by_name[name].get("conclusion") != "success":
             raise ValueError(f"failed downstream prerequisite {name} is not successful")
-    for name in SKIPPED_AFTER_FAILURE:
+    skipped_jobs = (
+        POST_MUTATION_SKIPPED_AFTER_FAILURE if post_mutation else SKIPPED_AFTER_FAILURE
+    )
+    for name in skipped_jobs:
         if (
             by_name[name].get("conclusion") != "skipped"
             or by_name[name].get("steps") != []
@@ -190,6 +175,34 @@ def verify_failed_downstream_jobs(value: dict[str, Any]) -> None:
             raise ValueError(f"post-failure downstream job {name} was not untouched")
 
     linux = by_name[LINUX_SIGNING_JOB]
+    if post_mutation:
+        checkout = "Run actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5"
+        post_checkout = f"Post {checkout}"
+        linux_steps = job_steps(linux, LINUX_SIGNING_JOB)
+        expected_linux_steps = {
+            "Set up job": "success",
+            checkout: "success",
+            "Run ./.github/actions/release-linux-repository-build": "success",
+            post_checkout: "success",
+            "Complete job": "success",
+        }
+        if linux.get("conclusion") != "success" or linux_steps != expected_linux_steps:
+            raise ValueError("post-mutation Linux repository build is not successful")
+        action = "Run ./.github/actions/release-owned-repository-publish"
+        expected_writer_steps = {
+            "Set up job": "success",
+            checkout: "success",
+            action: "failure",
+            f"Post {action}": "success",
+            post_checkout: "success",
+            "Complete job": "success",
+        }
+        for name in OWNED_WRITER_JOBS:
+            job = by_name[name]
+            steps = job_steps(job, name)
+            if job.get("conclusion") != "failure" or steps != expected_writer_steps:
+                raise ValueError(f"post-mutation writer failure {name} differs")
+        return True
     if linux.get("conclusion") != "failure":
         raise ValueError("Linux repository signing did not fail closed")
     linux_steps = job_steps(linux, LINUX_SIGNING_JOB)
@@ -229,10 +242,14 @@ def verify_failed_downstream_jobs(value: dict[str, Any]) -> None:
             "skipped",
             name,
         )
+    return False
 
 
 def verify_failed_downstream_artifacts(
-    value: dict[str, Any], args: argparse.Namespace, failed_control_sha: str
+    value: dict[str, Any],
+    args: argparse.Namespace,
+    failed_control_sha: str,
+    post_mutation: bool,
 ) -> int:
     artifacts = value.get("artifacts")
     if not isinstance(artifacts, list) or value.get("total_count") != len(artifacts):
@@ -247,6 +264,14 @@ def verify_failed_downstream_artifacts(
             for channel in PAYLOAD_CHANNELS
         ),
     }
+    if post_mutation:
+        expected_names.add(
+            f"rmux-downstream-apt_rpm-signed-{args.source_sha}-{args.release_id}"
+        )
+        expected_names.update(
+            f"rmux-downstream-{channel}-result-{args.source_sha}-{args.release_id}"
+            for channel in POST_MUTATION_RESULT_CHANNELS
+        )
     by_name: dict[str, dict[str, Any]] = {}
     for artifact in artifacts:
         if not isinstance(artifact, dict) or not isinstance(artifact.get("name"), str):
@@ -333,8 +358,10 @@ def verify_failed_attempt(
     verified_commit(
         failed_commit, failed_control_sha, "failed downstream control commit"
     )
-    verify_failed_downstream_jobs(jobs)
-    return verify_failed_downstream_artifacts(artifacts, args, failed_control_sha)
+    post_mutation = verify_failed_downstream_jobs(jobs)
+    return verify_failed_downstream_artifacts(
+        artifacts, args, failed_control_sha, post_mutation
+    )
 
 
 def prior_attempt_fixtures(args: argparse.Namespace) -> dict[str, Any] | None:

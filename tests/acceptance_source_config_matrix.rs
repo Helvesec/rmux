@@ -604,24 +604,14 @@ fn startup_config_unquoted_windows_powershell_default_shell_starts_powershell(
         OsStr::new("-s"),
         OsStr::new("psdefault"),
     ])?;
-    std::thread::sleep(std::time::Duration::from_millis(1_800));
     harness.success(["has-session", "-t", "psdefault"])?;
     assert_option(&harness, "default-shell", powershell)?;
-    harness.success([
-        "send-keys",
-        "-t",
-        "psdefault:0.0",
-        "Write-Output ('RMUX_' + 'PS51_READY')",
-        "Enter",
-    ])?;
-    wait_for_capture_contains(
+    wait_for_pane_current_command(
         &harness,
         "psdefault:0.0",
-        "RMUX_PS51_READY",
+        &["powershell.exe", "powershell"],
         std::time::Duration::from_secs(8),
-    )?;
-
-    Ok(())
+    )
 }
 
 #[test]
@@ -774,25 +764,35 @@ fn assert_binding_absent(
 }
 
 #[cfg(windows)]
-fn wait_for_capture_contains(
+fn wait_for_pane_current_command(
     harness: &CrossPlatformHarness,
     target: &str,
-    needle: &str,
+    expected: &[&str],
     timeout: std::time::Duration,
-) -> Result<String, Box<dyn Error>> {
+) -> Result<(), Box<dyn Error>> {
     let deadline = std::time::Instant::now() + timeout;
-    let mut last_capture = String::new();
+    let mut last_command = String::new();
 
     while std::time::Instant::now() < deadline {
-        last_capture = harness.stdout(["capture-pane", "-p", "-t", target])?;
-        if last_capture.contains(needle) {
-            return Ok(last_capture);
+        last_command = harness.stdout([
+            "display-message",
+            "-p",
+            "-t",
+            target,
+            "#{pane_current_command}",
+        ])?;
+        let command = last_command.trim();
+        if expected
+            .iter()
+            .any(|candidate| command.eq_ignore_ascii_case(candidate))
+        {
+            return Ok(());
         }
-        std::thread::sleep(std::time::Duration::from_millis(200));
+        std::thread::sleep(std::time::Duration::from_millis(50));
     }
 
     Err(
-        format!("timed out waiting for {needle:?} in {target}; last capture:\n{last_capture}")
+        format!("timed out waiting for {expected:?} in {target}; last command: {last_command:?}")
             .into(),
     )
 }

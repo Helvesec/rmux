@@ -330,6 +330,10 @@ fn delayed_true_shell_condition() -> String {
     "Start-Sleep -Milliseconds 50; exit 0".to_owned()
 }
 
+fn builtin_true_shell_condition() -> &'static str {
+    "true"
+}
+
 #[cfg(unix)]
 fn shell_print_command(text: &str) -> String {
     format!("printf {}", command_quote(text))

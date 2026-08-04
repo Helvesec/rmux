@@ -1,6 +1,6 @@
 use std::fs::File;
 use std::io::{self, Read, Write};
-use std::os::windows::io::FromRawHandle;
+use std::os::windows::io::{AsRawHandle, FromRawHandle};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -12,6 +12,7 @@ use rmux_proto::{
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::{mpsc, oneshot};
 use windows_sys::Win32::Foundation::HANDLE;
+use windows_sys::Win32::Storage::FileSystem::WriteFile;
 use windows_sys::Win32::System::Pipes::CreatePipe;
 
 use super::super::action::{run_attach_action, AttachActionExecutor};
@@ -2333,7 +2334,22 @@ impl Drop for DropBlockingPipeOutput {
         if let Some(drop_started_tx) = self.drop_started_tx.take() {
             let _ = drop_started_tx.send(());
         }
-        let _ = self.writer.write_all(&vec![b'd'; 1024 * 1024]);
+        let payload = vec![b'd'; 1024 * 1024];
+        let mut written = 0_u32;
+        let _ = unsafe {
+            // SAFETY: the file owns a live pipe handle for this call, payload
+            // remains valid for its duration, and written points to writable
+            // storage. A single WriteFile is intentional: Write::write_all
+            // retries interrupted writes and would undo the cancellation this
+            // fixture is meant to observe.
+            WriteFile(
+                self.writer.as_raw_handle() as HANDLE,
+                payload.as_ptr(),
+                payload.len() as u32,
+                &mut written,
+                std::ptr::null_mut(),
+            )
+        };
     }
 }
 

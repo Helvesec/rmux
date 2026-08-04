@@ -388,6 +388,10 @@ fn result_envelope_normalizes_exact_github_artifact_metadata() {
 with tempfile.TemporaryDirectory(dir=pathlib.Path.cwd()) as root:
     root = pathlib.Path(root)
     paths = write_fixture(root)
+    control_sha = 'f' * 40
+    metadata = json.loads(paths['predicate_meta'].read_text(encoding='utf-8'))
+    metadata['source_git_sha'] = control_sha
+    write_object(paths['predicate_meta'], metadata)
     bundle = root / 'downstream-channel-result.sigstore.json'
     bundle.write_text('{}\n', encoding='utf-8')
     spec = importlib.util.spec_from_file_location(
@@ -402,6 +406,7 @@ with tempfile.TemporaryDirectory(dir=pathlib.Path.cwd()) as root:
         attestation_id='result-attestation-7',
         attestation_bundle=bundle,
         bundle_artifact=paths['predicate_meta'],
+        artifact_source_sha=control_sha,
         created_at='2026-07-20T00:00:30Z',
     ))
     expected = artifact(

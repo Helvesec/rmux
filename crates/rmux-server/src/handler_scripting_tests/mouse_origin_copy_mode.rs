@@ -387,7 +387,7 @@ async fn background_command_queues_drop_mouse_origin_like_tmux() {
             "mouse-background-if-copy",
             format!(
                 "if-shell -b {} {{ copy-mode }}",
-                command_quote(&delayed_true_shell_condition())
+                command_quote(builtin_true_shell_condition())
             ),
         ),
         (

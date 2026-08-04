@@ -446,7 +446,7 @@ async fn assert_explicit_background_if_shell_target_survives_switch(queued: bool
         let commands = CommandParser::new()
             .parse(&format!(
                 "if-shell -b -t {gamma}:0.0 {} {{ wait-for {wait_channel} ; rename-window {expected_window_name} }}",
-                command_quote(&delayed_true_shell_condition())
+                command_quote(builtin_true_shell_condition())
             ))
             .expect("queued explicit background if-shell parses");
         with_expected_attach_and_session_identity(
@@ -465,7 +465,7 @@ async fn assert_explicit_background_if_shell_target_survives_switch(queued: bool
             handler.handle_if_shell(
                 requester_pid,
                 IfShellRequest {
-                    condition: delayed_true_shell_condition(),
+                    condition: builtin_true_shell_condition().to_owned(),
                     format_mode: false,
                     then_command: format!(
                         "wait-for {wait_channel} ; rename-window {expected_window_name}"

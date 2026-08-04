@@ -259,7 +259,7 @@ fn downstream_failure_jobs() -> Value {
 fn direct_downstream_failure_jobs() -> Value {
     let mut value = downstream_failure_jobs();
     let jobs = value["jobs"].as_array_mut().expect("jobs array");
-    for job in jobs {
+    for job in jobs.iter_mut() {
         let name = job["name"].as_str().expect("job name");
         let Some(short) = name.strip_prefix("Receipt-gated downstream publication / ") else {
             continue;
@@ -280,8 +280,87 @@ fn direct_downstream_failure_jobs() -> Value {
     value
 }
 
+fn post_mutation_failure_jobs() -> Value {
+    let mut value = direct_downstream_failure_jobs();
+    let jobs = value["jobs"].as_array_mut().expect("jobs array");
+    jobs.retain(|job| {
+        job["name"]
+            != "Build exact signed Linux repository trees / Publish only this run's authorized recovery artifact"
+    });
+    for job in jobs.iter_mut() {
+        let name = job["name"].as_str().expect("job name");
+        let replacement = match name {
+            "Build exact signed Linux repository trees / Sign retained APT and RPM repository trees" => {
+                Some(("Build exact signed Linux repository trees", "success", "Run ./.github/actions/release-linux-repository-build"))
+            }
+            "Publish exact Homebrew tap formula / Publish owned channel homebrew_tap" => {
+                Some(("Publish exact Homebrew tap formula", "failure", "Run ./.github/actions/release-owned-repository-publish"))
+            }
+            "Publish exact Scoop manifest / Publish owned channel scoop" => {
+                Some(("Publish exact Scoop manifest", "failure", "Run ./.github/actions/release-owned-repository-publish"))
+            }
+            "Publish exact Web Share WASM bytes / Publish owned channel web_share" => {
+                Some(("Publish exact Web Share WASM bytes", "failure", "Run ./.github/actions/release-owned-repository-publish"))
+            }
+            _ => None,
+        };
+        if let Some((name, conclusion, action)) = replacement {
+            job["name"] = json!(name);
+            job["conclusion"] = json!(conclusion);
+            let mut steps = vec![
+                step("Set up job", "success"),
+                step(
+                    "Run actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5",
+                    "success",
+                ),
+                step(action, conclusion),
+            ];
+            if conclusion == "failure" {
+                steps.push(step(&format!("Post {action}"), "success"));
+            }
+            steps.extend([
+                step(
+                    "Post Run actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5",
+                    "success",
+                ),
+                step("Complete job", "success"),
+            ]);
+            job["steps"] = json!(steps);
+        }
+    }
+    value["total_count"] = json!(jobs.len());
+    value
+}
+
 fn downstream_failure_artifacts() -> (Value, u64) {
     downstream_failure_artifacts_for(FAILED_RUN, FAILED_CONTROL, 81)
+}
+
+fn post_mutation_failure_artifacts() -> (Value, u64) {
+    let (mut value, receipt_id) = downstream_failure_artifacts();
+    let artifacts = value["artifacts"].as_array_mut().expect("artifacts array");
+    for name in [
+        format!("rmux-downstream-apt_rpm-signed-{SOURCE}-{RELEASE_ID}"),
+        format!("rmux-downstream-homebrew_tap-result-{SOURCE}-{RELEASE_ID}"),
+        format!("rmux-downstream-scoop-result-{SOURCE}-{RELEASE_ID}"),
+        format!("rmux-downstream-web_share-result-{SOURCE}-{RELEASE_ID}"),
+    ] {
+        artifacts.push(json!({
+            "id": receipt_id + artifacts.len() as u64,
+            "name": name,
+            "expired": false,
+            "digest": format!("sha256:{}", "a".repeat(64)),
+            "workflow_run": {
+                "id": FAILED_RUN,
+                "head_sha": FAILED_CONTROL,
+                "head_branch": "main",
+                "repository_id": 1_239_918_790,
+                "head_repository_id": 1_239_918_790,
+            },
+        }));
+    }
+    value["total_count"] = json!(artifacts.len());
+    (value, receipt_id)
 }
 
 fn downstream_failure_artifacts_for(
@@ -404,6 +483,35 @@ fn protected_main_recovery_accepts_the_flattened_pre_mutation_topology() {
     let root = fixture_root("flattened-pre-mutation");
     let jobs = direct_downstream_failure_jobs();
     let (artifacts, receipt_id) = downstream_failure_artifacts();
+    let output = run_recovery(
+        &root,
+        failed_run(FAILED_CONTROL, "main", "failure"),
+        jobs,
+        artifacts,
+        json!({
+            "total_count": 1,
+            "artifacts": [{
+                "id": receipt_id,
+                "name": format!("rmux-publication-receipt-{SOURCE}-{RELEASE_ID}"),
+                "expired": false,
+                "workflow_run": {"id": FAILED_RUN},
+            }],
+        }),
+    );
+    fs::remove_dir_all(&root).expect("remove fixture root");
+    assert!(
+        output.status.success(),
+        "stdout={} stderr={}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+#[test]
+fn protected_main_recovery_accepts_only_the_exact_post_mutation_seal_failure() {
+    let root = fixture_root("post-mutation-seal");
+    let jobs = post_mutation_failure_jobs();
+    let (artifacts, receipt_id) = post_mutation_failure_artifacts();
     let output = run_recovery(
         &root,
         failed_run(FAILED_CONTROL, "main", "failure"),
