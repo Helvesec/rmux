@@ -9,8 +9,8 @@ from typing import Any
 from downstream_channels import DIGEST, RELEASE_REF, SHA40, SHA256, match, positive
 
 CHANNEL_PRODUCERS = {
-    "chocolatey": ".github/workflows/release-chocolatey-channel.yml",
-    "snap_candidate": ".github/workflows/release-snap-channel.yml",
+    "chocolatey": ".github/workflows/release-receipt.yml",
+    "snap_candidate": ".github/workflows/release-receipt.yml",
 }
 
 IDENTITY_INPUT_FIELDS = (

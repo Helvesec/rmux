@@ -84,11 +84,7 @@ runs:
         test "$RMUX_PRIOR_RESULT_PRODUCER_WORKFLOW_ID" = "$RMUX_RECEIPT_WORKFLOW_ID"
         [[ "$RMUX_SOURCE_SHA" =~ ^[0-9a-f]{40}$ ]]
         [[ "$RMUX_RELEASE_REF" =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-rc\.[0-9]+)?$ ]]
-        if [ "$RMUX_CHANNEL" = chocolatey ]; then
-          expected=.github/workflows/release-chocolatey-channel.yml
-        else
-          expected=.github/workflows/release-snap-channel.yml
-        fi
+        expected=.github/workflows/release-receipt.yml
         test "$RMUX_PRIOR_RESULT_PRODUCER_WORKFLOW_PATH" = "$expected"
         root="$RUNNER_TEMP/rmux-$RMUX_CHANNEL-retry"
         test ! -e "$root"

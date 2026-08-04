@@ -67,7 +67,7 @@ fn prepare_args() -> Vec<(String, String)> {
         ("prior-result-producer-workflow-id".into(), "202".into()),
         (
             "prior-result-producer-workflow-path".into(),
-            ".github/workflows/release-chocolatey-channel.yml".into(),
+            ".github/workflows/release-receipt.yml".into(),
         ),
         ("prior-result-artifact-id".into(), "401".into()),
         (
@@ -936,7 +936,7 @@ fn retry_input_validators_accept_canonical_and_reject_invalid_forms() {
         ),
         (
             "prior-result-producer-workflow-path",
-            ".github/workflows/release-snap-channel.yml",
+            ".github/workflows/release-policy-channel.yml",
             "cross-channel producer path",
         ),
         ("prior-result-run-id", "102", "cross-run mismatch"),

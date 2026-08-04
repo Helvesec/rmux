@@ -1,0 +1,90 @@
+name: Publish exact Chocolatey channel
+description: Submit one receipt-bound Chocolatey payload from a protected parent job.
+
+inputs:
+  receipt-run-id: {required: true}
+  plan-artifact-id: {required: true}
+  plan-artifact-digest: {required: true}
+  payload-artifact-id: {required: true}
+  payload-artifact-digest: {required: true}
+  source-sha: {required: true}
+  release-id: {required: true}
+  release-ref: {required: true}
+  api-key: {required: true}
+
+runs:
+  using: composite
+  steps:
+    - id: prepare
+      uses: ./.github/actions/release-channel-prepare
+      with:
+        channel: chocolatey
+        receipt-run-id: ${{ inputs.receipt-run-id }}
+        plan-artifact-id: ${{ inputs.plan-artifact-id }}
+        plan-artifact-digest: ${{ inputs.plan-artifact-digest }}
+        payload-artifact-id: ${{ inputs.payload-artifact-id }}
+        payload-artifact-digest: ${{ inputs.payload-artifact-digest }}
+        source-sha: ${{ inputs.source-sha }}
+        release-id: ${{ inputs.release-id }}
+        release-ref: ${{ inputs.release-ref }}
+
+    - id: decision
+      name: Resolve exact Chocolatey execution authority
+      shell: pwsh
+      run: >-
+        python scripts/release/channel-execution.py
+        --request "${{ steps.prepare.outputs.request }}" --channel chocolatey
+        --target-evidence "${{ steps.prepare.outputs.root }}/downstream-channel-target-evidence.json"
+        --github-output "$env:GITHUB_OUTPUT"
+
+    - id: writer
+      name: Submit exact Chocolatey package or verify public bytes
+      if: steps.decision.outputs.execute == 'true'
+      shell: pwsh
+      env:
+        CHOCOLATEY_API_KEY: ${{ inputs.api-key }}
+      run: >-
+        scripts/release/publish-chocolatey-package.ps1
+        -PayloadDir "${{ steps.prepare.outputs.payload-root }}"
+        -ReleaseRef "${{ inputs.release-ref }}"
+        -TargetEvidence "${{ steps.prepare.outputs.root }}/downstream-channel-target-evidence.json"
+        -GitHubOutput "$env:GITHUB_OUTPUT"
+
+    - id: outcome
+      name: Normalize executable and policy-only outcomes
+      shell: pwsh
+      env:
+        RMUX_EXECUTE: ${{ steps.decision.outputs.execute }}
+        RMUX_EXECUTED_STATE: ${{ steps.writer.outputs.state }}
+        RMUX_BLOCKED_STATE: ${{ steps.decision.outputs.state }}
+        RMUX_EXECUTED_MUTATION: ${{ steps.writer.outputs.mutation_started }}
+        RMUX_BLOCKED_MUTATION: ${{ steps.decision.outputs.mutation_started }}
+        RMUX_EXECUTED_REMOTE_ID: ${{ steps.writer.outputs.remote_request_id }}
+        RMUX_BLOCKED_REMOTE_ID: ${{ steps.decision.outputs.remote_request_id }}
+      run: |
+        $execute = $env:RMUX_EXECUTE -eq "true"
+        $state = if ($execute) { $env:RMUX_EXECUTED_STATE } else { $env:RMUX_BLOCKED_STATE }
+        $mutation = if ($execute) { $env:RMUX_EXECUTED_MUTATION } else { $env:RMUX_BLOCKED_MUTATION }
+        $remoteId = if ($execute) { $env:RMUX_EXECUTED_REMOTE_ID } else { $env:RMUX_BLOCKED_REMOTE_ID }
+        if ([string]::IsNullOrWhiteSpace($state) -or $mutation -notmatch '^(true|false)$') {
+            throw "Chocolatey outcome is incomplete"
+        }
+        "state=$state" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
+        "mutation_started=$mutation" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
+        "remote_request_id=$remoteId" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
+
+    - name: Seal exact Chocolatey result evidence
+      uses: ./.github/actions/release-channel-result
+      with:
+        channel: chocolatey
+        prepared-root: ${{ steps.prepare.outputs.root }}
+        state: ${{ steps.outcome.outputs.state }}
+        started-at: ${{ steps.decision.outputs.started_at }}
+        mutation-started: ${{ steps.outcome.outputs.mutation_started }}
+        remote-request-id: ${{ steps.outcome.outputs.remote_request_id }}
+        target-evidence: ${{ steps.prepare.outputs.root }}/downstream-channel-target-evidence.json
+        source-sha: ${{ inputs.source-sha }}
+        release-id: ${{ inputs.release-id }}
+        release-ref: ${{ inputs.release-ref }}
+        producer-workflow-path: .github/workflows/release-receipt.yml
+        runner-image: windows-latest

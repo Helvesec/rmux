@@ -110,26 +110,25 @@ RESULT_STATES = {
 }
 RESULT_PRODUCERS = {
     "apt_rpm": {
+        ".github/workflows/release-receipt.yml": 316435347,
         ".github/workflows/release-linux-repository-publish.yml": 316435347,
         ".github/workflows/release-policy-channel.yml": 316435347,
     },
     "chocolatey": {
-        ".github/workflows/release-chocolatey-channel.yml": 316435347,
+        ".github/workflows/release-receipt.yml": 316435347,
         ".github/workflows/release-chocolatey-retry.yml": 316439352,
     },
     "crates_io": {".github/workflows/release-crates-channel.yml": 316435347},
     "homebrew_core": {".github/workflows/release-policy-channel.yml": 316435347},
-    "homebrew_tap": {
-        ".github/workflows/release-owned-repository-channel.yml": 316435347
-    },
+    "homebrew_tap": {".github/workflows/release-receipt.yml": 316435347},
     "rmux_io": {".github/workflows/release-rmux-io-channel.yml": 316435347},
-    "scoop": {".github/workflows/release-owned-repository-channel.yml": 316435347},
+    "scoop": {".github/workflows/release-receipt.yml": 316435347},
     "snap_candidate": {
-        ".github/workflows/release-snap-channel.yml": 316435347,
+        ".github/workflows/release-receipt.yml": 316435347,
         ".github/workflows/release-snap-retry.yml": 316439354,
     },
     "snap_stable": {".github/workflows/release-policy-channel.yml": 316435347},
-    "web_share": {".github/workflows/release-owned-repository-channel.yml": 316435347},
+    "web_share": {".github/workflows/release-receipt.yml": 316435347},
     "winget": {".github/workflows/release-policy-channel.yml": 316435347},
 }
 DERIVED_RESULT_PRODUCERS = {

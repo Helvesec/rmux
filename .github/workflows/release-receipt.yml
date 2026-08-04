@@ -143,101 +143,159 @@ jobs:
     name: Build exact signed Linux repository trees
     needs: [downstream-preparation]
     if: inputs.release_kind == 'stable'
-    uses: ./.github/workflows/release-linux-repository-build.yml
+    runs-on: ubuntu-22.04
+    timeout-minutes: 30
+    environment: release
     permissions:
       actions: read
-      attestations: write
       contents: read
-      id-token: write
-    with:
-      receipt_run_id: ${{ github.run_id }}
-      payload_artifact_id: ${{ fromJSON(needs.downstream-preparation.outputs.payload_artifact_ids).apt_rpm }}
-      payload_artifact_digest: ${{ fromJSON(needs.downstream-preparation.outputs.payload_artifact_digests).apt_rpm }}
-      expected_source_sha: ${{ inputs.expected_source_sha }}
-      release_id: ${{ inputs.release_id }}
-      release_ref: ${{ inputs.release_ref }}
+    outputs:
+      repository_artifact_id: ${{ steps.build.outputs.repository-artifact-id }}
+      repository_artifact_digest: ${{ steps.build.outputs.repository-artifact-digest }}
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
+        with: {persist-credentials: false}
+      - id: build
+        uses: ./.github/actions/release-linux-repository-build
+        with:
+          receipt-run-id: ${{ github.run_id }}
+          payload-artifact-id: ${{ fromJSON(needs.downstream-preparation.outputs.payload_artifact_ids).apt_rpm }}
+          payload-artifact-digest: ${{ fromJSON(needs.downstream-preparation.outputs.payload_artifact_digests).apt_rpm }}
+          source-sha: ${{ inputs.expected_source_sha }}
+          release-id: ${{ inputs.release_id }}
+          release-ref: ${{ inputs.release_ref }}
+          apt-gpg-private-key: ${{ secrets.RMUX_APT_GPG_PRIVATE_KEY }}
+          apt-gpg-key: ${{ secrets.RMUX_APT_GPG_KEY }}
+          rpm-gpg-private-key: ${{ secrets.RMUX_RPM_GPG_PRIVATE_KEY }}
+          rpm-gpg-key: ${{ secrets.RMUX_RPM_GPG_KEY }}
+          rpm-repo-gpg-private-key: ${{ secrets.RMUX_RPM_REPO_GPG_PRIVATE_KEY }}
+          rpm-repo-gpg-key: ${{ secrets.RMUX_RPM_REPO_GPG_KEY }}
 
   publish-homebrew-tap:
     name: Publish exact Homebrew tap formula
     needs: [downstream-preparation]
-    uses: ./.github/workflows/release-owned-repository-channel.yml
+    runs-on: ubuntu-22.04
+    timeout-minutes: 20
+    environment: release-publication
+    concurrency:
+      group: rmux-channel-homebrew-tap-${{ inputs.release_ref }}
+      cancel-in-progress: false
     permissions:
       actions: read
       attestations: write
       contents: read
       id-token: write
-    with:
-      channel: homebrew_tap
-      receipt_run_id: ${{ github.run_id }}
-      plan_artifact_id: ${{ needs.downstream-preparation.outputs.plan_artifact_id }}
-      plan_artifact_digest: ${{ needs.downstream-preparation.outputs.plan_artifact_digest }}
-      payload_artifact_id: ${{ fromJSON(needs.downstream-preparation.outputs.payload_artifact_ids).homebrew_tap }}
-      payload_artifact_digest: ${{ fromJSON(needs.downstream-preparation.outputs.payload_artifact_digests).homebrew_tap }}
-      expected_source_sha: ${{ inputs.expected_source_sha }}
-      release_id: ${{ inputs.release_id }}
-      release_ref: ${{ inputs.release_ref }}
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
+        with: {persist-credentials: false}
+      - uses: ./.github/actions/release-owned-repository-publish
+        with:
+          channel: homebrew_tap
+          receipt-run-id: ${{ github.run_id }}
+          plan-artifact-id: ${{ needs.downstream-preparation.outputs.plan_artifact_id }}
+          plan-artifact-digest: ${{ needs.downstream-preparation.outputs.plan_artifact_digest }}
+          payload-artifact-id: ${{ fromJSON(needs.downstream-preparation.outputs.payload_artifact_ids).homebrew_tap }}
+          payload-artifact-digest: ${{ fromJSON(needs.downstream-preparation.outputs.payload_artifact_digests).homebrew_tap }}
+          source-sha: ${{ inputs.expected_source_sha }}
+          release-id: ${{ inputs.release_id }}
+          release-ref: ${{ inputs.release_ref }}
+          app-id: ${{ vars.RMUX_DOWNSTREAM_APP_ID }}
+          app-private-key: ${{ secrets.RMUX_DOWNSTREAM_APP_PRIVATE_KEY }}
 
   publish-scoop:
     name: Publish exact Scoop manifest
     needs: [downstream-preparation]
-    uses: ./.github/workflows/release-owned-repository-channel.yml
+    runs-on: ubuntu-22.04
+    timeout-minutes: 20
+    environment: release-publication
+    concurrency:
+      group: rmux-channel-scoop-${{ inputs.release_ref }}
+      cancel-in-progress: false
     permissions:
       actions: read
       attestations: write
       contents: read
       id-token: write
-    with:
-      channel: scoop
-      receipt_run_id: ${{ github.run_id }}
-      plan_artifact_id: ${{ needs.downstream-preparation.outputs.plan_artifact_id }}
-      plan_artifact_digest: ${{ needs.downstream-preparation.outputs.plan_artifact_digest }}
-      payload_artifact_id: ${{ fromJSON(needs.downstream-preparation.outputs.payload_artifact_ids).scoop }}
-      payload_artifact_digest: ${{ fromJSON(needs.downstream-preparation.outputs.payload_artifact_digests).scoop }}
-      expected_source_sha: ${{ inputs.expected_source_sha }}
-      release_id: ${{ inputs.release_id }}
-      release_ref: ${{ inputs.release_ref }}
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
+        with: {persist-credentials: false}
+      - uses: ./.github/actions/release-owned-repository-publish
+        with:
+          channel: scoop
+          receipt-run-id: ${{ github.run_id }}
+          plan-artifact-id: ${{ needs.downstream-preparation.outputs.plan_artifact_id }}
+          plan-artifact-digest: ${{ needs.downstream-preparation.outputs.plan_artifact_digest }}
+          payload-artifact-id: ${{ fromJSON(needs.downstream-preparation.outputs.payload_artifact_ids).scoop }}
+          payload-artifact-digest: ${{ fromJSON(needs.downstream-preparation.outputs.payload_artifact_digests).scoop }}
+          source-sha: ${{ inputs.expected_source_sha }}
+          release-id: ${{ inputs.release_id }}
+          release-ref: ${{ inputs.release_ref }}
+          app-id: ${{ vars.RMUX_DOWNSTREAM_APP_ID }}
+          app-private-key: ${{ secrets.RMUX_DOWNSTREAM_APP_PRIVATE_KEY }}
 
   publish-web-share:
     name: Publish exact Web Share WASM bytes
     needs: [downstream-preparation]
-    uses: ./.github/workflows/release-owned-repository-channel.yml
+    runs-on: ubuntu-22.04
+    timeout-minutes: 20
+    environment: release-publication
+    concurrency:
+      group: rmux-channel-web-share-${{ inputs.release_ref }}
+      cancel-in-progress: false
     permissions:
       actions: read
       attestations: write
       contents: read
       id-token: write
-    with:
-      channel: web_share
-      receipt_run_id: ${{ github.run_id }}
-      plan_artifact_id: ${{ needs.downstream-preparation.outputs.plan_artifact_id }}
-      plan_artifact_digest: ${{ needs.downstream-preparation.outputs.plan_artifact_digest }}
-      payload_artifact_id: ${{ fromJSON(needs.downstream-preparation.outputs.payload_artifact_ids).web_share }}
-      payload_artifact_digest: ${{ fromJSON(needs.downstream-preparation.outputs.payload_artifact_digests).web_share }}
-      expected_source_sha: ${{ inputs.expected_source_sha }}
-      release_id: ${{ inputs.release_id }}
-      release_ref: ${{ inputs.release_ref }}
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
+        with: {persist-credentials: false}
+      - uses: ./.github/actions/release-owned-repository-publish
+        with:
+          channel: web_share
+          receipt-run-id: ${{ github.run_id }}
+          plan-artifact-id: ${{ needs.downstream-preparation.outputs.plan_artifact_id }}
+          plan-artifact-digest: ${{ needs.downstream-preparation.outputs.plan_artifact_digest }}
+          payload-artifact-id: ${{ fromJSON(needs.downstream-preparation.outputs.payload_artifact_ids).web_share }}
+          payload-artifact-digest: ${{ fromJSON(needs.downstream-preparation.outputs.payload_artifact_digests).web_share }}
+          source-sha: ${{ inputs.expected_source_sha }}
+          release-id: ${{ inputs.release_id }}
+          release-ref: ${{ inputs.release_ref }}
+          app-id: ${{ vars.RMUX_DOWNSTREAM_APP_ID }}
+          app-private-key: ${{ secrets.RMUX_DOWNSTREAM_APP_PRIVATE_KEY }}
 
   publish-linux-repository:
     name: Publish exact signed APT and RPM repositories
     needs: [downstream-preparation, build-linux-repository, publish-homebrew-tap, publish-scoop, publish-web-share]
     if: ${{ !cancelled() && !failure() && inputs.release_kind == 'stable' }}
-    uses: ./.github/workflows/release-linux-repository-publish.yml
+    runs-on: ubuntu-22.04
+    timeout-minutes: 20
+    environment: release-publication
+    concurrency:
+      group: rmux-channel-apt-rpm-${{ inputs.release_ref }}
+      cancel-in-progress: false
     permissions:
       actions: read
       attestations: write
       contents: read
       id-token: write
-    with:
-      receipt_run_id: ${{ github.run_id }}
-      plan_artifact_id: ${{ needs.downstream-preparation.outputs.plan_artifact_id }}
-      plan_artifact_digest: ${{ needs.downstream-preparation.outputs.plan_artifact_digest }}
-      payload_artifact_id: ${{ fromJSON(needs.downstream-preparation.outputs.payload_artifact_ids).apt_rpm }}
-      payload_artifact_digest: ${{ fromJSON(needs.downstream-preparation.outputs.payload_artifact_digests).apt_rpm }}
-      repository_artifact_id: ${{ needs.build-linux-repository.outputs.repository_artifact_id }}
-      repository_artifact_digest: ${{ needs.build-linux-repository.outputs.repository_artifact_digest }}
-      expected_source_sha: ${{ inputs.expected_source_sha }}
-      release_id: ${{ inputs.release_id }}
-      release_ref: ${{ inputs.release_ref }}
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
+        with: {persist-credentials: false}
+      - uses: ./.github/actions/release-linux-repository-publish
+        with:
+          receipt-run-id: ${{ github.run_id }}
+          plan-artifact-id: ${{ needs.downstream-preparation.outputs.plan_artifact_id }}
+          plan-artifact-digest: ${{ needs.downstream-preparation.outputs.plan_artifact_digest }}
+          payload-artifact-id: ${{ fromJSON(needs.downstream-preparation.outputs.payload_artifact_ids).apt_rpm }}
+          payload-artifact-digest: ${{ fromJSON(needs.downstream-preparation.outputs.payload_artifact_digests).apt_rpm }}
+          repository-artifact-id: ${{ needs.build-linux-repository.outputs.repository_artifact_id }}
+          repository-artifact-digest: ${{ needs.build-linux-repository.outputs.repository_artifact_digest }}
+          source-sha: ${{ inputs.expected_source_sha }}
+          release-id: ${{ inputs.release_id }}
+          release-ref: ${{ inputs.release_ref }}
+          app-id: ${{ vars.RMUX_DOWNSTREAM_APP_ID }}
+          app-private-key: ${{ secrets.RMUX_DOWNSTREAM_APP_PRIVATE_KEY }}
 
   record-linux-repository-policy:
     name: Record denied RC Linux repository channel
@@ -347,41 +405,61 @@ jobs:
     name: Submit exact Chocolatey package
     needs: [downstream-preparation, publish-linux-repository, record-linux-repository-policy, publish-crates]
     if: ${{ !cancelled() && !failure() }}
-    uses: ./.github/workflows/release-chocolatey-channel.yml
+    runs-on: windows-latest
+    timeout-minutes: 30
+    environment: release
+    concurrency:
+      group: rmux-channel-chocolatey-${{ inputs.release_ref }}
+      cancel-in-progress: false
     permissions:
       actions: read
       attestations: write
       contents: read
       id-token: write
-    with:
-      receipt_run_id: ${{ github.run_id }}
-      plan_artifact_id: ${{ needs.downstream-preparation.outputs.plan_artifact_id }}
-      plan_artifact_digest: ${{ needs.downstream-preparation.outputs.plan_artifact_digest }}
-      payload_artifact_id: ${{ fromJSON(needs.downstream-preparation.outputs.payload_artifact_ids).chocolatey }}
-      payload_artifact_digest: ${{ fromJSON(needs.downstream-preparation.outputs.payload_artifact_digests).chocolatey }}
-      expected_source_sha: ${{ inputs.expected_source_sha }}
-      release_id: ${{ inputs.release_id }}
-      release_ref: ${{ inputs.release_ref }}
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
+        with: {persist-credentials: false}
+      - uses: ./.github/actions/release-chocolatey-publish
+        with:
+          receipt-run-id: ${{ github.run_id }}
+          plan-artifact-id: ${{ needs.downstream-preparation.outputs.plan_artifact_id }}
+          plan-artifact-digest: ${{ needs.downstream-preparation.outputs.plan_artifact_digest }}
+          payload-artifact-id: ${{ fromJSON(needs.downstream-preparation.outputs.payload_artifact_ids).chocolatey }}
+          payload-artifact-digest: ${{ fromJSON(needs.downstream-preparation.outputs.payload_artifact_digests).chocolatey }}
+          source-sha: ${{ inputs.expected_source_sha }}
+          release-id: ${{ inputs.release_id }}
+          release-ref: ${{ inputs.release_ref }}
+          api-key: ${{ secrets.CHOCOLATEY_API_KEY }}
 
   publish-snap-candidate:
     name: Publish exact Snap candidate revisions
     needs: [downstream-preparation, record-homebrew-core, record-winget, record-snap-stable, publish-chocolatey]
     if: ${{ !cancelled() && !failure() }}
-    uses: ./.github/workflows/release-snap-channel.yml
+    runs-on: ubuntu-22.04
+    timeout-minutes: 30
+    environment: release
+    concurrency:
+      group: rmux-channel-snap-candidate-${{ inputs.release_ref }}
+      cancel-in-progress: false
     permissions:
       actions: read
       attestations: write
       contents: read
       id-token: write
-    with:
-      receipt_run_id: ${{ github.run_id }}
-      plan_artifact_id: ${{ needs.downstream-preparation.outputs.plan_artifact_id }}
-      plan_artifact_digest: ${{ needs.downstream-preparation.outputs.plan_artifact_digest }}
-      payload_artifact_id: ${{ fromJSON(needs.downstream-preparation.outputs.payload_artifact_ids).snap_candidate }}
-      payload_artifact_digest: ${{ fromJSON(needs.downstream-preparation.outputs.payload_artifact_digests).snap_candidate }}
-      expected_source_sha: ${{ inputs.expected_source_sha }}
-      release_id: ${{ inputs.release_id }}
-      release_ref: ${{ inputs.release_ref }}
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
+        with: {persist-credentials: false}
+      - uses: ./.github/actions/release-snap-publish
+        with:
+          receipt-run-id: ${{ github.run_id }}
+          plan-artifact-id: ${{ needs.downstream-preparation.outputs.plan_artifact_id }}
+          plan-artifact-digest: ${{ needs.downstream-preparation.outputs.plan_artifact_digest }}
+          payload-artifact-id: ${{ fromJSON(needs.downstream-preparation.outputs.payload_artifact_ids).snap_candidate }}
+          payload-artifact-digest: ${{ fromJSON(needs.downstream-preparation.outputs.payload_artifact_digests).snap_candidate }}
+          source-sha: ${{ inputs.expected_source_sha }}
+          release-id: ${{ inputs.release_id }}
+          release-ref: ${{ inputs.release_ref }}
+          store-credentials: ${{ secrets.SNAPCRAFT_STORE_CREDENTIALS }}
 
   pre-site-summary:
     name: Aggregate ten exact pre-site results

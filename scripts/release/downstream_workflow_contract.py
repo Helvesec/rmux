@@ -589,15 +589,10 @@ def _validate_helper_sizes(root: Path) -> None:
 def _validate_channel_orchestration(receipt: str, preparation: str) -> None:
     required_calls = {
         "release-channel-summary.yml": 2,
-        "release-chocolatey-channel.yml": 1,
         "release-crates-channel.yml": 1,
-        "release-linux-repository-build.yml": 1,
-        "release-linux-repository-publish.yml": 1,
-        "release-owned-repository-channel.yml": 3,
         "release-policy-channel.yml": 4,
         "release-rmux-io-channel.yml": 1,
         "release-rmux-io-payload.yml": 1,
-        "release-snap-channel.yml": 1,
     }
     for workflow, count in required_calls.items():
         target = f"uses: ./.github/workflows/{workflow}"
@@ -607,6 +602,31 @@ def _validate_channel_orchestration(receipt: str, preparation: str) -> None:
             raise ValueError(
                 f"downstream worker {workflow} is not a direct receipt child"
             )
+    protected_actions = {
+        "release-chocolatey-publish": 1,
+        "release-linux-repository-build": 1,
+        "release-linux-repository-publish": 1,
+        "release-owned-repository-publish": 3,
+        "release-snap-publish": 1,
+    }
+    for action, count in protected_actions.items():
+        target = f"uses: ./.github/actions/{action}"
+        if receipt.count(target) != count or target in preparation:
+            raise ValueError(f"protected receipt action count changed for {action}")
+    protected_secrets = {
+        "CHOCOLATEY_API_KEY": 1,
+        "RMUX_APT_GPG_PRIVATE_KEY": 1,
+        "RMUX_APT_GPG_KEY": 1,
+        "RMUX_RPM_GPG_PRIVATE_KEY": 1,
+        "RMUX_RPM_GPG_KEY": 1,
+        "RMUX_RPM_REPO_GPG_PRIVATE_KEY": 1,
+        "RMUX_RPM_REPO_GPG_KEY": 1,
+        "RMUX_DOWNSTREAM_APP_PRIVATE_KEY": 5,
+        "SNAPCRAFT_STORE_CREDENTIALS": 1,
+    }
+    for secret, count in protected_secrets.items():
+        if receipt.count(f"secrets.{secret}") != count:
+            raise ValueError(f"protected receipt secret count changed for {secret}")
     markers = tuple(
         receipt.find(f"\n  {job}:\n")
         for job in (

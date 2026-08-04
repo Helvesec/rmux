@@ -56,6 +56,7 @@ base = {
     'runner_image': 'ubuntu-22.04',
 }
 for workflow_path in (
+    '.github/workflows/release-receipt.yml',
     '.github/workflows/release-linux-repository-publish.yml',
     '.github/workflows/release-policy-channel.yml',
 ):
@@ -63,7 +64,7 @@ for workflow_path in (
     if validate_producer(producer, 'apt_rpm') != producer:
         raise SystemExit(f'APT/RPM producer was not preserved: {workflow_path}')
 
-forged = {**base, 'workflow_path': '.github/workflows/release-receipt.yml'}
+forged = {**base, 'workflow_path': '.github/workflows/release-crates-channel.yml'}
 try:
     validate_producer(forged, 'apt_rpm')
 except ValueError as error:
@@ -245,7 +246,7 @@ def write_fixture(root):
         'run_id': 51,
         'run_attempt': 1,
         'workflow_id': 316435347,
-        'workflow_path': '.github/workflows/release-owned-repository-channel.yml',
+        'workflow_path': '.github/workflows/release-receipt.yml',
         'runner_group_id': 0,
         'runner_group_name': 'GitHub Actions',
         'runner_image': 'ubuntu-22.04',
@@ -512,7 +513,7 @@ with tempfile.TemporaryDirectory(dir=pathlib.Path.cwd()) as root:
     arguments = arguments_path.read_text(encoding='utf-8').splitlines()
     for expected in (
         '--deny-self-hosted-runners',
-        'Helvesec/rmux/.github/workflows/release-owned-repository-channel.yml',
+        'Helvesec/rmux/.github/workflows/release-receipt.yml',
         '--signer-digest',
         '--source-digest',
         'refs/tags/v1.2.3',

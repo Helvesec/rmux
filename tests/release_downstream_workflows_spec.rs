@@ -168,68 +168,50 @@ fn downstream_caller_guard_rejects_relative_and_absolute_targets() {
 }
 
 #[test]
-fn protected_environment_secrets_are_not_shadowed_by_reusable_inputs() {
-    let workflows = repo_root().join(".github/workflows");
-    for privileged in [
+fn protected_environment_secrets_are_consumed_by_top_level_receipt_jobs() {
+    for reusable in [
         "release-chocolatey-channel.yml",
-        "release-crates-channel.yml",
         "release-linux-repository-build.yml",
         "release-linux-repository-publish.yml",
         "release-owned-repository-channel.yml",
         "release-snap-channel.yml",
     ] {
-        let call = format!("uses: ./.github/workflows/{privileged}");
         assert!(
-            RECEIPT.contains(&call),
-            "privileged workflow {privileged} is not a direct receipt child"
-        );
-        assert!(
-            !DOWNSTREAM.contains(&call),
-            "privileged workflow {privileged} is nested below the preparation workflow"
+            !RECEIPT.contains(&format!("uses: ./.github/workflows/{reusable}")),
+            "secret-bearing worker {reusable} crossed a reusable workflow boundary"
         );
     }
-    for (filename, secret) in [
-        ("release-chocolatey-channel.yml", "CHOCOLATEY_API_KEY"),
-        (
-            "release-linux-repository-publish.yml",
-            "RMUX_DOWNSTREAM_APP_PRIVATE_KEY",
-        ),
-        (
-            "release-owned-repository-channel.yml",
-            "RMUX_DOWNSTREAM_APP_PRIVATE_KEY",
-        ),
-        ("release-snap-channel.yml", "SNAPCRAFT_STORE_CREDENTIALS"),
+    assert!(RECEIPT.contains("uses: ./.github/workflows/release-crates-channel.yml"));
+    for (action, count) in [
+        ("release-chocolatey-publish", 1),
+        ("release-linux-repository-build", 1),
+        ("release-linux-repository-publish", 1),
+        ("release-owned-repository-publish", 3),
+        ("release-snap-publish", 1),
     ] {
-        let text = fs::read_to_string(workflows.join(filename)).expect("read workflow");
-        let workflow_call = text
-            .split("\npermissions: {}\n")
-            .next()
-            .expect("workflow_call boundary");
-        assert!(text.contains("environment: release"));
-        assert!(!workflow_call.contains("\n    secrets:\n"));
-        assert!(text.contains(&format!("secrets.{secret}")));
+        assert_eq!(
+            RECEIPT
+                .matches(&format!("uses: ./.github/actions/{action}"))
+                .count(),
+            count,
+            "protected action {action} is not owned by the receipt workflow"
+        );
     }
-
-    let build = fs::read_to_string(workflows.join("release-linux-repository-build.yml"))
-        .expect("read Linux repository build");
-    let workflow_call = build
-        .split("\n  workflow_dispatch:\n")
-        .next()
-        .expect("Linux workflow_call boundary");
-    assert!(!workflow_call.contains("\n    secrets:\n"));
-    assert!(!build.contains(
-        "RMUX_DOWNSTREAM_APP_PRIVATE_KEY: ${{ secrets.RMUX_DOWNSTREAM_APP_PRIVATE_KEY }}"
-    ));
-    for secret in [
-        "RMUX_APT_GPG_PRIVATE_KEY",
-        "RMUX_APT_GPG_KEY",
-        "RMUX_RPM_GPG_PRIVATE_KEY",
-        "RMUX_RPM_GPG_KEY",
-        "RMUX_RPM_REPO_GPG_PRIVATE_KEY",
-        "RMUX_RPM_REPO_GPG_KEY",
+    for (secret, count) in [
+        ("CHOCOLATEY_API_KEY", 1),
+        ("RMUX_APT_GPG_PRIVATE_KEY", 1),
+        ("RMUX_APT_GPG_KEY", 1),
+        ("RMUX_RPM_GPG_PRIVATE_KEY", 1),
+        ("RMUX_RPM_GPG_KEY", 1),
+        ("RMUX_RPM_REPO_GPG_PRIVATE_KEY", 1),
+        ("RMUX_RPM_REPO_GPG_KEY", 1),
+        ("RMUX_DOWNSTREAM_APP_PRIVATE_KEY", 5),
+        ("SNAPCRAFT_STORE_CREDENTIALS", 1),
     ] {
-        assert!(build.contains(&format!("secrets.{secret}")));
+        assert_eq!(RECEIPT.matches(&format!("secrets.{secret}")).count(), count);
     }
+    assert!(!RECEIPT.contains("secrets: inherit"));
+    assert!(!DOWNSTREAM.contains("RMUX_DOWNSTREAM_APP_PRIVATE_KEY"));
 }
 
 #[cfg(unix)]
@@ -331,8 +313,13 @@ fn downstream_authority_is_rechecked_live_before_payload_staging() {
         "build-linux-repository",
         Some("publish-homebrew-tap"),
     );
-    assert!(linux_repository.contains("attestations: write"));
-    assert!(linux_repository.contains("id-token: write"));
+    assert!(linux_repository.contains("environment: release"));
+    assert!(linux_repository.contains("uses: ./.github/actions/release-linux-repository-build"));
+    assert!(
+        linux_repository.contains("apt-gpg-private-key: ${{ secrets.RMUX_APT_GPG_PRIVATE_KEY }}")
+    );
+    assert!(!linux_repository.contains("attestations: write"));
+    assert!(!linux_repository.contains("id-token: write"));
 }
 
 #[test]
@@ -784,9 +771,7 @@ fn all_eleven_channels_are_default_denied_and_rmux_io_is_last() {
     assert!(final_summary.contains("Aggregate all eleven exact channel results"));
     assert!(final_summary.contains("release-channel-summary.yml"));
     assert_eq!(
-        RECEIPT
-            .matches("release-owned-repository-channel.yml")
-            .count(),
+        RECEIPT.matches("release-owned-repository-publish").count(),
         3
     );
     assert_eq!(RECEIPT.matches("release-policy-channel.yml").count(), 4);
