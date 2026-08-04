@@ -121,7 +121,11 @@ fn downstream_workflow_is_receipt_gated_read_only_and_active() {
     assert_eq!(activation["status"], "active");
     assert_eq!(activation["runtime_override_allowed"], false);
     assert_eq!(activation["capabilities"]["downstream_channels"], true);
-    let caller = job(RECEIPT, "downstream", None);
+    let caller = job(
+        RECEIPT,
+        "downstream-preparation",
+        Some("build-linux-repository"),
+    );
     assert!(!caller.contains("if: ${{ false }}"));
     assert!(caller.contains("uses: ./.github/workflows/release-downstream.yml"));
 
@@ -166,6 +170,24 @@ fn downstream_caller_guard_rejects_relative_and_absolute_targets() {
 #[test]
 fn protected_environment_secrets_are_not_shadowed_by_reusable_inputs() {
     let workflows = repo_root().join(".github/workflows");
+    for privileged in [
+        "release-chocolatey-channel.yml",
+        "release-crates-channel.yml",
+        "release-linux-repository-build.yml",
+        "release-linux-repository-publish.yml",
+        "release-owned-repository-channel.yml",
+        "release-snap-channel.yml",
+    ] {
+        let call = format!("uses: ./.github/workflows/{privileged}");
+        assert!(
+            RECEIPT.contains(&call),
+            "privileged workflow {privileged} is not a direct receipt child"
+        );
+        assert!(
+            !DOWNSTREAM.contains(&call),
+            "privileged workflow {privileged} is nested below the preparation workflow"
+        );
+    }
     for (filename, secret) in [
         ("release-chocolatey-channel.yml", "CHOCOLATEY_API_KEY"),
         (
@@ -267,13 +289,21 @@ fn downstream_authority_is_rechecked_live_before_payload_staging() {
     assert!(!DOWNSTREAM.contains("uses: ./.github/actions/release-downstream-audit"));
     assert!(!DOWNSTREAM.contains("RMUX_DOWNSTREAM_APP_PRIVATE_KEY"));
     assert!(!DOWNSTREAM.contains("environment: release-publication"));
-    let audit = job(RECEIPT, "audit-downstream-authority", Some("downstream"));
+    let audit = job(
+        RECEIPT,
+        "audit-downstream-authority",
+        Some("downstream-preparation"),
+    );
     assert!(audit.contains("environment: release-publication"));
     assert!(audit.contains("app-private-key: ${{ secrets.RMUX_DOWNSTREAM_APP_PRIVATE_KEY }}"));
     assert!(audit.contains("uses: ./.github/actions/release-downstream-audit"));
     assert!(audit.contains("artifact_id: ${{ steps.audit.outputs.artifact-id }}"));
     assert!(audit.contains("artifact_digest: ${{ steps.audit.outputs.artifact-digest }}"));
-    let downstream = job(RECEIPT, "downstream", None);
+    let downstream = job(
+        RECEIPT,
+        "downstream-preparation",
+        Some("build-linux-repository"),
+    );
     assert!(downstream.contains("needs: [receipt-only, audit-downstream-authority]"));
     assert!(downstream.contains("downstream_audit_artifact_id:"));
     assert!(downstream.contains("downstream_audit_artifact_digest:"));
@@ -294,14 +324,10 @@ fn downstream_authority_is_rechecked_live_before_payload_staging() {
     assert!(DOWNSTREAM_AUTHORITY_PROOF.contains("verify-exact-file-set.py"));
     assert!(DOWNSTREAM_AUTHORITY_PROOF.contains("verify-downstream-repository.py fixtures"));
     assert!(DOWNSTREAM_AUTHORITY_PROOF.contains("--allow-running-current-run"));
-    let payloads = job(
-        DOWNSTREAM,
-        "prepare-payloads",
-        Some("build-linux-repository"),
-    );
+    let payloads = job(DOWNSTREAM, "prepare-payloads", None);
     assert!(payloads.contains("needs: [prepare-plan, verify-downstream-authority]"));
     let linux_repository = job(
-        DOWNSTREAM,
+        RECEIPT,
         "build-linux-repository",
         Some("publish-homebrew-tap"),
     );
@@ -738,41 +764,43 @@ fn all_eleven_channels_are_default_denied_and_rmux_io_is_last() {
         );
     }
 
-    let summary = job(
-        DOWNSTREAM,
-        "pre-site-summary",
-        Some("prepare-rmux-io-handoff"),
-    );
+    let summary = job(RECEIPT, "pre-site-summary", Some("prepare-rmux-io-handoff"));
     let rmux_io = job(
-        DOWNSTREAM,
+        RECEIPT,
         "prepare-rmux-io-handoff",
         Some("record-rmux-io-handoff"),
     );
     let rmux_io_result = job(
-        DOWNSTREAM,
+        RECEIPT,
         "record-rmux-io-handoff",
         Some("final-channel-summary"),
     );
-    let final_summary = job(DOWNSTREAM, "final-channel-summary", None);
+    let final_summary = job(RECEIPT, "final-channel-summary", None);
     assert!(summary.contains("Aggregate ten exact pre-site results"));
     assert!(summary.contains("release-channel-summary.yml"));
-    assert!(rmux_io.contains("needs: [prepare-plan, pre-site-summary]"));
+    assert!(rmux_io.contains("needs: [downstream-preparation, pre-site-summary]"));
     assert!(rmux_io.contains("release-rmux-io-payload.yml"));
     assert!(rmux_io_result.contains("release-rmux-io-channel.yml"));
     assert!(final_summary.contains("Aggregate all eleven exact channel results"));
     assert!(final_summary.contains("release-channel-summary.yml"));
     assert_eq!(
-        DOWNSTREAM
+        RECEIPT
             .matches("release-owned-repository-channel.yml")
             .count(),
         3
     );
-    assert_eq!(DOWNSTREAM.matches("release-policy-channel.yml").count(), 4);
-    assert_eq!(DOWNSTREAM.matches("release-channel-summary.yml").count(), 2);
-    assert_eq!(DOWNSTREAM.matches("if: ${{ false }}").count(), 0);
+    assert_eq!(RECEIPT.matches("release-policy-channel.yml").count(), 4);
+    assert_eq!(RECEIPT.matches("release-channel-summary.yml").count(), 2);
+    assert_eq!(RECEIPT.matches("if: ${{ false }}").count(), 0);
     assert!(DOWNSTREAM.contains("test \"$GITHUB_REPOSITORY\" = \"Helvesec/rmux\""));
     assert!(DOWNSTREAM.contains("test \"$GITHUB_REPOSITORY_ID\" = \"1239918790\""));
-    assert_eq!(DOWNSTREAM.matches("channel-summary.py create").count(), 0);
+    assert_eq!(RECEIPT.matches("channel-summary.py create").count(), 0);
+    assert_eq!(
+        DOWNSTREAM
+            .matches("release-owned-repository-channel.yml")
+            .count(),
+        0
+    );
     assert!(!RECEIPT.contains("if: ${{ false }}"));
 }
 

@@ -10,10 +10,13 @@ use std::time::{SystemTime, UNIX_EPOCH};
 const SOURCE: &str = "1111111111111111111111111111111111111111";
 const CONTROL: &str = "2222222222222222222222222222222222222222";
 const FAILED_CONTROL: &str = "3333333333333333333333333333333333333333";
+const PRIOR_CONTROL: &str = "4444444444444444444444444444444444444444";
 const FAILED_RUN: u64 = 30_926_195_244;
+const PRIOR_RUN: u64 = 30_925_000_001;
 const CURRENT_RUN: u64 = 30_930_000_001;
 const RELEASE_ID: u64 = 364_986_297;
 const RECEIPT: &str = include_str!("../.github/workflows/release-receipt.yml");
+const RECEIPT_CREATE: &str = include_str!("../.github/actions/release-receipt-create/action.yml");
 
 fn repo_root() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -52,6 +55,17 @@ fn run_recovery(
     jobs: Value,
     artifacts: Value,
     existing: Value,
+) -> Output {
+    run_recovery_with_prior(root, failed, jobs, artifacts, existing, None)
+}
+
+fn run_recovery_with_prior(
+    root: &Path,
+    failed: Value,
+    jobs: Value,
+    artifacts: Value,
+    existing: Value,
+    prior_attempts: Option<Value>,
 ) -> Output {
     let failed = write(root, "failed.json", &failed);
     let current = write(
@@ -104,7 +118,8 @@ fn run_recovery(
     );
     let existing = write(root, "existing.json", &existing);
 
-    python3::command()
+    let mut command = python3::command();
+    command
         .arg(repo_root().join("scripts/release/receipt-recovery.py"))
         .args([
             "--failed-run-id",
@@ -137,15 +152,24 @@ fn run_recovery(
         .arg("--ci-runs-json")
         .arg(ci)
         .arg("--existing-receipts-json")
-        .arg(existing)
+        .arg(existing);
+    if let Some(prior_attempts) = prior_attempts {
+        let prior_attempts = write(root, "prior-attempts.json", &prior_attempts);
+        command.arg("--prior-attempts-json").arg(prior_attempts);
+    }
+    command
         .current_dir(repo_root())
         .output()
         .expect("run receipt recovery verifier")
 }
 
 fn failed_run(head_sha: &str, head_branch: &str, conclusion: &str) -> Value {
+    failed_run_with_id(FAILED_RUN, head_sha, head_branch, conclusion)
+}
+
+fn failed_run_with_id(run_id: u64, head_sha: &str, head_branch: &str, conclusion: &str) -> Value {
     json!({
-        "id": FAILED_RUN,
+        "id": run_id,
         "workflow_id": 316_435_347,
         "path": ".github/workflows/release-receipt.yml",
         "event": "workflow_dispatch",
@@ -232,12 +256,43 @@ fn downstream_failure_jobs() -> Value {
     json!({"total_count": jobs.len(), "jobs": jobs})
 }
 
+fn direct_downstream_failure_jobs() -> Value {
+    let mut value = downstream_failure_jobs();
+    let jobs = value["jobs"].as_array_mut().expect("jobs array");
+    for job in jobs {
+        let name = job["name"].as_str().expect("job name");
+        let Some(short) = name.strip_prefix("Receipt-gated downstream publication / ") else {
+            continue;
+        };
+        let direct = if [
+            "Prepare non-authoritative downstream plan",
+            "Verify exact downstream repository authority audit",
+            "Prepare exact downstream payloads / Materialize exact channel payloads",
+        ]
+        .contains(&short)
+        {
+            format!("Prepare receipt-gated downstream publication / {short}")
+        } else {
+            short.to_owned()
+        };
+        job["name"] = json!(direct);
+    }
+    value
+}
+
 fn downstream_failure_artifacts() -> (Value, u64) {
-    let receipt_id = 81_u64;
+    downstream_failure_artifacts_for(FAILED_RUN, FAILED_CONTROL, 81)
+}
+
+fn downstream_failure_artifacts_for(
+    run_id: u64,
+    control_sha: &str,
+    receipt_id: u64,
+) -> (Value, u64) {
     let mut names = vec![
         format!("rmux-publication-receipt-{SOURCE}-{RELEASE_ID}"),
         format!("rmux-publication-receipt-envelope-{SOURCE}-{RELEASE_ID}"),
-        format!("rmux-downstream-authority-{SOURCE}-{FAILED_RUN}"),
+        format!("rmux-downstream-authority-{SOURCE}-{run_id}"),
         format!("rmux-downstream-plan-{SOURCE}-{RELEASE_ID}"),
     ];
     for channel in [
@@ -266,8 +321,8 @@ fn downstream_failure_artifacts() -> (Value, u64) {
                 "expired": false,
                 "digest": format!("sha256:{}", "a".repeat(64)),
                 "workflow_run": {
-                    "id": FAILED_RUN,
-                    "head_sha": FAILED_CONTROL,
+                    "id": run_id,
+                    "head_sha": control_sha,
                     "head_branch": "main",
                     "repository_id": 1_239_918_790,
                     "head_repository_id": 1_239_918_790,
@@ -345,6 +400,87 @@ fn protected_main_recovery_accepts_only_the_exact_pre_mutation_failure() {
 }
 
 #[test]
+fn protected_main_recovery_accepts_the_flattened_pre_mutation_topology() {
+    let root = fixture_root("flattened-pre-mutation");
+    let jobs = direct_downstream_failure_jobs();
+    let (artifacts, receipt_id) = downstream_failure_artifacts();
+    let output = run_recovery(
+        &root,
+        failed_run(FAILED_CONTROL, "main", "failure"),
+        jobs,
+        artifacts,
+        json!({
+            "total_count": 1,
+            "artifacts": [{
+                "id": receipt_id,
+                "name": format!("rmux-publication-receipt-{SOURCE}-{RELEASE_ID}"),
+                "expired": false,
+                "workflow_run": {"id": FAILED_RUN},
+            }],
+        }),
+    );
+    fs::remove_dir_all(&root).expect("remove fixture root");
+    assert!(
+        output.status.success(),
+        "stdout={} stderr={}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+#[test]
+fn protected_main_recovery_accepts_only_a_verified_linear_receipt_chain() {
+    let root = fixture_root("linear-chain");
+    let (artifacts, receipt_id) = downstream_failure_artifacts();
+    let (prior_artifacts, prior_receipt_id) =
+        downstream_failure_artifacts_for(PRIOR_RUN, PRIOR_CONTROL, 181);
+    let mut prior_attempts = serde_json::Map::new();
+    prior_attempts.insert(
+        PRIOR_RUN.to_string(),
+        json!({
+            "run": failed_run_with_id(PRIOR_RUN, PRIOR_CONTROL, "main", "failure"),
+            "jobs": downstream_failure_jobs(),
+            "artifacts": prior_artifacts,
+            "commit": {
+                "sha": PRIOR_CONTROL,
+                "commit": {"verification": {"verified": true, "reason": "valid"}},
+            },
+        }),
+    );
+    let output = run_recovery_with_prior(
+        &root,
+        failed_run(FAILED_CONTROL, "main", "failure"),
+        downstream_failure_jobs(),
+        artifacts,
+        json!({
+            "total_count": 2,
+            "artifacts": [
+                {
+                    "id": prior_receipt_id,
+                    "name": format!("rmux-publication-receipt-{SOURCE}-{RELEASE_ID}"),
+                    "expired": false,
+                    "workflow_run": {"id": PRIOR_RUN},
+                },
+                {
+                    "id": receipt_id,
+                    "name": format!("rmux-publication-receipt-{SOURCE}-{RELEASE_ID}"),
+                    "expired": false,
+                    "workflow_run": {"id": FAILED_RUN},
+                },
+            ],
+        }),
+        Some(Value::Object(prior_attempts)),
+    );
+    fs::remove_dir_all(&root).expect("remove fixture root");
+    assert!(
+        output.status.success(),
+        "stdout={} stderr={}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+#[test]
 fn protected_main_recovery_rejects_any_owned_writer_mutation() {
     let root = fixture_root("writer-mutation");
     let mut jobs = downstream_failure_jobs();
@@ -386,8 +522,9 @@ fn protected_main_recovery_rejects_any_owned_writer_mutation() {
 #[test]
 fn receipt_recovery_is_explicit_and_normal_dispatch_remains_tag_bound() {
     assert!(RECEIPT.contains("failed_receipt_run_id:"));
-    assert!(RECEIPT.contains("scripts/release/receipt-recovery.py"));
-    assert!(RECEIPT.contains("test \"$GITHUB_REF\" = refs/heads/main"));
-    assert!(RECEIPT.contains("test \"$GITHUB_REF\" = \"refs/tags/$RMUX_RELEASE_REF\""));
-    assert!(RECEIPT.contains("--recovered-from-run-id \"$RMUX_FAILED_RECEIPT_RUN_ID\""));
+    assert!(RECEIPT.contains("uses: ./.github/actions/release-receipt-create"));
+    assert!(RECEIPT_CREATE.contains("scripts/release/receipt-recovery.py"));
+    assert!(RECEIPT_CREATE.contains("test \"$GITHUB_REF\" = refs/heads/main"));
+    assert!(RECEIPT_CREATE.contains("test \"$GITHUB_REF\" = \"refs/tags/$RMUX_RELEASE_REF\""));
+    assert!(RECEIPT_CREATE.contains("--recovered-from-run-id \"$RMUX_FAILED_RECEIPT_RUN_ID\""));
 }

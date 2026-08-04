@@ -18,43 +18,47 @@ CI_WORKFLOW_ID = 277622540
 SHA40 = re.compile(r"[0-9a-f]{40}")
 RELEASE_REF = re.compile(r"v[0-9]+\.[0-9]+\.[0-9]+(?:-rc\.[0-9]+)?")
 ACTIVE = frozenset({"queued", "in_progress", "requested", "waiting", "pending"})
-EARLY_SUCCESS_JOBS = frozenset(
+DIRECT_SUCCESS_JOBS = frozenset(
     {
         "Verify immutable Release and create receipt",
         "Audit live downstream repository authority",
-        "Receipt-gated downstream publication / Prepare non-authoritative downstream plan",
-        "Receipt-gated downstream publication / Verify exact downstream repository authority audit",
-        "Receipt-gated downstream publication / Prepare exact downstream payloads / Materialize exact channel payloads",
     }
 )
-LINUX_SIGNING_JOB = (
-    "Receipt-gated downstream publication / Build exact signed Linux repository trees / "
-    "Sign retained APT and RPM repository trees"
+PREPARATION_SUCCESS_JOBS = frozenset(
+    {
+        "Prepare non-authoritative downstream plan",
+        "Verify exact downstream repository authority audit",
+        "Prepare exact downstream payloads / Materialize exact channel payloads",
+    }
 )
+EARLY_SUCCESS_JOBS = DIRECT_SUCCESS_JOBS | PREPARATION_SUCCESS_JOBS
+LINUX_SIGNING_JOB = "Build exact signed Linux repository trees / Sign retained APT and RPM repository trees"
 OWNED_WRITER_JOBS = frozenset(
     {
-        "Receipt-gated downstream publication / Publish exact Homebrew tap formula / Publish owned channel homebrew_tap",
-        "Receipt-gated downstream publication / Publish exact Scoop manifest / Publish owned channel scoop",
-        "Receipt-gated downstream publication / Publish exact Web Share WASM bytes / Publish owned channel web_share",
+        "Publish exact Homebrew tap formula / Publish owned channel homebrew_tap",
+        "Publish exact Scoop manifest / Publish owned channel scoop",
+        "Publish exact Web Share WASM bytes / Publish owned channel web_share",
     }
 )
 SKIPPED_AFTER_FAILURE = frozenset(
     {
-        "Receipt-gated downstream publication / Build exact signed Linux repository trees / Publish only this run's authorized recovery artifact",
-        "Receipt-gated downstream publication / Publish exact signed APT and RPM repositories",
-        "Receipt-gated downstream publication / Publish exact crates.io package set",
-        "Receipt-gated downstream publication / Record denied RC Linux repository channel",
-        "Receipt-gated downstream publication / Submit exact Chocolatey package",
-        "Receipt-gated downstream publication / Record disabled Snap stable channel",
-        "Receipt-gated downstream publication / Record manual Homebrew Core submission",
-        "Receipt-gated downstream publication / Record manual WinGet submission",
-        "Receipt-gated downstream publication / Publish exact Snap candidate revisions",
-        "Receipt-gated downstream publication / Aggregate ten exact pre-site results",
-        "Receipt-gated downstream publication / Record blocked automated rmux.io update",
-        "Receipt-gated downstream publication / Prepare manual rmux.io handoff",
-        "Receipt-gated downstream publication / Aggregate all eleven exact channel results",
+        "Build exact signed Linux repository trees / Publish only this run's authorized recovery artifact",
+        "Publish exact signed APT and RPM repositories",
+        "Publish exact crates.io package set",
+        "Record denied RC Linux repository channel",
+        "Submit exact Chocolatey package",
+        "Record disabled Snap stable channel",
+        "Record manual Homebrew Core submission",
+        "Record manual WinGet submission",
+        "Publish exact Snap candidate revisions",
+        "Aggregate ten exact pre-site results",
+        "Record blocked automated rmux.io update",
+        "Prepare manual rmux.io handoff",
+        "Aggregate all eleven exact channel results",
     }
 )
+LEGACY_DOWNSTREAM_PREFIX = "Receipt-gated downstream publication / "
+PREPARATION_PREFIX = "Prepare receipt-gated downstream publication / "
 PAYLOAD_CHANNELS = (
     "apt_rpm",
     "chocolatey",
@@ -130,6 +134,38 @@ def exact_step(steps: dict[str, str], name: str, conclusion: str, label: str) ->
         raise ValueError(f"{label} step {name} did not conclude {conclusion}")
 
 
+def canonical_failed_jobs(
+    jobs: dict[str, dict[str, Any]],
+) -> dict[str, dict[str, Any]]:
+    downstream_jobs = (
+        PREPARATION_SUCCESS_JOBS
+        | {LINUX_SIGNING_JOB}
+        | OWNED_WRITER_JOBS
+        | SKIPPED_AFTER_FAILURE
+    )
+    legacy_names = DIRECT_SUCCESS_JOBS | {
+        f"{LEGACY_DOWNSTREAM_PREFIX}{name}" for name in downstream_jobs
+    }
+    direct_names = (
+        DIRECT_SUCCESS_JOBS
+        | {f"{PREPARATION_PREFIX}{name}" for name in PREPARATION_SUCCESS_JOBS}
+        | {LINUX_SIGNING_JOB}
+        | OWNED_WRITER_JOBS
+        | SKIPPED_AFTER_FAILURE
+    )
+    raw_names = set(jobs)
+    if raw_names == legacy_names:
+        return {
+            name.removeprefix(LEGACY_DOWNSTREAM_PREFIX): job
+            for name, job in jobs.items()
+        }
+    if raw_names == direct_names:
+        return {
+            name.removeprefix(PREPARATION_PREFIX): job for name, job in jobs.items()
+        }
+    raise ValueError("failed downstream job topology differs")
+
+
 def verify_failed_downstream_jobs(value: dict[str, Any]) -> None:
     jobs = value.get("jobs")
     if not isinstance(jobs, list) or value.get("total_count") != len(jobs):
@@ -142,14 +178,7 @@ def verify_failed_downstream_jobs(value: dict[str, Any]) -> None:
         if name in by_name:
             raise ValueError("failed downstream job names are not unique")
         by_name[name] = job
-    expected_names = (
-        EARLY_SUCCESS_JOBS
-        | {LINUX_SIGNING_JOB}
-        | OWNED_WRITER_JOBS
-        | SKIPPED_AFTER_FAILURE
-    )
-    if set(by_name) != expected_names:
-        raise ValueError("failed downstream job topology differs")
+    by_name = canonical_failed_jobs(by_name)
     for name in EARLY_SUCCESS_JOBS:
         if by_name[name].get("conclusion") != "success":
             raise ValueError(f"failed downstream prerequisite {name} is not successful")
@@ -253,6 +282,7 @@ def verify_failed_attempt(
     failed: dict[str, Any],
     jobs: dict[str, Any],
     artifacts: dict[str, Any],
+    failed_commit: dict[str, Any] | None = None,
 ) -> int | None:
     common = {
         "id": args.failed_run_id,
@@ -295,15 +325,121 @@ def verify_failed_attempt(
         },
         "failed downstream receipt run",
     )
-    failed_commit = object_fixture(
-        args.failed_control_commit_json,
-        f"repos/{REPOSITORY}/commits/{failed_control_sha}",
-    )
+    if failed_commit is None:
+        failed_commit = object_fixture(
+            args.failed_control_commit_json,
+            f"repos/{REPOSITORY}/commits/{failed_control_sha}",
+        )
     verified_commit(
         failed_commit, failed_control_sha, "failed downstream control commit"
     )
     verify_failed_downstream_jobs(jobs)
     return verify_failed_downstream_artifacts(artifacts, args, failed_control_sha)
+
+
+def prior_attempt_fixtures(args: argparse.Namespace) -> dict[str, Any] | None:
+    if args.prior_attempts_json is None:
+        return None
+    value = read_json(args.prior_attempts_json)
+    if not isinstance(value, dict):
+        raise ValueError("prior attempt fixtures are malformed")
+    return value
+
+
+def verify_prior_failed_attempt(
+    args: argparse.Namespace,
+    run_id: int,
+    artifact_id: int,
+    fixtures: dict[str, Any] | None,
+) -> None:
+    prior_args = argparse.Namespace(**vars(args))
+    prior_args.failed_run_id = run_id
+    prior_args.failed_control_commit_json = None
+    if fixtures is None:
+        failed = object_fixture(None, f"repos/{REPOSITORY}/actions/runs/{run_id}")
+        jobs = object_fixture(
+            None,
+            f"repos/{REPOSITORY}/actions/runs/{run_id}/jobs?filter=all&per_page=100",
+        )
+        artifacts = object_fixture(
+            None,
+            f"repos/{REPOSITORY}/actions/runs/{run_id}/artifacts?per_page=100",
+        )
+        failed_commit = None
+    else:
+        bundle = fixtures.get(str(run_id))
+        if not isinstance(bundle, dict) or set(bundle) != {
+            "run",
+            "jobs",
+            "artifacts",
+            "commit",
+        }:
+            raise ValueError(f"prior attempt fixture {run_id} is incomplete")
+        failed = bundle["run"]
+        jobs = bundle["jobs"]
+        artifacts = bundle["artifacts"]
+        failed_commit = bundle["commit"]
+        if not all(
+            isinstance(value, dict)
+            for value in (failed, jobs, artifacts, failed_commit)
+        ):
+            raise ValueError(f"prior attempt fixture {run_id} is malformed")
+    receipt_id = verify_failed_attempt(
+        prior_args, failed, jobs, artifacts, failed_commit
+    )
+    if receipt_id != artifact_id:
+        raise ValueError(f"prior receipt artifact {artifact_id} is not authoritative")
+
+
+def verify_live_receipt_chain(
+    args: argparse.Namespace,
+    existing: dict[str, Any],
+    failed_receipt_artifact_id: int | None,
+) -> None:
+    name = f"rmux-publication-receipt-{args.source_sha}-{args.release_id}"
+    receipts = existing.get("artifacts")
+    if not isinstance(receipts, list) or existing.get("total_count") != len(receipts):
+        raise ValueError("existing receipt artifact query is malformed")
+    live = [
+        item
+        for item in receipts
+        if isinstance(item, dict) and item.get("expired") is False
+    ]
+    if failed_receipt_artifact_id is None:
+        if live:
+            raise ValueError("a live receipt artifact already exists for this release")
+        return
+
+    by_run: dict[int, int] = {}
+    for item in live:
+        artifact_id = item.get("id")
+        run_id = item.get("workflow_run", {}).get("id")
+        if (
+            type(artifact_id) is not int
+            or artifact_id <= 0
+            or item.get("name") != name
+            or type(run_id) is not int
+            or run_id <= 0
+            or run_id in by_run
+            or artifact_id in by_run.values()
+        ):
+            raise ValueError("live receipt artifact identity differs")
+        by_run[run_id] = artifact_id
+    if (
+        by_run.get(args.failed_run_id) != failed_receipt_artifact_id
+        or not by_run
+        or args.failed_run_id != max(by_run)
+    ):
+        raise ValueError("the recoverable failed run is not the newest live receipt")
+
+    fixtures = prior_attempt_fixtures(args)
+    prior_run_ids = set(by_run) - {args.failed_run_id}
+    if fixtures is not None and set(fixtures) != {
+        str(run_id) for run_id in prior_run_ids
+    }:
+        raise ValueError("prior attempt fixture set differs from live receipts")
+    for run_id in sorted(prior_run_ids):
+        verify_prior_failed_attempt(args, run_id, by_run[run_id], fixtures)
 
 
 def verify(args: argparse.Namespace) -> None:
@@ -397,24 +533,7 @@ def verify(args: argparse.Namespace) -> None:
         args.existing_receipts_json,
         f"repos/{REPOSITORY}/actions/artifacts?name={name}&per_page=100",
     )
-    receipts = existing.get("artifacts")
-    if not isinstance(receipts, list) or existing.get("total_count") != len(receipts):
-        raise ValueError("existing receipt artifact query is malformed")
-    live = [
-        item
-        for item in receipts
-        if isinstance(item, dict) and item.get("expired") is False
-    ]
-    if failed_receipt_artifact_id is None:
-        if live:
-            raise ValueError("a live receipt artifact already exists for this release")
-    elif (
-        len(live) != 1
-        or live[0].get("id") != failed_receipt_artifact_id
-        or live[0].get("name") != name
-        or live[0].get("workflow_run", {}).get("id") != args.failed_run_id
-    ):
-        raise ValueError("the recoverable failed run is not the sole live receipt")
+    verify_live_receipt_chain(args, existing, failed_receipt_artifact_id)
 
 
 def parse_args() -> argparse.Namespace:
@@ -434,6 +553,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--control-commit-json", type=Path)
     parser.add_argument("--ci-runs-json", type=Path)
     parser.add_argument("--existing-receipts-json", type=Path)
+    parser.add_argument("--prior-attempts-json", type=Path)
     return parser.parse_args()
 
 

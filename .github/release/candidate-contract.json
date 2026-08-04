@@ -327,6 +327,7 @@
     ".github/actions/release-linux-repository-recovery-authorize/action.yml",
     ".github/actions/release-policy-audit/action.yml",
     ".github/actions/release-publication-inputs/action.yml",
+    ".github/actions/release-receipt-create/action.yml",
     ".github/actions/release-snap-candidate-write/action.yml",
     ".github/release/candidate-contract.json",
     ".github/release/candidate-workflow-contract.json",

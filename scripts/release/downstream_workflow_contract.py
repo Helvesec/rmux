@@ -165,9 +165,9 @@ def _validate_callers(root: Path, downstream_paths: tuple[Path, Path, Path]) -> 
             if (
                 path.name == "release-receipt.yml"
                 and downstream.name == "release-downstream.yml"
-                and "\n  downstream:\n" in text
+                and "\n  downstream-preparation:\n" in text
             ):
-                caller = text.split("\n  downstream:\n", 1)[1]
+                caller = text.split("\n  downstream-preparation:\n", 1)[1]
                 if (
                     "if: ${{ false }}" not in caller
                     and caller.count("./.github/workflows/release-downstream.yml") == 1
@@ -586,7 +586,7 @@ def _validate_helper_sizes(root: Path) -> None:
             raise ValueError(f"{name} exceeds the release helper size budget")
 
 
-def _validate_channel_orchestration(main: str) -> None:
+def _validate_channel_orchestration(receipt: str, preparation: str) -> None:
     required_calls = {
         "release-channel-summary.yml": 2,
         "release-chocolatey-channel.yml": 1,
@@ -601,10 +601,14 @@ def _validate_channel_orchestration(main: str) -> None:
     }
     for workflow, count in required_calls.items():
         target = f"uses: ./.github/workflows/{workflow}"
-        if main.count(target) != count:
+        if receipt.count(target) != count:
             raise ValueError(f"downstream call count changed for {workflow}")
+        if target in preparation:
+            raise ValueError(
+                f"downstream worker {workflow} is not a direct receipt child"
+            )
     markers = tuple(
-        main.find(f"\n  {job}:\n")
+        receipt.find(f"\n  {job}:\n")
         for job in (
             "pre-site-summary",
             "prepare-rmux-io-handoff",
@@ -616,18 +620,18 @@ def _validate_channel_orchestration(main: str) -> None:
         left < right for left, right in zip(markers, markers[1:])
     ):
         raise ValueError("rmux.io must remain between the two summary phases")
-    site = main[markers[1] : markers[3]]
+    site = receipt[markers[1] : markers[3]]
     if (
-        "needs: [prepare-plan, pre-site-summary]" not in site
+        "needs: [downstream-preparation, pre-site-summary]" not in site
         or "manual rmux.io" not in site
         or "release-rmux-io-channel.yml" not in site
     ):
         raise ValueError("rmux.io lost its exact manual pre-site handoff")
-    if main.count("if: ${{ false }}") != 0:
+    if receipt.count("if: ${{ false }}") != 0:
         raise ValueError("downstream graph contains an internal hard-coded stub")
-    if "secrets: inherit" in main:
+    if "secrets: inherit" in receipt or "secrets: inherit" in preparation:
         raise ValueError("downstream mutation workflows expose inherited secrets")
-    if "needs: [prepare-plan, verify-downstream-authority]" not in main:
+    if "needs: [prepare-plan, verify-downstream-authority]" not in preparation:
         raise ValueError(
             "downstream payloads do not depend on the live authority audit"
         )
@@ -647,8 +651,9 @@ def validate_downstream_workflows(root: Path) -> None:
     _validate_worker_environment_secrets(root)
     _validate_callers(root, paths)
     main = paths[0].read_text(encoding="utf-8")
+    receipt = _receipt_path(root).read_text(encoding="utf-8")
     _validate_receipt_origin(main)
-    _validate_channel_orchestration(main)
+    _validate_channel_orchestration(receipt, main)
     _validate_payload_prepare(root / ".github/workflows/release-downstream-prepare.yml")
     _validate_channel_result_action(_channel_result_action_path(root))
     for path in paths[1:]:

@@ -8,6 +8,7 @@ use std::path::PathBuf;
 const TAG: &str = include_str!("../.github/workflows/release-tag-authoring.yml");
 const PROMOTE: &str = include_str!("../.github/workflows/release-promote.yml");
 const RECEIPT: &str = include_str!("../.github/workflows/release-receipt.yml");
+const RECEIPT_CREATE: &str = include_str!("../.github/actions/release-receipt-create/action.yml");
 const GITHUB_PUBLISH: &str = include_str!("../.github/workflows/release-github-publish.yml");
 const RECEIPT_DISPATCH: &str = include_str!("../.github/workflows/release-receipt-dispatch.yml");
 const SIMULATION: &str = include_str!("../.github/workflows/release-promotion-simulation.yml");
@@ -285,46 +286,49 @@ fn promotion_splits_oidc_from_contents_write_and_keeps_exact_dag() {
 
 #[test]
 fn receipt_is_separate_receipt_only_and_never_writes_contents() {
-    let receipt = job(RECEIPT, "receipt-only", Some("downstream"));
+    let receipt = job(RECEIPT, "receipt-only", Some("audit-downstream-authority"));
     assert!(!receipt.contains("if: ${{ false }}"));
     assert!(RECEIPT.contains("on:\n  workflow_dispatch:"));
     assert!(!RECEIPT.contains("\n  workflow_call:"));
-    assert!(receipt.contains("test \"$GITHUB_RUN_ATTEMPT\" = 1"));
-    assert!(receipt.contains("assert-release-capability.py publication_receipt"));
-    assert!(receipt.contains("publication-receipt.py create-predicate"));
-    assert!(receipt.contains("publication-receipt.py create-envelope"));
+    assert!(receipt.contains("uses: ./.github/actions/release-receipt-create"));
+    assert!(RECEIPT_CREATE.contains("test \"$GITHUB_RUN_ATTEMPT\" = 1"));
+    assert!(RECEIPT_CREATE.contains("assert-release-capability.py publication_receipt"));
+    assert!(RECEIPT_CREATE.contains("publication-receipt.py create-predicate"));
+    assert!(RECEIPT_CREATE.contains("publication-receipt.py create-envelope"));
     assert!(receipt.contains("id-token: write"));
     assert!(receipt.contains("attestations: write"));
     assert!(!receipt.contains("contents: write"));
-    assert!(!RECEIPT.contains("gh release"));
-    assert!(!RECEIPT.contains("git push"));
-    assert_eq!(RECEIPT.matches("merge-multiple: true").count(), 2);
-    assert!(RECEIPT.contains("rmux-receipt/authorization"));
-    assert!(RECEIPT.contains("rmux-receipt/envelope"));
-    assert!(RECEIPT.contains("actions/runs/$RMUX_AUTHORIZATION_RUN_ID"));
-    assert!(RECEIPT.contains("releases/$RMUX_RELEASE_ID/assets?per_page=100&page=1"));
-    assert!(RECEIPT.contains("git/ref/tags/$RMUX_RELEASE_REF"));
-    assert!(RECEIPT.contains("git/tags/$tag_object_sha"));
-    assert!(RECEIPT.contains("\"run_attempt\": 1"));
-    assert!(RECEIPT.contains("status == \"in_progress\" and conclusion is None"));
-    assert!(RECEIPT.contains("status == \"completed\" and conclusion == \"success\""));
-    assert!(!RECEIPT.contains("isinstance(conclusion, str)"));
-    assert!(!RECEIPT.contains("\"conclusion\": \"success\""));
-    assert!(RECEIPT.contains("live immutable Release identity differs"));
-    assert!(RECEIPT.contains("live annotated tag signature or target differs"));
-    assert!(RECEIPT.contains("not isinstance(target, dict)"));
-    assert!(RECEIPT.contains("target.get(\"type\") != \"commit\""));
-    assert!(RECEIPT.contains("target.get(\"sha\") != os.environ[\"RMUX_EXPECTED_SOURCE_SHA\"]"));
-    assert!(!RECEIPT.contains("target != {\"type\": \"commit\""));
-    assert!(RECEIPT.contains("Accept: application/octet-stream"));
-    assert!(RECEIPT.contains("attestation verify"));
-    assert!(RECEIPT.contains(
+    assert!(!RECEIPT_CREATE.contains("gh release"));
+    assert!(!RECEIPT_CREATE.contains("git push"));
+    assert_eq!(RECEIPT_CREATE.matches("merge-multiple: true").count(), 2);
+    assert!(RECEIPT_CREATE.contains("rmux-receipt/authorization"));
+    assert!(RECEIPT_CREATE.contains("rmux-receipt/envelope"));
+    assert!(RECEIPT_CREATE.contains("actions/runs/$RMUX_AUTHORIZATION_RUN_ID"));
+    assert!(RECEIPT_CREATE.contains("releases/$RMUX_RELEASE_ID/assets?per_page=100&page=1"));
+    assert!(RECEIPT_CREATE.contains("git/ref/tags/$RMUX_RELEASE_REF"));
+    assert!(RECEIPT_CREATE.contains("git/tags/$tag_object_sha"));
+    assert!(RECEIPT_CREATE.contains("\"run_attempt\": 1"));
+    assert!(RECEIPT_CREATE.contains("status == \"in_progress\" and conclusion is None"));
+    assert!(RECEIPT_CREATE.contains("status == \"completed\" and conclusion == \"success\""));
+    assert!(!RECEIPT_CREATE.contains("isinstance(conclusion, str)"));
+    assert!(!RECEIPT_CREATE.contains("\"conclusion\": \"success\""));
+    assert!(RECEIPT_CREATE.contains("live immutable Release identity differs"));
+    assert!(RECEIPT_CREATE.contains("live annotated tag signature or target differs"));
+    assert!(RECEIPT_CREATE.contains("not isinstance(target, dict)"));
+    assert!(RECEIPT_CREATE.contains("target.get(\"type\") != \"commit\""));
+    assert!(
+        RECEIPT_CREATE.contains("target.get(\"sha\") != os.environ[\"RMUX_EXPECTED_SOURCE_SHA\"]")
+    );
+    assert!(!RECEIPT_CREATE.contains("target != {\"type\": \"commit\""));
+    assert!(RECEIPT_CREATE.contains("Accept: application/octet-stream"));
+    assert!(RECEIPT_CREATE.contains("attestation verify"));
+    assert!(RECEIPT_CREATE.contains(
         "--predicate-type https://rmux.io/attestations/release-promotion-authorization/v1"
     ));
-    assert!(RECEIPT.contains("--deny-self-hosted-runners"));
-    assert!(RECEIPT.contains("signed authorization predicate differs"));
-    assert!(RECEIPT.contains("${{ runner.temp }}/rmux-receipt/release-state.json"));
-    assert!(!RECEIPT.contains("release_state_artifact_id"));
+    assert!(RECEIPT_CREATE.contains("--deny-self-hosted-runners"));
+    assert!(RECEIPT_CREATE.contains("signed authorization predicate differs"));
+    assert!(RECEIPT_CREATE.contains("${{ runner.temp }}/rmux-receipt/release-state.json"));
+    assert!(!RECEIPT_CREATE.contains("release_state_artifact_id"));
 }
 
 const AUTHORIZATION_RUN_ID: &str = "4242";
@@ -333,10 +337,10 @@ const AUTHORIZATION_SOURCE_SHA: &str = "1234567890abcdef1234567890abcdef12345678
 const AUTHORIZATION_GUARD_ERROR: &str = "authorization producer run identity or lifecycle differs";
 
 /// Lift the inline Python guard that re-checks the live authorization producer
-/// run out of `release-receipt.yml`, so the shipped bytes can be executed
+/// run out of the receipt action, so the shipped bytes can be executed
 /// instead of merely string-matched.
 fn authorization_run_guard() -> String {
-    let lines: Vec<&str> = RECEIPT.lines().collect();
+    let lines: Vec<&str> = RECEIPT_CREATE.lines().collect();
     let start = lines
         .iter()
         .position(|line| line.trim() == "run_expected = {")
