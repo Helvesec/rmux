@@ -253,6 +253,13 @@ fn downstream_authority_is_rechecked_live_before_payload_staging() {
         Some("build-linux-repository"),
     );
     assert!(payloads.contains("needs: [prepare-plan, verify-downstream-authority]"));
+    let linux_repository = job(
+        DOWNSTREAM,
+        "build-linux-repository",
+        Some("publish-homebrew-tap"),
+    );
+    assert!(linux_repository.contains("attestations: write"));
+    assert!(linux_repository.contains("id-token: write"));
 }
 
 #[test]

@@ -265,7 +265,9 @@ jobs:
     uses: ./.github/workflows/release-linux-repository-build.yml
     permissions:
       actions: read
+      attestations: write
       contents: read
+      id-token: write
     with:
       receipt_run_id: ${{ inputs.receipt_run_id }}
       payload_artifact_id: ${{ fromJSON(needs.prepare-payloads.outputs.payload_artifact_ids).apt_rpm }}
