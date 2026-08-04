@@ -526,6 +526,26 @@ with tempfile.TemporaryDirectory(dir=pathlib.Path.cwd()) as root:
         if expected not in arguments:
             raise SystemExit(f'missing attestation policy argument: {expected}')
 
+    control_sha = '9' * 40
+    args.producer_source_sha = control_sha
+    args.producer_source_ref = 'refs/heads/main'
+    args.attestation_signer_workflow = '.github/workflows/release-receipt.yml'
+    verifier.verify(args)
+    arguments = arguments_path.read_text(encoding='utf-8').splitlines()
+    for expected in (control_sha, 'refs/heads/main'):
+        if expected not in arguments:
+            raise SystemExit(f'missing recovery attestation argument: {expected}')
+
+    args.attestation_signer_workflow = '.github/workflows/release-promote.yml'
+    try:
+        verifier.verify(args)
+    except ValueError as error:
+        if 'recovery attestation producer identity changed' not in str(error):
+            raise
+    else:
+        raise SystemExit('forged receipt recovery signer was accepted')
+    args.attestation_signer_workflow = '.github/workflows/release-receipt.yml'
+
     write_verification(digest='0' * 64)
     try:
         verifier.verify(args)

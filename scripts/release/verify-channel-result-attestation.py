@@ -15,7 +15,11 @@ from downstream_channels import (
     file_hash,
     read_object,
 )
-from downstream_result import LINUX_RECOVERY_PRODUCER, LINUX_RECOVERY_SIGNER
+from downstream_result import (
+    LINUX_RECOVERY_PRODUCER,
+    LINUX_RECOVERY_SIGNER,
+    RECEIPT_RECOVERY_PRODUCER,
+)
 from downstream_result_document import validate_envelope, validate_predicate
 
 REPOSITORY = "Helvesec/rmux"
@@ -79,6 +83,15 @@ def verify(args: argparse.Namespace) -> None:
             or producer_source_ref != "refs/heads/main"
         ):
             raise ValueError("Linux recovery attestation producer identity changed")
+    elif (
+        producer_path == RECEIPT_RECOVERY_PRODUCER
+        and producer_source_ref == "refs/heads/main"
+    ):
+        if (
+            producer_source_sha == args.source_sha
+            or signer_path != RECEIPT_RECOVERY_PRODUCER
+        ):
+            raise ValueError("receipt recovery attestation producer identity changed")
     elif (
         producer_source_sha != args.source_sha
         or producer_source_ref != f"refs/tags/{args.release_ref}"
