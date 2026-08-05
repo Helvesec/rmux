@@ -439,6 +439,53 @@ fn package_execution_failure_jobs() -> Value {
     value
 }
 
+fn crates_result_seal_failure_jobs() -> Value {
+    let mut value = package_execution_failure_jobs();
+    let jobs = value["jobs"].as_array_mut().expect("jobs array");
+    for job in jobs.iter_mut() {
+        let name = job["name"].as_str().expect("job name");
+        if name == "Publish exact signed APT and RPM repositories" {
+            job["conclusion"] = json!("success");
+            for step in job["steps"].as_array_mut().expect("APT steps") {
+                if step["name"] == "Run ./.github/actions/release-linux-repository-publish" {
+                    step["conclusion"] = json!("success");
+                }
+            }
+            continue;
+        }
+        if name == "Publish exact crates.io package set / Publish exact crates.io package set" {
+            job["steps"] = json!([
+                step("Set up job", "success"),
+                step(
+                    "Run actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5",
+                    "success",
+                ),
+                step("Run ./.github/actions/release-channel-prepare", "success"),
+                step("Resolve exact crates.io execution authority", "success"),
+                step("Check out the exact release source", "success"),
+                step(
+                    "Exchange GitHub OIDC for a short-lived crates.io token",
+                    "success",
+                ),
+                step("Publish and redownload every exact crate", "success"),
+                step("Normalize executable and policy-only outcomes", "success"),
+                step("Seal exact crates.io result evidence", "failure"),
+                step(
+                    "Post Exchange GitHub OIDC for a short-lived crates.io token",
+                    "success",
+                ),
+                step("Post Check out the exact release source", "success"),
+                step(
+                    "Post Run actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5",
+                    "success",
+                ),
+                step("Complete job", "success"),
+            ]);
+        }
+    }
+    value
+}
+
 fn downstream_failure_artifacts() -> (Value, u64) {
     downstream_failure_artifacts_for(FAILED_RUN, FAILED_CONTROL, 81)
 }
@@ -469,6 +516,33 @@ fn package_writer_failure_artifacts() -> (Value, u64) {
     }
     let total_count = artifacts.len();
     value["total_count"] = json!(total_count);
+    (value, receipt_id)
+}
+
+fn crates_result_seal_failure_artifacts() -> (Value, u64) {
+    let (mut value, receipt_id) = package_writer_failure_artifacts();
+    let artifacts = value["artifacts"].as_array_mut().expect("artifacts array");
+    for name in [
+        format!("rmux-downstream-apt_rpm-result-{SOURCE}-{RELEASE_ID}"),
+        format!("rmux-downstream-apt_rpm-result-envelope-{SOURCE}-{RELEASE_ID}"),
+        format!("rmux-downstream-apt_rpm-result-reference-{SOURCE}-{RELEASE_ID}"),
+        format!("rmux-downstream-crates_io-result-{SOURCE}-{RELEASE_ID}"),
+    ] {
+        artifacts.push(json!({
+            "id": receipt_id + artifacts.len() as u64,
+            "name": name,
+            "expired": false,
+            "digest": format!("sha256:{}", "a".repeat(64)),
+            "workflow_run": {
+                "id": FAILED_RUN,
+                "head_sha": FAILED_CONTROL,
+                "head_branch": "main",
+                "repository_id": 1_239_918_790,
+                "head_repository_id": 1_239_918_790,
+            },
+        }));
+    }
+    value["total_count"] = json!(artifacts.len());
     (value, receipt_id)
 }
 
@@ -739,6 +813,64 @@ fn protected_main_recovery_accepts_exact_package_execution_failures() {
         String::from_utf8_lossy(&output.stdout),
         String::from_utf8_lossy(&output.stderr)
     );
+}
+
+#[test]
+fn protected_main_recovery_accepts_exact_progressive_result_seal_failure() {
+    let root = fixture_root("progressive-result-seal-failure");
+    let (artifacts, receipt_id) = crates_result_seal_failure_artifacts();
+    let output = run_recovery(
+        &root,
+        failed_run(FAILED_CONTROL, "main", "failure"),
+        crates_result_seal_failure_jobs(),
+        artifacts,
+        json!({
+            "total_count": 1,
+            "artifacts": [{
+                "id": receipt_id,
+                "name": format!("rmux-publication-receipt-{SOURCE}-{RELEASE_ID}"),
+                "expired": false,
+                "workflow_run": {"id": FAILED_RUN},
+            }],
+        }),
+    );
+    fs::remove_dir_all(&root).expect("remove fixture root");
+    assert!(
+        output.status.success(),
+        "stdout={} stderr={}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+#[test]
+fn protected_main_recovery_rejects_partial_progressive_result_evidence() {
+    let root = fixture_root("progressive-result-evidence");
+    let (mut artifacts, receipt_id) = crates_result_seal_failure_artifacts();
+    let entries = artifacts["artifacts"]
+        .as_array_mut()
+        .expect("artifacts array");
+    entries.retain(|artifact| {
+        artifact["name"] != format!("rmux-downstream-crates_io-result-{SOURCE}-{RELEASE_ID}")
+    });
+    artifacts["total_count"] = json!(entries.len());
+    let output = run_recovery(
+        &root,
+        failed_run(FAILED_CONTROL, "main", "failure"),
+        crates_result_seal_failure_jobs(),
+        artifacts,
+        json!({
+            "total_count": 1,
+            "artifacts": [{
+                "id": receipt_id,
+                "name": format!("rmux-publication-receipt-{SOURCE}-{RELEASE_ID}"),
+                "expired": false,
+                "workflow_run": {"id": FAILED_RUN},
+            }],
+        }),
+    );
+    fs::remove_dir_all(&root).expect("remove fixture root");
+    assert!(!output.status.success());
 }
 
 #[test]

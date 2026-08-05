@@ -81,6 +81,26 @@ PACKAGE_WRITER_JOB_MAP = POST_MUTATION_JOB_MAP | {
     CRATES_PUBLISH_JOB_EXPANDED: CRATES_PUBLISH_JOB,
 }
 POST_MUTATION_RESULT_CHANNELS = ("homebrew_tap", "scoop", "web_share")
+PACKAGE_FAILURE_MODES = frozenset(
+    {
+        "package-writer-failure",
+        "package-execution-failure",
+        "package-result-seal-failure",
+        "crates-writer-failure",
+        "crates-execution-failure",
+        "crates-result-seal-failure",
+    }
+)
+APT_SUCCESS_FAILURE_MODES = frozenset(
+    {
+        "crates-writer-failure",
+        "crates-execution-failure",
+        "crates-result-seal-failure",
+    }
+)
+CRATES_RESULT_FAILURE_MODES = frozenset(
+    {"package-result-seal-failure", "crates-result-seal-failure"}
+)
 
 
 def result_envelope_names(source_sha: str, release_id: int) -> set[str]:
@@ -289,41 +309,67 @@ def verify_failed_downstream_jobs(value: dict[str, Any]) -> str:
             POST_MUTATION_SKIPPED_AFTER_FAILURE - {APT_PUBLISH_JOB, CRATES_PUBLISH_JOB},
         )
         apt_action = "Run ./.github/actions/release-linux-repository-publish"
+        apt = by_name[APT_PUBLISH_JOB]
+        apt_conclusion = apt.get("conclusion")
+        if apt_conclusion not in {"success", "failure"}:
+            raise ValueError("APT and RPM repository writer conclusion differs")
         exact_job_shape(
-            by_name[APT_PUBLISH_JOB],
+            apt,
             name=APT_PUBLISH_JOB,
-            conclusion="failure",
+            conclusion=apt_conclusion,
             steps=writer_prefix
-            | {apt_action: "failure", f"Post {apt_action}": "success"},
+            | {apt_action: apt_conclusion, f"Post {apt_action}": "success"},
         )
-        crates_steps = {
-            "Set up job": "success",
-            checkout: "success",
-            "Run ./.github/actions/release-channel-prepare": "success",
-            "Resolve exact crates.io execution authority": "success",
-            "Exchange GitHub OIDC for a short-lived crates.io token": (
-                "success" if preflight is not None else "failure"
+
+        crates = by_name[CRATES_PUBLISH_JOB]
+        if crates.get("conclusion") != "failure":
+            raise ValueError("crates.io package writer did not fail closed")
+        actual_crates_steps = job_steps(crates, CRATES_PUBLISH_JOB)
+        release_checkout = "Check out the exact release source"
+        post_release_checkout = f"Post {release_checkout}"
+
+        def crates_steps(
+            *, auth: str, writer: str, outcome: str, seal: str
+        ) -> tuple[dict[str, str], dict[str, str]]:
+            common = {
+                "Set up job": "success",
+                checkout: "success",
+                "Run ./.github/actions/release-channel-prepare": "success",
+                "Resolve exact crates.io execution authority": "success",
+                "Exchange GitHub OIDC for a short-lived crates.io token": auth,
+                "Publish and redownload every exact crate": writer,
+                "Normalize executable and policy-only outcomes": outcome,
+                "Seal exact crates.io result evidence": seal,
+                "Post Exchange GitHub OIDC for a short-lived crates.io token": "success",
+                post_checkout: "success",
+                "Complete job": "success",
+            }
+            with_release_checkout = common | {
+                release_checkout: "success",
+                post_release_checkout: "success",
+            }
+            return common, with_release_checkout
+
+        modes = {
+            "writer-failure": crates_steps(
+                auth="failure", writer="skipped", outcome="skipped", seal="skipped"
             ),
-            "Publish and redownload every exact crate": (
-                "failure" if preflight is not None else "skipped"
+            "execution-failure": crates_steps(
+                auth="success", writer="failure", outcome="skipped", seal="skipped"
             ),
-            "Normalize executable and policy-only outcomes": "skipped",
-            "Seal exact crates.io result evidence": "skipped",
-            "Post Exchange GitHub OIDC for a short-lived crates.io token": "success",
-            post_checkout: "success",
-            "Complete job": "success",
+            "result-seal-failure": crates_steps(
+                auth="success", writer="success", outcome="success", seal="failure"
+            ),
         }
-        exact_job_shape(
-            by_name[CRATES_PUBLISH_JOB],
-            name=CRATES_PUBLISH_JOB,
-            conclusion="failure",
-            steps=crates_steps,
-        )
-        return (
-            "package-execution-failure"
-            if preflight is not None
-            else "package-writer-failure"
-        )
+        matching_modes = [
+            mode
+            for mode, allowed_steps in modes.items()
+            if actual_crates_steps in allowed_steps
+        ]
+        if len(matching_modes) != 1:
+            raise ValueError("failed downstream job crates.io package writer differs")
+        prefix = "crates" if apt_conclusion == "success" else "package"
+        return f"{prefix}-{matching_modes[0]}"
     verify_skipped_jobs(by_name, SKIPPED_AFTER_FAILURE)
     if linux.get("conclusion") != "failure":
         raise ValueError("Linux repository signing did not fail closed")
@@ -401,13 +447,22 @@ def verify_failed_downstream_artifacts(
                 expected_names
                 | result_envelope_names(args.source_sha, args.release_id),
             )
-        elif failure_mode in {"package-writer-failure", "package-execution-failure"}:
+        elif failure_mode in PACKAGE_FAILURE_MODES:
             expected_names.update(
                 result_envelope_names(args.source_sha, args.release_id)
             )
             expected_names.update(
                 result_reference_names(args.source_sha, args.release_id)
             )
+            if failure_mode in APT_SUCCESS_FAILURE_MODES:
+                for suffix in ("result", "result-envelope", "result-reference"):
+                    expected_names.add(
+                        f"rmux-downstream-apt_rpm-{suffix}-{args.source_sha}-{args.release_id}"
+                    )
+            if failure_mode in CRATES_RESULT_FAILURE_MODES:
+                expected_names.add(
+                    f"rmux-downstream-crates_io-result-{args.source_sha}-{args.release_id}"
+                )
             allowed_names = (expected_names,)
         else:
             raise ValueError("failed downstream recovery mode differs")
