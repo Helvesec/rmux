@@ -44,6 +44,12 @@ def package_set_file(root: Path, version: str) -> Path:
     return expected
 
 
+def prepare_target_dir(path: Path) -> None:
+    if path.exists() or path.is_symlink():
+        raise ValueError("crates.io target directory must start absent")
+    path.mkdir(parents=True)
+
+
 def registry_url(name: str, version: str, *, download: bool = False) -> str:
     name = urllib.parse.quote(name, safe="")
     version = urllib.parse.quote(version, safe="")
@@ -161,6 +167,7 @@ def execute(args: argparse.Namespace) -> None:
     if not token or "\n" in token or "\r" in token:
         raise ValueError("short-lived crates.io token is missing or malformed")
     package_set = package_set_file(args.payload_dir, version)
+    prepare_target_dir(args.target_dir)
     extracted = args.target_dir / "canonical"
     manifest = unpack(package_set, extracted)
     packages = validate(

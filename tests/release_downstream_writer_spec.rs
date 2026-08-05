@@ -372,7 +372,7 @@ with tempfile.TemporaryDirectory(dir=pathlib.Path.cwd()) as directory:
 #[test]
 fn github_repository_writer_is_atomic_idempotent_and_prefix_exact() {
     assert!(GITHUB_REPOSITORY_COMMIT_PLAN.contains("createCommitOnBranch"));
-    assert!(GITHUB_REPOSITORY_COMMIT_PLAN.contains("GRAPHQL_COMMIT_MAX_BYTES = 44_000_000"));
+    assert!(GITHUB_REPOSITORY_COMMIT_PLAN.contains("GRAPHQL_COMMIT_MAX_BYTES = 25_000_000"));
     assert!(GITHUB_REPOSITORY_COMMIT_PLAN.contains("rmux-release-stage"));
     assert!(GITHUB_REPOSITORY_WRITER.contains("wasSignedByGitHub"));
     assert!(GITHUB_REPOSITORY_WRITER.contains("verification.get(\"verified\") is not True"));
@@ -400,6 +400,8 @@ class FakeApi:
         self.ref_updates = 0
         self.ref_deletes = 0
         self.fail_graphql_at = None
+        self.transient_graphql_at = None
+        self.transient_advances = False
         self.verified = verified
 
     @property
@@ -470,6 +472,11 @@ class FakeApi:
         branch_name = branch['branchName']
         if payload['expectedHeadOid'] != self.branches[branch_name]:
             raise AssertionError('non-atomic branch update')
+        if self.transient_graphql_at == self.graphql_calls:
+            self.transient_graphql_at = None
+            if self.transient_advances:
+                self.branches[branch_name] = 'f' * 40
+            raise ValueError('GitHub API POST /graphql failed: 502 transient')
         sha = self.sha()
         files = dict(self.trees[payload['expectedHeadOid']])
         changes = payload['fileChanges']
@@ -591,6 +598,42 @@ if large.graphql_calls < 2 or large.files != {**large_updates, 'keep.txt': b'kee
     raise SystemExit('chunked update did not preserve the exact final tree')
 if set(large.branches) != {'main'} or large.ref_deletes != 1:
     raise SystemExit('chunked update left its staging branch behind')
+
+transient = FakeApi({'managed/old.bin': b'old'})
+transient.transient_graphql_at = 2
+transient_outcome = publish(
+    transient,
+    full_name='Helvesec/rmux-packages',
+    branch='main',
+    updates=large_updates,
+    message='retry transient chunked bytes',
+    managed_prefixes=('managed',),
+    expected_base=transient.head,
+)
+if transient_outcome.state != 'public-live' or transient.ref_updates != 1:
+    raise SystemExit('transient signed commit failure was not recovered')
+
+ambiguous = FakeApi({'managed/old.bin': b'old'})
+ambiguous_base = ambiguous.head
+ambiguous.transient_graphql_at = 2
+ambiguous.transient_advances = True
+try:
+    publish(
+        ambiguous,
+        full_name='Helvesec/rmux-packages',
+        branch='main',
+        updates=large_updates,
+        message='reject ambiguous chunked bytes',
+        managed_prefixes=('managed',),
+        expected_base=ambiguous_base,
+    )
+except ValueError as error:
+    if 'outcome is ambiguous' not in str(error):
+        raise
+else:
+    raise SystemExit('ambiguous signed commit result was retried')
+if ambiguous.head != ambiguous_base or set(ambiguous.branches) != {'main'}:
+    raise SystemExit('ambiguous staging mutation changed main or leaked staging')
 
 broken = FakeApi({'managed/old.bin': b'old'})
 broken_base = broken.head

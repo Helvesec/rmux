@@ -26,6 +26,7 @@ EARLY_SUCCESS_JOBS = DIRECT_SUCCESS_JOBS | PREPARATION_SUCCESS_JOBS
 LINUX_SIGNING_JOB = "Build exact signed Linux repository trees / Sign retained APT and RPM repository trees"
 APT_PUBLISH_JOB = "Publish exact signed APT and RPM repositories"
 CRATES_PUBLISH_JOB = "Publish exact crates.io package set"
+CRATES_PREFLIGHT_JOB = "Verify crates.io Trusted Publishing authority"
 CRATES_PUBLISH_JOB_EXPANDED = (
     "Publish exact crates.io package set / Publish exact crates.io package set"
 )
@@ -150,6 +151,7 @@ def canonical_failed_jobs(
         | set(PACKAGE_WRITER_JOB_MAP)
         | (POST_MUTATION_SKIPPED_AFTER_FAILURE - {CRATES_PUBLISH_JOB})
     )
+    package_execution_names = package_writer_names | {CRATES_PREFLIGHT_JOB}
     raw_names = set(jobs)
     if raw_names == legacy_names:
         return (
@@ -175,7 +177,10 @@ def canonical_failed_jobs(
             },
             True,
         )
-    if raw_names == package_writer_names:
+    if frozenset(raw_names) in {
+        frozenset(package_writer_names),
+        frozenset(package_execution_names),
+    }:
         return (
             {
                 PACKAGE_WRITER_JOB_MAP.get(
@@ -266,6 +271,19 @@ def verify_failed_downstream_jobs(value: dict[str, Any]) -> str:
                 conclusion="success",
                 steps=writer_prefix | {action: "success", f"Post {action}": "success"},
             )
+        preflight = by_name.get(CRATES_PREFLIGHT_JOB)
+        if preflight is not None:
+            exact_job_shape(
+                preflight,
+                name=CRATES_PREFLIGHT_JOB,
+                conclusion="success",
+                steps={
+                    "Set up job": "success",
+                    "Exchange and revoke a preflight crates.io token": "success",
+                    "Post Exchange and revoke a preflight crates.io token": "success",
+                    "Complete job": "success",
+                },
+            )
         verify_skipped_jobs(
             by_name,
             POST_MUTATION_SKIPPED_AFTER_FAILURE - {APT_PUBLISH_JOB, CRATES_PUBLISH_JOB},
@@ -278,25 +296,34 @@ def verify_failed_downstream_jobs(value: dict[str, Any]) -> str:
             steps=writer_prefix
             | {apt_action: "failure", f"Post {apt_action}": "success"},
         )
+        crates_steps = {
+            "Set up job": "success",
+            checkout: "success",
+            "Run ./.github/actions/release-channel-prepare": "success",
+            "Resolve exact crates.io execution authority": "success",
+            "Exchange GitHub OIDC for a short-lived crates.io token": (
+                "success" if preflight is not None else "failure"
+            ),
+            "Publish and redownload every exact crate": (
+                "failure" if preflight is not None else "skipped"
+            ),
+            "Normalize executable and policy-only outcomes": "skipped",
+            "Seal exact crates.io result evidence": "skipped",
+            "Post Exchange GitHub OIDC for a short-lived crates.io token": "success",
+            post_checkout: "success",
+            "Complete job": "success",
+        }
         exact_job_shape(
             by_name[CRATES_PUBLISH_JOB],
             name=CRATES_PUBLISH_JOB,
             conclusion="failure",
-            steps={
-                "Set up job": "success",
-                checkout: "success",
-                "Run ./.github/actions/release-channel-prepare": "success",
-                "Resolve exact crates.io execution authority": "success",
-                "Exchange GitHub OIDC for a short-lived crates.io token": "failure",
-                "Publish and redownload every exact crate": "skipped",
-                "Normalize executable and policy-only outcomes": "skipped",
-                "Seal exact crates.io result evidence": "skipped",
-                "Post Exchange GitHub OIDC for a short-lived crates.io token": "success",
-                post_checkout: "success",
-                "Complete job": "success",
-            },
+            steps=crates_steps,
         )
-        return "package-writer-failure"
+        return (
+            "package-execution-failure"
+            if preflight is not None
+            else "package-writer-failure"
+        )
     verify_skipped_jobs(by_name, SKIPPED_AFTER_FAILURE)
     if linux.get("conclusion") != "failure":
         raise ValueError("Linux repository signing did not fail closed")
@@ -374,7 +401,7 @@ def verify_failed_downstream_artifacts(
                 expected_names
                 | result_envelope_names(args.source_sha, args.release_id),
             )
-        elif failure_mode == "package-writer-failure":
+        elif failure_mode in {"package-writer-failure", "package-execution-failure"}:
             expected_names.update(
                 result_envelope_names(args.source_sha, args.release_id)
             )

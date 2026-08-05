@@ -28,7 +28,7 @@ mutation CreateSignedCommit($input: CreateCommitOnBranchInput!) {
 }
 """
 
-GRAPHQL_COMMIT_MAX_BYTES = 44_000_000
+GRAPHQL_COMMIT_MAX_BYTES = 25_000_000
 STAGING_BRANCH_PREFIX = "rmux-release-stage"
 
 

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import time
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -23,6 +24,15 @@ class PublishOutcome:
     state: str
     mutation_started: bool
     commit_sha: str
+
+
+TRANSIENT_GRAPHQL_ERRORS = (
+    "GitHub API POST /graphql failed: 429 ",
+    "GitHub API POST /graphql failed: 500 ",
+    "GitHub API POST /graphql failed: 502 ",
+    "GitHub API POST /graphql failed: 503 ",
+    "GitHub API POST /graphql failed: 504 ",
+)
 
 
 class GitHubApi:
@@ -188,10 +198,21 @@ def create_signed_commit(
     )
     if request_size > GRAPHQL_COMMIT_MAX_BYTES:
         raise ValueError("signed GitHub commit request exceeds its safe payload limit")
-    data = api.graphql(
-        CREATE_COMMIT_MUTATION,
-        variables,
-    )
+    for attempt in range(3):
+        try:
+            data = api.graphql(CREATE_COMMIT_MUTATION, variables)
+            break
+        except (OSError, ValueError) as error:
+            transient = isinstance(error, OSError) or any(
+                marker in str(error) for marker in TRANSIENT_GRAPHQL_ERRORS
+            )
+            if not transient or attempt == 2:
+                raise
+            if branch_head(api, full_name, branch) != base_commit:
+                raise ValueError(
+                    "signed commit outcome is ambiguous; rerun idempotent recovery"
+                ) from error
+            time.sleep(2**attempt)
     mutation = data.get("createCommitOnBranch")
     if not isinstance(mutation, dict):
         raise ValueError("GitHub signed commit mutation returned no result")

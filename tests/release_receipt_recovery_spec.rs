@@ -405,6 +405,40 @@ fn package_writer_failure_jobs() -> Value {
     value
 }
 
+fn package_execution_failure_jobs() -> Value {
+    let mut value = package_writer_failure_jobs();
+    let jobs = value["jobs"].as_array_mut().expect("jobs array");
+    jobs.push(json!({
+        "name": "Verify crates.io Trusted Publishing authority",
+        "conclusion": "success",
+        "steps": [
+            step("Set up job", "success"),
+            step("Exchange and revoke a preflight crates.io token", "success"),
+            step(
+                "Post Exchange and revoke a preflight crates.io token",
+                "success",
+            ),
+            step("Complete job", "success"),
+        ],
+    }));
+    for job in jobs.iter_mut() {
+        if job["name"]
+            == "Publish exact crates.io package set / Publish exact crates.io package set"
+        {
+            for step in job["steps"].as_array_mut().expect("crates steps") {
+                if step["name"] == "Exchange GitHub OIDC for a short-lived crates.io token" {
+                    step["conclusion"] = json!("success");
+                }
+                if step["name"] == "Publish and redownload every exact crate" {
+                    step["conclusion"] = json!("failure");
+                }
+            }
+        }
+    }
+    value["total_count"] = json!(jobs.len());
+    value
+}
+
 fn downstream_failure_artifacts() -> (Value, u64) {
     downstream_failure_artifacts_for(FAILED_RUN, FAILED_CONTROL, 81)
 }
@@ -659,6 +693,34 @@ fn protected_main_recovery_accepts_exact_package_writer_failures() {
         &root,
         failed_run(FAILED_CONTROL, "main", "failure"),
         package_writer_failure_jobs(),
+        artifacts,
+        json!({
+            "total_count": 1,
+            "artifacts": [{
+                "id": receipt_id,
+                "name": format!("rmux-publication-receipt-{SOURCE}-{RELEASE_ID}"),
+                "expired": false,
+                "workflow_run": {"id": FAILED_RUN},
+            }],
+        }),
+    );
+    fs::remove_dir_all(&root).expect("remove fixture root");
+    assert!(
+        output.status.success(),
+        "stdout={} stderr={}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+#[test]
+fn protected_main_recovery_accepts_exact_package_execution_failures() {
+    let root = fixture_root("package-execution-failures");
+    let (artifacts, receipt_id) = package_writer_failure_artifacts();
+    let output = run_recovery(
+        &root,
+        failed_run(FAILED_CONTROL, "main", "failure"),
+        package_execution_failure_jobs(),
         artifacts,
         json!({
             "total_count": 1,

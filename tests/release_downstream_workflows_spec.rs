@@ -455,6 +455,17 @@ else:
     raise AssertionError("metadata access denial was treated as a missing version")
 
 with tempfile.TemporaryDirectory() as directory:
+    target = pathlib.Path(directory) / "missing" / "target"
+    module.prepare_target_dir(target)
+    assert target.is_dir()
+    try:
+        module.prepare_target_dir(target)
+    except ValueError as error:
+        assert "must start absent" in str(error)
+    else:
+        raise AssertionError("existing crates.io target directory was accepted")
+
+with tempfile.TemporaryDirectory() as directory:
     target = pathlib.Path(directory)
     filename = "rmux-types-0.9.1.crate"
     direct, temporary = module.generated_package_paths(target, filename)
