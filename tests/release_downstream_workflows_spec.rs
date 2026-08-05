@@ -601,6 +601,61 @@ fn downstream_rc_payloads_keep_stable_package_names() {
 }
 
 #[test]
+fn winget_release_date_comes_from_the_bound_publication_receipt() {
+    assert!(DOWNSTREAM_PREPARE
+        .contains("--receipt-predicate \"$root/plan/publication-receipt-predicate.json\""));
+    assert!(!DOWNSTREAM_PREPARE.contains("--release-date \"$(date -u +%F)\""));
+
+    let output = python3::command()
+        .args([
+            "-c",
+            r#"import importlib.util
+import pathlib
+import sys
+
+sys.path.insert(0, "scripts/release")
+path = pathlib.Path("scripts/release/stage-downstream-payloads.py")
+spec = importlib.util.spec_from_file_location("stage_downstream_payloads", path)
+module = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(module)
+identity = {
+    "id": 17,
+    "ref": "v1.2.3",
+    "intent_id": "stable:test",
+    "kind": "stable",
+    "tag_object_sha": "a" * 40,
+    "immutable": True,
+}
+plan = {"source_git_sha": "b" * 40, "release": identity}
+receipt = {
+    "source_git_sha": "b" * 40,
+    "release": dict(
+        identity,
+        created_at="2026-08-04T23:50:00Z",
+        published_at="2026-08-04T23:55:00Z",
+    ),
+}
+assert module.release_date_from_receipt(receipt, plan) == "2026-08-04"
+receipt["release"]["ref"] = "v9.9.9"
+try:
+    module.release_date_from_receipt(receipt, plan)
+except ValueError:
+    pass
+else:
+    raise AssertionError("mismatched receipt identity was accepted")
+"#,
+        ])
+        .current_dir(repo_root())
+        .output()
+        .expect("derive the WinGet release date from a publication receipt");
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+#[test]
 fn downstream_payloads_bind_the_complete_shadow_run_identity() {
     let marker = "- name: Verify exact candidate manifest artifact identity";
     let next_marker = "- name: Download only the exact candidate manifest artifact ID";

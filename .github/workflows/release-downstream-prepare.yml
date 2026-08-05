@@ -227,7 +227,8 @@ jobs:
             --manifest "$manifest" --downloads-dir "$root/candidate" \
             --release-assets-dir "$root/release/assets" \
             --plan "$root/plan/downstream-channel-plan.json" \
-            --release-date "$(date -u +%F)" --output-dir "$root/payloads"
+            --receipt-predicate "$root/plan/publication-receipt-predicate.json" \
+            --output-dir "$root/payloads"
 
       - id: payload-apt
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02

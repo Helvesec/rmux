@@ -5,21 +5,28 @@ from __future__ import annotations
 
 import argparse
 import hashlib
-import re
 import shutil
 import subprocess
 import sys
+from datetime import timezone
 from pathlib import Path
 from typing import Any
 
 from downstream_channels import CHANNELS, read_object, write_object
 from downstream_payload import infer_file_mappings
 from downstream_plan import validate_plan
-from release_evidence import validate_candidate_manifest
+from release_evidence import timestamp, validate_candidate_manifest
 
 ROOT = Path(__file__).resolve().parents[2]
-RELEASE_DATE = re.compile(r"[0-9]{4}-[0-9]{2}-[0-9]{2}")
 STAGED_CHANNELS = tuple(channel for channel in CHANNELS if channel != "rmux_io")
+RELEASE_IDENTITY_FIELDS = (
+    "id",
+    "ref",
+    "intent_id",
+    "kind",
+    "tag_object_sha",
+    "immutable",
+)
 
 
 def file_hash(path: Path) -> str:
@@ -108,6 +115,23 @@ def run_generator(arguments: list[str]) -> None:
         raise ValueError(f"downstream metadata generator failed: {message}")
 
 
+def release_date_from_receipt(receipt: dict[str, Any], plan: dict[str, Any]) -> str:
+    release = receipt.get("release")
+    planned_release = plan.get("release")
+    if not isinstance(release, dict) or not isinstance(planned_release, dict):
+        raise ValueError("receipt release identity is missing")
+    if receipt.get("source_git_sha") != plan.get("source_git_sha"):
+        raise ValueError("receipt and downstream plan source identities differ")
+    for field in RELEASE_IDENTITY_FIELDS:
+        if release.get(field) != planned_release.get(field):
+            raise ValueError("receipt and downstream plan release identities differ")
+    created_at = timestamp(release.get("created_at"), "release created_at")
+    published_at = timestamp(release.get("published_at"), "release published_at")
+    if created_at > published_at:
+        raise ValueError("release publication predates its creation")
+    return published_at.astimezone(timezone.utc).date().isoformat()
+
+
 def generated_metadata(
     root: Path,
     *,
@@ -161,8 +185,6 @@ def generated_metadata(
 
 
 def stage(args: argparse.Namespace) -> None:
-    if RELEASE_DATE.fullmatch(args.release_date) is None:
-        raise ValueError("release date must use YYYY-MM-DD")
     if args.output_dir.exists() or args.output_dir.is_symlink():
         raise ValueError("downstream payload output must start absent")
     downloads = args.downloads_dir.resolve(strict=True)
@@ -172,6 +194,10 @@ def stage(args: argparse.Namespace) -> None:
     manifest = read_object(args.manifest.resolve(strict=True), "candidate manifest")
     plan = read_object(args.plan.resolve(strict=True), "downstream plan")
     validate_plan(plan)
+    receipt = read_object(
+        args.receipt_predicate.resolve(strict=True), "publication receipt predicate"
+    )
+    release_date = release_date_from_receipt(receipt, plan)
     if (
         manifest.get("source_git_sha") != plan["source_git_sha"]
         or manifest.get("planned_release_ref") != plan["release"]["ref"]
@@ -200,7 +226,7 @@ def stage(args: argparse.Namespace) -> None:
         args.output_dir,
         version=version,
         release_ref=release_ref,
-        release_date=args.release_date,
+        release_date=release_date,
         checksums=checksums,
     )
     snap_entry = next(
@@ -217,7 +243,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--downloads-dir", type=Path, required=True)
     parser.add_argument("--release-assets-dir", type=Path, required=True)
     parser.add_argument("--plan", type=Path, required=True)
-    parser.add_argument("--release-date", required=True)
+    parser.add_argument("--receipt-predicate", type=Path, required=True)
     parser.add_argument("--output-dir", type=Path, required=True)
     return parser.parse_args()
 
