@@ -18,7 +18,6 @@ from downstream_channels import (
 from downstream_result import (
     LINUX_RECOVERY_PRODUCER,
     LINUX_RECOVERY_SIGNER,
-    RECEIPT_RECOVERY_PRODUCER,
 )
 from downstream_result_document import validate_envelope, validate_predicate
 
@@ -74,23 +73,25 @@ def verify(args: argparse.Namespace) -> None:
         getattr(args, "producer_source_ref", None) or f"refs/tags/{args.release_ref}"
     )
     signer_path = getattr(args, "attestation_signer_workflow", None) or producer_path
+    recovery = request["receipt"].get("recovery")
+    recovery_source = (
+        isinstance(recovery, dict)
+        and recovery.get("control_sha") == producer_source_sha
+        and recovery.get("control_ref") == producer_source_ref
+        and producer_source_ref == "refs/heads/main"
+        and producer_source_sha != args.source_sha
+    )
     if SHA40.fullmatch(producer_source_sha) is None:
         raise ValueError("channel result producer source SHA is not canonical")
     if producer_path == LINUX_RECOVERY_PRODUCER:
         if (
             predicate["channel"] != "apt_rpm"
             or signer_path != LINUX_RECOVERY_SIGNER
-            or producer_source_ref != "refs/heads/main"
+            or not recovery_source
         ):
             raise ValueError("Linux recovery attestation producer identity changed")
-    elif (
-        producer_path == RECEIPT_RECOVERY_PRODUCER
-        and producer_source_ref == "refs/heads/main"
-    ):
-        if (
-            producer_source_sha == args.source_sha
-            or signer_path != RECEIPT_RECOVERY_PRODUCER
-        ):
+    elif producer_source_ref == "refs/heads/main":
+        if not recovery_source or signer_path != producer_path:
             raise ValueError("receipt recovery attestation producer identity changed")
     elif (
         producer_source_sha != args.source_sha

@@ -214,6 +214,7 @@ def create_reference(
         channel=channel,
         release_source_sha=source_sha,
         producer=predicate["producer"],
+        recovery=request["receipt"].get("recovery"),
     )
     predicate_artifact = artifact_reference(
         read_object(predicate_artifact_path, "predicate artifact metadata"),

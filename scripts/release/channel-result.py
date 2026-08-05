@@ -105,6 +105,7 @@ def expected_envelope(args: argparse.Namespace) -> dict[str, Any]:
         channel=predicate["channel"],
         release_source_sha=predicate["source_git_sha"],
         producer=predicate["producer"],
+        recovery=request["receipt"].get("recovery"),
     )
     result_bundle = artifact_reference(
         read_object(args.bundle_artifact, "result bundle artifact"),

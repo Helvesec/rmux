@@ -288,7 +288,11 @@ producer = {
 }
 validate_producer(producer, 'apt_rpm')
 validate_result_artifact_source(
-    main, channel='apt_rpm', release_source_sha=source, producer=producer
+    main,
+    channel='apt_rpm',
+    release_source_sha=source,
+    producer=producer,
+    recovery={'control_sha': main, 'control_ref': 'refs/heads/main'},
 )
 for channel in ('chocolatey', 'snap_candidate'):
     try:

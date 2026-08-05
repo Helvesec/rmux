@@ -95,16 +95,20 @@ def validate_producer(value: Any, channel: str) -> dict[str, Any]:
 
 
 def validate_result_artifact_source(
-    value: Any, *, channel: str, release_source_sha: str, producer: dict[str, Any]
+    value: Any,
+    *,
+    channel: str,
+    release_source_sha: str,
+    producer: dict[str, Any],
+    recovery: Any = None,
 ) -> str:
     source_sha = match(value, SHA40, "result artifact source SHA")
-    if source_sha != release_source_sha and (
-        producer.get("workflow_path") != RECEIPT_RECOVERY_PRODUCER
-        and (
-            channel != "apt_rpm"
-            or producer.get("workflow_path") != LINUX_RECOVERY_PRODUCER
-        )
-    ):
+    recovery_matches = (
+        isinstance(recovery, dict)
+        and recovery.get("control_sha") == source_sha
+        and recovery.get("control_ref") == "refs/heads/main"
+    )
+    if source_sha != release_source_sha and not recovery_matches:
         raise ValueError("result artifact source differs from its release")
     return source_sha
 

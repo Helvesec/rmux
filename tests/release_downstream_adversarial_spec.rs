@@ -390,3 +390,51 @@ for external_id, remote_id in (
 "#
     ));
 }
+
+#[test]
+fn recovery_result_artifacts_require_the_exact_receipt_control_sha() {
+    assert_fixture(&format!(
+        "{PRELUDE}\n{}",
+        r#"
+from downstream_result import validate_result_artifact_source
+
+control_sha = '9' * 40
+producer = {
+    'workflow_path': '.github/workflows/release-crates-channel.yml',
+}
+recovery = {
+    'failed_run_id': 2,
+    'failed_conclusion': 'startup_failure',
+    'control_sha': control_sha,
+    'control_ref': 'refs/heads/main',
+}
+if validate_result_artifact_source(
+    control_sha,
+    channel='crates_io',
+    release_source_sha=SOURCE,
+    producer=producer,
+    recovery=recovery,
+) != control_sha:
+    raise SystemExit('exact recovery control SHA was not preserved')
+
+for forged in (
+    None,
+    {**recovery, 'control_sha': '8' * 40},
+    {**recovery, 'control_ref': 'refs/tags/v1.2.3'},
+):
+    try:
+        validate_result_artifact_source(
+            control_sha,
+            channel='crates_io',
+            release_source_sha=SOURCE,
+            producer=producer,
+            recovery=forged,
+        )
+    except ValueError as error:
+        if 'artifact source differs' not in str(error):
+            raise
+    else:
+        raise SystemExit('forged recovery control identity was accepted')
+"#
+    ));
+}

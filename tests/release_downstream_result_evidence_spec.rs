@@ -131,6 +131,12 @@ RECEIPT = {
         'bundle_sha256': '6' * 64,
     },
     'verified_at': '2026-07-20T00:00:00Z',
+    'recovery': {
+        'failed_run_id': 40,
+        'failed_conclusion': 'startup_failure',
+        'control_sha': '9' * 40,
+        'control_ref': 'refs/heads/main',
+    },
 }
 
 def write_fixture(root):
@@ -388,7 +394,7 @@ fn result_envelope_normalizes_exact_github_artifact_metadata() {
 with tempfile.TemporaryDirectory(dir=pathlib.Path.cwd()) as root:
     root = pathlib.Path(root)
     paths = write_fixture(root)
-    control_sha = 'f' * 40
+    control_sha = '9' * 40
     metadata = json.loads(paths['predicate_meta'].read_text(encoding='utf-8'))
     metadata['source_git_sha'] = control_sha
     write_object(paths['predicate_meta'], metadata)
