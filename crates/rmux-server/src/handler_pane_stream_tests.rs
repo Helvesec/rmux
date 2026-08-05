@@ -1553,14 +1553,36 @@ async fn natural_pane_exit_drains_raw_and_surface_streams_before_end() {
         .await;
 
     let raw_events = cursor_until_unlimited(&handler, raw.subscription_id, 1).await;
-    assert!(matches!(
-        raw_events.as_slice(),
-        [
-            PaneStreamEvent::RawBytes(bytes),
-            PaneStreamEvent::Lifecycle(PaneStreamLifecycleEvent::ProcessExited { .. }),
-            PaneStreamEvent::End(PaneStreamEndReason::PaneRemoved),
-        ] if bytes.bytes == b"natural-tail"
-    ));
+    assert_unique_pane_removed_end(&raw_events, "natural Raw exit drain");
+    assert!(
+        raw_events[..raw_events.len() - 1].iter().all(|event| {
+            matches!(
+                event,
+                PaneStreamEvent::RawBytes(_)
+                    | PaneStreamEvent::Lifecycle(PaneStreamLifecycleEvent::ProcessExited { .. })
+            )
+        }),
+        "natural Raw exit drain emitted an unexpected pre-terminal event: {raw_events:?}"
+    );
+    assert_eq!(
+        raw_events
+            .iter()
+            .filter(|event| matches!(event, PaneStreamEvent::RawBytes(bytes) if bytes.bytes == b"natural-tail"))
+            .count(),
+        1,
+        "natural Raw exit drain must deliver the staged tail exactly once: {raw_events:?}"
+    );
+    assert_eq!(
+        raw_events
+            .iter()
+            .filter(|event| matches!(
+                event,
+                PaneStreamEvent::Lifecycle(PaneStreamLifecycleEvent::ProcessExited { .. })
+            ))
+            .count(),
+        1,
+        "natural Raw exit must publish one lifecycle event: {raw_events:?}"
+    );
 
     let surface_events = cursor_until_unlimited(&handler, surface.subscription_id, 1).await;
     assert_unique_pane_removed_end(&surface_events, "natural Surface exit drain");

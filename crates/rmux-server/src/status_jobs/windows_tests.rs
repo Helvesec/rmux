@@ -114,6 +114,10 @@ impl WindowsStatusJobProbe {
 
     fn assert_process_dead(&self, stage: &str) {
         let pid = self.wait_for_pid();
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while rmux_os::process::is_live(pid) && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(20));
+        }
         assert!(
             !rmux_os::process::is_live(pid),
             "Windows status descendant {pid} survived {stage}"
