@@ -64,3 +64,10 @@ POST_MUTATION_JOB_MAP = {
     "Publish exact Web Share WASM bytes": "Publish exact Web Share WASM bytes / Publish owned channel web_share",
 }
 POST_MUTATION_RESULT_CHANNELS = ("homebrew_tap", "scoop", "web_share")
+
+
+def result_envelope_names(source_sha: str, release_id: int) -> set[str]:
+    return {
+        f"rmux-downstream-{channel}-result-envelope-{source_sha}-{release_id}"
+        for channel in POST_MUTATION_RESULT_CHANNELS
+    }

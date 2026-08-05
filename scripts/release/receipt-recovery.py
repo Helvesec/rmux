@@ -24,6 +24,7 @@ from receipt_recovery_topology import (
     PREPARATION_PREFIX,
     PREPARATION_SUCCESS_JOBS,
     SKIPPED_AFTER_FAILURE,
+    result_envelope_names,
 )
 
 REPOSITORY = "Helvesec/rmux"
@@ -264,6 +265,7 @@ def verify_failed_downstream_artifacts(
             for channel in PAYLOAD_CHANNELS
         ),
     }
+    allowed_names = (expected_names,)
     if post_mutation:
         expected_names.add(
             f"rmux-downstream-apt_rpm-signed-{args.source_sha}-{args.release_id}"
@@ -272,9 +274,9 @@ def verify_failed_downstream_artifacts(
             f"rmux-downstream-{channel}-result-{args.source_sha}-{args.release_id}"
             for channel in POST_MUTATION_RESULT_CHANNELS
         )
-        expected_names.update(
-            f"rmux-downstream-{channel}-result-envelope-{args.source_sha}-{args.release_id}"
-            for channel in POST_MUTATION_RESULT_CHANNELS
+        allowed_names = (
+            expected_names,
+            expected_names | result_envelope_names(args.source_sha, args.release_id),
         )
     by_name: dict[str, dict[str, Any]] = {}
     for artifact in artifacts:
@@ -284,7 +286,7 @@ def verify_failed_downstream_artifacts(
         if name in by_name:
             raise ValueError("failed downstream artifact names are not unique")
         by_name[name] = artifact
-    if set(by_name) != expected_names:
+    if set(by_name) not in allowed_names:
         raise ValueError("failed downstream artifact topology differs")
     for name, artifact in by_name.items():
         workflow_run = artifact.get("workflow_run", {})

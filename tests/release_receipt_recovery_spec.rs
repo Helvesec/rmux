@@ -337,25 +337,39 @@ fn downstream_failure_artifacts() -> (Value, u64) {
 }
 
 fn post_mutation_failure_artifacts() -> (Value, u64) {
-    let (mut value, receipt_id) = downstream_failure_artifacts();
+    post_mutation_failure_artifacts_for(FAILED_RUN, FAILED_CONTROL, 81, true)
+}
+
+fn post_mutation_failure_artifacts_for(
+    run_id: u64,
+    control_sha: &str,
+    receipt_id: u64,
+    include_envelopes: bool,
+) -> (Value, u64) {
+    let (mut value, receipt_id) = downstream_failure_artifacts_for(run_id, control_sha, receipt_id);
     let artifacts = value["artifacts"].as_array_mut().expect("artifacts array");
-    for name in [
-        format!("rmux-downstream-apt_rpm-signed-{SOURCE}-{RELEASE_ID}"),
-        format!("rmux-downstream-homebrew_tap-result-{SOURCE}-{RELEASE_ID}"),
-        format!("rmux-downstream-homebrew_tap-result-envelope-{SOURCE}-{RELEASE_ID}"),
-        format!("rmux-downstream-scoop-result-{SOURCE}-{RELEASE_ID}"),
-        format!("rmux-downstream-scoop-result-envelope-{SOURCE}-{RELEASE_ID}"),
-        format!("rmux-downstream-web_share-result-{SOURCE}-{RELEASE_ID}"),
-        format!("rmux-downstream-web_share-result-envelope-{SOURCE}-{RELEASE_ID}"),
-    ] {
+    let mut names = vec![format!(
+        "rmux-downstream-apt_rpm-signed-{SOURCE}-{RELEASE_ID}"
+    )];
+    for channel in ["homebrew_tap", "scoop", "web_share"] {
+        names.push(format!(
+            "rmux-downstream-{channel}-result-{SOURCE}-{RELEASE_ID}"
+        ));
+        if include_envelopes {
+            names.push(format!(
+                "rmux-downstream-{channel}-result-envelope-{SOURCE}-{RELEASE_ID}"
+            ));
+        }
+    }
+    for name in names {
         artifacts.push(json!({
             "id": receipt_id + artifacts.len() as u64,
             "name": name,
             "expired": false,
             "digest": format!("sha256:{}", "a".repeat(64)),
             "workflow_run": {
-                "id": FAILED_RUN,
-                "head_sha": FAILED_CONTROL,
+                "id": run_id,
+                "head_sha": control_sha,
                 "head_branch": "main",
                 "repository_id": 1_239_918_790,
                 "head_repository_id": 1_239_918_790,
@@ -540,8 +554,8 @@ fn protected_main_recovery_accepts_only_the_exact_post_mutation_seal_failure() {
 }
 
 #[test]
-fn protected_main_recovery_rejects_missing_post_mutation_result_envelope() {
-    let root = fixture_root("post-mutation-missing-envelope");
+fn protected_main_recovery_rejects_partial_post_mutation_result_envelopes() {
+    let root = fixture_root("post-mutation-partial-envelopes");
     let (mut artifacts, receipt_id) = post_mutation_failure_artifacts();
     let entries = artifacts["artifacts"]
         .as_array_mut()
@@ -570,17 +584,17 @@ fn protected_main_recovery_rejects_missing_post_mutation_result_envelope() {
 }
 
 #[test]
-fn protected_main_recovery_accepts_only_a_verified_linear_receipt_chain() {
-    let root = fixture_root("linear-chain");
-    let (artifacts, receipt_id) = downstream_failure_artifacts();
+fn protected_main_recovery_accepts_complete_results_after_a_legacy_result_set() {
+    let root = fixture_root("legacy-result-chain");
+    let (artifacts, receipt_id) = post_mutation_failure_artifacts();
     let (prior_artifacts, prior_receipt_id) =
-        downstream_failure_artifacts_for(PRIOR_RUN, PRIOR_CONTROL, 181);
+        post_mutation_failure_artifacts_for(PRIOR_RUN, PRIOR_CONTROL, 181, false);
     let mut prior_attempts = serde_json::Map::new();
     prior_attempts.insert(
         PRIOR_RUN.to_string(),
         json!({
             "run": failed_run_with_id(PRIOR_RUN, PRIOR_CONTROL, "main", "failure"),
-            "jobs": downstream_failure_jobs(),
+            "jobs": post_mutation_failure_jobs(),
             "artifacts": prior_artifacts,
             "commit": {
                 "sha": PRIOR_CONTROL,
@@ -591,7 +605,7 @@ fn protected_main_recovery_accepts_only_a_verified_linear_receipt_chain() {
     let output = run_recovery_with_prior(
         &root,
         failed_run(FAILED_CONTROL, "main", "failure"),
-        downstream_failure_jobs(),
+        post_mutation_failure_jobs(),
         artifacts,
         json!({
             "total_count": 2,
