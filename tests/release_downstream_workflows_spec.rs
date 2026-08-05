@@ -214,6 +214,56 @@ fn protected_environment_secrets_are_consumed_by_top_level_receipt_jobs() {
     assert!(!DOWNSTREAM.contains("RMUX_DOWNSTREAM_APP_PRIVATE_KEY"));
 }
 
+#[test]
+fn crates_oidc_authority_is_probed_before_any_public_writer() {
+    let preflight = job(
+        RECEIPT,
+        "preflight-crates-oidc",
+        Some("build-linux-repository"),
+    );
+    assert!(preflight.contains("needs: [downstream-preparation]"));
+    assert!(preflight.contains("environment: release"));
+    assert!(preflight.contains("id-token: write"));
+    assert!(preflight
+        .contains("rust-lang/crates-io-auth-action@c6f97d42243bad5fab37ca0427f495c86d5b1a18"));
+    assert_eq!(
+        RECEIPT
+            .matches("needs: [downstream-preparation, preflight-crates-oidc]")
+            .count(),
+        3
+    );
+    let crates = job(RECEIPT, "publish-crates", Some("record-homebrew-core"));
+    assert!(crates.contains(
+        "needs: [downstream-preparation, preflight-crates-oidc, build-linux-repository, publish-homebrew-tap, publish-scoop, publish-web-share]"
+    ));
+    let linux = job(
+        RECEIPT,
+        "publish-linux-repository",
+        Some("record-linux-repository-policy"),
+    );
+    assert!(linux.contains(
+        "needs: [downstream-preparation, preflight-crates-oidc, build-linux-repository, publish-homebrew-tap, publish-scoop, publish-web-share]"
+    ));
+    let preflight_offset = RECEIPT
+        .find("\n  preflight-crates-oidc:\n")
+        .expect("crates preflight job");
+    for writer in [
+        "publish-homebrew-tap",
+        "publish-scoop",
+        "publish-web-share",
+        "publish-linux-repository",
+        "publish-crates",
+    ] {
+        let writer_offset = RECEIPT
+            .find(&format!("\n  {writer}:\n"))
+            .unwrap_or_else(|| panic!("missing public writer {writer}"));
+        assert!(
+            preflight_offset < writer_offset,
+            "{writer} precedes OIDC preflight"
+        );
+    }
+}
+
 #[cfg(unix)]
 #[test]
 fn downstream_workflow_entry_points_are_executable() {

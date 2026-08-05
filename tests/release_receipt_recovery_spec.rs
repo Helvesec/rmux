@@ -332,12 +332,110 @@ fn post_mutation_failure_jobs() -> Value {
     value
 }
 
+fn package_writer_failure_jobs() -> Value {
+    let mut value = post_mutation_failure_jobs();
+    let jobs = value["jobs"].as_array_mut().expect("jobs array");
+    for job in jobs.iter_mut() {
+        let name = job["name"].as_str().expect("job name");
+        if [
+            "Publish exact Homebrew tap formula",
+            "Publish exact Scoop manifest",
+            "Publish exact Web Share WASM bytes",
+        ]
+        .contains(&name)
+        {
+            job["conclusion"] = json!("success");
+            for step in job["steps"].as_array_mut().expect("writer steps") {
+                if step["name"] == "Run ./.github/actions/release-owned-repository-publish" {
+                    step["conclusion"] = json!("success");
+                }
+            }
+            continue;
+        }
+        if name == "Publish exact signed APT and RPM repositories" {
+            let action = "Run ./.github/actions/release-linux-repository-publish";
+            job["conclusion"] = json!("failure");
+            job["steps"] = json!([
+                step("Set up job", "success"),
+                step(
+                    "Run actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5",
+                    "success",
+                ),
+                step(action, "failure"),
+                step(&format!("Post {action}"), "success"),
+                step(
+                    "Post Run actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5",
+                    "success",
+                ),
+                step("Complete job", "success"),
+            ]);
+            continue;
+        }
+        if name == "Publish exact crates.io package set" {
+            job["name"] =
+                json!("Publish exact crates.io package set / Publish exact crates.io package set");
+            job["conclusion"] = json!("failure");
+            job["steps"] = json!([
+                step("Set up job", "success"),
+                step(
+                    "Run actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5",
+                    "success",
+                ),
+                step("Run ./.github/actions/release-channel-prepare", "success"),
+                step("Resolve exact crates.io execution authority", "success"),
+                step(
+                    "Exchange GitHub OIDC for a short-lived crates.io token",
+                    "failure",
+                ),
+                step("Publish and redownload every exact crate", "skipped"),
+                step("Normalize executable and policy-only outcomes", "skipped"),
+                step("Seal exact crates.io result evidence", "skipped"),
+                step(
+                    "Post Exchange GitHub OIDC for a short-lived crates.io token",
+                    "success",
+                ),
+                step(
+                    "Post Run actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5",
+                    "success",
+                ),
+                step("Complete job", "success"),
+            ]);
+        }
+    }
+    value
+}
+
 fn downstream_failure_artifacts() -> (Value, u64) {
     downstream_failure_artifacts_for(FAILED_RUN, FAILED_CONTROL, 81)
 }
 
 fn post_mutation_failure_artifacts() -> (Value, u64) {
     post_mutation_failure_artifacts_for(FAILED_RUN, FAILED_CONTROL, 81, true)
+}
+
+fn package_writer_failure_artifacts() -> (Value, u64) {
+    let (mut value, receipt_id) = post_mutation_failure_artifacts();
+    let artifacts = value["artifacts"].as_array_mut().expect("artifacts array");
+    for channel in ["homebrew_tap", "scoop", "web_share"] {
+        artifacts.push(json!({
+            "id": receipt_id + artifacts.len() as u64,
+            "name": format!(
+                "rmux-downstream-{channel}-result-reference-{SOURCE}-{RELEASE_ID}"
+            ),
+            "expired": false,
+            "digest": format!("sha256:{}", "a".repeat(64)),
+            "workflow_run": {
+                "id": FAILED_RUN,
+                "head_sha": FAILED_CONTROL,
+                "head_branch": "main",
+                "repository_id": 1_239_918_790,
+                "head_repository_id": 1_239_918_790,
+            },
+        }));
+    }
+    let total_count = artifacts.len();
+    value["total_count"] = json!(total_count);
+    (value, receipt_id)
 }
 
 fn post_mutation_failure_artifacts_for(
@@ -551,6 +649,64 @@ fn protected_main_recovery_accepts_only_the_exact_post_mutation_seal_failure() {
         String::from_utf8_lossy(&output.stdout),
         String::from_utf8_lossy(&output.stderr)
     );
+}
+
+#[test]
+fn protected_main_recovery_accepts_exact_package_writer_failures() {
+    let root = fixture_root("package-writer-failures");
+    let (artifacts, receipt_id) = package_writer_failure_artifacts();
+    let output = run_recovery(
+        &root,
+        failed_run(FAILED_CONTROL, "main", "failure"),
+        package_writer_failure_jobs(),
+        artifacts,
+        json!({
+            "total_count": 1,
+            "artifacts": [{
+                "id": receipt_id,
+                "name": format!("rmux-publication-receipt-{SOURCE}-{RELEASE_ID}"),
+                "expired": false,
+                "workflow_run": {"id": FAILED_RUN},
+            }],
+        }),
+    );
+    fs::remove_dir_all(&root).expect("remove fixture root");
+    assert!(
+        output.status.success(),
+        "stdout={} stderr={}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+#[test]
+fn protected_main_recovery_rejects_partial_package_result_references() {
+    let root = fixture_root("package-writer-partial-references");
+    let (mut artifacts, receipt_id) = package_writer_failure_artifacts();
+    let entries = artifacts["artifacts"]
+        .as_array_mut()
+        .expect("artifacts array");
+    entries.retain(|artifact| {
+        artifact["name"] != format!("rmux-downstream-scoop-result-reference-{SOURCE}-{RELEASE_ID}")
+    });
+    artifacts["total_count"] = json!(entries.len());
+    let output = run_recovery(
+        &root,
+        failed_run(FAILED_CONTROL, "main", "failure"),
+        package_writer_failure_jobs(),
+        artifacts,
+        json!({
+            "total_count": 1,
+            "artifacts": [{
+                "id": receipt_id,
+                "name": format!("rmux-publication-receipt-{SOURCE}-{RELEASE_ID}"),
+                "expired": false,
+                "workflow_run": {"id": FAILED_RUN},
+            }],
+        }),
+    );
+    fs::remove_dir_all(&root).expect("remove fixture root");
+    assert!(!output.status.success());
 }
 
 #[test]

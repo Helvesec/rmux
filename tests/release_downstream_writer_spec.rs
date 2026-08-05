@@ -6,6 +6,8 @@ use std::process::{Command, Output};
 
 const GITHUB_REPOSITORY_WRITER: &str =
     include_str!("../scripts/release/github_repository_writer.py");
+const GITHUB_REPOSITORY_COMMIT_PLAN: &str =
+    include_str!("../scripts/release/github_repository_commit_plan.py");
 
 fn repo_root() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -369,51 +371,75 @@ with tempfile.TemporaryDirectory(dir=pathlib.Path.cwd()) as directory:
 
 #[test]
 fn github_repository_writer_is_atomic_idempotent_and_prefix_exact() {
-    assert!(GITHUB_REPOSITORY_WRITER.contains("createCommitOnBranch"));
+    assert!(GITHUB_REPOSITORY_COMMIT_PLAN.contains("createCommitOnBranch"));
+    assert!(GITHUB_REPOSITORY_COMMIT_PLAN.contains("GRAPHQL_COMMIT_MAX_BYTES = 44_000_000"));
+    assert!(GITHUB_REPOSITORY_COMMIT_PLAN.contains("rmux-release-stage"));
     assert!(GITHUB_REPOSITORY_WRITER.contains("wasSignedByGitHub"));
     assert!(GITHUB_REPOSITORY_WRITER.contains("verification.get(\"verified\") is not True"));
-    assert!(!GITHUB_REPOSITORY_WRITER.contains("/git/refs/heads/"));
+    assert!(GITHUB_REPOSITORY_WRITER.contains("/git/refs/heads/"));
+    assert!(GITHUB_REPOSITORY_WRITER.contains("{\"sha\": commit_sha, \"force\": False}"));
     assert!(!GITHUB_REPOSITORY_WRITER.contains("f\"/repos/{full_name}/git/commits\""));
     assert_python(
         r#"
+import base64
 import urllib.parse
 import sys
 
 sys.path.insert(0, 'scripts/release')
+import github_repository_commit_plan as commit_plan
 from github_repository_writer import publish
 
 class FakeApi:
     def __init__(self, files, verified=True):
-        self.head = '1' * 40
-        self.files = dict(files)
-        self.commits = {}
-        self.posts = 0
+        root = '1' * 40
+        self.branches = {'main': root}
+        self.trees = {root: dict(files)}
+        self.parents = {}
+        self.signed = set()
+        self.graphql_calls = 0
+        self.ref_updates = 0
+        self.ref_deletes = 0
+        self.fail_graphql_at = None
         self.verified = verified
 
+    @property
+    def head(self):
+        return self.branches['main']
+
+    @property
+    def files(self):
+        return self.trees[self.head]
+
     def sha(self):
-        self.posts += 1
-        return f'{self.posts + 1:040x}'
+        return f'{len(self.parents) + 2:040x}'
 
     def get(self, path):
-        if '/git/ref/heads/' in path:
-            return {'object': {'type': 'commit', 'sha': self.head}}
+        if '/git/ref/heads/' in path or '/git/refs/heads/' in path:
+            marker = '/git/refs/heads/' if '/git/refs/heads/' in path else '/git/ref/heads/'
+            branch = urllib.parse.unquote(path.split(marker, 1)[1])
+            if branch not in self.branches:
+                raise ValueError(f'GitHub API GET {path} failed: 404 missing')
+            return {
+                'ref': f'refs/heads/{branch}',
+                'object': {'type': 'commit', 'sha': self.branches[branch]},
+            }
         if '/git/commits/' in path:
             sha = path.rsplit('/', 1)[1]
-            if sha in self.commits:
+            if sha in self.signed:
                 return {
-                    'tree': {'sha': 'f' * 40},
                     'verification': {
                         'verified': self.verified,
                         'reason': 'valid' if self.verified else 'unsigned',
                         'signature': 'github-signature' if self.verified else None,
                     },
                 }
-            return {'tree': {'sha': 'f' * 40}}
+            raise AssertionError(f'unknown commit {sha}')
         if '/git/trees/' in path:
+            sha = path.split('/git/trees/', 1)[1].split('?', 1)[0]
             return {
                 'truncated': False,
                 'tree': [
-                    {'path': name, 'type': 'blob'} for name in sorted(self.files)
+                    {'path': name, 'type': 'blob'} for name in sorted(self.trees[sha])
                 ],
             }
         raise AssertionError(path)
@@ -421,9 +447,12 @@ class FakeApi:
     def get_bytes(self, path, *, limit):
         encoded = path.split('/contents/', 1)[1].split('?ref=', 1)[0]
         name = urllib.parse.unquote(encoded)
-        if name not in self.files:
+        ref = urllib.parse.unquote(path.split('?ref=', 1)[1])
+        sha = self.branches.get(ref, ref)
+        files = self.trees[sha]
+        if name not in files:
             raise ValueError(f'GitHub API GET {path} failed: 404 missing')
-        data = self.files[name]
+        data = files[name]
         if len(data) > limit:
             raise AssertionError('fixture exceeds limit')
         return data
@@ -431,26 +460,27 @@ class FakeApi:
     def graphql(self, query, variables):
         if 'createCommitOnBranch' not in query:
             raise AssertionError('wrong mutation')
+        self.graphql_calls += 1
+        if self.fail_graphql_at == self.graphql_calls:
+            raise ValueError('injected GraphQL failure')
         payload = variables['input']
         branch = payload['branch']
-        if branch != {
-            'repositoryNameWithOwner': 'Helvesec/rmux-packages',
-            'branchName': 'main',
-        }:
+        if branch['repositoryNameWithOwner'] != 'Helvesec/rmux-packages':
             raise AssertionError('wrong branch identity')
-        if payload['expectedHeadOid'] != self.head:
+        branch_name = branch['branchName']
+        if payload['expectedHeadOid'] != self.branches[branch_name]:
             raise AssertionError('non-atomic branch update')
         sha = self.sha()
-        import base64
-        files = dict(self.files)
+        files = dict(self.trees[payload['expectedHeadOid']])
         changes = payload['fileChanges']
         for entry in changes['deletions']:
             files.pop(entry['path'], None)
         for entry in changes['additions']:
             files[entry['path']] = base64.b64decode(entry['contents'])
-        self.commits[sha] = files
-        self.files = files
-        self.head = sha
+        self.trees[sha] = files
+        self.parents[sha] = payload['expectedHeadOid']
+        self.signed.add(sha)
+        self.branches[branch_name] = sha
         return {
             'createCommitOnBranch': {
                 'commit': {
@@ -464,6 +494,35 @@ class FakeApi:
                 'ref': {'target': {'oid': sha}},
             }
         }
+
+    def post(self, path, payload):
+        if path != '/repos/Helvesec/rmux-packages/git/refs':
+            raise AssertionError(path)
+        branch = payload['ref'].removeprefix('refs/heads/')
+        if branch in self.branches:
+            raise AssertionError('staging branch already exists')
+        self.branches[branch] = payload['sha']
+        return {'ref': payload['ref'], 'object': {'sha': payload['sha']}}
+
+    def patch(self, path, payload):
+        branch = urllib.parse.unquote(path.split('/git/refs/heads/', 1)[1])
+        if payload.get('force') is not False:
+            raise AssertionError('force update requested')
+        current = payload['sha']
+        while current != self.branches[branch]:
+            current = self.parents.get(current)
+            if current is None:
+                raise AssertionError('non-fast-forward staging promotion')
+        self.branches[branch] = payload['sha']
+        self.ref_updates += 1
+        return {'ref': f'refs/heads/{branch}', 'object': {'sha': payload['sha']}}
+
+    def delete(self, path):
+        branch = urllib.parse.unquote(path.split('/git/refs/heads/', 1)[1])
+        if branch == 'main':
+            raise AssertionError('main deletion requested')
+        del self.branches[branch]
+        self.ref_deletes += 1
 
 api = FakeApi({'managed/old.bin': b'old', 'keep.txt': b'keep'})
 base = api.head
@@ -481,7 +540,7 @@ if outcome.state != 'public-live' or not outcome.mutation_started:
 if api.files != {'managed/new.bin': b'new', 'keep.txt': b'keep'}:
     raise SystemExit(f'managed repository set differs: {api.files!r}')
 
-posts = api.posts
+posts = api.graphql_calls
 same = publish(
     api,
     full_name='Helvesec/rmux-packages',
@@ -489,25 +548,70 @@ same = publish(
     updates={'managed/new.bin': b'new'},
     message='publish exact bytes',
     managed_prefixes=('managed',),
-    expected_base=api.head,
+    expected_base=base,
 )
-if same.state != 'no-op-exact' or same.mutation_started or api.posts != posts:
-    raise SystemExit('exact repository no-op wrote Git objects')
+if same.state != 'no-op-exact' or same.mutation_started or api.graphql_calls != posts:
+    raise SystemExit('exact stale-base recovery wrote Git objects')
 
 try:
     publish(
         api,
         full_name='Helvesec/rmux-packages',
         branch='main',
-        updates={'managed/new.bin': b'new'},
+        updates={'managed/different.bin': b'different'},
         message='stale',
         managed_prefixes=('managed',),
-        expected_base='0' * 40,
+        expected_base=base,
     )
 except ValueError:
     pass
 else:
     raise SystemExit('stale repository base was accepted')
+
+commit_plan.GRAPHQL_COMMIT_MAX_BYTES = 1_600
+large = FakeApi({'managed/old.bin': b'old', 'keep.txt': b'keep'})
+large_base = large.head
+large_updates = {
+    'managed/one.bin': b'a' * 600,
+    'managed/two.bin': b'b' * 600,
+    'managed/three.bin': b'c' * 600,
+}
+large_outcome = publish(
+    large,
+    full_name='Helvesec/rmux-packages',
+    branch='main',
+    updates=large_updates,
+    message='publish chunked bytes',
+    managed_prefixes=('managed',),
+    expected_base=large_base,
+)
+if large_outcome.state != 'public-live' or large.ref_updates != 1:
+    raise SystemExit('chunked update did not advance main exactly once')
+if large.graphql_calls < 2 or large.files != {**large_updates, 'keep.txt': b'keep'}:
+    raise SystemExit('chunked update did not preserve the exact final tree')
+if set(large.branches) != {'main'} or large.ref_deletes != 1:
+    raise SystemExit('chunked update left its staging branch behind')
+
+broken = FakeApi({'managed/old.bin': b'old'})
+broken_base = broken.head
+broken.fail_graphql_at = 2
+try:
+    publish(
+        broken,
+        full_name='Helvesec/rmux-packages',
+        branch='main',
+        updates=large_updates,
+        message='fail chunked bytes',
+        managed_prefixes=('managed',),
+        expected_base=broken_base,
+    )
+except ValueError as error:
+    if 'injected GraphQL failure' not in str(error):
+        raise
+else:
+    raise SystemExit('chunked mutation failure was accepted')
+if broken.head != broken_base or set(broken.branches) != {'main'}:
+    raise SystemExit('failed chunked update changed main or leaked staging')
 
 unsigned = FakeApi({'managed/old.bin': b'old'}, verified=False)
 try:

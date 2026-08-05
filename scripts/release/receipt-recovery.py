@@ -12,23 +12,12 @@ from typing import Any
 from github_actions import gh_api, read_json
 from receipt_recovery_topology import (
     ACTIVE,
-    DIRECT_SUCCESS_JOBS,
-    EARLY_SUCCESS_JOBS,
-    LEGACY_DOWNSTREAM_PREFIX,
-    LINUX_SIGNING_JOB,
-    OWNED_WRITER_JOBS,
-    PAYLOAD_CHANNELS,
-    POST_MUTATION_JOB_MAP,
-    POST_MUTATION_RESULT_CHANNELS,
-    POST_MUTATION_SKIPPED_AFTER_FAILURE,
-    PREPARATION_PREFIX,
-    PREPARATION_SUCCESS_JOBS,
-    SKIPPED_AFTER_FAILURE,
-    result_envelope_names,
+    REPOSITORY_ID,
+    verify_failed_downstream_artifacts,
+    verify_failed_downstream_jobs,
 )
 
 REPOSITORY = "Helvesec/rmux"
-REPOSITORY_ID = 1239918790
 RECEIPT_WORKFLOW_ID = 316435347
 CI_WORKFLOW_ID = 277622540
 SHA40 = re.compile(r"[0-9a-f]{40}")
@@ -71,241 +60,6 @@ def verified_commit(value: dict[str, Any], sha: str, label: str) -> None:
         or verification.get("reason") != "valid"
     ):
         raise ValueError(f"{label} is not GitHub-verified")
-
-
-def job_steps(job: dict[str, Any], label: str) -> dict[str, str]:
-    steps = job.get("steps")
-    if not isinstance(steps, list):
-        raise ValueError(f"{label} has no step list")
-    result: dict[str, str] = {}
-    for step in steps:
-        if not isinstance(step, dict):
-            raise ValueError(f"{label} has a malformed step")
-        name = step.get("name")
-        conclusion = step.get("conclusion")
-        if not isinstance(name, str) or not isinstance(conclusion, str):
-            raise ValueError(f"{label} step identity is malformed")
-        if name in result and result[name] != conclusion:
-            raise ValueError(f"{label} duplicate step conclusions differ")
-        result[name] = conclusion
-    return result
-
-
-def exact_step(steps: dict[str, str], name: str, conclusion: str, label: str) -> None:
-    if steps.get(name) != conclusion:
-        raise ValueError(f"{label} step {name} did not conclude {conclusion}")
-
-
-def canonical_failed_jobs(
-    jobs: dict[str, dict[str, Any]],
-) -> tuple[dict[str, dict[str, Any]], bool]:
-    downstream_jobs = (
-        PREPARATION_SUCCESS_JOBS
-        | {LINUX_SIGNING_JOB}
-        | OWNED_WRITER_JOBS
-        | SKIPPED_AFTER_FAILURE
-    )
-    legacy_names = DIRECT_SUCCESS_JOBS | {
-        f"{LEGACY_DOWNSTREAM_PREFIX}{name}" for name in downstream_jobs
-    }
-    direct_names = (
-        DIRECT_SUCCESS_JOBS
-        | {f"{PREPARATION_PREFIX}{name}" for name in PREPARATION_SUCCESS_JOBS}
-        | {LINUX_SIGNING_JOB}
-        | OWNED_WRITER_JOBS
-        | SKIPPED_AFTER_FAILURE
-    )
-    post_mutation_names = (
-        DIRECT_SUCCESS_JOBS
-        | {f"{PREPARATION_PREFIX}{name}" for name in PREPARATION_SUCCESS_JOBS}
-        | set(POST_MUTATION_JOB_MAP)
-        | POST_MUTATION_SKIPPED_AFTER_FAILURE
-    )
-    raw_names = set(jobs)
-    if raw_names == legacy_names:
-        return (
-            {
-                name.removeprefix(LEGACY_DOWNSTREAM_PREFIX): job
-                for name, job in jobs.items()
-            },
-            False,
-        )
-    if raw_names == direct_names:
-        return (
-            {name.removeprefix(PREPARATION_PREFIX): job for name, job in jobs.items()},
-            False,
-        )
-    if raw_names == post_mutation_names:
-        return (
-            {
-                POST_MUTATION_JOB_MAP.get(
-                    name.removeprefix(PREPARATION_PREFIX),
-                    name.removeprefix(PREPARATION_PREFIX),
-                ): job
-                for name, job in jobs.items()
-            },
-            True,
-        )
-    raise ValueError("failed downstream job topology differs")
-
-
-def verify_failed_downstream_jobs(value: dict[str, Any]) -> bool:
-    jobs = value.get("jobs")
-    if not isinstance(jobs, list) or value.get("total_count") != len(jobs):
-        raise ValueError("failed downstream job set is malformed")
-    by_name: dict[str, dict[str, Any]] = {}
-    for job in jobs:
-        if not isinstance(job, dict) or not isinstance(job.get("name"), str):
-            raise ValueError("failed downstream job identity is malformed")
-        name = job["name"]
-        if name in by_name:
-            raise ValueError("failed downstream job names are not unique")
-        by_name[name] = job
-    by_name, post_mutation = canonical_failed_jobs(by_name)
-    for name in EARLY_SUCCESS_JOBS:
-        if by_name[name].get("conclusion") != "success":
-            raise ValueError(f"failed downstream prerequisite {name} is not successful")
-    skipped_jobs = (
-        POST_MUTATION_SKIPPED_AFTER_FAILURE if post_mutation else SKIPPED_AFTER_FAILURE
-    )
-    for name in skipped_jobs:
-        if (
-            by_name[name].get("conclusion") != "skipped"
-            or by_name[name].get("steps") != []
-        ):
-            raise ValueError(f"post-failure downstream job {name} was not untouched")
-
-    linux = by_name[LINUX_SIGNING_JOB]
-    if post_mutation:
-        checkout = "Run actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5"
-        post_checkout = f"Post {checkout}"
-        linux_steps = job_steps(linux, LINUX_SIGNING_JOB)
-        expected_linux_steps = {
-            "Set up job": "success",
-            checkout: "success",
-            "Run ./.github/actions/release-linux-repository-build": "success",
-            post_checkout: "success",
-            "Complete job": "success",
-        }
-        if linux.get("conclusion") != "success" or linux_steps != expected_linux_steps:
-            raise ValueError("post-mutation Linux repository build is not successful")
-        action = "Run ./.github/actions/release-owned-repository-publish"
-        expected_writer_steps = {
-            "Set up job": "success",
-            checkout: "success",
-            action: "failure",
-            f"Post {action}": "success",
-            post_checkout: "success",
-            "Complete job": "success",
-        }
-        for name in OWNED_WRITER_JOBS:
-            job = by_name[name]
-            steps = job_steps(job, name)
-            if job.get("conclusion") != "failure" or steps != expected_writer_steps:
-                raise ValueError(f"post-mutation writer failure {name} differs")
-        return True
-    if linux.get("conclusion") != "failure":
-        raise ValueError("Linux repository signing did not fail closed")
-    linux_steps = job_steps(linux, LINUX_SIGNING_JOB)
-    exact_step(
-        linux_steps,
-        "Import distinct repository signing keys",
-        "failure",
-        LINUX_SIGNING_JOB,
-    )
-    for name in (
-        "Authenticate retained history and generate signed repositories",
-        "Add static package host files and exact checksum inventory",
-        "Upload the exact signed repository tree",
-    ):
-        exact_step(linux_steps, name, "skipped", LINUX_SIGNING_JOB)
-
-    for name in OWNED_WRITER_JOBS:
-        job = by_name[name]
-        if job.get("conclusion") != "failure":
-            raise ValueError(f"owned repository job {name} did not fail closed")
-        steps = job_steps(job, name)
-        exact_step(
-            steps,
-            "Mint a repository-scoped downstream writer token",
-            "failure",
-            name,
-        )
-        exact_step(
-            steps,
-            "Publish and reread exact repository bytes",
-            "skipped",
-            name,
-        )
-        exact_step(
-            steps,
-            "Seal exact owned repository result evidence",
-            "skipped",
-            name,
-        )
-    return False
-
-
-def verify_failed_downstream_artifacts(
-    value: dict[str, Any],
-    args: argparse.Namespace,
-    failed_control_sha: str,
-    post_mutation: bool,
-) -> int:
-    artifacts = value.get("artifacts")
-    if not isinstance(artifacts, list) or value.get("total_count") != len(artifacts):
-        raise ValueError("failed downstream artifact set is malformed")
-    expected_names = {
-        f"rmux-publication-receipt-{args.source_sha}-{args.release_id}",
-        f"rmux-publication-receipt-envelope-{args.source_sha}-{args.release_id}",
-        f"rmux-downstream-authority-{args.source_sha}-{args.failed_run_id}",
-        f"rmux-downstream-plan-{args.source_sha}-{args.release_id}",
-        *(
-            f"rmux-downstream-{channel}-payload-{args.source_sha}-{args.release_id}"
-            for channel in PAYLOAD_CHANNELS
-        ),
-    }
-    allowed_names = (expected_names,)
-    if post_mutation:
-        expected_names.add(
-            f"rmux-downstream-apt_rpm-signed-{args.source_sha}-{args.release_id}"
-        )
-        expected_names.update(
-            f"rmux-downstream-{channel}-result-{args.source_sha}-{args.release_id}"
-            for channel in POST_MUTATION_RESULT_CHANNELS
-        )
-        allowed_names = (
-            expected_names,
-            expected_names | result_envelope_names(args.source_sha, args.release_id),
-        )
-    by_name: dict[str, dict[str, Any]] = {}
-    for artifact in artifacts:
-        if not isinstance(artifact, dict) or not isinstance(artifact.get("name"), str):
-            raise ValueError("failed downstream artifact identity is malformed")
-        name = artifact["name"]
-        if name in by_name:
-            raise ValueError("failed downstream artifact names are not unique")
-        by_name[name] = artifact
-    if set(by_name) not in allowed_names:
-        raise ValueError("failed downstream artifact topology differs")
-    for name, artifact in by_name.items():
-        workflow_run = artifact.get("workflow_run", {})
-        if (
-            type(artifact.get("id")) is not int
-            or artifact["id"] <= 0
-            or artifact.get("expired") is not False
-            or not isinstance(artifact.get("digest"), str)
-            or re.fullmatch(r"sha256:[0-9a-f]{64}", artifact["digest"]) is None
-            or workflow_run.get("id") != args.failed_run_id
-            or workflow_run.get("head_sha") != failed_control_sha
-            or workflow_run.get("head_branch") != "main"
-            or workflow_run.get("repository_id") != REPOSITORY_ID
-            or workflow_run.get("head_repository_id") != REPOSITORY_ID
-        ):
-            raise ValueError(f"failed downstream artifact {name} identity differs")
-    return by_name[f"rmux-publication-receipt-{args.source_sha}-{args.release_id}"][
-        "id"
-    ]
 
 
 def verify_failed_attempt(
@@ -364,9 +118,9 @@ def verify_failed_attempt(
     verified_commit(
         failed_commit, failed_control_sha, "failed downstream control commit"
     )
-    post_mutation = verify_failed_downstream_jobs(jobs)
+    failure_mode = verify_failed_downstream_jobs(jobs)
     return verify_failed_downstream_artifacts(
-        artifacts, args, failed_control_sha, post_mutation
+        artifacts, args, failed_control_sha, failure_mode
     )
 
 

@@ -574,6 +574,8 @@ def _validate_helper_sizes(root: Path) -> None:
         "downstream_result_reference.py",
         "downstream_summary.py",
         "collect-downstream-repository.py",
+        "github_repository_commit_plan.py",
+        "github_repository_writer.py",
         "verify-downstream-repository.py",
         "verify-channel-result-attestation.py",
         "prepare-channel-retry.py",
@@ -627,6 +629,24 @@ def _validate_channel_orchestration(receipt: str, preparation: str) -> None:
     for secret, count in protected_secrets.items():
         if receipt.count(f"secrets.{secret}") != count:
             raise ValueError(f"protected receipt secret count changed for {secret}")
+    crates_auth = (
+        "rust-lang/crates-io-auth-action@c6f97d42243bad5fab37ca0427f495c86d5b1a18"
+    )
+    if receipt.count(crates_auth) != 1:
+        raise ValueError("receipt lost its exact crates.io OIDC preflight")
+    preflight = receipt.find("\n  preflight-crates-oidc:\n")
+    first_writer = receipt.find("\n  publish-homebrew-tap:\n")
+    if preflight <= 0 or first_writer <= preflight:
+        raise ValueError("crates.io OIDC preflight must precede public writers")
+    if receipt.count("needs: [downstream-preparation, preflight-crates-oidc]") != 3:
+        raise ValueError("owned repository writers bypass the crates.io preflight")
+    crates_needs = (
+        "needs: [downstream-preparation, preflight-crates-oidc, "
+        "build-linux-repository, publish-homebrew-tap, publish-scoop, "
+        "publish-web-share]"
+    )
+    if receipt.count(crates_needs) != 2:
+        raise ValueError("package publication bypasses its OIDC preflight")
     markers = tuple(
         receipt.find(f"\n  {job}:\n")
         for job in (

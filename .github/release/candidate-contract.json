@@ -495,6 +495,7 @@
     "scripts/release/downstream_workflow_contract.py",
     "scripts/release/github_actions.py",
     "scripts/release/github_release_api.py",
+    "scripts/release/github_repository_commit_plan.py",
     "scripts/release/github_repository_writer.py",
     "scripts/release/install-gh-2.93.0.sh",
     "scripts/release/install-linux-glibc-build-tools.sh",

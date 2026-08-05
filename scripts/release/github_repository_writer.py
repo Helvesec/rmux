@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import base64
 import json
 import urllib.error
 import urllib.parse
@@ -10,26 +9,13 @@ import urllib.request
 from dataclasses import dataclass
 from typing import Any
 
-
-CREATE_COMMIT_MUTATION = """
-mutation CreateSignedCommit($input: CreateCommitOnBranchInput!) {
-  createCommitOnBranch(input: $input) {
-    commit {
-      oid
-      signature {
-        isValid
-        state
-        wasSignedByGitHub
-      }
-    }
-    ref {
-      target {
-        oid
-      }
-    }
-  }
-}
-"""
+from github_repository_commit_plan import (
+    CREATE_COMMIT_MUTATION,
+    GRAPHQL_COMMIT_MAX_BYTES,
+    commit_variables,
+    signed_commit_batches,
+    staging_branch_name,
+)
 
 
 @dataclass(frozen=True)
@@ -113,12 +99,48 @@ class GitHubApi:
     def post(self, path: str, payload: dict[str, Any]) -> dict[str, Any]:
         return self.request("POST", path, payload)
 
+    def patch(self, path: str, payload: dict[str, Any]) -> dict[str, Any]:
+        return self.request("PATCH", path, payload)
+
+    def delete(self, path: str) -> None:
+        if not path.startswith("/") or "//" in path:
+            raise ValueError("GitHub API path is invalid")
+        request = urllib.request.Request(
+            f"https://api.github.com{path}",
+            method="DELETE",
+            headers={
+                "Accept": "application/vnd.github+json",
+                "Authorization": f"Bearer {self._token}",
+                "User-Agent": "rmux-release-writer/1",
+                "X-GitHub-Api-Version": "2022-11-28",
+            },
+        )
+        try:
+            with urllib.request.urlopen(request, timeout=30) as response:
+                raw = response.read(1)
+        except urllib.error.HTTPError as error:
+            detail = error.read(4096).decode("utf-8", errors="replace")
+            raise ValueError(
+                f"GitHub API DELETE {path} failed: {error.code} {detail}"
+            ) from error
+        if raw:
+            raise ValueError("GitHub API DELETE returned an unexpected response")
+
     def graphql(self, query: str, variables: dict[str, Any]) -> dict[str, Any]:
         value = self.post("/graphql", {"query": query, "variables": variables})
         errors = value.get("errors")
         data = value.get("data")
         if errors is not None or not isinstance(data, dict):
-            raise ValueError("GitHub GraphQL commit mutation failed")
+            messages = []
+            if isinstance(errors, list):
+                for error in errors[:3]:
+                    if not isinstance(error, dict):
+                        continue
+                    message = error.get("message")
+                    if isinstance(message, str):
+                        messages.append(" ".join(message.split())[:500])
+            detail = f": {'; '.join(messages)}" if messages else ""
+            raise ValueError(f"GitHub GraphQL commit mutation failed{detail}")
         return data
 
 
@@ -150,28 +172,25 @@ def create_signed_commit(
     deletions: set[str],
     message: str,
 ) -> str:
+    variables = commit_variables(
+        full_name=full_name,
+        branch=branch,
+        base_commit=base_commit,
+        additions=additions,
+        deletions=deletions,
+        message=message,
+    )
+    request_size = len(
+        json.dumps(
+            {"query": CREATE_COMMIT_MUTATION, "variables": variables},
+            separators=(",", ":"),
+        ).encode()
+    )
+    if request_size > GRAPHQL_COMMIT_MAX_BYTES:
+        raise ValueError("signed GitHub commit request exceeds its safe payload limit")
     data = api.graphql(
         CREATE_COMMIT_MUTATION,
-        {
-            "input": {
-                "branch": {
-                    "repositoryNameWithOwner": full_name,
-                    "branchName": branch,
-                },
-                "expectedHeadOid": base_commit,
-                "message": {"headline": message},
-                "fileChanges": {
-                    "additions": [
-                        {
-                            "path": path,
-                            "contents": base64.b64encode(contents).decode("ascii"),
-                        }
-                        for path, contents in sorted(additions.items())
-                    ],
-                    "deletions": [{"path": path} for path in sorted(deletions)],
-                },
-            }
-        },
+        variables,
     )
     mutation = data.get("createCommitOnBranch")
     if not isinstance(mutation, dict):
@@ -257,6 +276,133 @@ def tree_paths(api: GitHubApi, full_name: str, commit_sha: str) -> set[str]:
     return paths
 
 
+def managed_paths(paths: set[str], prefixes: tuple[str, ...]) -> set[str]:
+    return {
+        path
+        for path in paths
+        if any(path == prefix or path.startswith(f"{prefix}/") for prefix in prefixes)
+    }
+
+
+def repository_state_is_exact(
+    api: GitHubApi,
+    *,
+    full_name: str,
+    commit_sha: str,
+    updates: dict[str, bytes],
+    managed_prefixes: tuple[str, ...],
+    managed_expected: set[str],
+) -> bool:
+    if managed_prefixes:
+        existing = managed_paths(
+            tree_paths(api, full_name, commit_sha), managed_prefixes
+        )
+        if existing != managed_expected:
+            return False
+    return all(
+        file_at(api, full_name, path, commit_sha) == data
+        for path, data in updates.items()
+    )
+
+
+def delete_branch_if_present(api: GitHubApi, full_name: str, branch: str) -> None:
+    encoded = urllib.parse.quote(branch, safe="")
+    get_path = f"/repos/{full_name}/git/ref/heads/{encoded}"
+    try:
+        api.get(get_path)
+    except ValueError as error:
+        if "failed: 404 " in str(error):
+            return
+        raise
+    api.delete(f"/repos/{full_name}/git/refs/heads/{encoded}")
+
+
+def create_staging_branch(
+    api: GitHubApi, full_name: str, branch: str, base_commit: str
+) -> None:
+    value = api.post(
+        f"/repos/{full_name}/git/refs",
+        {"ref": f"refs/heads/{branch}", "sha": base_commit},
+    )
+    target = value.get("object")
+    if (
+        value.get("ref") != f"refs/heads/{branch}"
+        or not isinstance(target, dict)
+        or object_sha(target, "created staging branch") != base_commit
+    ):
+        raise ValueError("GitHub created an unexpected staging branch")
+
+
+def advance_branch(
+    api: GitHubApi, full_name: str, branch: str, commit_sha: str
+) -> None:
+    encoded = urllib.parse.quote(branch, safe="")
+    value = api.patch(
+        f"/repos/{full_name}/git/refs/heads/{encoded}",
+        {"sha": commit_sha, "force": False},
+    )
+    target = value.get("object")
+    if (
+        value.get("ref") != f"refs/heads/{branch}"
+        or not isinstance(target, dict)
+        or object_sha(target, "advanced branch") != commit_sha
+    ):
+        raise ValueError("GitHub advanced an unexpected downstream branch")
+
+
+def publish_batched_signed_commits(
+    api: GitHubApi,
+    *,
+    full_name: str,
+    branch: str,
+    base_commit: str,
+    batches: list[tuple[dict[str, bytes], set[str]]],
+    updates: dict[str, bytes],
+    managed_prefixes: tuple[str, ...],
+    managed_expected: set[str],
+    message: str,
+) -> str:
+    staging = staging_branch_name(
+        base_commit,
+        updates,
+        set().union(*(deletions for _, deletions in batches)),
+    )
+    delete_branch_if_present(api, full_name, staging)
+    create_staging_branch(api, full_name, staging, base_commit)
+    current = base_commit
+    try:
+        for index, (additions, deletions) in enumerate(batches, start=1):
+            current = create_signed_commit(
+                api,
+                full_name=full_name,
+                branch=staging,
+                base_commit=current,
+                additions=additions,
+                deletions=deletions,
+                message=f"{message} (part {index}/{len(batches)})",
+            )
+        if not repository_state_is_exact(
+            api,
+            full_name=full_name,
+            commit_sha=current,
+            updates=updates,
+            managed_prefixes=managed_prefixes,
+            managed_expected=managed_expected,
+        ):
+            raise ValueError("staged downstream repository bytes differ")
+        if branch_head(api, full_name, branch) != base_commit:
+            raise ValueError("downstream repository changed during signed staging")
+        advance_branch(api, full_name, branch, current)
+    except (OSError, ValueError):
+        try:
+            delete_branch_if_present(api, full_name, staging)
+        except (OSError, ValueError):
+            pass
+        raise
+    delete_branch_if_present(api, full_name, staging)
+    return current
+
+
 def publish(
     api: GitHubApi,
     *,
@@ -268,58 +414,70 @@ def publish(
     expected_base: str | None = None,
 ) -> PublishOutcome:
     base_commit = branch_head(api, full_name, branch)
-    if expected_base is not None and base_commit != expected_base:
-        raise ValueError("downstream repository changed after payload preparation")
     existing_paths = (
         tree_paths(api, full_name, base_commit) if managed_prefixes else set()
     )
-    managed_existing = {
-        path
-        for path in existing_paths
-        if any(
-            path == prefix or path.startswith(f"{prefix}/")
-            for prefix in managed_prefixes
-        )
-    }
-    managed_expected = {
-        path
-        for path in updates
-        if any(
-            path == prefix or path.startswith(f"{prefix}/")
-            for prefix in managed_prefixes
-        )
-    }
+    managed_existing = managed_paths(existing_paths, managed_prefixes)
+    managed_expected = managed_paths(set(updates), managed_prefixes)
     if managed_prefixes and not managed_expected:
         raise ValueError("managed repository update has no files under its prefixes")
-    if managed_existing == managed_expected and all(
-        file_at(api, full_name, path, base_commit) == data
-        for path, data in updates.items()
+    if repository_state_is_exact(
+        api,
+        full_name=full_name,
+        commit_sha=base_commit,
+        updates=updates,
+        managed_prefixes=managed_prefixes,
+        managed_expected=managed_expected,
     ):
         return PublishOutcome("no-op-exact", False, base_commit)
-    commit_sha = create_signed_commit(
-        api,
+    if expected_base is not None and base_commit != expected_base:
+        raise ValueError("downstream repository changed after payload preparation")
+    deletions = managed_existing - managed_expected
+    changed_updates = {
+        path: data
+        for path, data in updates.items()
+        if file_at(api, full_name, path, base_commit) != data
+    }
+    batches = signed_commit_batches(
         full_name=full_name,
         branch=branch,
         base_commit=base_commit,
-        additions=updates,
-        deletions=managed_existing - managed_expected,
+        additions=changed_updates,
+        deletions=deletions,
         message=message,
     )
+    if len(batches) == 1:
+        additions, batch_deletions = batches[0]
+        commit_sha = create_signed_commit(
+            api,
+            full_name=full_name,
+            branch=branch,
+            base_commit=base_commit,
+            additions=additions,
+            deletions=batch_deletions,
+            message=message,
+        )
+    else:
+        commit_sha = publish_batched_signed_commits(
+            api,
+            full_name=full_name,
+            branch=branch,
+            base_commit=base_commit,
+            batches=batches,
+            updates=updates,
+            managed_prefixes=managed_prefixes,
+            managed_expected=managed_expected,
+            message=message,
+        )
     if branch_head(api, full_name, branch) != commit_sha:
         raise ValueError("downstream branch did not advance to the exact commit")
-    for path, expected in updates.items():
-        if file_at(api, full_name, path, commit_sha) != expected:
-            raise ValueError("downstream repository bytes differ after publication")
-    if managed_prefixes:
-        final_paths = tree_paths(api, full_name, commit_sha)
-        managed_final = {
-            path
-            for path in final_paths
-            if any(
-                path == prefix or path.startswith(f"{prefix}/")
-                for prefix in managed_prefixes
-            )
-        }
-        if managed_final != managed_expected:
-            raise ValueError("managed repository paths differ after publication")
+    if not repository_state_is_exact(
+        api,
+        full_name=full_name,
+        commit_sha=commit_sha,
+        updates=updates,
+        managed_prefixes=managed_prefixes,
+        managed_expected=managed_expected,
+    ):
+        raise ValueError("downstream repository bytes differ after publication")
     return PublishOutcome("public-live", True, commit_sha)
