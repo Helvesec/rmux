@@ -382,12 +382,19 @@ fn github_repository_writer_is_atomic_idempotent_and_prefix_exact() {
     assert_python(
         r#"
 import base64
+import hashlib
 import urllib.parse
 import sys
 
 sys.path.insert(0, 'scripts/release')
 import github_repository_commit_plan as commit_plan
 from github_repository_writer import publish
+
+def blob_sha(data):
+    digest = hashlib.sha1()
+    digest.update(f'blob {len(data)}\0'.encode())
+    digest.update(data)
+    return digest.hexdigest()
 
 class FakeApi:
     def __init__(self, files, verified=True):
@@ -401,7 +408,7 @@ class FakeApi:
         self.ref_deletes = 0
         self.fail_graphql_at = None
         self.transient_graphql_at = None
-        self.transient_advances = False
+        self.transient_advances = None
         self.verified = verified
 
     @property
@@ -429,6 +436,7 @@ class FakeApi:
             sha = path.rsplit('/', 1)[1]
             if sha in self.signed:
                 return {
+                    'parents': [{'sha': self.parents[sha]}],
                     'verification': {
                         'verified': self.verified,
                         'reason': 'valid' if self.verified else 'unsigned',
@@ -441,7 +449,8 @@ class FakeApi:
             return {
                 'truncated': False,
                 'tree': [
-                    {'path': name, 'type': 'blob'} for name in sorted(self.trees[sha])
+                    {'path': name, 'type': 'blob', 'sha': blob_sha(self.trees[sha][name])}
+                    for name in sorted(self.trees[sha])
                 ],
             }
         raise AssertionError(path)
@@ -475,19 +484,12 @@ class FakeApi:
         if self.transient_graphql_at == self.graphql_calls:
             self.transient_graphql_at = None
             if self.transient_advances:
-                self.branches[branch_name] = 'f' * 40
+                self.apply_payload(
+                    payload,
+                    tamper=self.transient_advances == 'unexpected',
+                )
             raise ValueError('GitHub API POST /graphql failed: 502 transient')
-        sha = self.sha()
-        files = dict(self.trees[payload['expectedHeadOid']])
-        changes = payload['fileChanges']
-        for entry in changes['deletions']:
-            files.pop(entry['path'], None)
-        for entry in changes['additions']:
-            files[entry['path']] = base64.b64decode(entry['contents'])
-        self.trees[sha] = files
-        self.parents[sha] = payload['expectedHeadOid']
-        self.signed.add(sha)
-        self.branches[branch_name] = sha
+        sha = self.apply_payload(payload)
         return {
             'createCommitOnBranch': {
                 'commit': {
@@ -501,6 +503,23 @@ class FakeApi:
                 'ref': {'target': {'oid': sha}},
             }
         }
+
+    def apply_payload(self, payload, *, tamper=False):
+        branch_name = payload['branch']['branchName']
+        sha = self.sha()
+        files = dict(self.trees[payload['expectedHeadOid']])
+        changes = payload['fileChanges']
+        for entry in changes['deletions']:
+            files.pop(entry['path'], None)
+        for entry in changes['additions']:
+            files[entry['path']] = base64.b64decode(entry['contents'])
+        if tamper:
+            files['managed/unexpected.bin'] = b'unexpected'
+        self.trees[sha] = files
+        self.parents[sha] = payload['expectedHeadOid']
+        self.signed.add(sha)
+        self.branches[branch_name] = sha
+        return sha
 
     def post(self, path, payload):
         if path != '/repos/Helvesec/rmux-packages/git/refs':
@@ -616,24 +635,42 @@ if transient_outcome.state != 'public-live' or transient.ref_updates != 1:
 ambiguous = FakeApi({'managed/old.bin': b'old'})
 ambiguous_base = ambiguous.head
 ambiguous.transient_graphql_at = 2
-ambiguous.transient_advances = True
+ambiguous.transient_advances = 'exact'
+ambiguous_outcome = publish(
+    ambiguous,
+    full_name='Helvesec/rmux-packages',
+    branch='main',
+    updates=large_updates,
+    message='recover exact committed response',
+    managed_prefixes=('managed',),
+    expected_base=ambiguous_base,
+)
+if ambiguous_outcome.state != 'public-live' or ambiguous.ref_updates != 1:
+    raise SystemExit('exact signed commit response loss was not recovered')
+if ambiguous.files != large_updates or set(ambiguous.branches) != {'main'}:
+    raise SystemExit('recovered signed commit tree differs or leaked staging')
+
+unexpected = FakeApi({'managed/old.bin': b'old'})
+unexpected_base = unexpected.head
+unexpected.transient_graphql_at = 2
+unexpected.transient_advances = 'unexpected'
 try:
     publish(
-        ambiguous,
+        unexpected,
         full_name='Helvesec/rmux-packages',
         branch='main',
         updates=large_updates,
-        message='reject ambiguous chunked bytes',
+        message='reject unexpected committed bytes',
         managed_prefixes=('managed',),
-        expected_base=ambiguous_base,
+        expected_base=unexpected_base,
     )
 except ValueError as error:
-    if 'outcome is ambiguous' not in str(error):
+    if 'unexpected repository bytes' not in str(error):
         raise
 else:
-    raise SystemExit('ambiguous signed commit result was retried')
-if ambiguous.head != ambiguous_base or set(ambiguous.branches) != {'main'}:
-    raise SystemExit('ambiguous staging mutation changed main or leaked staging')
+    raise SystemExit('unexpected signed commit result was accepted')
+if unexpected.head != unexpected_base or set(unexpected.branches) != {'main'}:
+    raise SystemExit('unexpected staging mutation changed main or leaked staging')
 
 broken = FakeApi({'managed/old.bin': b'old'})
 broken_base = broken.head

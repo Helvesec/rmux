@@ -17,6 +17,7 @@ const DOWNSTREAM_AUTHORITY_PROOF: &str =
 const DOWNSTREAM_PREPARE: &str =
     include_str!("../.github/workflows/release-downstream-prepare.yml");
 const RECEIPT: &str = include_str!("../.github/workflows/release-receipt.yml");
+const CRATES_CHANNEL: &str = include_str!("../.github/workflows/release-crates-channel.yml");
 const CI: &str = include_str!("../.github/workflows/ci.yml");
 const LINUX_REPOSITORY_BUILD: &str =
     include_str!("../.github/workflows/release-linux-repository-build.yml");
@@ -393,6 +394,24 @@ fn downstream_writers_keep_the_python_310_runtime_contract() {
 }
 
 #[test]
+fn crates_writer_repackages_only_the_exact_release_source() {
+    assert_workflow_call_only(CRATES_CHANNEL);
+    let source_checkout = CRATES_CHANNEL
+        .find("name: Check out the exact release source")
+        .expect("exact release source checkout");
+    let token_exchange = CRATES_CHANNEL
+        .find("name: Exchange GitHub OIDC")
+        .expect("crates.io token exchange");
+    let writer = CRATES_CHANNEL
+        .find("name: Publish and redownload every exact crate")
+        .expect("crates.io writer");
+    assert!(source_checkout < token_exchange && token_exchange < writer);
+    assert!(CRATES_CHANNEL.contains("ref: ${{ inputs.expected_source_sha }}"));
+    assert!(CRATES_CHANNEL.contains("path: rmux-release-source"));
+    assert!(CRATES_CHANNEL.contains("--source-dir \"$GITHUB_WORKSPACE/rmux-release-source\""));
+}
+
+#[test]
 fn linux_repository_build_retains_authenticated_previous_by_hash_indexes() {
     let authenticated = LINUX_REPOSITORY_BUILD
         .find("scripts/retain-linux-package-history.py")
@@ -410,6 +429,7 @@ fn crates_writer_distinguishes_missing_versions_from_download_denials() {
     let fixture = r#"
 import importlib.util
 import pathlib
+import subprocess
 import sys
 import tempfile
 import urllib.error
@@ -481,6 +501,35 @@ with tempfile.TemporaryDirectory() as directory:
         raise AssertionError("ambiguous Cargo package output was accepted")
     module.remove_generated_package(target, filename)
     assert not direct.exists() and not temporary.exists()
+
+with tempfile.TemporaryDirectory() as directory:
+    source = pathlib.Path(directory) / "source"
+    source.mkdir()
+    subprocess.run(["git", "init", "-q", str(source)], check=True)
+    (source / "Cargo.toml").write_text("[workspace]\n", encoding="utf-8")
+    subprocess.run(["git", "-C", str(source), "add", "Cargo.toml"], check=True)
+    subprocess.run([
+        "git", "-C", str(source), "-c", "user.name=RMUX Release Test",
+        "-c", "user.email=release-test@rmux.invalid", "commit", "-q", "-m", "baseline"
+    ], check=True)
+    head = subprocess.run(
+        ["git", "-C", str(source), "rev-parse", "HEAD"],
+        check=True, capture_output=True, text=True,
+    ).stdout.strip()
+    assert module.validate_source_checkout(source, head) == source.resolve()
+    try:
+        module.validate_source_checkout(source, "f" * 40)
+    except ValueError as error:
+        assert "SHA differs" in str(error)
+    else:
+        raise AssertionError("wrong release source SHA was accepted")
+    (source / "untracked").write_text("dirty\n", encoding="utf-8")
+    try:
+        module.validate_source_checkout(source, head)
+    except ValueError as error:
+        assert "is dirty" in str(error)
+    else:
+        raise AssertionError("dirty release source checkout was accepted")
 "#;
     let output = Command::new("python3")
         .args(["-c", fixture])

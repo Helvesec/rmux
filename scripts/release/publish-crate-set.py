@@ -29,6 +29,7 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser()
     parser.add_argument("--payload-dir", type=Path, required=True)
     parser.add_argument("--source-sha", required=True)
+    parser.add_argument("--source-dir", type=Path, required=True)
     parser.add_argument("--release-ref", required=True)
     parser.add_argument("--target-dir", type=Path, required=True)
     parser.add_argument("--target-evidence", type=Path, required=True)
@@ -48,6 +49,39 @@ def prepare_target_dir(path: Path) -> None:
     if path.exists() or path.is_symlink():
         raise ValueError("crates.io target directory must start absent")
     path.mkdir(parents=True)
+
+
+def git_output(source_dir: Path, *arguments: str) -> str:
+    completed = subprocess.run(
+        ["git", "-C", str(source_dir), *arguments],
+        check=False,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+    if completed.returncode != 0:
+        raise ValueError(f"release source Git check failed: {completed.stderr.strip()}")
+    return completed.stdout.strip()
+
+
+def validate_source_checkout(path: Path, source_sha: str) -> Path:
+    if path.is_symlink() or not path.is_dir():
+        raise ValueError("release source checkout is missing or symbolic")
+    source_dir = path.resolve(strict=True)
+    root_text = git_output(source_dir, "rev-parse", "--show-toplevel")
+    root = Path(root_text).resolve(strict=True)
+    if root != source_dir:
+        raise ValueError("release source checkout root differs")
+    if git_output(source_dir, "rev-parse", "--verify", "HEAD^{commit}") != source_sha:
+        raise ValueError("release source checkout SHA differs")
+    if git_output(
+        source_dir,
+        "status",
+        "--porcelain=v1",
+        "--untracked-files=all",
+    ):
+        raise ValueError("release source checkout is dirty")
+    return source_dir
 
 
 def registry_url(name: str, version: str, *, download: bool = False) -> str:
@@ -103,7 +137,9 @@ def registry_bytes(name: str, version: str) -> bytes | None:
     return data
 
 
-def run_cargo(args: list[str], *, token: str, target_dir: Path) -> None:
+def run_cargo(
+    args: list[str], *, token: str, target_dir: Path, source_dir: Path
+) -> None:
     environment = {
         **os.environ,
         "CARGO_REGISTRY_TOKEN": token,
@@ -112,6 +148,7 @@ def run_cargo(args: list[str], *, token: str, target_dir: Path) -> None:
     completed = subprocess.run(
         ["cargo", *args],
         check=False,
+        cwd=source_dir,
         env=environment,
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
@@ -167,6 +204,7 @@ def execute(args: argparse.Namespace) -> None:
     if not token or "\n" in token or "\r" in token:
         raise ValueError("short-lived crates.io token is missing or malformed")
     package_set = package_set_file(args.payload_dir, version)
+    source_dir = validate_source_checkout(args.source_dir, args.source_sha)
     prepare_target_dir(args.target_dir)
     extracted = args.target_dir / "canonical"
     manifest = unpack(package_set, extracted)
@@ -188,6 +226,7 @@ def execute(args: argparse.Namespace) -> None:
             ["publish", "--dry-run", "--locked", "--package", name],
             token=token,
             target_dir=cargo_target,
+            source_dir=source_dir,
         )
         if file_hash(generated_package(cargo_target, package["file"])) != file_hash(
             canonical
@@ -198,6 +237,7 @@ def execute(args: argparse.Namespace) -> None:
             ["publish", "--locked", "--package", name],
             token=token,
             target_dir=cargo_target,
+            source_dir=source_dir,
         )
         if file_hash(generated_package(cargo_target, package["file"])) != file_hash(
             canonical

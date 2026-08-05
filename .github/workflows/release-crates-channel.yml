@@ -55,6 +55,14 @@ jobs:
           --target-evidence "${{ steps.prepare.outputs.root }}/downstream-channel-target-evidence.json"
           --github-output "$GITHUB_OUTPUT"
 
+      - name: Check out the exact release source
+        if: steps.decision.outputs.execute == 'true'
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
+        with:
+          ref: ${{ inputs.expected_source_sha }}
+          path: rmux-release-source
+          persist-credentials: false
+
       - id: auth
         name: Exchange GitHub OIDC for a short-lived crates.io token
         if: steps.decision.outputs.execute == 'true'
@@ -70,6 +78,7 @@ jobs:
           scripts/release/publish-crate-set.py
           --payload-dir "${{ steps.prepare.outputs.payload-root }}"
           --source-sha "${{ inputs.expected_source_sha }}"
+          --source-dir "$GITHUB_WORKSPACE/rmux-release-source"
           --release-ref "${{ inputs.release_ref }}"
           --target-dir "$RUNNER_TEMP/rmux-crates-publish"
           --target-evidence "${{ steps.prepare.outputs.root }}/downstream-channel-target-evidence.json"

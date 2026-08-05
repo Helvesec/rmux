@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import time
 import urllib.error
@@ -156,7 +157,11 @@ class GitHubApi:
 
 def object_sha(value: dict[str, Any], label: str) -> str:
     sha = value.get("sha")
-    if not isinstance(sha, str) or len(sha) != 40:
+    if (
+        not isinstance(sha, str)
+        or len(sha) != 40
+        or any(character not in "0123456789abcdef" for character in sha)
+    ):
         raise ValueError(f"GitHub {label} has no canonical SHA")
     return sha
 
@@ -170,6 +175,68 @@ def object_oid(value: dict[str, Any], label: str) -> str:
     ):
         raise ValueError(f"GitHub {label} has no canonical OID")
     return oid
+
+
+def git_blob_sha(contents: bytes) -> str:
+    digest = hashlib.sha1(usedforsecurity=False)
+    digest.update(f"blob {len(contents)}\0".encode())
+    digest.update(contents)
+    return digest.hexdigest()
+
+
+def verify_rest_commit(
+    api: GitHubApi,
+    full_name: str,
+    commit_sha: str,
+    *,
+    expected_parent: str,
+) -> None:
+    commit = api.get(f"/repos/{full_name}/git/commits/{commit_sha}")
+    verification = commit.get("verification")
+    parents = commit.get("parents")
+    if (
+        not isinstance(verification, dict)
+        or verification.get("verified") is not True
+        or verification.get("reason") != "valid"
+        or not isinstance(verification.get("signature"), str)
+        or not verification["signature"]
+    ):
+        raise ValueError("GitHub REST verification rejected the signed commit")
+    if (
+        not isinstance(parents, list)
+        or len(parents) != 1
+        or not isinstance(parents[0], dict)
+        or object_sha(parents[0], "commit parent") != expected_parent
+    ):
+        raise ValueError("GitHub signed commit parent differs")
+
+
+def recover_exact_signed_commit(
+    api: GitHubApi,
+    *,
+    full_name: str,
+    commit_sha: str,
+    base_commit: str,
+    additions: dict[str, bytes],
+    deletions: set[str],
+) -> bool:
+    verify_rest_commit(
+        api,
+        full_name,
+        commit_sha,
+        expected_parent=base_commit,
+    )
+    expected = tree_blobs(api, full_name, base_commit)
+    for path in deletions:
+        expected.pop(path, None)
+    for path, contents in additions.items():
+        expected[path] = git_blob_sha(contents)
+    if tree_blobs(api, full_name, commit_sha) != expected:
+        return False
+    return all(
+        file_at(api, full_name, path, commit_sha) == contents
+        for path, contents in additions.items()
+    )
 
 
 def create_signed_commit(
@@ -206,12 +273,24 @@ def create_signed_commit(
             transient = isinstance(error, OSError) or any(
                 marker in str(error) for marker in TRANSIENT_GRAPHQL_ERRORS
             )
-            if not transient or attempt == 2:
+            if not transient:
                 raise
-            if branch_head(api, full_name, branch) != base_commit:
+            current = branch_head(api, full_name, branch)
+            if current != base_commit:
+                if recover_exact_signed_commit(
+                    api,
+                    full_name=full_name,
+                    commit_sha=current,
+                    base_commit=base_commit,
+                    additions=additions,
+                    deletions=deletions,
+                ):
+                    return current
                 raise ValueError(
-                    "signed commit outcome is ambiguous; rerun idempotent recovery"
+                    "signed commit outcome advanced to unexpected repository bytes"
                 ) from error
+            if attempt == 2:
+                raise
             time.sleep(2**attempt)
     mutation = data.get("createCommitOnBranch")
     if not isinstance(mutation, dict):
@@ -232,17 +311,12 @@ def create_signed_commit(
         or signature.get("wasSignedByGitHub") is not True
     ):
         raise ValueError("GitHub did not create a valid platform-signed commit")
-    verification = api.get(f"/repos/{full_name}/git/commits/{commit_sha}").get(
-        "verification"
+    verify_rest_commit(
+        api,
+        full_name,
+        commit_sha,
+        expected_parent=base_commit,
     )
-    if (
-        not isinstance(verification, dict)
-        or verification.get("verified") is not True
-        or verification.get("reason") != "valid"
-        or not isinstance(verification.get("signature"), str)
-        or not verification["signature"]
-    ):
-        raise ValueError("GitHub REST verification rejected the signed commit")
     return commit_sha
 
 
@@ -282,19 +356,23 @@ def file_at(api: GitHubApi, full_name: str, path: str, ref: str) -> bytes | None
         raise
 
 
-def tree_paths(api: GitHubApi, full_name: str, commit_sha: str) -> set[str]:
+def tree_blobs(api: GitHubApi, full_name: str, commit_sha: str) -> dict[str, str]:
     value = api.get(f"/repos/{full_name}/git/trees/{commit_sha}?recursive=1")
     if value.get("truncated") is not False or not isinstance(value.get("tree"), list):
         raise ValueError("downstream repository tree is missing or truncated")
-    paths: set[str] = set()
+    blobs: dict[str, str] = {}
     for entry in value["tree"]:
         if not isinstance(entry, dict) or entry.get("type") != "blob":
             continue
         path = entry.get("path")
-        if not isinstance(path, str) or not path or path in paths:
+        if not isinstance(path, str) or not path or path in blobs:
             raise ValueError("downstream repository tree path is invalid")
-        paths.add(path)
-    return paths
+        blobs[path] = object_sha(entry, "tree blob")
+    return blobs
+
+
+def tree_paths(api: GitHubApi, full_name: str, commit_sha: str) -> set[str]:
+    return set(tree_blobs(api, full_name, commit_sha))
 
 
 def managed_paths(paths: set[str], prefixes: tuple[str, ...]) -> set[str]:
