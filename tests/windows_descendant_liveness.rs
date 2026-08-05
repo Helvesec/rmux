@@ -16,6 +16,8 @@ const PROCESS_QUERY_LIMITED_INFORMATION: u32 = 0x1000;
 const SYNCHRONIZE: u32 = 0x0010_0000;
 const WAIT_TIMEOUT: u32 = 258;
 const CASE_TIMEOUT: Duration = Duration::from_secs(10);
+const DESCENDANT_START_TIMEOUT_SECONDS: u64 = 20;
+const DESCENDANT_READY_TIMEOUT: Duration = Duration::from_secs(30);
 const HOSTED_DAEMON_OPT_IN: (&str, &str) = ("RMUX_ALLOW_INTERNAL_DAEMON_IN_CALLER_JOB", "1");
 
 type RawHandle = *mut c_void;
@@ -276,6 +278,7 @@ fn spawn_durable(
     let pid = pid_path.to_string_lossy().into_owned();
     let ready = ready_path.to_string_lossy().into_owned();
     let input = input_path.to_string_lossy().into_owned();
+    let start_timeout = DESCENDANT_START_TIMEOUT_SECONDS.to_string();
 
     run_rmux(
         binary,
@@ -297,11 +300,12 @@ fn spawn_durable(
             &pid,
             &ready,
             &input,
+            &start_timeout,
         ],
     )?;
 
-    wait_for_path(&ready_path, CASE_TIMEOUT)?;
-    let descendant_pid = wait_for_pid_file(&pid_path, CASE_TIMEOUT)?;
+    wait_for_path(&ready_path, DESCENDANT_READY_TIMEOUT)?;
+    let descendant_pid = wait_for_pid_file(&pid_path, DESCENDANT_READY_TIMEOUT)?;
     let target = format!("{session}:0.0");
     let leader_pid = display_u32(binary, label, Some(&target), "#{pane_pid}")?;
     wait_for_process_exit(leader_pid, CASE_TIMEOUT)?;
@@ -337,13 +341,14 @@ impl DurableHelpers {
     [Parameter(Mandatory = $true)][string]$DescendantScript,
     [Parameter(Mandatory = $true)][string]$PidFile,
     [Parameter(Mandatory = $true)][string]$ReadyFile,
-    [Parameter(Mandatory = $true)][string]$InputFile
+    [Parameter(Mandatory = $true)][string]$InputFile,
+    [Parameter(Mandatory = $true)][int]$StartTimeoutSeconds
 )
 $ErrorActionPreference = 'Stop'
 $arguments = "-NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -File `"$DescendantScript`" `"$ReadyFile`" `"$InputFile`""
 $child = Start-Process -FilePath "$PSHOME\powershell.exe" -ArgumentList $arguments -NoNewWindow -PassThru
 [System.IO.File]::WriteAllText($PidFile, "$($child.Id)`n")
-$deadline = [DateTime]::UtcNow.AddSeconds(5)
+$deadline = [DateTime]::UtcNow.AddSeconds($StartTimeoutSeconds)
 while (-not (Test-Path -LiteralPath $ReadyFile) -and [DateTime]::UtcNow -lt $deadline) {
     Start-Sleep -Milliseconds 10
 }
