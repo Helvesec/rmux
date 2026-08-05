@@ -1,6 +1,8 @@
 #[cfg(unix)]
 use std::fs;
 #[cfg(unix)]
+use std::os::unix::fs::PermissionsExt;
+#[cfg(unix)]
 use std::path::{Path, PathBuf};
 #[cfg(unix)]
 use std::process::{Command, Output};
@@ -33,6 +35,14 @@ fn run(program: &Path, args: &[&str]) -> Output {
         .current_dir(repo_root())
         .output()
         .unwrap_or_else(|error| panic!("failed to run {}: {error}", program.display()))
+}
+
+#[cfg(unix)]
+fn write_executable(path: &Path, source: &str) {
+    fs::write(path, source).expect("write executable fixture");
+    let mut permissions = fs::metadata(path).expect("fixture metadata").permissions();
+    permissions.set_mode(0o755);
+    fs::set_permissions(path, permissions).expect("set fixture permissions");
 }
 
 #[test]
@@ -870,11 +880,71 @@ fn atomic_authority_schemas_cannot_drive_a_workflow_directly() {
 #[test]
 fn release_verification_cli_is_pinned_and_capability_checked() {
     let installer = include_str!("../scripts/release/install-gh-2.93.0.sh");
+    let result = include_str!("../.github/actions/release-channel-result/action.yml");
     assert!(installer.contains("version=2.93.0"));
     assert!(installer.contains("02d1290eba130e0b896f3709ffff22e1c75a51475ddb70476a85abc6b5807af0"));
+    assert!(installer.contains("gh_${version}_windows_amd64.zip"));
+    assert!(installer.contains("77aa01ed7317295ad550de0ad04f3f276b1ef0e9272e3d002ac28dd99853d211"));
+    assert!(installer.contains("$work/bin/gh.exe"));
+    assert!(installer.contains("Expand-Archive"));
     assert!(installer.contains("release verify --help"));
     assert!(installer.contains("release verify-asset --help"));
     assert!(installer.contains("attestation verify --help"));
+    assert!(result.contains("if [[ -x \"$install_root/gh.exe\" ]]"));
+    assert!(result.contains("echo \"binary=$binary\" >> \"$GITHUB_OUTPUT\""));
+}
+
+#[cfg(unix)]
+#[test]
+fn release_verification_cli_installer_supports_git_bash_windows() {
+    let root = temp_dir("gh-windows-installer");
+    let bin = root.join("bin");
+    let install = root.join("installed");
+    fs::create_dir(&bin).expect("create fake command directory");
+    write_executable(
+        &bin.join("uname"),
+        "#!/usr/bin/env bash\ncase \"$1\" in -s) echo MINGW64_NT-10.0-22631;; -m) echo x86_64;; *) exit 2;; esac\n",
+    );
+    write_executable(
+        &bin.join("curl"),
+        "#!/usr/bin/env bash\nset -euo pipefail\nout=\nwhile (( $# )); do\n  if [[ $1 == --output ]]; then out=$2; shift 2; else shift; fi\ndone\nprintf fixture > \"$out\"\n",
+    );
+    write_executable(
+        &bin.join("sha256sum"),
+        "#!/usr/bin/env bash\ncat >/dev/null\n",
+    );
+    write_executable(
+        &bin.join("cygpath"),
+        "#!/usr/bin/env bash\ntest \"$1\" = -w\nprintf '%s\\n' \"$2\"\n",
+    );
+    write_executable(
+        &bin.join("powershell.exe"),
+        "#!/usr/bin/env bash\nset -euo pipefail\nmkdir -p \"$RMUX_GH_DEST/bin\"\nprintf '%s\\n' '#!/usr/bin/env bash' 'if [[ $1 == --version ]]; then echo \"gh version 2.93.0 (fixture)\"; fi' > \"$RMUX_GH_DEST/bin/gh.exe\"\nchmod 755 \"$RMUX_GH_DEST/bin/gh.exe\"\n",
+    );
+
+    let path = format!(
+        "{}:{}",
+        bin.display(),
+        std::env::var("PATH").expect("PATH is set")
+    );
+    let output = Command::new("bash")
+        .arg(repo_root().join("scripts/release/install-gh-2.93.0.sh"))
+        .arg(&install)
+        .env("PATH", path)
+        .current_dir(repo_root())
+        .output()
+        .expect("run Windows verifier installer fixture");
+    assert!(
+        output.status.success(),
+        "stdout={} stderr={}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(install.join("gh.exe").is_file());
+    assert!(!install.join("gh").exists());
+    assert!(String::from_utf8_lossy(&output.stdout)
+        .contains(&format!("gh-bin={}", install.join("gh.exe").display())));
+    fs::remove_dir_all(root).expect("remove installer fixture");
 }
 
 #[test]

@@ -222,7 +222,12 @@ runs:
         set -euo pipefail
         install_root="$RUNNER_TEMP/rmux-gh-2.93.0-result-${{ inputs.channel }}"
         scripts/release/install-gh-2.93.0.sh "$install_root"
-        echo "binary=$install_root/gh" >> "$GITHUB_OUTPUT"
+        binary="$install_root/gh"
+        if [[ -x "$install_root/gh.exe" ]]; then
+          binary="$install_root/gh.exe"
+        fi
+        test -x "$binary"
+        echo "binary=$binary" >> "$GITHUB_OUTPUT"
 
     - name: Verify the exact signed channel result
       shell: bash

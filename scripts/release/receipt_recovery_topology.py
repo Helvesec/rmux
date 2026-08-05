@@ -102,6 +102,27 @@ CRATES_RESULT_FAILURE_MODES = frozenset(
     {"package-result-seal-failure", "crates-result-seal-failure"}
 )
 LINUX_REBUILD_FAILURE_MODE = "linux-repository-rebuild-failure"
+CHOCOLATEY_RESULT_SEAL_FAILURE_MODE = "chocolatey-result-seal-failure"
+CHOCOLATEY_RESULT_SEAL_JOB = "Submit exact Chocolatey package"
+CHOCOLATEY_RESULT_SEAL_SUCCESS_JOBS = DIRECT_SUCCESS_JOBS | {
+    *(f"{PREPARATION_PREFIX}{name}" for name in PREPARATION_SUCCESS_JOBS),
+    *PACKAGE_WRITER_JOB_MAP,
+    CRATES_PREFLIGHT_JOB,
+    APT_PUBLISH_JOB,
+    "Record disabled Snap stable channel / Record policy result snap_stable",
+    "Record manual Homebrew Core submission / Record policy result homebrew_core",
+    "Record manual WinGet submission / Record policy result winget",
+}
+CHOCOLATEY_RESULT_SEAL_SKIPPED_JOBS = frozenset(
+    {
+        "Record denied RC Linux repository channel",
+        "Aggregate ten exact pre-site results",
+        "Publish exact Snap candidate revisions",
+        "Record blocked automated rmux.io update",
+        "Prepare manual rmux.io handoff",
+        "Aggregate all eleven exact channel results",
+    }
+)
 
 
 def result_envelope_names(source_sha: str, release_id: int) -> set[str]:
@@ -242,6 +263,38 @@ def verify_skipped_jobs(
             raise ValueError(f"post-failure downstream job {name} was not untouched")
 
 
+def verify_chocolatey_result_seal_failure(
+    jobs: dict[str, dict[str, Any]],
+) -> bool:
+    expected = (
+        CHOCOLATEY_RESULT_SEAL_SUCCESS_JOBS
+        | CHOCOLATEY_RESULT_SEAL_SKIPPED_JOBS
+        | {CHOCOLATEY_RESULT_SEAL_JOB}
+    )
+    if set(jobs) != expected:
+        return False
+    for name in CHOCOLATEY_RESULT_SEAL_SUCCESS_JOBS:
+        if jobs[name].get("conclusion") != "success":
+            raise ValueError(f"pre-Chocolatey downstream job {name} is not successful")
+    verify_skipped_jobs(jobs, CHOCOLATEY_RESULT_SEAL_SKIPPED_JOBS)
+    checkout = "Run actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5"
+    action = "Run ./.github/actions/release-chocolatey-publish"
+    exact_job_shape(
+        jobs[CHOCOLATEY_RESULT_SEAL_JOB],
+        name=CHOCOLATEY_RESULT_SEAL_JOB,
+        conclusion="failure",
+        steps={
+            "Set up job": "success",
+            checkout: "success",
+            action: "failure",
+            f"Post {action}": "success",
+            f"Post {checkout}": "success",
+            "Complete job": "success",
+        },
+    )
+    return True
+
+
 def verify_failed_downstream_jobs(value: dict[str, Any]) -> str:
     jobs = value.get("jobs")
     if not isinstance(jobs, list) or value.get("total_count") != len(jobs):
@@ -254,6 +307,8 @@ def verify_failed_downstream_jobs(value: dict[str, Any]) -> str:
         if name in by_name:
             raise ValueError("failed downstream job names are not unique")
         by_name[name] = job
+    if verify_chocolatey_result_seal_failure(by_name):
+        return CHOCOLATEY_RESULT_SEAL_FAILURE_MODE
     by_name, post_mutation = canonical_failed_jobs(by_name)
     for name in EARLY_SUCCESS_JOBS:
         if by_name[name].get("conclusion") != "success":
@@ -458,7 +513,20 @@ def verify_failed_downstream_artifacts(
         ),
     }
     allowed_names = (expected_names,)
-    if failure_mode == LINUX_REBUILD_FAILURE_MODE:
+    if failure_mode == CHOCOLATEY_RESULT_SEAL_FAILURE_MODE:
+        expected_names.add(
+            f"rmux-downstream-apt_rpm-signed-{args.source_sha}-{args.release_id}"
+        )
+        for channel in set(PAYLOAD_CHANNELS) - {"chocolatey", "snap_candidate"}:
+            for suffix in ("result", "result-envelope", "result-reference"):
+                expected_names.add(
+                    f"rmux-downstream-{channel}-{suffix}-{args.source_sha}-{args.release_id}"
+                )
+        for suffix in ("result", "result-envelope"):
+            expected_names.add(
+                f"rmux-downstream-chocolatey-{suffix}-{args.source_sha}-{args.release_id}"
+            )
+    elif failure_mode == LINUX_REBUILD_FAILURE_MODE:
         expected_names.update(
             f"rmux-downstream-{channel}-result-{args.source_sha}-{args.release_id}"
             for channel in POST_MUTATION_RESULT_CHANNELS

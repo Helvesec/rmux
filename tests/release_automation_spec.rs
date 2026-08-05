@@ -812,9 +812,19 @@ fn ci_builds_windows_tests_once_and_runs_eighteen_hosted_shards() {
         nextest
             .matches("threads-required = \"num-test-threads\"")
             .count(),
-        2,
-        "Windows console tests must be exclusive while other shard tests stay parallel"
+        3,
+        "Windows console and acceptance tests must be exclusive while other shard tests stay parallel"
     );
+    for required in [
+        "platform = 'cfg(windows)'",
+        "filter = 'binary(/^acceptance_/)'",
+        "test-group = 'windows-console'",
+    ] {
+        assert!(
+            nextest.contains(required),
+            "Windows acceptance test isolation lost {required:?}"
+        );
+    }
     for required in [
         "name: Platform build and smoke on windows-latest",
         "always() &&",
