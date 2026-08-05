@@ -27,7 +27,9 @@ class StableVersion:
 
     @classmethod
     def parse(cls, value: str) -> StableVersion | None:
-        match = re.fullmatch(r"(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)", value)
+        match = re.fullmatch(
+            r"(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)", value
+        )
         if match is None:
             return None
         return cls(*(int(part) for part in match.groups()))
@@ -272,7 +274,9 @@ def authenticated_apt_packages(
                 package.stat().st_size != expected_package_size
                 or sha256(package) != expected_package_hash
             ):
-                raise HistoryError(f"APT package failed its signed index checksum: {filename}")
+                raise HistoryError(
+                    f"APT package failed its signed index checksum: {filename}"
+                )
             authenticated.append(AuthenticatedPackage(version, architecture, package))
     if package_records == 0:
         raise HistoryError("published APT repository contains no RMUX packages")
@@ -332,6 +336,38 @@ def authenticated_rpm_packages(
     return authenticated
 
 
+def rpm_content_identity(path: Path) -> tuple[str, ...]:
+    rpm = shutil.which("rpm")
+    if rpm is None:
+        raise HistoryError("rpm is required to compare RPM package content")
+    fields = run_checked(
+        [
+            rpm,
+            "-qp",
+            "--qf",
+            "%{NAME}\n%{VERSION}\n%{RELEASE}\n%{ARCH}\n"
+            "%{SHA256HEADER}\n%{PAYLOADDIGEST}\n",
+            str(path),
+        ],
+        capture_stdout=True,
+    ).splitlines()
+    if (
+        len(fields) != 6
+        or fields[0] != "rmux"
+        or any(not field or field == "(none)" for field in fields[1:])
+    ):
+        raise HistoryError(f"RPM content identity is incomplete: {path.name}")
+    return tuple(fields)
+
+
+def package_contents_match(published: Path, incoming: Path, manager: str) -> bool:
+    if manager == "RPM":
+        return rpm_content_identity(incoming) == rpm_content_identity(published)
+    return incoming.stat().st_size == published.stat().st_size and sha256(
+        incoming
+    ) == sha256(published)
+
+
 def latest_predecessor(
     packages: list[AuthenticatedPackage], current: StableVersion, manager: str
 ) -> StableVersion | None:
@@ -347,6 +383,66 @@ def latest_predecessor(
         )
     predecessors = [version for version in versions if version < current]
     return max(predecessors, default=None)
+
+
+def current_release_is_exact(
+    packages: list[AuthenticatedPackage],
+    current: StableVersion,
+    required_architectures: set[str],
+    manager: str,
+    staging: Path,
+    extension: str,
+) -> bool:
+    newer = sorted(
+        {package.version for package in packages if package.version > current}
+    )
+    if newer:
+        raise HistoryError(
+            f"refusing to replace newer {manager} release {newer[-1]} with {current}"
+        )
+    current_packages = [package for package in packages if package.version == current]
+    if not current_packages:
+        return False
+
+    by_architecture: dict[str, AuthenticatedPackage] = {}
+    for package in current_packages:
+        if package.architecture in by_architecture:
+            raise HistoryError(
+                f"published {manager} release {current} contains duplicate "
+                f"architecture {package.architecture}"
+            )
+        by_architecture[package.architecture] = package
+
+    missing = sorted(required_architectures - set(by_architecture))
+    if missing:
+        raise HistoryError(
+            f"published {manager} current release {current} lacks architecture(s): "
+            + ", ".join(missing)
+        )
+
+    expected_names: set[str] = set()
+    for architecture in sorted(required_architectures):
+        published = by_architecture[architecture].path
+        incoming = staging / published.name
+        if not incoming.is_file() or not package_contents_match(
+            published, incoming, manager
+        ):
+            raise HistoryError(
+                f"incoming {manager} package differs from published current release: "
+                f"{published.name}"
+            )
+        expected_names.add(published.name)
+
+    incoming_names = {
+        path.name
+        for path in staging.iterdir()
+        if path.is_file() and path.name.endswith(extension)
+    }
+    if incoming_names != expected_names:
+        raise HistoryError(
+            f"incoming {manager} package set differs from published current release"
+        )
+    return True
 
 
 def retain_predecessor(
@@ -371,7 +467,10 @@ def retain_predecessor(
     for package in packages:
         if package.version != predecessor:
             continue
-        if required_architectures and package.architecture not in required_architectures:
+        if (
+            required_architectures
+            and package.architecture not in required_architectures
+        ):
             continue
         if copy_without_replacing(package.path, staging):
             retained += 1
@@ -391,6 +490,7 @@ def main() -> int:
     )
     parser.add_argument("--apt-architecture", action="append", default=[])
     parser.add_argument("--rpm-architecture", action="append", default=[])
+    parser.add_argument("--allow-current-version-exact", action="store_true")
     parser.add_argument("--suite", default="stable")
     args = parser.parse_args()
 
@@ -402,10 +502,44 @@ def main() -> int:
         raise HistoryError(f"staging directory not found: {staging}")
     current = StableVersion.parse(args.current_version)
     if current is None:
-        raise HistoryError("--current-version must be stable MAJOR.MINOR.PATCH (not an RC)")
+        raise HistoryError(
+            "--current-version must be stable MAJOR.MINOR.PATCH (not an RC)"
+        )
 
-    apt_packages = authenticated_apt_packages(repository, args.suite, args.apt_signing_key)
+    apt_packages = authenticated_apt_packages(
+        repository, args.suite, args.apt_signing_key
+    )
     rpm_packages = authenticated_rpm_packages(repository, args.rpm_signing_key)
+    if args.allow_current_version_exact:
+        apt_current = current_release_is_exact(
+            apt_packages,
+            current,
+            set(args.apt_architecture),
+            "APT",
+            staging,
+            ".deb",
+        )
+        rpm_current = current_release_is_exact(
+            rpm_packages,
+            current,
+            set(args.rpm_architecture),
+            "RPM",
+            staging,
+            ".rpm",
+        )
+        if apt_current != rpm_current:
+            raise HistoryError(
+                "APT and RPM repositories disagree on whether the current release "
+                "is already published"
+            )
+        if apt_current:
+            print(f"current_version={current}")
+            print("current_version_already_published=true")
+            print("retained_predecessor=None")
+            print("retained_apt_packages=0")
+            print("retained_rpm_packages=0")
+            return 0
+
     apt_predecessor = latest_predecessor(apt_packages, current, "APT")
     rpm_predecessor = latest_predecessor(rpm_packages, current, "RPM")
     if apt_predecessor != rpm_predecessor:
@@ -430,6 +564,7 @@ def main() -> int:
     if apt_predecessor is not None and (apt_count == 0 or rpm_count == 0):
         raise HistoryError("stable predecessor has no retainable APT or RPM packages")
     print(f"current_version={current}")
+    print("current_version_already_published=false")
     print(f"retained_predecessor={apt_predecessor}")
     print(f"retained_apt_packages={apt_count}")
     print(f"retained_rpm_packages={rpm_count}")

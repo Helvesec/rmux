@@ -439,6 +439,52 @@ fn package_execution_failure_jobs() -> Value {
     value
 }
 
+fn linux_rebuild_failure_jobs() -> Value {
+    let mut value = post_mutation_failure_jobs();
+    let jobs = value["jobs"].as_array_mut().expect("jobs array");
+    for job in jobs.iter_mut() {
+        let name = job["name"].as_str().expect("job name");
+        if name == "Build exact signed Linux repository trees" {
+            job["conclusion"] = json!("failure");
+            for step in job["steps"].as_array_mut().expect("builder steps") {
+                if step["name"] == "Run ./.github/actions/release-linux-repository-build" {
+                    step["conclusion"] = json!("failure");
+                }
+            }
+            continue;
+        }
+        if [
+            "Publish exact Homebrew tap formula",
+            "Publish exact Scoop manifest",
+            "Publish exact Web Share WASM bytes",
+        ]
+        .contains(&name)
+        {
+            job["conclusion"] = json!("success");
+            for step in job["steps"].as_array_mut().expect("writer steps") {
+                if step["name"] == "Run ./.github/actions/release-owned-repository-publish" {
+                    step["conclusion"] = json!("success");
+                }
+            }
+        }
+    }
+    jobs.push(json!({
+        "name": "Verify crates.io Trusted Publishing authority",
+        "conclusion": "success",
+        "steps": [
+            step("Set up job", "success"),
+            step("Exchange and revoke a preflight crates.io token", "success"),
+            step(
+                "Post Exchange and revoke a preflight crates.io token",
+                "success",
+            ),
+            step("Complete job", "success"),
+        ],
+    }));
+    value["total_count"] = json!(jobs.len());
+    value
+}
+
 fn crates_result_seal_failure_jobs() -> Value {
     let mut value = package_execution_failure_jobs();
     let jobs = value["jobs"].as_array_mut().expect("jobs array");
@@ -516,6 +562,32 @@ fn package_writer_failure_artifacts() -> (Value, u64) {
     }
     let total_count = artifacts.len();
     value["total_count"] = json!(total_count);
+    (value, receipt_id)
+}
+
+fn linux_rebuild_failure_artifacts() -> (Value, u64) {
+    let (mut value, receipt_id) = downstream_failure_artifacts();
+    let artifacts = value["artifacts"].as_array_mut().expect("artifacts array");
+    for channel in ["homebrew_tap", "scoop", "web_share"] {
+        for suffix in ["result", "result-envelope", "result-reference"] {
+            artifacts.push(json!({
+                "id": receipt_id + artifacts.len() as u64,
+                "name": format!(
+                    "rmux-downstream-{channel}-{suffix}-{SOURCE}-{RELEASE_ID}"
+                ),
+                "expired": false,
+                "digest": format!("sha256:{}", "a".repeat(64)),
+                "workflow_run": {
+                    "id": FAILED_RUN,
+                    "head_sha": FAILED_CONTROL,
+                    "head_branch": "main",
+                    "repository_id": 1_239_918_790,
+                    "head_repository_id": 1_239_918_790,
+                },
+            }));
+        }
+    }
+    value["total_count"] = json!(artifacts.len());
     (value, receipt_id)
 }
 
@@ -795,6 +867,34 @@ fn protected_main_recovery_accepts_exact_package_execution_failures() {
         &root,
         failed_run(FAILED_CONTROL, "main", "failure"),
         package_execution_failure_jobs(),
+        artifacts,
+        json!({
+            "total_count": 1,
+            "artifacts": [{
+                "id": receipt_id,
+                "name": format!("rmux-publication-receipt-{SOURCE}-{RELEASE_ID}"),
+                "expired": false,
+                "workflow_run": {"id": FAILED_RUN},
+            }],
+        }),
+    );
+    fs::remove_dir_all(&root).expect("remove fixture root");
+    assert!(
+        output.status.success(),
+        "stdout={} stderr={}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+#[test]
+fn protected_main_recovery_accepts_exact_linux_rebuild_failures() {
+    let root = fixture_root("linux-rebuild-failure");
+    let (artifacts, receipt_id) = linux_rebuild_failure_artifacts();
+    let output = run_recovery(
+        &root,
+        failed_run(FAILED_CONTROL, "main", "failure"),
+        linux_rebuild_failure_jobs(),
         artifacts,
         json!({
             "total_count": 1,

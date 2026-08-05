@@ -190,6 +190,8 @@ fn manual_recovery_is_same_run_revalidated_and_canonically_sealed() {
     assert!(RESULT.contains("producer-head-sha:"));
     assert!(RESULT.contains("attestation-signer-workflow-path:"));
     assert!(HISTORY.contains("already contains current release"));
+    assert!(HISTORY.contains("--allow-current-version-exact"));
+    assert!(HISTORY.contains("incoming {manager} package differs from published current release"));
 }
 
 #[test]
@@ -200,6 +202,7 @@ import copy
 import importlib.util
 import pathlib
 import sys
+import tempfile
 
 sys.path.insert(0, 'scripts/release')
 from downstream_result import validate_producer, validate_result_artifact_source
@@ -323,6 +326,33 @@ for manager in ('APT', 'RPM'):
             raise
     else:
         raise SystemExit(f'{manager} republish was accepted')
+
+with tempfile.TemporaryDirectory() as root:
+    root = pathlib.Path(root)
+    published = root / 'published'
+    staging = root / 'staging'
+    published.mkdir()
+    staging.mkdir()
+    package_path = published / 'rmux_1.2.3_amd64.deb'
+    package_path.write_bytes(b'exact-current-package')
+    (staging / package_path.name).write_bytes(package_path.read_bytes())
+    exact = history.AuthenticatedPackage(current, 'amd64', package_path)
+    if not history.current_release_is_exact(
+        [exact], current, {'amd64'}, 'APT', staging, '.deb'
+    ):
+        raise SystemExit('exact current release was not recognized')
+    newer = history.StableVersion.parse('1.2.4')
+    assert newer is not None
+    newer_package = history.AuthenticatedPackage(newer, 'amd64', package_path)
+    try:
+        history.current_release_is_exact(
+            [exact, newer_package], current, {'amd64'}, 'APT', staging, '.deb'
+        )
+    except history.HistoryError as error:
+        if 'refusing to replace newer APT release 1.2.4 with 1.2.3' not in str(error):
+            raise
+    else:
+        raise SystemExit('newer published release was accepted during exact recovery')
 "#,
     );
     assert!(output.status.success(), "{}", stderr(&output));

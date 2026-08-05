@@ -185,23 +185,34 @@ jobs:
             --apt-signing-key "$RMUX_APT_GPG_KEY" \
             --rpm-signing-key "$RMUX_RPM_GPG_KEY" --current-version "$version" \
             --apt-architecture amd64 --apt-architecture arm64 \
-            --rpm-architecture x86_64 --rpm-architecture aarch64
-          "$apt_generator" \
-            --input-dir "$root/packages" --output-dir "$root/output/debian" \
-            --previous-repository-dir "$root/history/debian" \
-            --suite stable --component main --architecture amd64 --architecture arm64 \
-            --signing-key "$RMUX_APT_GPG_KEY"
-          scripts/generate-rpm-repository.sh \
-            --input-dir "$root/packages" --output-dir "$root/output/rpm" \
-            --previous-repository-dir "$root/history/rpm" \
-            --baseurl https://packages.rmux.io/rpm \
-            --gpg-key-url https://packages.rmux.io/rpm/RPM-GPG-KEY-rmux \
-            --repo-gpg-key-url https://packages.rmux.io/rpm/RPM-GPG-KEY-rmux-repository \
-            --rpm-signing-key "$RMUX_RPM_GPG_KEY" --rpm-signing-version "$version" \
-            --repo-signing-key "$RMUX_RPM_REPO_GPG_KEY"
-          gpg --armor --export "$RMUX_APT_GPG_KEY" > "$root/output/debian/rmux.asc"
-          gpg --armor --export "$RMUX_RPM_GPG_KEY" > "$root/output/rpm/RPM-GPG-KEY-rmux"
-          gpg --armor --export "$RMUX_RPM_REPO_GPG_KEY" > "$root/output/rpm/RPM-GPG-KEY-rmux-repository"
+            --rpm-architecture x86_64 --rpm-architecture aarch64 \
+            --allow-current-version-exact | tee "$root/HISTORY_STATUS"
+          if grep -qx 'current_version_already_published=true' "$root/HISTORY_STATUS"; then
+            for path in debian rpm index.html _headers; do
+              test -e "$root/history/$path" && test ! -L "$root/history/$path"
+            done
+            test -z "$(find "$root/history/debian" "$root/history/rpm" -type l -print -quit)"
+            cp -a "$root/history/debian" "$root/history/rpm" "$root/output/"
+            cp "$root/history/index.html" "$root/history/_headers" "$root/output/"
+            touch "$root/CURRENT_VERSION_ALREADY_PUBLISHED"
+          else
+            "$apt_generator" \
+              --input-dir "$root/packages" --output-dir "$root/output/debian" \
+              --previous-repository-dir "$root/history/debian" \
+              --suite stable --component main --architecture amd64 --architecture arm64 \
+              --signing-key "$RMUX_APT_GPG_KEY"
+            scripts/generate-rpm-repository.sh \
+              --input-dir "$root/packages" --output-dir "$root/output/rpm" \
+              --previous-repository-dir "$root/history/rpm" \
+              --baseurl https://packages.rmux.io/rpm \
+              --gpg-key-url https://packages.rmux.io/rpm/RPM-GPG-KEY-rmux \
+              --repo-gpg-key-url https://packages.rmux.io/rpm/RPM-GPG-KEY-rmux-repository \
+              --rpm-signing-key "$RMUX_RPM_GPG_KEY" --rpm-signing-version "$version" \
+              --repo-signing-key "$RMUX_RPM_REPO_GPG_KEY"
+            gpg --armor --export "$RMUX_APT_GPG_KEY" > "$root/output/debian/rmux.asc"
+            gpg --armor --export "$RMUX_RPM_GPG_KEY" > "$root/output/rpm/RPM-GPG-KEY-rmux"
+            gpg --armor --export "$RMUX_RPM_REPO_GPG_KEY" > "$root/output/rpm/RPM-GPG-KEY-rmux-repository"
+          fi
           cp "$root/PACKAGE_REPOSITORY_BASE" "$root/output/PACKAGE_REPOSITORY_BASE"
 
       - name: Add static package host files and exact checksum inventory
@@ -209,8 +220,10 @@ jobs:
         run: |
           set -euo pipefail
           root="$RUNNER_TEMP/rmux-linux-repository/output"
-          cp scripts/release/package-repository-index.html "$root/index.html"
-          cp scripts/release/package-repository-headers "$root/_headers"
+          if ! test -f "$RUNNER_TEMP/rmux-linux-repository/CURRENT_VERSION_ALREADY_PUBLISHED"; then
+            cp scripts/release/package-repository-index.html "$root/index.html"
+            cp scripts/release/package-repository-headers "$root/_headers"
+          fi
           (
             cd "$root"
             find debian rpm -type f -print0 | LC_ALL=C sort -z | \

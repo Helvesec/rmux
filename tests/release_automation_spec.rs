@@ -2778,7 +2778,7 @@ fn linux_repository_history_is_authenticated_before_retention() {
     )
     .expect("write older RPM fixture");
     let predecessor_rpm = rpm_repository.join("rmux-0.8.0-1.x86_64.rpm");
-    fs::write(&predecessor_rpm, b"signed-rpm").expect("write retained RPM fixture");
+    fs::write(&predecessor_rpm, b"signature:current-rpm").expect("write retained RPM fixture");
     let outside_matrix_rpm = rpm_repository.join("rmux-0.8.0-1.i686.rpm");
     fs::write(&outside_matrix_rpm, b"signed-rpm-other-architecture")
         .expect("write RPM fixture for an architecture outside the release matrix");
@@ -2817,7 +2817,7 @@ fn linux_repository_history_is_authenticated_before_retention() {
     let rpm = tools.join("rpm");
     fs::write(
         &rpm,
-        "#!/bin/sh\nset -eu\n[ \"$1\" = -qp ]\ncase \" $* \" in *0.7.0*) version=0.7.0 ;; *0.8.0*) version=0.8.0 ;; *) exit 93 ;; esac\ncase \" $* \" in *i686*) architecture=i686 ;; *) architecture=x86_64 ;; esac\nprintf 'rmux\\n%s\\n%s\\n' \"$version\" \"$architecture\"\n",
+        "#!/bin/sh\nset -eu\n[ \"$1\" = -qp ]\nfor package do :; done\ncase \" $* \" in *0.7.0*) version=0.7.0 ;; *0.8.0*) version=0.8.0 ;; *) exit 93 ;; esac\ncase \" $* \" in *i686*) architecture=i686 ;; *) architecture=x86_64 ;; esac\ncase \" $* \" in\n  *SHA256HEADER*)\n    normalized=$(sed 's/^signature://' \"$package\")\n    digest=$(printf '%s' \"$normalized\" | sha256sum | cut -d' ' -f1)\n    printf 'rmux\\n%s\\n1\\n%s\\n%s\\n%s\\n' \"$version\" \"$architecture\" \"$digest\" \"$digest\"\n    ;;\n  *) printf 'rmux\\n%s\\n%s\\n' \"$version\" \"$architecture\" ;;\nesac\n",
     )
     .expect("write fake rpm");
     make_executable(&rpm);
@@ -2928,7 +2928,7 @@ fn linux_repository_history_is_authenticated_before_retention() {
     let rejected_divergence = run_retention("0.9.0", "amd64", "x86_64", false, false);
     assert!(!rejected_divergence.status.success());
     assert!(stderr(&rejected_divergence).contains("disagree on the latest stable predecessor"));
-    fs::write(&predecessor_rpm, b"signed-rpm").expect("restore RPM predecessor");
+    fs::write(&predecessor_rpm, b"signature:current-rpm").expect("restore RPM predecessor");
     fs::write(&outside_matrix_rpm, b"signed-rpm-other-architecture")
         .expect("restore outside-matrix RPM predecessor");
 
@@ -2940,6 +2940,62 @@ fn linux_repository_history_is_authenticated_before_retention() {
     assert!(!rejected_republication.status.success());
     assert!(stderr(&rejected_republication)
         .contains("published APT repository already contains current release 0.8.0"));
+
+    let recovery_staging = root.join("recovery-staging");
+    fs::create_dir(&recovery_staging).expect("create exact republication staging");
+    fs::copy(&apt_package, recovery_staging.join("rmux_0.8.0_amd64.deb"))
+        .expect("stage exact published Debian package");
+    fs::write(
+        recovery_staging.join("rmux-0.8.0-1.x86_64.rpm"),
+        b"current-rpm",
+    )
+    .expect("stage unsigned RPM package with exact signed payload");
+    let run_exact_republication = || {
+        Command::new(repo_root().join("scripts/retain-linux-package-history.py"))
+            .args(["--repository-dir"])
+            .arg(&repository)
+            .args(["--staging-dir"])
+            .arg(&recovery_staging)
+            .args([
+                "--apt-signing-key",
+                "apt-key",
+                "--rpm-signing-key",
+                "rpm-key",
+                "--current-version",
+                "0.8.0",
+                "--apt-architecture",
+                "amd64",
+                "--rpm-architecture",
+                "x86_64",
+                "--allow-current-version-exact",
+            ])
+            .env("FAKE_RPM_DIGEST_ONLY", "0")
+            .env("FAKE_AMBIGUOUS_RPM_SELECTOR", "0")
+            .env("PATH", &path)
+            .current_dir(repo_root())
+            .output()
+            .expect("run exact package-history republication check")
+    };
+    let accepted_exact_republication = run_exact_republication();
+    assert!(
+        accepted_exact_republication.status.success(),
+        "{}",
+        stderr(&accepted_exact_republication)
+    );
+    assert!(
+        String::from_utf8_lossy(&accepted_exact_republication.stdout)
+            .contains("current_version_already_published=true")
+    );
+
+    fs::write(
+        recovery_staging.join("rmux-0.8.0-1.x86_64.rpm"),
+        b"divergent-current-rpm",
+    )
+    .expect("tamper staged current RPM package");
+    let rejected_divergent_republication = run_exact_republication();
+    assert!(!rejected_divergent_republication.status.success());
+    assert!(stderr(&rejected_divergent_republication)
+        .contains("incoming RPM package differs from published current release"));
 
     fs::remove_file(staging.join("rmux_0.8.0_amd64.deb"))
         .expect("remove accepted retained package");

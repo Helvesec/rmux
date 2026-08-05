@@ -101,6 +101,7 @@ APT_SUCCESS_FAILURE_MODES = frozenset(
 CRATES_RESULT_FAILURE_MODES = frozenset(
     {"package-result-seal-failure", "crates-result-seal-failure"}
 )
+LINUX_REBUILD_FAILURE_MODE = "linux-repository-rebuild-failure"
 
 
 def result_envelope_names(source_sha: str, release_id: int) -> set[str]:
@@ -172,6 +173,7 @@ def canonical_failed_jobs(
         | (POST_MUTATION_SKIPPED_AFTER_FAILURE - {CRATES_PUBLISH_JOB})
     )
     package_execution_names = package_writer_names | {CRATES_PREFLIGHT_JOB}
+    linux_rebuild_failure_names = post_mutation_names | {CRATES_PREFLIGHT_JOB}
     raw_names = set(jobs)
     if raw_names == legacy_names:
         return (
@@ -204,6 +206,17 @@ def canonical_failed_jobs(
         return (
             {
                 PACKAGE_WRITER_JOB_MAP.get(
+                    name.removeprefix(PREPARATION_PREFIX),
+                    name.removeprefix(PREPARATION_PREFIX),
+                ): job
+                for name, job in jobs.items()
+            },
+            True,
+        )
+    if raw_names == linux_rebuild_failure_names:
+        return (
+            {
+                POST_MUTATION_JOB_MAP.get(
                     name.removeprefix(PREPARATION_PREFIX),
                     name.removeprefix(PREPARATION_PREFIX),
                 ): job
@@ -249,14 +262,17 @@ def verify_failed_downstream_jobs(value: dict[str, Any]) -> str:
     if post_mutation:
         checkout = "Run actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5"
         post_checkout = f"Post {checkout}"
+        linux_conclusion = linux.get("conclusion")
+        if linux_conclusion not in {"success", "failure"}:
+            raise ValueError("Linux repository builder conclusion differs")
         exact_job_shape(
             linux,
             name=LINUX_SIGNING_JOB,
-            conclusion="success",
+            conclusion=linux_conclusion,
             steps={
                 "Set up job": "success",
                 checkout: "success",
-                "Run ./.github/actions/release-linux-repository-build": "success",
+                "Run ./.github/actions/release-linux-repository-build": linux_conclusion,
                 post_checkout: "success",
                 "Complete job": "success",
             },
@@ -272,6 +288,10 @@ def verify_failed_downstream_jobs(value: dict[str, Any]) -> str:
             by_name[name].get("conclusion") for name in OWNED_WRITER_JOBS
         }
         if owned_conclusions == {"failure"}:
+            if linux_conclusion != "success":
+                raise ValueError(
+                    "Linux builder and owned repository writers failed together"
+                )
             verify_skipped_jobs(by_name, POST_MUTATION_SKIPPED_AFTER_FAILURE)
             for name in OWNED_WRITER_JOBS:
                 exact_job_shape(
@@ -304,6 +324,11 @@ def verify_failed_downstream_jobs(value: dict[str, Any]) -> str:
                     "Complete job": "success",
                 },
             )
+        if linux_conclusion == "failure":
+            if preflight is None:
+                raise ValueError("Linux repository recovery lost crates.io preflight")
+            verify_skipped_jobs(by_name, POST_MUTATION_SKIPPED_AFTER_FAILURE)
+            return LINUX_REBUILD_FAILURE_MODE
         verify_skipped_jobs(
             by_name,
             POST_MUTATION_SKIPPED_AFTER_FAILURE - {APT_PUBLISH_JOB, CRATES_PUBLISH_JOB},
@@ -433,7 +458,15 @@ def verify_failed_downstream_artifacts(
         ),
     }
     allowed_names = (expected_names,)
-    if failure_mode != "pre-mutation-failure":
+    if failure_mode == LINUX_REBUILD_FAILURE_MODE:
+        expected_names.update(
+            f"rmux-downstream-{channel}-result-{args.source_sha}-{args.release_id}"
+            for channel in POST_MUTATION_RESULT_CHANNELS
+        )
+        expected_names.update(result_envelope_names(args.source_sha, args.release_id))
+        expected_names.update(result_reference_names(args.source_sha, args.release_id))
+        allowed_names = (expected_names,)
+    elif failure_mode != "pre-mutation-failure":
         expected_names.add(
             f"rmux-downstream-apt_rpm-signed-{args.source_sha}-{args.release_id}"
         )

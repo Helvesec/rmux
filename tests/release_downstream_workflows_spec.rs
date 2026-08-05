@@ -21,6 +21,8 @@ const CRATES_CHANNEL: &str = include_str!("../.github/workflows/release-crates-c
 const CI: &str = include_str!("../.github/workflows/ci.yml");
 const LINUX_REPOSITORY_BUILD: &str =
     include_str!("../.github/workflows/release-linux-repository-build.yml");
+const LINUX_REPOSITORY_BUILD_ACTION: &str =
+    include_str!("../.github/actions/release-linux-repository-build/action.yml");
 const CHANNEL_RESULT_ACTION: &str =
     include_str!("../.github/actions/release-channel-result/action.yml");
 const RECEIPT_REFERENCE_BUILDER: &str =
@@ -421,6 +423,12 @@ fn linux_repository_build_retains_authenticated_previous_by_hash_indexes() {
         .expect("APT repository generator");
     assert!(authenticated < generated);
     assert!(LINUX_REPOSITORY_BUILD.contains("--previous-repository-dir \"$root/history/debian\""));
+    for builder in [LINUX_REPOSITORY_BUILD, LINUX_REPOSITORY_BUILD_ACTION] {
+        assert!(builder.contains("--allow-current-version-exact"));
+        assert!(builder.contains("current_version_already_published=true"));
+        assert!(builder.contains("CURRENT_VERSION_ALREADY_PUBLISHED"));
+        assert!(builder.contains("cp -a \"$root/history/debian\" \"$root/history/rpm\""));
+    }
 }
 
 #[cfg(unix)]
