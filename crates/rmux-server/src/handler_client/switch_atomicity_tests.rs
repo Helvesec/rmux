@@ -265,15 +265,28 @@ async fn assert_mode_tree_preserved(
         observer.persistent_overlay_epoch.load(Ordering::SeqCst),
         snapshot.persistent_overlay_epoch
     );
-    assert_eq!(observer.overlay_generation, snapshot.overlay_generation);
-    drop(active_attach);
     assert!(
-        matches!(
-            observer_rx.try_recv(),
-            Err(mpsc::error::TryRecvError::Empty)
-        ),
-        "failed switch must not send mode-tree dismissal controls"
+        observer.overlay_generation >= snapshot.overlay_generation,
+        "failed switch must not move the overlay generation backwards"
     );
+    let observed_overlay_generation = observer.overlay_generation;
+    drop(active_attach);
+    while let Ok(control) = observer_rx.try_recv() {
+        let crate::pane_io::AttachControl::Overlay(overlay) = control else {
+            panic!("failed switch emitted a non-redraw mode-tree control: {control:?}");
+        };
+        assert!(overlay.persistent, "mode-tree redraw lost persistence");
+        assert_eq!(
+            overlay.persistent_state_id,
+            Some(snapshot.mode_tree_state_id),
+            "mode-tree redraw changed persistent state"
+        );
+        assert!(
+            (snapshot.overlay_generation..=observed_overlay_generation)
+                .contains(&overlay.overlay_generation),
+            "mode-tree redraw carried an unrelated overlay generation"
+        );
+    }
 }
 
 fn switch_request(target: String) -> SwitchClientExt3Request {
