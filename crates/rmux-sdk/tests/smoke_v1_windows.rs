@@ -6,7 +6,8 @@ mod windows {
     use super::common;
 
     use std::fs;
-    use std::path::PathBuf;
+    use std::io;
+    use std::path::{Path, PathBuf};
     use std::time::Duration;
     use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -132,7 +133,7 @@ mod windows {
         );
 
         harness.finish().await?;
-        fs::remove_dir_all(&root)?;
+        remove_dir_all_after_release(&root).await?;
         cleanup.disarm();
         Ok(())
     }
@@ -442,6 +443,20 @@ mod windows {
             "rmux-sdk-windows-config-{}-{nonce}",
             std::process::id()
         )))
+    }
+
+    async fn remove_dir_all_after_release(path: &Path) -> TestResult {
+        let deadline = Instant::now() + DEFAULT_TIMEOUT;
+        loop {
+            match fs::remove_dir_all(path) {
+                Ok(()) => return Ok(()),
+                Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
+                Err(error) if error.raw_os_error() == Some(32) && Instant::now() < deadline => {
+                    sleep(Duration::from_millis(25)).await;
+                }
+                Err(error) => return Err(error.into()),
+            }
+        }
     }
 
     struct TempRoot {
