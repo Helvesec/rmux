@@ -478,6 +478,7 @@
     "scripts/release/channel-summary.py",
     "scripts/release/channel-target-evidence.py",
     "scripts/release/channel_request.py",
+    "scripts/release/chocolatey-package-status.py",
     "scripts/release/collect-downstream-repository.py",
     "scripts/release/crate_package_set.py",
     "scripts/release/dispatch-candidate-shadow-audit.sh",

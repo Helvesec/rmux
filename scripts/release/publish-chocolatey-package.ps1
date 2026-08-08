@@ -40,49 +40,72 @@ if (
 }
 $package = $files[0].FullName
 $expectedHash = (Get-FileHash -LiteralPath $package -Algorithm SHA256).Hash.ToLowerInvariant()
+$metadataUrl = "https://community.chocolatey.org/api/v2/Packages(Id='rmux',Version='$version')"
 $packageUrl = "https://community.chocolatey.org/api/v2/package/rmux/$version"
 $pageUrl = "https://community.chocolatey.org/packages/rmux/$version"
+$metadata = Join-Path $env:RUNNER_TEMP "rmux-$version-chocolatey-metadata.xml"
 $download = Join-Path $env:RUNNER_TEMP "rmux-$version-public.nupkg"
 
-function Get-ExactPublicPackage {
+function Get-ExactPackageState {
     try {
-        Invoke-WebRequest -Uri $packageUrl -OutFile $download -MaximumRedirection 5
+        Invoke-WebRequest -Uri $metadataUrl -OutFile $metadata -MaximumRedirection 5
     }
     catch {
         if ($_.Exception.Response -and [int]$_.Exception.Response.StatusCode -eq 404) {
-            return $false
+            return "missing"
         }
         throw
     }
+
+    $statusLines = @(
+        python scripts/release/chocolatey-package-status.py `
+            --document $metadata `
+            --expected-version $version
+    )
+    if ($LASTEXITCODE -ne 0 -or $statusLines.Count -ne 1) {
+        throw "Chocolatey package metadata classification failed"
+    }
+    $packageState = $statusLines[0].Trim()
+    if ($packageState -notin @("pending", "public")) {
+        throw "Chocolatey package metadata returned an unknown state"
+    }
+
+    Invoke-WebRequest -Uri $packageUrl -OutFile $download -MaximumRedirection 5
     $actualHash = (Get-FileHash -LiteralPath $download -Algorithm SHA256).Hash.ToLowerInvariant()
     if ($actualHash -cne $expectedHash) {
         throw [ChocolateyPublicBytesMismatchException]::new(
-            "Public Chocolatey package bytes differ from the canonical payload"
+            "Existing Chocolatey package bytes differ from the canonical payload"
         )
     }
-    return $true
+    return $packageState
 }
 
 $mutationStarted = $false
 $remoteId = $null
 $state = $null
-$alreadyPublic = $false
+$packageState = $null
 try {
-    $alreadyPublic = Get-ExactPublicPackage
+    $packageState = Get-ExactPackageState
 }
 catch [ChocolateyPublicBytesMismatchException] {
     throw
 }
 catch {
-    Write-Warning "Chocolatey public package lookup failed before mutation"
+    Write-Warning "Chocolatey package lookup failed before mutation"
     $state = "failed-transient"
 }
 
-if ($null -eq $state -and $alreadyPublic) {
+if ($null -eq $state -and $packageState -eq "public") {
     $state = "no-op-exact"
     $remoteId = "rmux.$version"
 }
-elseif ($null -eq $state) {
+elseif ($null -eq $state -and $packageState -eq "pending") {
+    # The result contract uses this bit to prevent a duplicate retry once a remote submission exists.
+    $mutationStarted = $true
+    $state = "pending-moderation"
+    $remoteId = "rmux.$version"
+}
+elseif ($null -eq $state -and $packageState -eq "missing") {
     $mutationStarted = $true
     $remoteId = "rmux.$version"
     choco push $package `
@@ -97,6 +120,9 @@ elseif ($null -eq $state) {
     else {
         $state = "submitted"
     }
+}
+elseif ($null -eq $state) {
+    throw "Chocolatey package lookup returned an invalid state"
 }
 
 $observedAt = [DateTime]::UtcNow.ToString("yyyy-MM-ddTHH:mm:ssZ")

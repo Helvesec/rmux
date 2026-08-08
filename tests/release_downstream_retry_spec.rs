@@ -3,9 +3,12 @@ mod python3;
 
 use std::fs;
 use std::path::PathBuf;
+use std::process::Output;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 const ACTIVATION: &str = include_str!("../.github/release/release-activation.json");
 const CHOCOLATEY: &str = include_str!("../.github/workflows/release-chocolatey-retry.yml");
+const CHOCOLATEY_STATUS: &str = include_str!("../scripts/release/chocolatey-package-status.py");
 const CHOCOLATEY_WRITER: &str = include_str!("../scripts/release/publish-chocolatey-package.ps1");
 const DISPATCH: &str = include_str!("../.github/workflows/release-channel-retry.yml");
 const PREPARE: &str = include_str!("../.github/actions/release-channel-retry-prepare/action.yml");
@@ -16,6 +19,44 @@ const SNAP_WRITER: &str =
 
 fn repo_root() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+}
+
+fn temp_dir(label: &str) -> PathBuf {
+    let nonce = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("clock before epoch")
+        .as_nanos();
+    let path = std::env::temp_dir().join(format!(
+        "rmux-chocolatey-{label}-{}-{nonce}",
+        std::process::id()
+    ));
+    fs::create_dir_all(&path).expect("create Chocolatey fixture directory");
+    path
+}
+
+fn chocolatey_entry(version: &str, approved: &str, published: &str) -> String {
+    format!(
+        r#"<?xml version="1.0" encoding="utf-8"?>
+<entry xmlns="http://www.w3.org/2005/Atom"
+       xmlns:d="http://schemas.microsoft.com/ado/2007/08/dataservices">
+  <content>
+    <d:Version>{version}</d:Version>
+    <d:IsApproved>{approved}</d:IsApproved>
+    <d:Published>{published}</d:Published>
+  </content>
+</entry>
+"#
+    )
+}
+
+fn chocolatey_status(document: &PathBuf, expected_version: &str) -> Output {
+    python3::command()
+        .args(["scripts/release/chocolatey-package-status.py", "--document"])
+        .arg(document)
+        .args(["--expected-version", expected_version])
+        .current_dir(repo_root())
+        .output()
+        .expect("run Chocolatey metadata classifier")
 }
 
 fn assert_reusable_only(workflow: &str) {
@@ -254,7 +295,19 @@ fn retries_share_channel_concurrency_and_only_use_store_mutations() {
     assert!(CHOCOLATEY.contains("publish-chocolatey-package.ps1"));
     assert!(CHOCOLATEY_WRITER.contains("$state = \"failed-transient\""));
     assert!(CHOCOLATEY_WRITER.contains("$state = \"failed-terminal\""));
+    assert!(CHOCOLATEY_WRITER.contains("$state = \"pending-moderation\""));
     assert!(CHOCOLATEY_WRITER.contains("ChocolateyPublicBytesMismatchException"));
+    assert!(CHOCOLATEY_WRITER.contains("chocolatey-package-status.py"));
+    assert!(CHOCOLATEY_WRITER.contains("Packages(Id='rmux',Version='$version')"));
+    assert!(CHOCOLATEY_STATUS.contains("IsApproved"));
+    assert!(
+        CHOCOLATEY_WRITER
+            .find("Invoke-WebRequest -Uri $metadataUrl")
+            .expect("metadata lookup")
+            < CHOCOLATEY_WRITER
+                .find("choco push $package")
+                .expect("package push")
+    );
     assert!(
         SNAP_WRITER.contains("snapcore/action-publish@214b86e5ca036ead1668c79afb81e550e6c54d40")
     );
@@ -267,6 +320,76 @@ fn retries_share_channel_concurrency_and_only_use_store_mutations() {
         assert!(workflow.contains("attestations: write"));
         assert!(workflow.contains("id-token: write"));
     }
+}
+
+#[test]
+fn chocolatey_metadata_distinguishes_pending_from_public_packages() {
+    let root = temp_dir("metadata");
+    let pending = root.join("pending.xml");
+    let public = root.join("public.xml");
+    fs::write(
+        &pending,
+        chocolatey_entry("0.10.0", "false", "1900-01-01T00:00:00"),
+    )
+    .expect("write pending Chocolatey fixture");
+    fs::write(
+        &public,
+        chocolatey_entry("0.10.0", "true", "2026-08-08T12:34:56.789"),
+    )
+    .expect("write public Chocolatey fixture");
+
+    let pending_output = chocolatey_status(&pending, "0.10.0");
+    assert!(pending_output.status.success());
+    assert_eq!(
+        String::from_utf8_lossy(&pending_output.stdout).trim(),
+        "pending"
+    );
+    let public_output = chocolatey_status(&public, "0.10.0");
+    assert!(public_output.status.success());
+    assert_eq!(
+        String::from_utf8_lossy(&public_output.stdout).trim(),
+        "public"
+    );
+
+    for (name, document, expected_version) in [
+        (
+            "mismatched-version",
+            chocolatey_entry("0.9.1", "true", "2026-08-08T12:34:56Z"),
+            "0.10.0",
+        ),
+        (
+            "approved-without-publication",
+            chocolatey_entry("0.10.0", "true", "1900-01-01T00:00:00"),
+            "0.10.0",
+        ),
+        (
+            "unapproved-with-publication",
+            chocolatey_entry("0.10.0", "false", "2026-08-08T12:34:56Z"),
+            "0.10.0",
+        ),
+        (
+            "duplicate-publication",
+            chocolatey_entry("0.10.0", "true", "2026-08-08T12:34:56Z").replace(
+                "</content>",
+                "<d:Published>2026-08-08T12:34:56Z</d:Published></content>",
+            ),
+            "0.10.0",
+        ),
+        (
+            "external-entity",
+            "<!DOCTYPE entry [<!ENTITY version SYSTEM 'file:///etc/passwd'>]><entry />".to_owned(),
+            "0.10.0",
+        ),
+    ] {
+        let path = root.join(format!("{name}.xml"));
+        fs::write(&path, document).expect("write rejected Chocolatey fixture");
+        assert!(
+            !chocolatey_status(&path, expected_version).status.success(),
+            "invalid Chocolatey metadata accepted: {name}"
+        );
+    }
+
+    fs::remove_dir_all(root).expect("remove Chocolatey fixture directory");
 }
 
 #[test]
