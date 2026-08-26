@@ -10,11 +10,19 @@ categories = ["command-line-interface"]
 publish = true
 
 # Direct dependencies are intentionally minimal: `rmux-sdk` is the only
-# RMUX integration boundary, and one ratatui surface is linked under the
-# `ratatui-core` crate name for source compatibility.
+# RMUX integration boundary, and the ratatui surface is `ratatui-core` — the
+# crate ratatui 0.30 factors its buffer, layout, style and widget traits into.
+# Depending on it directly, rather than on a pinned `ratatui`, is what keeps
+# this crate's ratatui version out of its host's: a `Buffer` from any ratatui
+# 0.30.x is the same `ratatui_core::buffer::Buffer` this paints into.
 [dependencies]
-ratatui-core = { package = "ratatui", version = "=0.29.0", default-features = false }
+ratatui-core = { version = "0.1.2", default-features = false }
 rmux-sdk = { path = "../rmux-sdk", version = "0.10.0" }
 
+# `ratatui` itself is a dev-dependency and not a dependency: the crate builds
+# against `ratatui-core` alone, and this is here so `tests/ratatui_host_compat.rs`
+# can prove a host on the full ratatui can paint with the widget — the one claim
+# the other tests, which build their buffers from `ratatui-core`, cannot make.
 [dev-dependencies]
+ratatui = { version = "0.30.2", default-features = false }
 tokio = { version = "1.48.0", features = ["macros", "rt", "time"] }
