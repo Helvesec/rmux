@@ -283,7 +283,7 @@ fn popup_overlay_surface_rows_reset_around_each_row() {
         "a row must start from a known state: {row:?}"
     );
     assert!(
-        row.contains("red\u{1b}[0m\u{1b}8"),
+        row.ends_with("\u{1b}[0m\u{1b}8"),
         "a row must not leak its attributes into the frame: {row:?}"
     );
 }
@@ -391,4 +391,67 @@ fn status_layout_tracks_inline_range_changes_inside_status_left() {
         range.kind,
         crate::status_ranges::StatusRangeType::Control(7)
     ) && range.x == (1..=1)));
+}
+
+#[test]
+fn popup_surface_paints_final_rows_without_a_blank_pass() {
+    let spec = PopupRenderSpec {
+        rect: OverlayRect {
+            x: 2,
+            y: 1,
+            width: 8,
+            height: 2,
+        },
+        title: String::new(),
+        style: Style::default(),
+        border_style: Style::default(),
+        border_lines: BoxLines::None,
+        content: PopupContent::Surface(vec![b"abcdefgh".to_vec(), b"12345678".to_vec()]),
+    };
+    let frame = render_popup_overlay(&spec);
+    let frame = String::from_utf8(frame).unwrap();
+    // There must be no intermediate all-blank surface, even on terminals
+    // which paint the stream before the entire frame has arrived.
+    assert!(!frame.contains("        "));
+    assert_eq!(frame.matches("\x1b[2;3H").count(), 1);
+    assert_eq!(frame.matches("\x1b[3;3H").count(), 1);
+    assert!(frame.contains("abcdefgh"));
+    assert!(frame.contains("12345678"));
+}
+
+#[test]
+fn popup_surface_short_and_missing_rows_erase_old_cells() {
+    use rmux_core::{input::InputParser, Screen};
+    let size = TerminalSize { cols: 12, rows: 5 };
+    let mut screen = Screen::new(size, 0);
+    let mut parser = InputParser::new();
+    parser.parse(b"\x1b[2;3HXXXXXXXX\x1b[3;3HYYYYYYYY", &mut screen);
+    let spec = PopupRenderSpec {
+        rect: OverlayRect {
+            x: 2,
+            y: 1,
+            width: 8,
+            height: 2,
+        },
+        title: String::new(),
+        style: Style::default(),
+        border_style: Style::default(),
+        border_lines: BoxLines::None,
+        content: PopupContent::Surface(vec!["界e\u{301}".as_bytes().to_vec()]),
+    };
+    parser.parse(&render_popup_overlay(&spec), &mut screen);
+    let options = rmux_core::GridRenderOptions {
+        trim_spaces: false,
+        include_empty_cells: true,
+        ..Default::default()
+    };
+    let first = screen
+        .render_visible_line_independent_with_default_style(1, options, &Style::default())
+        .unwrap();
+    let second = screen
+        .render_visible_line_independent_with_default_style(2, options, &Style::default())
+        .unwrap();
+    assert!(!first.contains(&b'X'), "{first:?}");
+    assert!(!second.contains(&b'Y'), "{second:?}");
+    assert!(String::from_utf8(first).unwrap().contains("界e\u{301}"));
 }

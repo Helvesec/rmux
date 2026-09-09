@@ -1,5 +1,14 @@
 # Changelog
 
+## Unreleased
+
+### Terminal rendering
+
+- Paint popup content rows directly in their final state instead of clearing
+  the whole popup first. Shorter and missing rows still erase stale content;
+  ANSI styles and Unicode clipping are preserved. This removes the blank
+  prepaint phase that can flash during popup updates over a PTY or SSH.
+
 ## 0.10.0
 
 ### SDK
