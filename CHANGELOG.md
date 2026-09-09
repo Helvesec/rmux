@@ -44,6 +44,11 @@
 
 ### Reliability and performance
 
+- Paint popup content rows directly in their final state instead of clearing
+  the whole popup first. Shorter and missing rows still erase stale content;
+  ANSI styles and Unicode clipping are preserved. This removes the blank
+  prepaint phase that can flash during popup updates over a PTY or SSH.
+
 - Linearize pane generation, output sequence, invalidation revision, transcript
   capture, and observer registration. Mutations without output bytes now wake
   recoverable consumers, and child exit remains lifecycle rather than logical

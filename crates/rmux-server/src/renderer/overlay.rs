@@ -345,7 +345,8 @@ pub(crate) fn render_menu_overlay(spec: &MenuRenderSpec) -> Vec<u8> {
 
 pub(crate) fn render_popup_overlay(spec: &PopupRenderSpec) -> Vec<u8> {
     let mut frame = Vec::new();
-    fill_rect(&mut frame, spec.rect, &spec.style);
+    // Paint each content row in its final state. Clearing the whole rectangle
+    // first exposes a blank popup between PTY/SSH writes on every refresh.
     if spec.border_lines.visible() {
         draw_box(
             &mut frame,
@@ -358,20 +359,24 @@ pub(crate) fn render_popup_overlay(spec: &PopupRenderSpec) -> Vec<u8> {
     }
 
     let inner = inner_rect(spec.rect, spec.border_lines);
-    match &spec.content {
-        PopupContent::Surface(rows) => {
-            for (index, row) in rows.iter().enumerate() {
-                let Some(y) = content_row_y(inner, index) else {
-                    break;
-                };
-                draw_surface_row(&mut frame, inner.x, y, row, usize::from(inner.width));
+    for index in 0..usize::from(inner.height) {
+        let Some(y) = content_row_y(inner, index) else {
+            break;
+        };
+        match &spec.content {
+            PopupContent::Surface(rows) => {
+                let row = rows.get(index).map_or(&[][..], Vec::as_slice);
+                draw_surface_row(
+                    &mut frame,
+                    inner.x,
+                    y,
+                    row,
+                    usize::from(inner.width),
+                    &spec.style,
+                );
             }
-        }
-        PopupContent::Text(lines) => {
-            for (index, line) in lines.iter().enumerate() {
-                let Some(y) = content_row_y(inner, index) else {
-                    break;
-                };
+            PopupContent::Text(lines) => {
+                let line = lines.get(index).map_or("", String::as_str);
                 draw_formatted_text(
                     &mut frame,
                     inner.x,
@@ -588,8 +593,15 @@ fn draw_styled_text(frame: &mut Vec<u8>, x: u16, y: u16, text: &str, style: &Sty
 /// The row is clipped to the popup's inner width without splitting an escape
 /// sequence, and is bracketed by resets so neither the popup style nor a
 /// trailing attribute from the process bleeds into the rest of the frame.
-fn draw_surface_row(frame: &mut Vec<u8>, x: u16, y: u16, row: &[u8], width: usize) {
-    let clipped = super::truncate_rendered_pane_line(row, width, &rmux_core::Utf8Config::default());
+fn draw_surface_row(frame: &mut Vec<u8>, x: u16, y: u16, row: &[u8], width: usize, style: &Style) {
+    // Pad *after* the final text, using the popup background. This erases a
+    // shortened/missing row without blanking text we are about to repaint.
+    // Reuse the ANSI/grapheme-aware truncator for both clipping and padding.
+    let mut padded = row.to_vec();
+    padded.extend_from_slice(&super::style_sgr_bytes(style, true));
+    padded.resize(padded.len().saturating_add(width), b' ');
+    let clipped =
+        super::truncate_rendered_pane_line(&padded, width, &rmux_core::Utf8Config::default());
     if clipped.is_empty() {
         return;
     }
