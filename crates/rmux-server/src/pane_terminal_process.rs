@@ -3,12 +3,13 @@ use std::os::fd::BorrowedFd;
 #[cfg(unix)]
 use std::path::PathBuf;
 use std::process::ExitStatus;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use rmux_core::PaneGeometry;
 use rmux_proto::{ProcessCommand, RmuxError, TerminalPixels, TerminalSize};
 use rmux_pty::{
-    PtyChild, PtyMaster, Signal, TerminalGeometry as PtyTerminalGeometry,
+    ProcessShell, PtyChild, PtyMaster, RmuxShell, Signal, TerminalGeometry as PtyTerminalGeometry,
     TerminalSize as PtyTerminalSize,
 };
 
@@ -177,13 +178,27 @@ impl Drop for PaneTerminal {
     }
 }
 
+/// The [`RmuxShell`] backend every pane and popup of this server is spawned
+/// with. Defaults to the in-tree [`ProcessShell`]; `ServerDaemon::bind_with_shell`
+/// replaces it.
+#[derive(Clone, Debug)]
+pub(crate) struct PaneShell(pub(crate) Arc<dyn RmuxShell>);
+
+impl Default for PaneShell {
+    fn default() -> Self {
+        Self(Arc::new(ProcessShell))
+    }
+}
+
 pub(crate) fn open_pane_terminal(
+    shell: &dyn RmuxShell,
     geometry: PaneGeometry,
     profile: TerminalProfile,
     runtime_window_name: Option<String>,
     command: Option<&ProcessCommand>,
 ) -> Result<PaneTerminal, RmuxError> {
-    let (master, child) = spawn_pane_process(pty_size_from_geometry(geometry), &profile, command)?;
+    let (master, child) =
+        spawn_pane_process(shell, pty_size_from_geometry(geometry), &profile, command)?;
     Ok(PaneTerminal::new(
         master,
         child,

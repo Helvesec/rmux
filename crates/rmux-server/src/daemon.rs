@@ -25,6 +25,7 @@ use rmux_ipc::LocalListener;
 use rmux_proto::{
     encode_frame, FrameDecoder, HasSessionRequest, Request, Response, RmuxError, SessionName,
 };
+use rmux_pty::{ProcessShell, RmuxShell};
 
 use crate::listener;
 use crate::listener_options::ServeOptions;
@@ -317,7 +318,16 @@ impl ServerDaemon {
     }
 
     /// Binds the local IPC endpoint, starts accepting requests, and returns a handle.
+    ///
+    /// Panes and popups are spawned as operating-system processes through
+    /// [`ProcessShell`].
     pub async fn bind(self) -> io::Result<ServerHandle> {
+        self.bind_with_shell(Arc::new(ProcessShell)).await
+    }
+
+    /// Binds like [`bind`](Self::bind) but spawns every pane and popup of this
+    /// server through `shell` instead of [`ProcessShell`].
+    pub async fn bind_with_shell(self, shell: Arc<dyn RmuxShell>) -> io::Result<ServerHandle> {
         #[cfg(unix)]
         {
             let bound_listener = bind_unix_listener_at(self.config.socket_path())?;
@@ -333,6 +343,7 @@ impl ServerDaemon {
                 self.config.config_load().clone(),
                 self.config.subscription_limits(),
                 owner_uid,
+                Arc::clone(&shell),
             )
             .with_web_options(
                 self.config.web_port(),
@@ -373,6 +384,7 @@ impl ServerDaemon {
                 self.config.config_load().clone(),
                 self.config.subscription_limits(),
                 owner_uid,
+                Arc::clone(&shell),
             )
             .with_web_options(
                 self.config.web_port(),

@@ -11,6 +11,7 @@ use rmux_proto::{RmuxError, TerminalSize, WindowTarget};
 use tokio::sync::{broadcast, Mutex, Notify};
 
 use crate::daemon::ShutdownHandle;
+use crate::pane_terminal_process::PaneShell;
 #[path = "handler_alerts.rs"]
 mod alert_support;
 #[path = "handler_attach.rs"]
@@ -1153,6 +1154,12 @@ impl RequestHandler {
             .expect("shutdown handle mutex must not be poisoned") = Some(shutdown_handle);
     }
 
+    /// Installs the [`RmuxShell`](rmux_pty::RmuxShell) backend every pane and
+    /// popup of this server is spawned through.
+    pub(crate) async fn install_pane_shell(&self, shell: Arc<dyn rmux_pty::RmuxShell>) {
+        self.state.lock().await.pane_shell = PaneShell(shell);
+    }
+
     pub(crate) async fn shutdown_status_jobs(&self) {
         let status_jobs = self.state.lock().await.status_jobs().clone();
         let _ = tokio::task::spawn_blocking(move || status_jobs.shutdown_and_join()).await;
@@ -1716,6 +1723,10 @@ mod pane_silence_timer_tests;
 #[cfg(test)]
 #[path = "handler_pane_state_tests.rs"]
 mod pane_state_tests;
+
+#[cfg(all(test, unix))]
+#[path = "handler_pane_shell_tests.rs"]
+mod pane_shell_tests;
 
 #[cfg(test)]
 #[path = "handler_pane_state_race_tests.rs"]

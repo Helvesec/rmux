@@ -9,7 +9,7 @@ use std::sync::Arc;
 
 use rmux_core::{EnvironmentStore, OptionStore, PaneId};
 use rmux_proto::{AttachShellCommand, OptionName, ProcessCommand, RmuxError, SessionName};
-use rmux_pty::{ChildCommand, PtyChild, PtyMaster, TerminalSize as PtyTerminalSize};
+use rmux_pty::{ChildCommand, PtyChild, PtyMaster, RmuxShell, TerminalSize as PtyTerminalSize};
 use tokio::runtime::Handle;
 
 mod shell_resolver;
@@ -659,6 +659,7 @@ fn shell_command_window_name(command: &str) -> Option<String> {
 }
 
 pub(crate) fn spawn_pane_process(
+    shell: &dyn RmuxShell,
     size: PtyTerminalSize,
     profile: &TerminalProfile,
     command: Option<&ProcessCommand>,
@@ -674,7 +675,7 @@ pub(crate) fn spawn_pane_process(
         command = command.env(name, value);
     }
 
-    let spawned = command.spawn().map_err(|error| {
+    let spawned = shell.spawn(command).map_err(|error| {
         RmuxError::spawn_failed(format!(
             "{} shell: {error}",
             rmux_proto::SPAWN_FAILED_MESSAGE_PREFIX
