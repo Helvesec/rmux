@@ -105,8 +105,13 @@ impl HandlerState {
         let initial_title = profile.initial_pane_title();
         let lifecycle_cwd = profile.cwd().to_path_buf();
         let respawn_shell = profile.shell().to_path_buf();
-        let mut terminal =
-            open_pane_terminal(pane_geometry, profile, runtime_window_name, spawn.command)?;
+        let mut terminal = open_pane_terminal(
+            self.pane_shell.0.as_ref(),
+            pane_geometry,
+            profile,
+            runtime_window_name,
+            spawn.command,
+        )?;
         let pid = terminal.pid();
         let output_reader =
             clone_terminal_for_output_reader(&mut terminal, session.name(), pane.id())?;
@@ -243,6 +248,7 @@ impl HandlerState {
         let lifecycle_cwd = profile.cwd().to_path_buf();
         let respawn_shell = profile.shell().to_path_buf();
         let mut terminal = open_pane_terminal(
+            self.pane_shell.0.as_ref(),
             pane_geometry,
             profile,
             runtime_window_name.clone(),
@@ -452,6 +458,7 @@ impl HandlerState {
         let lifecycle_cwd = profile.cwd().to_path_buf();
         let respawn_shell = profile.shell().to_path_buf();
         let mut terminal = open_pane_terminal(
+            self.pane_shell.0.as_ref(),
             pane_geometry,
             profile,
             runtime_window_name.clone(),
@@ -956,6 +963,7 @@ impl HandlerState {
         let lifecycle_cwd = profile.cwd().to_path_buf();
         let respawn_shell = profile.shell().to_path_buf();
         let mut terminal = open_pane_terminal(
+            self.pane_shell.0.as_ref(),
             pane_geometry,
             profile,
             runtime_window_name.clone(),

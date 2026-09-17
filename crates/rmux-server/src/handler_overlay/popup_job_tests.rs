@@ -150,6 +150,7 @@ async fn assert_popup_termination(command: &str, label: &str, trigger: PopupTerm
     .expect("popup terminal profile");
     let environment = [format!("RMUX_POPUP_READY={}", marker.display())];
     let (job, _) = spawn_popup_job(
+        &rmux_pty::ProcessShell,
         TerminalSize { cols: 20, rows: 6 },
         &profile,
         Some(command),

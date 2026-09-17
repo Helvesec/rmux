@@ -7,8 +7,9 @@
 //! documented API that exposes:
 //! - PTY allocation,
 //! - terminal size query and resize on PTY file descriptors,
-//! - child spawning into a controlling terminal-backed PTY, and
-//! - child signaling and reaping.
+//! - child spawning into a controlling terminal-backed PTY,
+//! - child signaling and reaping, and
+//! - pluggable pane shell backends via `RmuxShell` (default `ProcessShell`).
 
 mod backend;
 mod child;
@@ -52,7 +53,7 @@ use std::error::Error as StdError;
 use std::ffi::NulError;
 use std::fmt;
 
-pub use child::{ChildCommand, PtyChild, SpawnedPty};
+pub use child::{ChildCommand, ProcessShell, PtyChild, RmuxShell, ShellChild, SpawnedPty};
 #[cfg(unix)]
 pub use pty::PtySlave;
 pub use pty::{PtyIo, PtyMaster, PtyPair};

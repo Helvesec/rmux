@@ -131,6 +131,7 @@ impl HandlerState {
             command: spawn.command.cloned(),
             pane_alert_callback: spawn.pane_alert_callback,
             pane_exit_callback: spawn.pane_exit_callback,
+            pane_shell: self.pane_shell.clone(),
         })
     }
 
@@ -138,6 +139,7 @@ impl HandlerState {
         job: &DeferredInitialPaneSpawn,
     ) -> Result<PaneTerminal, RmuxError> {
         open_pane_terminal(
+            job.pane_shell.0.as_ref(),
             job.geometry,
             job.profile.clone(),
             job.runtime_window_name.clone(),

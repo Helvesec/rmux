@@ -1,4 +1,7 @@
+use std::sync::Arc;
+
 use rmux_core::events::SubscriptionLimits;
+use rmux_pty::RmuxShell;
 
 use crate::signals::SignalWatcher;
 #[cfg(unix)]
@@ -12,6 +15,7 @@ pub(crate) struct ServeOptions {
     pub(crate) config_load: ConfigLoadOptions,
     pub(crate) subscription_limits: SubscriptionLimits,
     pub(crate) owner_uid: u32,
+    pub(crate) pane_shell: Arc<dyn RmuxShell>,
     pub(crate) web_frontend: Option<String>,
     pub(crate) web_port: u16,
     pub(crate) web_port_explicit: bool,
@@ -27,12 +31,14 @@ impl ServeOptions {
         config_load: ConfigLoadOptions,
         subscription_limits: SubscriptionLimits,
         owner_uid: u32,
+        pane_shell: Arc<dyn RmuxShell>,
     ) -> Self {
         Self {
             server_signals: None,
             config_load,
             subscription_limits,
             owner_uid,
+            pane_shell,
             web_frontend: None,
             web_port: 9777,
             web_port_explicit: false,

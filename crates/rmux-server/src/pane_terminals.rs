@@ -138,6 +138,7 @@ pub(crate) struct DeferredInitialPaneSpawn {
     pub(crate) command: Option<ProcessCommand>,
     pub(crate) pane_alert_callback: Option<PaneAlertCallback>,
     pub(crate) pane_exit_callback: Option<PaneExitCallback>,
+    pub(crate) pane_shell: crate::pane_terminal_process::PaneShell,
 }
 
 #[cfg(windows)]
@@ -271,6 +272,8 @@ pub(crate) struct HandlerState {
     pub(crate) hooks: HookStore,
     pub(crate) buffers: BufferStore,
     pub(crate) key_bindings: KeyBindingStore,
+    /// Backend every pane and popup spawn of this server goes through.
+    pub(crate) pane_shell: crate::pane_terminal_process::PaneShell,
     pub(crate) retained_lifecycle_targets:
         StdMutex<crate::handler::RetainedLifecycleTargetRegistry>,
     pub(crate) message_log: VecDeque<MessageEntry>,

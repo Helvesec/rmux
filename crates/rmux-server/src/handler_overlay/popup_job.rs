@@ -11,7 +11,7 @@ use rmux_core::{GridRenderOptions, Screen, Style};
 use rmux_proto::{RmuxError, TerminalSize};
 #[cfg(unix)]
 use rmux_pty::Signal;
-use rmux_pty::{PtyChild, PtyIo, TerminalSize as PtyTerminalSize};
+use rmux_pty::{PtyChild, PtyIo, RmuxShell, TerminalSize as PtyTerminalSize};
 #[cfg(unix)]
 use tokio::io::unix::AsyncFd;
 use tokio::time::sleep;
@@ -268,6 +268,7 @@ pub(in super::super) enum PopupDragMode {
 }
 
 pub(super) fn spawn_popup_job(
+    shell: &dyn RmuxShell,
     size: TerminalSize,
     profile: &TerminalProfile,
     shell_command: Option<&str>,
@@ -286,8 +287,8 @@ pub(super) fn spawn_popup_job(
     for (name, value) in env {
         command = command.env(name, value);
     }
-    let spawned = command
-        .spawn()
+    let spawned = shell
+        .spawn(command)
         .map_err(|error| RmuxError::Server(format!("failed to spawn popup process: {error}")))?;
     let (master, child) = spawned.into_parts();
     let writer_fd = master.into_io();

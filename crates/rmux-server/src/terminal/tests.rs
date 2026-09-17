@@ -1103,8 +1103,12 @@ fn windows_interactive_shell_starts_in_profile_cwd_and_accepts_input(
         Some(cwd.as_path()),
     )?;
 
-    let (master, mut child) =
-        super::spawn_pane_process(PtyTerminalSize::new(100, 30), &profile, None)?;
+    let (master, mut child) = super::spawn_pane_process(
+        &rmux_pty::ProcessShell,
+        PtyTerminalSize::new(100, 30),
+        &profile,
+        None,
+    )?;
     let io = master.try_clone_io()?;
     let cwd_markers = windows_path_markers(&cwd);
 

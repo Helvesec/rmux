@@ -88,7 +88,7 @@ fn quiet_clock_command(marker: &str) -> Vec<String> {
     ]
 }
 
-async fn wait_for_transcript_containing(
+pub(super) async fn wait_for_transcript_containing(
     handler: &RequestHandler,
     target: &PaneTarget,
     needle: &str,
@@ -109,7 +109,7 @@ async fn wait_for_transcript_containing(
     }
 }
 
-async fn capture_transcript(handler: &RequestHandler, target: &PaneTarget) -> String {
+pub(super) async fn capture_transcript(handler: &RequestHandler, target: &PaneTarget) -> String {
     let transcript = {
         let state = handler.state.lock().await;
         state
@@ -234,7 +234,11 @@ async fn pane_id(handler: &RequestHandler, target: &PaneTarget) -> u32 {
         .as_u32()
 }
 
-async fn list_panes_text(handler: &RequestHandler, target: &PaneTarget, format: &str) -> String {
+pub(super) async fn list_panes_text(
+    handler: &RequestHandler,
+    target: &PaneTarget,
+    format: &str,
+) -> String {
     let response = handler
         .handle(Request::ListPanes(Box::new(ListPanesRequest {
             target: target.session_name().clone(),

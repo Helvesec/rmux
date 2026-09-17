@@ -1,9 +1,10 @@
-use std::ffi::OsString;
+use std::ffi::{OsStr, OsString};
+use std::fmt;
 #[cfg(unix)]
 use std::fs::File;
 #[cfg(unix)]
 use std::os::unix::process::CommandExt;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::ExitStatus;
 #[cfg(unix)]
 use std::process::{Child, Command, Stdio};
@@ -123,9 +124,52 @@ impl ChildCommand {
         self
     }
 
-    /// Spawns the configured command inside a newly allocated PTY.
+    /// Returns the executable path this command runs.
+    #[must_use]
+    pub fn program(&self) -> &Path {
+        &self.program
+    }
+
+    /// Returns the `argv[0]` override, when one was configured.
+    #[must_use]
+    pub fn argv0(&self) -> Option<&OsStr> {
+        self.arg0.as_deref()
+    }
+
+    /// Returns the process arguments that follow `argv[0]`.
+    #[must_use]
+    pub fn arguments(&self) -> &[OsString] {
+        &self.args
+    }
+
+    /// Returns the explicit environment entries in application order.
+    #[must_use]
+    pub fn environment(&self) -> &[(OsString, OsString)] {
+        &self.env
+    }
+
+    /// Returns whether the inherited environment is cleared before the
+    /// entries from [`environment`](Self::environment) are applied.
+    #[must_use]
+    pub fn clears_env(&self) -> bool {
+        self.clear_env
+    }
+
+    /// Returns the child working directory, when one was configured.
+    #[must_use]
+    pub fn working_dir(&self) -> Option<&Path> {
+        self.current_dir.as_deref()
+    }
+
+    /// Returns the initial PTY size, when one was configured.
+    #[must_use]
+    pub fn initial_size(&self) -> Option<TerminalSize> {
+        self.size
+    }
+
+    /// Spawns the configured command through the default [`ProcessShell`].
     pub fn spawn(self) -> Result<SpawnedPty> {
-        spawn_child(self)
+        ProcessShell.spawn(self)
     }
 }
 
@@ -137,6 +181,15 @@ pub struct SpawnedPty {
 }
 
 impl SpawnedPty {
+    /// Pairs a PTY master with the shell running on the other endpoint.
+    ///
+    /// [`RmuxShell`] implementations outside this crate use this to return
+    /// their spawn result.
+    #[must_use]
+    pub fn new(master: PtyMaster, child: PtyChild) -> Self {
+        Self { master, child }
+    }
+
     /// Returns the PTY master endpoint.
     #[must_use]
     pub fn master(&self) -> &PtyMaster {
@@ -162,9 +215,91 @@ impl SpawnedPty {
     }
 }
 
-/// A handle for signaling and reaping a PTY-backed child process.
+/// Lifecycle control for whatever runs on the child side of a pane PTY.
+///
+/// Implemented by the operating-system process backend behind [`ProcessShell`]
+/// and by any custom [`RmuxShell`] backend, for example an in-process shell
+/// library. Backends without an operating-system wait status build their
+/// [`ExitStatus`] with `std::os::unix::process::ExitStatusExt::from_raw`.
+///
+/// The Windows methods are ConPTY-specific. A Windows pseudo console has no
+/// in-process child endpoint, so the process backend is the only implementor
+/// there and every method is required.
+pub trait ShellChild: fmt::Debug + Send {
+    /// Returns the process identifier RMUX attributes the pane to.
+    ///
+    /// The process backend returns the PTY session leader, which is also the
+    /// PTY foreground process-group identifier. An in-process shell reports the
+    /// host process instead; RMUX derives `#{pane_pid}` and foreground-process
+    /// probing from this value either way.
+    fn pid(&self) -> ProcessId;
+
+    /// Waits for the shell to exit and reaps it.
+    fn wait(&mut self) -> Result<ExitStatus>;
+
+    /// Attempts to reap the shell without blocking.
+    fn try_wait(&mut self) -> Result<Option<ExitStatus>>;
+
+    /// Sends a signal to the PTY foreground process group, or to the backend's
+    /// equivalent of it.
+    fn kill(&self, signal: Signal) -> Result<()>;
+
+    /// Sends a signal directly to the PTY session leader.
+    fn kill_session_leader(&self, signal: Signal) -> Result<()>;
+
+    /// Continues a stopped foreground process group, reporting `Ok(false)` when
+    /// nothing was stopped.
+    #[cfg(unix)]
+    fn continue_if_stopped(&self) -> Result<bool>;
+
+    /// Waits until the Windows pane leader and every job-scoped descendant exit.
+    #[cfg(windows)]
+    fn wait_for_process_tree_exit(&mut self) -> Result<ExitStatus>;
+
+    /// Observes Windows process-tree exit without blocking.
+    #[cfg(windows)]
+    fn try_wait_for_process_tree_exit(&mut self) -> Result<Option<ExitStatus>>;
+
+    /// Clones a wait-only handle without retaining the Windows Job Object.
+    #[cfg(windows)]
+    fn try_clone_for_wait(&self) -> Result<Box<dyn ShellChild>>;
+
+    /// Clones the handles a pane exit watcher needs to observe the complete
+    /// Windows process tree before the pseudo console is closed.
+    #[cfg(windows)]
+    fn try_clone_for_exit_teardown(&self) -> Result<Box<dyn ShellChild>>;
+
+    /// Closes the backing ConPTY after the shell has exited.
+    #[cfg(windows)]
+    fn close_pseudoconsole(&self);
+}
+
+/// A pluggable pane shell backend.
+///
+/// An implementation turns a spawn request into a shell attached to the child
+/// side of a newly allocated PTY. RMUX reads, writes, and resizes the returned
+/// PTY master exactly as it does for an operating-system process, so the
+/// multiplexer's I/O path is unaffected by the choice of backend.
+pub trait RmuxShell: fmt::Debug + Send + Sync {
+    /// Spawns the shell described by `command` inside a newly allocated PTY.
+    fn spawn(&self, command: ChildCommand) -> Result<SpawnedPty>;
+}
+
+/// The default backend: an operating-system process, forked and executed on
+/// Unix and launched into a ConPTY on Windows.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct ProcessShell;
+
+impl RmuxShell for ProcessShell {
+    fn spawn(&self, command: ChildCommand) -> Result<SpawnedPty> {
+        spawn_child(command)
+    }
+}
+
+/// The [`ShellChild`] implementation backing [`ProcessShell`].
 #[derive(Debug)]
-pub struct PtyChild {
+#[cfg_attr(all(not(unix), not(windows)), allow(dead_code))]
+struct ProcessChild {
     #[cfg(unix)]
     child: Child,
     #[cfg(windows)]
@@ -172,19 +307,12 @@ pub struct PtyChild {
     pid: ProcessId,
 }
 
-impl PtyChild {
-    /// Returns the PTY session leader's process identifier.
-    ///
-    /// The spawned child creates a fresh session and foreground process group,
-    /// so this PID is also the PTY process-group identifier used for later
-    /// signal delivery.
-    #[must_use]
-    pub fn pid(&self) -> ProcessId {
+impl ShellChild for ProcessChild {
+    fn pid(&self) -> ProcessId {
         self.pid
     }
 
-    /// Waits for the child process to exit and reaps it.
-    pub fn wait(&mut self) -> Result<ExitStatus> {
+    fn wait(&mut self) -> Result<ExitStatus> {
         #[cfg(unix)]
         {
             Ok(self.child.wait()?)
@@ -204,8 +332,7 @@ impl PtyChild {
         }
     }
 
-    /// Attempts to reap the child process without blocking.
-    pub fn try_wait(&mut self) -> Result<Option<ExitStatus>> {
+    fn try_wait(&mut self) -> Result<Option<ExitStatus>> {
         #[cfg(unix)]
         {
             Ok(self.child.try_wait()?)
@@ -227,68 +354,7 @@ impl PtyChild {
         }
     }
 
-    /// Waits until the Windows pane leader and every job-scoped descendant exit.
-    #[cfg(windows)]
-    pub fn wait_for_process_tree_exit(&mut self) -> Result<ExitStatus> {
-        backend::wait_child_process_tree(&mut self.child)
-    }
-
-    /// Observes Windows process-tree exit without blocking.
-    #[cfg(windows)]
-    pub fn try_wait_for_process_tree_exit(&mut self) -> Result<Option<ExitStatus>> {
-        backend::try_wait_child_process_tree(&mut self.child)
-    }
-
-    /// Clones a wait-only handle without retaining the Windows Job Object.
-    ///
-    /// Popup teardown relies on dropping the owning child to close the last
-    /// kill-on-close Job handle before this clone closes the shared ConPTY.
-    #[cfg(windows)]
-    pub fn try_clone_for_wait(&self) -> Result<Self> {
-        Ok(Self {
-            child: backend::try_clone_child_for_wait(&self.child)?,
-            pid: self.pid,
-        })
-    }
-
-    /// Clones the process, ConPTY, and Windows Job Object handles needed by a
-    /// pane exit watcher to observe the complete process tree before close.
-    #[cfg(windows)]
-    pub fn try_clone_for_exit_teardown(&self) -> Result<Self> {
-        Ok(Self {
-            child: backend::try_clone_child_for_exit_teardown(&self.child)?,
-            pid: self.pid,
-        })
-    }
-
-    /// Closes the backing ConPTY after the child has exited.
-    ///
-    /// Windows keeps the ConPTY output pipe alive while the pseudo console is
-    /// open. The server's exit watcher calls this after the entire pane process
-    /// tree exits so the output reader observes EOF without destroying a live
-    /// descendant that still owns the console.
-    #[cfg(windows)]
-    pub fn close_pseudoconsole(&self) {
-        backend::close_child_pseudoconsole(&self.child);
-    }
-
-    /// Sends an interrupt request to the PTY foreground process group.
-    pub fn interrupt(&self) -> Result<()> {
-        self.kill(Signal::INT)
-    }
-
-    /// Sends a forceful kill request to the PTY foreground process group.
-    pub fn terminate_forcefully(&self) -> Result<()> {
-        self.kill(Signal::KILL)
-    }
-
-    /// Sends a signal to the PTY foreground process group.
-    ///
-    /// PTY-backed sessions commonly fan out into multiple processes while
-    /// sharing the foreground group created during spawn. Signaling the group
-    /// preserves teardown correctness even when the session leader has already
-    /// delegated work to descendants.
-    pub fn kill(&self, signal: Signal) -> Result<()> {
+    fn kill(&self, signal: Signal) -> Result<()> {
         #[cfg(unix)]
         {
             backend::kill_foreground_process_group(self.pid, signal)
@@ -309,12 +375,7 @@ impl PtyChild {
         }
     }
 
-    /// Sends a signal directly to the PTY session leader.
-    ///
-    /// This is a teardown fallback for shells that move foreground jobs into a
-    /// different process group while the session leader is still the child that
-    /// must be reaped by RMUX.
-    pub fn kill_session_leader(&self, signal: Signal) -> Result<()> {
+    fn kill_session_leader(&self, signal: Signal) -> Result<()> {
         #[cfg(unix)]
         {
             backend::kill_process(self.pid, signal)?;
@@ -338,14 +399,8 @@ impl PtyChild {
         }
     }
 
-    /// Continues the PTY foreground process group if the session leader is
-    /// currently stopped.
-    ///
-    /// This mirrors tmux's SIGCHLD policy for stopped panes while leaving
-    /// SIGTTIN/SIGTTOU alone so background terminal I/O remains governed by
-    /// normal Unix job-control rules.
     #[cfg(unix)]
-    pub fn continue_if_stopped(&self) -> Result<bool> {
+    fn continue_if_stopped(&self) -> Result<bool> {
         let Some(stop_signal) = backend::stopped_signal(self.pid)? else {
             return Ok(false);
         };
@@ -356,6 +411,156 @@ impl PtyChild {
         backend::kill_foreground_process_group(self.pid, Signal::CONT)
             .or_else(|_| backend::kill_process(self.pid, Signal::CONT))?;
         Ok(true)
+    }
+
+    #[cfg(windows)]
+    fn wait_for_process_tree_exit(&mut self) -> Result<ExitStatus> {
+        backend::wait_child_process_tree(&mut self.child)
+    }
+
+    #[cfg(windows)]
+    fn try_wait_for_process_tree_exit(&mut self) -> Result<Option<ExitStatus>> {
+        backend::try_wait_child_process_tree(&mut self.child)
+    }
+
+    #[cfg(windows)]
+    fn try_clone_for_wait(&self) -> Result<Box<dyn ShellChild>> {
+        Ok(Box::new(Self {
+            child: backend::try_clone_child_for_wait(&self.child)?,
+            pid: self.pid,
+        }))
+    }
+
+    #[cfg(windows)]
+    fn try_clone_for_exit_teardown(&self) -> Result<Box<dyn ShellChild>> {
+        Ok(Box::new(Self {
+            child: backend::try_clone_child_for_exit_teardown(&self.child)?,
+            pid: self.pid,
+        }))
+    }
+
+    #[cfg(windows)]
+    fn close_pseudoconsole(&self) {
+        backend::close_child_pseudoconsole(&self.child);
+    }
+}
+
+/// A handle for signaling and reaping the shell behind a PTY.
+#[derive(Debug)]
+pub struct PtyChild {
+    inner: Box<dyn ShellChild>,
+}
+
+impl PtyChild {
+    /// Wraps a [`ShellChild`] produced by an [`RmuxShell`] backend.
+    #[must_use]
+    pub fn new(child: impl ShellChild + 'static) -> Self {
+        Self {
+            inner: Box::new(child),
+        }
+    }
+
+    /// Returns the PTY session leader's process identifier.
+    ///
+    /// The spawned child creates a fresh session and foreground process group,
+    /// so this PID is also the PTY process-group identifier used for later
+    /// signal delivery.
+    #[must_use]
+    pub fn pid(&self) -> ProcessId {
+        self.inner.pid()
+    }
+
+    /// Waits for the child process to exit and reaps it.
+    pub fn wait(&mut self) -> Result<ExitStatus> {
+        self.inner.wait()
+    }
+
+    /// Attempts to reap the child process without blocking.
+    pub fn try_wait(&mut self) -> Result<Option<ExitStatus>> {
+        self.inner.try_wait()
+    }
+
+    /// Waits until the Windows pane leader and every job-scoped descendant exit.
+    #[cfg(windows)]
+    pub fn wait_for_process_tree_exit(&mut self) -> Result<ExitStatus> {
+        self.inner.wait_for_process_tree_exit()
+    }
+
+    /// Observes Windows process-tree exit without blocking.
+    #[cfg(windows)]
+    pub fn try_wait_for_process_tree_exit(&mut self) -> Result<Option<ExitStatus>> {
+        self.inner.try_wait_for_process_tree_exit()
+    }
+
+    /// Clones a wait-only handle without retaining the Windows Job Object.
+    ///
+    /// Popup teardown relies on dropping the owning child to close the last
+    /// kill-on-close Job handle before this clone closes the shared ConPTY.
+    #[cfg(windows)]
+    pub fn try_clone_for_wait(&self) -> Result<Self> {
+        Ok(Self {
+            inner: self.inner.try_clone_for_wait()?,
+        })
+    }
+
+    /// Clones the process, ConPTY, and Windows Job Object handles needed by a
+    /// pane exit watcher to observe the complete process tree before close.
+    #[cfg(windows)]
+    pub fn try_clone_for_exit_teardown(&self) -> Result<Self> {
+        Ok(Self {
+            inner: self.inner.try_clone_for_exit_teardown()?,
+        })
+    }
+
+    /// Closes the backing ConPTY after the child has exited.
+    ///
+    /// Windows keeps the ConPTY output pipe alive while the pseudo console is
+    /// open. The server's exit watcher calls this after the entire pane process
+    /// tree exits so the output reader observes EOF without destroying a live
+    /// descendant that still owns the console.
+    #[cfg(windows)]
+    pub fn close_pseudoconsole(&self) {
+        self.inner.close_pseudoconsole();
+    }
+
+    /// Sends an interrupt request to the PTY foreground process group.
+    pub fn interrupt(&self) -> Result<()> {
+        self.kill(Signal::INT)
+    }
+
+    /// Sends a forceful kill request to the PTY foreground process group.
+    pub fn terminate_forcefully(&self) -> Result<()> {
+        self.kill(Signal::KILL)
+    }
+
+    /// Sends a signal to the PTY foreground process group.
+    ///
+    /// PTY-backed sessions commonly fan out into multiple processes while
+    /// sharing the foreground group created during spawn. Signaling the group
+    /// preserves teardown correctness even when the session leader has already
+    /// delegated work to descendants.
+    pub fn kill(&self, signal: Signal) -> Result<()> {
+        self.inner.kill(signal)
+    }
+
+    /// Sends a signal directly to the PTY session leader.
+    ///
+    /// This is a teardown fallback for shells that move foreground jobs into a
+    /// different process group while the session leader is still the child that
+    /// must be reaped by RMUX.
+    pub fn kill_session_leader(&self, signal: Signal) -> Result<()> {
+        self.inner.kill_session_leader(signal)
+    }
+
+    /// Continues the PTY foreground process group if the session leader is
+    /// currently stopped.
+    ///
+    /// This mirrors tmux's SIGCHLD policy for stopped panes while leaving
+    /// SIGTTIN/SIGTTOU alone so background terminal I/O remains governed by
+    /// normal Unix job-control rules.
+    #[cfg(unix)]
+    pub fn continue_if_stopped(&self) -> Result<bool> {
+        self.inner.continue_if_stopped()
     }
 }
 
@@ -412,7 +617,7 @@ fn spawn_child(command: ChildCommand) -> Result<SpawnedPty> {
 
     Ok(SpawnedPty {
         master,
-        child: PtyChild { child, pid },
+        child: PtyChild::new(ProcessChild { child, pid }),
     })
 }
 
@@ -429,12 +634,184 @@ fn spawn_child(_command: ChildCommand) -> Result<SpawnedPty> {
         let pid = child.pid();
         Ok(SpawnedPty {
             master,
-            child: PtyChild { child, pid },
+            child: PtyChild::new(ProcessChild { child, pid }),
         })
     }
 
     #[cfg(not(windows))]
     {
         Err(PtyError::Unsupported(unsupported_op::SPAWN_PTY_CHILD))
+    }
+}
+
+#[cfg(all(test, unix))]
+mod tests {
+    use std::ffi::OsStr;
+    use std::fs::File;
+    use std::io::Write;
+    use std::os::unix::process::ExitStatusExt;
+    use std::path::Path;
+    use std::process::ExitStatus;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::{Arc, Mutex};
+    use std::time::{Duration, Instant};
+
+    use super::{ChildCommand, ProcessId, PtyChild, RmuxShell, ShellChild, SpawnedPty};
+    use crate::{PtyMaster, PtyPair, PtySlave, Result, Signal, TerminalSize};
+
+    /// A shell child that never touches the operating system: it reports the
+    /// host process, records every signal, and exits once signaled.
+    #[derive(Debug)]
+    struct ScriptedChild {
+        exit: ExitStatus,
+        killed: Arc<AtomicBool>,
+        signals: Arc<Mutex<Vec<Signal>>>,
+        _terminal: PtySlave,
+    }
+
+    impl ShellChild for ScriptedChild {
+        fn pid(&self) -> ProcessId {
+            ProcessId::new(std::process::id()).expect("host pid")
+        }
+
+        fn wait(&mut self) -> Result<ExitStatus> {
+            Ok(self.exit)
+        }
+
+        fn try_wait(&mut self) -> Result<Option<ExitStatus>> {
+            Ok(self.killed.load(Ordering::SeqCst).then_some(self.exit))
+        }
+
+        fn kill(&self, signal: Signal) -> Result<()> {
+            self.signals.lock().expect("signal log").push(signal);
+            self.killed.store(true, Ordering::SeqCst);
+            Ok(())
+        }
+
+        fn kill_session_leader(&self, signal: Signal) -> Result<()> {
+            self.kill(signal)
+        }
+
+        fn continue_if_stopped(&self) -> Result<bool> {
+            Ok(false)
+        }
+    }
+
+    #[derive(Debug)]
+    struct ScriptedShell {
+        output: &'static [u8],
+        exit: ExitStatus,
+        seen: Arc<Mutex<Option<ChildCommand>>>,
+        signals: Arc<Mutex<Vec<Signal>>>,
+    }
+
+    impl RmuxShell for ScriptedShell {
+        fn spawn(&self, command: ChildCommand) -> Result<SpawnedPty> {
+            let size = command.initial_size().unwrap_or(TerminalSize::new(80, 24));
+            *self.seen.lock().expect("spawn log") = Some(command);
+
+            let (master, slave) = PtyPair::open_with_size(size)?.into_split();
+            let mut terminal = File::from(slave.try_clone()?.into_owned_fd());
+            terminal.write_all(self.output)?;
+            drop(terminal);
+
+            Ok(SpawnedPty::new(
+                master,
+                PtyChild::new(ScriptedChild {
+                    exit: self.exit,
+                    killed: Arc::new(AtomicBool::new(false)),
+                    signals: Arc::clone(&self.signals),
+                    _terminal: slave,
+                }),
+            ))
+        }
+    }
+
+    fn read_from_master(master: &PtyMaster, len: usize) -> Vec<u8> {
+        let io = master.io();
+        let mut buffer = vec![0_u8; len];
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let mut offset = 0;
+        while offset < buffer.len() {
+            match io.try_read(&mut buffer[offset..]) {
+                Ok(0) => panic!("pty master reached end of file after {offset} bytes"),
+                Ok(read) => offset += read,
+                Err(error)
+                    if matches!(
+                        error.kind(),
+                        std::io::ErrorKind::WouldBlock | std::io::ErrorKind::Interrupted
+                    ) =>
+                {
+                    assert!(Instant::now() < deadline, "timed out reading pty master");
+                    std::thread::sleep(Duration::from_millis(5));
+                }
+                Err(error) => panic!("pty master read failed: {error}"),
+            }
+        }
+        buffer
+    }
+
+    #[test]
+    fn custom_shell_backend_drives_pty_child_through_the_trait() {
+        let seen = Arc::new(Mutex::new(None));
+        let signals = Arc::new(Mutex::new(Vec::new()));
+        let shell: Arc<dyn RmuxShell> = Arc::new(ScriptedShell {
+            output: b"scripted\n",
+            exit: ExitStatusExt::from_raw(3 << 8),
+            seen: Arc::clone(&seen),
+            signals: Arc::clone(&signals),
+        });
+
+        let mut spawned = shell
+            .spawn(
+                ChildCommand::new("/opt/brush")
+                    .arg0("-brush")
+                    .args(["-c", "true"])
+                    .env("RMUX_TEST", "1")
+                    .current_dir("/tmp")
+                    .clear_env()
+                    .size(TerminalSize::new(80, 24)),
+            )
+            .expect("scripted shell spawns");
+
+        let recorded = seen
+            .lock()
+            .expect("spawn log")
+            .take()
+            .expect("spawn request");
+        assert_eq!(recorded.program(), Path::new("/opt/brush"));
+        assert_eq!(recorded.argv0(), Some(OsStr::new("-brush")));
+        assert_eq!(recorded.arguments(), [OsStr::new("-c"), OsStr::new("true")]);
+        assert_eq!(
+            recorded.environment(),
+            [(
+                OsStr::new("RMUX_TEST").to_owned(),
+                OsStr::new("1").to_owned()
+            )]
+        );
+        assert!(recorded.clears_env());
+        assert_eq!(recorded.working_dir(), Some(Path::new("/tmp")));
+        assert_eq!(recorded.initial_size(), Some(TerminalSize::new(80, 24)));
+
+        assert_eq!(
+            spawned.master().size().expect("master size"),
+            TerminalSize::new(80, 24)
+        );
+        assert_eq!(read_from_master(spawned.master(), 10), b"scripted\r\n");
+
+        let child = spawned.child_mut();
+        assert_eq!(child.pid().as_u32(), std::process::id());
+        assert_eq!(child.try_wait().expect("try_wait"), None);
+
+        child.interrupt().expect("interrupt");
+        child.terminate_forcefully().expect("terminate");
+        assert_eq!(
+            *signals.lock().expect("signal log"),
+            [Signal::INT, Signal::KILL]
+        );
+        assert_eq!(
+            child.try_wait().expect("try_wait").and_then(|s| s.code()),
+            Some(3)
+        );
     }
 }

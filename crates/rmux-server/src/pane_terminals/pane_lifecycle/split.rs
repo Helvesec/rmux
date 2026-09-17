@@ -147,6 +147,7 @@ impl HandlerState {
         let lifecycle_cwd = profile.cwd().to_path_buf();
         let respawn_shell = profile.shell().to_path_buf();
         let mut terminal = match open_pane_terminal(
+            self.pane_shell.0.as_ref(),
             new_pane_geometry,
             profile,
             runtime_window_name.clone(),

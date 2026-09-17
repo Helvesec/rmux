@@ -441,6 +441,7 @@ impl RequestHandler {
                 rendered_start_directory.as_deref(),
             )?;
             let (job, initial_bytes) = spawn_popup_job(
+                state.pane_shell.0.as_ref(),
                 content_size,
                 &profile,
                 command_text.as_deref(),

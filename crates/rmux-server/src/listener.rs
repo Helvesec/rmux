@@ -105,6 +105,9 @@ pub(crate) async fn serve(
         io::Error::other("Unix socket access controller is missing from serve options")
     })?)?;
     handler.install_shutdown_handle(shutdown_handle.clone());
+    handler
+        .install_pane_shell(Arc::clone(&options.pane_shell))
+        .await;
     handler.set_socket_path(&socket_path);
     let lifecycle_events = handler
         .take_lifecycle_dispatch_receiver()
