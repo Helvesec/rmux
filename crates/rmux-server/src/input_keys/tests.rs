@@ -805,3 +805,37 @@ fn vt10x_keypad_keys_follow_application_mode() {
         b"\x1bOq"
     );
 }
+
+#[test]
+fn a_negotiated_pane_encodes_shift_enter_distinguishably() {
+    // the two halves in one place: a pane asks for disambiguation the way an
+    // application does, and the key that could not be told from Enter before
+    // goes out as its own sequence
+    use rmux_core::TerminalScreen;
+    use rmux_proto::TerminalSize;
+
+    let mut pane = TerminalScreen::new(TerminalSize::new(80, 24), 100);
+    let ambiguous = encode_key(
+        pane.screen().mode(),
+        ExtendedKeyFormat::Xterm,
+        parse_key("S-Enter"),
+    )
+    .expect("encode");
+    assert_eq!(
+        ambiguous,
+        b"\n",
+        "an application cannot tell this from the Enter it is given for C-j"
+    );
+
+    pane.feed(b"\x1b[>1u");
+    let distinct = encode_key(
+        pane.screen().mode(),
+        ExtendedKeyFormat::Xterm,
+        parse_key("S-Enter"),
+    )
+    .expect("encode");
+    assert_eq!(distinct, b"\x1b[13;2u");
+
+    pane.feed(b"\x1b[?u");
+    assert_eq!(pane.take_replies(), b"\x1b[?1u", "and says so when asked");
+}

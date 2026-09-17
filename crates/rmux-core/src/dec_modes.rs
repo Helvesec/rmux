@@ -18,6 +18,25 @@
 
 use crate::input::mode;
 
+/// The sequence that puts a pane's keyboard protocol in force, highest first,
+/// or `None` when the pane is under none of them.
+///
+/// Kitty is stated with `CSI = flags ; 1 u` rather than pushed with
+/// `CSI > flags u`: these modes are re-asserted over and over, and every push
+/// would grow a stack on the far side that is not ours to spend.
+fn keyboard_protocol(mode_bits: u32) -> Option<&'static [u8]> {
+    let on = |bit: u32| mode_bits & bit != 0;
+    if on(mode::MODE_KEYS_KITTY) {
+        Some(b"\x1b[=1;1u")
+    } else if on(mode::MODE_KEYS_EXTENDED_2) {
+        Some(b"\x1b[>4;2m")
+    } else if on(mode::MODE_KEYS_EXTENDED) {
+        Some(b"\x1b[>4;1m")
+    } else {
+        None
+    }
+}
+
 /// Appends the DEC private *interactive* mode setters implied by `mode_bits`
 /// (and the DECSCUSR `cursor_style`) to `out`.
 ///
@@ -90,13 +109,8 @@ pub fn render_dec_modes(mode_bits: u32, cursor_style: u32, out: &mut Vec<u8>) {
         out.extend_from_slice(b"\x1b[?1005h");
     }
 
-    // Keyboard enhancement protocols.
-    if on(mode::MODE_KEYS_KITTY) {
-        out.extend_from_slice(b"\x1b[>1u");
-    } else if on(mode::MODE_KEYS_EXTENDED_2) {
-        out.extend_from_slice(b"\x1b[>4;2m");
-    } else if on(mode::MODE_KEYS_EXTENDED) {
-        out.extend_from_slice(b"\x1b[>4;1m");
+    if let Some(keyboard) = keyboard_protocol(mode_bits) {
+        out.extend_from_slice(keyboard);
     }
 
     // Cursor style (DECSCUSR). 0 == "terminal default" → leave untouched.
@@ -175,15 +189,11 @@ pub fn render_dec_modes_for_snapshot(mode_bits: u32, cursor_style: u32, out: &mu
         out.extend_from_slice(b"\x1b[?1005h");
     }
 
-    if on(mode::MODE_KEYS_KITTY) {
-        out.extend_from_slice(b"\x1b[>1u");
-    } else if on(mode::MODE_KEYS_EXTENDED_2) {
-        out.extend_from_slice(b"\x1b[>4;2m");
-    } else if on(mode::MODE_KEYS_EXTENDED) {
-        out.extend_from_slice(b"\x1b[>4;1m");
-    } else {
-        out.extend_from_slice(b"\x1b[<u");
-        out.extend_from_slice(b"\x1b[>4;0m");
+    match keyboard_protocol(mode_bits) {
+        Some(keyboard) => out.extend_from_slice(keyboard),
+        // a receiver may be showing an older state, so off is said out loud —
+        // said, not popped: the stack it keeps is its own
+        None => out.extend_from_slice(b"\x1b[=0;1u\x1b[>4;0m"),
     }
 
     out.extend_from_slice(format!("\x1b[{cursor_style} q").as_bytes());
@@ -254,7 +264,7 @@ mod tests {
             | mode::MODE_KEYS_EXTENDED_2
             | mode::MODE_KEYS_KITTY;
         let out = rendered(bits, 0);
-        assert!(out.contains("\x1b[>1u"), "{out:?}");
+        assert!(out.contains("\x1b[=1;1u"), "{out:?}");
         assert!(!out.contains("\x1b[>4;2m"), "{out:?}");
     }
 
@@ -267,7 +277,9 @@ mod tests {
         assert!(out.contains("\x1b[?2026l"), "{out:?}");
         assert!(out.contains("\x1b[?2004l"), "{out:?}");
         assert!(out.contains("\x1b[?1006l"), "{out:?}");
-        assert!(out.contains("\x1b[<u"), "{out:?}");
+        // off is stated, not popped: the receiver's stack is its own
+        assert!(out.contains("\x1b[=0;1u"), "{out:?}");
+        assert!(!out.contains("\x1b[<u"), "{out:?}");
         assert!(out.contains("\x1b[>4;0m"), "{out:?}");
         assert!(out.contains("\x1b[0 q"), "{out:?}");
         assert!(!out.contains("\x1b[?2026h"), "{out:?}");
@@ -302,7 +314,7 @@ mod tests {
         render_dec_modes_for_snapshot(bits, 0, &mut out);
         let out = String::from_utf8(out).expect("snapshot modes are ascii");
 
-        assert!(out.contains("\x1b[>1u"), "{out:?}");
+        assert!(out.contains("\x1b[=1;1u"), "{out:?}");
         assert!(!out.contains("\x1b[>4;2m"), "{out:?}");
     }
 }

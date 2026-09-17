@@ -10,6 +10,7 @@ mod colour;
 mod commands;
 mod csi_helpers;
 mod dispatch;
+mod kitty;
 pub mod mode;
 mod params;
 mod passthrough;
@@ -131,6 +132,9 @@ pub struct InputParser {
     utf8_expected: u8,
     utf8_started: bool,
 
+    /// Kitty keyboard negotiation, which each screen does independently.
+    kitty: kitty::KittyScreens,
+
     /// Last printed character data for REP.
     last_char: Option<char>,
     /// Whether this parse call emitted a printable character before REP.
@@ -177,6 +181,7 @@ impl InputParser {
             utf8_len: 0,
             utf8_expected: 0,
             utf8_started: false,
+            kitty: kitty::KittyScreens::default(),
             last_char: None,
             printed_in_current_parse: false,
             recovery_rebase_required: false,

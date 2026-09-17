@@ -3,53 +3,14 @@ use super::*;
 #[test]
 fn modset_extended_keys_mode_2() {
     let (_p, w) = parse(b"\x1b[>4;2m");
-    assert!(w.has_call("mode_clear(0x248000)")); // EXTENDED_KEY_MODES
+    assert!(w.has_call("mode_clear(0x48000)")); // XTERM_KEY_MODES
     assert!(w.has_call("mode_set(0x40000)")); // MODE_KEYS_EXTENDED_2
 }
 
 #[test]
 fn modoff_clears_extended_keys() {
     let (_p, w) = parse(b"\x1b[>4n");
-    assert!(w.has_call("mode_clear(0x248000)")); // EXTENDED_KEY_MODES
-}
-
-#[test]
-fn kitty_keyboard_requests_are_consumed_without_negotiating_support() {
-    for request in [
-        b"\x1b[=8u".as_slice(),
-        b"\x1b[=0u".as_slice(),
-        b"\x1b[=1;3u".as_slice(),
-        b"\x1b[>1u".as_slice(),
-        b"\x1b[>0u".as_slice(),
-        b"\x1b[>1;3u".as_slice(),
-        b"\x1b[<u".as_slice(),
-        b"\x1b[<2u".as_slice(),
-        b"\x1b[?u".as_slice(),
-    ] {
-        let (parser, writer) = parse(request);
-
-        assert!(parser.reply_buf.is_empty(), "request {request:?}");
-        assert_eq!(writer.mode, MODE_CURSOR | MODE_WRAP, "request {request:?}");
-        assert!(!writer.has_call("mode_set("), "request {request:?}");
-        assert!(!writer.has_call("mode_clear("), "request {request:?}");
-    }
-}
-
-#[test]
-fn kitty_keyboard_requests_preserve_xterm_extended_key_mode() {
-    let (_parser, writer) = parse(b"\x1b[>4;2m\x1b[=8u\x1b[>1u\x1b[<u\x1b[?u");
-    let mode_transitions = writer
-        .calls
-        .iter()
-        .filter(|call| call.starts_with("mode_set(") || call.starts_with("mode_clear("))
-        .map(String::as_str)
-        .collect::<Vec<_>>();
-
-    assert_eq!(writer.mode, MODE_CURSOR | MODE_WRAP | MODE_KEYS_EXTENDED_2);
-    assert_eq!(
-        mode_transitions,
-        ["mode_clear(0x248000)", "mode_set(0x40000)"]
-    );
+    assert!(w.has_call("mode_clear(0x48000)")); // XTERM_KEY_MODES
 }
 
 // ─── Hardening: ground timer ───────────────────────────────────────

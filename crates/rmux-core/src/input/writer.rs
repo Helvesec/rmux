@@ -97,6 +97,12 @@ pub trait ScreenWriter {
     fn alternate_on(&mut self, bg: i32, save_cursor: bool) {}
     /// Switch back from alternate screen.
     fn alternate_off(&mut self, bg: i32, restore_cursor: bool) {}
+    /// Whether the alternate screen is the one showing. Asked rather than
+    /// remembered: a second copy of this would drift the first time a screen
+    /// changed by any route the parser does not see.
+    fn is_alternate(&self) -> bool {
+        false
+    }
 
     // ─── Attributes ────────────────────────────────────────────
     /// Reset cell attributes to default.

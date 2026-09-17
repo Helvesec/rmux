@@ -74,7 +74,11 @@ pub(crate) fn encode_key_with_backspace(
         return key_code_to_bytes(key);
     }
 
-    if (pane_mode & mode::MODE_KEYS_EXTENDED_2) != 0 {
+    // Kitty is an extended-key mode in its own right: a pane that negotiated it
+    // asked for every modified key as a sequence, and gating that on the xterm
+    // modes left disambiguation working only for an application that happened
+    // to enable both.
+    if (pane_mode & (mode::MODE_KEYS_EXTENDED_2 | mode::MODE_KEYS_KITTY)) != 0 {
         input_key_extended(key, format).or_else(|| input_key_vt10x(pane_mode, key, backspace))
     } else if (pane_mode & mode::MODE_KEYS_EXTENDED) != 0 {
         input_key_mode1(key, backspace)

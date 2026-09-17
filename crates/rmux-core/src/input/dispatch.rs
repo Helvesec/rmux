@@ -6,6 +6,7 @@ pub use super::writer::ScreenWriter;
 use super::csi_helpers::{
     dispatch_rm, dispatch_rm_private, dispatch_sm, dispatch_sm_private, dispatch_winops,
 };
+use super::kitty;
 use super::mode;
 use super::sgr;
 use super::tables;
@@ -65,6 +66,8 @@ pub(crate) fn dispatch_esc<W: ScreenWriter + ?Sized>(parser: &mut InputParser, w
     match cmd {
         EscCommand::Ris => {
             parser.cell.reset();
+            parser.kitty.reset();
+            kitty::apply(&parser.kitty, writer);
             writer.full_reset();
         }
         EscCommand::Ind => {
@@ -401,28 +404,48 @@ pub(crate) fn dispatch_csi<W: ScreenWriter + ?Sized>(parser: &mut InputParser, w
                 return;
             }
             let m = parser.param_list.get(1, 0, 0);
-            writer.mode_clear(mode::EXTENDED_KEY_MODES);
+            // `CSI > 4 ; m` is the xterm protocol's, so it ends the Kitty
+            // negotiation rather than reaching past it: a pane left with flags
+            // it is not honouring answers the next query with a mode it is not
+            // in, and the request after that takes this one back.
+            kitty::negotiate(&mut parser.kitty, writer, kitty::KittyKeyboard::clear_flags);
+            writer.mode_clear(mode::XTERM_KEY_MODES);
             match m {
                 2 => writer.mode_set(mode::MODE_KEYS_EXTENDED_2),
                 1 => writer.mode_set(mode::MODE_KEYS_EXTENDED),
                 _ => {}
             }
         }
-        // RMUX 0.9 does not implement the complete Kitty keyboard protocol.
-        // Consume every negotiation form without replying or changing the
-        // pane's key mode: accepting Set/Push while ignoring Query advertises
-        // a partial protocol that applications cannot use losslessly, and Pop
-        // must not clear an independently enabled xterm extended-key mode.
-        CsiCommand::KittyKeyboardSet
-        | CsiCommand::KittyKeyboardPush
-        | CsiCommand::KittyKeyboardPop
-        | CsiCommand::KittyKeyboardQuery => {}
+        // Kitty keyboard protocol, disambiguation only. Every request is
+        // masked to what rmux implements, and the query reply is how an
+        // application that asked for more finds out what it got — which is the
+        // part the protocol relies on to degrade.
+        CsiCommand::KittyKeyboardSet => {
+            let (flags, mode) = (
+                parser.param_list.get(0, 0, 0),
+                kitty::SetMode::from_param(parser.param_list.get(1, 0, 1)),
+            );
+            kitty::negotiate(&mut parser.kitty, writer, |screen| screen.set(flags, mode));
+        }
+        CsiCommand::KittyKeyboardPush => {
+            let flags = parser.param_list.get(0, 0, 0);
+            kitty::negotiate(&mut parser.kitty, writer, |screen| screen.push(flags));
+        }
+        CsiCommand::KittyKeyboardPop => {
+            let count = parser.param_list.get(0, 0, 1);
+            kitty::negotiate(&mut parser.kitty, writer, |screen| screen.pop(count));
+        }
+        CsiCommand::KittyKeyboardQuery => {
+            let flags = parser.kitty.flags(writer.is_alternate());
+            parser.reply(&format!("\x1b[?{flags}u"));
+        }
         CsiCommand::Modoff => {
             let n = parser.param_list.get(0, 0, 0);
             if n != 4 {
                 return;
             }
-            writer.mode_clear(mode::EXTENDED_KEY_MODES);
+            kitty::negotiate(&mut parser.kitty, writer, kitty::KittyKeyboard::clear_flags);
+            writer.mode_clear(mode::XTERM_KEY_MODES);
         }
         CsiCommand::Scp => {
             // Save cursor position.

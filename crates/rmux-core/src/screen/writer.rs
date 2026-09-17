@@ -478,6 +478,10 @@ impl ScreenWriter for Screen {
         }
     }
 
+    fn is_alternate(&self) -> bool {
+        Screen::is_alternate(self)
+    }
+
     fn full_reset(&mut self) {
         self.clear_selected_cells();
         if self.is_alternate() {

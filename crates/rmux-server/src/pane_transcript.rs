@@ -767,6 +767,7 @@ fn visible_revision_reuse_map(previous: &[u64], next: &[u64]) -> Option<Vec<Opti
 #[cfg(test)]
 mod tests {
     use super::{visible_revision_reuse_map, PaneTranscript};
+    use rmux_core::input::mode;
     use rmux_core::{GridRenderOptions, ScreenCaptureRange, TerminalPaletteIndex, TerminalScreen};
     use rmux_proto::TerminalSize;
     use std::time::{Duration, Instant};
@@ -1077,22 +1078,25 @@ mod tests {
     }
 
     #[test]
-    fn append_bytes_ignores_kitty_keyboard_negotiation() {
+    fn append_bytes_negotiates_kitty_keyboard_for_the_pane() {
         let mut transcript = transcript(40, 4, 10);
         let initial_mode = transcript.mode();
 
-        for request in [
-            b"\x1b[=8u".as_slice(),
-            b"\x1b[>1u".as_slice(),
-            b"\x1b[<u".as_slice(),
-            b"\x1b[?u".as_slice(),
-        ] {
-            assert!(transcript
-                .append_bytes_with_effects(request)
-                .replies
-                .is_empty());
-            assert_eq!(transcript.mode(), initial_mode, "request {request:?}");
-        }
+        // a flag rmux does not implement leaves the pane as it was
+        let result = transcript.append_bytes_with_effects(b"\x1b[=8u");
+        assert!(result.replies.is_empty());
+        assert_eq!(transcript.mode(), initial_mode);
+
+        // disambiguation is the one it does
+        transcript.append_bytes_with_effects(b"\x1b[>1u");
+        assert_ne!(transcript.mode() & mode::MODE_KEYS_KITTY, 0);
+
+        // and the query answers with what the pane actually got
+        let result = transcript.append_bytes_with_effects(b"\x1b[?u");
+        assert_eq!(result.replies, b"\x1b[?1u");
+
+        transcript.append_bytes_with_effects(b"\x1b[<u");
+        assert_eq!(transcript.mode(), initial_mode, "the pop put it back");
     }
 
     #[test]

@@ -16,6 +16,7 @@ struct RecordingWriter {
     sx: u32,
     sy: u32,
     chars: Vec<char>,
+    alternate: bool,
 }
 
 impl RecordingWriter {
@@ -138,9 +139,11 @@ impl ScreenWriter for RecordingWriter {
             .push(format!("set_scroll_region({top}, {bottom})"));
     }
     fn alternate_on(&mut self, bg: i32, save: bool) {
+        self.alternate = true;
         self.calls.push(format!("alternate_on({bg}, {save})"));
     }
     fn alternate_off(&mut self, bg: i32, restore: bool) {
+        self.alternate = false;
         self.calls.push(format!("alternate_off({bg}, {restore})"));
     }
     fn set_tab_stop(&mut self) {
@@ -164,6 +167,10 @@ impl ScreenWriter for RecordingWriter {
     fn alignment_test(&mut self) {
         self.calls.push("alignment_test()".to_owned());
     }
+    fn is_alternate(&self) -> bool {
+        self.alternate
+    }
+
     fn full_reset(&mut self) {
         self.calls.push("full_reset()".to_owned());
     }
@@ -316,3 +323,6 @@ mod extended_timers_utf8;
 
 #[path = "tests/winops_and_resets.rs"]
 mod winops_and_resets;
+
+/// Kitty keyboard protocol negotiation.
+mod kitty_keyboard;

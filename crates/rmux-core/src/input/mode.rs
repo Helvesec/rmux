@@ -49,3 +49,6 @@ pub const MODE_KEYS_KITTY: u32 = 0x20_0000;
 pub const ALL_MOUSE_MODES: u32 = MODE_MOUSE_STANDARD | MODE_MOUSE_BUTTON | MODE_MOUSE_ALL;
 /// Extended key modes combined.
 pub const EXTENDED_KEY_MODES: u32 = MODE_KEYS_EXTENDED | MODE_KEYS_EXTENDED_2 | MODE_KEYS_KITTY;
+/// The two xterm `modifyOtherKeys` levels, which `CSI > 4 m` owns. Kitty is
+/// left out: its bit follows the negotiation, and only `kitty::apply` writes it.
+pub const XTERM_KEY_MODES: u32 = MODE_KEYS_EXTENDED | MODE_KEYS_EXTENDED_2;
