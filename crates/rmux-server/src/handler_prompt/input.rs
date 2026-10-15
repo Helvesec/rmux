@@ -40,7 +40,7 @@ impl PromptInputEvent {
 }
 
 pub(in super::super) fn decode_prompt_key(key: KeyCode) -> PromptInputEvent {
-    let name = key_string_lookup_key(key_code_lookup_bits(key), false).to_owned();
+    let name = key_string_lookup_key(key_code_lookup_bits(key), false);
     match name.as_str() {
         "Left" => PromptInputEvent::Left,
         "Right" => PromptInputEvent::Right,
@@ -58,7 +58,7 @@ pub(in super::super) fn decode_prompt_key(key: KeyCode) -> PromptInputEvent {
 
 #[cfg(test)]
 mod tests {
-    use rmux_core::{KEYC_CTRL, KEYC_META};
+    use rmux_core::{key_string_lookup_string, KEYC_CTRL, KEYC_META};
 
     use super::{decode_prompt_key, PromptInputEvent};
 
@@ -76,5 +76,18 @@ mod tests {
             decode_prompt_key(u64::from(b't') | KEYC_CTRL),
             PromptInputEvent::KeyName("C-t".to_owned())
         );
+    }
+
+    #[test]
+    fn named_input_preserves_key_modifiers() {
+        for name in ["q", "C-q", "M-q", "C-M-Left", "S-Up"] {
+            let key = key_string_lookup_string(name).expect("valid key");
+            assert_eq!(
+                decode_prompt_key(key),
+                PromptInputEvent::KeyName(name.to_owned())
+            );
+        }
+        let left = key_string_lookup_string("Left").expect("left key");
+        assert_eq!(decode_prompt_key(left), PromptInputEvent::Left);
     }
 }

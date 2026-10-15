@@ -1281,6 +1281,7 @@ dependencies = [
 name = "rmux-core"
 version = "0.10.0"
 dependencies = [
+ "base64",
  "chrono",
  "compact_str",
  "regex",

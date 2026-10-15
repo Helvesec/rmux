@@ -519,7 +519,8 @@ async fn display_message_print_uses_stored_default_window_name_for_detached_sess
             .set(
                 ScopeSelector::Global,
                 OptionName::DefaultShell,
-                "/bin/bash".to_owned(),
+                // Resolve Bash through PATH on non-FHS hosts such as NixOS.
+                "bash".to_owned(),
                 SetOptionMode::Replace,
             )
             .expect("test default-shell is valid");

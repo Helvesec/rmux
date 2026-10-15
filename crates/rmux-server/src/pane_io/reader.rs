@@ -222,6 +222,7 @@ struct PanePublishContext<'a> {
     pane_output: &'a PaneOutputSender,
     generation: Option<u64>,
     pane_alert_callback: Option<&'a PaneAlertCallback>,
+    status_terminal: Option<&'a PtyIo>,
     emit_no_bell_alert: bool,
 }
 
@@ -232,6 +233,7 @@ struct OwnedPanePublishContext {
     pane_output: PaneOutputSender,
     generation: Option<u64>,
     pane_alert_callback: Option<PaneAlertCallback>,
+    status_terminal: Option<PtyIo>,
     emit_no_bell_alert: bool,
 }
 
@@ -411,7 +413,7 @@ async fn read_pane_output(
                     "pane PTY reader exhausted startup EIO retries before first output"
                 );
             }
-            let _ = pane_output.send_for_generation(generation, Vec::new());
+            publish_pane_eof(&transcript, &pane_output, generation);
             if let Some(callback) = &pane_exit_callback {
                 callback(PaneExitEvent::eof_published(
                     session_name.clone(),
@@ -460,6 +462,7 @@ async fn read_pane_output(
                     pane_output: &pane_output,
                     generation,
                     pane_alert_callback: pane_alert_callback.as_ref(),
+                    status_terminal: Some(pane_reader.get_ref()),
                     emit_no_bell_alert,
                 },
                 bytes,
@@ -473,6 +476,12 @@ async fn read_pane_output(
                     pane_output: pane_output.clone(),
                     generation,
                     pane_alert_callback: pane_alert_callback.clone(),
+                    status_terminal: Some(
+                        pane_reader
+                            .get_ref()
+                            .try_clone()
+                            .map_err(io::Error::other)?,
+                    ),
                     emit_no_bell_alert,
                 },
                 bytes,
@@ -514,7 +523,7 @@ fn read_pane_output_blocking(
             Err(error) => return Err(error),
         };
         if bytes_read == 0 {
-            let _ = pane_output.send_for_generation(generation, Vec::new());
+            publish_pane_eof(&transcript, &pane_output, generation);
             eof_state.mark_published();
             if let Some(callback) = &pane_exit_callback {
                 callback(PaneExitEvent::eof_published(
@@ -534,12 +543,27 @@ fn read_pane_output_blocking(
                 pane_output: &pane_output,
                 generation,
                 pane_alert_callback: pane_alert_callback.as_ref(),
+                status_terminal: None,
                 emit_no_bell_alert: true,
             },
             buffer[..bytes_read].to_vec(),
         );
         write_parser_replies_to_pane_blocking(&pane_reader, replies)?;
     }
+}
+
+fn publish_pane_eof(
+    transcript: &SharedPaneTranscript,
+    pane_output: &PaneOutputSender,
+    generation: Option<u64>,
+) {
+    let _ = pane_output.publish_for_generation_with_invalidation(generation, Vec::new(), |_| {
+        transcript
+            .lock()
+            .expect("pane transcript mutex must not be poisoned")
+            .expire_program_status();
+        ((), Vec::new(), None)
+    });
 }
 
 fn publish_pane_bytes(context: PanePublishContext<'_>, bytes: Vec<u8>) -> Vec<u8> {
@@ -550,8 +574,11 @@ fn publish_pane_bytes(context: PanePublishContext<'_>, bytes: Vec<u8>) -> Vec<u8
         pane_output,
         generation,
         pane_alert_callback,
+        status_terminal,
         emit_no_bell_alert,
     } = context;
+    #[cfg(not(unix))]
+    let _ = status_terminal;
     if !pane_output.accepts_generation(generation) {
         return Vec::new();
     }
@@ -560,10 +587,28 @@ fn publish_pane_bytes(context: PanePublishContext<'_>, bytes: Vec<u8>) -> Vec<u8
             let mut transcript = transcript
                 .lock()
                 .expect("pane transcript mutex must not be poisoned");
+            // Sample within the generation-checked transcript publication, not
+            // before a potentially delayed blocking parse job.
+            #[cfg(unix)]
+            if let Some(terminal) = status_terminal {
+                transcript.observe_foreground_group(rmux_os::process::unix::foreground_pid(
+                    terminal.as_fd(),
+                ));
+            }
             let mouse_mode_before = transcript.mode() & rmux_core::input::mode::ALL_MOUSE_MODES;
             let mut append_result = transcript.append_bytes_with_effects(bytes);
             let mouse_mode_changed =
                 transcript.mode() & rmux_core::input::mode::ALL_MOUSE_MODES != mouse_mode_before;
+            // The entire reader-owned batch must be parsed before an empty
+            // kernel queue can establish the end of the old foreground drain.
+            #[cfg(unix)]
+            if transcript.program_status_transition_pending()
+                && status_terminal.is_some_and(|terminal| {
+                    rustix::io::ioctl_fionread(terminal).is_ok_and(|count| count == 0)
+                })
+            {
+                transcript.finish_program_status_drain();
+            }
             let passthroughs = std::mem::take(&mut append_result.passthroughs);
             let clipboard_set = passthroughs.iter().any(passthrough_is_clipboard_set);
             let clipboard_writes = passthroughs
@@ -651,6 +696,7 @@ pub(crate) fn publish_pane_bytes_capturing_alerts(
                 pane_output,
                 generation: None,
                 pane_alert_callback: Some(&callback),
+                status_terminal: None,
                 emit_no_bell_alert: false,
             },
             bytes,
@@ -680,6 +726,7 @@ pub(crate) fn publish_pane_bytes_for_test(
             pane_output,
             generation: None,
             pane_alert_callback: None,
+            status_terminal: None,
             emit_no_bell_alert: false,
         },
         bytes,
@@ -878,6 +925,7 @@ async fn publish_pane_bytes_on_blocking_pool(
                 pane_output: &context.pane_output,
                 generation: context.generation,
                 pane_alert_callback: context.pane_alert_callback.as_ref(),
+                status_terminal: context.status_terminal.as_ref(),
                 emit_no_bell_alert: context.emit_no_bell_alert,
             },
             bytes,
@@ -892,6 +940,7 @@ async fn publish_pane_bytes_on_blocking_pool(
             pane_output: &context.pane_output,
             generation: context.generation,
             pane_alert_callback: context.pane_alert_callback.as_ref(),
+            status_terminal: context.status_terminal.as_ref(),
             emit_no_bell_alert: context.emit_no_bell_alert,
         };
         publish_pane_bytes(context, bytes)
@@ -980,6 +1029,10 @@ fn spawn_blocking_pane_output_reader_inner(
         );
     }
 }
+
+#[cfg(test)]
+#[path = "reader/program_status_tests.rs"]
+mod program_status_tests;
 
 #[cfg(test)]
 mod tests {
@@ -1139,6 +1192,7 @@ mod tests {
                 pane_output: &output,
                 generation: None,
                 pane_alert_callback: Some(&callback),
+                status_terminal: None,
                 emit_no_bell_alert: false,
             },
             b"\x1b]2;linearized-title\x07".to_vec(),
@@ -1175,6 +1229,7 @@ mod tests {
                 pane_output: &output,
                 generation: None,
                 pane_alert_callback: Some(&callback),
+                status_terminal: None,
                 emit_no_bell_alert: false,
             },
             b"\x1b[?1003h".to_vec(),
@@ -1197,6 +1252,7 @@ mod tests {
             pane_output: &output,
             generation: None,
             pane_alert_callback: None,
+            status_terminal: None,
             emit_no_bell_alert: false,
         };
 
@@ -1264,6 +1320,7 @@ mod tests {
                 pane_output: &output,
                 generation: None,
                 pane_alert_callback: Some(&callback),
+                status_terminal: None,
                 emit_no_bell_alert: false,
             },
             b"\x1b]52;zzpc;?\x1b\\".to_vec(),

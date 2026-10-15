@@ -159,6 +159,8 @@ pub enum OscCommand {
     ResetCursor,
     /// OSC 133 — Shell integration / prompt mark.
     ShellIntegration,
+    /// OSC 7501 — Program status report or support query.
+    ProgramStatus,
 }
 
 /// DCS payload delivered to the screen writer.

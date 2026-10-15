@@ -15,7 +15,7 @@ use super::{
 /// Sort orders accepted by `list-keys -O`.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub enum KeyBindingSortOrder {
-    /// Sort by key code.
+    /// Preserve default listing order, then sort custom bindings by key code.
     #[default]
     Key,
     /// Sort by modifier bits.

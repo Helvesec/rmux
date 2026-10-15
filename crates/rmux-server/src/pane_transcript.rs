@@ -51,6 +51,9 @@ pub(crate) struct PaneTranscript {
     ground_timer_started_at: Option<Instant>,
     ground_timer_token: u64,
     pending_palette_queries: PendingPaletteQueries,
+    process_exited: bool,
+    foreground_group: Option<u32>,
+    foreground_transition_pending: bool,
     #[cfg(test)]
     utf8_config: Utf8Config,
 }
@@ -113,6 +116,9 @@ impl PaneTranscript {
             ground_timer_started_at: None,
             ground_timer_token: 0,
             pending_palette_queries: PendingPaletteQueries::default(),
+            process_exited: false,
+            foreground_group: None,
+            foreground_transition_pending: false,
             #[cfg(test)]
             utf8_config: Utf8Config::default(),
         }
@@ -150,6 +156,11 @@ impl PaneTranscript {
         let title_after = self.terminal.screen().title().to_owned();
         let title_changed = title_after != title_before;
         let path_changed = self.terminal.screen().path() != path_before;
+        // Exit can be observed before the last buffered PTY bytes are drained.
+        // Preserve done/error results but never resurrect an active dead process.
+        if self.process_exited || self.foreground_transition_pending {
+            self.terminal.screen_mut().expire_program_status();
+        }
         let passthroughs = self.terminal.take_terminal_passthrough();
         self.pending_palette_queries.register(&passthroughs, now);
         let dropped_passthrough_count = self.terminal.take_terminal_passthrough_dropped_count();
@@ -256,6 +267,43 @@ impl PaneTranscript {
         self.ground_timer_token = self.ground_timer_token.saturating_add(1);
         self.pending_palette_queries.clear();
         self.mode = None;
+    }
+
+    pub(crate) fn program_status(&self) -> &rmux_core::ProgramStatus {
+        self.terminal.screen().program_status()
+    }
+
+    /// Foreground process-group changes invalidate active reports even for
+    /// shells without OSC 133. This is a lifecycle heuristic, not writer identity.
+    pub(crate) fn observe_foreground_group(&mut self, group: Option<u32>) {
+        let Some(group) = group.filter(|group| *group > 0) else {
+            return;
+        };
+        if self.foreground_group.is_some_and(|old| old != group) {
+            // Bytes already queued (or read but not yet parsed) may still belong
+            // to the old group. Fail closed until that queue AND any fragmented
+            // sequence have drained; parsing them must not resurrect active state.
+            // Even an entire first report may still be in the reader's buffer.
+            // Absence of parsed records/fragments does not prove a clean drain.
+            self.foreground_transition_pending = true;
+            self.terminal.screen_mut().expire_program_status();
+        }
+        self.foreground_group = Some(group);
+    }
+
+    pub(crate) fn program_status_transition_pending(&self) -> bool {
+        self.foreground_transition_pending
+    }
+
+    pub(crate) fn finish_program_status_drain(&mut self) {
+        if self.foreground_transition_pending && self.terminal.pending_bytes().is_empty() {
+            self.foreground_transition_pending = false;
+        }
+    }
+
+    pub(crate) fn expire_program_status(&mut self) {
+        self.process_exited = true;
+        self.terminal.screen_mut().expire_program_status();
     }
 
     pub(crate) const fn output_sequence(&self) -> u64 {

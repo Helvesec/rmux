@@ -24,6 +24,57 @@ fn test_context() -> CopyModeCommandContext {
 }
 
 #[test]
+fn unchanged_resize_preserves_scrollback_cursor_selection_and_search() {
+    for context in [test_context(), vi_context()] {
+        let size = TerminalSize { cols: 20, rows: 3 };
+        let screen = build_screen(
+            20,
+            3,
+            "line1\r\nline2\r\nline3\r\nline4\r\nline5\r\nline6\r\n",
+        );
+        let mut state = CopyModeState::new(screen, None, false, &context, true, true);
+        for (command, args) in [
+            ("history-top", Vec::new()),
+            ("search-forward", vec!["line2".to_owned()]),
+            ("begin-selection", Vec::new()),
+            ("cursor-down", Vec::new()),
+        ] {
+            assert!(
+                state.execute_command(command, &args, &context).is_ok(),
+                "{command}"
+            );
+        }
+        let summary = state.summary();
+        let view = state.render_screen();
+        assert!(summary.scroll_position > 0);
+        assert!(summary.selection_present);
+        assert!(summary.search_present);
+        // Both the initial attach and the subsequent client-size notification
+        // can apply the same dimensions; neither should alter copy mode.
+        state.resize(size);
+        state.resize(size);
+        assert_eq!(state.summary(), summary);
+        assert_eq!(state.render_screen(), view);
+    }
+}
+
+#[test]
+fn changed_resize_still_reflows_copy_mode_and_clears_selection() {
+    let mut state =
+        CopyModeState::for_test(build_screen(20, 3, "line1\r\nline2\r\nline3\r\nline4\r\n"));
+    let context = test_context();
+    assert!(state.execute_command("history-top", &[], &context).is_ok());
+    assert!(state
+        .execute_command("begin-selection", &[], &context)
+        .is_ok());
+    assert!(state.summary().selection_present);
+    let size = TerminalSize { cols: 12, rows: 5 };
+    state.resize(size);
+    assert_eq!(state.render_screen().size(), size);
+    assert!(!state.summary().selection_present);
+}
+
+#[test]
 fn summary_top_line_time_is_zero_for_visible_lines_at_bottom() {
     let screen = build_screen(20, 5, "line1\r\nline2\r\n");
     let state = CopyModeState::for_test(screen);

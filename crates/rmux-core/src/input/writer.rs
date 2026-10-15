@@ -175,6 +175,12 @@ pub trait ScreenWriter {
     fn osc_reset_cursor(&mut self) {}
     /// Handle OSC 133 shell integration.
     fn osc_shell_integration(&mut self, data: &str) {}
+    /// Whether this writer stores OSC 7501 program-status reports.
+    fn supports_program_status(&self) -> bool {
+        false
+    }
+    /// Handle an OSC 7501 report (not a support query).
+    fn osc_program_status(&mut self, data: &str, end: InputEndType) {}
 
     // ─── DCS handlers ──────────────────────────────────────────
     /// Handle DCS passthrough string.

@@ -491,6 +491,7 @@ pub(crate) fn dispatch_osc<W: ScreenWriter + ?Sized>(parser: &mut InputParser, w
     // Owned: the OSC 10/11/12 arms below mutate parser state (stored colours
     // and the reply buffer) while the payload is still in use.
     let data = String::from_utf8_lossy(&buf[i..]).into_owned();
+    let input_len = buf.len();
     let end = parser.input_end;
 
     match option {
@@ -529,6 +530,21 @@ pub(crate) fn dispatch_osc<W: ScreenWriter + ?Sized>(parser: &mut InputParser, w
             writer.osc_reset_cursor();
         }
         133 => writer.osc_shell_integration(&data),
+        7501 if writer.supports_program_status() => {
+            let terminator = match end {
+                super::InputEndType::St => "\x1b\\",
+                super::InputEndType::Bel => "\x07",
+            };
+            // Include the actual numeric prefix (possibly zero-padded) in the cap.
+            if input_len + 2 + terminator.len() > 4096 {
+                return;
+            }
+            if data == "?" {
+                parser.reply(&format!("\x1b]7501;?:states=idle,working,done,blocked,error:kinds=permission,question,auth{terminator}"));
+            } else {
+                writer.osc_program_status(&data, end);
+            }
+        }
         _ => {}
     }
 }

@@ -32,6 +32,7 @@ mod layout;
 mod lifecycle;
 mod options;
 mod pane;
+mod program_status;
 mod screen;
 mod session;
 pub mod style;
@@ -80,6 +81,7 @@ pub use options::{
     OptionStore, ShowOptionsMode,
 };
 pub use pane::{Pane, PaneGeometry};
+pub use program_status::ProgramStatus;
 pub use screen::{
     RecoveryRow, RecoveryRowRenderer, Screen, ScreenCellRef, ScreenCellView, ScreenLineView,
 };

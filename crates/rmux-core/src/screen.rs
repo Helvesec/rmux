@@ -52,6 +52,7 @@ pub struct Screen {
     mode: u32,
     cursor_style: u32,
     title: String,
+    program_status: crate::ProgramStatus,
     window_name: String,
     path: String,
     title_stack: Vec<String>,
@@ -111,6 +112,7 @@ impl Screen {
             mode: mode::MODE_CURSOR | mode::MODE_WRAP,
             cursor_style: 0,
             title: String::new(),
+            program_status: crate::ProgramStatus::default(),
             window_name: String::new(),
             path: String::new(),
             title_stack: Vec::new(),
@@ -223,6 +225,17 @@ impl Screen {
 
     pub(crate) fn set_preserve_alternate_screen_cursor(&mut self, enabled: bool) {
         self.preserve_alternate_screen_cursor = enabled;
+    }
+
+    /// Terminal-local OSC 7501 records, unaffected by alternate-screen switching.
+    #[must_use]
+    pub fn program_status(&self) -> &crate::ProgramStatus {
+        &self.program_status
+    }
+
+    /// Expire active/idle reports when the attached process exits or a prompt starts.
+    pub fn expire_program_status(&mut self) {
+        self.program_status.expire_active();
     }
 
     /// Returns the most recent OSC 7 path.

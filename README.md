@@ -65,6 +65,13 @@ RMUX is an async, typed terminal multiplexer engine written in Rust. It implemen
 
 Use it as a standalone CLI, embed it in Rust terminal apps, or drive it through typed SDKs for Rust, Python, and TypeScript.
 
+### Native program status
+
+Applications can report structured foreground activity using OSC 7501. rmux
+stores bounded pane-local records, handles capability detection while detached,
+and exposes status through its existing format API. See
+[Program status](docs/program-status.md) for fields, lifecycle handling and limits.
+
 <a id="features"></a>
 
 ## ✨ Features

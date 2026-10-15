@@ -179,6 +179,12 @@ impl CopyModeState {
     }
 
     pub(crate) fn resize(&mut self, size: TerminalSize) {
+        // Attaching a client reapplies pane geometry even if it is unchanged.
+        // Do not discard selection/search state or move the saved viewport for
+        // a no-op resize when returning to an existing copy-mode pane.
+        if self.backing.size() == size {
+            return;
+        }
         self.backing.resize(size);
         self.selection = None;
         self.search_timed_out = false;

@@ -443,6 +443,39 @@ impl HandlerState {
         )
     }
 
+    pub(crate) fn pane_program_status(
+        &self,
+        session_name: &SessionName,
+        pane_id: PaneId,
+    ) -> Option<rmux_core::ProgramStatus> {
+        let window_index = self
+            .sessions
+            .session(session_name)?
+            .window_index_for_pane_id(pane_id)?;
+        let runtime_session_name = self.runtime_session_name_for_window(session_name, window_index);
+        let transcript = self.transcripts.get(&runtime_session_name)?.get(&pane_id)?;
+        let mut transcript = transcript
+            .lock()
+            .expect("pane transcript mutex must not be poisoned");
+        #[cfg(unix)]
+        {
+            let pane_index = self
+                .sessions
+                .session(session_name)?
+                .window_at(window_index)?
+                .panes()
+                .iter()
+                .find(|pane| pane.id() == pane_id)?
+                .index();
+            let group = self
+                .pane_master_fd(session_name, window_index, pane_index)
+                .ok()
+                .and_then(rmux_os::process::unix::foreground_pid);
+            transcript.observe_foreground_group(group);
+        }
+        Some(transcript.program_status().clone())
+    }
+
     pub(crate) fn pane_screen_state(
         &self,
         session_name: &SessionName,

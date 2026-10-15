@@ -225,6 +225,54 @@ impl<'a> RuntimeFormatContext<'a> {
             .map(|sequence| sequence.to_string())
     }
 
+    fn session_program_status_json(&self) -> Option<String> {
+        let state = self.state?;
+        let session = self.session?;
+        let panes = session
+            .windows()
+            .iter()
+            .flat_map(|(window_index, window)| {
+                window
+                    .panes()
+                    .iter()
+                    .filter_map(|pane| {
+                        let status = state.pane_program_status(session.name(), pane.id())?;
+                        Some(serde_json::json!({
+                            "pane_id": format!("%{}", pane.id().as_u32()),
+                            "window_index": window_index, "pane_index": pane.index(),
+                            "summary": status.summary(), "observed": status.observed(),
+                        }))
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .collect::<Vec<_>>();
+        Some(serde_json::json!({"version": 1, "panes": panes}).to_string())
+    }
+
+    fn pane_program_status(&self, field: &str) -> Option<String> {
+        let status = self
+            .state?
+            .pane_program_status(self.session?.name(), self.pane?.id())?;
+        let summary = status.summary();
+        if field == "json" {
+            return Some(
+                serde_json::json!({"version": 1, "observed": status.observed(), "summary": summary, "records": status.records()})
+                    .to_string(),
+            );
+        }
+        let record = summary?;
+        match field {
+            "state" => Some(record.state.as_str().to_owned()),
+            "app" => record.app,
+            "id" => Some(record.id),
+            "kind" => record.kind,
+            "progress" => record.progress.map(|value| value.to_string()),
+            "title" => record.title,
+            "message" => record.message,
+            _ => None,
+        }
+    }
+
     fn pane_cursor_position(&self) -> Option<(u32, u32)> {
         let session = self.session?;
         let pane = self.pane?;

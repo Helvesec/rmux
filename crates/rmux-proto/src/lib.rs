@@ -11,6 +11,7 @@ pub mod envelope;
 pub mod error;
 pub mod frame_kind;
 pub mod identity;
+pub mod program_status;
 pub mod request;
 pub mod response;
 pub mod types;
@@ -60,6 +61,7 @@ pub use frame_kind::{
     FrameFeature, FrameKind, FrameLedgerEntry, FrameStatus, V1_FRAME_LEDGER,
 };
 pub use identity::{PaneId, SessionId, SessionName, WindowId};
+pub use program_status::{ProgramStatusRecord, ProgramStatusState};
 pub use request::*;
 pub use response::*;
 pub use types::*;

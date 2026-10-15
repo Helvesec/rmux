@@ -3892,6 +3892,15 @@ async fn live_attach_mouse_border_drag_pipeline_preserves_mouse_event() {
 
 #[tokio::test]
 async fn live_attach_sgr_wheel_forwards_when_pane_mouse_any_is_enabled() {
+    assert_live_attach_sgr_wheel_forwarded(64).await;
+}
+
+#[tokio::test]
+async fn live_attach_sgr_wheel_down_forwards_when_pane_mouse_any_is_enabled() {
+    assert_live_attach_sgr_wheel_forwarded(65).await;
+}
+
+async fn assert_live_attach_sgr_wheel_forwarded(button: u16) {
     let handler = RequestHandler::new();
     let alpha = session_name("alpha");
     let requester_pid = std::process::id();
@@ -3914,13 +3923,13 @@ async fn live_attach_sgr_wheel_forwards_when_pane_mouse_any_is_enabled() {
     let expected = encode_mouse_event(
         mode::MODE_MOUSE_ALL | mode::MODE_MOUSE_SGR,
         &MouseForwardEvent {
-            b: 64,
+            b: button,
             lb: 0,
             x: 1,
             y: 1,
             lx: 0,
             ly: 0,
-            sgr_b: 64,
+            sgr_b: button,
             sgr_type: 'M',
             ignore: false,
         },
@@ -3928,11 +3937,19 @@ async fn live_attach_sgr_wheel_forwards_when_pane_mouse_any_is_enabled() {
         1,
     )
     .expect("sgr wheel encodes");
-    let capture =
-        RawPaneInputProbe::start(&handler, &alpha, "live-attach-sgr-wheel", expected.len()).await;
+    let capture = RawPaneInputProbe::start(
+        &handler,
+        &alpha,
+        &format!("live-attach-sgr-wheel-{button}"),
+        expected.len(),
+    )
+    .await;
 
     handler
-        .handle_attached_live_input_for_test(requester_pid, b"\x1b[<64;2;2M")
+        .handle_attached_live_input_for_test(
+            requester_pid,
+            format!("\x1b[<{button};2;2M").as_bytes(),
+        )
         .await
         .expect("live attach wheel input");
 
@@ -3946,7 +3963,7 @@ async fn live_attach_sgr_wheel_forwards_when_pane_mouse_any_is_enabled() {
         .and_then(|active| active.mouse.current_event.as_ref())
         .expect("current wheel event");
     assert_eq!(event.location, MouseLocation::Pane);
-    assert_eq!(event.raw.b, 64);
+    assert_eq!(event.raw.b, button);
     drop(active_attach);
 
     let state = handler.state.lock().await;
@@ -3955,6 +3972,163 @@ async fn live_attach_sgr_wheel_forwards_when_pane_mouse_any_is_enabled() {
             .pane_copy_mode_summary(&alpha, PaneId::new(0))
             .is_none(),
         "mouse-aware applications should receive the wheel event without entering copy-mode"
+    );
+}
+
+#[tokio::test]
+async fn live_attach_unbound_wheel_respects_modes_permissions_and_bindings() {
+    for case in [
+        "mouse-disabled",
+        "cannot-write",
+        "read-only",
+        "bound",
+        "legacy",
+        "unbound-up",
+    ] {
+        let handler = RequestHandler::new();
+        let alpha = session_name("alpha");
+        let requester_pid = std::process::id();
+        create_send_keys_test_session(&handler, &alpha).await;
+        enable_mouse(&handler).await;
+        if case != "mouse-disabled" {
+            let mut state = handler.state.lock().await;
+            let modes = if case == "legacy" {
+                b"\x1b[?1000h".as_slice()
+            } else {
+                b"\x1b[?1003h\x1b[?1006h".as_slice()
+            };
+            state
+                .append_bytes_to_pane_transcript_for_test(&alpha, 0, 0, modes)
+                .expect("mouse modes");
+        }
+        let (control_tx, _control_rx) = mpsc::unbounded_channel();
+        let _attach_id = handler
+            .register_attach(requester_pid, alpha.clone(), control_tx)
+            .await;
+        {
+            let mut active = handler.active_attach.lock().await;
+            let client = active.by_pid.get_mut(&requester_pid).expect("client");
+            if case == "cannot-write" {
+                client.can_write = false;
+            }
+            if case == "read-only" {
+                client
+                    .flags
+                    .insert(crate::client_flags::ClientFlags::READONLY);
+            }
+        }
+        if case == "bound" {
+            let result = handler
+                .handle(Request::BindKey(Box::new(BindKeyRequest {
+                    table_name: "root".into(),
+                    key: "WheelDownPane".into(),
+                    note: None,
+                    repeat: false,
+                    command: Some(vec!["send-keys".into(), "-l".into(), "bound".into()]),
+                })))
+                .await;
+            assert!(matches!(result, Response::BindKey(_)));
+        }
+        if case == "unbound-up" {
+            let result = handler
+                .handle(Request::UnbindKey(UnbindKeyRequest {
+                    table_name: "root".into(),
+                    key: Some("WheelUpPane".into()),
+                    all: false,
+                    quiet: false,
+                }))
+                .await;
+            assert!(matches!(result, Response::UnbindKey(_)));
+        }
+        let expected: &[u8] = match case {
+            "bound" => b"bound",
+            "legacy" => b"\x1b[Ma\x22\x22",
+            "unbound-up" => b"\x1b[<64;2;2M",
+            _ => b"",
+        };
+        let capture = RawPaneInputProbe::start(&handler, &alpha, case, expected.len()).await;
+        let event = if case == "unbound-up" {
+            b"\x1b[<64;2;2M"
+        } else {
+            b"\x1b[<65;2;2M"
+        };
+        handler
+            .handle_attached_live_input_for_test(requester_pid, event)
+            .await
+            .expect(case);
+        capture.finish(&handler, &alpha).await;
+        capture.assert_contents(&handler, expected).await;
+    }
+}
+
+#[tokio::test]
+async fn live_attach_unbound_wheel_uses_hovered_pane_and_relative_coordinates() {
+    let handler = RequestHandler::new();
+    let alpha = session_name("alpha");
+    let requester_pid = std::process::id();
+    create_send_keys_test_session(&handler, &alpha).await;
+    enable_mouse(&handler).await;
+    let result = handler
+        .handle(Request::SplitWindow(SplitWindowRequest {
+            target: SplitWindowTarget::Session(alpha.clone()),
+            direction: SplitDirection::Horizontal,
+            before: false,
+            environment: None,
+        }))
+        .await;
+    assert!(matches!(result, Response::SplitWindow(_)));
+    handler
+        .handle(Request::SelectPane(Box::new(SelectPaneRequest {
+            target: PaneTarget::new(alpha.clone(), 0),
+            title: None,
+            style: None,
+            input_disabled: None,
+            preserve_zoom: false,
+        })))
+        .await;
+    let zero = PaneTarget::with_window(alpha.clone(), 0, 0);
+    let one = PaneTarget::with_window(alpha.clone(), 0, 1);
+    let (x, y) = {
+        let mut state = handler.state.lock().await;
+        state
+            .append_bytes_to_pane_transcript_for_test(&alpha, 0, 1, b"\x1b[?1003h\x1b[?1006h")
+            .expect("mouse modes");
+        state.start_pane_input_capture_for_test(&zero);
+        state.start_pane_input_capture_for_test(&one);
+        let pane = state
+            .sessions
+            .session(&alpha)
+            .expect("session")
+            .window()
+            .pane(1)
+            .expect("pane");
+        (pane.geometry().x() + 3, pane.geometry().y() + 3)
+    };
+    let (control_tx, _control_rx) = mpsc::unbounded_channel();
+    let _attach_id = handler
+        .register_attach(requester_pid, alpha.clone(), control_tx)
+        .await;
+    handler
+        .handle_attached_live_input_for_test(
+            requester_pid,
+            format!("\x1b[<65;{};{}M", x + 1, y + 1).as_bytes(),
+        )
+        .await
+        .expect("wheel down");
+    let state = handler.state.lock().await;
+    assert_eq!(state.pane_input_capture_for_test(&zero), Some(vec![]));
+    assert_eq!(
+        state.pane_input_capture_for_test(&one),
+        Some(b"\x1b[<65;4;4M".to_vec())
+    );
+    assert_eq!(
+        state
+            .sessions
+            .session(&alpha)
+            .expect("session")
+            .window()
+            .active_pane_index(),
+        0
     );
 }
 

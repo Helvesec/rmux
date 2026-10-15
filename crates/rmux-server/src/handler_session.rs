@@ -1822,7 +1822,7 @@ impl RequestHandler {
             self.wait_for_windows_deferred_list_session_pane_pids()
                 .await;
         }
-        let state = self.state.lock().await;
+        let mut state = self.state.lock().await;
         let mut sessions = state
             .sessions
             .iter()
@@ -1838,6 +1838,17 @@ impl RequestHandler {
             sort_order,
             request.reversed && has_explicit_sort,
         );
+        // Native status queries must not expose active reports from dead panes
+        // while an asynchronous exit callback is still queued.
+        if [request.format.as_deref(), request.filter.as_deref()]
+            .into_iter()
+            .flatten()
+            .any(|format| format.contains("program_status"))
+        {
+            for session in &sessions {
+                let _ = state.refresh_list_panes_exit_statuses(&session.name, None);
+            }
+        }
 
         let active_attach = self.active_attach.lock().await;
         let active_control = self.active_control.lock().await;

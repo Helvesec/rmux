@@ -111,6 +111,7 @@ impl HandlerState {
             .copied()
         {
             self.mark_pane_lifecycle_exited(pane_id, metadata);
+            self.expire_runtime_pane_program_status(runtime_session_name, pane_id);
             return Ok(Some(metadata));
         }
 
@@ -130,7 +131,25 @@ impl HandlerState {
             .or_default()
             .insert(pane_id, metadata);
         self.mark_pane_lifecycle_exited(pane_id, metadata);
+        self.expire_runtime_pane_program_status(runtime_session_name, pane_id);
         Ok(Some(metadata))
+    }
+
+    fn expire_runtime_pane_program_status(
+        &self,
+        runtime_session_name: &SessionName,
+        pane_id: PaneId,
+    ) {
+        if let Some(transcript) = self
+            .transcripts
+            .get(runtime_session_name)
+            .and_then(|panes| panes.get(&pane_id))
+        {
+            transcript
+                .lock()
+                .expect("pane transcript mutex must not be poisoned")
+                .expire_program_status();
+        }
     }
 
     pub(crate) fn mark_pane_dead_without_exit_details(
@@ -147,10 +166,11 @@ impl HandlerState {
             self.runtime_session_name_for_window(target.session_name(), target.window_index());
         let metadata = PaneExitMetadata::without_exit_details();
         self.dead_panes
-            .entry(runtime_session_name)
+            .entry(runtime_session_name.clone())
             .or_default()
             .insert(pane_id, metadata);
         self.mark_pane_lifecycle_exited(pane_id, metadata);
+        self.expire_runtime_pane_program_status(&runtime_session_name, pane_id);
         Ok(())
     }
 

@@ -492,6 +492,7 @@ impl ScreenWriter for Screen {
         self.grid.clear_visible(COLOUR_DEFAULT);
         self.reset_tabs();
         self.title_stack.clear();
+        self.program_status.clear();
         self.active_hyperlink = 0;
         self.hyperlinks.reset();
         self.bump_metadata_revision();
@@ -642,7 +643,17 @@ impl ScreenWriter for Screen {
     fn osc_reset_fg(&mut self) {}
     fn osc_reset_bg(&mut self) {}
     fn osc_reset_cursor(&mut self) {}
-    fn osc_shell_integration(&mut self, _data: &str) {}
+    fn osc_shell_integration(&mut self, data: &str) {
+        if data.split(';').next() == Some("A") {
+            self.expire_program_status();
+        }
+    }
+    fn supports_program_status(&self) -> bool {
+        true
+    }
+    fn osc_program_status(&mut self, data: &str, end: InputEndType) {
+        self.program_status.report(data, end == InputEndType::Bel);
+    }
 }
 
 #[cfg(test)]
