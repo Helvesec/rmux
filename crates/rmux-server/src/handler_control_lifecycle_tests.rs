@@ -2017,3 +2017,76 @@ async fn failed_session_exit_finishes_stale_identity_without_destroying_recreate
         Some(new_session_id)
     );
 }
+
+#[tokio::test]
+async fn switching_last_client_reaps_only_unattached_opted_in_source() {
+    for attached in [false, true] {
+        for resident in [false, true] {
+            for enabled in [false, true] {
+                let handler = RequestHandler::new();
+                let owner = session_name("switch-cleanup-owner");
+                new_session(&handler, &owner).await;
+                let source = create_grouped_session(&handler, "switch-cleanup-view", &owner).await;
+                let destination = session_name("switch-cleanup-destination");
+                new_session(&handler, &destination).await;
+                let pid = std::process::id();
+                let mut attached_receiver = None;
+                let mut control_receiver = None;
+                if attached {
+                    let (tx, rx) = mpsc::unbounded_channel();
+                    handler.register_attach(pid, source.clone(), tx).await;
+                    attached_receiver = Some(rx);
+                } else {
+                    control_receiver =
+                        Some(register_control_session(&handler, pid, source.clone()).await);
+                }
+                let _resident = if resident {
+                    Some(register_control_session(&handler, pid + 1, source.clone()).await)
+                } else {
+                    None
+                };
+                let window_id = {
+                    let mut state = handler.state.lock().await;
+                    state
+                        .options
+                        .set(
+                            ScopeSelector::Session(source.clone()),
+                            OptionName::DestroyUnattached,
+                            if enabled { "on" } else { "off" }.into(),
+                            SetOptionMode::Replace,
+                        )
+                        .unwrap();
+                    state.sessions.session(&owner).unwrap().window().id()
+                };
+                let response = handler
+                    .dispatch(
+                        pid,
+                        Request::SwitchClient(rmux_proto::SwitchClientRequest {
+                            target: destination.clone(),
+                        }),
+                    )
+                    .await
+                    .response;
+                assert!(
+                    matches!(response, Response::SwitchClient(_)),
+                    "{response:?}"
+                );
+                let state = handler.state.lock().await;
+                assert_eq!(
+                    state.sessions.session(&source).is_none(),
+                    enabled && !resident,
+                    "attached={attached}, resident={resident}, enabled={enabled}"
+                );
+                assert_eq!(
+                    state.sessions.session(&owner).unwrap().window().id(),
+                    window_id,
+                    "reaping a grouped view must preserve its owner's window"
+                );
+                assert!(state.sessions.session(&destination).is_some());
+                drop(state);
+                drop(attached_receiver);
+                drop(control_receiver);
+            }
+        }
+    }
+}

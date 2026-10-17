@@ -434,6 +434,26 @@ impl RequestHandler {
             .await;
     }
 
+    /// Resolve the current name by identity after switch hooks and geometry
+    /// notifications: a renamed source is still ours, a recreated one is not.
+    pub(in crate::handler) async fn destroy_unattached_session_identity(
+        &self,
+        session_id: SessionId,
+    ) {
+        let candidate = {
+            let state = self.state.lock().await;
+            state
+                .sessions
+                .session_by_id(session_id)
+                .map(|session| (session.name().clone(), session_id))
+        };
+        if let Some(candidate) = candidate {
+            // Destroying a session can itself relocate clients. Keep that
+            // asynchronous cleanup cycle behind a boxed future.
+            Box::pin(self.destroy_unattached_sessions(vec![candidate])).await;
+        }
+    }
+
     pub(in crate::handler) async fn destroy_unattached_sessions(
         &self,
         mut candidates: Vec<(SessionName, SessionId)>,

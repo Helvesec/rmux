@@ -601,6 +601,8 @@ impl RequestHandler {
             let _ = self
                 .reconcile_attached_session_identity_size_and_emit(previous_session_id)
                 .await;
+            self.destroy_unattached_session_identity(previous_session_id)
+                .await;
         }
     }
 }
