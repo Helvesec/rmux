@@ -15,9 +15,10 @@ use super::pending_escape::PendingEscapeFlush;
 use super::persistent_overlay::{
     accept_persistent_overlay_state, advance_persistent_overlay_state, clear_then_base_frame,
     defer_persistent_clear, discard_stale_persistent_overlays, is_stale_persistent_switch,
-    persistent_overlay_replacement_pending, replacement_persistent_overlay_frame,
-    switch_requires_screen_clear, take_pending_persistent_overlay_for_state,
-    undelivered_client_title_bytes, update_persistent_overlay_cache,
+    persistent_overlay_replacement_pending, popup_frame_delta,
+    replacement_persistent_overlay_frame, switch_requires_screen_clear,
+    take_pending_persistent_overlay_for_state, undelivered_client_title_bytes,
+    update_persistent_overlay_cache,
 };
 use super::types::{AttachTarget, OpenAttachTarget, OverlayFrame};
 use super::wire::{
@@ -439,6 +440,11 @@ pub(super) async fn apply_pending_attach_controls(
                 if persistent_clear
                     || should_emit_overlay(*render_generation, overlay_generation, &overlay)
                 {
+                    let delta = popup_frame_delta(
+                        persistent_overlay.as_deref(),
+                        *persistent_overlay_visible,
+                        &overlay,
+                    );
                     update_persistent_overlay_cache(
                         persistent_overlay,
                         persistent_overlay_visible,
@@ -456,7 +462,10 @@ pub(super) async fn apply_pending_attach_controls(
                     emit_render_frame(
                         stream,
                         &current_target.outer_terminal,
-                        clear_frame.as_deref().unwrap_or(&overlay.frame),
+                        clear_frame
+                            .as_deref()
+                            .or(delta.as_deref())
+                            .unwrap_or(&overlay.frame),
                     )
                     .await?;
                 }

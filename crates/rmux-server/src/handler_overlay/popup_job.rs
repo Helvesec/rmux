@@ -460,19 +460,12 @@ fn spawn_popup_reader_task(
     let reader = AsyncFd::new(reader_fd)
         .map_err(|error| RmuxError::Server(format!("failed to watch popup pty: {error}")))?;
     tokio::spawn(async move {
-        let mut buffer = [0_u8; 8192];
         loop {
-            let bytes_read = match read_async_fd(&reader, &mut buffer).await {
-                Ok(bytes_read) => bytes_read,
-                Err(_) => break,
+            let batch = match read_popup_batch(&reader).await {
+                Ok(batch) if !batch.is_empty() => batch,
+                _ => break,
             };
-            if bytes_read == 0 {
-                break;
-            }
-            surface
-                .lock()
-                .expect("popup surface")
-                .append(&buffer[..bytes_read]);
+            surface.lock().expect("popup surface").append(&batch);
             let _ = handler.popup_reader_tick(identity, popup_id).await;
         }
     });
@@ -510,6 +503,28 @@ fn spawn_popup_reader_task(
         }
     });
     Ok(())
+}
+
+// A TUI frame can span several PTY reads. Bound the batching delay and byte
+// budget so a noisy popup cannot starve input or keep extending its deadline.
+#[cfg(unix)]
+async fn read_popup_batch(reader: &AsyncFd<PtyIo>) -> io::Result<Vec<u8>> {
+    const MAX_BATCH_BYTES: usize = 256 * 1024;
+    let mut buffer = [0_u8; 8192];
+    let first = read_async_fd(reader, &mut buffer).await?;
+    if first == 0 {
+        return Ok(Vec::new());
+    }
+    let mut batch = buffer[..first].to_vec();
+    sleep(Duration::from_millis(8)).await;
+    while batch.len() < MAX_BATCH_BYTES {
+        let remaining = (MAX_BATCH_BYTES - batch.len()).min(buffer.len());
+        match reader.get_ref().try_read(&mut buffer[..remaining]) {
+            Ok(0) | Err(_) => break,
+            Ok(count) => batch.extend_from_slice(&buffer[..count]),
+        }
+    }
+    Ok(batch)
 }
 
 #[cfg(unix)]

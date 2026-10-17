@@ -172,7 +172,7 @@ pub(crate) use persistent_overlay::replay_client_visible_payloads;
 use persistent_overlay::{
     accept_persistent_overlay_state, advance_persistent_overlay_state, clear_then_base_frame,
     defer_persistent_clear, discard_stale_persistent_overlays, is_stale_persistent_switch,
-    persistent_overlay_replacement_pending, prime_persistent_overlay_barriers,
+    persistent_overlay_replacement_pending, popup_frame_delta, prime_persistent_overlay_barriers,
     replacement_persistent_overlay_frame, switch_requires_screen_clear,
     take_pending_persistent_overlay_for_state, update_persistent_overlay_cache,
 };
@@ -1228,6 +1228,11 @@ pub(crate) async fn forward_attach(
                                     &overlay,
                                 )
                             {
+                                let delta = popup_frame_delta(
+                                    persistent_overlay.as_deref(),
+                                    persistent_overlay_visible,
+                                    &overlay,
+                                );
                                 update_persistent_overlay_cache(
                                     &mut persistent_overlay,
                                     &mut persistent_overlay_visible,
@@ -1245,7 +1250,10 @@ pub(crate) async fn forward_attach(
                                 emit_render_frame(
                                     &stream,
                                     &current_target.outer_terminal,
-                                    clear_frame.as_deref().unwrap_or(&overlay.frame),
+                                    clear_frame
+                                        .as_deref()
+                                        .or(delta.as_deref())
+                                        .unwrap_or(&overlay.frame),
                                 )
                                 .await?;
                                 flush_deferred_passthroughs(

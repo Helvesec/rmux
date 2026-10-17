@@ -27,6 +27,7 @@ pub(crate) struct OverlayFrame {
     pub(crate) render_generation: u64,
     pub(crate) overlay_generation: u64,
     pub(crate) persistent: bool,
+    pub(crate) row_diff: bool,
     pub(crate) persistent_state_id: Option<u64>,
 }
 
@@ -37,6 +38,7 @@ impl OverlayFrame {
             render_generation,
             overlay_generation,
             persistent: false,
+            row_diff: false,
             persistent_state_id: None,
         }
     }
@@ -51,8 +53,16 @@ impl OverlayFrame {
             render_generation,
             overlay_generation,
             persistent: true,
+            row_diff: false,
             persistent_state_id: None,
         }
+    }
+
+    /// Only popup reader refreshes may elide unchanged, self-contained rows.
+    /// Keep `frame` complete so queue replacement and screen restoration work.
+    pub(crate) fn with_row_diff(mut self) -> Self {
+        self.row_diff = true;
+        self
     }
 
     pub(crate) fn persistent_with_state(
@@ -66,6 +76,7 @@ impl OverlayFrame {
             render_generation,
             overlay_generation,
             persistent: true,
+            row_diff: false,
             persistent_state_id: Some(persistent_state_id),
         }
     }

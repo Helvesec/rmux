@@ -566,3 +566,32 @@ mod windows {
         Ok(())
     }
 }
+
+#[cfg(unix)]
+#[tokio::test(flavor = "current_thread")]
+async fn popup_reader_batches_split_output_without_waiting_for_eof() {
+    use std::io::Write;
+    use std::time::Duration;
+    let pair = PtyPair::open().unwrap();
+    let (master, slave) = pair.into_split();
+    let reader = tokio::io::unix::AsyncFd::new(master.into_io()).unwrap();
+    let mut writer = std::fs::File::from(slave.into_owned_fd());
+    writer.write_all(b"first").unwrap();
+    let writer_task = tokio::spawn(async move {
+        tokio::time::sleep(Duration::from_millis(1)).await;
+        writer.write_all(b"second").unwrap();
+        writer
+    });
+    let batch = tokio::time::timeout(Duration::from_secs(1), super::read_popup_batch(&reader))
+        .await
+        .unwrap()
+        .unwrap();
+    let _writer = writer_task.await.unwrap();
+    assert_eq!(batch, b"firstsecond");
+    assert!(
+        tokio::time::timeout(Duration::from_millis(25), super::read_popup_batch(&reader))
+            .await
+            .is_err(),
+        "an idle popup must sleep rather than render empty ticks"
+    );
+}
