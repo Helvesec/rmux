@@ -3,6 +3,8 @@ use rmux_proto::{
     DisplayMessageRequest, NewSessionRequest, OptionName, PaneTarget, Request, RespawnPaneRequest,
     Response, ScopeSelector, SessionName, SetOptionMode, SetOptionRequest, Target, TerminalSize,
 };
+#[cfg(windows)]
+use rmux_proto::{HasSessionRequest, HasSessionResponse, NewSessionExtRequest};
 use tokio::time::{sleep, Duration, Instant};
 
 fn session_name(value: &str) -> SessionName {
@@ -66,6 +68,56 @@ async fn display_message_pane_dead_observes_exited_child_promptly() {
         assert!(
             Instant::now() < deadline,
             "pane_dead did not flip promptly, last value was {dead:?}"
+        );
+        sleep(Duration::from_millis(20)).await;
+    }
+}
+
+#[cfg(windows)]
+#[tokio::test]
+async fn pane_exiting_during_deferred_start_closes_its_session_before_the_start_ends() {
+    let handler = RequestHandler::new();
+    let alpha = session_name("alpha");
+    let created = handler
+        .handle(Request::NewSessionExt(Box::new(NewSessionExtRequest {
+            session_name: Some(alpha.clone()),
+            working_directory: None,
+            detached: true,
+            size: Some(TerminalSize { cols: 80, rows: 24 }),
+            environment: None,
+            group_target: None,
+            attach_if_exists: false,
+            detach_other_clients: false,
+            kill_other_clients: false,
+            flags: None,
+            window_name: None,
+            print_session_info: false,
+            print_format: None,
+            command: Some(vec!["exit 3".to_owned()]),
+            process_command: None,
+            client_environment: None,
+            skip_environment_update: false,
+        })))
+        .await;
+    assert!(matches!(created, Response::NewSession(_)), "{created:?}");
+
+    // The deferred start keeps its input queued for 2 s.
+    let deadline = Instant::now() + Duration::from_millis(1500);
+    loop {
+        let response = handler
+            .handle(Request::HasSession(HasSessionRequest {
+                target: alpha.clone(),
+            }))
+            .await;
+        if matches!(
+            response,
+            Response::HasSession(HasSessionResponse { exists: false })
+        ) {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "session of a pane that exited during its start stayed, last {response:?}"
         );
         sleep(Duration::from_millis(20)).await;
     }

@@ -91,18 +91,32 @@ impl HandlerState {
         runtime_session_name: &SessionName,
         pane_id: PaneId,
     ) -> Result<Option<PaneExitMetadata>, RmuxError> {
+        let Some(target) = self.pane_target_for_runtime_pane(runtime_session_name, pane_id) else {
+            return Ok(None);
+        };
+
         #[cfg(windows)]
         if self
             .starting_panes
             .get(runtime_session_name)
             .is_some_and(|panes| panes.contains_key(&pane_id))
         {
-            return Ok(None);
+            // A process that already exited ends its pane's start: no console
+            // is left to receive the input queued for it.
+            if self
+                .terminals
+                .pane_exit_status(
+                    runtime_session_name,
+                    pane_id,
+                    target.window_index(),
+                    target.pane_index(),
+                )?
+                .is_none()
+            {
+                return Ok(None);
+            }
+            let _ = self.cancel_starting_pane(runtime_session_name, pane_id);
         }
-
-        let Some(target) = self.pane_target_for_runtime_pane(runtime_session_name, pane_id) else {
-            return Ok(None);
-        };
 
         if let Some(metadata) = self
             .dead_panes

@@ -1011,6 +1011,15 @@ impl RequestHandler {
                     tokio::time::sleep(input_grace_deadline - now).await;
                     continue;
                 }
+                let still_starting = self
+                    .state
+                    .lock()
+                    .await
+                    .starting_runtime_session_for_identity(&runtime_session_name_hint, identity)
+                    .is_some();
+                if !still_starting {
+                    break;
+                }
                 let write_result = Self::flush_deferred_initial_pane_input(flush).await;
                 if let Err(error) = write_result {
                     let mut state = self.state.lock().await;
