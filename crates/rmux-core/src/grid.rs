@@ -1190,7 +1190,7 @@ fn reflow_wrapped_lines_remapping_cursor(
         }
 
         let end = if wrapped {
-            self::line_width(&line)
+            line.wrapped_end()
         } else {
             line.used_end()
         };
@@ -1445,10 +1445,6 @@ fn reflow_logical_line_remapping_cursor(
     }
     output.push(current);
     (output, mapped_cursor)
-}
-
-fn line_width(line: &GridLine) -> usize {
-    line.width() as usize
 }
 
 #[cfg(test)]

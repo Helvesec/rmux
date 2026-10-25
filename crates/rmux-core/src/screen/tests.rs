@@ -551,6 +551,19 @@ fn width_resize_reflows_wrapped_lines_instead_of_truncating() {
 }
 
 #[test]
+fn width_resize_joins_a_short_wrapped_row_by_its_written_cells() {
+    let mut screen = new_screen(8, 4, 10);
+    parse(&mut screen, b"ab\r\ncd\x1b[1;1H");
+    crate::input::ScreenWriter::linefeed(&mut screen, true, COLOUR_DEFAULT);
+
+    screen.resize(TerminalSize { cols: 4, rows: 4 });
+
+    let capture = screen.capture_transcript(full_range(), GridRenderOptions::default());
+    let rendered = String::from_utf8(capture).expect("capture must be UTF-8");
+    assert_eq!(rendered.lines().find(|line| !line.is_empty()), Some("abcd"));
+}
+
+#[test]
 fn width_resize_reflows_plain_ascii_without_materializing_cells() {
     let mut screen = new_screen(4, 3, 20);
     parse(&mut screen, b"abcdefghijkl");
