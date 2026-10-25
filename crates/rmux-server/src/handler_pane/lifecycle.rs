@@ -959,17 +959,9 @@ fn append_remain_on_exit_message(
                 target.pane_index(),
             )
         })?;
-    let rows = state
-        .transcript_handle(target)?
-        .lock()
-        .expect("pane transcript mutex must not be poisoned")
-        .clone_screen()
-        .size()
-        .rows
-        .max(1);
-    let mut bytes = format!("\x1b[{rows};1H\n\x1b[2K").into_bytes();
-    bytes.extend_from_slice(rendered.as_bytes());
-    state.append_bytes_to_runtime_pane_transcript(runtime_session_name, pane_id, &bytes)
+    state.mutate_runtime_pane_transcript(runtime_session_name, pane_id, true, |transcript| {
+        transcript.append_dead_pane_footer(rendered.as_bytes());
+    })
 }
 
 fn apply_dead_pane_automatic_window_name(

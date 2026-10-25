@@ -174,6 +174,18 @@ impl HandlerState {
         pane_id: PaneId,
         bytes: &[u8],
     ) -> Result<(), RmuxError> {
+        self.mutate_runtime_pane_transcript(runtime_session_name, pane_id, !bytes.is_empty(), |t| {
+            t.append_bytes(bytes);
+        })
+    }
+
+    pub(crate) fn mutate_runtime_pane_transcript(
+        &mut self,
+        runtime_session_name: &SessionName,
+        pane_id: PaneId,
+        changed: bool,
+        mutation: impl FnOnce(&mut crate::pane_transcript::PaneTranscript),
+    ) -> Result<(), RmuxError> {
         let transcript = self
             .transcripts
             .get(runtime_session_name)
@@ -195,16 +207,14 @@ impl HandlerState {
             output.mutate_transcript(
                 &transcript,
                 crate::pane_io::PaneInvalidationReason::TranscriptMutation,
-                |transcript| {
-                    transcript.append_bytes(bytes);
-                    ((), !bytes.is_empty())
-                },
+                |transcript| (mutation(transcript), changed),
             );
         } else {
-            transcript
-                .lock()
-                .expect("pane transcript mutex must not be poisoned")
-                .append_bytes(bytes);
+            mutation(
+                &mut transcript
+                    .lock()
+                    .expect("pane transcript mutex must not be poisoned"),
+            );
         }
         Ok(())
     }

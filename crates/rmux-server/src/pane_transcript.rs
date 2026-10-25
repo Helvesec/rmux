@@ -130,6 +130,25 @@ impl PaneTranscript {
         self.append_bytes_with_effects(bytes).bell_count
     }
 
+    /// Writes a dead pane's footer as tmux's `server_destroy_pane` does: reset
+    /// the scroll region, a linefeed from the bottom row, the footer on the new
+    /// row, and the row above it marked wrapped. The mark comes last because
+    /// text written at column 0 breaks the wrap of the row above.
+    pub(crate) fn append_dead_pane_footer(&mut self, footer: &[u8]) {
+        let rows = self.terminal.screen().size().rows.max(1);
+        self.append_bytes(format!("\x1b[r\x1b[{rows};1H\n").as_bytes());
+        self.append_bytes(footer);
+        if rows > 1 {
+            self.append_bytes(format!("\x1b7\x1b[{};1H", rows - 1).as_bytes());
+            rmux_core::input::ScreenWriter::linefeed(
+                self.terminal.screen_mut(),
+                true,
+                rmux_core::input::COLOUR_DEFAULT,
+            );
+            self.append_bytes(b"\x1b8");
+        }
+    }
+
     #[cfg(test)]
     pub(crate) fn append_bytes_and_take_replies(&mut self, bytes: &[u8]) -> PaneAppendResult {
         self.append_bytes_with_effects(bytes)
@@ -783,6 +802,26 @@ mod tests {
         assert_eq!(
             transcript.capture_main(ScreenCaptureRange::default(), GridRenderOptions::default()),
             b"three\n\n"
+        );
+    }
+
+    #[test]
+    fn dead_pane_footer_joins_the_row_above_like_tmux() {
+        let mut transcript = transcript(20, 3, 10);
+        transcript.append_bytes(b"\x1b[1;2rerror");
+        transcript.append_dead_pane_footer(b"Pane is dead");
+        let joined = GridRenderOptions {
+            join_wrapped: true,
+            ..GridRenderOptions::default()
+        };
+
+        assert_eq!(
+            transcript.capture_main(ScreenCaptureRange::default(), GridRenderOptions::default()),
+            b"\n\nPane is dead\n"
+        );
+        assert_eq!(
+            transcript.capture_main(ScreenCaptureRange::default(), joined),
+            b"\nPane is dead\n"
         );
     }
 
