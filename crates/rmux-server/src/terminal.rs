@@ -654,7 +654,15 @@ fn os_environment_name_eq(left: &OsStr, right: &str) -> bool {
 }
 
 fn shell_command_window_name(command: &str) -> Option<String> {
-    let first = command.split_whitespace().next()?;
+    #[cfg(windows)]
+    if is_lone_windows_program(command) {
+        return executable_name(command);
+    }
+    let command = command.trim_start();
+    let first = match command.strip_prefix('"') {
+        Some(quoted) => quoted.split('"').next()?,
+        None => command.split_whitespace().next()?,
+    };
     executable_name(first)
 }
 
