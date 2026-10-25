@@ -51,12 +51,14 @@ pub(super) fn exec_full_helper(args: &[OsString]) -> Result<i32, String> {
         if output_pipes.any() {
             return run_full_helper_with_piped_output(command, output_pipes);
         }
-        let status = command.status().map_err(|error| {
-            format!(
-                "failed to run private rmux helper '{}': {error}",
-                helper.display()
-            )
-        })?;
+        let status = rmux_os::daemon::spawn_daemon_launcher_command(&mut command)
+            .and_then(|mut child| child.wait())
+            .map_err(|error| {
+                format!(
+                    "failed to run private rmux helper '{}': {error}",
+                    helper.display()
+                )
+            })?;
         Ok(status.code().unwrap_or(1))
     }
 }
@@ -117,12 +119,13 @@ fn run_full_helper_with_piped_output(
     if output_pipes.stderr {
         command.stderr(Stdio::piped());
     }
-    let mut child = command.spawn().map_err(|error| {
-        format!(
-            "failed to run private rmux helper '{}': {error}",
-            command.get_program().to_string_lossy()
-        )
-    })?;
+    let mut child =
+        rmux_os::daemon::spawn_daemon_launcher_command(&mut command).map_err(|error| {
+            format!(
+                "failed to run private rmux helper '{}': {error}",
+                command.get_program().to_string_lossy()
+            )
+        })?;
     let stdout = child.stdout.take();
     let stderr = child.stderr.take();
 
