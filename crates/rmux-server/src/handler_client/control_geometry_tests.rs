@@ -506,6 +506,87 @@ async fn undeclared_control_client_alone_never_resizes_the_session_like_tmux37()
 }
 
 #[tokio::test]
+async fn ignore_size_control_client_never_resizes_the_session_like_tmux() {
+    let handler = RequestHandler::new();
+    let session = session_name("control-ignore-size");
+    create_session(&handler, session.clone(), INITIAL_SIZE).await;
+    let requester_pid = std::process::id();
+    let (_control_id, _events) =
+        register_control_client_with_id(&handler, requester_pid, &session).await;
+
+    let response = handler
+        .handle(Request::AttachSessionExt2(Box::new(
+            rmux_proto::request::AttachSessionExt2Request {
+                target: Some(session.clone()),
+                target_spec: None,
+                detach_other_clients: false,
+                kill_other_clients: false,
+                read_only: false,
+                skip_environment_update: true,
+                flags: Some(vec!["ignore-size".to_owned()]),
+                working_directory: None,
+                client_terminal: rmux_proto::ClientTerminalContext::default(),
+                client_size: None,
+            },
+        )))
+        .await;
+    assert!(!matches!(response, Response::Error(_)), "{response:?}");
+    let response = handler
+        .handle(Request::RefreshClient(Box::new(
+            refresh_client_size_request(requester_pid, CONTROL_SIZE),
+        )))
+        .await;
+    assert!(
+        matches!(response, Response::RefreshClient(_)),
+        "{response:?}"
+    );
+
+    assert_eq!(
+        control_client_size(&handler, requester_pid).await,
+        CONTROL_SIZE
+    );
+    assert_eq!(session_size(&handler, &session).await, INITIAL_SIZE);
+    let active_control = handler.active_control.lock().await;
+    let active = active_control
+        .by_pid
+        .get(&requester_pid)
+        .expect("control client remains registered");
+    assert!(crate::handler::format_control_client_flags(active).contains("ignore-size"));
+}
+
+#[tokio::test]
+async fn refresh_client_flags_toggle_ignore_size_on_a_control_client_like_tmux() {
+    let handler = RequestHandler::new();
+    let session = session_name("control-refresh-ignore-size");
+    create_session(&handler, session.clone(), INITIAL_SIZE).await;
+    let requester_pid = std::process::id();
+    let (_control_id, _events) =
+        register_control_client_with_id(&handler, requester_pid, &session).await;
+    let refresh = |flags: &str, size: TerminalSize| {
+        let mut request = refresh_client_size_request(requester_pid, size);
+        request.flags = Some(flags.to_owned());
+        Request::RefreshClient(Box::new(request))
+    };
+
+    let response = handler.handle(refresh("ignore-size", CONTROL_SIZE)).await;
+    assert!(
+        matches!(response, Response::RefreshClient(_)),
+        "{response:?}"
+    );
+    assert_eq!(session_size(&handler, &session).await, INITIAL_SIZE);
+
+    let response = handler.handle(refresh("!ignore-size", TARGET_SIZE)).await;
+    assert!(
+        matches!(response, Response::RefreshClient(_)),
+        "{response:?}"
+    );
+    assert_eq!(session_size(&handler, &session).await, TARGET_SIZE);
+
+    let response = handler.handle(refresh("read-only", TARGET_SIZE)).await;
+    assert!(matches!(response, Response::Error(_)), "{response:?}");
+}
+
+#[tokio::test]
 async fn undeclared_control_client_switch_never_resizes_the_target_like_tmux37() {
     // The same rule on the switch-client path, which feeds the reporting
     // client's own size straight into the policy instead of going through the

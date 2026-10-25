@@ -472,6 +472,7 @@ fn control_size_candidates(
         .filter(|(pid, active)| {
             Some(**pid) != excluded_pid
                 && active.size_declared
+                && !active.flags.ignore_size
                 && !active.closing.load(Ordering::Acquire)
                 && active
                     .session_name

@@ -176,6 +176,18 @@ impl RequestHandler {
         Ok(())
     }
 
+    async fn set_control_client_ignore_size(&self, control_pid: u32) {
+        if let Some(active) = self
+            .active_control
+            .lock()
+            .await
+            .by_pid
+            .get_mut(&control_pid)
+        {
+            active.flags.ignore_size = true;
+        }
+    }
+
     pub(in crate::handler) async fn resolve_target_managed_client(
         &self,
         requester_pid: u32,

@@ -147,6 +147,7 @@ pub(crate) struct ControlClientFlags {
     pub(crate) pause_after_millis: Option<u64>,
     pub(crate) no_output: bool,
     pub(crate) wait_exit: bool,
+    pub(crate) ignore_size: bool,
 }
 
 impl ControlClientFlags {
