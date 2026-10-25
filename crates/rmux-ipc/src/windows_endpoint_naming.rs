@@ -51,6 +51,11 @@ pub(crate) fn random_nonce_excluding(rejected: &[&str]) -> io::Result<String> {
     }
 }
 
+pub(crate) fn socket_path_label(path: &str) -> String {
+    let digest = Sha256::digest(path.as_bytes());
+    format!("path-{}", encode_hex(&digest[..16]))
+}
+
 fn encode_hex(bytes: &[u8]) -> String {
     const HEX: &[u8; 16] = b"0123456789abcdef";
     let mut output = String::with_capacity(bytes.len() * 2);

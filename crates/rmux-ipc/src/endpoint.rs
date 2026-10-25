@@ -253,7 +253,7 @@ pub fn resolve_tmux_compatible_endpoint(
     socket_path: Option<&Path>,
 ) -> io::Result<LocalEndpoint> {
     if let Some(socket_path) = socket_path {
-        return endpoint_for_socket_path(socket_path);
+        return tmux_compatible_endpoint_for_socket_path(socket_path);
     }
     if let Some(socket_name) = socket_name {
         if let Some(endpoint) = claude_swarm_socket_redirect(socket_name) {
@@ -292,6 +292,32 @@ fn endpoint_for_socket_path(socket_path: &Path) -> io::Result<LocalEndpoint> {
         io::ErrorKind::InvalidInput,
         "Windows -S requires an explicit \\\\.\\pipe\\rmux-... endpoint; use -L for labels",
     ))
+}
+
+/// A tmux caller names a private server by a file path. On Windows that path
+/// selects the RMUX-derived pipe of a label made from it, so every spelling of
+/// one file (8.3, long, case) names one server and no foreign pipe is reached.
+#[cfg(windows)]
+fn tmux_compatible_endpoint_for_socket_path(socket_path: &Path) -> io::Result<LocalEndpoint> {
+    let value = socket_path.as_os_str().to_string_lossy();
+    if value.is_empty() || strip_ascii_prefix(&value, PIPE_PREFIX).is_some() {
+        return endpoint_for_socket_path(socket_path);
+    }
+    let absolute = std::path::absolute(socket_path)?;
+    let resolved = match (absolute.parent(), absolute.file_name()) {
+        (Some(parent), Some(name)) => std::fs::canonicalize(parent)
+            .map(|parent| parent.join(name))
+            .unwrap_or(absolute),
+        _ => absolute,
+    };
+    endpoint_for_label(crate::windows_endpoint_naming::socket_path_label(
+        &resolved.to_string_lossy().to_lowercase(),
+    ))
+}
+
+#[cfg(not(windows))]
+fn tmux_compatible_endpoint_for_socket_path(socket_path: &Path) -> io::Result<LocalEndpoint> {
+    endpoint_for_socket_path(socket_path)
 }
 
 fn endpoint_for_empty_socket_path() -> io::Result<LocalEndpoint> {
@@ -890,6 +916,31 @@ mod tests {
             .expect("swarm endpoint")
             .into_path();
         assert_eq!(native, unredirected);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn tmux_compatible_socket_path_names_one_private_server_per_file() {
+        let dir = std::env::temp_dir();
+        let path = dir.join("rmux-fs-socket.sock");
+        let resolve = |path: &Path| {
+            resolve_tmux_compatible_endpoint(None, Some(path)).expect("tmux -S file path")
+        };
+
+        let endpoint = resolve(&path);
+
+        assert!(socket_path_is_rmux_owned(endpoint.as_path()).expect("owned check"));
+        assert_eq!(
+            resolve(&dir.join(".").join("RMUX-FS-SOCKET.sock")),
+            endpoint
+        );
+        assert_ne!(resolve(&dir.join("other.sock")), endpoint);
+        assert_eq!(
+            resolve_endpoint(None, Some(&path))
+                .expect_err("rmux -S file path")
+                .kind(),
+            io::ErrorKind::InvalidInput
+        );
     }
 
     #[cfg(windows)]
