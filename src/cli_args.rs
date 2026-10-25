@@ -511,6 +511,10 @@ impl Cli {
         &self.terminal_features
     }
 
+    pub(crate) fn command_queue(&self) -> &[Command] {
+        &self.command_queue
+    }
+
     pub(crate) fn into_command_queue(self) -> Vec<Command> {
         self.command_queue
     }

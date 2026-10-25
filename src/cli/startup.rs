@@ -10,6 +10,7 @@ use rmux_server::{DaemonConfig, ServerDaemon};
 use crate::cli_args::{Cli, Command, ConfigFileSelection, StartServerArgs, TopLevelCommandScan};
 use crate::server_runtime::build_daemon_runtime;
 
+use super::dispatch::command_has_start_server_flag;
 use super::ExitFailure;
 
 #[derive(Debug)]
@@ -193,7 +194,16 @@ pub(super) enum ServerStartupConfig {
 }
 
 pub(super) fn startup_config_from_cli(cli: &Cli) -> StartupConfig {
-    startup_config_from_selection(cli.config_file_selection(), cli.command.as_ref())
+    startup_config_from_selection(cli.config_file_selection(), server_starting_command(cli))
+}
+
+/// As in tmux, a queue such as `set-option ... ; new-session` starts the
+/// server before its first command, with the start options of the command
+/// that starts it.
+pub(super) fn server_starting_command(cli: &Cli) -> Option<&Command> {
+    cli.command_queue()
+        .iter()
+        .find(|command| command_has_start_server_flag(command))
 }
 
 pub(super) fn startup_config_from_top_level_scan(
