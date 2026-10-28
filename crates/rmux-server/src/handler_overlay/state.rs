@@ -25,6 +25,29 @@ impl ClientOverlayState {
         }
     }
 
+    pub(in crate::handler) fn intersects(&self, region: OverlayRect) -> bool {
+        let overlaps = |rect: OverlayRect| {
+            rect.width > 0
+                && rect.height > 0
+                && region.width > 0
+                && region.height > 0
+                && rect.x < region.x.saturating_add(region.width)
+                && region.x < rect.x.saturating_add(rect.width)
+                && rect.y < region.y.saturating_add(region.height)
+                && region.y < rect.y.saturating_add(rect.height)
+        };
+        match self {
+            Self::Menu(menu) => overlaps(menu.rect),
+            Self::Popup(popup) => {
+                overlaps(popup.rect)
+                    || popup
+                        .nested_menu
+                        .as_ref()
+                        .is_some_and(|menu| overlaps(menu.rect))
+            }
+        }
+    }
+
     pub(in crate::handler) fn render(&self) -> Vec<u8> {
         match self {
             Self::Menu(menu) => menu.render(),

@@ -4872,3 +4872,129 @@ async fn select_window_clears_alert_flags_on_newly_selected_window() {
         "alert flags should be cleared when selecting a window via next-window"
     );
 }
+
+#[tokio::test]
+async fn pane_output_refresh_preserves_popup_but_updates_other_attached_clients() {
+    let handler = RequestHandler::new();
+    let session = create_quiet_session(&handler, "popup-output-refresh").await;
+    let (popup_tx, mut popup_rx) = mpsc::unbounded_channel();
+    let (plain_tx, mut plain_rx) = mpsc::unbounded_channel();
+    handler
+        .register_attach(771, session.clone(), popup_tx)
+        .await;
+    handler
+        .register_attach(772, session.clone(), plain_tx)
+        .await;
+    let popup = rmux_core::command_parser::CommandParser::new()
+        .parse_one_group("display-popup -N -T OutputGuard -w 30 -h 8")
+        .expect("popup parses");
+    handler
+        .execute_parsed_commands_for_test(771, popup)
+        .await
+        .expect("popup opens");
+    drain_attach_controls_until_quiet(
+        &mut popup_rx,
+        Duration::from_millis(150),
+        Duration::from_secs(2),
+    )
+    .await;
+    drain_attach_controls_until_quiet(
+        &mut plain_rx,
+        Duration::from_millis(150),
+        Duration::from_secs(2),
+    )
+    .await;
+
+    handler
+        .refresh_attached_session_for_pane_output(&session)
+        .await;
+    assert!(
+        popup_rx.try_recv().is_err(),
+        "pane output must not erase/repaint a popup"
+    );
+    assert!(
+        matches!(plain_rx.try_recv(), Ok(AttachControl::Switch(_))),
+        "another client without a popup must keep seeing pane output"
+    );
+
+    // Automatic renaming is another output-driven refresh path. It must
+    // update the model and unobscured clients without repainting this popup.
+    set_option(
+        &handler,
+        ScopeSelector::Window(WindowTarget::with_window(session.clone(), 0)),
+        OptionName::AutomaticRenameFormat,
+        "popup-background-renamed",
+    )
+    .await;
+    while popup_rx.try_recv().is_ok() {}
+    while plain_rx.try_recv().is_ok() {}
+    let pane_id = {
+        let state = handler.state.lock().await;
+        state
+            .sessions
+            .session(&session)
+            .unwrap()
+            .window_at(0)
+            .unwrap()
+            .pane(0)
+            .unwrap()
+            .id()
+    };
+    handler
+        .handle_pane_alert_event(crate::pane_io::PaneAlertEvent {
+            session_name: session.clone(),
+            pane_id,
+            bell_count: 0,
+            title_changed: false,
+            title_change: None,
+            path_changed: false,
+            clipboard_set: false,
+            clipboard_writes: Vec::new(),
+            clipboard_queries: Vec::new(),
+            mouse_mode_changed: false,
+            alternate_mode_changed: false,
+            queue_activity_alert: true,
+            generation: None,
+        })
+        .await;
+    assert!(
+        popup_rx.try_recv().is_err(),
+        "automatic naming must preserve the popup"
+    );
+    {
+        let state = handler.state.lock().await;
+        assert_eq!(
+            state
+                .sessions
+                .session(&session)
+                .unwrap()
+                .window_at(0)
+                .unwrap()
+                .name(),
+            Some("popup-background-renamed")
+        );
+    }
+
+    // Layout changes and explicit refreshes still restore the full surface.
+    handler.refresh_attached_session(&session).await;
+    assert!(
+        matches!(popup_rx.try_recv(), Ok(AttachControl::Switch(_))),
+        "explicit refresh must remain available with a popup open"
+    );
+    while popup_rx.try_recv().is_ok() {}
+    let close = rmux_core::command_parser::CommandParser::new()
+        .parse_one_group("display-popup -C")
+        .expect("popup close parses");
+    handler
+        .execute_parsed_commands_for_test(771, close)
+        .await
+        .expect("popup closes");
+    while popup_rx.try_recv().is_ok() {}
+    handler
+        .refresh_attached_session_for_pane_output(&session)
+        .await;
+    assert!(
+        matches!(popup_rx.try_recv(), Ok(AttachControl::Switch(_))),
+        "pane output must resume after dismissal"
+    );
+}

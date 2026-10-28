@@ -543,9 +543,13 @@ impl RequestHandler {
         expected_attach_id: u64,
         expected_session_name: &SessionName,
         expected_session_id: SessionId,
-        bytes: Vec<u8>,
-        client_title: Option<RenderedClientTitle>,
+        frame: (
+            Vec<u8>,
+            Option<RenderedClientTitle>,
+            Option<crate::renderer::OverlayRect>,
+        ),
     ) -> Result<(), rmux_proto::RmuxError> {
+        let (bytes, client_title, status_region) = frame;
         let mut active_attach = self.active_attach.lock().await;
         let Some(active) = active_attach.by_pid.get_mut(&attach_pid) else {
             return Err(attached_client_required("refresh-client"));
@@ -557,7 +561,18 @@ impl RequestHandler {
         {
             return Err(attached_client_required("refresh-client"));
         }
-        if active.transient_message.is_some() {
+        // Check the current overlay while holding the same lock used to enqueue
+        // the status frame. An overlay may have opened or moved during rendering.
+        // Defer a status frame that intersects an overlay; do not repaint the
+        // overlay after it, which would expose the status as another flash.
+        if active.transient_message.is_some()
+            || status_region.is_some_and(|region| {
+                active
+                    .overlay
+                    .as_ref()
+                    .is_some_and(|overlay| overlay.intersects(region))
+            })
+        {
             return Ok(());
         }
         // Remember before the send: a failed send takes the client down, and a
@@ -1227,7 +1242,24 @@ fn reset_interactive_attach_state_for_session_switch(
     active.transient_message = None;
     active.transient_terminal_prefix.clear();
     active.overlay_state_id = active.overlay_state_id.saturating_add(1);
-    active.overlay.take()
+    let retired = active.overlay.take();
+    if retired.is_some() {
+        // The render loop keeps its own "an overlay is on screen" flag and
+        // holds back base-pane repaints while it is set. Retiring the overlay
+        // here without telling it latches that flag: the client lands on the
+        // new session with the old popup still drawn, and — since the pane it
+        // switched to may be idle — no later output ever arrives to lift the
+        // hold. Every other dismissal path sends this empty frame; a session
+        // switch is one too.
+        let _ = active
+            .control_tx
+            .send(AttachControl::Overlay(OverlayFrame::persistent(
+                Vec::new(),
+                active.render_generation,
+                active.overlay_generation,
+            )));
+    }
+    retired
 }
 
 fn terminate_overlay_job(overlay: Option<super::overlay_support::ClientOverlayState>) {

@@ -241,7 +241,7 @@ pub(super) async fn apply_pending_attach_controls(
     stream: &AttachTransport,
     render_generation: &mut u64,
     overlay_generation: &mut u64,
-    persistent_overlay: &mut Option<Vec<u8>>,
+    persistent_overlay: &mut Option<OverlayFrame>,
     persistent_overlay_visible: &mut bool,
     persistent_overlay_state_id: &mut Option<u64>,
     locked: &mut bool,
@@ -523,7 +523,7 @@ pub(super) fn take_pending_live_passthroughs(
 pub(super) async fn redraw_after_persistent_overlay_state_advance(
     _stream: &AttachTransport,
     _current_target: &OpenAttachTarget,
-    _persistent_overlay: &mut Option<Vec<u8>>,
+    _persistent_overlay: &mut Option<OverlayFrame>,
     persistent_overlay_visible: &mut bool,
     previous_state_id: Option<u64>,
     current_state_id: Option<u64>,

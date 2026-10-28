@@ -1850,7 +1850,7 @@ async fn detach_control_emits_stop_and_banner_in_one_data_frame() {
     let expected_stop = current_target.outer_terminal.attach_stop_sequence();
     let mut render_generation = 0_u64;
     let mut overlay_generation = 0_u64;
-    let mut persistent_overlay = None::<Vec<u8>>;
+    let mut persistent_overlay = None::<OverlayFrame>;
     let mut persistent_overlay_visible = false;
     let mut persistent_overlay_state_id = current_target.persistent_overlay_state_id;
     let mut locked = false;
@@ -1917,7 +1917,7 @@ async fn lock_control_emits_attach_stop_before_transferring_terminal_ownership()
     let expected_stop = current_target.outer_terminal.attach_stop_sequence();
     let mut render_generation = 0_u64;
     let mut overlay_generation = 0_u64;
-    let mut persistent_overlay = None::<Vec<u8>>;
+    let mut persistent_overlay = None::<OverlayFrame>;
     let mut persistent_overlay_visible = false;
     let mut persistent_overlay_state_id = current_target.persistent_overlay_state_id;
     let mut locked = false;
@@ -2234,7 +2234,7 @@ async fn pending_switch_action_reports_target_change_for_status_reschedule() {
         .expect("open target");
     let mut render_generation = 0_u64;
     let mut overlay_generation = 0_u64;
-    let mut persistent_overlay = None::<Vec<u8>>;
+    let mut persistent_overlay = None::<OverlayFrame>;
     let mut persistent_overlay_visible = false;
     let mut persistent_overlay_state_id = current_target.persistent_overlay_state_id;
     let mut locked = false;
@@ -2289,7 +2289,7 @@ async fn pending_refresh_after_switch_preserves_target_change() {
         .expect("open target");
     let mut render_generation = 0_u64;
     let mut overlay_generation = 0_u64;
-    let mut persistent_overlay = None::<Vec<u8>>;
+    let mut persistent_overlay = None::<OverlayFrame>;
     let mut persistent_overlay_visible = false;
     let mut persistent_overlay_state_id = current_target.persistent_overlay_state_id;
     let mut locked = false;
@@ -2350,7 +2350,7 @@ async fn pending_same_pane_switch_preserves_partial_input_and_escape_deadline() 
     .expect("open target");
     let mut render_generation = 0_u64;
     let mut overlay_generation = 0_u64;
-    let mut persistent_overlay = None::<Vec<u8>>;
+    let mut persistent_overlay = None::<OverlayFrame>;
     let mut persistent_overlay_visible = false;
     let mut persistent_overlay_state_id = current_target.persistent_overlay_state_id;
     let mut locked = false;
@@ -2400,7 +2400,7 @@ async fn pending_different_pane_switch_clears_partial_input_and_escape_deadline(
         .expect("open target");
     let mut render_generation = 0_u64;
     let mut overlay_generation = 0_u64;
-    let mut persistent_overlay = None::<Vec<u8>>;
+    let mut persistent_overlay = None::<OverlayFrame>;
     let mut persistent_overlay_visible = false;
     let mut persistent_overlay_state_id = current_target.persistent_overlay_state_id;
     let mut locked = false;
@@ -2459,7 +2459,7 @@ async fn terminal_ownership_controls_clear_partial_input_and_escape_deadline() {
                 .expect("open target");
         let mut render_generation = 0_u64;
         let mut overlay_generation = 0_u64;
-        let mut persistent_overlay = None::<Vec<u8>>;
+        let mut persistent_overlay = None::<OverlayFrame>;
         let mut persistent_overlay_visible = false;
         let mut persistent_overlay_state_id = current_target.persistent_overlay_state_id;
         let mut locked = false;
@@ -2515,7 +2515,7 @@ async fn stale_persistent_switches_still_advance_render_generation() {
             .expect("open target");
     let mut render_generation = 41_u64;
     let mut overlay_generation = 0_u64;
-    let mut persistent_overlay = None::<Vec<u8>>;
+    let mut persistent_overlay = None::<OverlayFrame>;
     let mut persistent_overlay_visible = false;
     let mut persistent_overlay_state_id = current_target.persistent_overlay_state_id;
     let mut locked = false;
@@ -2568,7 +2568,7 @@ async fn render_only_switch_forwards_pending_live_passthroughs() {
     let mut current_target = open_attach_target(initial, false).expect("open target");
     let mut render_generation = 0_u64;
     let mut overlay_generation = 0_u64;
-    let mut persistent_overlay = None::<Vec<u8>>;
+    let mut persistent_overlay = None::<OverlayFrame>;
     let mut persistent_overlay_visible = false;
     let mut persistent_overlay_state_id = current_target.persistent_overlay_state_id;
     let mut locked = false;
@@ -3305,7 +3305,7 @@ async fn exited_after_same_source_render_switch_does_not_duplicate_dequeued_outp
         .expect("queue terminal exit");
     let mut render_generation = 0_u64;
     let mut overlay_generation = 0_u64;
-    let mut persistent_overlay = None::<Vec<u8>>;
+    let mut persistent_overlay = None::<OverlayFrame>;
     let mut persistent_overlay_visible = false;
     let mut persistent_overlay_state_id = current_target.persistent_overlay_state_id;
     let mut locked = false;
@@ -3486,7 +3486,7 @@ async fn exited_after_non_coalesced_same_source_switches_forwards_passthroughs_o
 
     let mut render_generation = 0_u64;
     let mut overlay_generation = 0_u64;
-    let mut persistent_overlay = None::<Vec<u8>>;
+    let mut persistent_overlay = None::<OverlayFrame>;
     let mut persistent_overlay_visible = false;
     let mut persistent_overlay_state_id = current_target.persistent_overlay_state_id;
     let mut locked = false;

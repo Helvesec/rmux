@@ -136,7 +136,9 @@ impl RequestHandler {
                     .apply_prepared_pane_alert_events(prepared_events)
                     .await;
                 for session_name in inactive_output_refreshes {
-                    handler.refresh_attached_session(&session_name).await;
+                    handler
+                        .refresh_attached_session_for_pane_output(&session_name)
+                        .await;
                 }
             });
         })
@@ -162,7 +164,8 @@ impl RequestHandler {
             .handle_pane_alert_events_deferred_refresh(vec![event])
             .await
         {
-            self.refresh_attached_session(&session_name).await;
+            self.refresh_attached_session_for_pane_output(&session_name)
+                .await;
         }
     }
 
@@ -231,7 +234,8 @@ impl RequestHandler {
             .apply_prepared_pane_alert_events_before_exit(prepared, silence_resets)
             .await;
         for session_name in refreshes {
-            self.refresh_attached_session(&session_name).await;
+            self.refresh_attached_session_for_pane_output(&session_name)
+                .await;
         }
     }
 
@@ -430,7 +434,8 @@ impl RequestHandler {
             }
         }
         for session_name in automatic_name_refreshes {
-            self.refresh_attached_session(&session_name).await;
+            self.refresh_attached_session_for_pane_output(&session_name)
+                .await;
         }
         self.execute_alert_plans(plans).await;
         inactive_output_refreshes

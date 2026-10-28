@@ -579,6 +579,7 @@ impl RequestHandler {
                         active.render_generation,
                         active.overlay_generation,
                     )
+                    .with_deferred_pane_updates()
                 } else if let (Some(_mode_tree), Some(mode_tree_frame)) =
                     (active.mode_tree.as_ref(), active.mode_tree_frame.as_ref())
                 {

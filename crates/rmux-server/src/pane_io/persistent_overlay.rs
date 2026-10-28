@@ -263,7 +263,7 @@ fn overlay_matches_switch(
 }
 
 pub(super) fn update_persistent_overlay_cache(
-    cache: &mut Option<Vec<u8>>,
+    cache: &mut Option<OverlayFrame>,
     visible: &mut bool,
     overlay: &OverlayFrame,
 ) {
@@ -274,7 +274,7 @@ pub(super) fn update_persistent_overlay_cache(
         *cache = None;
         *visible = false;
     } else {
-        *cache = Some(overlay.frame.clone());
+        *cache = Some(overlay.clone());
         *visible = true;
     }
 }
@@ -302,14 +302,14 @@ pub(super) fn clear_then_base_frame(current_target: &OpenAttachTarget) -> Vec<u8
 }
 
 pub(super) fn replacement_persistent_overlay_frame(
-    cache: &Option<Vec<u8>>,
+    cache: &Option<OverlayFrame>,
     visible: bool,
     next_target: &AttachTarget,
 ) -> Option<Vec<u8>> {
     if !visible || next_target.persistent_overlay_state_id.is_none() {
         return None;
     }
-    cache.clone()
+    cache.as_ref().map(|overlay| overlay.frame.clone())
 }
 
 pub(super) fn persistent_overlay_replacement_pending(

@@ -1868,3 +1868,53 @@ async fn status_right_click_routes_window_menu_to_clicked_window_target() {
         Target::Window(WindowTarget::with_window(alpha, 0))
     );
 }
+
+#[tokio::test]
+async fn popup_status_ticks_respect_covered_rows_and_resume_after_close() {
+    for (position, lines, popup, blocked) in [
+        ("bottom", "on", "-h 100% -y 0", true),
+        ("bottom", "on", "-h 99% -y 0", false),
+        ("top", "2", "-h 8 -y 0", true),
+        ("top", "2", "-h 8 -y 12", false),
+    ] {
+        let handler = RequestHandler::new();
+        let name = session_name("popup-status-coverage");
+        let pid = std::process::id();
+        let mut rx = create_quiet_attached_session(&handler, &name, pid).await;
+        run_overlay_command(&handler, pid, &format!(
+            "set -g status {lines}; set -g status-position {position}; set -g status-interval 3600; set -g status-left STATUS-COVERAGE"
+        )).await;
+        run_overlay_command(
+            &handler,
+            pid,
+            &format!("display-popup -N -B -w 100% -x 0 {popup}"),
+        )
+        .await;
+        let _ = next_overlay_frame(&mut rx).await;
+        while rx.try_recv().is_ok() {}
+        handler
+            .refresh_attached_client_status(pid, &name)
+            .await
+            .expect("status tick");
+        let mut writes = Vec::new();
+        while let Ok(control) = rx.try_recv() {
+            if let AttachControl::Write(bytes) = control {
+                writes.extend(bytes);
+            }
+        }
+        assert_eq!(writes.is_empty(), blocked, "{position} {lines} {popup}");
+        run_overlay_command(&handler, pid, "display-popup -C").await;
+        while rx.try_recv().is_ok() {}
+        handler
+            .refresh_attached_client_status(pid, &name)
+            .await
+            .expect("status after close");
+        let mut writes = Vec::new();
+        while let Ok(control) = rx.try_recv() {
+            if let AttachControl::Write(bytes) = control {
+                writes.extend(bytes);
+            }
+        }
+        assert!(!writes.is_empty(), "status resumes after close");
+    }
+}

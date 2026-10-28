@@ -8,6 +8,25 @@ use crate::pane_io::AttachControl;
 
 impl RequestHandler {
     pub(crate) async fn refresh_attached_session(&self, session_name: &rmux_proto::SessionName) {
+        self.refresh_attached_session_with_output_policy(session_name, false)
+            .await;
+    }
+
+    /// Output behind a popup/menu still updates its transcript, but must not
+    /// repeatedly clear the client's overlay to repaint the obscured pane.
+    pub(crate) async fn refresh_attached_session_for_pane_output(
+        &self,
+        session_name: &rmux_proto::SessionName,
+    ) {
+        self.refresh_attached_session_with_output_policy(session_name, true)
+            .await;
+    }
+
+    async fn refresh_attached_session_with_output_policy(
+        &self,
+        session_name: &rmux_proto::SessionName,
+        pane_output_only: bool,
+    ) {
         let _refresh_span = crate::perf_instrument::span("attach_refresh")
             .with_str("scope", "session")
             .with_str("session", session_name.as_str());
@@ -36,7 +55,10 @@ impl RequestHandler {
             let mut overlay_pids = Vec::new();
             let mut stale_clients = Vec::new();
             for (pid, active) in &mut active_attach.by_pid {
-                if &active.session_name != session_name || active.suspended {
+                if &active.session_name != session_name
+                    || active.suspended
+                    || (pane_output_only && active.overlay.is_some())
+                {
                     continue;
                 }
                 if active.mode_tree.is_some() {
@@ -135,7 +157,10 @@ impl RequestHandler {
         let mut active_attach = self.active_attach.lock().await;
         let mut stale_clients = Vec::new();
         for (pid, active) in &mut active_attach.by_pid {
-            if &active.session_name != session_name || active.suspended {
+            if &active.session_name != session_name
+                || active.suspended
+                || (pane_output_only && active.overlay.is_some())
+            {
                 continue;
             }
             let Some((identity, mut target, transient_message, rendered_status)) =

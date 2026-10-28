@@ -245,6 +245,12 @@ Expands to
 Expands to
 .BR "choose-tree -w" .
 .SH NOTES
+.B display-popup
+keeps background pane updates off the attached client's screen until the popup
+closes. Pane output continues to be captured, and closing the popup restores
+the latest pane contents. Status updates that overlap a popup or menu are
+held back while it is open; status bars outside the overlay continue updating.
+.PP
 .B link-window
 and
 .B unlink-window

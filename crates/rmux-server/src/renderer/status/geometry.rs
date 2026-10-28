@@ -89,6 +89,15 @@ impl StatusGeometry {
         }
     }
 
+    pub(crate) fn status_rect(self) -> Option<crate::renderer::OverlayRect> {
+        self.status_y.map(|y| crate::renderer::OverlayRect {
+            x: 0,
+            y,
+            width: self.terminal_size.cols,
+            height: self.status_lines,
+        })
+    }
+
     pub(crate) const fn content_y_offset(self) -> u16 {
         self.content_y_offset
     }

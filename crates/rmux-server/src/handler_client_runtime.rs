@@ -231,7 +231,7 @@ impl RequestHandler {
             )
         };
         let socket_path = self.socket_path();
-        let (bytes, client_title) = {
+        let status_frame = {
             let state = self.state.lock().await;
             let session = state
                 .sessions
@@ -287,15 +287,19 @@ impl RequestHandler {
             // outer-terminal property, not part of the drawn frame.
             let mut bytes = outer_terminal.render_client_title(title_update);
             bytes.extend_from_slice(&outer_terminal.wrap_render_frame(&frame));
-            (bytes, outer_terminal.rendered_client_title(title_update))
+            (
+                bytes,
+                outer_terminal.rendered_client_title(title_update),
+                crate::renderer::StatusGeometry::for_session(session.as_ref(), &state.options)
+                    .status_rect(),
+            )
         };
         self.send_attached_status_if_unobscured(
             attach_pid,
             current_attach_id,
             session_name,
             current_session_id,
-            bytes,
-            client_title,
+            status_frame,
         )
         .await
     }

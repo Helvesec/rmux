@@ -21,12 +21,15 @@ use crate::outer_terminal::{OuterTerminal, RenderedClientTitle};
 use super::attach_control::AttachControl;
 use super::live_render::LivePaneRender;
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub(crate) struct OverlayFrame {
     pub(crate) frame: Vec<u8>,
     pub(crate) render_generation: u64,
     pub(crate) overlay_generation: u64,
     pub(crate) persistent: bool,
+    /// Popup/menu ownership suppresses base-pane paints; other cached overlays
+    /// (such as clocks and choosers) retain their existing refresh behavior.
+    pub(crate) defer_pane_updates: bool,
     pub(crate) persistent_state_id: Option<u64>,
 }
 
@@ -37,6 +40,7 @@ impl OverlayFrame {
             render_generation,
             overlay_generation,
             persistent: false,
+            defer_pane_updates: false,
             persistent_state_id: None,
         }
     }
@@ -51,8 +55,14 @@ impl OverlayFrame {
             render_generation,
             overlay_generation,
             persistent: true,
+            defer_pane_updates: false,
             persistent_state_id: None,
         }
+    }
+
+    pub(crate) fn with_deferred_pane_updates(mut self) -> Self {
+        self.defer_pane_updates = true;
+        self
     }
 
     pub(crate) fn persistent_with_state(
@@ -66,6 +76,7 @@ impl OverlayFrame {
             render_generation,
             overlay_generation,
             persistent: true,
+            defer_pane_updates: false,
             persistent_state_id: Some(persistent_state_id),
         }
     }
