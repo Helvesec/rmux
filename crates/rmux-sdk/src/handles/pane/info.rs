@@ -1,4 +1,5 @@
 use std::collections::hash_map::DefaultHasher;
+use std::collections::HashMap;
 use std::hash::{Hash, Hasher};
 
 use crate::handles::session::unexpected_response;
@@ -514,6 +515,73 @@ async fn fetch_live_details_by_id(
         }
     }
     Ok(LiveDetails::default())
+}
+
+/// Live details for every pane in a session, keyed by pane id — one
+/// `list-panes` probe with the same [`PANE_INFO_FORMAT`] the pane-scoped
+/// snapshot uses, so callers can decorate a whole window's panes without
+/// one round-trip per pane.
+async fn fetch_session_live_details(
+    client: &TransportClient,
+    session_name: &rmux_proto::SessionName,
+) -> Result<HashMap<PaneId, LiveDetails>> {
+    let response = client
+        .request(Request::ListPanes(Box::new(ListPanesRequest {
+            target: session_name.clone(),
+            target_window_index: None,
+            format: Some(PANE_INFO_FORMAT.to_owned()),
+            filter: None,
+            sort_order: None,
+            reversed: false,
+        })))
+        .await?;
+
+    let output = match response {
+        Response::ListPanes(response) => response.output.stdout,
+        response => return Err(unexpected_response("list-panes", response)),
+    };
+
+    let mut details = HashMap::new();
+    for line in String::from_utf8_lossy(&output).lines() {
+        let parsed = parse_details_line(line)?;
+        if let Some(pane_id) = parsed.pane_id {
+            details.insert(pane_id, parsed);
+        }
+    }
+    Ok(details)
+}
+
+/// Fill window-level [`PaneInfo`]s with the live per-pane details the
+/// pane-scoped snapshot serves: process/exit state, start command,
+/// working directory, geometry, and lifecycle counters. Panes the probe
+/// could not resolve are left untouched (their process state stays
+/// `Unknown`), so a pane that vanished mid-snapshot degrades exactly the
+/// way the pane-scoped path's absent-slot snapshot does.
+pub(in crate::handles) async fn apply_live_details(
+    client: &TransportClient,
+    session_name: &rmux_proto::SessionName,
+    panes: &mut [PaneInfo],
+    window_size: TerminalSizeSpec,
+) -> Result<()> {
+    let details = fetch_session_live_details(client, session_name).await?;
+    for info in panes.iter_mut() {
+        let Some(live) = details.get(&info.id) else {
+            continue;
+        };
+        info.size = pane_size_from_details(live, &window_size);
+        info.process = derive_process_state(live);
+        info.exit_state = derive_exit_state(live);
+        info.command = live.start_command.clone();
+        info.working_directory = live.current_path.clone();
+        info.generation = live.generation;
+        info.revision = if live.lifecycle_revision == 0 {
+            revision_from_details(live)
+        } else {
+            live.lifecycle_revision
+        };
+        info.output_sequence = live.output_sequence;
+    }
+    Ok(())
 }
 
 pub(super) async fn pane_title_for_id(

@@ -19,6 +19,8 @@ mod capture_pane;
 mod foreground;
 #[path = "pane/info.rs"]
 mod info;
+
+pub(in crate::handles) use info::apply_live_details;
 #[path = "pane/input.rs"]
 mod input;
 #[path = "pane/lifecycle.rs"]
