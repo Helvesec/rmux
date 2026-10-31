@@ -3,6 +3,7 @@
 use std::fmt;
 use std::time::Duration;
 
+use crate::handles::pane::apply_live_details;
 use crate::handles::session::unexpected_response;
 use crate::transport::{OperationDeadline, TransportClient};
 use crate::{
@@ -131,9 +132,15 @@ impl Window {
     /// Returns a sticky info snapshot for this window and its listed panes.
     ///
     /// The snapshot is assembled from live daemon `list-sessions`,
-    /// `list-windows`, and `list-panes` responses. If the target has already
-    /// been closed, the returned snapshot contains only the still-observable
-    /// session metadata, or is empty when the session is gone.
+    /// `list-windows`, and `list-panes` responses, plus one session-scoped
+    /// pane details probe of the same shape [`Pane::info`](crate::Pane::info)
+    /// uses — so every listed pane's process state, exit state, start
+    /// command, working directory, geometry, and lifecycle counters reflect
+    /// the daemon's current view. A pane whose details line the probe could
+    /// not resolve keeps `PaneProcessState::Unknown`. If the target has
+    /// already been closed, the returned snapshot contains only the
+    /// still-observable session metadata, or is empty when the session is
+    /// gone.
     pub async fn info(&self) -> Result<InfoSnapshot> {
         window_info_snapshot(&self.transport.begin_operation(), &self.target).await
     }
@@ -297,7 +304,7 @@ async fn window_info_snapshot(
 
     let panes = list_window_panes_or_empty(client, target).await?;
     let session_id = session.id;
-    let pane_infos = panes
+    let mut pane_infos = panes
         .into_iter()
         .map(|pane| {
             let mut info = PaneInfo::new(pane.id, window.id, session_id);
@@ -306,7 +313,17 @@ async fn window_info_snapshot(
             info.process = PaneProcessState::Unknown;
             info
         })
-        .collect();
+        .collect::<Vec<_>>();
+    if let Err(error) =
+        apply_live_details(client, &target.session_name, &mut pane_infos, window.size).await
+    {
+        // The window vanished between the pane listing and the details
+        // probe: degrade to the undecorated snapshot, the same tolerance
+        // the pane listing itself applies.
+        if !is_already_closed_error(&error, target) {
+            return Err(error);
+        }
+    }
 
     Ok(InfoSnapshot::new(
         vec![session],
