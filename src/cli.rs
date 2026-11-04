@@ -106,8 +106,8 @@ use shell_startup::{same_file_identity_for_paths, usable_shell_path};
 #[cfg(test)]
 use startup::ServerStartupConfig;
 use startup::{
-    run_foreground_server, startup_config_from_cli, startup_config_from_top_level_scan,
-    StartServerConnection, StartupEndpoint, StartupOptions,
+    run_foreground_server, server_starting_command, startup_config_from_cli,
+    startup_config_from_top_level_scan, StartServerConnection, StartupEndpoint, StartupOptions,
 };
 use target_resolution::{
     list_session_names, listed_pane_index_matches_target, resolve_current_pane_target,
@@ -224,10 +224,7 @@ where
         && !cli.no_fork
         && !cli.no_start_server
         && cli.shell_command.is_none()
-        && cli
-            .command
-            .as_ref()
-            .is_some_and(command_has_start_server_flag)
+        && server_starting_command(&cli).is_some()
     {
         let outcome = ensure_server_running_with_config_outcome(
             &socket_path,
@@ -592,8 +589,8 @@ fn shell_command_token(token: String) -> String {
 mod tests {
     use super::{
         command_has_start_server_flag, default_client_command, render_list_commands_line, run,
-        same_file_identity_for_paths, startup_config_from_cli, top_level_parse_failure,
-        usable_shell_path, ServerStartupConfig,
+        same_file_identity_for_paths, server_starting_command, startup_config_from_cli,
+        top_level_parse_failure, usable_shell_path, ServerStartupConfig,
     };
     use crate::cli_args::{
         parse as parse_cli, parse_target_spec, AttachSessionArgs, Command, ListSessionsArgs,
@@ -803,6 +800,38 @@ mod tests {
                 .expect("parsed command");
             assert!(!command_has_start_server_flag(&command));
         }
+    }
+
+    #[test]
+    fn a_queue_starts_the_server_with_the_options_of_the_command_that_starts_it() {
+        let parse = |values: &[&str]| parse_cli(values.iter().copied()).expect("queue parses");
+        let starts = |values: &[&str]| server_starting_command(&parse(values)).is_some();
+
+        assert!(starts(&[
+            "rmux",
+            "set-option",
+            "-g",
+            "status",
+            "off",
+            ";",
+            "new-session",
+            "-d"
+        ]));
+        assert!(starts(&["rmux", "new-session", "-d"]));
+        assert!(!starts(&["rmux", "list-sessions", ";", "has-session"]));
+
+        let queued_web_server = parse(&[
+            "rmux",
+            "list-commands",
+            ";",
+            "start-server",
+            "--web-port",
+            "4321",
+        ]);
+        assert_eq!(
+            startup_config_from_cli(&queued_web_server).web_port,
+            Some(4321)
+        );
     }
 
     #[test]
