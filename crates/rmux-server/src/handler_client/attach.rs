@@ -207,6 +207,8 @@ impl RequestHandler {
                 {
                     return HandleOutcome::response(Response::Error(ErrorResponse { error }));
                 }
+            } else if flags == super::ClientFlags::IGNORESIZE {
+                self.set_control_client_ignore_size(requester_pid).await;
             } else if request.read_only || request.flags.is_some() {
                 return HandleOutcome::response(Response::Error(ErrorResponse {
                     error: RmuxError::Server(

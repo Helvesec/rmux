@@ -189,6 +189,10 @@ impl RequestHandler {
                 error: attached_client_required("refresh-client"),
             });
         }
+        let ignore_size = match control_ignore_size_flag(&request) {
+            Ok(ignore_size) => ignore_size,
+            Err(error) => return Response::Error(ErrorResponse { error }),
+        };
 
         let control_size = match request.control_size.as_deref() {
             Some(value) => match parse_control_size(value) {
@@ -203,15 +207,22 @@ impl RequestHandler {
         };
 
         let (session_name, session_id) = {
-            let active_control = self.active_control.lock().await;
-            let Some(active) = active_control.by_pid.get(&control_pid).filter(|active| {
-                active.id == identity.control_id()
-                    && !active.closing.load(std::sync::atomic::Ordering::SeqCst)
-            }) else {
+            let mut active_control = self.active_control.lock().await;
+            let Some(active) = active_control
+                .by_pid
+                .get_mut(&control_pid)
+                .filter(|active| {
+                    active.id == identity.control_id()
+                        && !active.closing.load(std::sync::atomic::Ordering::SeqCst)
+                })
+            else {
                 return Response::Error(ErrorResponse {
                     error: attached_client_required("refresh-client"),
                 });
             };
+            if let Some(ignore_size) = ignore_size {
+                active.flags.ignore_size = ignore_size;
+            }
             (active.session_name.clone(), active.session_id)
         };
 
@@ -235,13 +246,14 @@ impl RequestHandler {
                     });
                 };
                 let size_sequence = active.size_sequence;
+                let declared_size = (!active.flags.ignore_size).then_some(size);
                 match super::super::attach_support::resize_control_session_for_client(
                     &mut state,
                     super::super::attach_support::ControlResizeClient::new(
                         &active_attach,
                         &active_control,
                         control_pid,
-                        Some(size),
+                        declared_size,
                         size_sequence,
                     ),
                     session_name,
@@ -449,11 +461,27 @@ trait RefreshClientControlScope {
 
 impl RefreshClientControlScope for RefreshClientRequest {
     fn has_attach_only_effects(&self) -> bool {
-        self.status_only
-            || self.clipboard_query
-            || self.flags.is_some()
-            || self.flags_alias.is_some()
+        self.status_only || self.clipboard_query
     }
+}
+
+/// The ignore-size change in a control client's `refresh-client -f`, applied
+/// before `-C` as tmux does; other client flags are not available to it.
+fn control_ignore_size_flag(request: &RefreshClientRequest) -> Result<Option<bool>, RmuxError> {
+    let raw = request.flags.as_deref().or(request.flags_alias.as_deref());
+    let mut ignore_size = None;
+    for token in raw.unwrap_or_default().split(',').filter(|t| !t.is_empty()) {
+        ignore_size = match token {
+            "ignore-size" | "ignoresize" => Some(true),
+            "!ignore-size" | "!ignoresize" => Some(false),
+            _ => {
+                return Err(RmuxError::Server(
+                    "refresh-client client flags are not available for control clients".to_owned(),
+                ))
+            }
+        };
+    }
+    Ok(ignore_size)
 }
 
 fn validate_refresh_supported_request(request: &RefreshClientRequest) -> Result<(), RmuxError> {

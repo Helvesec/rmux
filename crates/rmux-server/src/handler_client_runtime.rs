@@ -481,7 +481,7 @@ pub(in crate::handler) fn format_control_client_flags(
         client_flag(attached, "attached"),
         client_flag(attached, "focused"),
         Some("control-mode".to_owned()),
-        None,
+        client_flag(active.flags.ignore_size, "ignore-size"),
         None,
         client_flag(active.flags.no_output, "no-output"),
         client_flag(active.flags.wait_exit, "wait-exit"),

@@ -1367,10 +1367,11 @@ impl RequestHandler {
                 SelectionTargetTransitionSnapshot::capture(&state, selection.window_target())
             })
             .transpose()?;
-        let control_size = active.size_declared.then_some(TerminalSize {
-            cols: active.client_width,
-            rows: active.client_height,
-        });
+        let control_size =
+            (active.size_declared && !active.flags.ignore_size).then_some(TerminalSize {
+                cols: active.client_width,
+                rows: active.client_height,
+            });
         let session_changed =
             active.session_name != next_session_name || active.session_id != next_session_id;
         let previous_session_id = active.session_id;
