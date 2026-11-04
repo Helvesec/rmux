@@ -42,6 +42,11 @@ use windows_sys::Win32::System::Console::{
     GetStdHandle, STD_ERROR_HANDLE, STD_INPUT_HANDLE, STD_OUTPUT_HANDLE,
 };
 #[cfg(windows)]
+use windows_sys::Win32::System::JobObjects::{
+    JobObjectExtendedLimitInformation, QueryInformationJobObject,
+    JOBOBJECT_EXTENDED_LIMIT_INFORMATION, JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
+};
+#[cfg(windows)]
 use windows_sys::Win32::System::Threading::{
     CreateEventW, OpenEventW, SetEvent, WaitForSingleObject, CREATE_BREAKAWAY_FROM_JOB,
     CREATE_NO_WINDOW, CREATE_UNICODE_ENVIRONMENT, DETACHED_PROCESS, EVENT_MODIFY_STATE,
@@ -79,12 +84,22 @@ pub fn spawn_hidden_daemon_command(command: &mut Command) -> io::Result<Child> {
     spawn_hidden_daemon_command_impl(command)
 }
 
+/// Spawns a child that may itself start the daemon.
+///
+/// The child still gets the standard handles `command` names, but not this
+/// process's own captured stdout/stderr as extra inherited handles, which the
+/// child's daemon would otherwise keep open.
+pub fn spawn_daemon_launcher_command(command: &mut Command) -> io::Result<Child> {
+    spawn_hidden_daemon_command_impl(command)
+}
+
 /// Spawns a hidden daemon that must escape the launcher's Windows job object.
 ///
-/// Callers must first configure the command with job breakaway enabled. Unlike
-/// the legacy fallback policy, this helper performs exactly one spawn attempt.
-/// On Windows, breakaway-related failures explain why RMUX refuses to retry
-/// inside the caller's job object.
+/// Callers must first configure the command with job breakaway enabled. When
+/// the caller's job forbids breakaway, the daemon starts inside that job only
+/// if the job cannot end it with its last handle (no kill-on-close limit), so
+/// the daemon still outlives the launcher. Other breakaway failures explain
+/// why RMUX refuses to retry inside the caller's job object.
 pub fn spawn_hidden_daemon_command_requiring_job_breakaway(
     command: &mut Command,
 ) -> io::Result<Child> {
@@ -95,8 +110,9 @@ pub fn spawn_hidden_daemon_command_requiring_job_breakaway(
 /// Windows job breakaway flag.
 ///
 /// This compatibility helper now always returns `false`: an RMUX daemon must
-/// outlive its short-lived launcher, so starting it inside the launcher's job
-/// object is never a safe fallback.
+/// outlive its short-lived launcher, so a blind retry inside the launcher's job
+/// object is not a safe fallback. The breakaway spawn itself starts the daemon
+/// inside a job only when that job cannot end it with the launcher.
 #[deprecated(note = "hidden RMUX daemons must require Windows job breakaway")]
 #[must_use]
 pub const fn should_retry_hidden_daemon_without_breakaway(_error: &io::Error) -> bool {
@@ -477,7 +493,43 @@ fn spawn_hidden_daemon_command_requiring_job_breakaway_impl(
     }
 
     let _guard = StandardHandleInheritanceGuard::new()?;
-    command.spawn().map_err(hidden_daemon_breakaway_spawn_error)
+    match command.spawn() {
+        // A job that forbids breakaway but does not end with its last handle
+        // (a scheduled task's job) still lets the daemon outlive the launcher.
+        Err(error)
+            if error.raw_os_error() == Some(ERROR_ACCESS_DENIED as i32)
+                && !current_job_kills_on_close() =>
+        {
+            command.creation_flags(hidden_daemon_creation_flags(false));
+            command.spawn().map_err(hidden_daemon_breakaway_spawn_error)
+        }
+        result => result.map_err(hidden_daemon_breakaway_spawn_error),
+    }
+}
+
+#[cfg(windows)]
+fn current_job_kills_on_close() -> bool {
+    job_kills_on_close(std::ptr::null_mut())
+}
+
+/// Whether `job` (null: the caller's own job) ends its processes with its
+/// last handle. A job that cannot be queried counts as one that does.
+#[cfg(windows)]
+fn job_kills_on_close(job: HANDLE) -> bool {
+    // SAFETY: the structure is plain data for which all-zero bytes are valid.
+    let mut info: JOBOBJECT_EXTENDED_LIMIT_INFORMATION = unsafe { std::mem::zeroed() };
+    let ok = unsafe {
+        // SAFETY: `job` is null (the caller's own job) or a job handle the
+        // caller owns; `info` is a writable buffer of the size passed.
+        QueryInformationJobObject(
+            job,
+            JobObjectExtendedLimitInformation,
+            (&mut info as *mut JOBOBJECT_EXTENDED_LIMIT_INFORMATION).cast(),
+            std::mem::size_of::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>() as u32,
+            std::ptr::null_mut(),
+        )
+    };
+    ok == 0 || info.BasicLimitInformation.LimitFlags & JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE != 0
 }
 
 #[cfg(not(windows))]
@@ -602,7 +654,145 @@ impl Drop for StandardHandleInheritanceGuard {
 #[cfg(all(test, windows))]
 mod tests {
     use super::*;
+    use std::io::Write;
+    use std::os::windows::io::AsRawHandle;
+    use std::process::Stdio;
+    use std::time::Instant;
+    use windows_sys::Win32::System::JobObjects::{
+        AssignProcessToJobObject, CreateJobObjectW, JobObjectExtendedLimitInformation,
+        SetInformationJobObject, JOBOBJECT_EXTENDED_LIMIT_INFORMATION,
+        JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
+    };
     use windows_sys::Win32::System::Threading::CREATE_NEW_PROCESS_GROUP;
+
+    const TEST_ROLE_ENV: &str = "RMUX_OS_DAEMON_TEST_ROLE";
+
+    fn test_role() -> Option<String> {
+        std::env::var(TEST_ROLE_ENV).ok()
+    }
+
+    /// Runs one test of this binary again as a child in `role`, held on its
+    /// stdin until the caller has put it in `job`.
+    fn spawn_test_role_in_job(test: &str, role: &str, job: HANDLE) -> Child {
+        let test = format!("daemon::tests::{test}");
+        let mut child = Command::new(std::env::current_exe().expect("test binary path"))
+            .args([test.as_str(), "--exact", "--nocapture", "--test-threads=1"])
+            .env(TEST_ROLE_ENV, role)
+            // A role runs under the policy of the job the test made, not a caller's opt-in.
+            .env_remove(INTERNAL_CALLER_JOB_TEST_OPT_IN_ENV)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("test role starts");
+        // SAFETY: `job` and the child's process handle are both live.
+        let assigned = unsafe { AssignProcessToJobObject(job, child.as_raw_handle() as HANDLE) };
+        assert_ne!(assigned, 0, "{}", io::Error::last_os_error());
+        child
+            .stdin
+            .take()
+            .expect("test role stdin")
+            .write_all(b"\n")
+            .expect("release the test role");
+        child
+    }
+
+    fn wait_for_release() {
+        let mut line = String::new();
+        io::stdin()
+            .read_line(&mut line)
+            .expect("the parent releases the test role");
+    }
+
+    fn test_job(kill_on_close: bool) -> HANDLE {
+        // SAFETY: creates an unnamed job object that the caller closes.
+        let job = unsafe { CreateJobObjectW(std::ptr::null(), std::ptr::null()) };
+        assert!(!job.is_null(), "{}", io::Error::last_os_error());
+        if kill_on_close {
+            // SAFETY: the structure is plain data for which all-zero bytes are valid.
+            let mut info: JOBOBJECT_EXTENDED_LIMIT_INFORMATION = unsafe { std::mem::zeroed() };
+            info.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+            // SAFETY: `job` is the live job above; `info` is a readable buffer
+            // of the size passed.
+            let ok = unsafe {
+                SetInformationJobObject(
+                    job,
+                    JobObjectExtendedLimitInformation,
+                    (&info as *const JOBOBJECT_EXTENDED_LIMIT_INFORMATION).cast(),
+                    std::mem::size_of::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>() as u32,
+                )
+            };
+            assert_ne!(ok, 0, "{}", io::Error::last_os_error());
+        }
+        job
+    }
+
+    #[test]
+    fn launcher_keeps_the_callers_captured_output_out_of_its_children() {
+        if test_role().as_deref() == Some("launcher") {
+            wait_for_release();
+            let mut grandchild = Command::new("cmd.exe");
+            grandchild
+                .args(["/D", "/C", "ping -n 11 127.0.0.1 >nul"])
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null());
+            process::exit(i32::from(
+                spawn_daemon_launcher_command(&mut grandchild).is_err(),
+            ));
+        }
+        // The job ends the grandchild when the test closes it.
+        let job = test_job(true);
+        let launcher = spawn_test_role_in_job(
+            "launcher_keeps_the_callers_captured_output_out_of_its_children",
+            "launcher",
+            job,
+        );
+        let started = Instant::now();
+        let output = launcher.wait_with_output().expect("launcher output");
+        let elapsed = started.elapsed();
+        // SAFETY: the job handle is owned by this test.
+        unsafe { CloseHandle(job) };
+
+        assert_eq!(output.status.code(), Some(0));
+        assert!(
+            elapsed < Duration::from_secs(5),
+            "the launcher's captured output stayed open for {elapsed:?}"
+        );
+    }
+
+    #[test]
+    fn daemon_starts_in_a_job_that_forbids_breakaway_only_if_the_job_cannot_end_it() {
+        if test_role().as_deref() == Some("job-spawn") {
+            wait_for_release();
+            let mut daemon = Command::new("cmd.exe");
+            daemon.args(["/D", "/C", "exit 0"]);
+            configure_hidden_daemon_command(&mut daemon, true);
+            let code = match spawn_hidden_daemon_command_requiring_job_breakaway(&mut daemon) {
+                Ok(mut child) => child.wait().map_or(4, |_| 0),
+                Err(error) if error.to_string().contains("will not retry") => 3,
+                Err(_) => 4,
+            };
+            process::exit(code);
+        }
+        for (kill_on_close, expected) in [(false, 0), (true, 3)] {
+            let job = test_job(kill_on_close);
+            let status = spawn_test_role_in_job(
+                "daemon_starts_in_a_job_that_forbids_breakaway_only_if_the_job_cannot_end_it",
+                "job-spawn",
+                job,
+            )
+            .wait()
+            .expect("test role exits");
+            // SAFETY: the job handle is owned by this test.
+            unsafe { CloseHandle(job) };
+            assert_eq!(
+                status.code(),
+                Some(expected),
+                "kill_on_close={kill_on_close}"
+            );
+        }
+    }
 
     #[test]
     fn hidden_daemon_flags_detach_console_and_preserve_unicode_env() {
