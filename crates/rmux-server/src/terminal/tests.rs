@@ -1391,3 +1391,34 @@ fn read_until_io(
         }
     }
 }
+
+#[cfg(windows)]
+#[test]
+fn lone_windows_program_path_runs_without_the_shell() {
+    let program = std::env::current_exe().expect("test binary path");
+    assert!(super::is_lone_windows_program(&program.to_string_lossy()));
+    assert!(!super::is_lone_windows_program(
+        r"C:\no such dir\missing.exe"
+    ));
+    assert!(!super::is_lone_windows_program("cmd /c echo hi"));
+}
+
+#[test]
+fn shell_command_window_name_keeps_a_program_path_with_spaces_whole() {
+    let program = std::env::current_exe().expect("test binary path");
+    let name = program
+        .file_name()
+        .map(|name| name.to_string_lossy().into_owned());
+    let quoted = format!("\"{}\" -x", program.display());
+
+    assert_eq!(super::shell_command_window_name(&quoted), name);
+    assert_eq!(
+        super::shell_command_window_name("vim notes.txt").as_deref(),
+        Some("vim")
+    );
+    #[cfg(windows)]
+    assert_eq!(
+        super::shell_command_window_name(&program.to_string_lossy()),
+        name
+    );
+}

@@ -654,7 +654,15 @@ fn os_environment_name_eq(left: &OsStr, right: &str) -> bool {
 }
 
 fn shell_command_window_name(command: &str) -> Option<String> {
-    let first = command.split_whitespace().next()?;
+    #[cfg(windows)]
+    if is_lone_windows_program(command) {
+        return executable_name(command);
+    }
+    let command = command.trim_start();
+    let first = match command.strip_prefix('"') {
+        Some(quoted) => quoted.split('"').next()?,
+        None => command.split_whitespace().next()?,
+    };
     executable_name(first)
 }
 
@@ -716,6 +724,12 @@ fn spawn_command(
     command: Option<&ProcessCommand>,
 ) -> Result<ChildCommand, RmuxError> {
     let command = match command {
+        // A lone Windows program path, often under "Program Files", would split
+        // at its spaces in the shell, so it runs directly.
+        #[cfg(windows)]
+        Some(ProcessCommand::Shell(command)) if is_lone_windows_program(command) => {
+            ChildCommand::new(command)
+        }
         Some(ProcessCommand::Shell(command)) => profile.shell_child_command(command),
         Some(ProcessCommand::Argv(argv)) if !argv.is_empty() => {
             let environment = profile.environment_map();
@@ -728,6 +742,12 @@ fn spawn_command(
         Some(ProcessCommand::Argv(_)) | Some(_) | None => profile.interactive_child_command(),
     };
     Ok(command)
+}
+
+#[cfg(windows)]
+fn is_lone_windows_program(command: &str) -> bool {
+    let path = Path::new(command);
+    path.is_absolute() && path.is_file() && !is_windows_batch_script(path)
 }
 
 #[cfg(windows)]
