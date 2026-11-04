@@ -1,4 +1,4 @@
-use rmux_proto::{PaneTarget, RmuxError, SessionName, Target};
+use rmux_proto::{OptionName, PaneTarget, RmuxError, SessionName, Target};
 
 use crate::pane_terminal_lookup::pane_id_for_target;
 use crate::pane_terminals::{session_not_found, HandlerState};
@@ -39,6 +39,20 @@ impl HandlerState {
             target.window_index(),
             target.pane_index(),
         )?;
+        // A pane that may remain after its exit turns dead only when the exit
+        // commits with its remain-on-exit message, as in tmux.
+        let remain_on_exit = self
+            .options
+            .resolve_for_pane(
+                target.session_name(),
+                target.window_index(),
+                target.pane_index(),
+                OptionName::RemainOnExit,
+            )
+            .is_some_and(|value| value != "off");
+        if remain_on_exit {
+            return Ok(self.pane_exit_metadata(target.session_name(), pane_id));
+        }
         let runtime_session_name =
             self.runtime_session_name_for_window(target.session_name(), target.window_index());
         self.observe_runtime_pane_exit(&runtime_session_name, pane_id)

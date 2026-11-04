@@ -830,6 +830,17 @@ impl GridLine {
             .map_or(0, |index| index + 1)
     }
 
+    /// Where a wrapped row joins the next one when reflowed, as tmux's
+    /// `cellused`: a compact ASCII row after its written cells, written
+    /// trailing spaces included; a cell row at its full width, which keeps
+    /// the blanks DCH and ICH leave in a wrapped row as data.
+    pub(super) fn wrapped_end(&self) -> usize {
+        match &self.plain_text {
+            Some(text) => usize::from(self.plain_text_data_end).max(text.len()),
+            None => self.width() as usize,
+        }
+    }
+
     pub(super) fn mark_reflow_gap(&mut self, start: u32) {
         self.materialize_for_cell_mutation();
         for cell in self.cells.iter_mut().skip(start as usize) {
@@ -1153,6 +1164,11 @@ impl GridLine {
             return None;
         }
         let used_end = self.used_end();
+        // A compact row would join its wrap after its written cells, but a
+        // short wrapped cell row joins at its full width (`wrapped_end`).
+        if self.flags.contains(GridLineFlags::WRAPPED) && used_end < self.width as usize {
+            return None;
+        }
         if used_end == 0 {
             return Some(Self {
                 cells: Vec::new(),
@@ -1189,7 +1205,11 @@ impl GridLine {
         if self.plain_text.is_some() {
             return true;
         }
-        start == 0 && self.cells.iter().all(GridCell::is_blank)
+        // A wrapped cell row joins at its full width (`wrapped_end`), which a
+        // compact row would not keep.
+        start == 0
+            && !self.flags.contains(GridLineFlags::WRAPPED)
+            && self.cells.iter().all(GridCell::is_blank)
     }
 
     fn update_plain_text_cache(&mut self, start: usize, bytes: &[u8]) {

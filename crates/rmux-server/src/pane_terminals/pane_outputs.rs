@@ -91,18 +91,32 @@ impl HandlerState {
         runtime_session_name: &SessionName,
         pane_id: PaneId,
     ) -> Result<Option<PaneExitMetadata>, RmuxError> {
+        let Some(target) = self.pane_target_for_runtime_pane(runtime_session_name, pane_id) else {
+            return Ok(None);
+        };
+
         #[cfg(windows)]
         if self
             .starting_panes
             .get(runtime_session_name)
             .is_some_and(|panes| panes.contains_key(&pane_id))
         {
-            return Ok(None);
+            // A process that already exited ends its pane's start: no console
+            // is left to receive the input queued for it.
+            if self
+                .terminals
+                .pane_exit_status(
+                    runtime_session_name,
+                    pane_id,
+                    target.window_index(),
+                    target.pane_index(),
+                )?
+                .is_none()
+            {
+                return Ok(None);
+            }
+            let _ = self.cancel_starting_pane(runtime_session_name, pane_id);
         }
-
-        let Some(target) = self.pane_target_for_runtime_pane(runtime_session_name, pane_id) else {
-            return Ok(None);
-        };
 
         if let Some(metadata) = self
             .dead_panes
@@ -160,6 +174,18 @@ impl HandlerState {
         pane_id: PaneId,
         bytes: &[u8],
     ) -> Result<(), RmuxError> {
+        self.mutate_runtime_pane_transcript(runtime_session_name, pane_id, !bytes.is_empty(), |t| {
+            t.append_bytes(bytes);
+        })
+    }
+
+    pub(crate) fn mutate_runtime_pane_transcript(
+        &mut self,
+        runtime_session_name: &SessionName,
+        pane_id: PaneId,
+        changed: bool,
+        mutation: impl FnOnce(&mut crate::pane_transcript::PaneTranscript),
+    ) -> Result<(), RmuxError> {
         let transcript = self
             .transcripts
             .get(runtime_session_name)
@@ -181,16 +207,14 @@ impl HandlerState {
             output.mutate_transcript(
                 &transcript,
                 crate::pane_io::PaneInvalidationReason::TranscriptMutation,
-                |transcript| {
-                    transcript.append_bytes(bytes);
-                    ((), !bytes.is_empty())
-                },
+                |transcript| (mutation(transcript), changed),
             );
         } else {
-            transcript
-                .lock()
-                .expect("pane transcript mutex must not be poisoned")
-                .append_bytes(bytes);
+            mutation(
+                &mut transcript
+                    .lock()
+                    .expect("pane transcript mutex must not be poisoned"),
+            );
         }
         Ok(())
     }
