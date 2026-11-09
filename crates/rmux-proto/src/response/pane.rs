@@ -335,6 +335,26 @@ pub enum PaneStateEventDto {
         /// Terminal close reason.
         reason: PaneStateClosedReason,
     },
+    /// The pane process exited, with the exit details the daemon observed.
+    ///
+    /// Sent instead of [`PaneStateEventDto::Closed`] for process exits to
+    /// connections that negotiated
+    /// [`CAPABILITY_SDK_PANE_STATE_EXIT_EVENTS`](crate::CAPABILITY_SDK_PANE_STATE_EXIT_EVENTS);
+    /// every other connection receives the legacy `Closed` event, so the
+    /// variant index stays append-only and older readers never see it.
+    Exited {
+        /// Global pane-state revision.
+        revision: u64,
+        /// Stable pane id.
+        pane_id: PaneId,
+        /// Terminal close reason.
+        reason: PaneStateClosedReason,
+        /// The pane process's exit status when the daemon observed one.
+        exit_status: Option<i32>,
+        /// The pane process's terminating signal when the daemon observed
+        /// one.
+        exit_signal: Option<i32>,
+    },
 }
 
 /// Response payload for subscribing to revisioned pane-state events.
@@ -795,5 +815,114 @@ impl ListPanesResponse {
     #[must_use]
     pub fn command_output(&self) -> &CommandOutput {
         &self.output
+    }
+}
+
+#[cfg(test)]
+mod pane_state_closed_event_wire_tests {
+    use super::*;
+
+    /// The pane-state event enum exactly as daemons before exit reporting
+    /// encoded it: the same variant order and the same three-field `Closed`.
+    /// Serializing this replica reproduces the bytes an older daemon puts on
+    /// the wire for a Closed event. Only the  variant is ever
+    /// constructed; the rest carry the legacy variant positions.
+    #[derive(Serialize)]
+    #[allow(dead_code)]
+    enum LegacyPaneStateEventDto {
+        TitleChanged {
+            revision: u64,
+            pane_id: PaneId,
+            old_title: String,
+            new_title: String,
+        },
+        OptionSet {
+            revision: u64,
+            pane_id: PaneId,
+            name: String,
+            old_value: Option<String>,
+            new_value: String,
+        },
+        OptionUnset {
+            revision: u64,
+            pane_id: PaneId,
+            name: String,
+            old_value: Option<String>,
+        },
+        ForegroundChanged {
+            revision: u64,
+            pane_id: PaneId,
+            old_state: ForegroundStateDto,
+            new_state: ForegroundStateDto,
+        },
+        Closed {
+            revision: u64,
+            pane_id: PaneId,
+            reason: PaneStateClosedReason,
+        },
+    }
+
+    #[test]
+    fn closed_event_from_daemon_before_exit_reporting_deserializes_unchanged() {
+        let bytes = bincode::serialize(&LegacyPaneStateEventDto::Closed {
+            revision: 7,
+            pane_id: PaneId::new(3),
+            reason: PaneStateClosedReason::DiedKept,
+        })
+        .expect("legacy Closed event serializes");
+
+        let event = bincode::deserialize::<PaneStateEventDto>(&bytes)
+            .expect("the current event type accepts the legacy encoding");
+        match event {
+            PaneStateEventDto::Closed {
+                revision,
+                pane_id,
+                reason,
+            } => {
+                assert_eq!(revision, 7);
+                assert_eq!(pane_id, PaneId::new(3));
+                assert_eq!(reason, PaneStateClosedReason::DiedKept);
+            }
+            other => panic!("expected the Closed variant, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn exited_event_round_trips_exit_fields() {
+        let event = PaneStateEventDto::Exited {
+            revision: 9,
+            pane_id: PaneId::new(4),
+            reason: PaneStateClosedReason::DiedKept,
+            exit_status: Some(3),
+            exit_signal: None,
+        };
+        let bytes = bincode::serialize(&event).expect("Exited event serializes");
+        let parsed = bincode::deserialize::<PaneStateEventDto>(&bytes)
+            .expect("Exited event round-trips through the wire codec");
+        assert_eq!(parsed, event);
+    }
+
+    #[test]
+    fn exited_variant_is_appended_after_closed() {
+        // Older readers decode variant indexes positionally: the exit event
+        // must never reorder the legacy variants it was appended after.
+        let legacy_order = [
+            "TitleChanged",
+            "OptionSet",
+            "OptionUnset",
+            "ForegroundChanged",
+            "Closed",
+        ];
+        let serialized = bincode::serialize(&LegacyPaneStateEventDto::Closed {
+            revision: 1,
+            pane_id: PaneId::new(1),
+            reason: PaneStateClosedReason::Killed,
+        })
+        .expect("legacy event serializes");
+        assert_eq!(
+            serialized.first().copied(),
+            Some(4),
+            "Closed stays variant index {legacy_order:?} index 4"
+        );
     }
 }

@@ -547,3 +547,29 @@ async fn stream_open_refuses_cursor_transport_without_state_event_capability() {
     main_server.await.expect("main server task succeeds");
     cursor_server.await.expect("cursor server task succeeds");
 }
+
+#[test]
+fn exited_event_maps_from_dto_with_exit_details() {
+    let event = PaneStateEvent::from(PaneStateEventDto::Exited {
+        revision: 5,
+        pane_id: PaneId::new(2),
+        reason: PaneStateClosedReason::DiedKept,
+        exit_status: Some(3),
+        exit_signal: None,
+    });
+    match event {
+        PaneStateEvent::Exited {
+            revision,
+            reason,
+            exit_status,
+            exit_signal,
+            ..
+        } => {
+            assert_eq!(revision, 5);
+            assert_eq!(reason, PaneStateClosedReason::DiedKept);
+            assert_eq!(exit_status, Some(3));
+            assert_eq!(exit_signal, None);
+        }
+        other => panic!("expected the Exited event, got {other:?}"),
+    }
+}

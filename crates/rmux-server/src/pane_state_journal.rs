@@ -58,6 +58,11 @@ pub(crate) enum PaneStateChange {
     },
     Closed {
         reason: PaneStateClosedReason,
+        /// The pane process's exit status when the daemon observed one.
+        exit_status: Option<i32>,
+        /// The pane process's terminating signal when the daemon observed
+        /// one.
+        exit_signal: Option<i32>,
     },
 }
 
@@ -89,7 +94,26 @@ struct PaneStateSubscription {
     closed: bool,
     closed_revision: Option<u64>,
     closed_reason: Option<PaneStateClosedReason>,
+    closed_exit_status: Option<i32>,
+    closed_exit_signal: Option<i32>,
+    /// The closed state was seeded at subscribe time (the pane was already
+    /// closed when the subscription was created) rather than recorded while
+    /// the subscription was live. Seeded subscriptions still count as open
+    /// until delivery so a later final close re-points them instead of
+    /// being dropped.
+    closed_seeded: bool,
     evicted_state_revision_before_close: u64,
+}
+
+impl PaneStateSubscription {
+    /// True while the subscription still needs a close record: live
+    /// subscriptions that have not closed yet, and seeded subscriptions
+    /// whose terminal delivery has not happened (a later close re-points
+    /// them). Delivered live subscriptions are removed promptly, so
+    /// `closed && !seeded` means delivered-or-awaiting-removal.
+    fn awaiting_close_delivery(&self) -> bool {
+        !self.closed || self.closed_seeded
+    }
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -172,6 +196,9 @@ pub(crate) struct PaneStateJournal {
     subscription_generation_counts: HashMap<PaneGeneration, usize>,
     closed_panes: HashSet<PaneId>,
     closed_pane_order: VecDeque<PaneId>,
+    /// Connections that negotiated the pane-state exit-events capability;
+    /// their terminal events carry the observed exit status.
+    connection_exit_events: HashSet<u64>,
 }
 
 impl Default for PaneStateJournal {
@@ -209,6 +236,7 @@ impl PaneStateJournal {
             subscription_generation_counts: HashMap::new(),
             closed_panes: HashSet::new(),
             closed_pane_order: VecDeque::new(),
+            connection_exit_events: HashSet::new(),
         }
     }
 
@@ -359,9 +387,17 @@ mod tests {
             Some(9),
             PaneStateChange::Closed {
                 reason: PaneStateClosedReason::Killed,
+                exit_status: None,
+                exit_signal: None,
             },
         );
-        journal.remember_pane_closed_event(pane_id, PaneStateClosedReason::Killed, revision);
+        journal.remember_pane_closed_event(
+            pane_id,
+            PaneStateClosedReason::Killed,
+            revision,
+            None,
+            None,
+        );
         revision
     }
 
@@ -604,6 +640,8 @@ mod tests {
             Some(9),
             PaneStateChange::Closed {
                 reason: PaneStateClosedReason::Killed,
+                exit_status: None,
+                exit_signal: None,
             },
         );
         journal.mark_pane_closed(pane_id(1));
@@ -850,6 +888,8 @@ mod tests {
             Some(9),
             PaneStateChange::Closed {
                 reason: PaneStateClosedReason::Killed,
+                exit_status: None,
+                exit_signal: None,
             },
         );
         journal.mark_pane_closed(pane_id(1));
@@ -902,6 +942,8 @@ mod tests {
             Some(1),
             PaneStateChange::Closed {
                 reason: PaneStateClosedReason::Killed,
+                exit_status: None,
+                exit_signal: None,
             },
         );
         journal.mark_pane_closed(pane_id(1));
@@ -909,6 +951,8 @@ mod tests {
             pane_id(1),
             PaneStateClosedReason::Killed,
             closed_revision,
+            None,
+            None,
         );
 
         let mut events = Vec::new();
@@ -960,6 +1004,8 @@ mod tests {
             Some(1),
             PaneStateChange::Closed {
                 reason: PaneStateClosedReason::Killed,
+                exit_status: None,
+                exit_signal: None,
             },
         );
         assert!(journal.mark_pane_closed(pane_id(1)));
@@ -967,6 +1013,8 @@ mod tests {
             pane_id(1),
             PaneStateClosedReason::Killed,
             closed_revision,
+            None,
+            None,
         );
         for index in 0..3 {
             journal.push(
@@ -1018,6 +1066,8 @@ mod tests {
             Some(1),
             PaneStateChange::Closed {
                 reason: PaneStateClosedReason::DiedKept,
+                exit_status: None,
+                exit_signal: None,
             },
         );
         assert!(journal.mark_pane_closed(pane_id(1)));
@@ -1025,6 +1075,8 @@ mod tests {
             pane_id(1),
             PaneStateClosedReason::DiedKept,
             closed_revision,
+            None,
+            None,
         );
         journal.push(
             pane_id(1),
@@ -1093,12 +1145,16 @@ mod tests {
             Some(1),
             PaneStateChange::Closed {
                 reason: PaneStateClosedReason::DiedKept,
+                exit_status: None,
+                exit_signal: None,
             },
         );
         journal.remember_pane_closed_event(
             pane_id(1),
             PaneStateClosedReason::DiedKept,
             closed_revision,
+            None,
+            None,
         );
         journal.push(
             pane_id(1),
@@ -1173,6 +1229,8 @@ mod tests {
             Some(1),
             PaneStateChange::Closed {
                 reason: PaneStateClosedReason::Killed,
+                exit_status: None,
+                exit_signal: None,
             },
         );
         assert!(journal.mark_pane_closed(pane_id(1)));
@@ -1180,6 +1238,8 @@ mod tests {
             pane_id(1),
             PaneStateClosedReason::Killed,
             closed_revision,
+            None,
+            None,
         );
 
         let mut events = Vec::new();
@@ -1218,6 +1278,8 @@ mod tests {
             Some(1),
             PaneStateChange::Closed {
                 reason: PaneStateClosedReason::DiedKept,
+                exit_status: None,
+                exit_signal: None,
             },
         );
         assert!(journal.mark_pane_closed(pane_id(1)));
@@ -1225,6 +1287,8 @@ mod tests {
             pane_id(1),
             PaneStateClosedReason::DiedKept,
             first_closed_revision,
+            None,
+            None,
         );
 
         let subscription = journal
@@ -1247,12 +1311,16 @@ mod tests {
             None,
             PaneStateChange::Closed {
                 reason: PaneStateClosedReason::Killed,
+                exit_status: None,
+                exit_signal: None,
             },
         );
         journal.remember_pane_closed_event(
             pane_id(1),
             PaneStateClosedReason::Killed,
             killed_revision,
+            None,
+            None,
         );
 
         let mut events = Vec::new();
@@ -1271,6 +1339,121 @@ mod tests {
                 reason: PaneStateClosedReason::Killed,
                 ..
             }] if *revision == killed_revision
+        ));
+    }
+
+    #[test]
+    fn late_subscription_to_a_died_kept_pane_delivers_the_retained_close_with_exit_status() {
+        // The downstream-watcher starvation case: the pane's process exits
+        // before any subscription exists, no final kill ever arrives, and
+        // the pane stays kept-dead. A subscription created afterwards must
+        // still receive the one retained terminal event — shaped for its
+        // negotiated capability, carrying the recorded exit status.
+        let mut journal = PaneStateJournal::new(8);
+        let closed_revision = journal.push(
+            pane_id(1),
+            Some(1),
+            PaneStateChange::Closed {
+                reason: PaneStateClosedReason::DiedKept,
+                exit_status: Some(3),
+                exit_signal: None,
+            },
+        );
+        assert!(journal.mark_pane_closed(pane_id(1)));
+        journal.remember_pane_closed_event(
+            pane_id(1),
+            PaneStateClosedReason::DiedKept,
+            closed_revision,
+            Some(3),
+            None,
+        );
+        journal.set_connection_exit_events(7, true);
+
+        let subscription = journal
+            .subscribe(
+                7,
+                pane_id(1),
+                PaneStateInclude {
+                    title: false,
+                    options: false,
+                    foreground: false,
+                },
+            )
+            .expect("late subscription fits");
+
+        let mut events = Vec::new();
+        assert_eq!(
+            journal.read_after(7, subscription, journal.current_revision(), 16, &mut events),
+            Ok(PaneStateRead::Ready {
+                next_revision: closed_revision,
+                limited: false,
+                event_count: 1,
+            })
+        );
+        assert!(matches!(
+            events.as_slice(),
+            [PaneStateEventDto::Exited {
+                revision,
+                reason: PaneStateClosedReason::DiedKept,
+                exit_status: Some(3),
+                exit_signal: None,
+                ..
+            }] if *revision == closed_revision
+        ));
+    }
+
+    #[test]
+    fn late_subscription_without_the_exit_capability_receives_the_legacy_closed() {
+        // The same starvation scenario over a connection that never
+        // negotiated the exit capability: the retained close is still
+        // delivered (the seeding fix), in the legacy shape.
+        let mut journal = PaneStateJournal::new(8);
+        let closed_revision = journal.push(
+            pane_id(1),
+            Some(1),
+            PaneStateChange::Closed {
+                reason: PaneStateClosedReason::DiedKept,
+                exit_status: Some(3),
+                exit_signal: None,
+            },
+        );
+        assert!(journal.mark_pane_closed(pane_id(1)));
+        journal.remember_pane_closed_event(
+            pane_id(1),
+            PaneStateClosedReason::DiedKept,
+            closed_revision,
+            Some(3),
+            None,
+        );
+
+        let subscription = journal
+            .subscribe(
+                7,
+                pane_id(1),
+                PaneStateInclude {
+                    title: false,
+                    options: false,
+                    foreground: false,
+                },
+            )
+            .expect("late subscription fits");
+
+        let mut events = Vec::new();
+        assert_eq!(
+            journal.read_after(7, subscription, journal.current_revision(), 16, &mut events),
+            Ok(PaneStateRead::Ready {
+                next_revision: closed_revision,
+                limited: false,
+                event_count: 1,
+            })
+        );
+        assert!(matches!(
+            events.as_slice(),
+            [PaneStateEventDto::Closed {
+                revision,
+                reason: PaneStateClosedReason::DiedKept,
+                ..
+            }] if *revision == closed_revision
         ));
     }
 
@@ -1340,6 +1523,8 @@ mod tests {
             Some(1),
             PaneStateChange::Closed {
                 reason: PaneStateClosedReason::Killed,
+                exit_status: None,
+                exit_signal: None,
             },
         );
         assert!(journal.mark_pane_closed(pane_id(1)));
@@ -1347,6 +1532,8 @@ mod tests {
             pane_id(1),
             PaneStateClosedReason::Killed,
             closed_revision,
+            None,
+            None,
         );
         journal.reopen_pane(pane_id(1));
         journal.push(
@@ -1538,12 +1725,16 @@ mod tests {
                     Some(1),
                     PaneStateChange::Closed {
                         reason: PaneStateClosedReason::Killed,
+                        exit_status: None,
+                        exit_signal: None,
                     },
                 );
                 journal.remember_pane_closed_event(
                     watched,
                     PaneStateClosedReason::Killed,
                     revision,
+                    None,
+                    None,
                 );
                 *closed_revision = Some(revision);
             }

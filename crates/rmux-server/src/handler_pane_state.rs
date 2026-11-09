@@ -362,8 +362,12 @@ impl RequestHandler {
         change: PaneStateChange,
     ) {
         let closes_pane = matches!(change, PaneStateChange::Closed { .. });
-        let close_reason = match &change {
-            PaneStateChange::Closed { reason } => Some(*reason),
+        let close_details = match &change {
+            PaneStateChange::Closed {
+                reason,
+                exit_status,
+                exit_signal,
+            } => Some((*reason, *exit_status, *exit_signal)),
             _ => None,
         };
         {
@@ -372,8 +376,14 @@ impl RequestHandler {
                 return;
             }
             let revision = journal.push(pane_id, generation, change);
-            if let Some(reason) = close_reason {
-                journal.remember_pane_closed_event(pane_id, reason, revision);
+            if let Some((reason, exit_status, exit_signal)) = close_details {
+                journal.remember_pane_closed_event(
+                    pane_id,
+                    reason,
+                    revision,
+                    exit_status,
+                    exit_signal,
+                );
             }
         }
         if closes_pane {
@@ -397,12 +407,16 @@ impl RequestHandler {
                     None,
                     PaneStateChange::Closed {
                         reason: PaneStateClosedReason::Killed,
+                        exit_status: None,
+                        exit_signal: None,
                     },
                 );
                 journal.remember_pane_closed_event(
                     pane_id,
                     PaneStateClosedReason::Killed,
                     revision,
+                    None,
+                    None,
                 );
             }
             journal.reopen_pane(pane_id);
@@ -421,6 +435,8 @@ impl RequestHandler {
                 None,
                 PaneStateChange::Closed {
                     reason: PaneStateClosedReason::Killed,
+                    exit_status: None,
+                    exit_signal: None,
                 },
             );
         }
@@ -456,6 +472,15 @@ impl RequestHandler {
             journal.remove_connection(connection_id);
         }
         self.pane_state_notify.notify_waiters();
+    }
+
+    /// Marks a negotiated connection as wanting the exit-bearing terminal
+    /// event (`sdk.pane.state_events.exit`, required from the connection's
+    /// handshake). The pane-state journal shapes its terminal events per
+    /// connection.
+    pub(crate) fn set_connection_pane_state_exit_events(&self, connection_id: u64, enabled: bool) {
+        self.lock_pane_state_journal()
+            .set_connection_exit_events(connection_id, enabled);
     }
 
     fn remove_pane_state_subscription(
@@ -691,9 +716,13 @@ fn foreground_state_changed(previous: &ForegroundStateDto, next: &ForegroundStat
 }
 
 fn pane_state_events_include_closed(events: &[rmux_proto::PaneStateEventDto]) -> bool {
-    events
-        .iter()
-        .any(|event| matches!(event, rmux_proto::PaneStateEventDto::Closed { .. }))
+    events.iter().any(|event| {
+        matches!(
+            event,
+            rmux_proto::PaneStateEventDto::Closed { .. }
+                | rmux_proto::PaneStateEventDto::Exited { .. }
+        )
+    })
 }
 
 fn foreground_change_from_previous(

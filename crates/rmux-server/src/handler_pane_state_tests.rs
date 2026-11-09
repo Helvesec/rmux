@@ -282,7 +282,15 @@ async fn pane_state_closed_reason_variants_are_delivered_before_end_of_stream() 
         let (_session, target, pane_id) =
             create_session_with_pane(&handler, &format!("pane-state-closed-{index}")).await;
         let subscription_id = subscribe(&handler, 93, target, false, false).await;
-        handler.record_pane_state_change(pane_id, Some(1), PaneStateChange::Closed { reason });
+        handler.record_pane_state_change(
+            pane_id,
+            Some(1),
+            PaneStateChange::Closed {
+                reason,
+                exit_status: None,
+                exit_signal: None,
+            },
+        );
 
         match read_cursor(&handler, 93, subscription_id, 0).await {
             Response::PaneStateCursor(response) => {
@@ -320,6 +328,8 @@ async fn duplicate_closed_for_same_pane_is_suppressed_until_reopened() {
         Some(1),
         PaneStateChange::Closed {
             reason: PaneStateClosedReason::DiedKept,
+            exit_status: None,
+            exit_signal: None,
         },
     );
     handler.record_pane_state_change(
@@ -327,6 +337,8 @@ async fn duplicate_closed_for_same_pane_is_suppressed_until_reopened() {
         None,
         PaneStateChange::Closed {
             reason: PaneStateClosedReason::Killed,
+            exit_status: None,
+            exit_signal: None,
         },
     );
 
@@ -356,6 +368,8 @@ async fn duplicate_closed_for_same_pane_is_suppressed_until_reopened() {
         Some(2),
         PaneStateChange::Closed {
             reason: PaneStateClosedReason::Killed,
+            exit_status: None,
+            exit_signal: None,
         },
     );
 
@@ -393,6 +407,8 @@ async fn pane_state_late_subscription_after_died_kept_receives_killed_close() {
         Some(1),
         PaneStateChange::Closed {
             reason: PaneStateClosedReason::DiedKept,
+            exit_status: None,
+            exit_signal: None,
         },
     );
     let first_closed_revision = handler
@@ -406,6 +422,8 @@ async fn pane_state_late_subscription_after_died_kept_receives_killed_close() {
         None,
         PaneStateChange::Closed {
             reason: PaneStateClosedReason::Killed,
+            exit_status: None,
+            exit_signal: None,
         },
     );
 
@@ -436,6 +454,8 @@ async fn respawn_pane_reopens_pane_state_before_future_close() {
         Some(1),
         PaneStateChange::Closed {
             reason: PaneStateClosedReason::DiedKept,
+            exit_status: None,
+            exit_signal: None,
         },
     );
 
@@ -462,6 +482,8 @@ async fn respawn_pane_reopens_pane_state_before_future_close() {
         Some(2),
         PaneStateChange::Closed {
             reason: PaneStateClosedReason::Killed,
+            exit_status: None,
+            exit_signal: None,
         },
     );
 
@@ -569,6 +591,8 @@ async fn respawn_window_reopens_retained_pane_state_before_future_close() {
         Some(1),
         PaneStateChange::Closed {
             reason: PaneStateClosedReason::DiedKept,
+            exit_status: None,
+            exit_signal: None,
         },
     );
 
@@ -597,6 +621,8 @@ async fn respawn_window_reopens_retained_pane_state_before_future_close() {
         Some(2),
         PaneStateChange::Closed {
             reason: PaneStateClosedReason::Killed,
+            exit_status: None,
+            exit_signal: None,
         },
     );
 

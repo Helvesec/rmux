@@ -8,6 +8,7 @@ use rmux_proto::{
     PaneOptionEntry as ProtoPaneOptionEntry, PaneStateCursorRequest, PaneStateEventDto,
     PaneStateSnapshot, PaneStateSubscriptionId, Request, Response, SubscribePaneStateRequest,
     CAPABILITY_SDK_PANE_BY_ID, CAPABILITY_SDK_PANE_FOREGROUND, CAPABILITY_SDK_PANE_STATE_EVENTS,
+    CAPABILITY_SDK_PANE_STATE_EXIT_EVENTS,
 };
 
 use super::foreground::ForegroundState;
@@ -126,6 +127,25 @@ pub enum PaneStateEvent {
         /// Terminal close reason.
         reason: PaneStateClosedReason,
     },
+    /// The pane process exited, with the exit details the daemon observed.
+    ///
+    /// The terminal counterpart of [`PaneStateEvent::Closed`] for process
+    /// exits, delivered by daemons that advertise the
+    /// `sdk.pane.state_events.exit` capability. Daemons without the
+    /// capability deliver `Closed` with no exit details.
+    Exited {
+        /// Global pane-state journal revision.
+        revision: u64,
+        /// Stable pane id.
+        pane_id: PaneId,
+        /// Terminal close reason.
+        reason: PaneStateClosedReason,
+        /// The pane process's exit status when the daemon observed one.
+        exit_status: Option<i32>,
+        /// The pane process's terminating signal when the daemon observed
+        /// one.
+        exit_signal: Option<i32>,
+    },
 }
 
 /// Opaque long-poll stream for pane title/option/foreground/close events.
@@ -184,6 +204,21 @@ impl PaneStateEventStream {
         }
         if matches!(target, rmux_proto::PaneTargetRef::Id { .. }) {
             capabilities.push(CAPABILITY_SDK_PANE_BY_ID);
+        }
+        // Exit-bearing terminal events ride the negotiated capability: an
+        // advertising daemon sends `Exited` with the recorded status, an
+        // older daemon stays on the legacy `Closed` shape.
+        let daemon_advertises_exit_events =
+            crate::capabilities::negotiated_capabilities(pane.transport())
+                .await
+                .map(|supported| {
+                    supported
+                        .iter()
+                        .any(|capability| *capability == CAPABILITY_SDK_PANE_STATE_EXIT_EVENTS)
+                })
+                .unwrap_or(false);
+        if daemon_advertises_exit_events {
+            capabilities.push(CAPABILITY_SDK_PANE_STATE_EXIT_EVENTS);
         }
         crate::capabilities::require(pane.transport(), &capabilities).await?;
         crate::capabilities::require_with_handshake(
@@ -294,12 +329,16 @@ impl PaneStateEventStream {
             | PaneStateEvent::OptionSet { revision, .. }
             | PaneStateEvent::OptionUnset { revision, .. }
             | PaneStateEvent::ForegroundChanged { revision, .. }
-            | PaneStateEvent::Closed { revision, .. } => {
+            | PaneStateEvent::Closed { revision, .. }
+            | PaneStateEvent::Exited { revision, .. } => {
                 self.next_revision = self.next_revision.max(*revision);
             }
             PaneStateEvent::Lagged { .. } => {}
         }
-        if matches!(event, PaneStateEvent::Closed { .. }) {
+        if matches!(
+            event,
+            PaneStateEvent::Closed { .. } | PaneStateEvent::Exited { .. }
+        ) {
             self.closed = true;
             self.pending.clear();
         }
@@ -404,6 +443,19 @@ impl From<PaneStateEventDto> for PaneStateEvent {
                 revision,
                 pane_id,
                 reason,
+            },
+            PaneStateEventDto::Exited {
+                revision,
+                pane_id,
+                reason,
+                exit_status,
+                exit_signal,
+            } => Self::Exited {
+                revision,
+                pane_id,
+                reason,
+                exit_status,
+                exit_signal,
             },
             _ => unreachable!("unknown pane-state event variant from this rmux-proto version"),
         }
