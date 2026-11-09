@@ -179,6 +179,7 @@ fn closed_revision(response: Response, pane_id: PaneId) -> u64 {
                 revision,
                 pane_id: event_pane_id,
                 reason: PaneStateClosedReason::Killed,
+                ..
             }] if *event_pane_id == pane_id => *revision,
             events => panic!("expected one killed Closed event, got {events:?}"),
         },

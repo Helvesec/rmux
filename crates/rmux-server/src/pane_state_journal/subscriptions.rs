@@ -64,6 +64,9 @@ impl PaneStateJournal {
                 closed: false,
                 closed_revision: None,
                 closed_reason: None,
+                closed_exit_status: None,
+                closed_exit_signal: None,
+                closed_seeded: false,
                 evicted_state_revision_before_close: 0,
             },
         );
@@ -72,7 +75,54 @@ impl PaneStateJournal {
             &mut self.subscription_generation_counts,
             (pane_id, generation),
         );
+        self.seed_subscription_if_pane_closed(id);
         Ok(id)
+    }
+
+    /// A subscription created after its pane already closed must still
+    /// receive the terminal event: its cursor starts at or past the close
+    /// revision, so replay would filter the record out and nothing else
+    /// would ever deliver it. Seed the subscription's closed state from the
+    /// pane's most recent retained Closed record so `read_after`'s existing
+    /// synthesis path hands over the one terminal event (with the recorded
+    /// exit status). A close whose record was evicted stays open — no
+    /// invented reason is delivered.
+    fn seed_subscription_if_pane_closed(&mut self, id: PaneStateSubscriptionId) {
+        let Some(subscription) = self.subscriptions.get(&id) else {
+            return;
+        };
+        if !self.closed_panes.contains(&subscription.pane_id) {
+            return;
+        }
+        let Some((revision, reason, exit_status, exit_signal)) = self
+            .records
+            .iter()
+            .rev()
+            .find_map(|record| match &record.change {
+                PaneStateChange::Closed {
+                    reason,
+                    exit_status,
+                    exit_signal,
+                } if record.pane_id == subscription.pane_id => {
+                    Some((record.revision, *reason, *exit_status, *exit_signal))
+                }
+                _ => None,
+            })
+        else {
+            return;
+        };
+        let Some(subscription) = self.subscriptions.get_mut(&id) else {
+            return;
+        };
+        subscription.evicted_state_revision_before_close =
+            evicted_revisions_for_subscription(&self.evicted_revisions, subscription)
+                .max_matching_state_change(subscription.include);
+        subscription.closed = true;
+        subscription.closed_seeded = true;
+        subscription.closed_revision = Some(revision);
+        subscription.closed_reason = Some(reason);
+        subscription.closed_exit_status = exit_status;
+        subscription.closed_exit_signal = exit_signal;
     }
 
     pub(crate) fn unsubscribe(
@@ -90,7 +140,19 @@ impl PaneStateJournal {
         Ok(removed)
     }
 
+    /// Records whether a negotiated connection wants the exit-bearing
+    /// terminal event (`sdk.pane.state_events.exit`). Absent means the
+    /// legacy `Closed` shape.
+    pub(crate) fn set_connection_exit_events(&mut self, connection_id: u64, enabled: bool) {
+        if enabled {
+            self.connection_exit_events.insert(connection_id);
+        } else {
+            self.connection_exit_events.remove(&connection_id);
+        }
+    }
+
     pub(crate) fn remove_connection(&mut self, connection_id: u64) {
+        self.connection_exit_events.remove(&connection_id);
         let subscription_ids = self
             .subscriptions
             .iter()
@@ -123,10 +185,9 @@ impl PaneStateJournal {
             self.closed_pane_order.push_back(pane_id);
             self.prune_closed_panes();
         }
-        let has_open_subscription = self
-            .subscriptions
-            .values()
-            .any(|subscription| subscription.pane_id == pane_id && !subscription.closed);
+        let has_open_subscription = self.subscriptions.values().any(|subscription| {
+            subscription.pane_id == pane_id && subscription.awaiting_close_delivery()
+        });
         let should_record_close = newly_closed || has_open_subscription;
         if should_record_close {
             for subscription in self.subscriptions.values_mut() {
@@ -143,18 +204,33 @@ impl PaneStateJournal {
         pane_id: PaneId,
         reason: PaneStateClosedReason,
         revision: u64,
+        exit_status: Option<i32>,
+        exit_signal: Option<i32>,
     ) {
         let evicted_revisions = &self.evicted_revisions;
         for subscription in self.subscriptions.values_mut() {
-            if subscription.pane_id == pane_id
-                && subscription.closed
-                && subscription.closed_revision.is_none()
-            {
+            if subscription.pane_id != pane_id || !subscription.closed {
+                continue;
+            }
+            if subscription.closed_seeded {
+                // A seeded subscription waits for the pane's final close:
+                // re-point it at the newer record (with that record's exit
+                // details) instead of delivering the stale seeded close.
                 subscription.evicted_state_revision_before_close =
                     evicted_revisions_for_subscription(evicted_revisions, subscription)
                         .max_matching_state_change(subscription.include);
                 subscription.closed_revision = Some(revision);
                 subscription.closed_reason = Some(reason);
+                subscription.closed_exit_status = exit_status;
+                subscription.closed_exit_signal = exit_signal;
+            } else if subscription.closed_revision.is_none() {
+                subscription.evicted_state_revision_before_close =
+                    evicted_revisions_for_subscription(evicted_revisions, subscription)
+                        .max_matching_state_change(subscription.include);
+                subscription.closed_revision = Some(revision);
+                subscription.closed_reason = Some(reason);
+                subscription.closed_exit_status = exit_status;
+                subscription.closed_exit_signal = exit_signal;
             }
         }
     }
@@ -225,6 +301,7 @@ impl PaneStateJournal {
         if subscription.connection_id != connection_id {
             return Err("subscription is not owned by this connection");
         }
+        let exit_events = self.connection_exit_events.contains(&connection_id);
         let limit = max_events.max(1);
         if subscription.closed {
             if let Some(read) = self.closed_relevant_lag(subscription, after_revision) {
@@ -236,7 +313,7 @@ impl PaneStateJournal {
                     && closed_revision.is_none_or(|revision| record.revision <= revision)
                     && record_matches_subscription(record, subscription)
             }) {
-                output.push(record_to_dto(record));
+                output.push(record_to_dto(record, exit_events));
                 if output.len() >= limit {
                     let next_revision = output_revision(output).unwrap_or(after_revision);
                     return Ok(PaneStateRead::Ready {
@@ -261,11 +338,7 @@ impl PaneStateJournal {
                 // delta. A lag rebase snapshots current state and may advance
                 // the client's cursor past this revision, but the subscription
                 // must still deliver its one terminal event before removal.
-                output.push(PaneStateEventDto::Closed {
-                    revision,
-                    pane_id: subscription.pane_id,
-                    reason,
-                });
+                output.push(terminal_event(subscription, revision, reason, exit_events));
                 return Ok(PaneStateRead::Ready {
                     next_revision: after_revision.max(revision),
                     limited: false,
@@ -284,7 +357,7 @@ impl PaneStateJournal {
         for record in self.records.iter().filter(|record| {
             record.revision > after_revision && record_matches_subscription(record, subscription)
         }) {
-            output.push(record_to_dto(record));
+            output.push(record_to_dto(record, exit_events));
             if output.len() >= limit {
                 let next_revision = output_revision(output).unwrap_or(after_revision);
                 return Ok(PaneStateRead::Ready {
@@ -429,7 +502,7 @@ fn decrement_count(counts: &mut HashMap<PaneId, usize>, pane_id: PaneId) {
     }
 }
 
-fn record_to_dto(record: &PaneStateRecord) -> PaneStateEventDto {
+fn record_to_dto(record: &PaneStateRecord, exit_events: bool) -> PaneStateEventDto {
     match &record.change {
         PaneStateChange::TitleChanged { old, new } => PaneStateEventDto::TitleChanged {
             revision: record.revision,
@@ -456,11 +529,62 @@ fn record_to_dto(record: &PaneStateRecord) -> PaneStateEventDto {
             old_state: old.clone(),
             new_state: new.clone(),
         },
-        PaneStateChange::Closed { reason } => PaneStateEventDto::Closed {
-            revision: record.revision,
-            pane_id: record.pane_id,
-            reason: *reason,
-        },
+        PaneStateChange::Closed {
+            reason,
+            exit_status,
+            exit_signal,
+        } => terminal_event_dto(
+            record.revision,
+            record.pane_id,
+            *reason,
+            *exit_status,
+            *exit_signal,
+            exit_events,
+        ),
+    }
+}
+
+/// The terminal event for one close, shaped for the connection: capable
+/// connections receive the exit-bearing `Exited` event, everything else
+/// the legacy `Closed`.
+fn terminal_event(
+    subscription: &PaneStateSubscription,
+    revision: u64,
+    reason: PaneStateClosedReason,
+    exit_events: bool,
+) -> PaneStateEventDto {
+    terminal_event_dto(
+        revision,
+        subscription.pane_id,
+        reason,
+        subscription.closed_exit_status,
+        subscription.closed_exit_signal,
+        exit_events,
+    )
+}
+
+fn terminal_event_dto(
+    revision: u64,
+    pane_id: PaneId,
+    reason: PaneStateClosedReason,
+    exit_status: Option<i32>,
+    exit_signal: Option<i32>,
+    exit_events: bool,
+) -> PaneStateEventDto {
+    if exit_events {
+        PaneStateEventDto::Exited {
+            revision,
+            pane_id,
+            reason,
+            exit_status,
+            exit_signal,
+        }
+    } else {
+        PaneStateEventDto::Closed {
+            revision,
+            pane_id,
+            reason,
+        }
     }
 }
 
@@ -470,7 +594,8 @@ fn output_revision(events: &[PaneStateEventDto]) -> Option<u64> {
         | PaneStateEventDto::OptionSet { revision, .. }
         | PaneStateEventDto::OptionUnset { revision, .. }
         | PaneStateEventDto::ForegroundChanged { revision, .. }
-        | PaneStateEventDto::Closed { revision, .. } => *revision,
+        | PaneStateEventDto::Closed { revision, .. }
+        | PaneStateEventDto::Exited { revision, .. } => *revision,
         _ => unreachable!("unknown pane-state event variant from this rmux-proto version"),
     })
 }

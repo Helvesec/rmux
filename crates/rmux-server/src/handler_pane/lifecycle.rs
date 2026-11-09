@@ -317,6 +317,8 @@ impl RequestHandler {
                                 event.generation,
                                 PaneStateChange::Closed {
                                     reason: PaneStateClosedReason::Exited,
+                                    exit_status: metadata.status,
+                                    exit_signal: metadata.signal,
                                 },
                             );
                             self.prune_web_panes(&[event.pane_id]);
@@ -382,6 +384,8 @@ impl RequestHandler {
                                         event.generation,
                                         PaneStateChange::Closed {
                                             reason: PaneStateClosedReason::Exited,
+                                            exit_status: metadata.status,
+                                            exit_signal: metadata.signal,
                                         },
                                     );
                                     self.prune_web_panes(&result.removed_pane_ids);
@@ -810,11 +814,17 @@ impl RequestHandler {
                 window_name,
             },
         );
+        // The kept-dead pane's exit details come from the same stored
+        // metadata the format engine's pane_dead_status serves, so the
+        // state stream and the probe paths agree on the exit code.
+        let metadata = state.pane_exit_metadata(&runtime_session_name, event.pane_id);
         self.record_pane_state_change(
             event.pane_id,
             Some(output_generation),
             PaneStateChange::Closed {
                 reason: PaneStateClosedReason::DiedKept,
+                exit_status: metadata.as_ref().and_then(|metadata| metadata.status),
+                exit_signal: metadata.as_ref().and_then(|metadata| metadata.signal),
             },
         );
         Some((target, pane_event))

@@ -38,6 +38,13 @@ pub const CAPABILITY_SDK_PANE_BROADCAST: &str = "sdk.pane.broadcast";
 pub const CAPABILITY_SDK_PANE_OPTIONS: &str = "sdk.pane.options";
 /// Stable feature id for SDK pane title/option/close state events.
 pub const CAPABILITY_SDK_PANE_STATE_EVENTS: &str = "sdk.pane.state_events";
+/// Stable feature id for pane-state exit events that carry the observed
+/// process exit status.
+///
+/// Connections that require this capability receive
+/// [`PaneStateEventDto::Exited`](crate::PaneStateEventDto::Exited) instead
+/// of the legacy `Closed` event when a pane's process exits.
+pub const CAPABILITY_SDK_PANE_STATE_EXIT_EVENTS: &str = "sdk.pane.state_events.exit";
 /// Stable feature id for SDK best-effort pane foreground process state.
 pub const CAPABILITY_SDK_PANE_FOREGROUND: &str = "sdk.pane.foreground";
 /// Stable feature id for atomic SDK split visible/stable identity responses.
@@ -91,6 +98,7 @@ pub const SUPPORTED_CAPABILITIES: &[&str] = &[
     CAPABILITY_SDK_PANE_BROADCAST,
     CAPABILITY_SDK_PANE_OPTIONS,
     CAPABILITY_SDK_PANE_STATE_EVENTS,
+    CAPABILITY_SDK_PANE_STATE_EXIT_EVENTS,
     CAPABILITY_SDK_PANE_FOREGROUND,
     CAPABILITY_SDK_SESSION_LEASE,
     CAPABILITY_SDK_SESSION_LEASE_BY_ID_V2,

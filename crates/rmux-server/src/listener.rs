@@ -6,7 +6,8 @@ use std::time::Duration;
 use rmux_ipc::{wait_for_peer_close, LocalListener, LocalStream, PeerIdentity};
 use rmux_proto::{
     encode_frame, ErrorResponse, FrameDecoder, Request, Response, WaitForMode,
-    CAPABILITY_SDK_SESSION_LEASE_BY_ID_V2, CAPABILITY_SDK_WAITS_ARMED,
+    CAPABILITY_SDK_PANE_STATE_EXIT_EVENTS, CAPABILITY_SDK_SESSION_LEASE_BY_ID_V2,
+    CAPABILITY_SDK_WAITS_ARMED,
 };
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::{oneshot, watch};
@@ -348,6 +349,9 @@ async fn serve_connection(
 
                 if request_enables_sdk_wait_armed_ack(&request) {
                     sdk_wait_armed_ack_enabled = true;
+                }
+                if request_enables_pane_state_exit_events(&request) {
+                    handler.set_connection_pane_state_exit_events(connection_id, true);
                 }
                 let enables_session_lease_by_id =
                     request_enables_session_lease_by_id(&request);
@@ -824,6 +828,17 @@ fn request_enables_session_lease_by_id(request: &Request) -> bool {
                 .required_capabilities
                 .iter()
                 .any(|capability| capability == CAPABILITY_SDK_SESSION_LEASE_BY_ID_V2)
+    )
+}
+
+fn request_enables_pane_state_exit_events(request: &Request) -> bool {
+    matches!(
+        request,
+        Request::Handshake(handshake)
+            if handshake
+                .required_capabilities
+                .iter()
+                .any(|capability| capability == CAPABILITY_SDK_PANE_STATE_EXIT_EVENTS)
     )
 }
 
