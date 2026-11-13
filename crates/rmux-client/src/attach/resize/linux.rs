@@ -61,7 +61,9 @@ fn pthread_result(code: libc::c_int) -> io::Result<()> {
 
 fn notify(thread: &thread::JoinHandle<()>) -> io::Result<()> {
     // SAFETY: The join handle still owns the native thread ID, and SIGWINCH is valid.
-    pthread_result(unsafe { libc::pthread_kill(thread.as_pthread_t(), libc::SIGWINCH) })
+    pthread_result(unsafe {
+        libc::pthread_kill(thread.as_pthread_t() as libc::pthread_t, libc::SIGWINCH)
+    })
 }
 
 #[derive(Debug)]

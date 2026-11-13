@@ -122,7 +122,7 @@ pub(super) fn interrupt_thread<T>(thread: &thread::JoinHandle<T>) {
             // by the caller. All captured signal handlers remain installed, so
             // delivery only interrupts the output syscall and re-observes the
             // already-recorded termination.
-            libc::pthread_kill(thread.as_pthread_t(), signal)
+            libc::pthread_kill(thread.as_pthread_t() as libc::pthread_t, signal)
         };
     }
 }
@@ -172,7 +172,7 @@ where
                     return Err(io::Error::new(
                         io::ErrorKind::WriteZero,
                         "failed to write the complete attach output frame",
-                    ))
+                    ));
                 }
                 Ok(written) => bytes = &bytes[written..],
                 Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
