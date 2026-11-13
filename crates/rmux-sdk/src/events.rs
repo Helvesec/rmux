@@ -26,6 +26,7 @@ pub use recovery::{
     PaneRecoveryRebase, PaneRecoveryRebaseReason, PaneRecoveryState, PaneRecoveryStream,
 };
 pub use render::{PaneRenderStream, RenderUpdate};
+pub use rmux_proto::PanePassthroughKind;
 pub use streams::{
     PaneLagNotice, PaneLineItem, PaneLineStream, PaneOutputChunk, PaneOutputStart,
     PaneOutputStream, PaneRecentOutput,

@@ -567,6 +567,43 @@ pub struct PaneRawBytes {
     pub bytes: Vec<u8>,
 }
 
+/// Terminal passthrough protocol family of one graphics event.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[non_exhaustive]
+pub enum PanePassthroughKind {
+    /// Kitty terminal graphics protocol, APC-framed for an outer terminal.
+    KittyGraphics,
+    /// SIXEL graphics protocol, DCS-framed for an outer terminal.
+    Sixel,
+    /// Opaque tmux DCS passthrough payload, already framed for an outer
+    /// terminal.
+    Raw,
+}
+
+/// One parser-extracted terminal graphics event delivered on a raw pane
+/// stream.
+///
+/// The daemon's grid parser recognized this escape and extracted it from
+/// pane output; the visible cell grid never represents it. `bytes` carries
+/// the escape ready to be written to a graphics-capable outer terminal, and
+/// the captured pane-local cursor position lets the consumer place it.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct PaneGraphicsPassthrough {
+    /// Stream-local epoch established by the latest raw rebase.
+    pub epoch: u64,
+    /// Monotonic pane-output sequence carrying this escape. The adjacent
+    /// raw-bytes event for the same sequence embeds the same escape verbatim.
+    pub sequence: u64,
+    /// Protocol family of this event.
+    pub kind: PanePassthroughKind,
+    /// Pane-local cursor column captured when the escape arrived.
+    pub cursor_x: u32,
+    /// Pane-local cursor row captured when the escape arrived.
+    pub cursor_y: u32,
+    /// Outer-terminal-ready escape bytes for this event.
+    pub bytes: Vec<u8>,
+}
+
 /// One OSC 8 hyperlink referenced by a structured pane surface.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PaneSurfaceHyperlink {
@@ -688,6 +725,13 @@ pub enum PaneStreamEvent {
     Lifecycle(PaneStreamLifecycleEvent),
     /// Typed terminal or subscription termination.
     End(PaneStreamEndReason),
+    /// One parser-extracted terminal graphics event.
+    ///
+    /// Appended after `End` because bincode cannot grow existing variants
+    /// positionally: only connections that required the
+    /// `sdk.pane.graphics_passthrough` capability on a raw stream over a pane
+    /// with passthrough enabled receive this variant.
+    GraphicsPassthrough(PaneGraphicsPassthrough),
 }
 
 /// Atomic initial event and already-reserved pane stream subscription.

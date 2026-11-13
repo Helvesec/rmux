@@ -1,11 +1,12 @@
 use std::sync::{Arc, Mutex as StdMutex, Weak};
 use std::time::Instant;
 
-use rmux_core::events::{OutputCursorItem, DEFAULT_SUBSCRIPTION_BATCH_EVENTS};
+use rmux_core::events::{OutputCursorItem, OutputEvent, DEFAULT_SUBSCRIPTION_BATCH_EVENTS};
+use rmux_core::TerminalPassthroughKind;
 use rmux_proto::{
-    ErrorResponse, PaneRawBytes, PaneRawRebaseReason, PaneStreamCursorRequest, PaneStreamEndReason,
-    PaneStreamEvent, PaneStreamLifecycleEvent, Response, RmuxError,
-    DEFAULT_MAX_DETACHED_FRAME_LENGTH,
+    ErrorResponse, PaneGraphicsPassthrough, PanePassthroughKind, PaneRawBytes, PaneRawRebaseReason,
+    PaneStreamCursorRequest, PaneStreamEndReason, PaneStreamEvent, PaneStreamLifecycleEvent,
+    Response, RmuxError, DEFAULT_MAX_DETACHED_FRAME_LENGTH,
 };
 
 use crate::pane_io::{PaneBoundary, PaneObservationItem, PaneOutputReceiver};
@@ -36,6 +37,45 @@ fn encoded_raw_bytes_size(epoch: u64, sequence: u64, byte_len: usize) -> Result<
         bytes: Vec::new(),
     });
     Ok(encoded_stream_event_size(&empty)?.saturating_add(byte_len))
+}
+
+/// Extracts the graphics passthrough events carried by one output event.
+///
+/// Clipboard and palette-query side effects are excluded: both are
+/// server-correlated protocols with dedicated request paths, so reflecting
+/// them here would double-deliver them to SDK consumers.
+fn graphics_passthrough_events(
+    epoch: u64,
+    sequence: u64,
+    event: &OutputEvent,
+) -> Vec<PaneStreamEvent> {
+    event
+        .passthroughs()
+        .iter()
+        .filter_map(|passthrough| {
+            let kind = match passthrough.kind() {
+                TerminalPassthroughKind::KittyGraphics => PanePassthroughKind::KittyGraphics,
+                TerminalPassthroughKind::Sixel => PanePassthroughKind::Sixel,
+                TerminalPassthroughKind::Raw => PanePassthroughKind::Raw,
+                TerminalPassthroughKind::Clipboard | TerminalPassthroughKind::PaletteQuery => {
+                    return None;
+                }
+            };
+            if passthrough.clipboard_query_metadata().is_some() {
+                return None;
+            }
+            Some(PaneStreamEvent::GraphicsPassthrough(
+                PaneGraphicsPassthrough {
+                    epoch,
+                    sequence,
+                    kind,
+                    cursor_x: passthrough.cursor_x(),
+                    cursor_y: passthrough.cursor_y(),
+                    bytes: passthrough.render_sequence(),
+                },
+            ))
+        })
+        .collect()
 }
 
 pub(super) enum RawInitializationOutcome {
@@ -267,12 +307,18 @@ impl RequestHandler {
                 .streams
                 .get(&subscription_id)
                 .and_then(PaneStreamSubscription::end_reason);
+            let graphics_passthrough = subscriptions
+                .streams
+                .get(&subscription_id)
+                .map(PaneStreamSubscription::reserved_graphics_passthrough)
+                .unwrap_or(false);
             subscriptions.streams.insert(
                 subscription_id,
                 PaneStreamSubscription::Raw(RawPaneStream::new(
                     start.receiver,
                     1,
                     start.include_snapshot,
+                    graphics_passthrough,
                     end_reason,
                 )),
             );
@@ -379,6 +425,37 @@ impl RequestHandler {
                             break;
                         }
                         PaneObservationItem::Output(OutputCursorItem::Event(event)) => {
+                            let sequence = event.sequence();
+                            let mut deferred = false;
+                            if stream.graphics_passthrough() {
+                                for graphics in
+                                    graphics_passthrough_events(stream.epoch, sequence, &event)
+                                {
+                                    let event_size = match encoded_stream_event_size(&graphics) {
+                                        Ok(size) => size,
+                                        Err(error) => {
+                                            return Response::Error(ErrorResponse { error })
+                                        }
+                                    };
+                                    let next_response_size =
+                                        response_size.saturating_add(event_size);
+                                    if !events.is_empty()
+                                        && next_response_size > DEFAULT_MAX_DETACHED_FRAME_LENGTH
+                                    {
+                                        deferred = true;
+                                        break;
+                                    }
+                                    response_size = next_response_size;
+                                    events.push(graphics);
+                                }
+                            }
+                            if deferred {
+                                stream.defer_observation(PaneObservationItem::Output(
+                                    OutputCursorItem::Event(event),
+                                ));
+                                reached_frame_limit = true;
+                                break;
+                            }
                             let event_size = match encoded_raw_bytes_size(
                                 stream.epoch,
                                 event.sequence(),
