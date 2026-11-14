@@ -380,6 +380,7 @@ pub(crate) struct RequestHandler {
     shutdown_reason: Arc<StdMutex<Option<PendingShutdownReason>>>,
     shutdown_retry_state: Arc<StdMutex<shutdown_support::ShutdownRetryState>>,
     active_detached_connections: Arc<StdMutex<HashSet<u64>>>,
+    pane_graphics_passthrough_connections: Arc<StdMutex<HashSet<u64>>>,
     active_detached_requester_access: Arc<StdMutex<HashMap<u32, DetachedRequesterAccess>>>,
     active_detached_requests: Arc<AtomicUsize>,
     normal_request_admission: Arc<shutdown_support::NormalRequestAdmission>,
@@ -483,6 +484,9 @@ impl Clone for RequestHandler {
             shutdown_reason: self.shutdown_reason.clone(),
             shutdown_retry_state: self.shutdown_retry_state.clone(),
             active_detached_connections: self.active_detached_connections.clone(),
+            pane_graphics_passthrough_connections: self
+                .pane_graphics_passthrough_connections
+                .clone(),
             active_detached_requester_access: self.active_detached_requester_access.clone(),
             active_detached_requests: self.active_detached_requests.clone(),
             normal_request_admission: self.normal_request_admission.clone(),
@@ -575,6 +579,7 @@ pub(crate) struct WeakRequestHandler {
     shutdown_reason: Weak<StdMutex<Option<PendingShutdownReason>>>,
     shutdown_retry_state: Weak<StdMutex<shutdown_support::ShutdownRetryState>>,
     active_detached_connections: Weak<StdMutex<HashSet<u64>>>,
+    pane_graphics_passthrough_connections: Weak<StdMutex<HashSet<u64>>>,
     active_detached_requester_access: Weak<StdMutex<HashMap<u32, DetachedRequesterAccess>>>,
     active_detached_requests: Weak<AtomicUsize>,
     normal_request_admission: Weak<shutdown_support::NormalRequestAdmission>,
@@ -637,6 +642,9 @@ impl WeakRequestHandler {
             shutdown_reason: self.shutdown_reason.upgrade()?,
             shutdown_retry_state: self.shutdown_retry_state.upgrade()?,
             active_detached_connections: self.active_detached_connections.upgrade()?,
+            pane_graphics_passthrough_connections: self
+                .pane_graphics_passthrough_connections
+                .upgrade()?,
             active_detached_requester_access: self.active_detached_requester_access.upgrade()?,
             active_detached_requests: self.active_detached_requests.upgrade()?,
             normal_request_admission: self.normal_request_admission.upgrade()?,
@@ -951,6 +959,7 @@ impl RequestHandler {
                 shutdown_support::ShutdownRetryState::new(),
             )),
             active_detached_connections: Arc::new(StdMutex::new(HashSet::new())),
+            pane_graphics_passthrough_connections: Arc::new(StdMutex::new(HashSet::new())),
             active_detached_requester_access: Arc::new(StdMutex::new(HashMap::new())),
             active_detached_requests: Arc::new(AtomicUsize::new(0)),
             normal_request_admission: Arc::new(shutdown_support::NormalRequestAdmission::new()),
@@ -1053,6 +1062,9 @@ impl RequestHandler {
             shutdown_reason: Arc::downgrade(&self.shutdown_reason),
             shutdown_retry_state: Arc::downgrade(&self.shutdown_retry_state),
             active_detached_connections: Arc::downgrade(&self.active_detached_connections),
+            pane_graphics_passthrough_connections: Arc::downgrade(
+                &self.pane_graphics_passthrough_connections,
+            ),
             active_detached_requester_access: Arc::downgrade(
                 &self.active_detached_requester_access,
             ),

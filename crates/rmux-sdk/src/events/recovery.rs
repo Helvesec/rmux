@@ -4,7 +4,7 @@ use std::error::Error;
 use std::fmt;
 
 use rmux_proto::{
-    PaneRawRebase as ProtoRebase, PaneRawRebaseReason as ProtoReason,
+    PanePassthroughKind, PaneRawRebase as ProtoRebase, PaneRawRebaseReason as ProtoReason,
     PaneStreamEvent as ProtoEvent, PaneStreamMode, PaneTargetRef,
 };
 
@@ -25,6 +25,29 @@ pub struct PaneRecoveryOptions {
     /// Emulator consumers normally leave this disabled because the required
     /// raw keyframe already reconstructs the pane.
     pub include_snapshot: bool,
+    /// Whether parser-extracted terminal graphics events should be delivered
+    /// on this stream.
+    ///
+    /// Requires the daemon to advertise the `sdk.pane.graphics_passthrough`
+    /// capability, and the pane to have its `allow-passthrough` option set to
+    /// `on` or `all` before the stream opens; the daemon snapshots that option
+    /// at subscribe time. Graphics events are live-only: the daemon never
+    /// replays an image escape through a rebase, so images are ephemeral
+    /// across rebuilds, scrollback, and occlusion.
+    pub graphics_passthrough: bool,
+}
+
+impl PaneRecoveryOptions {
+    /// Returns the options with graphics passthrough delivery enabled or
+    /// disabled.
+    ///
+    /// The struct stays `#[non_exhaustive]`, so callers build options from
+    /// [`PaneRecoveryOptions::default`] with this builder.
+    #[must_use]
+    pub fn with_graphics_passthrough(mut self, graphics_passthrough: bool) -> Self {
+        self.graphics_passthrough = graphics_passthrough;
+        self
+    }
 }
 
 /// Why the daemon rebuilt a raw stream's emulator state.
@@ -120,6 +143,31 @@ pub enum PaneRecoveryEvent {
     },
     /// Non-terminal child lifecycle observation.
     Lifecycle(PaneStreamLifecycleEvent),
+    /// One parser-extracted terminal graphics event.
+    ///
+    /// Delivered only when [`PaneRecoveryOptions::graphics_passthrough`] was
+    /// set, the daemon advertised the capability, and the pane allowed
+    /// passthrough when the stream opened. The event carries the escape ready
+    /// to be written to a graphics-capable outer terminal; `sequence` names
+    /// the pane-output chunk that embedded it, and the adjacent
+    /// [`PaneRecoveryEvent::Bytes`] event for the same sequence still carries
+    /// the escape verbatim. Graphics events never advance
+    /// [`PaneRecoveryState`] sequence state and are never replayed after a
+    /// rebase.
+    Graphics {
+        /// Rebase epoch this event belongs to.
+        epoch: u64,
+        /// Pane-output sequence carrying the escape.
+        sequence: u64,
+        /// Protocol family of the escape.
+        kind: PanePassthroughKind,
+        /// Pane-local cursor column captured when the escape arrived.
+        cursor_x: u32,
+        /// Pane-local cursor row captured when the escape arrived.
+        cursor_y: u32,
+        /// Outer-terminal-ready escape bytes.
+        bytes: Vec<u8>,
+    },
     /// Typed logical end of this stream.
     End(PaneStreamEndReason),
 }
@@ -165,6 +213,9 @@ impl PaneRecoveryState {
             PaneRecoveryEvent::Lifecycle(PaneStreamLifecycleEvent::ProcessExited {
                 output_sequence,
             }) => self.apply_lifecycle(*output_sequence),
+            // Graphics events annotate an output sequence the adjacent Bytes
+            // event advances; they carry no sequence state of their own.
+            PaneRecoveryEvent::Graphics { .. } => Ok(()),
             PaneRecoveryEvent::End(reason) => {
                 self.ended = Some(*reason);
                 Ok(())
@@ -525,6 +576,7 @@ const fn stream_event_kind(event: &ProtoEvent) -> &'static str {
         ProtoEvent::SurfaceReset(_) => "surface-reset",
         ProtoEvent::SurfacePatch(_) => "surface-patch",
         ProtoEvent::Lifecycle(_) => "lifecycle",
+        ProtoEvent::GraphicsPassthrough(_) => "graphics-passthrough",
         ProtoEvent::End(_) => "end",
         _ => "unsupported",
     }
@@ -540,6 +592,16 @@ fn map_event(event: ProtoEvent) -> Result<MappedEvent<PaneRecoveryEvent>> {
             sequence: bytes.sequence,
             bytes: bytes.bytes,
         })),
+        ProtoEvent::GraphicsPassthrough(graphics) => {
+            Ok(MappedEvent::live(PaneRecoveryEvent::Graphics {
+                epoch: graphics.epoch,
+                sequence: graphics.sequence,
+                kind: graphics.kind,
+                cursor_x: graphics.cursor_x,
+                cursor_y: graphics.cursor_y,
+                bytes: graphics.bytes,
+            }))
+        }
         ProtoEvent::Lifecycle(event) => Ok(MappedEvent::live(PaneRecoveryEvent::Lifecycle(
             lifecycle_from_proto(event)?,
         ))),

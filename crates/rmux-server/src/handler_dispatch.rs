@@ -2,7 +2,7 @@ use rmux_core::command_parser::ParsedCommand;
 use rmux_proto::request::Request;
 use rmux_proto::{
     capabilities_for_features, ControlModeResponse, ErrorResponse, HandshakeResponse, Response,
-    RmuxError,
+    RmuxError, CAPABILITY_SDK_PANE_GRAPHICS_PASSTHROUGH,
 };
 #[cfg(all(test, any(unix, windows), feature = "web"))]
 use std::sync::{Arc, Mutex};
@@ -311,6 +311,13 @@ impl RequestHandler {
             let response = if let Err(error) = request.validate_against(&supported_capabilities) {
                 Response::Error(ErrorResponse { error })
             } else {
+                if request
+                    .required_capabilities
+                    .iter()
+                    .any(|capability| capability == CAPABILITY_SDK_PANE_GRAPHICS_PASSTHROUGH)
+                {
+                    self.note_pane_graphics_passthrough_connection(connection_id);
+                }
                 Response::Handshake(HandshakeResponse {
                     wire_version: rmux_proto::RMUX_WIRE_VERSION,
                     capabilities: supported_capabilities

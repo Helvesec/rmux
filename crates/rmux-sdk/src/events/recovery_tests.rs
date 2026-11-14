@@ -1258,3 +1258,105 @@ fn recovery_state_rejects_wrong_epoch_and_noncontiguous_bytes() {
         })
     );
 }
+
+#[test]
+fn recovery_state_lets_graphics_events_annotate_the_adjacent_sequence() {
+    let mut state = PaneRecoveryState::default();
+    state
+        .apply(&PaneRecoveryEvent::Rebase(
+            super::rebase_from_proto(rebase(1, ProtoReason::Initial)).expect("initial rebase"),
+        ))
+        .expect("initial rebase");
+
+    let graphics = PaneRecoveryEvent::Graphics {
+        epoch: 1,
+        sequence: 5,
+        kind: rmux_proto::PanePassthroughKind::KittyGraphics,
+        cursor_x: 2,
+        cursor_y: 0,
+        bytes: b"\x1b_Gf=100;AAAA\x1b\\".to_vec(),
+    };
+    state.apply(&graphics).expect("graphics advance no state");
+    assert_eq!(state.next_sequence(), Some(5), "graphics are annotations");
+
+    state
+        .apply(&PaneRecoveryEvent::Bytes {
+            epoch: 1,
+            sequence: 5,
+            bytes: b"\x1b_Gf=100;AAAA\x1b\\".to_vec(),
+        })
+        .expect("the adjacent bytes event advances the sequence");
+    assert_eq!(state.next_sequence(), Some(6));
+}
+
+#[tokio::test]
+async fn graphics_passthrough_events_surface_as_typed_sdk_events() {
+    let (client, mut server) = tokio::io::duplex(64 * 1024);
+    let server_task = tokio::spawn(async move {
+        serve_subscribe(&mut server).await;
+        assert!(matches!(
+            read_request(&mut server).await,
+            Request::PaneStreamCursor(PaneStreamCursorRequest {
+                subscription_id: id,
+                ..
+            }) if id == subscription_id()
+        ));
+        write_response(
+            &mut server,
+            Response::PaneStreamCursor(Box::new(PaneStreamCursorResponse {
+                subscription_id: subscription_id(),
+                events: vec![
+                    PaneStreamEvent::GraphicsPassthrough(rmux_proto::PaneGraphicsPassthrough {
+                        epoch: 1,
+                        sequence: 5,
+                        kind: rmux_proto::PanePassthroughKind::KittyGraphics,
+                        cursor_x: 2,
+                        cursor_y: 0,
+                        bytes: b"\x1b_Gf=100;AAAA\x1b\\".to_vec(),
+                    }),
+                    PaneStreamEvent::RawBytes(PaneRawBytes {
+                        epoch: 1,
+                        sequence: 5,
+                        bytes: b"\x1b_Gf=100;AAAA\x1b\\".to_vec(),
+                    }),
+                ],
+                limited: false,
+            })),
+        )
+        .await;
+        assert_eq!(
+            read_request(&mut server).await,
+            Request::UnsubscribePaneStream(UnsubscribePaneStreamRequest {
+                subscription_id: subscription_id(),
+            })
+        );
+    });
+
+    let mut stream = open_stream(client).await;
+    assert!(matches!(
+        stream.next().await.expect("initial event"),
+        Some(PaneRecoveryEvent::Rebase(_))
+    ));
+
+    assert_eq!(
+        stream.next().await.expect("graphics event"),
+        Some(PaneRecoveryEvent::Graphics {
+            epoch: 1,
+            sequence: 5,
+            kind: rmux_proto::PanePassthroughKind::KittyGraphics,
+            cursor_x: 2,
+            cursor_y: 0,
+            bytes: b"\x1b_Gf=100;AAAA\x1b\\".to_vec(),
+        })
+    );
+    assert_eq!(
+        stream.next().await.expect("raw chunk"),
+        Some(PaneRecoveryEvent::Bytes {
+            epoch: 1,
+            sequence: 5,
+            bytes: b"\x1b_Gf=100;AAAA\x1b\\".to_vec(),
+        })
+    );
+    drop(stream);
+    server_task.await.expect("server task");
+}
