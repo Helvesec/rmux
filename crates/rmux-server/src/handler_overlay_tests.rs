@@ -1,3 +1,4 @@
+use super::super::input_capture::RawPaneInputProbe;
 use super::super::{
     overlay_support::{AttachedOverlayInput, ClientOverlayState},
     RequestHandler,
@@ -6,11 +7,12 @@ use super::session_name;
 use crate::input_keys::MAX_SGR_MOUSE_FRAME_BYTES;
 use crate::mouse::{layout_for_session, StatusRangeType};
 use crate::pane_io::AttachControl;
+use rmux_core::kitty_keyboard::FRAME_LIMIT;
 use rmux_proto::request::RefreshClientRequest;
 use rmux_proto::{
     BindKeyRequest, CapturePaneRequest, ListSessionsRequest, NewSessionExtRequest,
     NewSessionRequest, PaneTarget, Request, Response, ScopeSelector, SessionName, SetBufferRequest,
-    SetOptionMode, Target, TerminalSize, WindowTarget, DEFAULT_MAX_FRAME_LENGTH,
+    SetOptionMode, Target, TerminalSize, WindowTarget,
 };
 use rmux_proto::{OptionName, SetOptionRequest};
 use std::sync::{Arc, Condvar, Mutex as StdMutex};
@@ -84,7 +86,7 @@ async fn create_attached_session(
             environment: None,
         }))
         .await;
-    assert!(matches!(created, Response::NewSession(_)));
+    crate::session_fixture::assert_new_session(&created);
 
     let (control_tx, control_rx) = mpsc::unbounded_channel();
     let _attach_id = handler
@@ -155,6 +157,26 @@ fn quiet_overlay_command() -> Vec<String> {
         .collect()
 }
 
+#[cfg(unix)]
+fn quiet_popup_shell_command() -> &'static str {
+    "sleep 60"
+}
+
+#[cfg(windows)]
+fn quiet_popup_shell_command() -> &'static str {
+    "ping -n 120 127.0.0.1 >NUL"
+}
+
+#[cfg(unix)]
+fn ready_popup_shell_command() -> &'static str {
+    "printf RMUX_POPUP_READY; sleep 60"
+}
+
+#[cfg(windows)]
+fn ready_popup_shell_command() -> &'static str {
+    "echo RMUX_POPUP_READY & ping -n 120 127.0.0.1 >NUL"
+}
+
 async fn run_overlay_command(handler: &RequestHandler, requester_pid: u32, command: &str) {
     let parsed = handler
         .parse_control_commands(command)
@@ -196,6 +218,101 @@ async fn display_menu_accepts_parsed_command_list_items_from_queue() {
     let frame = next_overlay_frame(&mut control_rx).await;
     let rendered = String::from_utf8(frame.frame).expect("menu frame is utf-8");
     assert!(rendered.contains("First"));
+}
+
+#[tokio::test]
+async fn display_menu_masks_and_restores_native_pane_focus() {
+    let handler = RequestHandler::new();
+    let alpha = session_name("focus-menu-mask");
+    let requester_pid = std::process::id();
+    let mut control_rx = create_quiet_attached_session(&handler, &alpha, requester_pid).await;
+    let target = PaneTarget::new(alpha.clone(), 0);
+    {
+        let mut state = handler.state.lock().await;
+        state
+            .append_bytes_to_pane_transcript_for_test(&alpha, 0, 0, b"\x1b[?1004h")
+            .expect("pane enables focus reporting");
+        state.start_pane_input_capture_for_test(&target);
+    }
+    run_overlay_command(
+        &handler,
+        requester_pid,
+        r#"display-menu -xM -yM -T Menu "Close" "f" { display-message closed }"#,
+    )
+    .await;
+    let _ = next_overlay_frame(&mut control_rx).await;
+    {
+        let state = handler.state.lock().await;
+        assert_eq!(
+            state.pane_input_capture_for_test(&target),
+            Some(b"\x1b[O".to_vec())
+        );
+    }
+    handler
+        .handle_attached_live_input_for_test(requester_pid, b"\x1b[O")
+        .await
+        .expect("menu passes focus-out to the attach controller");
+    {
+        let active_attach = handler.active_attach.lock().await;
+        let active = &active_attach.by_pid[&requester_pid];
+        assert!(!active.reported_focused);
+        assert!(
+            active.overlay.is_some(),
+            "focus-out must not close the menu"
+        );
+    }
+    handler
+        .handle_attached_live_input_for_test(requester_pid, b"\x1b[I")
+        .await
+        .expect("menu passes focus-in to the attach controller");
+    {
+        let active_attach = handler.active_attach.lock().await;
+        let active = &active_attach.by_pid[&requester_pid];
+        assert!(active.reported_focused);
+        assert!(active.overlay.is_some(), "focus-in must not close the menu");
+    }
+    handler
+        .clear_interactive_overlay(requester_pid, true)
+        .await
+        .expect("menu action closes the masking surface");
+    {
+        let state = handler.state.lock().await;
+        assert_eq!(
+            state.pane_input_capture_for_test(&target),
+            Some(b"\x1b[O\x1b[I".to_vec())
+        );
+    }
+}
+
+#[tokio::test]
+async fn display_popup_masks_and_restores_native_pane_focus() {
+    let handler = RequestHandler::new();
+    let alpha = session_name("focus-popup-mask");
+    let requester_pid = std::process::id();
+    let mut control_rx = create_quiet_attached_session(&handler, &alpha, requester_pid).await;
+    let target = PaneTarget::new(alpha.clone(), 0);
+    {
+        let mut state = handler.state.lock().await;
+        state
+            .append_bytes_to_pane_transcript_for_test(&alpha, 0, 0, b"\x1b[?1004h")
+            .expect("pane enables focus reporting");
+        state.start_pane_input_capture_for_test(&target);
+    }
+
+    run_overlay_command(
+        &handler,
+        requester_pid,
+        r#"display-popup -N -T Popup -w 20 -h 6 -x C -y C"#,
+    )
+    .await;
+    let _ = next_overlay_frame(&mut control_rx).await;
+    run_overlay_command(&handler, requester_pid, "display-popup -C").await;
+
+    let state = handler.state.lock().await;
+    assert_eq!(
+        state.pane_input_capture_for_test(&target),
+        Some(b"\x1b[O\x1b[I".to_vec())
+    );
 }
 
 #[tokio::test]
@@ -260,6 +377,117 @@ async fn display_menu_single_character_shortcut_executes_item() {
     assert!(active.overlay.is_none());
 }
 
+async fn assert_menu_shortcut_writes(label: &str, shortcut: &str, input: &[u8], expected: &[u8]) {
+    let handler = RequestHandler::new();
+    let session = session_name(label);
+    let requester_pid = std::process::id();
+    let mut control_rx = create_quiet_attached_session(&handler, &session, requester_pid).await;
+    // The overlay takes and returns focus; this fixture measures only what the
+    // menu writes to the pane, so the pane must not report those edges.
+    handler
+        .disable_pane_focus_reports_for_test(&PaneTarget::new(session.clone(), 0))
+        .await;
+    let capture = RawPaneInputProbe::start(&handler, &session, label, expected.len()).await;
+    let command = format!("display-menu -T Menu Action {shortcut:?} {{ send-keys -l {label:?} }}");
+
+    run_overlay_command(&handler, requester_pid, &command).await;
+    let _ = next_overlay_frame(&mut control_rx).await;
+    let input_handler = handler.clone();
+    let input = input.to_vec();
+    tokio::spawn(async move {
+        input_handler
+            .handle_attached_live_input_for_test(requester_pid, &input)
+            .await
+    })
+    .await
+    .expect("menu shortcut task joins")
+    .expect("menu shortcut input is handled");
+
+    capture.finish(&handler, &session).await;
+    capture.assert_contents(&handler, expected).await;
+    assert!(handler.active_attach.lock().await.by_pid[&requester_pid]
+        .overlay
+        .is_none());
+}
+
+#[tokio::test]
+async fn display_menu_modify_other_keys_printables_execute_shortcuts() {
+    for (label, shortcut, input) in [
+        ("mok-menu-shift-a", "A", b"\x1b[27;2;65~".as_slice()),
+        ("mok-menu-plain-nine", "9", b"\x1b[27;1;57~".as_slice()),
+        ("mok-menu-raw-a", "A", b"A".as_slice()),
+        ("mok-menu-kitty-a", "A", b"\x1b[65u".as_slice()),
+    ] {
+        assert_menu_shortcut_writes(label, shortcut, input, label.as_bytes()).await;
+    }
+}
+
+async fn assert_prompt_input_writes(label: &str, input: &[u8], expected: &[u8]) {
+    let handler = RequestHandler::new();
+    let session = session_name(label);
+    let requester_pid = std::process::id();
+    let _control_rx = create_quiet_attached_session(&handler, &session, requester_pid).await;
+    let capture = RawPaneInputProbe::start(&handler, &session, label, expected.len()).await;
+
+    let parsed = handler
+        .parse_control_commands(r#"command-prompt -p Prompt { send-keys -l 'P:%%' }"#)
+        .await
+        .expect("prompt command parses");
+    let prompt_handler = handler.clone();
+    let prompt = tokio::spawn(async move {
+        prompt_handler
+            .execute_parsed_commands_for_test(requester_pid, parsed)
+            .await
+    });
+    timeout(Duration::from_secs(1), async {
+        while !handler.prompt_active(requester_pid).await {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("prompt becomes active");
+    handler
+        .handle_attached_live_input_for_test(requester_pid, input)
+        .await
+        .expect("prompt input is handled");
+    handler
+        .handle_attached_live_input_for_test(requester_pid, b"\r")
+        .await
+        .expect("prompt submission is handled");
+    prompt
+        .await
+        .expect("prompt task joins")
+        .expect("prompt command executes");
+
+    capture.finish(&handler, &session).await;
+    capture.assert_contents(&handler, expected).await;
+    assert!(!handler.prompt_active(requester_pid).await);
+}
+
+#[tokio::test]
+async fn command_prompt_modify_other_keys_printables_insert_text() {
+    for (label, input, expected) in [
+        (
+            "mok-prompt-shift-a",
+            b"\x1b[27;2;65~".as_slice(),
+            b"P:A".as_slice(),
+        ),
+        (
+            "mok-prompt-unicode",
+            b"\x1b[27;1;233~".as_slice(),
+            "P:é".as_bytes(),
+        ),
+        ("mok-prompt-raw-a", b"A".as_slice(), b"P:A".as_slice()),
+        (
+            "mok-prompt-kitty-a",
+            b"\x1b[65u".as_slice(),
+            b"P:A".as_slice(),
+        ),
+    ] {
+        assert_prompt_input_writes(label, input, expected).await;
+    }
+}
+
 #[tokio::test]
 async fn display_menu_hyphen_prefixed_label_with_command_is_actionable() {
     let handler = RequestHandler::new();
@@ -303,10 +531,83 @@ async fn next_overlay_frame(
         match timeout(deadline - now, control_rx.recv())
             .await
             .expect("overlay control message arrives")
+            .map(AttachControl::materialize_received)
         {
             Some(AttachControl::Overlay(frame)) => return frame,
             Some(AttachControl::Refresh | AttachControl::Switch(_)) => continue,
             other => panic!("expected overlay frame, got {other:?}"),
+        }
+    }
+}
+
+async fn next_overlay_frame_containing(
+    control_rx: &mut mpsc::UnboundedReceiver<AttachControl>,
+    marker: &[u8],
+) -> crate::pane_io::OverlayFrame {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(1);
+    loop {
+        let now = tokio::time::Instant::now();
+        assert!(now < deadline, "popup readiness marker arrives");
+        match timeout(deadline - now, control_rx.recv())
+            .await
+            .expect("popup readiness marker arrives")
+            .map(AttachControl::materialize_received)
+        {
+            Some(AttachControl::Overlay(frame))
+                if frame
+                    .frame
+                    .windows(marker.len())
+                    .any(|window| window == marker) =>
+            {
+                return frame;
+            }
+            Some(AttachControl::Overlay(_) | AttachControl::Refresh | AttachControl::Switch(_)) => {
+            }
+            other => panic!("expected popup readiness frame, got {other:?}"),
+        }
+    }
+}
+
+/// Only a popup job's reader repaints through the popup coalescing slot
+/// (`send_popup_overlay`). A real job (ConPTY under Windows) writes its modes,
+/// title and repaint whenever its terminal emits them, so a read waiting for an
+/// ordinary overlay (a replay or a clear) must not take such a repaint for it.
+fn is_popup_reader_repaint(control: &AttachControl) -> bool {
+    matches!(control, AttachControl::CoalescedPopupOverlay(_))
+}
+
+/// The next overlay frame that is not a popup job's reader repaint.
+async fn next_ordinary_overlay_frame(
+    control_rx: &mut mpsc::UnboundedReceiver<AttachControl>,
+) -> crate::pane_io::OverlayFrame {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(1);
+    loop {
+        let now = tokio::time::Instant::now();
+        assert!(now < deadline, "ordinary overlay control message arrives");
+        let control = timeout(deadline - now, control_rx.recv())
+            .await
+            .expect("ordinary overlay control message arrives");
+        if control.as_ref().is_some_and(is_popup_reader_repaint) {
+            continue;
+        }
+        match control.map(AttachControl::materialize_received) {
+            Some(AttachControl::Overlay(frame)) => return frame,
+            Some(AttachControl::Refresh | AttachControl::Switch(_)) => {}
+            other => panic!("expected ordinary overlay frame, got {other:?}"),
+        }
+    }
+}
+
+/// The first overlay frame stamped after `overlay_generation`: an older one was
+/// published before the step that set it.
+async fn next_overlay_frame_after(
+    control_rx: &mut mpsc::UnboundedReceiver<AttachControl>,
+    overlay_generation: u64,
+) -> crate::pane_io::OverlayFrame {
+    loop {
+        let frame = next_overlay_frame(control_rx).await;
+        if frame.overlay_generation > overlay_generation {
+            return frame;
         }
     }
 }
@@ -359,10 +660,13 @@ async fn refresh_overlay_frame_after_base_switch(
     loop {
         let now = tokio::time::Instant::now();
         assert!(now < deadline, "refresh-client overlay replay arrives");
-        match timeout(deadline - now, control_rx.recv())
+        let control = timeout(deadline - now, control_rx.recv())
             .await
-            .expect("refresh-client control arrives")
-        {
+            .expect("refresh-client control arrives");
+        if control.as_ref().is_some_and(is_popup_reader_repaint) {
+            continue;
+        }
+        match control.map(AttachControl::materialize_received) {
             Some(AttachControl::Switch(_)) => saw_switch = true,
             Some(AttachControl::Overlay(frame)) => {
                 assert!(saw_switch, "base refresh must precede the overlay replay");
@@ -418,10 +722,18 @@ async fn refresh_client_replays_active_popup_after_base_switch() {
         r#"display-popup -N -T Popup -w 20 -h 6 -x C -y C"#,
     )
     .await;
-    let _ = next_overlay_frame(&mut control_rx).await;
+    let initial = next_overlay_frame(&mut control_rx).await;
+    assert!(
+        initial.frame.ends_with(b"\x1b[?25l"),
+        "a no-job popup must hide the unrelated pane cursor"
+    );
 
     let frame = refresh_client_overlay_frame(&handler, requester_pid, &mut control_rx).await;
     assert!(frame.persistent);
+    assert!(
+        frame.frame.ends_with(b"\x1b[?25l"),
+        "the replayed popup frame must retain cursor ownership"
+    );
     let rendered = String::from_utf8(frame.frame).expect("popup frame is utf-8");
     assert!(rendered.contains("Popup"));
 
@@ -504,7 +816,7 @@ async fn session_identity_refresh_keeps_the_underlying_menu_hidden_by_a_prompt()
 
     let mut saw_prompt = false;
     while let Ok(control) = control_rx.try_recv() {
-        match control {
+        match control.materialize_received() {
             AttachControl::Switch(target) => {
                 let target = target.into_target();
                 let rendered = String::from_utf8_lossy(&target.render_frame);
@@ -596,7 +908,179 @@ async fn stale_same_pid_popup_callbacks_cannot_mutate_replacement_popup() {
 }
 
 #[tokio::test]
-async fn replacing_a_job_backed_popup_terminates_its_child() {
+async fn popup_repaint_backpressure_does_not_detach_attached_client() {
+    let handler = RequestHandler::new();
+    let fixture = handler.clone();
+    let mut exercise = tokio::spawn(async move {
+        let handler = fixture;
+        let alpha = session_name("popup-repaint-backpressure");
+        let requester_pid = 920_216;
+        let mut control_rx = create_quiet_attached_session(&handler, &alpha, requester_pid).await;
+
+        // Record only the child and PTY created by this private handler fixture.
+        #[cfg(unix)]
+        {
+            let state = handler.state.lock().await;
+            let pid = state.pane_pid_in_window(&alpha, 0, 0).unwrap();
+            let tty = state.pane_tty_path_in_window(&alpha, 0, 0).unwrap();
+            eprintln!(
+                "popup quiet fixture: parent={} pid={pid} pgid={pid} tty={}",
+                std::process::id(),
+                tty.display()
+            );
+        }
+
+        run_overlay_command(
+            &handler,
+            requester_pid,
+            r#"display-popup -N -T Backpressure -w 100% -h 100% -x C -y C"#,
+        )
+        .await;
+
+        let (identity, popup_id, surface, backlog, closing) = {
+            let active_attach = handler.active_attach.lock().await;
+            let active = &active_attach.by_pid[&requester_pid];
+            let Some(ClientOverlayState::Popup(popup)) = active.overlay.as_ref() else {
+                panic!("expected popup overlay");
+            };
+            assert!(
+                popup.no_job && popup.job.is_none(),
+                "-N never spawns a popup job"
+            );
+            (
+                active.identity(requester_pid),
+                popup.id,
+                Arc::clone(&popup.surface),
+                Arc::clone(&active.control_backlog),
+                Arc::clone(&active.closing),
+            )
+        };
+        while let Ok(control) = control_rx.try_recv() {
+            crate::pane_io::release_attach_control_backlog(
+                &backlog,
+                control.received_backlog_units(),
+            );
+        }
+        assert_eq!(backlog.load(std::sync::atomic::Ordering::Acquire), 0);
+
+        let repaint_count = super::super::attach_support::ATTACH_CONTROL_BACKLOG_LIMIT * 2;
+        let (done, baseline) = {
+            let surface = surface.lock().expect("popup surface");
+            (
+                Arc::clone(&surface.flush_done_for_test),
+                surface.production_counts_for_test(),
+            )
+        };
+        for marker in 0..repaint_count {
+            // Earlier acknowledged renders still exercise real queue replacement
+            // under pressure. Hold only the last production worker to force the
+            // schedule that made an immediate try_recv drain race final delivery.
+            let gate = (marker + 1 == repaint_count).then(|| {
+                let gate = Arc::new(tokio::sync::Semaphore::new(0));
+                surface.lock().expect("popup surface").flush_gate_for_test =
+                    Some(Arc::clone(&gate));
+                gate
+            });
+            surface
+                .lock()
+                .expect("popup surface")
+                .append_for_test(format!("\x1b[Hpopup-final-{marker:03}").as_bytes());
+            handler
+                .popup_reader_tick(identity, popup_id)
+                .await
+                .expect("popup repaint succeeds");
+            if let Some(gate) = gate {
+                tokio::task::yield_now().await;
+                let counts = surface
+                    .lock()
+                    .expect("popup surface")
+                    .production_counts_for_test();
+                assert_eq!(counts, (baseline.0 + marker, baseline.1 + marker));
+                assert_eq!(backlog.load(std::sync::atomic::Ordering::Acquire), 1);
+                tokio::select! {
+                    biased;
+                    _ = done.notified() => panic!("held final worker must not acknowledge publication"),
+                    _ = std::future::ready(()) => {}
+                }
+                eprintln!(
+                    "popup delayed final: acknowledged={marker} final_pending=true backlog=1"
+                );
+                gate.add_permits(1);
+            }
+            timeout(Duration::from_secs(2), done.notified())
+                .await
+                .expect("actual reader publication completes before draining");
+        }
+        let counts = surface
+            .lock()
+            .expect("popup surface")
+            .production_counts_for_test();
+        assert_eq!(
+            counts,
+            (baseline.0 + repaint_count, baseline.1 + repaint_count)
+        );
+
+        assert!(
+            !closing.load(std::sync::atomic::Ordering::SeqCst),
+            "popup repaint pressure must not close the attached client"
+        );
+        let active_attach = handler.active_attach.lock().await;
+        assert!(active_attach.by_pid.contains_key(&requester_pid));
+        assert!(
+            backlog.load(std::sync::atomic::Ordering::Acquire)
+                < super::super::attach_support::ATTACH_CONTROL_BACKLOG_LIMIT,
+            "replacement-safe popup repaints must stay below the overload limit"
+        );
+        drop(active_attach);
+
+        let final_marker = format!("popup-final-{:03}", repaint_count - 1);
+        let mut overlay_frames = Vec::new();
+        let mut saw_detach = false;
+        while let Ok(control) = control_rx.try_recv() {
+            crate::pane_io::release_attach_control_backlog(
+                &backlog,
+                control.received_backlog_units(),
+            );
+            let control = control.materialize_received();
+            match control {
+                AttachControl::Overlay(frame) => overlay_frames.push(frame),
+                AttachControl::Detach => saw_detach = true,
+                other => panic!("unexpected popup repaint control: {other:?}"),
+            }
+        }
+        assert!(!saw_detach, "popup repaint pressure must not queue Detach");
+        assert_eq!(
+            overlay_frames.len(),
+            1,
+            "only the latest repaint is retained"
+        );
+        assert!(
+            String::from_utf8_lossy(&overlay_frames[0].frame).contains(&final_marker),
+            "the retained repaint must contain the popup's final surface"
+        );
+        assert_eq!(backlog.load(std::sync::atomic::Ordering::Acquire), 1);
+        drop(overlay_frames);
+        assert_eq!(backlog.load(std::sync::atomic::Ordering::Acquire), 0);
+        eprintln!(
+            "popup backpressure final: repaints={repaint_count} latest={final_marker} no_detach=true retained=1 released=0"
+        );
+    });
+    // Keep the owning handler outside the task so panic/timeout cannot skip
+    // teardown. Abort and join first, releasing any state lock before cleanup.
+    let outcome = timeout(Duration::from_secs(15), &mut exercise).await;
+    if outcome.is_err() {
+        exercise.abort();
+        let _ = exercise.await;
+    }
+    handler.state.lock().await.shutdown_terminals_for_test();
+    eprintln!("popup quiet fixture: owned terminal teardown completed");
+    outcome
+        .expect("backpressure fixture is bounded")
+        .expect("backpressure assertions pass");
+}
+
+#[tokio::test]
+async fn a_second_popup_keeps_a_job_backed_popup_and_its_child() {
     let handler = RequestHandler::new();
     let alpha = session_name("popup-replacement-terminates-child");
     let requester_pid = std::process::id();
@@ -605,10 +1089,13 @@ async fn replacing_a_job_backed_popup_terminates_its_child() {
     run_overlay_command(
         &handler,
         requester_pid,
-        r#"display-popup -T Old -w 20 -h 6 -x C -y C"#,
+        &format!(
+            r#"display-popup -T Old -w 20 -h 6 -x C -y C "{}""#,
+            ready_popup_shell_command()
+        ),
     )
     .await;
-    let _ = next_overlay_frame(&mut control_rx).await;
+    let _ = next_overlay_frame_containing(&mut control_rx, b"RMUX_POPUP_READY").await;
     let old_job = {
         let active_attach = handler.active_attach.lock().await;
         let Some(ClientOverlayState::Popup(popup)) =
@@ -625,30 +1112,34 @@ async fn replacing_a_job_backed_popup_terminates_its_child() {
         "the regression requires a live old popup process"
     );
 
+    // Measured on tmux 3.7b: a second display-popup for a client that already shows a
+    // popup succeeds without opening, and the first popup and its job stay in place.
     run_overlay_command(
         &handler,
         requester_pid,
-        r#"display-popup -N -E -T Replacement -w 20 -h 6 -x C -y C"#,
+        r#"display-popup -N -E -T Second -w 20 -h 6 -x C -y C"#,
     )
     .await;
-    let replacement_frame = next_overlay_frame(&mut control_rx).await;
+    tokio::time::sleep(Duration::from_millis(300)).await;
     assert!(
-        String::from_utf8_lossy(&replacement_frame.frame).contains("Replacement"),
-        "replacement popup should remain active"
+        old_job.child_is_running_for_test(),
+        "the first popup's job keeps running"
     );
-
-    timeout(Duration::from_secs(2), async {
-        while old_job.child_is_running_for_test() {
-            tokio::time::sleep(Duration::from_millis(10)).await;
-        }
-    })
-    .await
-    .expect("replaced popup child should be terminated and reaped");
+    {
+        let active_attach = handler.active_attach.lock().await;
+        let Some(ClientOverlayState::Popup(popup)) =
+            active_attach.by_pid[&requester_pid].overlay.as_ref()
+        else {
+            panic!("the first popup stays on the client");
+        };
+        assert_eq!(popup.title, "Old");
+        assert!(popup.job.is_some(), "the first popup keeps its job");
+    }
 
     handler
         .clear_interactive_overlay(requester_pid, true)
         .await
-        .expect("replacement popup cleanup");
+        .expect("first popup cleanup");
 }
 
 #[tokio::test]
@@ -852,6 +1343,474 @@ async fn popup_surface_frame(
     }
     let frame = refresh_client_overlay_frame(handler, requester_pid, control_rx).await;
     String::from_utf8(frame.frame).expect("popup frame is utf-8")
+}
+
+/// Feeds `output` to a detached popup surface the way its job's reader would,
+/// and returns the first popup frame rendered after `output` was applied.
+async fn popup_reader_surface_frame(
+    handler: &RequestHandler,
+    requester_pid: u32,
+    control_rx: &mut mpsc::UnboundedReceiver<AttachControl>,
+    _detached: &DetachedPopupJob,
+    output: &[u8],
+) -> crate::pane_io::OverlayFrame {
+    let (identity, popup_id, injected_generation) = {
+        let mut active_attach = handler.active_attach.lock().await;
+        let active = active_attach
+            .by_pid
+            .get_mut(&requester_pid)
+            .expect("attached client");
+        let identity = active.identity(requester_pid);
+        let Some(ClientOverlayState::Popup(popup)) = active.overlay.as_mut() else {
+            panic!("expected popup overlay");
+        };
+        popup
+            .surface
+            .lock()
+            .expect("popup surface")
+            .append_for_test(output);
+        let popup_id = popup.id;
+        // A popup repaint rendered before `output` now fails its generation
+        // check and renders again, so every frame stamped after this one
+        // shows `output`, whatever the job's reader published meanwhile.
+        active.overlay_generation = active.overlay_generation.saturating_add(1);
+        (identity, popup_id, active.overlay_generation)
+    };
+    handler
+        .popup_reader_tick(identity, popup_id)
+        .await
+        .expect("popup reader refresh succeeds");
+    next_overlay_frame_after(control_rx, injected_generation).await
+}
+
+/// A popup whose surface only the test writes to. Under ConPTY the job's own
+/// terminal writes its startup modes, title and repaint whenever Windows emits
+/// them, so its reader may publish a popup-only refresh or move the surface
+/// cursor between two steps of a test. The job keeps writing to its original
+/// surface, which `write_job_surface` reaches to replay such a write anywhere.
+struct DetachedPopupJob {
+    write_job_surface: JobSurfaceWriter,
+}
+
+/// Writes to the surface a popup job's reader keeps.
+type JobSurfaceWriter = Box<dyn Fn(&[u8]) + Send + Sync>;
+
+/// Gives the popup a blank surface of the same size that no job reader writes
+/// to.
+async fn detach_popup_surface_from_job(
+    handler: &RequestHandler,
+    requester_pid: u32,
+) -> DetachedPopupJob {
+    let mut active_attach = handler.active_attach.lock().await;
+    let active = active_attach
+        .by_pid
+        .get_mut(&requester_pid)
+        .expect("attached client");
+    let Some(ClientOverlayState::Popup(popup)) = active.overlay.as_mut() else {
+        panic!("expected popup overlay");
+    };
+    let detached = popup
+        .surface
+        .lock()
+        .expect("popup surface")
+        .detached_for_test();
+    let job_surface = std::mem::replace(&mut popup.surface, Arc::new(StdMutex::new(detached)));
+    DetachedPopupJob {
+        write_job_surface: Box::new(move |bytes| {
+            job_surface
+                .lock()
+                .expect("job popup surface")
+                .append_for_test(bytes);
+        }),
+    }
+}
+
+/// What a ConPTY job writes late around a repaint: it hides the cursor, sets
+/// its title and homes, and may show the cursor again only in a later read.
+const LATE_CONPTY_JOB_WRITE: &[u8] = b"\x1b[?25l\x1b]0;job\x07\x1b[H";
+
+/// Replays a late job write the way the job's reader delivers it, and waits
+/// until the popup refresh it causes has been published to the client.
+async fn publish_late_job_write(
+    handler: &RequestHandler,
+    requester_pid: u32,
+    job: &DetachedPopupJob,
+    output: &[u8],
+) {
+    let (identity, popup_id, surface) = {
+        let mut active_attach = handler.active_attach.lock().await;
+        let active = active_attach
+            .by_pid
+            .get_mut(&requester_pid)
+            .expect("attached client");
+        let identity = active.identity(requester_pid);
+        let Some(ClientOverlayState::Popup(popup)) = active.overlay.as_mut() else {
+            panic!("expected popup overlay");
+        };
+        (identity, popup.id, Arc::clone(&popup.surface))
+    };
+    let published = || {
+        surface
+            .lock()
+            .expect("popup surface")
+            .production_counts_for_test()
+            .1
+    };
+    let before = published();
+    (job.write_job_surface)(output);
+    handler
+        .popup_reader_tick(identity, popup_id)
+        .await
+        .expect("popup reader refresh succeeds");
+    timeout(Duration::from_secs(1), async {
+        while published() == before {
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+    })
+    .await
+    .expect("the job reader refresh is published");
+}
+
+/// Replays a late job write, then the base refresh the pane's own late ConPTY
+/// output causes: that ordinary control closes the popup coalescing slot, so
+/// the job's repaint stays queued ahead of the next popup frame.
+async fn publish_late_job_write_then_pane_refresh(
+    handler: &RequestHandler,
+    requester_pid: u32,
+    job: &DetachedPopupJob,
+) {
+    publish_late_job_write(handler, requester_pid, job, LATE_CONPTY_JOB_WRITE).await;
+    let active_attach = handler.active_attach.lock().await;
+    active_attach.by_pid[&requester_pid]
+        .control_tx
+        .send(AttachControl::Refresh)
+        .expect("pane refresh is queued");
+}
+
+fn expected_popup_cursor_suffix(
+    rect: crate::renderer::OverlayRect,
+    bordered: bool,
+    cursor_x: u16,
+    cursor_y: u16,
+    visible: bool,
+) -> Vec<u8> {
+    let border_offset = if bordered { 1 } else { 0 };
+    format!(
+        "\x1b[{};{}H\x1b[?25{}",
+        rect.y
+            .saturating_add(border_offset)
+            .saturating_add(cursor_y)
+            .saturating_add(1),
+        rect.x
+            .saturating_add(border_offset)
+            .saturating_add(cursor_x)
+            .saturating_add(1),
+        if visible { 'h' } else { 'l' }
+    )
+    .into_bytes()
+}
+
+fn final_cursor_visibility(frame: &[u8]) -> Option<bool> {
+    let frame = String::from_utf8_lossy(frame);
+    match (frame.rfind("\u{1b}[?25h"), frame.rfind("\u{1b}[?25l")) {
+        (Some(show), Some(hide)) => Some(show > hide),
+        (Some(_), None) => Some(true),
+        (None, Some(_)) => Some(false),
+        (None, None) => None,
+    }
+}
+
+#[tokio::test]
+async fn live_popup_projects_bordered_cursor_visibility_move_resize_replay_and_clear() {
+    let handler = RequestHandler::new();
+    let alpha = session_name("popup-live-cursor");
+    let requester_pid = std::process::id();
+    let mut control_rx = create_attached_session(&handler, &alpha, requester_pid).await;
+    let command = format!(
+        r#"display-popup -T Cursor -w 20 -h 6 -x C -y C "{}""#,
+        ready_popup_shell_command()
+    );
+
+    run_overlay_command(&handler, requester_pid, &command).await;
+    let _ = next_overlay_frame_containing(&mut control_rx, b"RMUX_POPUP_READY").await;
+    let (rect, _popup_cleanup) =
+        install_popup_test_writer(&handler, requester_pid, false, |_| Ok(())).await;
+    let job = detach_popup_surface_from_job(&handler, requester_pid).await;
+
+    // Each read below follows a late job write, as one may under ConPTY.
+    publish_late_job_write_then_pane_refresh(&handler, requester_pid, &job).await;
+    let visible = popup_reader_surface_frame(
+        &handler,
+        requester_pid,
+        &mut control_rx,
+        &job,
+        b"\x1b[2J\x1b[3;5H",
+    )
+    .await;
+    let expected = expected_popup_cursor_suffix(rect, true, 4, 2, true);
+    assert!(
+        visible.frame.ends_with(&expected),
+        "bordered popup cursor should follow its live surface: {:?}",
+        String::from_utf8_lossy(&visible.frame)
+    );
+
+    publish_late_job_write(&handler, requester_pid, &job, LATE_CONPTY_JOB_WRITE).await;
+    let replay = refresh_client_overlay_frame(&handler, requester_pid, &mut control_rx).await;
+    assert!(
+        replay.frame.ends_with(&expected),
+        "refresh replay should retain the popup cursor projection"
+    );
+
+    let hidden = popup_reader_surface_frame(
+        &handler,
+        requester_pid,
+        &mut control_rx,
+        &job,
+        b"\x1b[?25l\x1b[4;6H",
+    )
+    .await;
+    let (identity, popup_id, active_render_generation, active_overlay_generation, job_present) = {
+        let active_attach = handler.active_attach.lock().await;
+        let active = &active_attach.by_pid[&requester_pid];
+        let Some(ClientOverlayState::Popup(popup)) = active.overlay.as_ref() else {
+            panic!("expected cursor popup");
+        };
+        (
+            active.identity(requester_pid),
+            popup.id,
+            active.render_generation,
+            active.overlay_generation,
+            popup.job.is_some(),
+        )
+    };
+    assert!(
+        hidden
+            .frame
+            .ends_with(&expected_popup_cursor_suffix(rect, true, 5, 3, false)),
+        "a child DECTCEM hide should be projected with its cursor position; identity={identity:?}, popup_id={popup_id}, active_render_generation={active_render_generation}, active_overlay_generation={active_overlay_generation}, received_render_generation={}, received_overlay_generation={}, popup_job_present={job_present}, frame={:?}",
+        hidden.render_generation,
+        hidden.overlay_generation,
+        String::from_utf8_lossy(&hidden.frame)
+    );
+
+    let moved_rect = {
+        let mut active_attach = handler.active_attach.lock().await;
+        let Some(ClientOverlayState::Popup(popup)) = active_attach
+            .by_pid
+            .get_mut(&requester_pid)
+            .and_then(|active| active.overlay.as_mut())
+        else {
+            panic!("expected popup overlay");
+        };
+        popup.rect.x = popup.rect.x.saturating_add(3);
+        popup.rect.y = popup.rect.y.saturating_add(2);
+        popup.rect
+    };
+    let moved = popup_reader_surface_frame(
+        &handler,
+        requester_pid,
+        &mut control_rx,
+        &job,
+        b"\x1b[?25h\x1b[2;3H",
+    )
+    .await;
+    assert!(
+        moved
+            .frame
+            .ends_with(&expected_popup_cursor_suffix(moved_rect, true, 2, 1, true)),
+        "a moved popup should translate from its current content origin"
+    );
+
+    let resized_rect = {
+        let mut active_attach = handler.active_attach.lock().await;
+        let Some(ClientOverlayState::Popup(popup)) = active_attach
+            .by_pid
+            .get_mut(&requester_pid)
+            .and_then(|active| active.overlay.as_mut())
+        else {
+            panic!("expected popup overlay");
+        };
+        popup.rect.width = 8;
+        popup.rect.height = 5;
+        popup.rect
+    };
+    let resized = popup_reader_surface_frame(
+        &handler,
+        requester_pid,
+        &mut control_rx,
+        &job,
+        b"\x1b[999;999H",
+    )
+    .await;
+    assert!(
+        resized.frame.ends_with(&expected_popup_cursor_suffix(
+            resized_rect,
+            true,
+            5,
+            2,
+            true
+        )),
+        "a resized popup should clamp the projected cursor to drawable content"
+    );
+
+    publish_late_job_write(&handler, requester_pid, &job, LATE_CONPTY_JOB_WRITE).await;
+    handler
+        .clear_interactive_overlay(requester_pid, true)
+        .await
+        .expect("popup clear succeeds");
+    let clear = next_ordinary_overlay_frame(&mut control_rx).await;
+    assert!(
+        clear.frame.is_empty(),
+        "popup clear publishes an empty frame"
+    );
+
+    let response = handler
+        .dispatch(
+            requester_pid,
+            Request::RefreshClient(Box::new(full_refresh_client_request(requester_pid))),
+        )
+        .await
+        .response;
+    assert!(matches!(response, Response::RefreshClient(_)));
+    let base_frame = loop {
+        match timeout(Duration::from_secs(1), control_rx.recv())
+            .await
+            .expect("base redraw arrives")
+        {
+            Some(AttachControl::Switch(target)) => break target.into_target().render_frame,
+            Some(AttachControl::Refresh | AttachControl::Overlay(_)) => {}
+            other => panic!("expected base redraw after popup clear, got {other:?}"),
+        }
+    };
+    assert_eq!(
+        final_cursor_visibility(&base_frame),
+        Some(true),
+        "the existing base redraw should restore the visible pane cursor"
+    );
+}
+
+#[tokio::test]
+async fn live_borderless_popup_projects_cursor_without_border_offset() {
+    let handler = RequestHandler::new();
+    let alpha = session_name("popup-borderless-cursor");
+    let requester_pid = std::process::id();
+    let mut control_rx = create_attached_session(&handler, &alpha, requester_pid).await;
+    let command = format!(
+        r#"display-popup -B -T Cursor -w 20 -h 6 -x C -y C "{}""#,
+        quiet_popup_shell_command()
+    );
+
+    run_overlay_command(&handler, requester_pid, &command).await;
+    let _ = next_overlay_frame(&mut control_rx).await;
+    let (rect, _popup_cleanup) =
+        install_popup_test_writer(&handler, requester_pid, false, |_| Ok(())).await;
+    let job = detach_popup_surface_from_job(&handler, requester_pid).await;
+    publish_late_job_write_then_pane_refresh(&handler, requester_pid, &job).await;
+    let frame = popup_reader_surface_frame(
+        &handler,
+        requester_pid,
+        &mut control_rx,
+        &job,
+        b"\x1b[2J\x1b[3;5H",
+    )
+    .await;
+
+    assert!(
+        frame
+            .frame
+            .ends_with(&expected_popup_cursor_suffix(rect, false, 4, 2, true)),
+        "-B should not add a border offset to the popup cursor"
+    );
+}
+
+#[tokio::test]
+async fn popup_cursor_preserves_exited_surface_and_hides_nested_menu_or_zero_size() {
+    let handler = RequestHandler::new();
+    let alpha = session_name("popup-hidden-cursor-states");
+    let requester_pid = std::process::id();
+    let mut control_rx = create_attached_session(&handler, &alpha, requester_pid).await;
+    let command = format!(
+        r#"display-popup -T Cursor -w 20 -h 6 -x C -y C "{}""#,
+        quiet_popup_shell_command()
+    );
+
+    run_overlay_command(&handler, requester_pid, &command).await;
+    let _ = next_overlay_frame(&mut control_rx).await;
+    let (_, _popup_cleanup) =
+        install_popup_test_writer(&handler, requester_pid, false, |_| Ok(())).await;
+    let job_write = detach_popup_surface_from_job(&handler, requester_pid).await;
+    let _ = popup_reader_surface_frame(
+        &handler,
+        requester_pid,
+        &mut control_rx,
+        &job_write,
+        b"\x1b[2J\x1b[3;5H",
+    )
+    .await;
+    // A ConPTY job writes its title and repaint late; here that popup-only
+    // refresh is queued before the menu opens, as one was in Windows CI.
+    publish_late_job_write(
+        &handler,
+        requester_pid,
+        &job_write,
+        b"\x1b]0;job\x07\x1b[?25h\x1b[H",
+    )
+    .await;
+
+    run_overlay_command(
+        &handler,
+        requester_pid,
+        r#"display-menu -T Menu "First" "f" { display-message first }"#,
+    )
+    .await;
+    let nested = next_overlay_frame_containing(&mut control_rx, b"First").await;
+    assert!(
+        nested.frame.ends_with(b"\x1b[?25l"),
+        "a nested menu should hide the popup cursor after composing both layers"
+    );
+
+    let (zero_sized, exited, rect) = {
+        let mut active_attach = handler.active_attach.lock().await;
+        let active = active_attach
+            .by_pid
+            .get_mut(&requester_pid)
+            .expect("attached client");
+        let Some(ClientOverlayState::Popup(popup)) = active.overlay.as_mut() else {
+            panic!("expected popup overlay");
+        };
+        popup.nested_menu = None;
+        let original_rect = popup.rect;
+        popup.rect.width = 2;
+        popup.rect.height = 2;
+        let zero_sized = active
+            .overlay
+            .as_ref()
+            .expect("popup remains active")
+            .render();
+        let Some(ClientOverlayState::Popup(popup)) = active.overlay.as_mut() else {
+            panic!("expected popup overlay");
+        };
+        popup.rect = original_rect;
+        let job = popup.job.take().expect("live popup job");
+        let exited = active
+            .overlay
+            .as_ref()
+            .expect("retained exited popup")
+            .render();
+        let Some(ClientOverlayState::Popup(popup)) = active.overlay.as_mut() else {
+            panic!("expected popup overlay");
+        };
+        popup.job = Some(job);
+        (zero_sized, exited, original_rect)
+    };
+    assert!(
+        zero_sized.ends_with(b"\x1b[?25l"),
+        "zero-sized popup content should hide the cursor"
+    );
+    assert!(
+        exited.ends_with(&expected_popup_cursor_suffix(rect, true, 4, 2, true)),
+        "tmux3.7b retains the final surface cursor after the popup job exits"
+    );
 }
 
 #[tokio::test]
@@ -1213,60 +2172,108 @@ async fn display_menu_partial_utf8_input_is_retained_and_recovered() {
 
 #[tokio::test]
 async fn display_menu_extended_key_partial_is_bounded_without_pane_leak() {
-    let handler = RequestHandler::new();
-    let alpha = session_name("alpha");
-    let requester_pid = std::process::id();
-    let mut control_rx = create_quiet_attached_session(&handler, &alpha, requester_pid).await;
-    let target = PaneTarget::new(alpha.clone(), 0);
-    let before_capture = capture_pane_print(&handler, target.clone()).await;
+    enum Resolution {
+        Final,
+        Interruption,
+        Expiry,
+    }
 
-    run_overlay_command(
-        &handler,
-        requester_pid,
-        r#"display-menu -T Menu "First" "f" "display-message first""#,
-    )
-    .await;
-    let _ = next_overlay_frame(&mut control_rx).await;
+    for (label, resolution) in [
+        ("menu-kitty-bound-final", Resolution::Final),
+        ("menu-kitty-bound-interruption", Resolution::Interruption),
+        ("menu-kitty-bound-expiry", Resolution::Expiry),
+    ] {
+        let handler = RequestHandler::new();
+        let session = session_name(label);
+        let requester_pid = std::process::id();
+        let mut control_rx = create_quiet_attached_session(&handler, &session, requester_pid).await;
+        // The overlay takes and returns focus; this fixture measures only what
+        // the menu writes to the pane, so the pane must not report those edges.
+        handler
+            .disable_pane_focus_reports_for_test(&PaneTarget::new(session.clone(), 0))
+            .await;
+        let capture = RawPaneInputProbe::start(&handler, &session, label, b"NINE".len()).await;
 
-    let mut pending_input = Vec::new();
-    handler
-        .handle_attached_live_input(requester_pid, &mut pending_input, b"\x1b[27;2;65")
-        .await
-        .expect("partial menu extended key is retained");
-    assert_eq!(pending_input, b"\x1b[27;2;65");
-    assert_eq!(
-        capture_pane_print(&handler, target.clone()).await,
-        before_capture,
-        "partial menu prompt extended key must not leak to the pane"
-    );
+        run_overlay_command(
+            &handler,
+            requester_pid,
+            r#"display-menu -T Menu "Nine" "9" "send-keys -l NINE""#,
+        )
+        .await;
+        let _ = next_overlay_frame(&mut control_rx).await;
 
-    let oversized = vec![b'9'; DEFAULT_MAX_FRAME_LENGTH - pending_input.len() + 1];
-    let err = handler
-        .handle_attached_live_input(requester_pid, &mut pending_input, &oversized)
-        .await
-        .expect_err("oversized partial menu extended key should be bounded");
-    assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
-    assert!(err.to_string().contains("menu overlay prompt input"));
-    assert!(
-        pending_input.is_empty(),
-        "overflowing menu prompt input should be cleared after rejection"
-    );
-    assert_eq!(
-        capture_pane_print(&handler, target.clone()).await,
-        before_capture,
-        "rejected oversized menu prompt input must not leak to the pane"
-    );
+        let mut exact_limit = b"\x1b[27;2;65".to_vec();
+        exact_limit.resize(FRAME_LIMIT, b'9');
+        let mut pending_input = Vec::new();
+        handler
+            .handle_attached_live_input(requester_pid, &mut pending_input, &exact_limit)
+            .await
+            .expect("an exact-limit Kitty candidate is retained");
+        assert_eq!(pending_input, exact_limit, "exact 4096-byte retention");
 
-    handler
-        .handle_attached_live_input(requester_pid, &mut pending_input, b"9")
-        .await
-        .expect("menu remains usable after partial-input rejection");
-    assert!(pending_input.is_empty());
-    assert_eq!(
-        capture_pane_print(&handler, target).await,
-        before_capture,
-        "post-rejection menu input must not leak to the pane"
-    );
+        handler
+            .handle_attached_live_input(requester_pid, &mut pending_input, b"9")
+            .await
+            .expect("the first over-limit byte is quarantined");
+        assert_eq!(pending_input.len(), FRAME_LIMIT + 1);
+        assert_eq!(&pending_input[..FRAME_LIMIT], exact_limit);
+        assert_eq!(pending_input[FRAME_LIMIT], b'0', "adapter sentinel");
+
+        let saturated = pending_input.clone();
+        handler
+            .handle_attached_live_input(
+                requester_pid,
+                &mut pending_input,
+                &vec![b'9'; FRAME_LIMIT * 2],
+            )
+            .await
+            .expect("a saturated continuation remains quarantined");
+        assert_eq!(
+            pending_input, saturated,
+            "continuation must retain only 4096 bytes plus one adapter sentinel"
+        );
+        assert!(matches!(
+            handler.active_attach.lock().await.by_pid[&requester_pid]
+                .overlay
+                .as_ref(),
+            Some(ClientOverlayState::Menu(_))
+        ));
+
+        match resolution {
+            Resolution::Final => handler
+                .handle_attached_live_input(requester_pid, &mut pending_input, b"~")
+                .await
+                .expect("the final rejects the saturated candidate"),
+            Resolution::Interruption => handler
+                .handle_attached_live_input(requester_pid, &mut pending_input, b"\x01")
+                .await
+                .expect("a control byte interrupts the saturated candidate"),
+            Resolution::Expiry => {
+                handler
+                    .flush_attached_pending_escape_input(requester_pid, &mut pending_input)
+                    .await
+                    .expect("expiry abandons the saturated candidate");
+            }
+        }
+        assert!(pending_input.is_empty(), "{label} clears retained input");
+        assert!(matches!(
+            handler.active_attach.lock().await.by_pid[&requester_pid]
+                .overlay
+                .as_ref(),
+            Some(ClientOverlayState::Menu(_))
+        ));
+
+        handler
+            .handle_attached_live_input(requester_pid, &mut pending_input, b"9")
+            .await
+            .expect("the next menu shortcut remains usable");
+        assert!(pending_input.is_empty());
+        capture.finish(&handler, &session).await;
+        capture.assert_contents(&handler, b"NINE").await;
+        assert!(handler.active_attach.lock().await.by_pid[&requester_pid]
+            .overlay
+            .is_none());
+    }
 }
 
 #[tokio::test]
@@ -1867,4 +2874,57 @@ async fn status_right_click_routes_window_menu_to_clicked_window_target() {
         menu.current_target,
         Target::Window(WindowTarget::with_window(alpha, 0))
     );
+}
+
+#[path = "handler_overlay_tests/popup_burst.rs"]
+mod popup_burst;
+
+#[tokio::test]
+async fn popup_status_ticks_respect_covered_rows_and_resume_after_close() {
+    for (position, lines, popup, blocked) in [
+        ("bottom", "on", "-h 100% -y 0", true),
+        ("bottom", "on", "-h 99% -y 0", false),
+        ("top", "2", "-h 8 -y 0", true),
+        ("top", "2", "-h 8 -y 12", false),
+    ] {
+        let handler = RequestHandler::new();
+        let name = session_name("popup-status-coverage");
+        let pid = std::process::id();
+        let mut rx = create_quiet_attached_session(&handler, &name, pid).await;
+        run_overlay_command(&handler, pid, &format!(
+            "set -g status {lines}; set -g status-position {position}; set -g status-interval 3600; set -g status-left STATUS-COVERAGE"
+        )).await;
+        run_overlay_command(
+            &handler,
+            pid,
+            &format!("display-popup -N -B -w 100% -x 0 {popup}"),
+        )
+        .await;
+        let _ = next_overlay_frame(&mut rx).await;
+        while rx.try_recv().is_ok() {}
+        handler
+            .refresh_attached_client_status(pid, &name)
+            .await
+            .expect("status tick");
+        let mut writes = Vec::new();
+        while let Ok(control) = rx.try_recv() {
+            if let AttachControl::Write(bytes) = control {
+                writes.extend(bytes);
+            }
+        }
+        assert_eq!(writes.is_empty(), blocked, "{position} {lines} {popup}");
+        run_overlay_command(&handler, pid, "display-popup -C").await;
+        while rx.try_recv().is_ok() {}
+        handler
+            .refresh_attached_client_status(pid, &name)
+            .await
+            .expect("status after close");
+        let mut writes = Vec::new();
+        while let Ok(control) = rx.try_recv() {
+            if let AttachControl::Write(bytes) = control {
+                writes.extend(bytes);
+            }
+        }
+        assert!(!writes.is_empty(), "status resumes after close");
+    }
 }

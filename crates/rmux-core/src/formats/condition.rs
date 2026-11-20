@@ -1,3 +1,5 @@
+use std::rc::Rc;
+
 use super::{
     format_expand1, format_skip, is_truthy, resolve_variable, ExpandState, FormatVariables,
     FORMAT_LOOP_LIMIT,
@@ -71,6 +73,8 @@ where
         expand_time: state.expand_time,
         stop_expansion: false,
         preserve_jobs: state.preserve_jobs,
+        disable_jobs: state.disable_jobs,
+        budget: Rc::clone(&state.budget),
     };
     format_expand1(&mut nested_state, body, variables)
 }
@@ -116,6 +120,8 @@ where
         expand_time: state.expand_time,
         stop_expansion: false,
         preserve_jobs: state.preserve_jobs,
+        disable_jobs: state.disable_jobs,
+        budget: Rc::clone(&state.budget),
     };
     let expanded = format_expand1(&mut nested_state, raw, variables);
     if expanded == raw {

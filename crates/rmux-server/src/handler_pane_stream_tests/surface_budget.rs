@@ -431,11 +431,7 @@ async fn distinct_peer_accepts_real_blank_window_resize_within_encoded_budget() 
     let (target, _, transcript) = test_pane(&handler).await;
     resize_window(&handler, &target, 512, 331).await;
     assert_eq!(
-        transcript
-            .lock()
-            .expect("pane transcript mutex")
-            .screen()
-            .size(),
+        transcript.lock().screen().size(),
         TerminalSize {
             cols: 512,
             rows: 331,
@@ -445,11 +441,7 @@ async fn distinct_peer_accepts_real_blank_window_resize_within_encoded_budget() 
 
     resize_window(&handler, &target, 512, 332).await;
     assert_eq!(
-        transcript
-            .lock()
-            .expect("pane transcript mutex")
-            .screen()
-            .size(),
+        transcript.lock().screen().size(),
         TerminalSize {
             cols: 512,
             rows: 332,

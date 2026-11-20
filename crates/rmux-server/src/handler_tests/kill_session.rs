@@ -1,4 +1,6 @@
 use super::*;
+#[cfg(test)]
+use crate::session_fixture::SessionSetupExt as _;
 
 #[cfg(unix)]
 fn quiet_kill_session_command() -> Vec<String> {
@@ -47,7 +49,7 @@ async fn create_quiet_kill_session(handler: &RequestHandler, name: &str) -> Sess
             skip_environment_update: false,
         })))
         .await;
-    assert!(matches!(response, Response::NewSession(_)));
+    crate::session_fixture::assert_new_session(&response);
     handler
         .wait_for_pane_startup_to_finish_for_test(&PaneTarget::new(session.clone(), 0))
         .await;
@@ -81,7 +83,7 @@ async fn create_grouped_kill_session(
             skip_environment_update: false,
         })))
         .await;
-    assert!(matches!(response, Response::NewSession(_)), "{response:?}");
+    crate::session_fixture::assert_new_session(&response);
     session
 }
 
@@ -116,7 +118,7 @@ async fn has_session_resolves_unique_prefix_matches() {
             environment: None,
         }))
         .await;
-    assert!(matches!(created, Response::NewSession(_)));
+    crate::session_fixture::assert_new_session(&created);
 
     assert_eq!(
         handler
@@ -148,7 +150,7 @@ async fn kill_session_all_except_target_preserves_only_the_resolved_target() {
                 environment: None,
             }))
             .await;
-        assert!(matches!(created, Response::NewSession(_)));
+        crate::session_fixture::assert_new_session(&created);
     }
 
     let response = handler
@@ -187,7 +189,7 @@ async fn concurrent_group_owner_kills_rekey_live_subscription_to_final_owner() {
         state
             .sessions
             .session(&owner)
-            .and_then(rmux_core::Session::active_pane_id)
+            .and_then(|session| session.active_pane_id())
             .expect("group owner has an active pane")
     };
     let subscribed = handler
@@ -260,11 +262,17 @@ async fn kill_session_clear_alerts_preserves_the_resolved_session() {
 
     {
         let mut state = handler.state.lock().await;
-        let session = state.sessions.session_mut(&alpha).expect("session exists");
-        session
-            .window_at_mut(0)
-            .expect("window exists")
-            .queue_alerts(WINDOW_ALERTFLAGS);
+        state
+            .sessions
+            .queue_window_alerts_for_tests(
+                &rmux_proto::WindowTarget::with_window(alpha.clone(), 0),
+                WINDOW_ALERTFLAGS,
+            )
+            .unwrap();
+        let mut session = state
+            .sessions
+            .session_setup(&alpha)
+            .expect("session exists");
         assert!(session.add_winlink_alert_flags(0, WINLINK_ALERTFLAGS));
     }
 
@@ -308,7 +316,7 @@ async fn kill_session_last_session_requests_shutdown() {
             environment: None,
         }))
         .await;
-    assert!(matches!(created, Response::NewSession(_)));
+    crate::session_fixture::assert_new_session(&created);
     let pane_id = {
         let state = handler.state.lock().await;
         state
@@ -362,7 +370,7 @@ async fn exit_empty_shutdown_is_cancelled_when_a_new_session_starts_first() {
             environment: None,
         }))
         .await;
-    assert!(matches!(created, Response::NewSession(_)));
+    crate::session_fixture::assert_new_session(&created);
 
     let response = handler
         .handle(Request::KillSession(KillSessionRequest {
@@ -385,7 +393,7 @@ async fn exit_empty_shutdown_is_cancelled_when_a_new_session_starts_first() {
             environment: None,
         }))
         .await;
-    assert!(matches!(recreated, Response::NewSession(_)));
+    crate::session_fixture::assert_new_session(&recreated);
     assert!(
         !handler.request_shutdown_if_pending(),
         "stale exit-empty shutdown must not stop a newly non-empty server"
@@ -409,7 +417,7 @@ async fn exit_empty_shutdown_retries_after_state_lock_contention() {
             environment: None,
         }))
         .await;
-    assert!(matches!(created, Response::NewSession(_)));
+    crate::session_fixture::assert_new_session(&created);
 
     let response = handler
         .handle(Request::KillSession(KillSessionRequest {
@@ -453,7 +461,7 @@ async fn exit_empty_shutdown_waits_for_last_session_control_cleanup() {
             environment: None,
         }))
         .await;
-    assert!(matches!(created, Response::NewSession(_)));
+    crate::session_fixture::assert_new_session(&created);
     let session_id = handler
         .state
         .lock()
@@ -537,7 +545,7 @@ async fn exit_empty_shutdown_is_cancelled_by_live_unattached_control() {
             environment: None,
         }))
         .await;
-    assert!(matches!(created, Response::NewSession(_)));
+    crate::session_fixture::assert_new_session(&created);
     let (event_tx, _event_rx) = mpsc::channel(1);
     let control_id = handler
         .register_control_with_closing(
@@ -585,7 +593,7 @@ async fn exit_empty_does_not_downgrade_pending_kill_server_shutdown() {
             environment: None,
         }))
         .await;
-    assert!(matches!(created, Response::NewSession(_)));
+    crate::session_fixture::assert_new_session(&created);
 
     let kill_server = handler
         .handle(Request::KillServer(rmux_proto::KillServerRequest))
@@ -613,7 +621,7 @@ async fn exit_empty_does_not_downgrade_pending_kill_server_shutdown() {
             environment: None,
         }))
         .await;
-    assert!(matches!(recreated, Response::NewSession(_)));
+    crate::session_fixture::assert_new_session(&recreated);
     assert!(
         handler.request_shutdown_if_pending(),
         "explicit kill-server must not become a cancellable exit-empty shutdown"
@@ -648,7 +656,7 @@ async fn kill_session_last_session_respects_exit_empty_off() {
             environment: None,
         }))
         .await;
-    assert!(matches!(created, Response::NewSession(_)));
+    crate::session_fixture::assert_new_session(&created);
 
     let response = handler
         .handle(Request::KillSession(KillSessionRequest {
@@ -686,7 +694,7 @@ async fn kill_session_last_session_exits_attached_clients_before_shutdown() {
             environment: None,
         }))
         .await;
-    assert!(matches!(created, Response::NewSession(_)));
+    crate::session_fixture::assert_new_session(&created);
 
     let (control_tx, mut control_rx) = mpsc::unbounded_channel();
     let _attach_id = handler
@@ -752,7 +760,7 @@ async fn kill_session_all_except_target_does_not_request_shutdown_while_target_s
                 environment: None,
             }))
             .await;
-        assert!(matches!(created, Response::NewSession(_)));
+        crate::session_fixture::assert_new_session(&created);
     }
 
     let response = handler
@@ -865,7 +873,7 @@ async fn kill_session_group_selectors_fail_closed_when_target_name_is_recreated(
             skip_environment_update: false,
         })))
         .await;
-    assert!(matches!(grouped, Response::NewSession(_)), "{grouped:?}");
+    crate::session_fixture::assert_new_session(&grouped);
     let keeper = create_quiet_kill_session(&handler, "kill-group-identity-keeper").await;
     let beta_attach_pid = 41_002;
     let (beta_control_tx, mut beta_control_rx) = mpsc::unbounded_channel();
@@ -1009,7 +1017,7 @@ async fn kill_session_group_selectors_follow_a_renamed_victim_identity() {
             skip_environment_update: false,
         })))
         .await;
-    assert!(matches!(grouped, Response::NewSession(_)), "{grouped:?}");
+    crate::session_fixture::assert_new_session(&grouped);
     let keeper = create_quiet_kill_session(&handler, "kill-group-rename-keeper").await;
     let renamed = session_name("kill-group-rename-delta");
     let beta_attach_pid = 41_004;
@@ -1100,7 +1108,7 @@ async fn kill_session_clear_alerts_does_not_request_shutdown() {
             environment: None,
         }))
         .await;
-    assert!(matches!(created, Response::NewSession(_)));
+    crate::session_fixture::assert_new_session(&created);
 
     let response = handler
         .handle(Request::KillSession(KillSessionRequest {

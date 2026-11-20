@@ -164,9 +164,9 @@ fn send_keys_pane_exit_wait_follows_session_identity_across_rename() -> Result<(
             "alpha:0.0",
             "--wait-pane-exit",
             "--timeout",
-            "5s",
+            "30s",
             "--",
-            "printf WAIT_EXIT_%s STARTED; sleep 1; exit 7",
+            "printf WAIT_EXIT_%s STARTED; read marker; exit 7",
             "Enter",
         ])
         .stdin(Stdio::null())
@@ -185,11 +185,15 @@ fn send_keys_pane_exit_wait_follows_session_identity_across_rename() -> Result<(
     ])?);
     assert_success(&harness.run(&["rename-session", "-t", "alpha", "beta"])?);
     std::thread::sleep(Duration::from_millis(150));
+    let premature_status = wait_child.try_wait()?;
     assert!(
-        wait_child.try_wait()?.is_none(),
-        "pane-exit wait must remain armed after the target session is renamed"
+        premature_status.is_none(),
+        "pane-exit wait must remain armed after the target session is renamed: {premature_status:?}"
     );
 
+    // The pane only exits once released through its new session name, so
+    // scheduler or harness-lock delays cannot end the wait before the check.
+    assert_success(&harness.run(&["send-keys", "-t", "beta:0.0", "release", "Enter"])?);
     let output = wait_child.wait_with_output()?;
     assert_eq!(
         output.status.code(),

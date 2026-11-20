@@ -1,0 +1,35 @@
+{
+  "version": 1,
+  "release": {
+    "status": "pending",
+    "url": null,
+    "source_ref": null,
+    "receipt_ref": null,
+    "receipt_path": null
+  },
+  "issue_forms": [
+    ".github/ISSUE_TEMPLATE/bug_report.yml",
+    ".github/ISSUE_TEMPLATE/feature_request.yml",
+    ".github/ISSUE_TEMPLATE/config.yml"
+  ],
+  "external_guides": {
+    "unix_installation": {
+      "source_path": "scripts/install-unix-archive.sh",
+      "source_ref": "1f4571e74f36be0c033c6294d1616c7d3a6fbda1",
+      "status": "pending",
+      "url": null
+    },
+    "windows_installation": {
+      "source_path": "scripts/install-windows.ps1",
+      "source_ref": "1f4571e74f36be0c033c6294d1616c7d3a6fbda1",
+      "status": "pending",
+      "url": null
+    },
+    "configuration": {
+      "source_path": "docs/human-friendly-config.md",
+      "source_ref": "1f4571e74f36be0c033c6294d1616c7d3a6fbda1",
+      "status": "pending",
+      "url": null
+    }
+  }
+}

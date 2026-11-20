@@ -1,0 +1,696 @@
+{
+  "scope": "R1-509 C4 only",
+  "test_mapping": {
+    "show_options_h_uses_full_helper_while_plain_g_remains_tiny": 4005,
+    "set_option_unset_scope_matrix_matches_tmux": 4722,
+    "set_option_unset_clusters_queued_match_tmux": 4790
+  },
+  "target_renaming": "alpha -> bank (existing native driver helper session)",
+  "operations": [
+    {
+      "role": "H-install",
+      "argv": [
+        "set-hook",
+        "-g",
+        "after-new-window",
+        "display-message hook-fired"
+      ],
+      "exit_code": 0,
+      "stdout": ""
+    },
+    {
+      "role": "H-plain-list",
+      "argv": [
+        "show-options",
+        "-g"
+      ],
+      "exit_code": 0,
+      "absent": "after-new-window"
+    },
+    {
+      "role": "H-hook-list",
+      "argv": [
+        "show-options",
+        "-gH"
+      ],
+      "exit_code": 0,
+      "contains": "after-new-window[0] display-message hook-fired\n"
+    },
+    {
+      "role": "H-named-hook",
+      "argv": [
+        "show-options",
+        "-gHv",
+        "after-new-window"
+      ],
+      "exit_code": 0,
+      "stdout": "display-message hook-fired\n"
+    },
+    {
+      "role": "H-window-reject",
+      "argv": [
+        "show-window-options",
+        "-H"
+      ],
+      "exit_code": 1,
+      "stderr_contains": "unknown flag -H"
+    },
+    {
+      "role": "U-session-set-session",
+      "argv": [
+        "set-option",
+        "-t",
+        "bank",
+        "@agent.state",
+        "session"
+      ],
+      "exit_code": 0,
+      "stdout": ""
+    },
+    {
+      "role": "U-session-set-window",
+      "argv": [
+        "set-option",
+        "-w",
+        "-t",
+        "bank:0",
+        "@agent.state",
+        "window"
+      ],
+      "exit_code": 0,
+      "stdout": ""
+    },
+    {
+      "role": "U-session-set-pane",
+      "argv": [
+        "set-option",
+        "-p",
+        "-t",
+        "bank:0.0",
+        "@agent.state",
+        "pane"
+      ],
+      "exit_code": 0,
+      "stdout": ""
+    },
+    {
+      "role": "U-session-before-session",
+      "argv": [
+        "show-options",
+        "-qv",
+        "-t",
+        "bank",
+        "@agent.state"
+      ],
+      "exit_code": 0,
+      "stdout": "session\n"
+    },
+    {
+      "role": "U-session-before-window",
+      "argv": [
+        "show-options",
+        "-wqv",
+        "-t",
+        "bank:0",
+        "@agent.state"
+      ],
+      "exit_code": 0,
+      "stdout": "window\n"
+    },
+    {
+      "role": "U-session-before-pane",
+      "argv": [
+        "show-options",
+        "-pqv",
+        "-t",
+        "bank:0.0",
+        "@agent.state"
+      ],
+      "exit_code": 0,
+      "stdout": "pane\n"
+    },
+    {
+      "role": "U-session-unset",
+      "argv": [
+        "set-option",
+        "-U",
+        "-t",
+        "bank:0.0",
+        "@agent.state"
+      ],
+      "exit_code": 0,
+      "stdout": ""
+    },
+    {
+      "role": "U-session-after-session",
+      "argv": [
+        "show-options",
+        "-qv",
+        "-t",
+        "bank",
+        "@agent.state"
+      ],
+      "exit_code": 0,
+      "stdout": ""
+    },
+    {
+      "role": "U-session-after-window",
+      "argv": [
+        "show-options",
+        "-wqv",
+        "-t",
+        "bank:0",
+        "@agent.state"
+      ],
+      "exit_code": 0,
+      "stdout": "window\n"
+    },
+    {
+      "role": "U-session-after-pane",
+      "argv": [
+        "show-options",
+        "-pqv",
+        "-t",
+        "bank:0.0",
+        "@agent.state"
+      ],
+      "exit_code": 0,
+      "stdout": "pane\n"
+    },
+    {
+      "role": "U-pane-set-session",
+      "argv": [
+        "set-option",
+        "-t",
+        "bank",
+        "@agent.state",
+        "session"
+      ],
+      "exit_code": 0,
+      "stdout": ""
+    },
+    {
+      "role": "U-pane-set-window",
+      "argv": [
+        "set-option",
+        "-w",
+        "-t",
+        "bank:0",
+        "@agent.state",
+        "window"
+      ],
+      "exit_code": 0,
+      "stdout": ""
+    },
+    {
+      "role": "U-pane-set-pane",
+      "argv": [
+        "set-option",
+        "-p",
+        "-t",
+        "bank:0.0",
+        "@agent.state",
+        "pane"
+      ],
+      "exit_code": 0,
+      "stdout": ""
+    },
+    {
+      "role": "U-pane-before-session",
+      "argv": [
+        "show-options",
+        "-qv",
+        "-t",
+        "bank",
+        "@agent.state"
+      ],
+      "exit_code": 0,
+      "stdout": "session\n"
+    },
+    {
+      "role": "U-pane-before-window",
+      "argv": [
+        "show-options",
+        "-wqv",
+        "-t",
+        "bank:0",
+        "@agent.state"
+      ],
+      "exit_code": 0,
+      "stdout": "window\n"
+    },
+    {
+      "role": "U-pane-before-pane",
+      "argv": [
+        "show-options",
+        "-pqv",
+        "-t",
+        "bank:0.0",
+        "@agent.state"
+      ],
+      "exit_code": 0,
+      "stdout": "pane\n"
+    },
+    {
+      "role": "U-pane-unset",
+      "argv": [
+        "set-option",
+        "-pU",
+        "-t",
+        "bank:0.0",
+        "@agent.state"
+      ],
+      "exit_code": 0,
+      "stdout": ""
+    },
+    {
+      "role": "U-pane-after-session",
+      "argv": [
+        "show-options",
+        "-qv",
+        "-t",
+        "bank",
+        "@agent.state"
+      ],
+      "exit_code": 0,
+      "stdout": "session\n"
+    },
+    {
+      "role": "U-pane-after-window",
+      "argv": [
+        "show-options",
+        "-wqv",
+        "-t",
+        "bank:0",
+        "@agent.state"
+      ],
+      "exit_code": 0,
+      "stdout": "window\n"
+    },
+    {
+      "role": "U-pane-after-pane",
+      "argv": [
+        "show-options",
+        "-pqv",
+        "-t",
+        "bank:0.0",
+        "@agent.state"
+      ],
+      "exit_code": 0,
+      "stdout": ""
+    },
+    {
+      "role": "U-window-set-session",
+      "argv": [
+        "set-option",
+        "-t",
+        "bank",
+        "@agent.state",
+        "session"
+      ],
+      "exit_code": 0,
+      "stdout": ""
+    },
+    {
+      "role": "U-window-set-window",
+      "argv": [
+        "set-option",
+        "-w",
+        "-t",
+        "bank:0",
+        "@agent.state",
+        "window"
+      ],
+      "exit_code": 0,
+      "stdout": ""
+    },
+    {
+      "role": "U-window-set-pane",
+      "argv": [
+        "set-option",
+        "-p",
+        "-t",
+        "bank:0.0",
+        "@agent.state",
+        "pane"
+      ],
+      "exit_code": 0,
+      "stdout": ""
+    },
+    {
+      "role": "U-window-before-session",
+      "argv": [
+        "show-options",
+        "-qv",
+        "-t",
+        "bank",
+        "@agent.state"
+      ],
+      "exit_code": 0,
+      "stdout": "session\n"
+    },
+    {
+      "role": "U-window-before-window",
+      "argv": [
+        "show-options",
+        "-wqv",
+        "-t",
+        "bank:0",
+        "@agent.state"
+      ],
+      "exit_code": 0,
+      "stdout": "window\n"
+    },
+    {
+      "role": "U-window-before-pane",
+      "argv": [
+        "show-options",
+        "-pqv",
+        "-t",
+        "bank:0.0",
+        "@agent.state"
+      ],
+      "exit_code": 0,
+      "stdout": "pane\n"
+    },
+    {
+      "role": "U-window-unset",
+      "argv": [
+        "set-option",
+        "-wU",
+        "-t",
+        "bank:0",
+        "@agent.state"
+      ],
+      "exit_code": 0,
+      "stdout": ""
+    },
+    {
+      "role": "U-window-after-session",
+      "argv": [
+        "show-options",
+        "-qv",
+        "-t",
+        "bank",
+        "@agent.state"
+      ],
+      "exit_code": 0,
+      "stdout": "session\n"
+    },
+    {
+      "role": "U-window-after-window",
+      "argv": [
+        "show-options",
+        "-wqv",
+        "-t",
+        "bank:0",
+        "@agent.state"
+      ],
+      "exit_code": 0,
+      "stdout": ""
+    },
+    {
+      "role": "U-window-after-pane",
+      "argv": [
+        "show-options",
+        "-pqv",
+        "-t",
+        "bank:0.0",
+        "@agent.state"
+      ],
+      "exit_code": 0,
+      "stdout": ""
+    },
+    {
+      "role": "U-queued-qU-set-session",
+      "argv": [
+        "set-option",
+        "-t",
+        "bank",
+        "@x",
+        "sv"
+      ],
+      "exit_code": 0,
+      "stdout": ""
+    },
+    {
+      "role": "U-queued-qU-set-window",
+      "argv": [
+        "set-option",
+        "-w",
+        "-t",
+        "bank:0",
+        "@x",
+        "wv"
+      ],
+      "exit_code": 0,
+      "stdout": ""
+    },
+    {
+      "role": "U-queued-qU-set-pane",
+      "argv": [
+        "set-option",
+        "-p",
+        "-t",
+        "bank:0.0",
+        "@x",
+        "pv"
+      ],
+      "exit_code": 0,
+      "stdout": ""
+    },
+    {
+      "role": "U-queued-qU-before-session",
+      "argv": [
+        "show-options",
+        "-qv",
+        "-t",
+        "bank",
+        "@x"
+      ],
+      "exit_code": 0,
+      "stdout": "sv\n"
+    },
+    {
+      "role": "U-queued-qU-before-window",
+      "argv": [
+        "show-options",
+        "-wqv",
+        "-t",
+        "bank:0",
+        "@x"
+      ],
+      "exit_code": 0,
+      "stdout": "wv\n"
+    },
+    {
+      "role": "U-queued-qU-before-pane",
+      "argv": [
+        "show-options",
+        "-pqv",
+        "-t",
+        "bank:0.0",
+        "@x"
+      ],
+      "exit_code": 0,
+      "stdout": "pv\n"
+    },
+    {
+      "role": "U-queued-qU-unset",
+      "argv": [
+        "run-shell",
+        "-C",
+        "set-option -qU -t bank:0.0 @x"
+      ],
+      "exit_code": 0,
+      "stdout": ""
+    },
+    {
+      "role": "U-queued-qU-after-session",
+      "argv": [
+        "show-options",
+        "-qv",
+        "-t",
+        "bank",
+        "@x"
+      ],
+      "exit_code": 0,
+      "stdout": ""
+    },
+    {
+      "role": "U-queued-qU-after-window",
+      "argv": [
+        "show-options",
+        "-wqv",
+        "-t",
+        "bank:0",
+        "@x"
+      ],
+      "exit_code": 0,
+      "stdout": "wv\n"
+    },
+    {
+      "role": "U-queued-qU-after-pane",
+      "argv": [
+        "show-options",
+        "-pqv",
+        "-t",
+        "bank:0.0",
+        "@x"
+      ],
+      "exit_code": 0,
+      "stdout": "pv\n"
+    },
+    {
+      "role": "U-queued-gU-set-global",
+      "argv": [
+        "set-option",
+        "-g",
+        "@y",
+        "gv"
+      ],
+      "exit_code": 0,
+      "stdout": ""
+    },
+    {
+      "role": "U-queued-gU-set-session",
+      "argv": [
+        "set-option",
+        "-t",
+        "bank",
+        "@y",
+        "sv"
+      ],
+      "exit_code": 0,
+      "stdout": ""
+    },
+    {
+      "role": "U-queued-gU-set-window",
+      "argv": [
+        "set-option",
+        "-w",
+        "-t",
+        "bank:0",
+        "@y",
+        "wv"
+      ],
+      "exit_code": 0,
+      "stdout": ""
+    },
+    {
+      "role": "U-queued-gU-set-pane",
+      "argv": [
+        "set-option",
+        "-p",
+        "-t",
+        "bank:0.0",
+        "@y",
+        "pv"
+      ],
+      "exit_code": 0,
+      "stdout": ""
+    },
+    {
+      "role": "U-queued-gU-before-global",
+      "argv": [
+        "show-options",
+        "-gqv",
+        "@y"
+      ],
+      "exit_code": 0,
+      "stdout": "gv\n"
+    },
+    {
+      "role": "U-queued-gU-before-session",
+      "argv": [
+        "show-options",
+        "-qv",
+        "-t",
+        "bank",
+        "@y"
+      ],
+      "exit_code": 0,
+      "stdout": "sv\n"
+    },
+    {
+      "role": "U-queued-gU-before-window",
+      "argv": [
+        "show-options",
+        "-wqv",
+        "-t",
+        "bank:0",
+        "@y"
+      ],
+      "exit_code": 0,
+      "stdout": "wv\n"
+    },
+    {
+      "role": "U-queued-gU-before-pane",
+      "argv": [
+        "show-options",
+        "-pqv",
+        "-t",
+        "bank:0.0",
+        "@y"
+      ],
+      "exit_code": 0,
+      "stdout": "pv\n"
+    },
+    {
+      "role": "U-queued-gU-unset",
+      "argv": [
+        "run-shell",
+        "-C",
+        "set-option -gU @y"
+      ],
+      "exit_code": 0,
+      "stdout": ""
+    },
+    {
+      "role": "U-queued-gU-after-global",
+      "argv": [
+        "show-options",
+        "-gqv",
+        "@y"
+      ],
+      "exit_code": 0,
+      "stdout": ""
+    },
+    {
+      "role": "U-queued-gU-after-session",
+      "argv": [
+        "show-options",
+        "-qv",
+        "-t",
+        "bank",
+        "@y"
+      ],
+      "exit_code": 0,
+      "stdout": "sv\n"
+    },
+    {
+      "role": "U-queued-gU-after-window",
+      "argv": [
+        "show-options",
+        "-wqv",
+        "-t",
+        "bank:0",
+        "@y"
+      ],
+      "exit_code": 0,
+      "stdout": "wv\n"
+    },
+    {
+      "role": "U-queued-gU-after-pane",
+      "argv": [
+        "show-options",
+        "-pqv",
+        "-t",
+        "bank:0.0",
+        "@y"
+      ],
+      "exit_code": 0,
+      "stdout": "pv\n"
+    }
+  ]
+}

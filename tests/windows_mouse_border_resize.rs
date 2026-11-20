@@ -718,9 +718,10 @@ fn package_pipe_name(label: &str) -> Result<String, Box<dyn Error>> {
 }
 
 fn rmux_binary() -> std::path::PathBuf {
-    std::env::var_os(RMUX_MOUSE_BORDER_RMUX_BIN_ENV)
+    let selected = std::env::var_os(RMUX_MOUSE_BORDER_RMUX_BIN_ENV)
         .map(std::path::PathBuf::from)
-        .unwrap_or_else(|| env!("CARGO_BIN_EXE_rmux").into())
+        .unwrap_or_else(|| env!("CARGO_BIN_EXE_rmux").into());
+    rmux_os::build_identity::resolve(selected.as_os_str()).expect("candidate executable identity")
 }
 
 fn assert_success(output: Output, context: &str) -> Result<Output, Box<dyn Error>> {

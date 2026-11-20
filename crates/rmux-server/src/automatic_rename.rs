@@ -34,7 +34,7 @@ pub(crate) fn window_allows_automatic_rename(
 #[cfg(test)]
 pub(crate) fn session_window_allows_automatic_rename(
     options: &OptionStore,
-    session: &rmux_core::Session,
+    session: rmux_core::ManagedSessionView<'_>,
     window_index: u32,
     tracked: bool,
 ) -> bool {
@@ -45,7 +45,7 @@ pub(crate) fn session_window_allows_automatic_rename(
 
 #[cfg(test)]
 mod tests {
-    use rmux_core::{OptionStore, Session};
+    use rmux_core::OptionStore;
     use rmux_proto::{
         OptionName, ScopeSelector, SessionName, SetOptionMode, TerminalSize, WindowTarget,
     };
@@ -58,7 +58,10 @@ mod tests {
 
     #[test]
     fn automatic_rename_option_disables_automatic_name_updates() {
-        let session = Session::new(session_name("alpha"), TerminalSize { cols: 80, rows: 24 });
+        let session = crate::session_fixture::SessionFixture::new(
+            session_name("alpha"),
+            TerminalSize { cols: 80, rows: 24 },
+        );
         let mut options = OptionStore::new();
         options
             .set(
@@ -70,17 +73,23 @@ mod tests {
             .expect("automatic-rename option set succeeds");
 
         assert!(!session_window_allows_automatic_rename(
-            &options, &session, 0, true
+            &options,
+            session.view(),
+            0,
+            true
         ));
     }
 
     #[test]
     fn automatic_rename_option_allows_default_automatic_names() {
-        let session = Session::new(session_name("alpha"), TerminalSize { cols: 80, rows: 24 });
+        let session = crate::session_fixture::SessionFixture::new(
+            session_name("alpha"),
+            TerminalSize { cols: 80, rows: 24 },
+        );
 
         assert!(session_window_allows_automatic_rename(
             &OptionStore::new(),
-            &session,
+            session.view(),
             0,
             false
         ));

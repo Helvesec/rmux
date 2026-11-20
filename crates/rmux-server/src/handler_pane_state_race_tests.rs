@@ -28,7 +28,7 @@ async fn create_session(handler: &RequestHandler, value: &str) -> SessionName {
             environment: None,
         }))
         .await;
-    assert!(matches!(response, Response::NewSession(_)), "{response:?}");
+    crate::session_fixture::assert_new_session(&response);
     session
 }
 
@@ -279,7 +279,10 @@ async fn kept_exit_interposed_by_respawn_cannot_touch_the_new_generation() {
     };
     for (name, value) in [
         ("remain-on-exit", "on"),
-        ("remain-on-exit-format", "STALE_EXIT_MARKER"),
+        (
+            "remain-on-exit-format",
+            stale_exit_diagnostic::STALE_EXIT_MARKER,
+        ),
     ] {
         let response = handler
             .handle(Request::PaneOptionSet(PaneOptionSetRequest {
@@ -336,17 +339,16 @@ async fn kept_exit_interposed_by_respawn_cannot_touch_the_new_generation() {
         matches!(respawned, Response::RespawnPane(_)),
         "{respawned:?}"
     );
-    let (current_generation, replacement_output_sequence) = {
+    let current_generation = {
         let mut state = handler.state.lock().await;
         let generation = state.pane_output_generation_for_target(&target, pane_id);
         state
             .append_bytes_to_runtime_pane_transcript(&session, pane_id, b"NEW_GENERATION_MARKER")
             .expect("append marker to replacement transcript");
-        let output_sequence = state
-            .pane_output_sequence(&session, pane_id)
-            .expect("replacement output sequence exists");
-        (generation, output_sequence)
+        generation
     };
+    let mut replacement =
+        stale_exit_diagnostic::ReplacementPublications::snapshot(&handler, &target).await;
     assert_ne!(current_generation, exited_generation);
     let (subscription_id, subscription_revision, subscribed_pane_id) =
         subscribe(&handler, 1004, target.clone(), true).await;
@@ -362,11 +364,8 @@ async fn kept_exit_interposed_by_respawn_cannot_touch_the_new_generation() {
             current_generation,
             "stale exit must not replace or rewind the replacement generation"
         );
-        assert_eq!(
-            state.pane_output_sequence(&session, pane_id),
-            Some(replacement_output_sequence),
-            "stale exit must not append its remain-on-exit marker to the replacement transcript"
-        );
+        let boundary = replacement.boundary(|_| ());
+        replacement.assert_only_publications_advanced(&boundary);
         assert!(!state.pane_is_dead(&session, pane_id));
     }
 
@@ -402,6 +401,118 @@ async fn kept_exit_interposed_by_respawn_cannot_touch_the_new_generation() {
             "stale exit emitted PaneDied for the replacement generation"
         );
     }
+}
+
+#[tokio::test]
+async fn atomic_exit_preparation_same_generation_commits_once() {
+    let handler = Arc::new(RequestHandler::new());
+    let session = create_session(&handler, "a01-atomic-exit-prepare").await;
+    handler.wait_for_initial_panes_for_test().await;
+    let target = PaneTarget::with_window(session.clone(), 0, 0);
+    let pane_id = {
+        let state = handler.state.lock().await;
+        state
+            .sessions
+            .session(&session)
+            .and_then(|session| session.window_at(0))
+            .and_then(|window| window.pane(0))
+            .map(|pane| pane.id())
+            .expect("initial pane exists")
+    };
+    for (name, value) in [
+        ("remain-on-exit", "on"),
+        ("remain-on-exit-format", "ATOMIC_EXIT_PREPARED"),
+    ] {
+        let response = handler
+            .handle(Request::PaneOptionSet(PaneOptionSetRequest {
+                target: PaneTargetRef::slot(target.clone()),
+                name: name.to_owned(),
+                value: Some(value.to_owned()),
+                mode: SetOptionMode::Replace,
+                unset: false,
+            }))
+            .await;
+        assert!(
+            matches!(response, Response::PaneOptionSet(_)),
+            "{response:?}"
+        );
+    }
+
+    let generation = {
+        let mut state = handler.state.lock().await;
+        let generation = state.pane_output_generation_for_target(&target, pane_id);
+        state
+            .mark_pane_dead_without_exit_details(&target)
+            .expect("mark pane naturally exited");
+        generation
+    };
+    let mut lifecycle_events = handler.subscribe_lifecycle_events();
+    while lifecycle_events.try_recv().is_ok() {}
+    let pause = handler.install_pane_exit_commit_pause();
+    let exit_handler = Arc::clone(&handler);
+    let exit_session = session.clone();
+    let first_exit = tokio::spawn(async move {
+        exit_handler
+            .handle_pane_exit_event(PaneExitEvent::eof_published(
+                exit_session,
+                pane_id,
+                Some(generation),
+            ))
+            .await;
+    });
+    tokio::time::timeout(Duration::from_secs(1), pause.reached.notified())
+        .await
+        .expect("first exit reaches post-plan pause");
+
+    handler
+        .handle_pane_exit_event(PaneExitEvent::eof_published(
+            session.clone(),
+            pane_id,
+            Some(generation),
+        ))
+        .await;
+    pause.release.notify_one();
+    first_exit.await.expect("first exit task joins");
+
+    let capture = {
+        let state = handler.state.lock().await;
+        let transcript = state
+            .transcript_handle(&target)
+            .expect("kept pane retains its transcript");
+        let screen = transcript.lock().clone_screen();
+        let mut text = String::new();
+        let cols = usize::from(screen.size().cols);
+        for row in 0..usize::from(screen.size().rows) {
+            screen.visit_visible_line_cells(row, cols, |cell| {
+                if !cell.is_padding() {
+                    text.push_str(cell.text());
+                }
+            });
+            text.push('\n');
+        }
+        text
+    };
+    assert_eq!(
+        capture.matches("ATOMIC_EXIT_PREPARED").count(),
+        1,
+        "same-generation exit commits must prepare one dead-pane status line: {capture:?}"
+    );
+
+    let pane_died_events = std::iter::from_fn(|| lifecycle_events.try_recv().ok())
+        .filter(|event| {
+            matches!(
+                event.event,
+                LifecycleEvent::PaneDied {
+                    pane_id: Some(event_pane_id),
+                    ..
+                } if event_pane_id == pane_id.as_u32()
+            )
+        })
+        .count();
+    assert_eq!(
+        pane_died_events, 1,
+        "same-generation exit commits must publish one PaneDied event"
+    );
 }
 
 #[tokio::test]
@@ -955,16 +1066,19 @@ async fn break_pane_prepares_linked_identity_before_same_slot_reuse() {
     let break_session = session.clone();
     let breaking = tokio::spawn(async move {
         break_handler
-            .handle_break_pane(BreakPaneRequest {
-                source: PaneTarget::with_window(break_session.clone(), 0, 1),
-                target: Some(WindowTarget::with_window(break_session, 1)),
-                name: None,
-                detached: true,
-                after: false,
-                before: false,
-                print_target: false,
-                format: None,
-            })
+            .handle_break_pane(
+                std::process::id(),
+                BreakPaneRequest {
+                    source: PaneTarget::with_window(break_session.clone(), 0, 1),
+                    target: Some(WindowTarget::with_window(break_session, 1)),
+                    name: None,
+                    detached: true,
+                    after: false,
+                    before: false,
+                    print_target: false,
+                    format: None,
+                },
+            )
             .await
     });
     tokio::time::timeout(Duration::from_secs(1), pause.reached.notified())
@@ -1232,3 +1346,9 @@ async fn pane_option_mutation_and_journal_order_are_linearized() {
         response => panic!("pane option cursor failed: {response:?}"),
     }
 }
+
+#[path = "handler_pane_state_race_tests/stale_exit_diagnostic.rs"]
+mod stale_exit_diagnostic;
+
+#[path = "handler_pane_state_race_tests/exit_probe_retention.rs"]
+mod exit_probe_retention;

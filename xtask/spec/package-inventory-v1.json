@@ -1,0 +1,397 @@
+{
+  "schema_version": 1,
+  "scope": "workspace-package-feature-library-binary-declarations",
+  "metadata_format": 1,
+  "source_base": {
+    "commit": "6abbebc5df9f1d65d5815f599d213165ef4a12db",
+    "tree": "f959da1162025e24aca093494ca568671776c2a0"
+  },
+  "packages": [
+    {
+      "id": "package:ratatui-rmux",
+      "name": "ratatui-rmux",
+      "version": "0.10.0",
+      "edition": "2021",
+      "rust_version": "1.88.0",
+      "publish": null,
+      "targets": [
+        {
+          "id": "package:ratatui-rmux/lib:ratatui_rmux",
+          "name": "ratatui_rmux",
+          "kind": [
+            "lib"
+          ],
+          "crate_types": [
+            "lib"
+          ],
+          "required_features": []
+        }
+      ],
+      "features": {}
+    },
+    {
+      "id": "package:rmux",
+      "name": "rmux",
+      "version": "0.10.0",
+      "edition": "2021",
+      "rust_version": "1.88.0",
+      "publish": null,
+      "targets": [
+        {
+          "id": "package:rmux/bin:rmux",
+          "name": "rmux",
+          "kind": [
+            "bin"
+          ],
+          "crate_types": [
+            "bin"
+          ],
+          "required_features": []
+        },
+        {
+          "id": "package:rmux/bin:rmux-daemon",
+          "name": "rmux-daemon",
+          "kind": [
+            "bin"
+          ],
+          "crate_types": [
+            "bin"
+          ],
+          "required_features": []
+        }
+      ],
+      "features": {
+        "default": [
+          "web"
+        ],
+        "kitty-keyboard": [
+          "rmux-core/kitty-keyboard"
+        ],
+        "tiny-cli": [],
+        "web": [
+          "rmux-server/web"
+        ]
+      }
+    },
+    {
+      "id": "package:rmux-bootstrap",
+      "name": "rmux-bootstrap",
+      "version": "0.10.0",
+      "edition": "2021",
+      "rust_version": "1.88.0",
+      "publish": null,
+      "targets": [
+        {
+          "id": "package:rmux-bootstrap/lib:rmux_bootstrap",
+          "name": "rmux_bootstrap",
+          "kind": [
+            "lib"
+          ],
+          "crate_types": [
+            "lib"
+          ],
+          "required_features": []
+        }
+      ],
+      "features": {}
+    },
+    {
+      "id": "package:rmux-client",
+      "name": "rmux-client",
+      "version": "0.10.0",
+      "edition": "2021",
+      "rust_version": "1.88.0",
+      "publish": null,
+      "targets": [
+        {
+          "id": "package:rmux-client/lib:rmux_client",
+          "name": "rmux_client",
+          "kind": [
+            "lib"
+          ],
+          "crate_types": [
+            "lib"
+          ],
+          "required_features": []
+        }
+      ],
+      "features": {}
+    },
+    {
+      "id": "package:rmux-core",
+      "name": "rmux-core",
+      "version": "0.10.0",
+      "edition": "2021",
+      "rust_version": "1.88.0",
+      "publish": null,
+      "targets": [
+        {
+          "id": "package:rmux-core/lib:rmux_core",
+          "name": "rmux_core",
+          "kind": [
+            "lib"
+          ],
+          "crate_types": [
+            "lib"
+          ],
+          "required_features": []
+        }
+      ],
+      "features": {
+        "kitty-keyboard": [],
+        "test-seams": []
+      }
+    },
+    {
+      "id": "package:rmux-ipc",
+      "name": "rmux-ipc",
+      "version": "0.10.0",
+      "edition": "2021",
+      "rust_version": "1.88.0",
+      "publish": null,
+      "targets": [
+        {
+          "id": "package:rmux-ipc/lib:rmux_ipc",
+          "name": "rmux_ipc",
+          "kind": [
+            "lib"
+          ],
+          "crate_types": [
+            "lib"
+          ],
+          "required_features": []
+        }
+      ],
+      "features": {}
+    },
+    {
+      "id": "package:rmux-os",
+      "name": "rmux-os",
+      "version": "0.10.0",
+      "edition": "2021",
+      "rust_version": "1.88.0",
+      "publish": null,
+      "targets": [
+        {
+          "id": "package:rmux-os/lib:rmux_os",
+          "name": "rmux_os",
+          "kind": [
+            "lib"
+          ],
+          "crate_types": [
+            "lib"
+          ],
+          "required_features": []
+        }
+      ],
+      "features": {}
+    },
+    {
+      "id": "package:rmux-proto",
+      "name": "rmux-proto",
+      "version": "0.10.0",
+      "edition": "2021",
+      "rust_version": "1.88.0",
+      "publish": null,
+      "targets": [
+        {
+          "id": "package:rmux-proto/lib:rmux_proto",
+          "name": "rmux_proto",
+          "kind": [
+            "lib"
+          ],
+          "crate_types": [
+            "lib"
+          ],
+          "required_features": []
+        }
+      ],
+      "features": {
+        "fuzzing": []
+      }
+    },
+    {
+      "id": "package:rmux-pty",
+      "name": "rmux-pty",
+      "version": "0.10.0",
+      "edition": "2021",
+      "rust_version": "1.88.0",
+      "publish": null,
+      "targets": [
+        {
+          "id": "package:rmux-pty/lib:rmux_pty",
+          "name": "rmux_pty",
+          "kind": [
+            "lib"
+          ],
+          "crate_types": [
+            "lib"
+          ],
+          "required_features": []
+        }
+      ],
+      "features": {
+        "test-seams": []
+      }
+    },
+    {
+      "id": "package:rmux-sdk",
+      "name": "rmux-sdk",
+      "version": "0.10.0",
+      "edition": "2021",
+      "rust_version": "1.88.0",
+      "publish": null,
+      "targets": [
+        {
+          "id": "package:rmux-sdk/lib:rmux_sdk",
+          "name": "rmux_sdk",
+          "kind": [
+            "lib"
+          ],
+          "crate_types": [
+            "lib"
+          ],
+          "required_features": []
+        }
+      ],
+      "features": {
+        "crossterm": [
+          "dep:crossterm"
+        ],
+        "default": [
+          "web"
+        ],
+        "regex": [
+          "dep:regex"
+        ],
+        "web": []
+      }
+    },
+    {
+      "id": "package:rmux-server",
+      "name": "rmux-server",
+      "version": "0.10.0",
+      "edition": "2021",
+      "rust_version": "1.88.0",
+      "publish": null,
+      "targets": [
+        {
+          "id": "package:rmux-server/lib:rmux_server",
+          "name": "rmux_server",
+          "kind": [
+            "lib"
+          ],
+          "crate_types": [
+            "lib"
+          ],
+          "required_features": []
+        }
+      ],
+      "features": {
+        "default": [
+          "web"
+        ],
+        "fuzzing": [],
+        "web": [
+          "dep:base64",
+          "dep:hkdf",
+          "dep:httparse",
+          "dep:rmux-web-crypto",
+          "dep:serde",
+          "dep:serde_json",
+          "dep:sha1",
+          "dep:sha2",
+          "dep:subtle",
+          "dep:toml",
+          "dep:zeroize"
+        ]
+      }
+    },
+    {
+      "id": "package:rmux-types",
+      "name": "rmux-types",
+      "version": "0.10.0",
+      "edition": "2021",
+      "rust_version": "1.88.0",
+      "publish": null,
+      "targets": [
+        {
+          "id": "package:rmux-types/lib:rmux_types",
+          "name": "rmux_types",
+          "kind": [
+            "lib"
+          ],
+          "crate_types": [
+            "lib"
+          ],
+          "required_features": []
+        }
+      ],
+      "features": {
+        "default": [],
+        "serde": [
+          "dep:serde"
+        ]
+      }
+    },
+    {
+      "id": "package:rmux-web-crypto",
+      "name": "rmux-web-crypto",
+      "version": "0.10.0",
+      "edition": "2021",
+      "rust_version": "1.88.0",
+      "publish": null,
+      "targets": [
+        {
+          "id": "package:rmux-web-crypto/lib:rmux_web_crypto",
+          "name": "rmux_web_crypto",
+          "kind": [
+            "cdylib",
+            "rlib"
+          ],
+          "crate_types": [
+            "cdylib",
+            "rlib"
+          ],
+          "required_features": []
+        }
+      ],
+      "features": {
+        "default": [
+          "x25519"
+        ],
+        "wasm": [
+          "dep:wasm-bindgen"
+        ],
+        "wasm-test": [
+          "wasm"
+        ],
+        "x25519": [
+          "dep:x25519-dalek"
+        ]
+      }
+    },
+    {
+      "id": "package:xtask",
+      "name": "xtask",
+      "version": "0.10.0",
+      "edition": "2021",
+      "rust_version": "1.88.0",
+      "publish": [],
+      "targets": [
+        {
+          "id": "package:xtask/bin:xtask",
+          "name": "xtask",
+          "kind": [
+            "bin"
+          ],
+          "crate_types": [
+            "bin"
+          ],
+          "required_features": []
+        }
+      ],
+      "features": {}
+    }
+  ]
+}

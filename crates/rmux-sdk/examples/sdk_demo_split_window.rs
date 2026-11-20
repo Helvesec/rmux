@@ -1,6 +1,5 @@
 use rmux_sdk::SplitDirection;
 
-#[path = "sdk_demo_helpers/mod.rs"]
 mod sdk_demo_helpers;
 
 #[tokio::main]
@@ -14,7 +13,7 @@ async fn main() -> rmux_sdk::Result<()> {
     // example:end
 
     let panes = session.window(0).panes().await?;
-    println!("split pane: {}", new_pane.target().to_proto());
+    println!("split pane: {}", new_pane.target());
     println!("visible panes: {}", panes.len());
     sdk_demo_helpers::cleanup(session).await
 }

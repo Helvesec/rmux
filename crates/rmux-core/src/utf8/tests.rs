@@ -1,5 +1,6 @@
 use super::{
-    combine_char, text_width, truncate_right_to_width, truncate_to_width, CombineResult, Utf8Config,
+    combine_char, text_width, truncate_right_to_width, truncate_to_width, CombineResult,
+    CombinedSequenceAction, CombinedSequenceDiscard, Utf8Config,
 };
 use crate::OptionStore;
 use rmux_proto::{OptionName, ScopeSelector, SetOptionMode};
@@ -76,6 +77,29 @@ fn regional_indicators_and_skin_tones_force_combined_width() {
             width: 2,
         }
     );
+    assert_eq!(
+        combine_char(Some(("👨🏻\u{200D}🤝\u{200D}👨", 2)), '🏿', &config),
+        CombineResult::Combined {
+            text: "👨🏻\u{200D}🤝\u{200D}👨🏿".to_owned(),
+            width: 2,
+        }
+    );
+}
+
+#[test]
+fn skin_tone_zwj_continuations_preserve_measured_owner_widths() {
+    let config = Utf8Config::default();
+
+    assert_eq!(text_width("A\u{200D}👨🏻", &config), 3);
+    assert_eq!(text_width("👨\u{200D}🤝\u{200D}👨🏿", &config), 2);
+}
+
+#[test]
+fn modifier_rooted_zwj_owners_do_not_absorb_skin_tones() {
+    let config = Utf8Config::default();
+
+    assert_eq!(text_width("🏻\u{200D}👩🏽", &config), 4);
+    assert_eq!(text_width("A\u{200D}👨🏻\u{200D}👩🏽", &config), 5);
 }
 
 #[test]
@@ -127,6 +151,131 @@ fn zwj_sequences_continue_combining_after_the_joiner() {
         truncate_to_width("👨\u{200D}👩A", 2, &config),
         "👨\u{200D}👩"
     );
+}
+
+#[test]
+fn overlong_zwj_sequence_discards_its_tail_without_shifting_following_text() {
+    let config = Utf8Config::default();
+    let bounded_prefix = "👩\u{200D}❤\u{FE0F}\u{200D}💋\u{200D}👨\u{200D}";
+    let captured_sequence = "👩\u{200D}❤\u{FE0F}\u{200D}💋\u{200D}👨\u{200D}👩";
+    let captured_with_ascii = format!("{captured_sequence}A");
+    assert!(bounded_prefix.len() <= super::MAX_COMBINED_BYTES);
+    assert!(captured_sequence.len() > super::MAX_COMBINED_BYTES);
+
+    assert_eq!(text_width(&captured_with_ascii, &config), 3);
+    assert_eq!(
+        truncate_to_width(&captured_with_ascii, 2, &config),
+        captured_sequence
+    );
+    assert_eq!(
+        truncate_to_width(&captured_with_ascii, 3, &config),
+        captured_with_ascii
+    );
+
+    let extended_tail = format!("{captured_sequence}🏽\u{200D}👩A");
+    assert_eq!(text_width(&extended_tail, &config), 3);
+    assert_eq!(truncate_to_width(&extended_tail, 3, &config), extended_tail);
+    assert_eq!(text_width(&format!("{captured_sequence}表"), &config), 4);
+}
+
+#[test]
+fn gh219_discarded_tail_waits_for_a_fresh_spacing_character() {
+    let config = Utf8Config::default();
+    let mut discard = CombinedSequenceDiscard::Extensions;
+
+    assert!(discard.is_active());
+    assert_eq!(
+        discard.action_for('\u{FE0F}', &config),
+        CombinedSequenceAction::Discard
+    );
+    assert!(discard.is_active());
+    assert_eq!(
+        discard.action_for('中', &config),
+        CombinedSequenceAction::Standalone
+    );
+    assert!(!discard.is_active());
+}
+
+#[test]
+fn gh219_truncation_keeps_discarded_bytes_inside_source_slices() {
+    let config = Utf8Config::default();
+    let family = "👩\u{200D}❤\u{FE0F}\u{200D}💋\u{200D}👨";
+    let status = "👩🏽\u{200D}❤\u{FE0F}\u{200D}👨🏽 #S";
+    let left_cases = [
+        ("\u{200D}abc", 3, "\u{200D}abc"),
+        ("A\u{3164}B", 2, "A\u{3164}B"),
+        (&format!("{family}A"), 3, &format!("{family}A")),
+        (status, 10, status),
+    ];
+
+    for (value, width, expected) in left_cases {
+        let clipped = truncate_to_width(value, width, &config);
+        assert_eq!(clipped, expected);
+        assert!(value.starts_with(&clipped));
+        assert!(value.is_char_boundary(clipped.len()));
+        assert!(text_width(&clipped, &config) <= width);
+    }
+
+    let value = "AB👩\u{200D}❤\u{FE0F}\u{200D}💋\u{200D}👨X";
+    let clipped = truncate_right_to_width(value, 4, &config);
+    let source_start = value.find('B').expect("B source boundary");
+    assert_eq!(clipped, value[source_start..]);
+    assert!(value.ends_with(&clipped));
+    assert!(value.is_char_boundary(value.len() - clipped.len()));
+    assert_eq!(text_width(&clipped, &config), 4);
+}
+
+#[test]
+fn zwj_at_the_exact_byte_bound_starts_a_following_cjk_cell() {
+    let config = Utf8Config::default();
+    let bounded_cluster = concat!(
+        "👩\u{20D0}",
+        "\u{0301}\u{0301}\u{0301}\u{0301}\u{0301}\u{0301}",
+        "\u{0301}\u{0301}\u{0301}\u{0301}\u{0301}",
+        "\u{200D}",
+    );
+    let value = format!("{bounded_cluster}中");
+    assert_eq!(bounded_cluster.len(), super::MAX_COMBINED_BYTES);
+
+    assert_eq!(text_width(&value, &config), 4);
+    assert_eq!(truncate_to_width(&value, 2, &config), bounded_cluster);
+    assert_eq!(truncate_to_width(&value, 4, &config), value);
+}
+
+#[test]
+fn truncation_is_always_a_source_byte_prefix_or_suffix() {
+    let config = Utf8Config::default();
+    let values = [
+        "👨\u{200D}👩\u{200D}👦\u{200D}👦中ABCDEFGH",
+        "👩\u{200D}❤\u{FE0F}\u{200D}💋\u{200D}👨中A",
+        "\u{3164}A",
+        "각A",
+        "👋🏽A",
+        "🇨🇭A",
+        "❤\u{FE0F}A",
+        "A\u{0301}B",
+        "\u{200D}A",
+    ];
+
+    for value in values {
+        for width in 0..=text_width(value, &config).saturating_add(1) {
+            let left = truncate_to_width(value, width, &config);
+            assert!(
+                value.starts_with(&left),
+                "truncate_to_width({value:?}, {width}) returned non-prefix {left:?}"
+            );
+            assert!(value.is_char_boundary(left.len()));
+            assert!(text_width(&left, &config) <= width);
+
+            let right = truncate_right_to_width(value, width, &config);
+            assert!(
+                value.ends_with(&right),
+                "truncate_right_to_width({value:?}, {width}) returned non-suffix {right:?}"
+            );
+            assert!(value.is_char_boundary(value.len() - right.len()));
+            assert!(text_width(&right, &config) <= width);
+        }
+    }
 }
 
 #[test]

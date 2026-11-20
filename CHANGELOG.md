@@ -1,5 +1,39 @@
 # Changelog
 
+## 0.11.0
+
+### Terminal
+
+- Support OSC 7501 program status (protocol revision 0.4). Panes answer the
+  `OSC 7501 ; ?` capability query and store bounded per-pane records exposed
+  through `pane_program_status*` and `session_program_status_json` formats.
+  Shell prompts (OSC 133 A), process exit and, on Unix, foreground
+  process-group changes expire active records; RIS clears them. tmux 3.7b
+  ignores OSC 7501, so this is a documented product divergence.
+
+### Copy mode
+
+- Keep the selection, search and viewport when copy mode receives a resize to
+  its current size.
+
+### ratatui-rmux
+
+- Breaking: depend on `ratatui-core` 0.1 instead of `ratatui = "=0.29.0"`
+  aliased under the `ratatui-core` name. `PaneWidget` now implements
+  `ratatui_core::widgets::Widget` and paints into
+  `ratatui_core::buffer::Buffer`, which is the `Buffer` of every ratatui 0.30.x
+  release. Hosts on ratatui 0.30 can render it; hosts still on ratatui 0.29
+  can no longer pass their `Buffer`, `Rect`, `Style` or `Color` and must
+  upgrade to ratatui 0.30 or stay on ratatui-rmux 0.10. The `rmux` binary
+  itself still uses ratatui 0.29.
+
+### Protocol
+
+- Move detached RPC from wire version 8 to wire version 9 for control-mode
+  format subscriptions. An already-running pre-0.10 daemon must be restarted,
+  as must a 0.10.0 daemon, before connecting a 0.11.0 client. Restarting the
+  daemon ends its open sessions.
+
 ## 0.10.0
 
 ### SDK

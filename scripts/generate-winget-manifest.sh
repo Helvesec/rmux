@@ -21,6 +21,10 @@ Options:
 USAGE
 }
 
+layout_tool() {
+  printf '%s\n' "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/packaging/layout"
+}
+
 die() {
   printf 'error: %s\n' "$*" >&2
   exit 1
@@ -87,11 +91,17 @@ EOF
 }
 
 installer_manifest() {
-  local asset sha base_url nested_path
+  local asset sha base_url nested_path command_alias
   asset="rmux-$version-windows-x86_64.zip"
   sha="$(asset_sha256 "$asset")"
   base_url="https://github.com/$repository/releases/download/$release_tag"
-  nested_path="rmux-$version-windows-x86_64\\rmux.exe"
+  nested_path="$("$(layout_tool)" nested-exe \
+    --package-name "rmux-$version-windows-x86_64")" ||
+    die "could not project the WinGet nested installer path"
+  # The command this package exposes is declared once, beside the entry it
+  # points at, instead of being repeated in the template.
+  command_alias="$("$(layout_tool)" command-alias --consumer winget)" ||
+    die "could not project the WinGet command alias"
 
   cat <<EOF
 # yaml-language-server: \$schema=https://aka.ms/winget-manifest.installer.1.10.0.schema.json
@@ -102,7 +112,7 @@ InstallerType: zip
 NestedInstallerType: portable
 NestedInstallerFiles:
   - RelativeFilePath: $nested_path
-    PortableCommandAlias: rmux
+    PortableCommandAlias: $command_alias
 ArchiveBinariesDependOnPath: true
 ReleaseDate: "$release_date"
 Dependencies:

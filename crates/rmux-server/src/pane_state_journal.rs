@@ -9,9 +9,7 @@ use rmux_proto::{
     DEFAULT_MAX_DETACHED_FRAME_LENGTH,
 };
 
-#[path = "pane_state_journal/retention.rs"]
 mod retention;
-#[path = "pane_state_journal/subscriptions.rs"]
 mod subscriptions;
 
 use retention::retained_record_bytes;
@@ -89,7 +87,24 @@ struct PaneStateSubscription {
     closed: bool,
     closed_revision: Option<u64>,
     closed_reason: Option<PaneStateClosedReason>,
+    /// The closed state was seeded at subscribe time (the pane was already
+    /// closed when the subscription was created) rather than recorded while
+    /// the subscription was live. Seeded subscriptions still count as open
+    /// until delivery so a later final close re-points them instead of
+    /// being dropped.
+    closed_seeded: bool,
     evicted_state_revision_before_close: u64,
+}
+
+impl PaneStateSubscription {
+    /// True while the subscription still needs a close record: live
+    /// subscriptions that have not closed yet, and seeded subscriptions
+    /// whose terminal delivery has not happened (a later close re-points
+    /// them). Delivered live subscriptions are removed promptly, so
+    /// `closed && !seeded` means delivered-or-awaiting-removal.
+    fn awaiting_close_delivery(&self) -> bool {
+        !self.closed || self.closed_seeded
+    }
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -1271,6 +1286,58 @@ mod tests {
                 reason: PaneStateClosedReason::Killed,
                 ..
             }] if *revision == killed_revision
+        ));
+    }
+
+    #[test]
+    fn late_subscription_to_a_died_kept_pane_delivers_the_retained_close() {
+        // The pane's process exits before any subscription exists, no final
+        // kill arrives, and the pane stays kept-dead. A subscription created
+        // afterwards starts at a cursor at or past the close revision and
+        // must still receive the one retained terminal event.
+        let mut journal = PaneStateJournal::new(8);
+        let closed_revision = journal.push(
+            pane_id(1),
+            Some(1),
+            PaneStateChange::Closed {
+                reason: PaneStateClosedReason::DiedKept,
+            },
+        );
+        assert!(journal.mark_pane_closed(pane_id(1)));
+        journal.remember_pane_closed_event(
+            pane_id(1),
+            PaneStateClosedReason::DiedKept,
+            closed_revision,
+        );
+
+        let subscription = journal
+            .subscribe(
+                7,
+                pane_id(1),
+                PaneStateInclude {
+                    title: false,
+                    options: false,
+                    foreground: false,
+                },
+            )
+            .expect("late subscription fits");
+
+        let mut events = Vec::new();
+        assert_eq!(
+            journal.read_after(7, subscription, journal.current_revision(), 16, &mut events),
+            Ok(PaneStateRead::Ready {
+                next_revision: closed_revision,
+                limited: false,
+                event_count: 1,
+            })
+        );
+        assert!(matches!(
+            events.as_slice(),
+            [PaneStateEventDto::Closed {
+                revision,
+                reason: PaneStateClosedReason::DiedKept,
+                ..
+            }] if *revision == closed_revision
         ));
     }
 

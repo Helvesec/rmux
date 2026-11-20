@@ -68,11 +68,14 @@ pub(super) fn dispatch_sm_private<W: ScreenWriter + ?Sized>(
             1004 => writer.mode_set(mode::MODE_FOCUSON),
             1005 => writer.mode_set(mode::MODE_MOUSE_UTF8),
             1006 => writer.mode_set(mode::MODE_MOUSE_SGR),
-            47 | 1047 => writer.alternate_on(bg, false),
-            1049 => writer.alternate_on(bg, true),
+            47 | 1047 => writer.alternate_on_with_rendition(&parser.cell, false),
+            1049 => writer.alternate_on_with_rendition(&parser.cell, true),
             2004 => writer.mode_set(mode::MODE_BRACKETPASTE),
             2026 => writer.start_sync(),
-            2031 => writer.mode_set(mode::MODE_THEME_UPDATES),
+            2031 => {
+                writer.mode_set(mode::MODE_THEME_UPDATES);
+                parser.theme_event(super::ThemeAction::Subscribe(true));
+            }
             WIN32_CONSOLE_INPUT_MODE => {}
             _ => {}
         }
@@ -110,11 +113,14 @@ pub(super) fn dispatch_rm_private<W: ScreenWriter + ?Sized>(
             1004 => writer.mode_clear(mode::MODE_FOCUSON),
             1005 => writer.mode_clear(mode::MODE_MOUSE_UTF8),
             1006 => writer.mode_clear(mode::MODE_MOUSE_SGR),
-            47 | 1047 => writer.alternate_off(bg, false),
-            1049 => writer.alternate_off(bg, true),
+            47 | 1047 => writer.alternate_off_with_rendition(&mut parser.cell, false),
+            1049 => writer.alternate_off_with_rendition(&mut parser.cell, true),
             2004 => writer.mode_clear(mode::MODE_BRACKETPASTE),
             2026 => writer.stop_sync(),
-            2031 => writer.mode_clear(mode::MODE_THEME_UPDATES),
+            2031 => {
+                writer.mode_clear(mode::MODE_THEME_UPDATES);
+                parser.theme_event(super::ThemeAction::Subscribe(false));
+            }
             WIN32_CONSOLE_INPUT_MODE => {}
             _ => {}
         }

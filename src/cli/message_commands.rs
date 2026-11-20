@@ -107,7 +107,14 @@ fn run_display_message_direct(
 }
 
 fn display_message_can_use_direct_request(args: &DisplayMessageArgs) -> bool {
-    !args.all_formats && !args.stdin && !args.literal && !args.verbose && args.target.is_none()
+    !rmux_core::cli_entry::DisplayMessageEntry {
+        all_formats: args.all_formats,
+        stdin: args.stdin,
+        literal: args.literal,
+        verbose: args.verbose,
+        has_target: args.target.is_some(),
+    }
+    .uses_source_queue()
 }
 
 fn resolve_display_message_target(

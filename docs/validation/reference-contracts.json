@@ -1,0 +1,899 @@
+{
+  "schema": 1,
+  "scope": "PHASE0_REFERENCE_CONTRACT",
+  "source_base": "80575f422b07e12f1399e54ebee5049dc65503e6",
+  "plan_sha256": "a13cdce4f403d89a285352c771828bccebcf87a998c4a44ee846aa5f56439944",
+  "criterion": "0.contracts",
+  "authorities": [
+    {
+      "path": "tests/reference/tmux_compat/frozen_reference.yaml",
+      "sha256": "6b18ee8ac9a8b2730bd58bb81282fbbd71a1ae3d425459672a1374c40cc53471"
+    },
+    {
+      "path": "tests/reference/tmux_compat/error_exit_matrix.yaml",
+      "sha256": "298de8b9ae1716a7b336de944adda7832f404b2cd8ec0241a73125c1c2d6bcf2"
+    },
+    {
+      "path": "tests/reference/tmux_compat/divergences.toml",
+      "sha256": "a44f207a4ee3a06b19c8d8e92c93e1e5ee128f816b722d7ca1d2b98de133f365"
+    },
+    {
+      "path": "docs/tmux-compat-decisions.md",
+      "sha256": "9574e2e154bc97f4d5f1fb96ce4a5ec9bc57ff4d45e1b4b196e67f6a8d84fd03"
+    },
+    {
+      "path": "tests/conformance/kitty_keyboard/pin.json",
+      "sha256": "aa9d9794a0bbee98ef2051232f8ec00bba402f450d7a2b6ae05af1ee4c2f9d06"
+    },
+    {
+      "path": "docs/specs/web-share-e2ee-protocol-v1.md",
+      "sha256": "6a72b74d0cbf9734c51b618d5220efe040c2ad908867ce2cd2dedf4b553969e9"
+    },
+    {
+      "path": "scripts/bench/qualification.py",
+      "sha256": "01a7bbea0430dda34bb4fcef07c34d3eec2aaf171de13c97b1002cfde54466df"
+    }
+  ],
+  "families": [
+    {
+      "id": "conformance",
+      "owner": "L6",
+      "routes": [
+        "CLI",
+        "by-id",
+        "control-mode",
+        "binding",
+        "source-file",
+        "queue"
+      ],
+      "platforms": [
+        "linux",
+        "macos",
+        "windows10",
+        "windows11"
+      ],
+      "feature_profiles": [
+        "no-default-features",
+        "default",
+        "every-promised-combination",
+        "all-features"
+      ],
+      "feature_authority": "Cargo.toml and owning crate Cargo.toml; cfg-specific cells frozen before collection",
+      "invariants": [
+        "Equivalent entry routes preserve observable behavior; ambiguity defaults to parity."
+      ],
+      "observables": [
+        "stdout",
+        "stderr",
+        "exit code",
+        "server state",
+        "hooks",
+        "frames",
+        "PTY bytes"
+      ],
+      "neighbors": [
+        "aliases",
+        "unknown names",
+        "partial errors"
+      ],
+      "references": [
+        {
+          "path": "tests/reference/tmux_compat/frozen_reference.yaml",
+          "sha256": "6b18ee8ac9a8b2730bd58bb81282fbbd71a1ae3d425459672a1374c40cc53471"
+        },
+        {
+          "path": "tests/reference/tmux_compat/divergences.toml",
+          "sha256": "a44f207a4ee3a06b19c8d8e92c93e1e5ee128f816b722d7ca1d2b98de133f365"
+        },
+        {
+          "path": "tests/scripting_sdk.rs",
+          "sha256": "fa1a5009ec9e5450ed528bc39904f340fa70fa7dd04310eca2e8c8b35971f538"
+        }
+      ],
+      "oracle_rule": "Exact tmux3.7b source/binary/case/symbol/captured bytes; a fixture repin invalidates affected observations, no PATH oracle.",
+      "product_status": "NOT_QUALIFIED_HERE"
+    },
+    {
+      "id": "configuration",
+      "owner": "L5",
+      "routes": [
+        "startup",
+        "source-file",
+        "queue",
+        "binding",
+        "CLI"
+      ],
+      "platforms": [
+        "linux",
+        "macos",
+        "windows10",
+        "windows11"
+      ],
+      "feature_profiles": [
+        "no-default-features",
+        "default",
+        "every-promised-combination",
+        "all-features"
+      ],
+      "feature_authority": "Cargo.toml and owning crate Cargo.toml; cfg-specific cells frozen before collection",
+      "invariants": [
+        "One source-file keeps initial environment and alias snapshot except bare parse-time assignments; explicit repeated -f executes twice."
+      ],
+      "observables": [
+        "state and diagnostics",
+        "effects in order"
+      ],
+      "neighbors": [
+        "fallback native identity",
+        "non-UTF8 HOME onLinux"
+      ],
+      "references": [
+        {
+          "path": "tests/acceptance_source_config_matrix.rs",
+          "sha256": "b4020043c5f83fb7b3c64814c0b7260651634aabceff5dfc3446ff39765ee54d"
+        },
+        {
+          "path": "tests/acceptance_target_format_matrix.rs",
+          "sha256": "1a484a0d62cf4744daddb349667c6edcbe238bfc3834acf06180c122f0e2bac7"
+        }
+      ],
+      "oracle_rule": "Exact tmux3.7b source/binary/case/symbol/captured bytes; a fixture repin invalidates affected observations, no PATH oracle.",
+      "product_status": "NOT_QUALIFIED_HERE"
+    },
+    {
+      "id": "runtime",
+      "owner": "L2",
+      "routes": [
+        "CLI",
+        "by-id",
+        "SDK",
+        "control-mode",
+        "binding"
+      ],
+      "platforms": [
+        "linux",
+        "macos",
+        "windows10",
+        "windows11"
+      ],
+      "feature_profiles": [
+        "no-default-features",
+        "default",
+        "every-promised-combination",
+        "all-features"
+      ],
+      "feature_authority": "Cargo.toml and owning crate Cargo.toml; cfg-specific cells frozen before collection",
+      "invariants": [
+        "Stable IDs and generations; validation then reversible application then commit then ordered unlocked fanout.",
+        "Replacement and shutdown keep deterministic ownership/cancellation."
+      ],
+      "observables": [
+        "state and IDs",
+        "events and hooks",
+        "rollback",
+        "child/PTY ownership"
+      ],
+      "neighbors": [
+        "rename/rekey",
+        "move/swap/unlink",
+        "startup failure",
+        "detach EOF/command"
+      ],
+      "references": [
+        {
+          "path": "crates/rmux-server/src/lifecycle_commit_order.rs",
+          "sha256": "511f6c316a2a74daf494ac5dde853d1062e7e356a45af6ac5f7a6e798cde7ab9"
+        },
+        {
+          "path": "tests/canonical_workflow.rs",
+          "sha256": "f4dc6ab1692d2c8ca98821e5eaede75e75b7becbdbf31e60bfc456a1649e1d52"
+        }
+      ],
+      "oracle_rule": "Exact tmux3.7b source/binary/case/symbol/captured bytes; a fixture repin invalidates affected observations, no PATH oracle. Native ownership assertions additionally required; no synthetic process evidence.",
+      "product_status": "NOT_QUALIFIED_HERE"
+    },
+    {
+      "id": "windows",
+      "owner": "L4",
+      "routes": [
+        "blocking CLI",
+        "async SDK",
+        "ConPTY",
+        "console"
+      ],
+      "platforms": [
+        "windows10",
+        "windows11"
+      ],
+      "feature_profiles": [
+        "no-default-features",
+        "default",
+        "every-promised-combination",
+        "all-features"
+      ],
+      "feature_authority": "Cargo.toml and owning crate Cargo.toml; cfg-specific cells frozen before collection",
+      "invariants": [
+        "SameSID/sameintegrity admission; differences reject without frame or replacement daemon.",
+        "Fail-closed JobObject/breakaway policy preserved."
+      ],
+      "observables": [
+        "PermissionDenied",
+        "launch/join cardinality",
+        "native handles",
+        "console restoration"
+      ],
+      "neighbors": [
+        "opposite integrity directions",
+        "sixteen synchronized callers",
+        "VT/legacy"
+      ],
+      "references": [
+        {
+          "path": "tests/windows_terminal_matrix.rs",
+          "sha256": "57525b43ed3ac5a2a81aaabdbbccca4caf1d175eb05e5b236c45144cf5e35630"
+        },
+        {
+          "path": "scripts/windows_ctrl_matrix.ps1",
+          "sha256": "aa786b87d411fd02f67d84eaaa0e546b4d12704126aa28a5ac209d7c13d8a10c"
+        }
+      ],
+      "oracle_rule": "NativeWindows10 and11 independently; no WSL/Cygwin substitution.",
+      "product_status": "NOT_QUALIFIED_HERE"
+    },
+    {
+      "id": "terminal",
+      "owner": "L4",
+      "routes": [
+        "attached client",
+        "nested attach",
+        "SSH TTY",
+        "SSH non-TTY"
+      ],
+      "platforms": [
+        "linux",
+        "macos",
+        "windows10",
+        "windows11"
+      ],
+      "feature_profiles": [
+        "no-default-features",
+        "default",
+        "every-promised-combination",
+        "all-features"
+      ],
+      "feature_authority": "Cargo.toml and owning crate Cargo.toml; cfg-specific cells frozen before collection",
+      "invariants": [
+        "Capabilities control behavior; unknown terminal gets safe minimal profile.",
+        "Unicode grapheme prefix and complete restoration."
+      ],
+      "observables": [
+        "exact byte/frame vectors",
+        "cells and cursor",
+        "modes after detach",
+        "PTY/ConPTY"
+      ],
+      "neighbors": [
+        "resize",
+        "mouse",
+        "paste",
+        "focus",
+        "unknown terminal"
+      ],
+      "references": [
+        {
+          "path": "tests/conformance/kitty_keyboard/pin.json",
+          "sha256": "aa9d9794a0bbee98ef2051232f8ec00bba402f450d7a2b6ae05af1ee4c2f9d06"
+        },
+        {
+          "path": "tests/tmux_compat_surface_matrix.rs",
+          "sha256": "6ab6f168cdbb1c39c69a05e999bc5f4e19bf615a76f26a25e515ae287e1a662f"
+        }
+      ],
+      "oracle_rule": "Exact tmux3.7b source/binary/case/symbol/captured bytes; a fixture repin invalidates affected observations, no PATH oracle. Protocol corpus authority remains separate; every promised native terminal cell is required.",
+      "product_status": "NOT_QUALIFIED_HERE"
+    },
+    {
+      "id": "sdk",
+      "owner": "L3",
+      "routes": [
+        "installed Rust consumer",
+        "blocking SDK",
+        "async SDK"
+      ],
+      "platforms": [
+        "linux",
+        "macos",
+        "windows10",
+        "windows11"
+      ],
+      "feature_profiles": [
+        "no-default-features",
+        "default",
+        "every-promised-combination",
+        "all-features"
+      ],
+      "feature_authority": "Cargo.toml and owning crate Cargo.toml; cfg-specific cells frozen before collection",
+      "invariants": [
+        "Declared stable surface and exact MSRV per promised target/features."
+      ],
+      "observables": [
+        "compile contract",
+        "typed errors",
+        "cancellation",
+        "published API"
+      ],
+      "neighbors": [
+        "no-default/default/all/powerset",
+        "minimum compiler",
+        "platform API canary"
+      ],
+      "references": [
+        {
+          "path": "docs/scripting-sdk.md",
+          "sha256": "2b83a85db3865bf9b929501612c547beb0c8b73721bbfbc4c85e234fce641395"
+        },
+        {
+          "path": "scripts/public_api_policy.py",
+          "sha256": "8aabe4646fdc06c1bfd7220303a9a158f3193507f39cbc808cd6b3b9ac9d5657"
+        }
+      ],
+      "oracle_rule": "Versioned API baseline and installed-consumer matrix; no compilation proof in phase0.",
+      "product_status": "NOT_QUALIFIED_HERE"
+    },
+    {
+      "id": "wire",
+      "owner": "L3",
+      "routes": [
+        "CLI transport",
+        "SDK transport",
+        "control-mode"
+      ],
+      "platforms": [
+        "linux",
+        "macos",
+        "windows10",
+        "windows11"
+      ],
+      "feature_profiles": [
+        "no-default-features",
+        "default",
+        "every-promised-combination",
+        "all-features"
+      ],
+      "feature_authority": "Cargo.toml and owning crate Cargo.toml; cfg-specific cells frozen before collection",
+      "invariants": [
+        "Wire version bytes and compatibility directions are explicit; unknown variant refused before effect."
+      ],
+      "observables": [
+        "frame bytes",
+        "response/code",
+        "connection fate"
+      ],
+      "neighbors": [
+        "current/historical peers",
+        "framing bounds",
+        "malformed inputs"
+      ],
+      "references": [
+        {
+          "path": "tests/conformance/control_transcript.txt",
+          "sha256": "882a27b8e4d09991cbe8d8fb48bb753b0ddc3ffd34354fd496ae4b35b1f0d193"
+        },
+        {
+          "path": "tests/conformance/control_notifications.txt",
+          "sha256": "eee2487b7db387efaa79115bad0751de565b96c4d7ab0ad4fada025ed45abd83"
+        }
+      ],
+      "oracle_rule": "Pinned wire fixtures and source version; no reinterpretation of old fixture versions.",
+      "product_status": "NOT_QUALIFIED_HERE"
+    },
+    {
+      "id": "packaging",
+      "owner": "L1",
+      "routes": [
+        "builders",
+        "installers",
+        "validators"
+      ],
+      "platforms": [
+        "linux",
+        "macos",
+        "windows10",
+        "windows11"
+      ],
+      "feature_profiles": [
+        "no-default-features",
+        "default",
+        "every-promised-combination",
+        "all-features"
+      ],
+      "feature_authority": "Cargo.toml and owning crate Cargo.toml; cfg-specific cells frozen before collection",
+      "invariants": [
+        "Common descriptor projections; preserve source/artifact identity and applicable modes."
+      ],
+      "observables": [
+        "exact paths",
+        "hashes/modes",
+        "native lifecycle at acquired scope"
+      ],
+      "neighbors": [
+        "required/missing/extra",
+        "variant",
+        "downstream adapters"
+      ],
+      "references": [
+        {
+          "path": "scripts/packaging/rmux-package-layout.json",
+          "sha256": "7853088e4e54068a137f64c26605f87411397985b6a15b58545765b6685ee569"
+        },
+        {
+          "path": "tests/package_layout_spec.py",
+          "sha256": "02e8df168fb56c4747a9a6168346e3ac8ac83711dedc755d2e57bbd5bc3d6667"
+        }
+      ],
+      "oracle_rule": "Descriptor plus independent accepted layout fixtures; old payload never relabelled current source.",
+      "product_status": "NOT_QUALIFIED_HERE"
+    },
+    {
+      "id": "web",
+      "owner": "L2",
+      "routes": [
+        "HTTP upgrade",
+        "WS handshake",
+        "authenticated mutation"
+      ],
+      "platforms": [
+        "linux",
+        "macos",
+        "windows10",
+        "windows11"
+      ],
+      "feature_profiles": [
+        "no-default-features",
+        "default",
+        "every-promised-combination",
+        "all-features"
+      ],
+      "feature_authority": "Cargo.toml and owning crate Cargo.toml; cfg-specific cells frozen before collection",
+      "invariants": [
+        "Opaque rejection, sole authenticated missing-PIN exception.",
+        "Admission/revocation linearization exact once or zero."
+      ],
+      "observables": [
+        "canonical peer transcript",
+        "close code",
+        "timing distribution",
+        "crypto freshness/distribution"
+      ],
+      "neighbors": [
+        "invalid token/origin/proof/PIN/capability",
+        "backoff states",
+        "list/lookup/stop no listener"
+      ],
+      "references": [
+        {
+          "path": "docs/specs/web-share-e2ee-protocol-v1.md",
+          "sha256": "6a72b74d0cbf9734c51b618d5220efe040c2ad908867ce2cd2dedf4b553969e9"
+        }
+      ],
+      "oracle_rule": "web-reference-profile.json defines prospective statistical contract; no measured equivalence claimed.",
+      "product_status": "NOT_QUALIFIED_HERE"
+    },
+    {
+      "id": "poison",
+      "owner": "L2",
+      "routes": [
+        "mutex acquisition",
+        "Condvar reacquisition",
+        "close/cleanup"
+      ],
+      "platforms": [
+        "linux",
+        "macos",
+        "windows10",
+        "windows11"
+      ],
+      "feature_profiles": [
+        "no-default-features",
+        "default",
+        "every-promised-combination",
+        "all-features"
+      ],
+      "feature_authority": "Cargo.toml and owning crate Cargo.toml; cfg-specific cells frozen before collection",
+      "invariants": [
+        "Never use potentially incoherent poisoned state without a reviewed repair exception."
+      ],
+      "observables": [
+        "typed error or owner-boundary panic before effect",
+        "state unchanged",
+        "poison retained"
+      ],
+      "neighbors": [
+        "wake afterpoison",
+        "closed state",
+        "nth mutation interruption"
+      ],
+      "references": [
+        {
+          "path": "crates/rmux-client/src/attach_lock_state.rs",
+          "sha256": "b6d877b1fad3b4654c28c1da358c15bd626c4460e5ae65ceeda4003a03e34df2"
+        },
+        {
+          "path": "crates/rmux-sdk/src/transport/state.rs",
+          "sha256": "86bc57857d67eecb517bb79eeef54a161bf2c0641c82f0b420f9ad3bdf4936bf"
+        }
+      ],
+      "oracle_rule": "poison-policy.json; source observations are debt inventory, not executed Rust tests.",
+      "product_status": "NOT_QUALIFIED_HERE"
+    },
+    {
+      "id": "benchmark",
+      "owner": "L5",
+      "routes": [
+        "frozen native driver"
+      ],
+      "platforms": [
+        "linux",
+        "macos",
+        "windows10",
+        "windows11"
+      ],
+      "feature_profiles": [
+        "no-default-features",
+        "default",
+        "every-promised-combination",
+        "all-features"
+      ],
+      "feature_authority": "Cargo.toml and owning crate Cargo.toml; cfg-specific cells frozen before collection",
+      "invariants": [
+        "Equivalent useful work and thermal state; preserve historical population and harness ownership."
+      ],
+      "observables": [
+        "postcondition",
+        "raw samples",
+        "CPU/RSS/tail",
+        "attempt accounting"
+      ],
+      "neighbors": [
+        "cold/warm",
+        "hidden helper",
+        "wrong artifact"
+      ],
+      "references": [
+        {
+          "path": "benches/perf/qualification/population.json",
+          "sha256": "d2608970b6830d4d8e0688a3828916d380850a5bd41addede3104df4929041c5"
+        },
+        {
+          "path": "scripts/bench/qualification.py",
+          "sha256": "01a7bbea0430dda34bb4fcef07c34d3eec2aaf171de13c97b1002cfde54466df"
+        }
+      ],
+      "oracle_rule": "Existing R5/R6 population and qualification stay authoritative; this gate does not implement their driver.",
+      "product_status": "NOT_QUALIFIED_HERE"
+    },
+    {
+      "id": "kitty",
+      "owner": "L4",
+      "routes": [
+        "codec input",
+        "codec output",
+        "negotiation",
+        "native acquisition"
+      ],
+      "platforms": [
+        "linux",
+        "macos",
+        "windows10",
+        "windows11"
+      ],
+      "feature_profiles": [
+        "no-default-features",
+        "default",
+        "every-promised-combination",
+        "all-features"
+      ],
+      "feature_authority": "Cargo.toml and owning crate Cargo.toml; cfg-specific cells frozen before collection",
+      "invariants": [
+        "Pinned Kitty obligations and vectors retain their authority/policy distinctions."
+      ],
+      "observables": [
+        "byte-for-byte vectors",
+        "state transitions",
+        "capability"
+      ],
+      "neighbors": [
+        "fallback",
+        "unknown bits",
+        "bounded recovery"
+      ],
+      "references": [
+        {
+          "path": "tests/conformance/kitty_keyboard/pin.json",
+          "sha256": "aa9d9794a0bbee98ef2051232f8ec00bba402f450d7a2b6ae05af1ee4c2f9d06"
+        },
+        {
+          "path": "tests/conformance/kitty_keyboard/obligations.jsonl",
+          "sha256": "f8d2a59c894f2d19c8a7daad15799249586909c955391e48798e8197d6d04bf7"
+        }
+      ],
+      "oracle_rule": "Existing corpus checker scope remains integrity only; no native Kitty conformance acquired.",
+      "product_status": "NOT_QUALIFIED_HERE"
+    }
+  ],
+  "classification": {
+    "values": [
+      "parity",
+      "extension",
+      "corrective-divergence",
+      "indeterminate"
+    ],
+    "indeterminate": "No corrective or product PASS; parity prevails until measured exact oracle plus independent counterproof.",
+    "legacy_divergences": "Existing59C-D IDs and statuses retained through source references; none is promoted to confirmed oracle bug by this contract.",
+    "corrective_requirements": [
+      "exact oracle source/binary/case/symbol/capture",
+      "second independent invariant/contract violation",
+      "independent RMUX expected observable",
+      "differential negative canary",
+      "all equivalent entry routes",
+      "_product_divergence suffix"
+    ]
+  },
+  "known_oracle_mismatch": {
+    "path": "tests/reference/tmux_compat/error_exit_matrix.yaml",
+    "historical_source_sha": "31d77e29b6c9fbb07d032018da78db3a8a38d979",
+    "historical_binary_sha256": "525149cdac8d41b7e60ad68c4bab0670c8b769c646bab780e2a7b66239ad83a0",
+    "current_reference_source_sha": "e802909de06012a4df6209d55e86487c56223163",
+    "current_reference_binary_sha256": "eb05f981dfc0ed55f29b7dc8e13ed838827ebca2764a9fc559ae817d9cf1acd0",
+    "disposition": "PRESERVED_STALE_ATTRIBUTION_NO_CURRENT_PARITY_CREDIT",
+    "owner": "L6 oracle/conformance; pilot repin authority"
+  },
+  "execution_receipt": {
+    "row_fields": [
+      "qualification_id",
+      "cell_id",
+      "scenario_id",
+      "risk",
+      "source_sha",
+      "artifact_sha256",
+      "command_sha256",
+      "inputs_sha256",
+      "observable_id",
+      "target",
+      "native_os",
+      "features_sha256",
+      "prerequisites_sha256",
+      "collector_sha256"
+    ],
+    "trace_fields": [
+      "qualification_id",
+      "cell_id",
+      "scenario_id",
+      "risk",
+      "source_sha",
+      "artifact_sha256",
+      "command_sha256",
+      "inputs_sha256",
+      "observable_id",
+      "target",
+      "native_os",
+      "features_sha256",
+      "prerequisites_sha256",
+      "collector_sha256",
+      "challenge_id",
+      "run_id",
+      "job_id",
+      "attempt",
+      "execution_id",
+      "started_ns",
+      "ended_ns",
+      "stdout_sha256",
+      "stderr_sha256"
+    ],
+    "qualifications": [
+      "Q1",
+      "Q2"
+    ],
+    "expected_source": "Separately frozen nonempty case/cell plan derived from these families and canonical scenario sources, not reconstructed from result selection.",
+    "challenge": "Unique256-bit challenge and plan digest issued before launch, bound to exact expected cell; copied/relabelled/retried/nonexecuted/skip receipts fail.",
+    "cardinality": "Exactly one real PASS per expected qualification\u00d7cell\u00d7ID\u00d7source\u00d7artifact\u00d7risk; Q2samecandidate/content but new challenge/run/execution trace.",
+    "proof_address": "SHA256canonical(command),inputs,artifact,rawtrace and output hashes. Same trace or execution identity cannot be counted twice.",
+    "trust_boundary": "Trusted collector signs/attests observed source/host/command/time and captures challenge in envelope. Schema checks alone cannot prove a fabricated execution occurred.",
+    "synthetic": "Pure fixtures carry synthetic=true and are refused by native evidence mode.",
+    "sharing": "One frozen expected row can declare shared_scenario_ids before challenges. Exactly one actual execution, counted once; duplicate claim or unannounced alias fails. No Q1trace may becomeQ2."
+  },
+  "product_conformance": "NOT_EVALUATED",
+  "reference_applicability": {
+    "policy_id": "L1-026.qualification-applicability.v1",
+    "path": "scripts/bench/qualification.py",
+    "historical": {
+      "commit": "80575f422b07e12f1399e54ebee5049dc65503e6",
+      "sha256": "01a7bbea0430dda34bb4fcef07c34d3eec2aaf171de13c97b1002cfde54466df"
+    },
+    "current": {
+      "commit": "6ab9c31b5d9510c95fbdf20c3646bd3956294f3c",
+      "tree": "155dd032b7a45b54d26accc19ce3c86456253792",
+      "sha256": "b77dfed425cd17b44ac17ed719db80a56e603fed25f84a72a41438c03c7555fb"
+    },
+    "review": {
+      "job_id": "R2-057",
+      "completed_at": "2026-09-27T10:11:34.380201+00:00",
+      "receipt_sha256": "941dd18a89f49c5885db9a79d169f86c0a1caccbfb1c24b74cd4e7946591fd8c"
+    },
+    "consumer": {
+      "job_id": "integrator-068",
+      "at": "2026-09-27T10:28:16.754255+00:00",
+      "receipt_sha256": "d95d5d1a7c94745e04031f64e3109e390bca79d0d90e79b611c4395e0a2151b1"
+    },
+    "qualified_base": {
+      "commit": "b73256eda197e5bf7b7d28a2fdf9c5e9631aacb4",
+      "tree": "56233e8bc2110018c5f1ae07ac45825e85fb57bf"
+    }
+  },
+  "prospective_reference_applicability": {
+    "policy_id": "L1-028.qualification-applicability.v1",
+    "path": "scripts/bench/qualification.py",
+    "previous_policy_sha256": "7285d26d2553325aafc7450f087ada1a083d77a8cd87c6bdac3aca8a713813aa",
+    "previous_current_sha256": "b77dfed425cd17b44ac17ed719db80a56e603fed25f84a72a41438c03c7555fb",
+    "candidate": {
+      "commit": "437c11c4c4f3c8dc26d544b9145f5548625eb7de",
+      "tree": "3d37747da0f7e77550be27a891f54baf1c535072",
+      "bytes": 28839,
+      "sha256": "8d49c6459ad84265da18ab080adfcbe8535ff1b92c3bbcf5373bb41eed24fe25"
+    },
+    "source_files": [
+      {
+        "path": "benches/perf/qualification/DARWIN-QUALIFICATION.md",
+        "bytes": 6420,
+        "sha256": "3ffc1c5a68ef6e44bc5db426b3c6dbb988da2193e3cc8686cc6ff1f986460e3e"
+      },
+      {
+        "path": "benches/perf/qualification/test_qualification.py",
+        "bytes": 13449,
+        "sha256": "98ff80e4e6fd228c99a8287a2cd97df375844cbfbe9cfe0dc129bb08242a382d"
+      },
+      {
+        "path": "benches/perf/qualification/native_history_canary.py",
+        "bytes": 5178,
+        "sha256": "db10ea6780304335344f413683613ed538b7d4269204c7939fefcc3db2a4a558"
+      },
+      {
+        "path": "scripts/bench/qualification.py",
+        "bytes": 28839,
+        "sha256": "8d49c6459ad84265da18ab080adfcbe8535ff1b92c3bbcf5373bb41eed24fe25"
+      },
+      {
+        "path": "scripts/bench/qualify_darwin.py",
+        "bytes": 29585,
+        "sha256": "5734dddfcfdcc5d719eed03c1fd62292e2e9ec339ba9c0167c81892aba9bc7b7"
+      },
+      {
+        "path": "scripts/bench/tool_identity.py",
+        "bytes": 24412,
+        "sha256": "efd1f5d576688ecf84c00cbecf7a0b3094ea9ce26d0af54011c872eb4d153124"
+      }
+    ],
+    "review": {
+      "job_id": "R2-071",
+      "completed_at": "2026-09-27T15:08:46.849355+00:00",
+      "receipt_sha256": "dd8d1f9c55d398be652957a8943ca3ba9aa14577c0423bec59a88a9d0e94c170"
+    },
+    "qualified_base": {
+      "commit": "9b4050b466ab8605bca5ff405441ece9bf7d8d0a",
+      "tree": "ef1c66cae4c75b7593a9612cb57ea6bb0a8c09f4"
+    },
+    "scope": "REVIEWED_SOURCE_REFERENCE_ONLY",
+    "integration": "PENDING_INDEPENDENT_APPLICABILITY_REVIEW_AND_UNIQUE_INTEGRATOR",
+    "native_credit": false
+  },
+  "packaging_reference_applicability": {
+    "policy_id": "packaging.sbom-tool-pins.v1",
+    "scope": "REFERENCE_APPLICABILITY_ONLY",
+    "path": "scripts/packaging/rmux-package-layout.json",
+    "historical_sha256": "7853088e4e54068a137f64c26605f87411397985b6a15b58545765b6685ee569",
+    "current_sha256": "102c8ba0867791364613b8c05a10b8937451342da83edc2e67394cdfa2c0013d",
+    "delta": {
+      "profiles": [
+        "linux-archive-cargo-build-closure-v1",
+        "linux-rpm-cargo-build-closure-v1",
+        "linux-deb-cargo-build-closure-v1",
+        "linux-tar-repro-cargo-build-closure-v1",
+        "linux-deb-repro-cargo-build-closure-v1",
+        "linux-rpm-repro-cargo-build-closure-v1",
+        "linux-rpm-full-repro-cargo-build-closure-v1",
+        "linux-deb-full-repro-cargo-build-closure-v1",
+        "linux-tar-full-repro-cargo-build-closure-v1"
+      ],
+      "roles": [
+        "generator",
+        "validator"
+      ],
+      "path": "scripts/packaging/sbom.py",
+      "previous_sha256": "9d065b2f82a341121461c9a918f3c9cffe5e793fcdaeac2ae44857d8250ae2ce",
+      "current_sha256": "0b6decf7e4b0461ee2af0e552112333114236ead0a497c3b5713c979338d7f40",
+      "pin_count": 18
+    },
+    "native_credit": false
+  },
+  "divergence_reference_applicability": {
+    "policy_id": "divergences.appended-entry-delta.v8",
+    "scope": "REFERENCE_APPLICABILITY_ONLY",
+    "path": "tests/reference/tmux_compat/divergences.toml",
+    "historical_source": "80575f422b07e12f1399e54ebee5049dc65503e6",
+    "historical_sha256": "a44f207a4ee3a06b19c8d8e92c93e1e5ee128f816b722d7ca1d2b98de133f365",
+    "current_sha256": "dc483eb157f74f7dfcb817a6672aa50a8f7190b850af1d59cbd72cba805c7820",
+    "integrated_changes": [
+      {
+        "commit": "68f408611e9da15117e247a8351f64ff536c095a",
+        "sha256": "0341bd13751d293ffd12b3ae45343826247bbec50d7772b00136dee52214e07a"
+      },
+      {
+        "commit": "91bb296ea6c9ce15557f4061d4f24a02cfb43a97",
+        "sha256": "3cd980389472e7e65f11e2fd69eb406f39d9e456218554181ec700a96706cadc"
+      },
+      {
+        "commit": "f02f5d698f83a338c74c2f20c430c708ea340e36",
+        "sha256": "3652c6cedbb1466dd9bcdc8ec2479a227a014afd16bb9389fa6a971f6005bf2a"
+      },
+      {
+        "commit": "d6e0acafd88104843c715c8efaf955a6a045d197",
+        "sha256": "ae8cce32cd3b8de721ef6b7cde8c17be4b54e7e21a6e11c8c6946c4cb475d7da"
+      },
+      {
+        "commit": "bf464d0567aac5dfc58e13d71bfb3a502a7e5cff",
+        "sha256": "4686531ba1ed513cbe2be5f7e261dac38aecaf19620d22930db1ea7eb38a77b3"
+      },
+      {
+        "commit": "77b1f7ca79be2e4759f0c2954d48bdc583c02524",
+        "sha256": "52cbbab6a41adaa6025243e4e5b5dbf0fc70e511ef076470ce88a1aee79c1ffc"
+      },
+      {
+        "commit": "a57d4cce8996b88a4dd195e5942a06d7b10aa41c",
+        "sha256": "c29a87badf661c6bb61e097853a58b57423794f94a394e00e5e46cbcef31d59b"
+      },
+      {
+        "commit": "eec9f8814358a598d5eaba30ba28912f9e02c2ad",
+        "sha256": "ad63d9add4f18c9c3428a450cd5a713107541c1c714c852ce039c604902246eb"
+      },
+      {
+        "commit": "4ec27dc18fe3fdf75419cdc065f806dcb946c49b",
+        "sha256": "cd22dc230a3e91a452641458dd58dfe37ed10c54f77cfe7b775b63d9a10c9da0"
+      },
+      {
+        "commit": "e5b9a6f90912cea605c253514d7887aa7ee05205",
+        "sha256": "d8c7e27de1f44abe5065ea1bec7f6e9a481e616607eb82b03581d6346c136857"
+      },
+      {
+        "commit": "7f6febd388e9e6b399d4ceccb9330ac207d799ea",
+        "sha256": "f65078f7d2ae978eb1772b811397bf0cc279daad313d0b8fd01ba38ee4764f26"
+      },
+      {
+        "commit": "ff064c20ef654e85cbbb93d299ceed891f4a811c",
+        "sha256": "2fe0611a5721c3bcb612ce87827d8f531ceaacc89f33b35cf32acde8a557fb56"
+      },
+      {
+        "commit": "d4aad8296c917f00c12c7a31c91f6f1572b4d334",
+        "sha256": "dc483eb157f74f7dfcb817a6672aa50a8f7190b850af1d59cbd72cba805c7820"
+      }
+    ],
+    "changed_ids": [
+      "C-D32",
+      "C-D36",
+      "C-D44",
+      "C-D51",
+      "C-D52",
+      "C-D55",
+      "C-D70",
+      "C-D85",
+      "C-D92"
+    ],
+    "added_ids": [
+      "C-D93",
+      "C-D94",
+      "C-D95",
+      "C-D96",
+      "C-D97"
+    ],
+    "native_credit": false
+  }
+}

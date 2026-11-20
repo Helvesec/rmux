@@ -21,7 +21,9 @@ fn smoke_config_corpus_reports_parse_only_stdout_diagnostics() -> Result<(), Box
         .arg("scripts/smoke-config-corpus.sh")
         .arg(&corpus)
         .arg("--rmux")
-        .arg(env!("CARGO_BIN_EXE_rmux"))
+        .arg(rmux_os::build_identity::cargo_binary(env!(
+            "CARGO_BIN_EXE_rmux"
+        )))
         .arg("--keep-going")
         .arg("--results")
         .arg(&results)
@@ -56,7 +58,9 @@ fn vendored_gpakosz_corpus_passes_parse_only_and_startup_fallback() -> Result<()
             .arg("scripts/smoke-config-corpus.sh")
             .arg(&corpus)
             .arg("--rmux")
-            .arg(env!("CARGO_BIN_EXE_rmux"))
+            .arg(rmux_os::build_identity::cargo_binary(env!(
+                "CARGO_BIN_EXE_rmux"
+            )))
             .arg("--mode")
             .arg(mode)
             .arg("--results")

@@ -4,52 +4,47 @@ use super::*;
 async fn live_attach_synchronize_panes_writes_to_each_live_pane() {
     let handler = RequestHandler::new();
     let alpha = session_name("alpha");
-    let requester_pid = std::process::id();
-
-    create_send_keys_test_session(&handler, &alpha).await;
-    let split = handler
-        .handle(Request::SplitWindow(SplitWindowRequest {
-            target: SplitWindowTarget::Pane(PaneTarget::new(alpha.clone(), 0)),
-            direction: SplitDirection::Horizontal,
-            before: false,
-            environment: None,
-        }))
-        .await;
-    assert!(matches!(split, Response::SplitWindow(_)));
-
-    let select_first = handler
-        .handle(Request::SelectPane(Box::new(SelectPaneRequest {
-            target: PaneTarget::with_window(alpha.clone(), 0, 0),
-            title: None,
-            style: None,
-            input_disabled: None,
-            preserve_zoom: false,
-        })))
-        .await;
-    assert!(matches!(select_first, Response::SelectPane(_)));
-
-    let set_sync = handler
-        .handle(Request::SetOption(SetOptionRequest {
-            scope: ScopeSelector::Window(WindowTarget::with_window(alpha.clone(), 0)),
-            option: OptionName::SynchronizePanes,
-            value: "on".to_owned(),
-            mode: SetOptionMode::Replace,
-        }))
-        .await;
-    assert!(matches!(set_sync, Response::SetOption(_)));
-
-    let pane_zero = PaneTarget::with_window(alpha.clone(), 0, 0);
-    let pane_one = PaneTarget::with_window(alpha.clone(), 0, 1);
-    {
+    let (requester_pid, pane_zero, pane_one) = setup_synchronized_attached_mode_captures(
+        &handler,
+        &alpha,
+        0,
+        b"\x1b[?1004h",
+        b"\x1b[?1004h",
+    )
+    .await;
+    let (pane_zero_id, pane_zero_generation, pane_one_id, pane_one_generation) = {
         let state = handler.state.lock().await;
+        let window = state.sessions.session(&alpha).unwrap().window();
+        let pane_zero_id = window.pane(0).unwrap().id();
+        let pane_one_id = window.pane(1).unwrap().id();
+        assert_ne!(pane_zero_id, pane_one_id);
+        assert_eq!(window.active_pane().unwrap().id(), pane_zero_id);
+        for target in [&pane_zero, &pane_one] {
+            assert_ne!(
+                state.transcript_handle(target).unwrap().lock().mode() & mode::MODE_FOCUSON,
+                0
+            );
+        }
+        assert_eq!(
+            state.pane_input_capture_for_test(&pane_zero),
+            Some(b"\x1b[I".to_vec())
+        );
+        assert_eq!(
+            state.pane_input_capture_for_test(&pane_one),
+            Some(Vec::new())
+        );
+        let pane_zero_generation =
+            state.pane_output_generation_for_target(&pane_zero, pane_zero_id);
+        let pane_one_generation = state.pane_output_generation_for_target(&pane_one, pane_one_id);
         state.start_pane_input_capture_for_test(&pane_zero);
         state.start_pane_input_capture_for_test(&pane_one);
-    }
-
-    let (control_tx, _control_rx) = mpsc::unbounded_channel();
-    let _attach_id = handler
-        .register_attach(requester_pid, alpha.clone(), control_tx)
-        .await;
+        (
+            pane_zero_id,
+            pane_zero_generation,
+            pane_one_id,
+            pane_one_generation,
+        )
+    };
 
     handler
         .handle_attached_live_input_for_test(requester_pid, b"sync")
@@ -57,6 +52,18 @@ async fn live_attach_synchronize_panes_writes_to_each_live_pane() {
         .expect("live attach input");
 
     let state = handler.state.lock().await;
+    let window = state.sessions.session(&alpha).unwrap().window();
+    assert_eq!(window.pane(0).unwrap().id(), pane_zero_id);
+    assert_eq!(window.pane(1).unwrap().id(), pane_one_id);
+    assert_eq!(window.active_pane().unwrap().id(), pane_zero_id);
+    assert_eq!(
+        state.pane_output_generation_for_target(&pane_zero, pane_zero_id),
+        pane_zero_generation
+    );
+    assert_eq!(
+        state.pane_output_generation_for_target(&pane_one, pane_one_id),
+        pane_one_generation
+    );
     assert_eq!(
         state.pane_input_capture_for_test(&pane_zero),
         Some(b"sync".to_vec())
@@ -79,6 +86,20 @@ async fn live_attach_synchronize_panes_keeps_terminal_responses_on_active_pane()
         b"\x1b[?1004h",
     )
     .await;
+
+    {
+        let state = handler.state.lock().await;
+        assert_eq!(
+            state.pane_input_capture_for_test(&pane_zero),
+            Some(b"\x1b[I".to_vec())
+        );
+        assert_eq!(
+            state.pane_input_capture_for_test(&pane_one),
+            Some(Vec::new())
+        );
+        state.start_pane_input_capture_for_test(&pane_zero);
+        state.start_pane_input_capture_for_test(&pane_one);
+    }
 
     let kitty_response = b"\x1b_Gi=7;OK\x1b\\";
     let mut expected = Vec::new();
@@ -110,7 +131,7 @@ async fn live_attach_synchronize_panes_keeps_terminal_responses_on_active_pane()
             .expect("pane-bound terminal response succeeds");
     }
     assert!(pending_input.is_empty());
-    expected.extend_from_slice(b"\x1b[12;34R\x1b[I");
+    expected.extend_from_slice(b"\x1b[12;34R");
 
     let state = handler.state.lock().await;
     assert_eq!(
@@ -406,6 +427,10 @@ async fn setup_synchronized_attached_mode_captures(
     create_synchronized_two_pane_session(handler, session_name).await;
     let pane_zero = PaneTarget::with_window(session_name.clone(), 0, 0);
     let pane_one = PaneTarget::with_window(session_name.clone(), 0, 1);
+    handler
+        .disable_pane_focus_reports_for_test(&pane_zero)
+        .await;
+    handler.disable_pane_focus_reports_for_test(&pane_one).await;
     {
         let mut state = handler.state.lock().await;
         state
@@ -455,4 +480,185 @@ async fn assert_per_pane_up_encoding(
         state.pane_input_capture_for_test(application_target),
         Some(application)
     );
+}
+
+#[tokio::test]
+async fn unconsumed_user_keys_never_reach_synchronized_panes() {
+    let handler = RequestHandler::new();
+    let alpha = session_name("unconsumed-user-key");
+    let (pid, pane_zero, pane_one) =
+        setup_synchronized_attached_mode_captures(&handler, &alpha, 0, b"", b"").await;
+    let (control_tx, _control_rx) = mpsc::unbounded_channel();
+    handler
+        .register_attach(pid, alpha.clone(), control_tx)
+        .await;
+    {
+        let mut state = handler.state.lock().await;
+        state
+            .options
+            .set(
+                ScopeSelector::Global,
+                OptionName::AssumePasteTime,
+                "0".to_owned(),
+                SetOptionMode::Replace,
+            )
+            .unwrap();
+        state
+            .options
+            .set_by_name(
+                rmux_proto::OptionScopeSelector::ServerGlobal,
+                "user-keys[3]",
+                Some("\x1b[901~".to_owned()),
+                SetOptionMode::Replace,
+                false,
+                false,
+                false,
+            )
+            .unwrap();
+    }
+    for synchronized in ["off", "on"] {
+        let response = handler
+            .handle(Request::SetOption(SetOptionRequest {
+                scope: ScopeSelector::Window(WindowTarget::with_window(alpha.clone(), 0)),
+                option: OptionName::SynchronizePanes,
+                value: synchronized.to_owned(),
+                mode: SetOptionMode::Replace,
+            }))
+            .await;
+        assert!(matches!(response, Response::SetOption(_)), "{response:?}");
+        for binding in [
+            None,
+            Some("bind-key -n User3 rename-window BOUND"),
+            Some("unbind-key -n User3"),
+        ] {
+            if let Some(command) = binding {
+                let parsed = rmux_core::command_parser::CommandParser::new()
+                    .parse_one_group(command)
+                    .unwrap();
+                handler
+                    .execute_parsed_commands_for_test(pid, parsed)
+                    .await
+                    .unwrap();
+            }
+            let mut pending = Vec::new();
+            handler
+                .handle_attached_live_input(pid, &mut pending, b"\x1b[90")
+                .await
+                .unwrap();
+            assert_eq!(pending, b"\x1b[90");
+            handler
+                .handle_attached_live_input(pid, &mut pending, b"1~")
+                .await
+                .unwrap();
+            assert!(pending.is_empty());
+            let state = handler.state.lock().await;
+            for target in [&pane_zero, &pane_one] {
+                assert_eq!(
+                    state.pane_input_capture_for_test(target),
+                    Some(Vec::new()),
+                    "attached User3: sync={synchronized}, binding={binding:?}, target={target}"
+                );
+            }
+            if binding == Some("bind-key -n User3 rename-window BOUND") {
+                assert_eq!(
+                    state.sessions.session(&alpha).unwrap().window().name(),
+                    Some("BOUND")
+                );
+            }
+        }
+        for request in [
+            Request::SendKeys(SendKeysRequest {
+                target: pane_zero.clone(),
+                keys: vec!["User3".into()],
+            }),
+            Request::PaneInput(rmux_proto::PaneInputRequest {
+                target: PaneTargetRef::slot(pane_zero.clone()),
+                keys: vec!["User3".into()],
+                literal: false,
+            }),
+            Request::PaneBroadcastInput(PaneBroadcastInputRequest {
+                targets: vec![
+                    PaneTargetRef::slot(pane_zero.clone()),
+                    PaneTargetRef::slot(pane_one.clone()),
+                ],
+                keys: vec!["User3".into()],
+                literal: false,
+            }),
+        ] {
+            let response = handler.handle(request).await;
+            assert!(!matches!(response, Response::Error(_)), "{response:?}");
+        }
+        for option in [OptionName::Prefix, OptionName::Prefix2] {
+            handler
+                .state
+                .lock()
+                .await
+                .options
+                .set(
+                    ScopeSelector::Global,
+                    option,
+                    "User3".to_owned(),
+                    SetOptionMode::Replace,
+                )
+                .unwrap();
+            let response = handler
+                .handle(Request::SendPrefix(SendPrefixRequest {
+                    target: Some(pane_zero.clone()),
+                    secondary: option == OptionName::Prefix2,
+                }))
+                .await;
+            assert!(matches!(response, Response::SendPrefix(_)), "{response:?}");
+        }
+        {
+            let state = handler.state.lock().await;
+            for target in [&pane_zero, &pane_one] {
+                assert_eq!(
+                    state.pane_input_capture_for_test(target),
+                    Some(Vec::new()),
+                    "API User3: sync={synchronized}, target={target}"
+                );
+            }
+        }
+        let response = handler
+            .handle(Request::SendKeys(SendKeysRequest {
+                target: pane_zero.clone(),
+                keys: vec!["a".into(), "User3".into(), "b".into()],
+            }))
+            .await;
+        assert!(matches!(response, Response::SendKeys(_)), "{response:?}");
+        let mut state = handler.state.lock().await;
+        state
+            .options
+            .set(
+                ScopeSelector::Global,
+                OptionName::Prefix,
+                "C-b".to_owned(),
+                SetOptionMode::Replace,
+            )
+            .unwrap();
+        state
+            .options
+            .set(
+                ScopeSelector::Global,
+                OptionName::Prefix2,
+                "None".to_owned(),
+                SetOptionMode::Replace,
+            )
+            .unwrap();
+        assert_eq!(
+            state.pane_input_capture_for_test(&pane_zero),
+            Some(b"ab".to_vec())
+        );
+        assert_eq!(
+            state.pane_input_capture_for_test(&pane_one),
+            Some(if synchronized == "on" {
+                b"ab".to_vec()
+            } else {
+                Vec::new()
+            })
+        );
+        for target in [&pane_zero, &pane_one] {
+            state.start_pane_input_capture_for_test(target);
+        }
+    }
 }

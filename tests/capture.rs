@@ -281,6 +281,527 @@ fn capture_pane_can_print_large_scrollback() -> Result<(), Box<dyn Error>> {
     Ok(())
 }
 
+/// Markers printed by the pane's own child around a whole-screen erase.
+///
+/// They are distinct substrings so a capture assertion cannot pass by matching
+/// a prefix of another marker.
+const SCROLL_ON_CLEAR_FIRST: &str = "soc1_scroll_on_clear_alpha_one";
+const SCROLL_ON_CLEAR_SECOND: &str = "soc1_scroll_on_clear_bravo_two";
+const SCROLL_ON_CLEAR_THIRD: &str = "soc1_scroll_on_clear_charlie_three";
+/// Written before the transfer and pushed off the screen into scrollback, so it
+/// is already history when the pane changes window. It must survive the move in
+/// both directions: that is what proves the transfer carried the existing
+/// transcript along instead of giving the pane a fresh one.
+const SCROLL_ON_CLEAR_SCROLLBACK: &str = "soc1_scroll_on_clear_zulu_scrollback";
+
+#[test]
+fn capture_pane_drops_cleared_rows_when_scroll_on_clear_is_off() -> Result<(), Box<dyn Error>> {
+    let harness = CliHarness::new("capture-scroll-on-clear-off")?;
+    let mut daemon = harness.start_hidden_daemon()?;
+
+    assert_success(&harness.run(&[
+        "new-session",
+        "-d",
+        "-s",
+        "alpha",
+        "-x",
+        "80",
+        "-y",
+        "24",
+        "sleep 60",
+    ])?);
+    assert_success(&harness.run(&[
+        "set-option",
+        "-w",
+        "-t",
+        "alpha:0",
+        "scroll-on-clear",
+        "off",
+    ])?);
+    assert_success(&harness.run(&[
+        "respawn-pane",
+        "-k",
+        "-t",
+        "alpha:0.0",
+        &scroll_on_clear_child_command(),
+    ])?);
+    let _ = wait_for_capture(&harness, SCROLL_ON_CLEAR_THIRD)?;
+
+    let rendered = capture_full_scrollback(&harness)?;
+    assert!(
+        rendered.contains(SCROLL_ON_CLEAR_THIRD),
+        "post-erase marker missing from the capture: {rendered:?}"
+    );
+    assert!(
+        !rendered.contains(SCROLL_ON_CLEAR_FIRST),
+        "scroll-on-clear off kept the first erased row in scrollback: {rendered:?}"
+    );
+    assert!(
+        !rendered.contains(SCROLL_ON_CLEAR_SECOND),
+        "scroll-on-clear off kept the second erased row in scrollback: {rendered:?}"
+    );
+
+    terminate_child(daemon.child_mut())?;
+    Ok(())
+}
+
+#[test]
+fn capture_pane_keeps_cleared_rows_when_scroll_on_clear_is_default() -> Result<(), Box<dyn Error>> {
+    let harness = CliHarness::new("capture-scroll-on-clear-default")?;
+    let mut daemon = harness.start_hidden_daemon()?;
+
+    assert_success(&harness.run(&[
+        "new-session",
+        "-d",
+        "-s",
+        "alpha",
+        "-x",
+        "80",
+        "-y",
+        "24",
+        "sleep 60",
+    ])?);
+    let shown = harness.run(&[
+        "show-options",
+        "-A",
+        "-w",
+        "-t",
+        "alpha:0",
+        "scroll-on-clear",
+    ])?;
+    assert_eq!(shown.status.code(), Some(0));
+    // Inherited from the window-global root, as measured on tmux 3.7b.
+    assert_eq!(stdout(&shown), "scroll-on-clear* on\n");
+
+    assert_success(&harness.run(&[
+        "respawn-pane",
+        "-k",
+        "-t",
+        "alpha:0.0",
+        &scroll_on_clear_child_command(),
+    ])?);
+    let _ = wait_for_capture(&harness, SCROLL_ON_CLEAR_THIRD)?;
+
+    let rendered = capture_full_scrollback(&harness)?;
+    assert!(
+        rendered.contains(SCROLL_ON_CLEAR_THIRD),
+        "post-erase marker missing from the capture: {rendered:?}"
+    );
+    assert!(
+        rendered.contains(SCROLL_ON_CLEAR_FIRST),
+        "default scroll-on-clear dropped the first erased row: {rendered:?}"
+    );
+    assert!(
+        rendered.contains(SCROLL_ON_CLEAR_SECOND),
+        "default scroll-on-clear dropped the second erased row: {rendered:?}"
+    );
+
+    terminate_child(daemon.child_mut())?;
+    Ok(())
+}
+
+#[test]
+fn capture_pane_honours_scroll_on_clear_turned_off_on_a_live_pane() -> Result<(), Box<dyn Error>> {
+    let harness = CliHarness::new("capture-scroll-on-clear-hot")?;
+    let mut daemon = harness.start_hidden_daemon()?;
+    let gate = harness.tmpdir().join("soc1-scroll-on-clear-gate");
+
+    assert_success(&harness.run(&[
+        "new-session",
+        "-d",
+        "-s",
+        "alpha",
+        "-x",
+        "80",
+        "-y",
+        "24",
+        "sleep 60",
+    ])?);
+    assert_success(&harness.run(&[
+        "respawn-pane",
+        "-k",
+        "-t",
+        "alpha:0.0",
+        &gated_scroll_on_clear_child_command(&gate),
+    ])?);
+    // The child is parked on the gate, so the option below lands on a pane that
+    // is already live and has already produced the rows the erase will decide
+    // about. Nothing is respawned after this point.
+    let _ = wait_for_capture(&harness, SCROLL_ON_CLEAR_SECOND)?;
+
+    assert_success(&harness.run(&[
+        "set-option",
+        "-p",
+        "-t",
+        "alpha:0.0",
+        "scroll-on-clear",
+        "off",
+    ])?);
+    std::fs::write(&gate, b"")?;
+    let _ = wait_for_capture(&harness, SCROLL_ON_CLEAR_THIRD)?;
+
+    let rendered = capture_full_scrollback(&harness)?;
+    assert!(
+        rendered.contains(SCROLL_ON_CLEAR_THIRD),
+        "post-erase marker missing from the capture: {rendered:?}"
+    );
+    assert!(
+        !rendered.contains(SCROLL_ON_CLEAR_FIRST),
+        "live scroll-on-clear off kept the first erased row: {rendered:?}"
+    );
+    assert!(
+        !rendered.contains(SCROLL_ON_CLEAR_SECOND),
+        "live scroll-on-clear off kept the second erased row: {rendered:?}"
+    );
+
+    terminate_child(daemon.child_mut())?;
+    Ok(())
+}
+
+#[test]
+fn capture_pane_honours_the_destination_window_scroll_on_clear_after_join_pane(
+) -> Result<(), Box<dyn Error>> {
+    let harness = CliHarness::new("capture-scroll-on-clear-join-off-to-on")?;
+    let mut daemon = harness.start_hidden_daemon()?;
+
+    let transferred = run_scroll_on_clear_transfer_journey(&harness, "off", "on", |harness| {
+        assert_success(&harness.run(&["join-pane", "-s", "alpha:0.0", "-t", "alpha:1"])?);
+        Ok(())
+    })?;
+
+    // The option system already resolves the destination policy, so anything the
+    // capture disagrees with below is the cached transcript value, not lookup.
+    assert_eq!(transferred.resolved_option, "scroll-on-clear on\n");
+    assert!(
+        transferred.rendered.contains(SCROLL_ON_CLEAR_FIRST),
+        "join-pane into an `on` window dropped the first erased row: {:?}",
+        transferred.rendered
+    );
+    assert!(
+        transferred.rendered.contains(SCROLL_ON_CLEAR_SECOND),
+        "join-pane into an `on` window dropped the second erased row: {:?}",
+        transferred.rendered
+    );
+
+    terminate_child(daemon.child_mut())?;
+    Ok(())
+}
+
+#[test]
+fn capture_pane_drops_cleared_rows_after_join_pane_into_a_scroll_on_clear_off_window(
+) -> Result<(), Box<dyn Error>> {
+    let harness = CliHarness::new("capture-scroll-on-clear-join-on-to-off")?;
+    let mut daemon = harness.start_hidden_daemon()?;
+
+    let transferred = run_scroll_on_clear_transfer_journey(&harness, "on", "off", |harness| {
+        assert_success(&harness.run(&["join-pane", "-s", "alpha:0.0", "-t", "alpha:1"])?);
+        Ok(())
+    })?;
+
+    assert_eq!(transferred.resolved_option, "scroll-on-clear off\n");
+    assert!(
+        !transferred.rendered.contains(SCROLL_ON_CLEAR_FIRST),
+        "join-pane into an `off` window kept the first erased row: {:?}",
+        transferred.rendered
+    );
+    assert!(
+        !transferred.rendered.contains(SCROLL_ON_CLEAR_SECOND),
+        "join-pane into an `off` window kept the second erased row: {:?}",
+        transferred.rendered
+    );
+
+    terminate_child(daemon.child_mut())?;
+    Ok(())
+}
+
+#[test]
+fn capture_pane_honours_the_new_window_scroll_on_clear_after_break_pane(
+) -> Result<(), Box<dyn Error>> {
+    let harness = CliHarness::new("capture-scroll-on-clear-break")?;
+    let mut daemon = harness.start_hidden_daemon()?;
+
+    let transferred = run_scroll_on_clear_transfer_journey(&harness, "off", "on", |harness| {
+        // `break-pane` only creates a window when the source window still has
+        // another pane; with a single pane it moves the whole window, options
+        // and all, which would not change the policy at all.
+        assert_success(&harness.run(&["split-window", "-d", "-t", "alpha:0.0", "sleep 60"])?);
+        assert_success(&harness.run(&["break-pane", "-d", "-s", "alpha:0.0"])?);
+        Ok(())
+    })?;
+
+    // The broken-out window is new, so it inherits the window-global `on` that
+    // `show-options -A` marks with a star, rather than the source window's `off`.
+    assert_eq!(transferred.resolved_option, "scroll-on-clear* on\n");
+    assert!(
+        transferred.rendered.contains(SCROLL_ON_CLEAR_FIRST),
+        "break-pane into an `on` window dropped the first erased row: {:?}",
+        transferred.rendered
+    );
+    assert!(
+        transferred.rendered.contains(SCROLL_ON_CLEAR_SECOND),
+        "break-pane into an `on` window dropped the second erased row: {:?}",
+        transferred.rendered
+    );
+
+    terminate_child(daemon.child_mut())?;
+    Ok(())
+}
+
+#[test]
+fn capture_pane_matches_frozen_tmux_for_scroll_on_clear_off_when_available(
+) -> Result<(), Box<dyn Error>> {
+    let harness = TmuxCompatHarness::new("capture-scroll-on-clear-tmux-compat")?;
+    let tmux_binary = match FrozenTmuxBinary::discover() {
+        FrozenTmuxBinary::Available(path) => path,
+        FrozenTmuxBinary::Unavailable {
+            checked_path,
+            reason,
+        } => {
+            eprintln!(
+                "runtime skip: frozen tmux binary unavailable via {FROZEN_TMUX_ENV} or default '{}': {reason}",
+                checked_path.display()
+            );
+            return Ok(());
+        }
+    };
+    let config = TmuxCompatRunConfig::default();
+
+    let create = harness.run_pair_with(
+        &tmux_binary,
+        &[
+            "new-session",
+            "-d",
+            "-s",
+            "alpha",
+            "-x",
+            "80",
+            "-y",
+            "24",
+            "sleep 60",
+        ],
+        config.clone(),
+    )?;
+    assert_exact_tmux_compat(&create);
+    let scroll_on_clear = harness.run_pair_with(
+        &tmux_binary,
+        &[
+            "set-window-option",
+            "-t",
+            "alpha:0",
+            "scroll-on-clear",
+            "off",
+        ],
+        config.clone(),
+    )?;
+    assert_exact_tmux_compat(&scroll_on_clear);
+
+    let child_command = scroll_on_clear_child_command();
+    let respawn = harness.run_pair_with(
+        &tmux_binary,
+        &["respawn-pane", "-k", "-t", "alpha:0.0", &child_command],
+        config.clone(),
+    )?;
+    assert_exact_tmux_compat(&respawn);
+
+    assert_capture_tmux_compat_when(
+        &harness,
+        &tmux_binary,
+        &config,
+        &[
+            "capture-pane",
+            "-p",
+            "-S",
+            "-",
+            "-E",
+            "-",
+            "-t",
+            "alpha:0.0",
+        ],
+        |run| {
+            let rendered = run.tmux.stdout_string();
+            rendered.contains(SCROLL_ON_CLEAR_THIRD) && !rendered.contains(SCROLL_ON_CLEAR_FIRST)
+        },
+        "scroll-on-clear off compatibility never observed the erased scrollback",
+    )
+}
+
+/// Builds the child command whose own `printf` emits the raw `ESC [ H` and
+/// `ESC [ 2 J` bytes around three markers.
+///
+/// The bytes deliberately come from the pane's child rather than `send-keys`
+/// (which would exercise the key encoder, not the erase path) and deliberately
+/// avoid the terminfo `clear` command, which appends `ED 3` and would erase
+/// scrollback on both sides of the policy.
+fn scroll_on_clear_child_command() -> String {
+    format!(
+        "printf '{SCROLL_ON_CLEAR_FIRST}\\n'; printf '{SCROLL_ON_CLEAR_SECOND}\\n'; \
+         printf '\\033[H\\033[2J'; printf '{SCROLL_ON_CLEAR_THIRD}\\n'; sleep 60"
+    )
+}
+
+/// The same journey, but the child parks on `gate` between the two erased rows
+/// and the erase itself, so the option can be changed on the live pane.
+fn gated_scroll_on_clear_child_command(gate: &std::path::Path) -> String {
+    let gate = gate.display();
+    format!(
+        "printf '{SCROLL_ON_CLEAR_FIRST}\\n'; printf '{SCROLL_ON_CLEAR_SECOND}\\n'; \
+         while [ ! -f '{gate}' ]; do sleep 0.05; done; \
+         printf '\\033[H\\033[2J'; printf '{SCROLL_ON_CLEAR_THIRD}\\n'; sleep 60"
+    )
+}
+
+/// The gated journey preceded by a marker that is scrolled off the 24 row screen,
+/// so the pane already owns scrollback before it is transferred.
+fn transferred_scroll_on_clear_child_command(gate: &std::path::Path) -> String {
+    let gate = gate.display();
+    format!(
+        "printf '{SCROLL_ON_CLEAR_SCROLLBACK}\\n'; \
+         i=0; while [ $i -lt 30 ]; do printf '\\n'; i=$((i+1)); done; \
+         printf '{SCROLL_ON_CLEAR_FIRST}\\n'; printf '{SCROLL_ON_CLEAR_SECOND}\\n'; \
+         while [ ! -f '{gate}' ]; do sleep 0.05; done; \
+         printf '\\033[H\\033[2J'; printf '{SCROLL_ON_CLEAR_THIRD}\\n'; sleep 60"
+    )
+}
+
+/// What the journey below observed once the erase had landed in the new window.
+struct TransferredPane {
+    rendered: String,
+    resolved_option: String,
+}
+
+/// Drives one live pane across a real transfer.
+///
+/// `alpha:0` is given `source_option` and `alpha:1` `destination_option`, then a
+/// child parks on a gate with its erase still ahead of it. `transfer` moves that
+/// live pane through the CLI, and only afterwards is the gate released, so the
+/// erase is decided entirely by the destination window's policy. The pane is
+/// addressed by `#{pane_id}` after the move because a transfer renumbers indices.
+fn run_scroll_on_clear_transfer_journey<F>(
+    harness: &CliHarness,
+    source_option: &str,
+    destination_option: &str,
+    transfer: F,
+) -> Result<TransferredPane, Box<dyn Error>>
+where
+    F: FnOnce(&CliHarness) -> Result<(), Box<dyn Error>>,
+{
+    let gate = harness.tmpdir().join("soc1-transfer-gate");
+
+    assert_success(&harness.run(&[
+        "new-session",
+        "-d",
+        "-s",
+        "alpha",
+        "-x",
+        "80",
+        "-y",
+        "24",
+        "sleep 60",
+    ])?);
+    assert_success(&harness.run(&["new-window", "-d", "-t", "alpha:", "sleep 60"])?);
+    assert_success(&harness.run(&[
+        "set-option",
+        "-w",
+        "-t",
+        "alpha:0",
+        "scroll-on-clear",
+        source_option,
+    ])?);
+    assert_success(&harness.run(&[
+        "set-option",
+        "-w",
+        "-t",
+        "alpha:1",
+        "scroll-on-clear",
+        destination_option,
+    ])?);
+    assert_success(&harness.run(&[
+        "respawn-pane",
+        "-k",
+        "-t",
+        "alpha:0.0",
+        &transferred_scroll_on_clear_child_command(&gate),
+    ])?);
+    // Parked on the gate: the pane is live, owns scrollback, and has produced the
+    // rows the erase will decide about. Nothing is respawned after this point.
+    let _ = wait_for_capture(harness, SCROLL_ON_CLEAR_SECOND)?;
+
+    let pane_id = pane_format(harness, "alpha:0.0", "#{pane_id}")?;
+    let pane_pid = pane_format(harness, "alpha:0.0", "#{pane_pid}")?;
+
+    transfer(harness)?;
+
+    assert_eq!(
+        pane_format(harness, &pane_id, "#{pane_id}")?,
+        pane_id,
+        "the transfer replaced the pane instead of moving it"
+    );
+    assert_eq!(
+        pane_format(harness, &pane_id, "#{pane_pid}")?,
+        pane_pid,
+        "the transfer respawned the child instead of moving the live runtime"
+    );
+    let window_index = pane_format(harness, &pane_id, "#{window_index}")?;
+    assert_ne!(
+        window_index, "0",
+        "the transfer left the pane in its original window"
+    );
+
+    let resolved = harness.run(&[
+        "show-options",
+        "-A",
+        "-w",
+        "-t",
+        &pane_id,
+        "scroll-on-clear",
+    ])?;
+    assert_eq!(resolved.status.code(), Some(0));
+    let resolved_option = stdout(&resolved);
+
+    // Only now does the same child emit the erase, from its new window.
+    std::fs::write(&gate, b"")?;
+    let _ = wait_for_capture_at(harness, &pane_id, SCROLL_ON_CLEAR_THIRD)?;
+    let rendered = capture_full_scrollback_at(harness, &pane_id)?;
+
+    assert!(
+        rendered.contains(SCROLL_ON_CLEAR_THIRD),
+        "post-erase marker missing from the capture: {rendered:?}"
+    );
+    assert!(
+        rendered.contains(SCROLL_ON_CLEAR_SCROLLBACK),
+        "the scrollback written before the transfer did not survive it: {rendered:?}"
+    );
+
+    Ok(TransferredPane {
+        rendered,
+        resolved_option,
+    })
+}
+
+#[track_caller]
+fn pane_format(harness: &CliHarness, target: &str, format: &str) -> Result<String, Box<dyn Error>> {
+    let output = harness.run(&["display-message", "-p", "-t", target, format])?;
+    assert_eq!(output.status.code(), Some(0));
+    assert!(stderr(&output).is_empty());
+    Ok(stdout(&output).trim().to_owned())
+}
+
+#[track_caller]
+fn capture_full_scrollback(harness: &CliHarness) -> Result<String, Box<dyn Error>> {
+    capture_full_scrollback_at(harness, "alpha:0.0")
+}
+
+#[track_caller]
+fn capture_full_scrollback_at(
+    harness: &CliHarness,
+    target: &str,
+) -> Result<String, Box<dyn Error>> {
+    let output = harness.run(&["capture-pane", "-p", "-S", "-", "-E", "-", "-t", target])?;
+    assert_eq!(output.status.code(), Some(0));
+    assert!(stderr(&output).is_empty());
+    Ok(stdout(&output))
+}
+
 #[test]
 fn capture_pane_matches_frozen_tmux_for_respawned_output_when_available(
 ) -> Result<(), Box<dyn Error>> {
@@ -495,9 +1016,17 @@ fn wait_for_capture(
     harness: &CliHarness,
     marker: &str,
 ) -> Result<std::process::Output, Box<dyn Error>> {
+    wait_for_capture_at(harness, "alpha:0.0", marker)
+}
+
+fn wait_for_capture_at(
+    harness: &CliHarness,
+    target: &str,
+    marker: &str,
+) -> Result<std::process::Output, Box<dyn Error>> {
     let mut last = None;
     for _ in 0..100 {
-        let output = harness.run(&["capture-pane", "-p", "-t", "alpha:0.0"])?;
+        let output = harness.run(&["capture-pane", "-p", "-t", target])?;
         if output.status.code() == Some(0) && stdout(&output).contains(marker) {
             return Ok(output);
         }

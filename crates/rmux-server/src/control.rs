@@ -15,7 +15,7 @@ use rmux_ipc::LocalStream;
 #[cfg(windows)]
 use rmux_proto::CONTROL_STDIN_EOF_MARKER;
 #[cfg(any(unix, windows))]
-use rmux_proto::{format_exit_line, format_guard_line, ControlGuardKind};
+use rmux_proto::{format_guard_line, ControlGuardKind};
 use rmux_proto::{ControlMode, RmuxError, SessionName, MAX_INITIAL_CONTROL_COMMANDS};
 #[cfg(any(unix, windows))]
 use std::collections::{HashMap, HashSet, VecDeque};
@@ -32,7 +32,7 @@ use std::sync::{Mutex as StdMutex, OnceLock};
 #[cfg(any(unix, windows))]
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 #[cfg(any(unix, windows))]
-use tokio::io::{AsyncReadExt, AsyncWriteExt, WriteHalf};
+use tokio::io::WriteHalf;
 #[cfg(all(test, unix))]
 use tokio::sync::Notify;
 #[cfg(any(unix, windows))]
@@ -40,35 +40,65 @@ use tokio::sync::{mpsc, watch};
 #[cfg(any(unix, windows))]
 use tokio::task::JoinHandle;
 
-#[path = "control/output_queue.rs"]
+#[cfg(any(unix, windows))]
+mod input;
+#[cfg(test)]
+use input::append_control_input;
+#[cfg(any(unix, windows))]
+use input::append_control_input_with_rejection;
+#[cfg(any(unix, windows))]
+pub(crate) use input::MAX_CONTROL_LINE_BYTES;
+#[cfg(all(test, unix))]
+use input::{extract_complete_control_lines, MAX_QUEUED_CONTROL_LINES};
+
 mod output_queue;
 #[cfg(any(unix, windows))]
 use output_queue::{ensure_control_newline, flush_output_queue, ControlOutputQueue};
 
-#[path = "control/command_numbering.rs"]
+mod pane_output_state;
+#[cfg(any(unix, windows))]
+pub(crate) use pane_output_state::{ControlPaneOutputAction, ControlPaneOutputActionKind};
+#[cfg(any(unix, windows))]
+use pane_output_state::{ControlPaneOutputRefresh, ControlPaneOutputStates};
+
+mod transport_drain;
+#[cfg(all(test, unix))]
+use transport_drain::install_control_transport_drain_pause;
+#[cfg(any(unix, windows))]
+use transport_drain::ControlTransportDrain;
+
 mod command_numbering;
 #[cfg(any(unix, windows))]
 use command_numbering::{ControlCommandNumbering, ControlCommandOrigin};
 
-#[path = "control/command_validation.rs"]
 mod command_validation;
 #[cfg(any(unix, windows))]
 use command_validation::validate_control_command_arguments;
 
-#[path = "control/subscriptions.rs"]
+mod pane_event_delivery;
 mod subscriptions;
 #[cfg(any(unix, windows))]
+use crate::pane_io::{PaneOutputAttachedClientReadDemandGuard, PaneOutputReadDemandGuard};
+#[cfg(any(unix, windows))]
+use pane_event_delivery::PaneEventSender;
+#[cfg(any(unix, windows))]
 use subscriptions::{
-    drain_ready_pane_events, handle_pane_event, refresh_subscriptions, PaneEvent, PaneSubscription,
-    PaneSubscriptionStart,
+    drain_ready_pane_events, handle_pane_event, refresh_subscription_for_pane,
+    refresh_subscriptions, PaneEvent, PaneSubscription, PaneSubscriptionStart,
+    PaneSubscriptionState,
 };
 
-#[path = "control/session_attachment.rs"]
+pub(crate) mod format_subscriptions;
+#[cfg(any(unix, windows))]
+pub(crate) use format_subscriptions::{
+    validate_control_format_definition_batch, ControlFormatLimitExceeded,
+    ControlFormatNotificationBatch, ControlFormatSubscriptions,
+};
+
 mod session_attachment;
 #[cfg(any(unix, windows))]
 use session_attachment::ControlSessionAttachment;
 
-#[path = "control/eof_completion.rs"]
 mod eof_completion;
 #[cfg(any(unix, windows))]
 use eof_completion::ControlEofCompletion;
@@ -112,47 +142,98 @@ fn control_command_is_cancel_safe_wait(command: &rmux_core::command_parser::Pars
         _ => false,
     }
 }
-#[cfg(any(unix, windows))]
-const MAX_CONTROL_LINE_BYTES: usize = 1024 * 1024;
-#[cfg(any(unix, windows))]
-const MAX_QUEUED_CONTROL_LINES: usize = 1024;
-#[cfg(any(unix, windows))]
-const MAX_QUEUED_CONTROL_BYTES: usize = 4 * 1024 * 1024;
-
-#[cfg(any(unix, windows))]
-// Keep one bounded, global post-EOF window for already accepted frames to
-// publish fast replies before falling back to the detached finite drain.
-const CONTROL_EOF_GRACE: Duration = Duration::from_millis(250);
-
-#[cfg(any(unix, windows))]
-type ControlEofTransition = Pin<Box<tokio::time::Sleep>>;
-
-#[cfg(any(unix, windows))]
-fn arm_control_eof_transition(transition: &mut Option<ControlEofTransition>) {
-    if transition.is_none() {
-        *transition = Some(Box::pin(tokio::time::sleep(CONTROL_EOF_GRACE)));
-    }
-}
-
-#[cfg(any(unix, windows))]
-async fn wait_for_control_eof_transition(transition: &mut Option<ControlEofTransition>) {
-    match transition.as_mut() {
-        Some(transition) => transition.as_mut().await,
-        None => std::future::pending().await,
-    }
-}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub(crate) struct ControlClientFlags {
     pub(crate) pause_after_millis: Option<u64>,
     pub(crate) no_output: bool,
     pub(crate) wait_exit: bool,
+    pub(crate) ignore_size: bool,
+    /// tmux's `CLIENT_READONLY` on a control client: set by `attach-session -r`
+    /// or `-f read-only`, toggled by `switch-client -r`. It refuses this
+    /// client's `send-keys` (other than `-X`); its other commands still run.
+    pub(crate) read_only: bool,
 }
 
 impl ControlClientFlags {
     #[must_use]
     pub(crate) const fn uses_extended_output(self) -> bool {
         self.pause_after_millis.is_some()
+    }
+
+    pub(crate) fn apply_flag_string(&mut self, flags: &str) {
+        for token in flags.split(',').filter(|token| !token.is_empty()) {
+            let (remove, token) = token
+                .strip_prefix('!')
+                .map_or((false, token), |token| (true, token));
+            match token {
+                "ignore-size" | "ignoresize" => self.ignore_size = !remove,
+                "no-output" => self.no_output = !remove,
+                "wait-exit" => self.wait_exit = !remove,
+                // tmux 3.7b `server_client_set_flags()` masks `!read-only` off a
+                // read-only client, so the flag string can set it but never
+                // clear it; only `switch-client -r` does.
+                "read-only" | "readonly" => self.read_only |= !remove,
+                "pause-after" => self.pause_after_millis = (!remove).then_some(0),
+                token => {
+                    let Some(seconds) = token
+                        .strip_prefix("pause-after=")
+                        .and_then(|value| value.parse::<u32>().ok())
+                    else {
+                        continue;
+                    };
+                    if !remove {
+                        self.pause_after_millis = Some(u64::from(seconds).saturating_mul(1000));
+                    } else {
+                        self.pause_after_millis = None;
+                    }
+                }
+            }
+        }
+    }
+
+    /// tmux 3.7b `switch-client -r`: a read-only client loses both
+    /// `CLIENT_READONLY` and `CLIENT_IGNORESIZE`, any other gains both.
+    pub(crate) fn toggle_read_only(&mut self) {
+        let read_only = !self.read_only;
+        self.read_only = read_only;
+        self.ignore_size = read_only;
+    }
+}
+
+/// The flag change a control-session commit applies to its client, on a
+/// prospective copy, so the geometry chosen under the same locks already
+/// counts the client with its new `ignore-size`.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(crate) enum ControlFlagChange {
+    #[default]
+    Keep,
+    /// `attach-session [-r] [-f flags]`: tmux 3.7b `cmd_attach_session()` runs
+    /// `server_client_set_flags()` on the `-f` list, then `-r` adds
+    /// `CLIENT_READONLY|CLIENT_IGNORESIZE`.
+    Attach { flags: Vec<String>, read_only: bool },
+    /// `switch-client -r`.
+    ToggleReadOnly,
+}
+
+impl ControlFlagChange {
+    pub(crate) fn apply(&self, flags: &mut ControlClientFlags) {
+        match self {
+            Self::Keep => {}
+            Self::Attach {
+                flags: values,
+                read_only,
+            } => {
+                for value in values {
+                    flags.apply_flag_string(value);
+                }
+                if *read_only {
+                    flags.read_only = true;
+                    flags.ignore_size = true;
+                }
+            }
+            Self::ToggleReadOnly => flags.toggle_read_only(),
+        }
     }
 }
 
@@ -163,6 +244,8 @@ pub(crate) enum ControlServerEvent {
         session_name: SessionName,
         pane_sequences: Vec<(u32, u64)>,
     },
+    FormatSubscriptions(Vec<String>),
+    PaneOutputActions(Vec<ControlPaneOutputAction>),
     Refresh,
     Notification(String),
     Exit(Option<String>),
@@ -182,6 +265,7 @@ pub(crate) enum ControlCommandResponseEvent {
         origin: ControlQueueCommandOrigin,
     },
     Notification(String),
+    PaneOutputActions(Vec<ControlPaneOutputAction>),
     FrameCompleted {
         stdout: Vec<u8>,
         error: Option<RmuxError>,
@@ -259,1481 +343,52 @@ pub(crate) async fn forward_control(
 }
 
 #[cfg(any(unix, windows))]
-async fn forward_control_inner(
-    stream: LocalStream,
-    handler: Arc<RequestHandler>,
-    control_identity: ControlClientIdentity,
-    upgrade_input: ControlUpgradeInput,
-    mut shutdown: watch::Receiver<()>,
-    mut server_events: mpsc::Receiver<ControlServerEvent>,
-    lifecycle: ControlLifecycle,
-) -> io::Result<()> {
-    let requester_pid = control_identity.requester_pid();
-    let control_id = control_identity.control_id();
-    let ControlUpgradeInput {
-        buffered_bytes: initial_socket_bytes,
-        initial_command_count,
-        mode,
-    } = upgrade_input;
-    validate_initial_control_command_count(initial_command_count)
-        .map_err(|error| io::Error::new(io::ErrorKind::InvalidInput, error.to_string()))?;
-    let (pane_event_tx, mut pane_event_rx) = mpsc::channel(CONTROL_PANE_EVENT_CAPACITY);
-    let (mut read_half, mut write_half) = tokio::io::split(stream);
-    let mut input_buffer = Vec::new();
-    let mut queued_lines = VecDeque::new();
-    let mut queued_input_bytes = 0_usize;
-    append_control_input(
-        &mut input_buffer,
-        &mut queued_lines,
-        &mut queued_input_bytes,
-        &initial_socket_bytes,
-    )?;
-    let mut read_buffer = [0_u8; 8192];
-    let mut shutdown_draining = shutdown.has_changed().unwrap_or(true);
-    while queued_lines.len() < initial_command_count && !shutdown_draining {
-        let bytes_read = tokio::select! {
-            biased;
-            result = shutdown.changed() => {
-                let _ = result;
-                shutdown_draining = true;
-                continue;
-            }
-            result = read_half.read(&mut read_buffer) => result?,
-        };
-        if bytes_read == 0 {
-            return Err(io::Error::new(
-                io::ErrorKind::UnexpectedEof,
-                format!(
-                    "control-mode stream closed after {} of {initial_command_count} initial commands",
-                    queued_lines.len()
-                ),
-            ));
-        }
-        append_control_input(
-            &mut input_buffer,
-            &mut queued_lines,
-            &mut queued_input_bytes,
-            &read_buffer[..bytes_read],
-        )?;
-    }
-    if shutdown_draining {
-        input_buffer.clear();
-        queued_lines.clear();
-        queued_input_bytes = 0;
-    }
-    let mut output_queue = ControlOutputQueue::default();
-    let mut subscriptions = HashMap::new();
-    let mut paused_panes = HashSet::new();
-    let mut deferred_server_events = DeferredServerEvents::default();
-    let mut input_closed = shutdown_draining;
-    let mut eof_queue_lease = None;
-    let mut eof_transition = None;
-    #[cfg(windows)]
-    let initial_stdin_eof_marker = consume_control_eof_marker(
-        &mut input_buffer,
-        &mut queued_lines,
-        &mut queued_input_bytes,
-    );
-    #[cfg(windows)]
-    if initial_stdin_eof_marker {
-        input_closed = true;
-        acquire_control_eof_queue_lease(&mut eof_queue_lease, &handler, control_identity).await;
-        arm_control_eof_transition(&mut eof_transition);
-    }
-    let mut attachment =
-        ControlSessionAttachment::new(handler.control_session_name(requester_pid).await);
-    let mut flags: ControlClientFlags = handler
-        .control_client_flags(requester_pid)
-        .await
-        .unwrap_or_default();
-    let mut current_command: Option<ActiveControlCommand> = None;
-    let mut current_response_frame: Option<ActiveControlResponseFrame> = None;
-    let mut current_response_notifications: Option<mpsc::Receiver<ControlCommandResponseEvent>> =
-        None;
-    let mut initial_command_completion_pending = false;
-    let mut eof_completion = ControlEofCompletion::default();
-    #[cfg(windows)]
-    if initial_stdin_eof_marker {
-        eof_completion.observe_stdin_eof_marker(attachment.is_attached(), !queued_lines.is_empty());
-    }
-    let mut command_numbering = if initial_command_count == 0 {
-        let initial_timestamp = unix_epoch_seconds();
-        output_queue.enqueue_line(
-            format_guard_line(ControlGuardKind::Begin, initial_timestamp, 1, 0).into_bytes(),
-            false,
-        );
-        output_queue.enqueue_line(
-            format_guard_line(ControlGuardKind::End, initial_timestamp, 1, 0).into_bytes(),
-            false,
-        );
-        ControlCommandNumbering::after_initial_ack()
-    } else {
-        ControlCommandNumbering::with_initial_commands(initial_command_count)
-    };
-
-    refresh_subscriptions(
-        &handler,
-        control_identity,
-        attachment.session_name(),
-        &mut subscriptions,
-        pane_event_tx.clone(),
-        PaneSubscriptionStart::Now,
-    )
-    .await;
-    while let Ok(event) = server_events.try_recv() {
-        let mut event_context = ServerEventContext {
-            handler: &handler,
-            control_identity,
-            requester_pid,
-            session_name: attachment.session_name_mut(),
-            subscriptions: &mut subscriptions,
-            pane_event_tx: pane_event_tx.clone(),
-            pane_event_rx: &mut pane_event_rx,
-            output_queue: &mut output_queue,
-            write_half: &mut write_half,
-            paused_panes: &mut paused_panes,
-            flags: &mut flags,
-            deferred: &mut deferred_server_events,
-        };
-        if handle_server_event(event, &mut event_context, false).await? {
-            return Ok(());
-        }
-    }
-
-    loop {
-        if !shutdown_draining && shutdown.has_changed().unwrap_or(true) {
-            shutdown_draining = true;
-            input_closed = true;
-            input_buffer.clear();
-            queued_lines.clear();
-            queued_input_bytes = 0;
-            eof_transition = None;
-            if let Some(command) = current_command.as_ref() {
-                command.eof_cancellation.cancel_for_eof();
-            }
-        }
-        if current_command.is_none() {
-            let reconcile_ready_control_events = initial_command_completion_pending
-                || (input_closed && !control_control_waits_for_attached_session(mode, &attachment));
-            let mut event_context = ServerEventContext {
-                handler: &handler,
-                control_identity,
-                requester_pid,
-                session_name: attachment.session_name_mut(),
-                subscriptions: &mut subscriptions,
-                pane_event_tx: pane_event_tx.clone(),
-                pane_event_rx: &mut pane_event_rx,
-                output_queue: &mut output_queue,
-                write_half: &mut write_half,
-                paused_panes: &mut paused_panes,
-                flags: &mut flags,
-                deferred: &mut deferred_server_events,
-            };
-            if flush_deferred_server_events(&mut event_context).await? {
-                return Ok(());
-            }
-            if reconcile_ready_control_events {
-                // A successful attach publishes its session-change event before
-                // the command task returns. When completion and both futures are
-                // ready, the biased select below deliberately observes command
-                // completion first. Reconcile the bounded snapshot of events
-                // already published before deciding whether the completed CLI
-                // batch is unattached or treating an EOF-bound client as
-                // terminal. New arrivals are left to the select, so a continuous
-                // producer cannot starve either terminal decision.
-                let ready_server_event_count = server_events.len();
-                for _ in 0..ready_server_event_count {
-                    let Ok(event) = server_events.try_recv() else {
-                        break;
-                    };
-                    if handle_server_event(event, &mut event_context, false).await? {
-                        return Ok(());
-                    }
-                }
-            }
-        }
-        eof_completion.observe_attachment(
-            attachment.is_attached(),
-            current_command.is_some() || !queued_lines.is_empty(),
-        );
-        if output_queue.is_transport_closed()
-            && input_closed
-            && current_command.is_none()
-            && queued_lines.is_empty()
-        {
-            // A terminal write failure makes an already-closed input queue
-            // reclaimable, including persistent attached `-CC`. It does not
-            // itself prove read EOF: complete frames may still be buffered in
-            // the pipe, so open input must keep draining until the read side
-            // independently closes.
-            return Ok(());
-        }
-        if shutdown_draining && current_command.is_none() {
-            output_queue.enqueue_line(
-                format_exit_line(Some("server shutting down")).into_bytes(),
-                false,
-            );
-            flush_output_queue(&mut output_queue, &mut write_half, flags, &mut paused_panes)
-                .await?;
-            return Ok(());
-        }
-        if lifecycle.closing.load(Ordering::SeqCst) && current_command.is_none() {
-            output_queue.enqueue_line(format_exit_line(None).into_bytes(), false);
-            flush_output_queue(&mut output_queue, &mut write_half, flags, &mut paused_panes)
-                .await?;
-            return Ok(());
-        }
-        if initial_command_completion_pending && current_command.is_none() {
-            initial_command_completion_pending = false;
-            if !attachment.is_attached() {
-                output_queue.enqueue_line(format_exit_line(None).into_bytes(), false);
-                flush_output_queue(&mut output_queue, &mut write_half, flags, &mut paused_panes)
-                    .await?;
-                write_half.shutdown().await?;
-                return Ok(());
-            }
-        }
-        if !shutdown_draining
-            && input_closed
-            && current_command.is_none()
-            && queued_lines.is_empty()
-            && !control_control_waits_for_attached_session(mode, &attachment)
-        {
-            // Any incomplete line remaining in input_buffer after EOF is
-            // discarded, matching tmux's `evbuffer_readln` semantics. EOF
-            // itself is promoted to a bare `%exit\n` so the control-mode
-            // transcript is terminated by a guard-tuple-free exit line,
-            // matching tmux's `server_client_control_mode` close path.
-            output_queue.enqueue_line(format_exit_line(None).into_bytes(), false);
-            flush_output_queue(&mut output_queue, &mut write_half, flags, &mut paused_panes)
-                .await?;
-            return Ok(());
-        }
-
-        while !shutdown_draining && current_command.is_none() {
-            let Some(next_line) = queued_lines.front() else {
-                break;
-            };
-            #[cfg(windows)]
-            if next_line == CONTROL_STDIN_EOF_MARKER {
-                queued_lines
-                    .pop_front()
-                    .expect("peeked control EOF marker remains queued");
-                input_closed = true;
-                acquire_control_eof_queue_lease(&mut eof_queue_lease, &handler, control_identity)
-                    .await;
-                arm_control_eof_transition(&mut eof_transition);
-                input_buffer.clear();
-                queued_lines.clear();
-                queued_input_bytes = 0;
-                eof_completion.observe_stdin_eof_marker(attachment.is_attached(), false);
-                break;
-            }
-            if next_line.is_empty() {
-                queued_lines
-                    .pop_front()
-                    .expect("peeked empty control line remains queued");
-                output_queue.enqueue_line(format_exit_line(None).into_bytes(), false);
-                flush_output_queue(&mut output_queue, &mut write_half, flags, &mut paused_panes)
-                    .await?;
-                return Ok(());
-            }
-            let parsed_commands = handler
-                .parse_control_commands(next_line)
-                .await
-                .and_then(validate_control_command_arguments);
-            let requires_drain = parsed_commands
-                .as_ref()
-                .is_ok_and(control_commands_require_drain);
-            let Some(normal_request_guard) = handler.try_begin_normal_request(requires_drain)
-            else {
-                shutdown_draining = true;
-                input_closed = true;
-                input_buffer.clear();
-                queued_lines.clear();
-                queued_input_bytes = 0;
-                eof_transition = None;
-                break;
-            };
-            let line = queued_lines
-                .pop_front()
-                .expect("admitted control command remains queued");
-            queued_input_bytes = queued_input_bytes.saturating_sub(line.len());
-
-            let timestamp = unix_epoch_seconds();
-            let command_frame = command_numbering.next_frame();
-            output_queue.enqueue_line(
-                format_guard_line(
-                    ControlGuardKind::Begin,
-                    timestamp,
-                    command_frame.number,
-                    command_frame.guard_flag,
-                )
-                .into_bytes(),
-                false,
-            );
-            flush_output_queue(&mut output_queue, &mut write_half, flags, &mut paused_panes)
-                .await?;
-
-            match parsed_commands {
-                Ok(commands) => {
-                    eof_completion.command_started(&commands);
-                    let handler = Arc::clone(&handler);
-                    let eof_cancellation = ControlQueueEofCancellation::new(control_identity);
-                    if input_closed {
-                        eof_cancellation.cancel_for_eof();
-                    }
-                    let task_eof_cancellation = eof_cancellation.clone();
-                    let (response_tx, response_rx) = mpsc::channel(CONTROL_SERVER_EVENT_CAPACITY);
-                    let response_sink = ControlCommandResponseSink::new(
-                        control_identity,
-                        response_tx,
-                        Arc::clone(&lifecycle.closing),
-                    );
-                    current_response_notifications = Some(response_rx);
-                    current_response_frame = Some(ActiveControlResponseFrame::owner());
-                    current_command = Some(ActiveControlCommand {
-                        timestamp,
-                        command_number: command_frame.number,
-                        guard_flag: command_frame.guard_flag,
-                        origin: command_frame.origin,
-                        eof_cancellation,
-                        task: Some(tokio::spawn(async move {
-                            let _normal_request_guard = normal_request_guard;
-                            with_control_command_response_sink(
-                                response_sink,
-                                with_control_queue_eof_cancellation(
-                                    task_eof_cancellation,
-                                    handler.execute_control_commands_identity(
-                                        requester_pid,
-                                        control_id,
-                                        commands,
-                                    ),
-                                ),
-                            )
-                            .await
-                        })),
-                    });
-                    if input_closed {
-                        arm_control_eof_transition(&mut eof_transition);
-                    }
-                }
-                Err(error) => {
-                    drop(normal_request_guard);
-                    output_queue.enqueue_stdout(format!("parse error: {error}").into_bytes());
-                    if drain_ready_pane_events(
-                        &mut pane_event_rx,
-                        &mut output_queue,
-                        &mut paused_panes,
-                        flags,
-                    )? {
-                        flush_output_queue(
-                            &mut output_queue,
-                            &mut write_half,
-                            flags,
-                            &mut paused_panes,
-                        )
-                        .await?;
-                        return Ok(());
-                    }
-                    output_queue.enqueue_line(
-                        format_guard_line(
-                            ControlGuardKind::Error,
-                            timestamp,
-                            command_frame.number,
-                            command_frame.guard_flag,
-                        )
-                        .into_bytes(),
-                        false,
-                    );
-                    flush_output_queue(
-                        &mut output_queue,
-                        &mut write_half,
-                        flags,
-                        &mut paused_panes,
-                    )
-                    .await?;
-                    if command_frame.origin.completes_initial_batch() {
-                        initial_command_completion_pending = true;
-                        break;
-                    }
-                }
-            }
-        }
-        if initial_command_completion_pending && current_command.is_none() {
-            continue;
-        }
-        if shutdown_draining && current_command.is_none() {
-            continue;
-        }
-        if !shutdown_draining
-            && input_closed
-            && current_command.is_none()
-            && queued_lines.is_empty()
-            && !control_control_waits_for_attached_session(mode, &attachment)
-        {
-            output_queue.enqueue_line(format_exit_line(None).into_bytes(), false);
-            flush_output_queue(&mut output_queue, &mut write_half, flags, &mut paused_panes)
-                .await?;
-            return Ok(());
-        }
-
-        tokio::select! {
-            biased;
-
-            result = shutdown.changed(), if !shutdown_draining => {
-                let _ = result;
-                shutdown_draining = true;
-                input_closed = true;
-                input_buffer.clear();
-                queued_lines.clear();
-                queued_input_bytes = 0;
-                eof_transition = None;
-                if let Some(command) = current_command.as_ref() {
-                    command.eof_cancellation.cancel_for_eof();
-                }
-            }
-            result = read_half.read(&mut read_buffer), if !input_closed && !shutdown_draining => {
-                let bytes_read = result?;
-                if bytes_read == 0 {
-                    input_closed = true;
-                    acquire_control_eof_queue_lease(
-                        &mut eof_queue_lease,
-                        &handler,
-                        control_identity,
-                    )
-                    .await;
-                    if let Some(command) = current_command.as_ref() {
-                        command.eof_cancellation.cancel_for_eof();
-                    }
-                    #[cfg(windows)]
-                    eof_completion.observe_transport_eof(
-                        attachment.is_attached(),
-                        current_command.is_some() || !queued_lines.is_empty(),
-                    );
-                    arm_control_eof_transition(&mut eof_transition);
-                } else {
-                    append_control_input(
-                        &mut input_buffer,
-                        &mut queued_lines,
-                        &mut queued_input_bytes,
-                        &read_buffer[..bytes_read],
-                    )?;
-                    #[cfg(windows)]
-                    if consume_control_eof_marker(
-                        &mut input_buffer,
-                        &mut queued_lines,
-                        &mut queued_input_bytes,
-                    ) {
-                        input_closed = true;
-                        acquire_control_eof_queue_lease(
-                            &mut eof_queue_lease,
-                            &handler,
-                            control_identity,
-                        )
-                        .await;
-                        if let Some(command) = current_command.as_ref() {
-                            command.eof_cancellation.cancel_for_eof();
-                        }
-                        eof_completion.observe_stdin_eof_marker(
-                            attachment.is_attached(),
-                            current_command.is_some() || !queued_lines.is_empty(),
-                        );
-                        arm_control_eof_transition(&mut eof_transition);
-                    }
-                }
-            }
-            Some(event) = async {
-                match current_response_notifications.as_mut() {
-                    Some(notifications) => notifications.recv().await,
-                    None => std::future::pending().await,
-                }
-            }, if current_command.is_some() => {
-                let mut event_context = ServerEventContext {
-                    handler: &handler,
-                    control_identity,
-                    requester_pid,
-                    session_name: attachment.session_name_mut(),
-                    subscriptions: &mut subscriptions,
-                    pane_event_tx: pane_event_tx.clone(),
-                    pane_event_rx: &mut pane_event_rx,
-                    output_queue: &mut output_queue,
-                    write_half: &mut write_half,
-                    paused_panes: &mut paused_panes,
-                    flags: &mut flags,
-                    deferred: &mut deferred_server_events,
-                };
-                let command = current_command
-                    .as_mut()
-                    .expect("response events belong to an active command");
-                let response_frame = current_response_frame
-                    .as_mut()
-                    .expect("active commands own response frame state");
-                if handle_control_command_response_event(
-                    event,
-                    &mut command_numbering,
-                    command,
-                    response_frame,
-                    &mut event_context,
-                )
-                .await?
-                {
-                    return Ok(());
-                }
-            }
-            result = async {
-                match current_command.as_mut() {
-                    Some(command) => match command.task.as_mut() {
-                        Some(task) => Some(task.await),
-                        None => std::future::pending().await,
-                    },
-                    None => std::future::pending().await,
-                }
-            } => {
-                let Some(task_result) = result else {
-                    continue;
-                };
-                let result = task_result
-                    .map_err(|error| io::Error::other(format!("control command task failed: {error}")))?;
-                let mut response_notifications = current_response_notifications
-                    .take()
-                    .expect("active control command owns a response channel");
-                // The typed response sender is dropped before the task joins.
-                // Drain its finite FIFO without waiting so the last child
-                // boundary is applied before command completion.
-                while let Ok(event) = response_notifications.try_recv() {
-                    let mut event_context = ServerEventContext {
-                        handler: &handler,
-                        control_identity,
-                        requester_pid,
-                        session_name: attachment.session_name_mut(),
-                        subscriptions: &mut subscriptions,
-                        pane_event_tx: pane_event_tx.clone(),
-                        pane_event_rx: &mut pane_event_rx,
-                        output_queue: &mut output_queue,
-                        write_half: &mut write_half,
-                        paused_panes: &mut paused_panes,
-                        flags: &mut flags,
-                        deferred: &mut deferred_server_events,
-                    };
-                    let command = current_command
-                        .as_mut()
-                        .expect("drained responses belong to an active command");
-                    let response_frame = current_response_frame
-                        .as_mut()
-                        .expect("active commands own response frame state");
-                    if handle_control_command_response_event(
-                        event,
-                        &mut command_numbering,
-                        command,
-                        response_frame,
-                        &mut event_context,
-                    )
-                    .await?
-                    {
-                        return Ok(());
-                    }
-                }
-                let Some(command) = current_command.take() else {
-                    continue;
-                };
-                eof_completion.command_finished();
-                let response_frame = current_response_frame
-                    .take()
-                    .expect("completed commands own response frame state");
-                let server_shutdown_started = result.server_shutdown_started;
-                if response_frame.open {
-                    if !result.stdout.is_empty() {
-                        output_queue.enqueue_stdout(result.stdout);
-                    }
-                    if drain_ready_pane_events(
-                        &mut pane_event_rx,
-                        &mut output_queue,
-                        &mut paused_panes,
-                        flags,
-                    )? {
-                        flush_output_queue(
-                            &mut output_queue,
-                            &mut write_half,
-                            flags,
-                            &mut paused_panes,
-                        )
-                        .await?;
-                        return Ok(());
-                    }
-                    enqueue_control_frame_terminal(&mut output_queue, &command, result.error);
-                }
-                flush_output_queue(&mut output_queue, &mut write_half, flags, &mut paused_panes).await?;
-                if command.origin.completes_initial_batch() {
-                    initial_command_completion_pending = true;
-                }
-                let shutdown_requested =
-                    server_shutdown_started || handler.request_shutdown_if_pending();
-                if shutdown_requested {
-                    // The listener publishes its shutdown watch on a later
-                    // scheduler turn. Stop this exact queue synchronously so a
-                    // buffered frame cannot start after kill-server.
-                    shutdown_draining = true;
-                    input_closed = true;
-                    input_buffer.clear();
-                    queued_lines.clear();
-                    queued_input_bytes = 0;
-                    eof_transition = None;
-                    lifecycle.shutdown_handle.request_shutdown();
-                } else if input_closed {
-                    arm_control_eof_transition(&mut eof_transition);
-                }
-            }
-            _ = wait_for_control_eof_transition(&mut eof_transition),
-                if !shutdown_draining
-                    && input_closed
-                    && current_command.is_some()
-                    && !mode.is_control_control()
-                    && eof_completion.allows_detached_drain_transition() =>
-            {
-                // The transport can close as soon as the active guard has
-                // been terminated, but every complete frame accepted before
-                // EOF still belongs to this exact control registration. Keep
-                // its queue lease until those finite frames have drained.
-                let deferred_exit_reason = deferred_server_events.exit_reason.take();
-                let lease = match eof_queue_lease {
-                    Some(lease) => lease,
-                    None => handler.begin_control_queue_drain(control_identity).await,
-                };
-                // Exit is terminal even when its event was consumed while the
-                // active command was still running. A missing exact
-                // registration or an already-closing lifecycle is terminal
-                // too: the Exit producer may have detached and removed this
-                // control client even when its event channel was full.
-                // Acquire the lease when possible so a same-PID replacement
-                // still waits for the active frame, but never turn its absence
-                // into a product error after the transport has reached EOF.
-                let stop_after_active = deferred_exit_reason.is_some()
-                    || lease == ControlQueueDrainLease::Unavailable
-                    || lifecycle.closing.load(Ordering::SeqCst);
-                let closed = close_active_control_command_on_eof(
-                    &mut current_command,
-                    &mut current_response_frame,
-                    &mut output_queue,
-                    &mut write_half,
-                    flags,
-                    &mut paused_panes,
-                    deferred_exit_reason
-                        .as_ref()
-                        .and_then(Option::as_deref),
-                )
-                .await;
-                #[cfg(windows)]
-                {
-                    // Tokio's named-pipe `AsyncWrite::shutdown` only flushes;
-                    // it does not half-close the duplex handle. Release both
-                    // split halves after the terminal `%exit` is flushed so
-                    // Windows clients can use transport EOF as the unambiguous
-                    // completion signal while the finite queue drains below.
-                    drop(read_half);
-                    drop(write_half);
-                }
-                let mut drain_context = EofDrainContext {
-                    server_events: &mut server_events,
-                    events_open: true,
-                    handler: &handler,
-                    control_identity,
-                    shutdown: &mut shutdown,
-                    shutdown_handle: &lifecycle.shutdown_handle,
-                };
-                let drain_result = drain_control_queue_after_eof(
-                    closed.task,
-                    &mut queued_lines,
-                    &mut queued_input_bytes,
-                    stop_after_active,
-                    &mut drain_context,
-                )
-                .await;
-                drain_result?;
-                return closed.transport_result;
-            }
-            Some(event) = server_events.recv() => {
-                let mut event_context = ServerEventContext {
-                    handler: &handler,
-                    control_identity,
-                    requester_pid,
-                    session_name: attachment.session_name_mut(),
-                    subscriptions: &mut subscriptions,
-                    pane_event_tx: pane_event_tx.clone(),
-                    pane_event_rx: &mut pane_event_rx,
-                    output_queue: &mut output_queue,
-                    write_half: &mut write_half,
-                    paused_panes: &mut paused_panes,
-                    flags: &mut flags,
-                    deferred: &mut deferred_server_events,
-                };
-                if handle_server_event(event, &mut event_context, current_command.is_some()).await?
-                {
-                    return Ok(());
-                }
-            }
-            Some(event) = pane_event_rx.recv() => {
-                let lagged =
-                    handle_pane_event(event, &mut output_queue, &mut paused_panes, flags)?;
-                flush_output_queue(&mut output_queue, &mut write_half, flags, &mut paused_panes).await?;
-                if lagged {
-                    return Ok(());
-                }
-            }
-        }
-    }
-}
+mod timing;
+#[cfg(any(unix, windows))]
+use timing::*;
 
 #[cfg(any(unix, windows))]
-fn control_control_waits_for_attached_session(
-    mode: ControlMode,
-    attachment: &ControlSessionAttachment,
-) -> bool {
-    mode.is_control_control() && attachment.is_attached()
-}
+mod read_demand;
+#[cfg(any(unix, windows))]
+use read_demand::*;
 
 #[cfg(any(unix, windows))]
-async fn acquire_control_eof_queue_lease(
-    eof_queue_lease: &mut Option<ControlQueueDrainLease>,
-    handler: &RequestHandler,
-    control_identity: ControlClientIdentity,
-) {
-    if eof_queue_lease.is_some() {
-        return;
-    }
-    *eof_queue_lease = Some(handler.begin_control_queue_drain(control_identity).await);
-    #[cfg(all(test, unix))]
-    pause_after_control_eof_queue_lease(handler, control_identity).await;
-}
-
-#[cfg(all(test, unix))]
-struct ControlEofQueueLeasePause {
-    handler: Arc<RequestHandler>,
-    identity: ControlClientIdentity,
-    reached: Notify,
-    release: Notify,
-}
-
-#[cfg(all(test, unix))]
-impl ControlEofQueueLeasePause {
-    fn matches(&self, handler: &RequestHandler, identity: ControlClientIdentity) -> bool {
-        std::ptr::eq(self.handler.as_ref(), handler) && self.identity == identity
-    }
-}
-
-#[cfg(all(test, unix))]
-struct ControlEofQueueLeasePauseGuard {
-    pause: Arc<ControlEofQueueLeasePause>,
-}
-
-#[cfg(all(test, unix))]
-impl std::ops::Deref for ControlEofQueueLeasePauseGuard {
-    type Target = ControlEofQueueLeasePause;
-
-    fn deref(&self) -> &Self::Target {
-        &self.pause
-    }
-}
-
-#[cfg(all(test, unix))]
-impl Drop for ControlEofQueueLeasePauseGuard {
-    fn drop(&mut self) {
-        let Some(pauses) = CONTROL_EOF_QUEUE_LEASE_PAUSES.get() else {
-            return;
-        };
-        let mut installed = pauses.lock().expect("control EOF queue lease pause");
-        if let Some(index) = installed
-            .iter()
-            .position(|pause| Arc::ptr_eq(pause, &self.pause))
-        {
-            installed.swap_remove(index);
-        }
-    }
-}
-
-#[cfg(all(test, unix))]
-static CONTROL_EOF_QUEUE_LEASE_PAUSES: OnceLock<StdMutex<Vec<Arc<ControlEofQueueLeasePause>>>> =
-    OnceLock::new();
-
-#[cfg(all(test, unix))]
-fn install_control_eof_queue_lease_pause(
-    handler: &Arc<RequestHandler>,
-    identity: ControlClientIdentity,
-) -> ControlEofQueueLeasePauseGuard {
-    let pause = Arc::new(ControlEofQueueLeasePause {
-        handler: Arc::clone(handler),
-        identity,
-        reached: Notify::new(),
-        release: Notify::new(),
-    });
-    let mut installed = CONTROL_EOF_QUEUE_LEASE_PAUSES
-        .get_or_init(|| StdMutex::new(Vec::new()))
-        .lock()
-        .expect("control EOF queue lease pause");
-    let duplicate = installed
-        .iter()
-        .any(|installed| installed.matches(handler, identity));
-    if !duplicate {
-        installed.push(Arc::clone(&pause));
-    }
-    drop(installed);
-    assert!(
-        !duplicate,
-        "only one control EOF queue lease pause may be installed per handler and identity"
-    );
-    ControlEofQueueLeasePauseGuard { pause }
-}
-
-#[cfg(all(test, unix))]
-async fn pause_after_control_eof_queue_lease(
-    handler: &RequestHandler,
-    identity: ControlClientIdentity,
-) {
-    let pause = {
-        let mut installed = CONTROL_EOF_QUEUE_LEASE_PAUSES
-            .get_or_init(|| StdMutex::new(Vec::new()))
-            .lock()
-            .expect("control EOF queue lease pause");
-        installed
-            .iter()
-            .position(|pause| pause.matches(handler, identity))
-            .map(|index| installed.swap_remove(index))
-    };
-    if let Some(pause) = pause {
-        pause.reached.notify_one();
-        pause.release.notified().await;
-    }
-}
+mod eof;
+#[cfg(any(unix, windows))]
+use eof::*;
 
 #[cfg(any(unix, windows))]
-struct ClosedControlCommand {
-    task: Option<JoinHandle<ControlCommandResult>>,
-    transport_result: io::Result<()>,
-}
+mod server_events;
+#[cfg(any(unix, windows))]
+use server_events::*;
 
 #[cfg(any(unix, windows))]
-async fn close_active_control_command_on_eof(
-    current_command: &mut Option<ActiveControlCommand>,
-    current_response_frame: &mut Option<ActiveControlResponseFrame>,
-    output_queue: &mut ControlOutputQueue,
-    write_half: &mut WriteHalf<LocalStream>,
-    flags: ControlClientFlags,
-    paused_panes: &mut HashSet<u32>,
-    exit_reason: Option<&str>,
-) -> ClosedControlCommand {
-    let Some(mut command) = current_command.take() else {
-        *current_response_frame = None;
-        return ClosedControlCommand {
-            task: None,
-            transport_result: Ok(()),
-        };
-    };
-    let response_frame = current_response_frame
-        .take()
-        .expect("active commands own response frame state");
-    if response_frame.open {
-        output_queue.enqueue_line(
-            format_guard_line(
-                ControlGuardKind::End,
-                command.timestamp,
-                command.command_number,
-                command.guard_flag,
-            )
-            .into_bytes(),
-            false,
-        );
-    }
-    output_queue.enqueue_line(format_exit_line(exit_reason).into_bytes(), false);
-    command.eof_cancellation.cancel_for_eof();
-    let task = command.task.take();
-    drop(command);
-    let transport_result = async {
-        flush_output_queue(output_queue, write_half, flags, paused_panes).await?;
-        write_half.shutdown().await
-    }
-    .await;
-    ClosedControlCommand {
-        task,
-        transport_result,
-    }
-}
+mod response_events;
+#[cfg(any(unix, windows))]
+use response_events::*;
 
 #[cfg(any(unix, windows))]
-struct EofDrainContext<'a> {
-    server_events: &'a mut mpsc::Receiver<ControlServerEvent>,
-    events_open: bool,
-    handler: &'a Arc<RequestHandler>,
-    control_identity: ControlClientIdentity,
-    shutdown: &'a mut watch::Receiver<()>,
-    shutdown_handle: &'a ShutdownHandle,
-}
+mod event_state;
+#[cfg(any(unix, windows))]
+use event_state::*;
 
 #[cfg(any(unix, windows))]
-async fn drain_control_queue_after_eof(
-    active_task: Option<JoinHandle<ControlCommandResult>>,
-    queued_lines: &mut VecDeque<String>,
-    queued_input_bytes: &mut usize,
-    stop_after_active: bool,
-    context: &mut EofDrainContext<'_>,
-) -> io::Result<()> {
-    let active_requested_stop = match active_task {
-        Some(task) => drain_control_command_after_eof(task, context).await?,
-        None => context.shutdown.has_changed().unwrap_or(true),
-    };
-    let mut stop = stop_after_active || active_requested_stop;
-
-    while !stop {
-        if context.shutdown.has_changed().unwrap_or(true) {
-            break;
-        }
-        let Some(line) = queued_lines.pop_front() else {
-            break;
-        };
-        *queued_input_bytes = queued_input_bytes.saturating_sub(line.len());
-        #[cfg(windows)]
-        if line == CONTROL_STDIN_EOF_MARKER {
-            break;
-        }
-        if line.is_empty() {
-            break;
-        }
-
-        let commands = match context
-            .handler
-            .parse_control_commands(&line)
-            .await
-            .and_then(validate_control_command_arguments)
-        {
-            Ok(commands) => commands,
-            // The transport has already received its terminal %exit, so a
-            // queued parse error has nowhere to be reported. It behaves like
-            // the live queue: this frame fails without suppressing later
-            // complete frames.
-            Err(_) => continue,
-        };
-        let Some(normal_request_guard) = context
-            .handler
-            .try_begin_normal_request(control_commands_require_drain(&commands))
-        else {
-            break;
-        };
-        let handler_for_command = Arc::clone(context.handler);
-        let control_identity = context.control_identity;
-        let eof_cancellation = ControlQueueEofCancellation::new(control_identity);
-        eof_cancellation.cancel_for_eof();
-        let task = tokio::spawn(async move {
-            let _normal_request_guard = normal_request_guard;
-            with_control_queue_eof_cancellation(
-                eof_cancellation,
-                handler_for_command.execute_control_commands_identity(
-                    control_identity.requester_pid(),
-                    control_identity.control_id(),
-                    commands,
-                ),
-            )
-            .await
-        });
-        stop = drain_control_command_after_eof(task, context).await?;
-    }
-
-    queued_lines.clear();
-    *queued_input_bytes = 0;
-    Ok(())
-}
+mod active_command;
+#[cfg(any(unix, windows))]
+use active_command::*;
 
 #[cfg(any(unix, windows))]
-async fn drain_control_command_after_eof(
-    mut task: JoinHandle<ControlCommandResult>,
-    context: &mut EofDrainContext<'_>,
-) -> io::Result<bool> {
-    let mut exit_received = false;
-    let result = loop {
-        tokio::select! {
-            biased;
-
-            result = &mut task => break result,
-            event = context.server_events.recv(), if context.events_open => {
-                match event {
-                    Some(ControlServerEvent::Exit(_)) => exit_received = true,
-                    Some(_) => {}
-                    None => context.events_open = false,
-                }
-            }
-        }
-    };
-    let result = result
-        .map_err(|error| io::Error::other(format!("control command task failed: {error}")))?;
-    // The command result and its terminal Exit event can become ready in the
-    // same scheduler turn. Explicitly drain events emitted before task
-    // completion so a later queued frame cannot run after client exit.
-    while context.events_open {
-        match context.server_events.try_recv() {
-            Ok(ControlServerEvent::Exit(_)) => exit_received = true,
-            Ok(_) => {}
-            Err(mpsc::error::TryRecvError::Empty) => break,
-            Err(mpsc::error::TryRecvError::Disconnected) => {
-                context.events_open = false;
-            }
-        }
-    }
-    if context.shutdown.has_changed().unwrap_or(true) {
-        return Ok(true);
-    }
-    let shutdown_requested =
-        result.server_shutdown_started || context.handler.request_shutdown_if_pending();
-    if shutdown_requested {
-        context.shutdown_handle.request_shutdown();
-    }
-    // A terminal action in the command can mark the client closing while the
-    // event channel is full. In that case no Exit reaches this receiver, so
-    // revalidate after the task joins rather than relying on the closing
-    // snapshot taken before the active frame.
-    let registration_closed = !context
-        .handler
-        .control_queue_identity_is_open(context.control_identity)
-        .await;
-    Ok(exit_received || shutdown_requested || registration_closed)
-}
-
+mod transport;
 #[cfg(any(unix, windows))]
-async fn handle_server_event(
-    event: ControlServerEvent,
-    context: &mut ServerEventContext<'_>,
-    command_active: bool,
-) -> io::Result<bool> {
-    match event {
-        ControlServerEvent::SessionChanged(next_session) => {
-            if command_active {
-                context.deferred.defer_session_change(next_session, None);
-                return Ok(false);
-            }
-            *context.session_name = next_session;
-            refresh_subscriptions(
-                context.handler,
-                context.control_identity,
-                context.session_name.as_ref(),
-                context.subscriptions,
-                context.pane_event_tx.clone(),
-                PaneSubscriptionStart::Oldest,
-            )
-            .await;
-        }
-        ControlServerEvent::SessionChangedAt {
-            session_name: next_session,
-            pane_sequences,
-        } => {
-            if command_active {
-                context
-                    .deferred
-                    .defer_session_change(Some(next_session), Some(pane_sequences));
-                return Ok(false);
-            }
-            *context.session_name = Some(next_session);
-            refresh_subscriptions(
-                context.handler,
-                context.control_identity,
-                context.session_name.as_ref(),
-                context.subscriptions,
-                context.pane_event_tx.clone(),
-                PaneSubscriptionStart::Sequences(&pane_sequences),
-            )
-            .await;
-        }
-        ControlServerEvent::Refresh => {
-            refresh_subscriptions(
-                context.handler,
-                context.control_identity,
-                context.session_name.as_ref(),
-                context.subscriptions,
-                context.pane_event_tx.clone(),
-                PaneSubscriptionStart::Oldest,
-            )
-            .await;
-        }
-        ControlServerEvent::Notification(line) => {
-            if command_active || context.deferred.exit_reason.is_some() {
-                context.deferred.defer_notification(line);
-                return Ok(false);
-            }
-            if write_control_notification(line, context).await? {
-                return Ok(true);
-            }
-        }
-        ControlServerEvent::Exit(reason) => {
-            if command_active || !context.deferred.notifications.is_empty() {
-                context.deferred.exit_reason = Some(reason);
-                return Ok(false);
-            }
-            context
-                .output_queue
-                .enqueue_line(format_exit_line(reason.as_deref()).into_bytes(), false);
-            flush_output_queue(
-                context.output_queue,
-                context.write_half,
-                *context.flags,
-                context.paused_panes,
-            )
-            .await?;
-            return Ok(true);
-        }
-    }
-
-    *context.flags = context
-        .handler
-        .control_client_flags(context.requester_pid)
-        .await
-        .unwrap_or(*context.flags);
-    Ok(false)
-}
-
+use transport_state::forward_control_inner;
 #[cfg(any(unix, windows))]
-async fn write_control_notification(
-    line: String,
-    context: &mut ServerEventContext<'_>,
-) -> io::Result<bool> {
-    if drain_ready_pane_events(
-        context.pane_event_rx,
-        context.output_queue,
-        context.paused_panes,
-        *context.flags,
-    )? {
-        flush_output_queue(
-            context.output_queue,
-            context.write_half,
-            *context.flags,
-            context.paused_panes,
-        )
-        .await?;
-        return Ok(true);
-    }
-    context
-        .output_queue
-        .enqueue_line(ensure_control_newline(line.into_bytes()), false);
-    flush_output_queue(
-        context.output_queue,
-        context.write_half,
-        *context.flags,
-        context.paused_panes,
-    )
-    .await?;
-    Ok(false)
-}
-
+mod transport_commands;
 #[cfg(any(unix, windows))]
-async fn handle_control_command_response_event(
-    event: ControlCommandResponseEvent,
-    numbering: &mut ControlCommandNumbering,
-    command: &mut ActiveControlCommand,
-    response_frame: &mut ActiveControlResponseFrame,
-    context: &mut ServerEventContext<'_>,
-) -> io::Result<bool> {
-    match event {
-        ControlCommandResponseEvent::Notification(line) => {
-            if !response_frame.open {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    "control response notification has no open owner guard",
-                ));
-            }
-            write_control_notification(line, context).await
-        }
-        ControlCommandResponseEvent::FrameStarted { origin } => {
-            if response_frame.open {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    format!(
-                        "synchronous {origin:?} child started before its owner guard completed"
-                    ),
-                ));
-            }
-            command.timestamp = unix_epoch_seconds();
-            command.command_number = numbering.next_synchronous_child_number();
-            response_frame.open = true;
-            response_frame.origin = Some(origin);
-            context.output_queue.enqueue_line(
-                format_guard_line(
-                    ControlGuardKind::Begin,
-                    command.timestamp,
-                    command.command_number,
-                    command.guard_flag,
-                )
-                .into_bytes(),
-                false,
-            );
-            flush_output_queue(
-                context.output_queue,
-                context.write_half,
-                *context.flags,
-                context.paused_panes,
-            )
-            .await?;
-            Ok(false)
-        }
-        ControlCommandResponseEvent::FrameCompleted { stdout, error } => {
-            if !response_frame.open {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    "control response completed without an open owner guard",
-                ));
-            }
-            if !stdout.is_empty() {
-                context.output_queue.enqueue_stdout(stdout);
-            }
-            if drain_ready_pane_events(
-                context.pane_event_rx,
-                context.output_queue,
-                context.paused_panes,
-                *context.flags,
-            )? {
-                flush_output_queue(
-                    context.output_queue,
-                    context.write_half,
-                    *context.flags,
-                    context.paused_panes,
-                )
-                .await?;
-                return Ok(true);
-            }
-            enqueue_control_frame_terminal(context.output_queue, command, error);
-            response_frame.open = false;
-            let _completed_origin = response_frame.origin.take();
-            flush_output_queue(
-                context.output_queue,
-                context.write_half,
-                *context.flags,
-                context.paused_panes,
-            )
-            .await?;
-            Ok(false)
-        }
-    }
-}
-
+mod transport_completion;
 #[cfg(any(unix, windows))]
-fn enqueue_control_frame_terminal(
-    output_queue: &mut ControlOutputQueue,
-    command: &ActiveControlCommand,
-    error: Option<RmuxError>,
-) {
-    let terminal = match error {
-        Some(error) => {
-            output_queue.enqueue_stdout(error.to_string().into_bytes());
-            ControlGuardKind::Error
-        }
-        None => ControlGuardKind::End,
-    };
-    output_queue.enqueue_line(
-        format_guard_line(
-            terminal,
-            command.timestamp,
-            command.command_number,
-            command.guard_flag,
-        )
-        .into_bytes(),
-        false,
-    );
-}
-
+mod transport_eof;
 #[cfg(any(unix, windows))]
-async fn flush_deferred_server_events(context: &mut ServerEventContext<'_>) -> io::Result<bool> {
-    while let Some(line) = context.deferred.pop_notification() {
-        if handle_server_event(ControlServerEvent::Notification(line), context, false).await? {
-            return Ok(true);
-        }
-    }
-
-    if let Some(DeferredSessionChange {
-        session_name,
-        pane_sequences,
-    }) = context.deferred.session_change.take()
-    {
-        let event = match (session_name, pane_sequences) {
-            (Some(session_name), Some(pane_sequences)) => ControlServerEvent::SessionChangedAt {
-                session_name,
-                pane_sequences,
-            },
-            (next_session, None) => ControlServerEvent::SessionChanged(next_session),
-            (None, Some(_)) => unreachable!("pane cursors require a control session"),
-        };
-        if handle_server_event(event, context, false).await? {
-            return Ok(true);
-        }
-    }
-
-    if let Some(reason) = context.deferred.exit_reason.take() {
-        return handle_server_event(ControlServerEvent::Exit(reason), context, false).await;
-    }
-
-    Ok(false)
-}
-
-#[cfg(any(unix, windows))]
-struct ServerEventContext<'a> {
-    handler: &'a RequestHandler,
-    control_identity: ControlClientIdentity,
-    requester_pid: u32,
-    session_name: &'a mut Option<SessionName>,
-    subscriptions: &'a mut HashMap<u32, PaneSubscription>,
-    pane_event_tx: mpsc::Sender<PaneEvent>,
-    pane_event_rx: &'a mut mpsc::Receiver<PaneEvent>,
-    output_queue: &'a mut ControlOutputQueue,
-    write_half: &'a mut WriteHalf<LocalStream>,
-    paused_panes: &'a mut HashSet<u32>,
-    flags: &'a mut ControlClientFlags,
-    deferred: &'a mut DeferredServerEvents,
-}
-
-#[derive(Debug, Default)]
-#[cfg(any(unix, windows))]
-struct DeferredServerEvents {
-    notifications: VecDeque<String>,
-    notification_bytes: usize,
-    session_change: Option<DeferredSessionChange>,
-    exit_reason: Option<Option<String>>,
-}
-
-#[derive(Debug)]
-#[cfg(any(unix, windows))]
-struct DeferredSessionChange {
-    session_name: Option<SessionName>,
-    pane_sequences: Option<Vec<(u32, u64)>>,
-}
-
-#[cfg(any(unix, windows))]
-impl DeferredServerEvents {
-    fn defer_notification(&mut self, line: String) {
-        if self.exit_reason.is_some() {
-            return;
-        }
-        let next_bytes = self.notification_bytes.saturating_add(line.len());
-        if self.notifications.len() >= MAX_DEFERRED_CONTROL_NOTIFICATIONS
-            || next_bytes > MAX_DEFERRED_CONTROL_NOTIFICATION_BYTES
-        {
-            self.notifications.clear();
-            self.notification_bytes = 0;
-            self.exit_reason = Some(Some("control notification queue exceeded".to_owned()));
-            return;
-        }
-        self.notification_bytes = next_bytes;
-        self.notifications.push_back(line);
-    }
-
-    fn pop_notification(&mut self) -> Option<String> {
-        let line = self.notifications.pop_front()?;
-        self.notification_bytes = self.notification_bytes.saturating_sub(line.len());
-        Some(line)
-    }
-
-    fn defer_session_change(
-        &mut self,
-        next_session: Option<SessionName>,
-        pane_sequences: Option<Vec<(u32, u64)>>,
-    ) {
-        if self.exit_reason.is_some() {
-            return;
-        }
-        self.session_change = Some(DeferredSessionChange {
-            session_name: next_session,
-            pane_sequences,
-        });
-    }
-}
-
-#[derive(Debug)]
-#[cfg(any(unix, windows))]
-struct ActiveControlResponseFrame {
-    open: bool,
-    origin: Option<ControlQueueCommandOrigin>,
-}
-
-#[cfg(any(unix, windows))]
-impl ActiveControlResponseFrame {
-    const fn owner() -> Self {
-        Self {
-            open: true,
-            origin: None,
-        }
-    }
-}
-
-#[derive(Debug)]
-#[cfg(any(unix, windows))]
-struct ActiveControlCommand {
-    timestamp: i64,
-    command_number: u64,
-    guard_flag: u8,
-    origin: ControlCommandOrigin,
-    eof_cancellation: ControlQueueEofCancellation,
-    task: Option<JoinHandle<ControlCommandResult>>,
-}
-
-#[cfg(any(unix, windows))]
-impl Drop for ActiveControlCommand {
-    fn drop(&mut self) {
-        if let Some(task) = self.task.as_ref() {
-            if !task.is_finished() {
-                task.abort();
-            }
-        }
-    }
-}
-
-#[cfg(any(unix, windows))]
-fn extract_complete_control_lines(buffer: &mut Vec<u8>) -> Vec<String> {
-    let mut lines = Vec::new();
-
-    while let Some(position) = buffer.iter().position(|byte| *byte == b'\n') {
-        let mut line = buffer.drain(..=position).collect::<Vec<_>>();
-        if matches!(line.last(), Some(b'\n')) {
-            let _ = line.pop();
-        }
-        if matches!(line.last(), Some(b'\r')) {
-            let _ = line.pop();
-        }
-        lines.push(String::from_utf8_lossy(&line).into_owned());
-    }
-
-    lines
-}
-
-#[cfg(any(unix, windows))]
-fn append_control_input(
-    input_buffer: &mut Vec<u8>,
-    queued_lines: &mut VecDeque<String>,
-    queued_input_bytes: &mut usize,
-    bytes: &[u8],
-) -> io::Result<()> {
-    input_buffer.extend_from_slice(bytes);
-    let lines = extract_complete_control_lines(input_buffer);
-    if input_buffer.len() > MAX_CONTROL_LINE_BYTES {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            format!("control input line exceeds {MAX_CONTROL_LINE_BYTES} bytes without a newline"),
-        ));
-    }
-    for line in lines {
-        if line.len() > MAX_CONTROL_LINE_BYTES {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                format!("control input line exceeds {MAX_CONTROL_LINE_BYTES} bytes"),
-            ));
-        }
-        let next_line_count = queued_lines.len().saturating_add(1);
-        let next_byte_count = queued_input_bytes.saturating_add(line.len());
-        if next_line_count > MAX_QUEUED_CONTROL_LINES || next_byte_count > MAX_QUEUED_CONTROL_BYTES
-        {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                format!(
-                    "control input queue exceeds {MAX_QUEUED_CONTROL_LINES} lines or {MAX_QUEUED_CONTROL_BYTES} bytes"
-                ),
-            ));
-        }
-        *queued_input_bytes = next_byte_count;
-        queued_lines.push_back(line);
-    }
-    Ok(())
-}
+mod transport_state;
 
 #[cfg(windows)]
 fn consume_control_eof_marker(

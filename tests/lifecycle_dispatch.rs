@@ -4,7 +4,6 @@ mod common;
 
 use std::error::Error;
 use std::fs;
-use std::os::unix::fs::PermissionsExt;
 use std::time::{Duration, Instant};
 
 use common::{assert_success, stdout, CliHarness};
@@ -21,7 +20,7 @@ fn slow_lifecycle_hook_does_not_drop_a_large_burst() -> Result<(), Box<dyn Error
     let hook_path = harness.tmpdir().join("slow-hook.sh");
     let event_path = state_dir.join("events.log");
     let started_path = state_dir.join("started");
-    fs::write(
+    common::executable_fixture::write_executable(
         &hook_path,
         format!(
             "#!/bin/sh\nset -eu\nmkdir -p '{state}'\nif mkdir '{state}/first' 2>/dev/null; then : > '{started}'; sleep 1; fi\nprintf 'event\\n' >> '{events}'\n",
@@ -29,10 +28,8 @@ fn slow_lifecycle_hook_does_not_drop_a_large_burst() -> Result<(), Box<dyn Error
             started = started_path.display(),
             events = event_path.display(),
         ),
+        0o700,
     )?;
-    let mut permissions = fs::metadata(&hook_path)?.permissions();
-    permissions.set_mode(0o700);
-    fs::set_permissions(&hook_path, permissions)?;
 
     let config_path = harness.tmpdir().join("lifecycle-burst.conf");
     let config = (1..=BURST_EVENTS)
@@ -76,16 +73,14 @@ fn kill_server_drains_accepted_session_closed_hooks() -> Result<(), Box<dyn Erro
     let _daemon = harness.start_hidden_daemon()?;
     let hook_path = harness.tmpdir().join("session-closed-hook.sh");
     let event_path = harness.tmpdir().join("session-closed.log");
-    fs::write(
+    common::executable_fixture::write_executable(
         &hook_path,
         format!(
             "#!/bin/sh\nset -eu\nsleep 0.02\nprintf 'closed\\n' >> '{}'\n",
             event_path.display(),
         ),
+        0o700,
     )?;
-    let mut permissions = fs::metadata(&hook_path)?.permissions();
-    permissions.set_mode(0o700);
-    fs::set_permissions(&hook_path, permissions)?;
 
     for index in 0..CLOSED_SESSIONS {
         assert_success(&harness.run(&[
@@ -142,6 +137,76 @@ fn kill_server_cancels_wait_for_inside_accepted_session_closed_hook() -> Result<
         std::thread::sleep(Duration::from_millis(20));
     }
 
+    Ok(())
+}
+
+#[test]
+fn a_session_closed_hook_calling_the_server_back_does_not_hold_its_stop(
+) -> Result<(), Box<dyn Error>> {
+    // tmux 3.7b, measured with this hook and no client attached: kill-server
+    // runs the hook, whose server-starting call fails at once with
+    // "server exited unexpectedly" (rc=1), and the server dies within about
+    // 100 ms; SIGTERM and SIGINT never start the hook. A call left waiting on
+    // the stopping server's endpoint held its stop for the whole 5 s
+    // lifecycle-hook grace, then lost the end of the hook.
+    const PROMPT_STOP: Duration = Duration::from_millis(2500);
+    for stop in ["kill-server", "-TERM", "-INT"] {
+        let harness = CliHarness::new("lifecycle-dispatch-stop-hook-callback")?;
+        let mut daemon = harness.start_hidden_daemon()?;
+        assert_success(&harness.run(&["new-session", "-d", "-s", "alpha", "sleep 30"])?);
+        let hook_log = harness.tmpdir().join("session-closed.log");
+        let hook_script = harness.tmpdir().join("session-closed.sh");
+        fs::write(
+            &hook_script,
+            format!(
+                "echo start >> '{log}'\n\
+                 '{rmux}' -S '{socket}' new-session -d -s zombie >> '{log}' 2>&1\n\
+                 echo \"rc=$?\" >> '{log}'\n",
+                rmux = harness.base_command().get_program().to_string_lossy(),
+                socket = harness.socket_path().display(),
+                log = hook_log.display(),
+            ),
+        )?;
+        let hook = format!("run-shell 'sh {}'", hook_script.display());
+        assert_success(&harness.run(&["set-hook", "-g", "session-closed", &hook])?);
+
+        let stopped_at = Instant::now();
+        if stop == "kill-server" {
+            assert_success(&harness.run(&["kill-server"])?);
+        } else {
+            // The signal goes to the daemon this test started and still owns.
+            let signalled = std::process::Command::new("kill")
+                .args([stop, &daemon.pid().to_string()])
+                .status()?;
+            assert!(signalled.success(), "{stop}: kill {signalled:?}");
+        }
+        daemon.child_mut().wait()?;
+        let server_lifetime = stopped_at.elapsed();
+
+        let hook_lines = fs::read_to_string(&hook_log).unwrap_or_default();
+        let hook_lines: Vec<&str> = hook_lines.lines().collect();
+        assert!(
+            server_lifetime < PROMPT_STOP,
+            "{stop}: the server lived {server_lifetime:?} after the stop; hook: {hook_lines:?}"
+        );
+        if stop == "kill-server" {
+            assert_eq!(
+                hook_lines,
+                ["start", "server exited unexpectedly", "rc=1"],
+                "{stop}: the hook's call fails at once and the hook runs to its end"
+            );
+        } else {
+            assert!(
+                hook_lines.is_empty(),
+                "{stop}: no client holds the server, so no session-closed hook runs: {hook_lines:?}"
+            );
+        }
+        let zombie = harness.run(&["has-session", "-t", "zombie"])?;
+        assert!(
+            !zombie.status.success(),
+            "{stop}: the hook reached no newer daemon"
+        );
+    }
     Ok(())
 }
 

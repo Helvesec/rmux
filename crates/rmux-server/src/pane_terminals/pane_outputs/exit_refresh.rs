@@ -39,9 +39,9 @@ impl HandlerState {
             target.window_index(),
             target.pane_index(),
         )?;
-        let runtime_session_name =
-            self.runtime_session_name_for_window(target.session_name(), target.window_index());
-        self.observe_runtime_pane_exit(&runtime_session_name, pane_id)
+        // Queries never publish an observation: only the lifecycle commit can
+        // make exit metadata visible together with the kept pane's footer.
+        Ok(self.pane_exit_metadata(target.session_name(), pane_id))
     }
 
     fn format_target_active_pane(&self, target: &Target) -> Result<Option<PaneTarget>, RmuxError> {
@@ -94,7 +94,7 @@ impl HandlerState {
             .session(session_name)
             .ok_or_else(|| session_not_found(session_name))?;
         let mut targets = Vec::new();
-        for (&current_window_index, window) in session.windows() {
+        for (current_window_index, window) in session.windows() {
             if window_index.is_some_and(|index| index != current_window_index) {
                 continue;
             }

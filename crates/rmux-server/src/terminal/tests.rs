@@ -1,5 +1,8 @@
 #[cfg(unix)]
 use super::environment_from_os_pairs;
+#[cfg(unix)]
+#[path = "post_exec_tests.rs"]
+mod post_exec_tests;
 #[cfg(windows)]
 use super::raw_process_environment;
 #[cfg(windows)]
@@ -33,6 +36,9 @@ use std::time::Instant;
 use tokio::time::sleep;
 
 static UNIQUE_ID: AtomicUsize = AtomicUsize::new(0);
+
+#[path = "tests/program_path_spaces.rs"]
+mod program_path_spaces;
 
 #[cfg(unix)]
 #[test]
@@ -507,7 +513,7 @@ fn run_shell_profile_replaces_reserved_names_case_insensitively() {
 }
 
 #[test]
-fn terminal_profile_prefers_rmux_term_program_for_default_window_name() {
+fn terminal_profile_names_default_window_after_shell_despite_rmux_term_program() {
     let environment = EnvironmentStore::new();
     let mut options = OptionStore::new();
     let session_name = SessionName::new("alpha").expect("valid session name");
@@ -535,11 +541,13 @@ fn terminal_profile_prefers_rmux_term_program_for_default_window_name() {
     )
     .expect("profile");
 
-    assert_eq!(profile.default_window_name().as_deref(), Some("rmux"));
+    assert_eq!(profile.environment_value("TERM_PROGRAM"), Some("rmux"));
+    let shell_name = default_shell_name();
+    assert_eq!(profile.default_window_name().as_deref(), Some(&*shell_name));
 }
 
 #[test]
-fn terminal_profile_initial_pane_title_uses_host_short() {
+fn terminal_profile_initial_pane_title_uses_platform_hostname() {
     let environment = EnvironmentStore::new();
     let mut options = OptionStore::new();
     let session_name = SessionName::new("alpha").expect("valid session name");
@@ -575,7 +583,46 @@ fn terminal_profile_initial_pane_title_uses_host_short() {
 
     let title = profile.initial_pane_title().expect("initial title");
     let host = crate::host_name::local_hostname().expect("host name");
+    #[cfg(unix)]
+    assert_eq!(title, host);
+    #[cfg(not(unix))]
     assert_eq!(title, host.split('.').next().unwrap_or(&host));
+}
+
+#[cfg(unix)]
+#[test]
+fn terminal_profile_initial_pane_title_preserves_native_hostname() {
+    let environment = EnvironmentStore::new();
+    let mut options = OptionStore::new();
+    let session_name = SessionName::new("alpha").expect("valid session name");
+    options
+        .set(
+            ScopeSelector::Global,
+            OptionName::DefaultShell,
+            default_shell_string(),
+            SetOptionMode::Replace,
+        )
+        .expect("default-shell succeeds");
+    let profile = TerminalProfile::for_session(
+        &environment,
+        &options,
+        &session_name,
+        7,
+        Path::new("/tmp/rmux.sock"),
+        None,
+        false,
+        None,
+        None,
+        None,
+    )
+    .expect("profile");
+
+    // tmux seeds pane_title with the full hostname. The default status-right
+    // then clips that title to 21 cells; shortening it here loses the domain.
+    assert_eq!(
+        profile.initial_pane_title(),
+        rmux_os::host::local_hostname(),
+    );
 }
 
 #[test]
@@ -703,7 +750,10 @@ fn terminal_profile_runtime_window_name_tracks_spawned_command_shape() {
             .as_deref(),
         Some("top")
     );
-    assert_eq!(profile.automatic_window_name(None).as_deref(), Some("rmux"));
+    assert_eq!(
+        profile.automatic_window_name(None).as_deref(),
+        Some(&*shell_name)
+    );
     assert_eq!(
         profile
             .automatic_window_name(Some(&rmux_proto::ProcessCommand::Shell(
@@ -1103,8 +1153,12 @@ fn windows_interactive_shell_starts_in_profile_cwd_and_accepts_input(
         Some(cwd.as_path()),
     )?;
 
-    let (master, mut child) =
-        super::spawn_pane_process(PtyTerminalSize::new(100, 30), &profile, None)?;
+    let (master, mut child) = super::spawn_pane_process(
+        &rmux_pty::ProcessShell,
+        PtyTerminalSize::new(100, 30),
+        &profile,
+        None,
+    )?;
     let io = master.try_clone_io()?;
     let cwd_markers = windows_path_markers(&cwd);
 
@@ -1390,4 +1444,147 @@ fn read_until_io(
             Err(io::Error::other("pty reader thread stopped before sending output").into())
         }
     }
+}
+
+#[cfg(unix)]
+#[test]
+fn unix_pane_shell_command_uses_basename_and_preserves_context() -> Result<(), Box<dyn Error>> {
+    let (output, cwd) = unix_shell_context_witness(true)?;
+    assert_eq!(output, format!("sh\n{cwd}\nvalue with spaces;*\n"));
+    Ok(())
+}
+
+#[cfg(unix)]
+#[test]
+fn unix_generic_shell_command_keeps_path_and_preserves_context() -> Result<(), Box<dyn Error>> {
+    let (output, cwd) = unix_shell_context_witness(false)?;
+    assert_eq!(output, format!("/bin/sh\n{cwd}\nvalue with spaces;*\n"));
+    Ok(())
+}
+
+#[cfg(unix)]
+fn unix_shell_context_witness(pane: bool) -> Result<(String, String), Box<dyn Error>> {
+    let cwd = unique_output_path(if pane {
+        "pane-shell-context"
+    } else {
+        "generic-shell-context"
+    });
+    fs::create_dir(&cwd)?;
+    let output_path = cwd.join("witness");
+    let result = (|| -> Result<(String, String), Box<dyn Error>> {
+        let environment = EnvironmentStore::new();
+        let mut options = OptionStore::new();
+        options.set(
+            ScopeSelector::Global,
+            OptionName::DefaultShell,
+            "/bin/sh".to_owned(),
+            SetOptionMode::Replace,
+        )?;
+        let profile = TerminalProfile::for_session(
+            &environment,
+            &options,
+            &SessionName::new("shell-context")?,
+            7,
+            &cwd.join("unused.sock"),
+            None,
+            true,
+            Some(&["RMUX_TEST_SHELL_WITNESS=value with spaces;*".to_owned()]),
+            Some(rmux_core::PaneId::new(3)),
+            Some(&cwd),
+        )?;
+        let command = format!(
+            "printf '%s\\n' \"$0\" \"$PWD\" \"$RMUX_TEST_SHELL_WITNESS\" > {}",
+            shell_quote_path(&output_path)
+        );
+        let (master, mut child) = if pane {
+            // Exercise the real pane dispatch, not just the dedicated constructor.
+            super::spawn_pane_process(
+                &rmux_pty::ProcessShell,
+                rmux_pty::TerminalSize::new(80, 24),
+                &profile,
+                Some(&ProcessCommand::Shell(command)),
+            )?
+        } else {
+            let mut child_command = profile
+                .shell_child_command(&command)
+                .clear_env()
+                .current_dir(profile.cwd());
+            for (name, value) in profile.raw_environment() {
+                child_command = child_command.env(name, value);
+            }
+            child_command.spawn()?.into_parts()
+        };
+        #[cfg(target_os = "linux")]
+        println!(
+            "shell-context child pid={} stat={:?}",
+            child.pid().as_u32(),
+            fs::read_to_string(format!("/proc/{}/stat", child.pid().as_u32()))
+        );
+        let status = wait_for_unix_shell_witness(&mut child);
+        drop(master);
+        let status = status?;
+        assert!(status.success(), "shell witness failed: {status}");
+        let bytes = fs::read(&output_path)?;
+        assert!(bytes.len() < 4096, "unexpected shell witness output volume");
+        let output = String::from_utf8(bytes)?;
+        println!("shell-context output={output:?}");
+        Ok((output, cwd.to_string_lossy().into_owned()))
+    })();
+    fs::remove_dir_all(&cwd)?;
+    result
+}
+
+#[cfg(unix)]
+fn wait_for_unix_shell_witness(
+    child: &mut rmux_pty::PtyChild,
+) -> Result<std::process::ExitStatus, Box<dyn Error>> {
+    let start = std::time::Instant::now();
+    while start.elapsed() < Duration::from_secs(4) {
+        if let Some(status) = child.try_wait()? {
+            return Ok(status);
+        }
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    // This handle still owns an unreaped child, so its PID cannot have been reused.
+    child.terminate_forcefully()?;
+    while start.elapsed() < Duration::from_secs(5) {
+        if child.try_wait()?.is_some() {
+            return Err(
+                io::Error::new(io::ErrorKind::TimedOut, "shell witness exceeded 4s").into(),
+            );
+        }
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    Err(io::Error::new(io::ErrorKind::TimedOut, "shell witness cleanup exceeded 5s").into())
+}
+
+#[cfg(windows)]
+#[test]
+fn lone_windows_program_path_runs_without_the_shell() {
+    let program = std::env::current_exe().expect("test binary path");
+    assert!(super::is_lone_windows_program(&program.to_string_lossy()));
+    assert!(!super::is_lone_windows_program(
+        r"C:\no such dir\missing.exe"
+    ));
+    assert!(!super::is_lone_windows_program("cmd /c echo hi"));
+}
+
+#[test]
+fn shell_command_window_name_keeps_a_program_path_with_spaces_whole() {
+    let program = std::env::current_exe().expect("test binary path");
+    let name = program
+        .file_name()
+        .map(|name| name.to_string_lossy().into_owned());
+    let quoted = format!("\"{}\" -x", program.display());
+
+    assert_eq!(super::shell_command_window_name(&quoted), name);
+    assert_eq!(
+        super::shell_command_window_name("vim notes.txt").as_deref(),
+        Some("vim")
+    );
+    #[cfg(windows)]
+    assert_eq!(
+        super::shell_command_window_name(&program.to_string_lossy()),
+        name
+    );
 }

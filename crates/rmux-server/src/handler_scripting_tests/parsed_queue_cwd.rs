@@ -133,7 +133,7 @@ async fn create_session_with_cwd(handler: &RequestHandler, session: &SessionName
             skip_environment_update: false,
         })))
         .await;
-    assert!(matches!(response, Response::NewSession(_)), "{response:?}");
+    crate::session_fixture::assert_new_session(&response);
 }
 
 async fn assert_window_and_split_cwds(

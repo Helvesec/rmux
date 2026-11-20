@@ -1,8 +1,8 @@
 //! SDK command DTOs.
 //!
-//! Commands in this module are serializable value objects. They can be mapped
-//! to `rmux-proto` requests, but they do not send IPC, start daemons, probe
-//! endpoints, or parse tmux command strings.
+//! Commands in this module are inert, serializable SDK value objects. They do
+//! not send IPC, start daemons, probe endpoints, or parse tmux command strings.
+//! Use typed facade operations or [`crate::Rmux::cmd`] for execution.
 
 use serde::{Deserialize, Serialize};
 
@@ -26,11 +26,12 @@ pub struct CommandRun {
     pub exit: Option<i32>,
 }
 
-/// A detached command payload accepted by the SDK.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+/// An inert, typed SDK command payload.
+///
+/// Serde preserves the original typed variant names and binary indices 1–4.
+/// The former raw `Request` name and index 0 are rejected during deserialization.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RmuxCommandKind {
-    /// A protocol request supplied directly by the caller.
-    Request(rmux_proto::Request),
     /// A `new-session` SDK spec.
     NewSession(NewSessionSpec),
     /// An `attach-session` SDK spec.
@@ -46,24 +47,11 @@ impl RmuxCommandKind {
     #[must_use]
     pub fn command_name(&self) -> &'static str {
         match self {
-            Self::Request(request) => request.command_name(),
             Self::NewSession(_) => "new-session",
             Self::AttachSession(_) => "attach-session",
             Self::SplitWindow(_) => "split-window",
             Self::RefreshClient(_) => "refresh-client",
         }
-    }
-
-    /// Converts this value object into the corresponding protocol request.
-    #[must_use]
-    pub fn into_request(self) -> rmux_proto::Request {
-        self.into()
-    }
-}
-
-impl From<rmux_proto::Request> for RmuxCommandKind {
-    fn from(value: rmux_proto::Request) -> Self {
-        Self::Request(value)
     }
 }
 
@@ -88,42 +76,6 @@ impl From<SplitSpec> for RmuxCommandKind {
 impl From<RefreshClientSpec> for RmuxCommandKind {
     fn from(value: RefreshClientSpec) -> Self {
         Self::RefreshClient(value)
-    }
-}
-
-impl From<RmuxCommandKind> for rmux_proto::Request {
-    fn from(value: RmuxCommandKind) -> Self {
-        match value {
-            RmuxCommandKind::Request(request) => request,
-            RmuxCommandKind::NewSession(spec) => Self::NewSessionExt(Box::new(spec.into())),
-            RmuxCommandKind::AttachSession(spec) => Self::AttachSessionExt2(Box::new(spec.into())),
-            RmuxCommandKind::SplitWindow(spec) => Self::SplitWindowExt(Box::new(spec.into())),
-            RmuxCommandKind::RefreshClient(spec) => Self::RefreshClient(Box::new(spec.into())),
-        }
-    }
-}
-
-impl From<NewSessionSpec> for rmux_proto::Request {
-    fn from(value: NewSessionSpec) -> Self {
-        RmuxCommandKind::from(value).into()
-    }
-}
-
-impl From<AttachSessionSpec> for rmux_proto::Request {
-    fn from(value: AttachSessionSpec) -> Self {
-        RmuxCommandKind::from(value).into()
-    }
-}
-
-impl From<SplitSpec> for rmux_proto::Request {
-    fn from(value: SplitSpec) -> Self {
-        RmuxCommandKind::from(value).into()
-    }
-}
-
-impl From<RefreshClientSpec> for rmux_proto::Request {
-    fn from(value: RefreshClientSpec) -> Self {
-        RmuxCommandKind::from(value).into()
     }
 }
 
@@ -161,22 +113,10 @@ impl RmuxCommand {
     pub fn command_name(&self) -> &'static str {
         self.command.command_name()
     }
-
-    /// Converts the command payload into its protocol request.
-    #[must_use]
-    pub fn into_request(self) -> rmux_proto::Request {
-        self.command.into_request()
-    }
 }
 
 impl From<RmuxCommandKind> for RmuxCommand {
     fn from(value: RmuxCommandKind) -> Self {
-        Self::new(value)
-    }
-}
-
-impl From<rmux_proto::Request> for RmuxCommand {
-    fn from(value: rmux_proto::Request) -> Self {
         Self::new(value)
     }
 }
@@ -205,8 +145,4 @@ impl From<RefreshClientSpec> for RmuxCommand {
     }
 }
 
-impl From<RmuxCommand> for rmux_proto::Request {
-    fn from(value: RmuxCommand) -> Self {
-        value.into_request()
-    }
-}
+mod serde_kind;

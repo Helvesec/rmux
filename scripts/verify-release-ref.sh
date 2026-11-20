@@ -14,7 +14,11 @@ if [[ ! $repository =~ ^[^/]+/[^/]+$ ]]; then
   echo "invalid GitHub repository: $repository" >&2
   exit 2
 fi
-if [[ ! $release_tag =~ ^v[0-9]+\.[0-9]+\.[0-9]+([-.][0-9A-Za-z.-]+)?$ ]]; then
+# Keep the stable/RC identity contract used by release-identity.sh: numeric
+# components are canonical, and RC numbering starts at one.
+version_component='(0|[1-9][0-9]*)'
+release_pattern="^v${version_component}\.${version_component}\.${version_component}(-rc\.[1-9][0-9]*)?$"
+if [[ ! $release_tag =~ $release_pattern ]]; then
   echo "invalid release tag: $release_tag" >&2
   exit 2
 fi
@@ -78,12 +82,33 @@ fi
 
 release_json_file=$(mktemp)
 trap 'rm -f "$release_json_file"' EXIT
-if gh api \
+release_api_exit=0
+gh api --include \
   -H 'Accept: application/vnd.github+json' \
   -H 'X-GitHub-Api-Version: 2022-11-28' \
-  "repos/$repository/releases/tags/$encoded_tag" >"$release_json_file" 2>/dev/null; then
-  release_tag_name=$(jq -er '.tag_name' <"$release_json_file")
-  release_target=$(jq -er '.target_commitish | ascii_downcase' <"$release_json_file")
+  "repos/$repository/releases/tags/$encoded_tag" >"$release_json_file" 2>/dev/null || release_api_exit=$?
+release_status_line=$(head -n 1 "$release_json_file")
+release_status_line=${release_status_line%$'\r'}
+http_status_pattern='^HTTP/[0-9]+(\.[0-9]+)?[[:blank:]]+([0-9]{3})([[:blank:]].*)?$'
+if [[ ! $release_status_line =~ $http_status_pattern ]]; then
+  echo "GitHub Release lookup did not return a valid HTTP status" >&2
+  exit 1
+fi
+release_http_status=${BASH_REMATCH[2]}
+release_json=$(awk '
+  BEGIN { headers = 1 }
+  headers && /^\r?$/ { headers = 0; next }
+  !headers { print }
+  END { if (headers) exit 1 }
+' "$release_json_file")
+if [[ $release_http_status == 404 && $release_api_exit == 1 ]]; then
+  : # Only an explicit HTTP 404 proves that the Release is absent.
+elif [[ $release_http_status != 200 || $release_api_exit != 0 ]]; then
+  echo "GitHub Release lookup failed (HTTP $release_http_status, gh exit $release_api_exit)" >&2
+  exit 1
+else
+  release_tag_name=$(jq -er '.tag_name' <<<"$release_json")
+  release_target=$(jq -er '.target_commitish | ascii_downcase' <<<"$release_json")
   if [[ $release_tag_name != "$release_tag" ]]; then
     echo "GitHub Release tag_name $release_tag_name does not match $release_tag" >&2
     exit 1

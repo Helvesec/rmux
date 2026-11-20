@@ -13,19 +13,25 @@ use rmux_pty::{ChildCommand, SpawnedPty, TerminalSize};
 #[path = "support/windows_cli_serial.rs"]
 mod windows_cli_serial;
 
+#[path = "support/terminal_profiles.rs"]
+mod terminal_profiles;
+use terminal_profiles::{
+    assert_profile_line, attach_terminal_profiles, control_terminal_profiles, TerminalProfile,
+};
+
 const SETUP_TIMEOUT: Duration = Duration::from_secs(8);
 const CONTROL_TIMEOUT: Duration = Duration::from_secs(20);
 
 const FORMAT: &str = "#{client_termname}|#{client_termfeatures}|#{client_utf8}|#{client_flags}";
-const EXPLICIT_TOP_LEVEL_TERMINAL_ARGS: &[&str] = &["-u", "-2", "-T", "RGB"];
-const NO_TOP_LEVEL_ARGS: &[&str] = &[];
 const INHERITED_RMUX: &str = r"C:\tmp\outer-rmux,123,0";
 const INHERITED_TMUX: &str = r"C:\tmp\outer-tmux,123,0";
 
 #[test]
 fn unrelated_starting_pane_does_not_block_a_stable_session_refresh() -> Result<(), Box<dyn Error>> {
     let _serial_guard = windows_cli_serial::acquire("deferred-pane-session-scope")?;
-    let binary = PathBuf::from(env!("CARGO_BIN_EXE_rmux"));
+    let binary = PathBuf::from(rmux_os::build_identity::cargo_binary(env!(
+        "CARGO_BIN_EXE_rmux"
+    )));
     let label = format!("win-deferred-scope-{}", std::process::id());
     let _server = RmuxServerGuard::new(&binary, label.clone());
 
@@ -52,18 +58,6 @@ fn unrelated_starting_pane_does_not_block_a_stable_session_refresh() -> Result<(
     Ok(())
 }
 
-#[derive(Debug, Clone, Copy)]
-struct TerminalProfile {
-    name: &'static str,
-    term: &'static str,
-    term_program: &'static str,
-    colorterm: &'static str,
-    wt_session: bool,
-    top_level_args: &'static [&'static str],
-    expected_utf8: &'static str,
-    expected_features: &'static [&'static str],
-}
-
 #[test]
 fn windows_attached_client_terminal_profile_matrix_reports_runtime_features(
 ) -> Result<(), Box<dyn Error>> {
@@ -71,7 +65,9 @@ fn windows_attached_client_terminal_profile_matrix_reports_runtime_features(
     let _ambient_multiplexer_env = MultiplexerEnvGuard::with_fake_outer();
 
     for profile in attach_terminal_profiles() {
-        let binary = PathBuf::from(env!("CARGO_BIN_EXE_rmux"));
+        let binary = PathBuf::from(rmux_os::build_identity::cargo_binary(env!(
+            "CARGO_BIN_EXE_rmux"
+        )));
         let label = format!(
             "win-term-matrix-{}-{}",
             sanitize_label(profile.name),
@@ -103,7 +99,9 @@ fn windows_control_mode_terminal_profile_matrix_reports_runtime_features(
     let _ambient_multiplexer_env = MultiplexerEnvGuard::with_fake_outer();
 
     for profile in control_terminal_profiles() {
-        let binary = PathBuf::from(env!("CARGO_BIN_EXE_rmux"));
+        let binary = PathBuf::from(rmux_os::build_identity::cargo_binary(env!(
+            "CARGO_BIN_EXE_rmux"
+        )));
         let label = format!(
             "win-control-term-matrix-{}-{}",
             sanitize_label(profile.name),
@@ -149,116 +147,6 @@ fn windows_control_mode_terminal_profile_matrix_reports_runtime_features(
     }
 
     Ok(())
-}
-
-fn attach_terminal_profiles() -> &'static [TerminalProfile] {
-    &[
-        TerminalProfile {
-            name: "explicit-vt100-top-level",
-            term: "vt100",
-            term_program: "",
-            colorterm: "",
-            wt_session: false,
-            top_level_args: EXPLICIT_TOP_LEVEL_TERMINAL_ARGS,
-            expected_utf8: "1",
-            expected_features: &["256", "RGB"],
-        },
-        TerminalProfile {
-            name: "windows-terminal",
-            term: "xterm-256color",
-            term_program: "Windows Terminal",
-            colorterm: "truecolor",
-            wt_session: true,
-            top_level_args: NO_TOP_LEVEL_ARGS,
-            expected_utf8: "1",
-            expected_features: &["256", "RGB", "bpaste", "mouse", "sync"],
-        },
-        TerminalProfile {
-            name: "kitty-term-profile",
-            term: "xterm-kitty",
-            term_program: "",
-            colorterm: "",
-            wt_session: false,
-            top_level_args: NO_TOP_LEVEL_ARGS,
-            expected_utf8: "0",
-            expected_features: &["kitty-graphics", "hyperlinks", "margins", "osc7", "sync"],
-        },
-        TerminalProfile {
-            name: "wezterm-profile",
-            term: "wezterm",
-            term_program: "WezTerm",
-            colorterm: "truecolor",
-            wt_session: false,
-            top_level_args: NO_TOP_LEVEL_ARGS,
-            expected_utf8: "0",
-            expected_features: &["kitty-graphics", "sixel", "sync", "RGB"],
-        },
-        TerminalProfile {
-            name: "mintty-profile",
-            term: "mintty",
-            term_program: "mintty",
-            colorterm: "",
-            wt_session: false,
-            top_level_args: NO_TOP_LEVEL_ARGS,
-            expected_utf8: "0",
-            expected_features: &["clipboard", "mouse", "sixel"],
-        },
-    ]
-}
-
-fn control_terminal_profiles() -> &'static [TerminalProfile] {
-    &[
-        TerminalProfile {
-            name: "control-explicit-vt100-top-level",
-            term: "vt100",
-            term_program: "",
-            colorterm: "",
-            wt_session: false,
-            top_level_args: EXPLICIT_TOP_LEVEL_TERMINAL_ARGS,
-            expected_utf8: "1",
-            expected_features: &["256", "RGB"],
-        },
-        TerminalProfile {
-            name: "control-windows-terminal",
-            term: "xterm-256color",
-            term_program: "Windows Terminal",
-            colorterm: "truecolor",
-            wt_session: true,
-            top_level_args: NO_TOP_LEVEL_ARGS,
-            expected_utf8: "1",
-            expected_features: &["bpaste", "mouse", "sync"],
-        },
-        TerminalProfile {
-            name: "control-kitty-term-profile",
-            term: "xterm-kitty",
-            term_program: "",
-            colorterm: "",
-            wt_session: false,
-            top_level_args: NO_TOP_LEVEL_ARGS,
-            expected_utf8: "0",
-            expected_features: &[],
-        },
-        TerminalProfile {
-            name: "control-wezterm-profile",
-            term: "wezterm",
-            term_program: "WezTerm",
-            colorterm: "truecolor",
-            wt_session: false,
-            top_level_args: NO_TOP_LEVEL_ARGS,
-            expected_utf8: "0",
-            expected_features: &[],
-        },
-        TerminalProfile {
-            name: "control-mintty-profile",
-            term: "mintty",
-            term_program: "mintty",
-            colorterm: "",
-            wt_session: false,
-            top_level_args: NO_TOP_LEVEL_ARGS,
-            expected_utf8: "0",
-            expected_features: &[],
-        },
-    ]
 }
 
 fn spawn_profile_attach(
@@ -419,69 +307,6 @@ fn extract_control_payload_line(stdout: &[u8]) -> Option<String> {
         .lines()
         .find(|line| !line.starts_with('%') && line.contains('|'))
         .map(ToOwned::to_owned)
-}
-
-fn assert_profile_line(
-    profile: &TerminalProfile,
-    line: &str,
-    control_mode: bool,
-) -> Result<(), Box<dyn Error>> {
-    let parts = line.trim_end().split('|').collect::<Vec<_>>();
-    if parts.len() != 4 {
-        return Err(format!(
-            "profile {} produced malformed list-clients line {line:?}",
-            profile.name
-        )
-        .into());
-    }
-
-    assert_eq!(
-        parts[0], profile.term,
-        "profile {} should preserve client_termname",
-        profile.name
-    );
-    assert_eq!(
-        parts[2], profile.expected_utf8,
-        "profile {} should preserve client_utf8",
-        profile.name
-    );
-
-    let features = parts[1].split(',').collect::<Vec<_>>();
-    for expected in profile.expected_features {
-        assert!(
-            features.iter().any(|feature| feature == expected),
-            "profile {} should include feature {expected:?}; got {features:?} from {line:?}",
-            profile.name
-        );
-    }
-
-    let flags = parts[3].split(',').collect::<Vec<_>>();
-    assert!(
-        flags.contains(&"attached") && flags.contains(&"focused"),
-        "profile {} should report attached/focused client flags; got {flags:?}",
-        profile.name
-    );
-    if profile.expected_utf8 == "1" {
-        assert!(
-            flags.contains(&"UTF-8"),
-            "profile {} should expose UTF-8 client flag; got {flags:?}",
-            profile.name
-        );
-    } else {
-        assert!(
-            !flags.contains(&"UTF-8"),
-            "profile {} should not expose UTF-8 client flag; got {flags:?}",
-            profile.name
-        );
-    }
-    assert_eq!(
-        flags.contains(&"control-mode"),
-        control_mode,
-        "profile {} control-mode flag mismatch in {flags:?}",
-        profile.name
-    );
-
-    Ok(())
 }
 
 struct RmuxServerGuard<'a> {

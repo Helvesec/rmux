@@ -3,34 +3,34 @@
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
-use crate::{
-    ControlModeRequest, HandshakeRequest, PaneTarget, PaneTargetRef, SdkWaitId, SdkWaitOwnerId,
-    SessionName, Target, WindowTarget,
-};
+use crate::{ControlModeRequest, HandshakeRequest, PaneTarget, SessionName, WindowTarget};
+#[cfg(test)]
+use crate::{SdkWaitId, SdkWaitOwnerId};
 
-#[path = "request/compat.rs"]
 mod compat;
 
-#[path = "request/display.rs"]
 mod display;
 pub use display::{
     DisplayMessageDurationMillis, DisplayMessageDurationParseError, DisplayMessageExtRequest,
     DisplayMessageRequest,
 };
 
-#[path = "request/show.rs"]
 mod show;
 pub use show::ShowHooksRequest;
 pub use show::{ShowEnvironmentRequest, ShowOptionsRequest};
 
-#[path = "request/layout.rs"]
 mod layout;
 pub use layout::{
-    NextLayoutRequest, PreviousLayoutRequest, SelectCustomLayoutRequest, SelectLayoutRequest,
-    SelectLayoutTarget, SelectOldLayoutRequest, SpreadLayoutRequest,
+    decode_rmux_window_snapshot_json, decode_rmux_window_snapshot_v2_json,
+    ExportWindowSnapshotRequest, ExportWindowSnapshotV2Request, NextLayoutRequest,
+    PreviousLayoutRequest, ResizePaneAxesRequest, RestoreWindowSnapshotRequest,
+    RestoreWindowSnapshotV2Request, RmuxFloatingPaneSnapshot, RmuxPaneRuntimeIdentity,
+    RmuxWindowLayoutMetadata, RmuxWindowResizeTopology, RmuxWindowSnapshot, RmuxWindowSnapshotCell,
+    RmuxWindowSnapshotSplitDirection, RmuxWindowSnapshotV2, SelectCustomLayoutRequest,
+    SelectLayoutRequest, SelectLayoutTarget, SelectOldLayoutRequest, SpreadLayoutRequest,
+    RMUX_WINDOW_SNAPSHOT_V2_VERSION, RMUX_WINDOW_SNAPSHOT_VERSION,
 };
 
-#[path = "request/pane.rs"]
 mod pane;
 pub use pane::{
     BreakPaneRequest, DisplayPanesRequest, JoinPaneRequest, KillPaneRequest, LastPaneRequest,
@@ -48,7 +48,6 @@ pub use pane::{
     UnsubscribePaneStateRequest, UnsubscribePaneStreamRequest,
 };
 
-#[path = "request/window.rs"]
 mod window;
 pub use window::{
     KillWindowRequest, LastWindowRequest, LinkWindowRequest, ListWindowsRequest, MoveWindowRequest,
@@ -57,11 +56,9 @@ pub use window::{
     RotateWindowDirection, RotateWindowRequest, SelectWindowRequest, SwapWindowRequest,
 };
 
-#[path = "request/target.rs"]
 mod target;
 pub use target::{ResolveTargetRequest, ResolveTargetType};
 
-#[path = "request/session.rs"]
 mod session;
 pub use session::{
     CreateSessionLeaseRequest, HasSessionRequest, KillSessionRequest, ListSessionsRequest,
@@ -69,14 +66,12 @@ pub use session::{
     RenewSessionLeaseRequest,
 };
 
-#[path = "request/server.rs"]
 mod server;
 pub use server::{
     DaemonStatusRequest, KillServerRequest, LockClientRequest, LockServerRequest,
     LockSessionRequest, ServerAccessRequest, ShutdownIfIdleRequest,
 };
 
-#[path = "request/client.rs"]
 mod client;
 pub use client::{
     AttachSessionExt2Request, AttachSessionExt3Request, AttachSessionExtRequest,
@@ -85,21 +80,18 @@ pub use client::{
     SwitchClientExtRequest, SwitchClientRequest,
 };
 
-#[path = "request/keys.rs"]
 mod keys;
 pub use keys::{
     BindKeyRequest, ClockModeRequest, CopyModeRequest, ListKeysRequest, SendPrefixRequest,
     UnbindKeyRequest,
 };
 
-#[path = "request/options.rs"]
 mod options;
 pub use options::{
     SetEnvironmentMode, SetEnvironmentRequest, SetHookMutationRequest, SetHookRequest,
     SetOptionByNameRequest, SetOptionRequest,
 };
 
-#[path = "request/buffer.rs"]
 mod buffer;
 pub use buffer::{
     CapturePaneRequest, CapturePaneTargetActionRequest, ClearHistoryRequest, DeleteBufferRequest,
@@ -107,12 +99,22 @@ pub use buffer::{
     ShowBufferRequest,
 };
 
-#[path = "request/web.rs"]
 mod web;
 pub use web::{
     CreateWebShareRequest, ListWebSharesRequest, LookupWebShareRequest, StopAllWebSharesRequest,
     StopWebShareRequest, WebShareConfigRequest, WebShareRequest, WebShareScope, WebShareUrlOptions,
     WebTerminalPalette, WebTerminalTheme,
+};
+
+mod shell;
+pub use shell::{IfShellRequest, RunShellDelaySeconds, RunShellRequest};
+
+mod routing;
+
+mod wait;
+pub use wait::{
+    CancelSdkWaitRequest, SdkWaitForOutputRefRequest, SdkWaitForOutputRequest, WaitForMode,
+    WaitForRequest,
 };
 
 /// All detached public command and internal RPC requests supported by the wire
@@ -382,141 +384,26 @@ pub enum Request {
     PaneStreamCursor(PaneStreamCursorRequest),
     /// Closes a recoverable raw or surface pane stream.
     UnsubscribePaneStream(UnsubscribePaneStreamRequest),
-}
-
-impl Request {
-    /// Returns the stable routing name for the request variant.
-    #[must_use]
-    pub const fn command_name(&self) -> &'static str {
-        match self {
-            Self::NewSession(_) => "new-session",
-            Self::HasSession(_) => "has-session",
-            Self::KillSession(_) => "kill-session",
-            Self::NewWindow(_) => "new-window",
-            Self::KillWindow(_) => "kill-window",
-            Self::SelectWindow(_) => "select-window",
-            Self::RenameWindow(_) => "rename-window",
-            Self::NextWindow(_) => "next-window",
-            Self::PreviousWindow(_) => "previous-window",
-            Self::LastWindow(_) => "last-window",
-            Self::ListWindows(_) => "list-windows",
-            Self::LinkWindow(_) => "link-window",
-            Self::MoveWindow(_) => "move-window",
-            Self::SwapWindow(_) => "swap-window",
-            Self::RotateWindow(_) => "rotate-window",
-            Self::SplitWindow(_)
-            | Self::SplitWindowExt(_)
-            | Self::SplitWindowTargetAction(_)
-            | Self::SplitWindowIdentity(_) => "split-window",
-            Self::SwapPane(_) => "swap-pane",
-            Self::LastPane(_) => "last-pane",
-            Self::JoinPane(_) => "join-pane",
-            Self::BreakPane(_) => "break-pane",
-            Self::KillPane(_) => "kill-pane",
-            Self::SelectLayout(_) => "select-layout",
-            Self::ResizePane(_) => "resize-pane",
-            Self::DisplayPanes(_) => "display-panes",
-            Self::SelectPane(_) | Self::SelectPaneAdjacent(_) | Self::SelectPaneMark(_) => {
-                "select-pane"
-            }
-            Self::SendKeys(_) | Self::SendKeysExt2(_) => "send-keys",
-            Self::AttachSession(_) => "attach-session",
-            Self::SwitchClient(_) => "switch-client",
-            Self::DetachClient(_) => "detach-client",
-            Self::SetOption(_) => "set-option",
-            Self::SetEnvironment(_) => "set-environment",
-            Self::SetHook(_) => "set-hook",
-            Self::NextLayout(_) => "next-layout",
-            Self::PreviousLayout(_) => "previous-layout",
-            Self::ShowOptions(_) => "show-options",
-            Self::ShowEnvironment(_) => "show-environment",
-            Self::SetBuffer(_) => "set-buffer",
-            Self::ShowBuffer(_) => "show-buffer",
-            Self::PasteBuffer(_) => "paste-buffer",
-            Self::ListBuffers(_) => "list-buffers",
-            Self::DeleteBuffer(_) => "delete-buffer",
-            Self::LoadBuffer(_) => "load-buffer",
-            Self::SaveBuffer(_) => "save-buffer",
-            Self::CapturePane(_) | Self::CapturePaneTargetAction(_) => "capture-pane",
-            Self::PaneSnapshot(_) => "pane-snapshot",
-            Self::SubscribePaneOutput(_) | Self::SubscribePaneOutputRef(_) => {
-                "subscribe-pane-output"
-            }
-            Self::UnsubscribePaneOutput(_) => "unsubscribe-pane-output",
-            Self::PaneOutputCursor(_) => "pane-output-cursor",
-            Self::SubscribePaneStream(_) => "subscribe-pane-stream",
-            Self::PaneStreamCursor(_) => "pane-stream-cursor",
-            Self::UnsubscribePaneStream(_) => "unsubscribe-pane-stream",
-            Self::SdkWaitForOutput(_) | Self::SdkWaitForOutputRef(_) => "sdk-wait-output",
-            Self::CancelSdkWait(_) => "cancel-sdk-wait",
-            Self::PaneInput(_) => "send-keys",
-            Self::PaneBroadcastInput(_) => "send-keys",
-            Self::CreateSessionLease(_) => "create-session-lease",
-            Self::RenewSessionLease(_) => "renew-session-lease",
-            Self::ReleaseSessionLease(_) => "release-session-lease",
-            Self::PaneResize(_) | Self::ResizePaneTargetAction(_) => "resize-pane",
-            Self::PaneKill(_) => "kill-pane",
-            Self::PaneRespawn(_) => "respawn-pane",
-            Self::PaneSnapshotRef(_) => "pane-snapshot",
-            Self::PaneSelect(_) => "select-pane",
-            Self::PaneOptionSet(_) => "pane-option-set",
-            Self::PaneOptionGet(_) => "pane-option-get",
-            Self::SubscribePaneState(_) => "subscribe-pane-state",
-            Self::PaneStateCursor(_) => "pane-state-cursor",
-            Self::UnsubscribePaneState(_) => "unsubscribe-pane-state",
-            Self::PaneForegroundState(_) => "pane-foreground-state",
-            Self::DisplayMessage(_) | Self::DisplayMessageExt(_) => "display-message",
-            Self::ResolveTarget(_) => "resolve-target",
-            Self::RunShell(_) => "run-shell",
-            Self::IfShell(_) => "if-shell",
-            Self::WaitFor(_) => "wait-for",
-            Self::RenameSession(_) => "rename-session",
-            Self::ListSessions(_) => "list-sessions",
-            Self::ListPanes(_) => "list-panes",
-            Self::SourceFile(_) => "source-file",
-            Self::UnlinkWindow(_) => "unlink-window",
-            Self::SetOptionByName(_) => "set-option",
-            Self::SetHookMutation(_) => "set-hook",
-            Self::ShowHooks(_) => "show-hooks",
-            Self::SendKeysExt(_) => "send-keys",
-            Self::SwitchClientExt(_) => "switch-client",
-            Self::BindKey(_) => "bind-key",
-            Self::UnbindKey(_) => "unbind-key",
-            Self::ListKeys(_) => "list-keys",
-            Self::SendPrefix(_) => "send-prefix",
-            Self::ClearHistory(_) => "clear-history",
-            Self::CopyMode(_) => "copy-mode",
-            Self::ControlMode(_) => "control-mode",
-            Self::ClockMode(_) => "clock-mode",
-            Self::ShowMessages(_) => "show-messages",
-            Self::NewSessionExt(_) => "new-session",
-            Self::AttachSessionExt(_) => "attach-session",
-            Self::SwitchClientExt2(_) => "switch-client",
-            Self::SelectCustomLayout(_) => "select-layout",
-            Self::SelectOldLayout(_) => "select-layout",
-            Self::SpreadLayout(_) => "select-layout",
-            Self::ResizeWindow(_) => "resize-window",
-            Self::RespawnWindow(_) => "respawn-window",
-            Self::MovePane(_) => "move-pane",
-            Self::PipePane(_) => "pipe-pane",
-            Self::RespawnPane(_) => "respawn-pane",
-            Self::KillServer(_) => "kill-server",
-            Self::LockServer(_) => "lock-server",
-            Self::LockSession(_) => "lock-session",
-            Self::LockClient(_) => "lock-client",
-            Self::ServerAccess(_) => "server-access",
-            Self::RefreshClient(_) => "refresh-client",
-            Self::ListClients(_) => "list-clients",
-            Self::SuspendClient(_) => "suspend-client",
-            Self::DetachClientExt(_) => "detach-client",
-            Self::AttachSessionExt2(_) | Self::AttachSessionExt3(_) => "attach-session",
-            Self::SwitchClientExt3(_) => "switch-client",
-            Self::Handshake(_) => "handshake",
-            Self::DaemonStatus(_) => "daemon-status",
-            Self::ShutdownIfIdle(_) => "shutdown-if-idle",
-            Self::WebShare(_) => "web-share",
-        }
-    }
+    /// Atomic capability negotiation and server-owned CLI argv execution.
+    RuntimeCommandExecution(Box<crate::RuntimeCommandExecutionRequest>),
+    /// Versioned atomic split/key command and binary terminal payload offer.
+    SplitWindowCommandV1(Box<crate::SplitWindowCommandV1Request>),
+    /// Explicit typed RMUX window snapshot export.
+    ExportWindowSnapshot(ExportWindowSnapshotRequest),
+    /// Explicit typed RMUX window snapshot restore.
+    RestoreWindowSnapshot(Box<RestoreWindowSnapshotRequest>),
+    /// Atomic runtime execution with support and declared operation separated.
+    RuntimeCommandExecutionV2(Box<crate::RuntimeCommandExecutionV2Request>),
+    /// One `new-pane` offered with the finished bytes it is to display.
+    NewPaneInputV1(Box<crate::NewPaneInputV1Request>),
+    /// Opt-in canonical V2 snapshot export.
+    ExportWindowSnapshotV2(ExportWindowSnapshotV2Request),
+    /// Transactional canonical V2 snapshot restore.
+    RestoreWindowSnapshotV2(Box<RestoreWindowSnapshotV2Request>),
+    /// Sequential absolute axes with deferred height validation.
+    ResizePaneAxes(Box<ResizePaneAxesRequest>),
+    /// File-backed source execution with separate finished binary input.
+    SourceFileInputV1(Box<crate::SourceFileInputV1Request>),
 }
 
 /// Request payload for `show-messages`.
@@ -528,76 +415,6 @@ pub struct ShowMessagesRequest {
     pub terminals: bool,
     /// The optional target client filter used by terminal and job summaries.
     pub target_client: Option<String>,
-}
-
-/// Request payload for `run-shell`.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct RunShellRequest {
-    /// The server-local shell command passed to `sh -c`.
-    pub command: String,
-    /// Literal positional format arguments exposed as `#{1}`, `#{2}`, and so on.
-    #[serde(default)]
-    pub arguments: Vec<String>,
-    /// Whether the command should run fire-and-forget without output capture.
-    pub background: bool,
-    /// Whether the command should be executed as tmux commands instead of `sh -c`.
-    #[serde(default)]
-    pub as_commands: bool,
-    /// Whether stderr should be captured alongside stdout.
-    #[serde(default)]
-    pub show_stderr: bool,
-    /// Optional delay, in seconds, before the command runs.
-    #[serde(default)]
-    pub delay_seconds: Option<RunShellDelaySeconds>,
-    /// Optional explicit working directory.
-    #[serde(default)]
-    pub start_directory: Option<PathBuf>,
-    /// Optional explicit target pane used for format and session context.
-    #[serde(default)]
-    pub target: Option<PaneTarget>,
-    /// Internal source-file recursion depth inherited by queued run-shell.
-    #[serde(default)]
-    pub source_depth: Option<usize>,
-}
-
-/// Losslessly serializable `run-shell -d` seconds value with stable `Eq`.
-#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
-pub struct RunShellDelaySeconds(pub f64);
-
-impl RunShellDelaySeconds {
-    /// Returns the raw seconds value.
-    #[must_use]
-    pub const fn as_secs_f64(self) -> f64 {
-        self.0
-    }
-}
-
-impl PartialEq for RunShellDelaySeconds {
-    fn eq(&self, other: &Self) -> bool {
-        self.0.to_bits() == other.0.to_bits()
-    }
-}
-
-impl Eq for RunShellDelaySeconds {}
-
-/// Request payload for `if-shell`.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct IfShellRequest {
-    /// The condition string expanded through the shared formatter before evaluation.
-    pub condition: String,
-    /// Whether to evaluate the expanded condition with format truthiness instead of `sh -c`.
-    pub format_mode: bool,
-    /// The nested RMUX command string dispatched when the condition is true.
-    pub then_command: String,
-    /// The optional nested RMUX command string dispatched when the condition is false.
-    pub else_command: Option<String>,
-    /// Optional exact target used as shared-format context.
-    pub target: Option<Target>,
-    /// The caller working directory used to resolve nested relative file paths.
-    pub caller_cwd: Option<PathBuf>,
-    /// Whether the condition should be evaluated asynchronously.
-    #[serde(default)]
-    pub background: bool,
 }
 
 /// Request payload for `source-file`.
@@ -629,72 +446,6 @@ pub struct UnlinkWindowRequest {
     /// Whether removing the final link is allowed (`-k`).
     #[serde(default)]
     pub kill_if_last: bool,
-}
-
-/// The supported `wait-for` operation modes.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-pub enum WaitForMode {
-    /// Wait for the next signal on the named channel.
-    Wait,
-    /// Signal all current plain waiters on the named channel.
-    Signal,
-    /// Acquire the named server-local lock, waiting in FIFO order when held.
-    Lock,
-    /// Release the named server-local lock.
-    Unlock,
-}
-
-/// Request payload for `wait-for`.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct WaitForRequest {
-    /// The server-local wait channel name.
-    pub channel: String,
-    /// The selected wait operation.
-    pub mode: WaitForMode,
-}
-
-/// Request payload for a daemon-backed SDK byte wait.
-///
-/// This is intentionally distinct from tmux-compatible [`WaitForRequest`].
-/// SDK waits are pane-output waits with typed IDs used only for cancellation
-/// and teardown bookkeeping; they never signal or lock tmux `wait-for`
-/// channels.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct SdkWaitForOutputRequest {
-    /// Opaque SDK transport owner for this wait.
-    pub owner_id: SdkWaitOwnerId,
-    /// Wait ID allocated by the SDK under `owner_id`.
-    pub wait_id: SdkWaitId,
-    /// Pane whose raw output stream is observed.
-    pub target: PaneTarget,
-    /// Raw byte sequence to search for in pane output.
-    pub bytes: Vec<u8>,
-    /// Cursor position used when arming the wait.
-    pub start: PaneOutputSubscriptionStart,
-}
-
-/// Request payload for a daemon-backed SDK byte wait by slot or stable id.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct SdkWaitForOutputRefRequest {
-    /// Opaque SDK transport owner for this wait.
-    pub owner_id: SdkWaitOwnerId,
-    /// Wait ID allocated by the SDK under `owner_id`.
-    pub wait_id: SdkWaitId,
-    /// Pane whose raw output stream is observed.
-    pub target: PaneTargetRef,
-    /// Raw byte sequence to search for in pane output.
-    pub bytes: Vec<u8>,
-    /// Cursor position used when arming the wait.
-    pub start: PaneOutputSubscriptionStart,
-}
-
-/// Request payload for best-effort cancellation of a daemon-backed SDK wait.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-pub struct CancelSdkWaitRequest {
-    /// Opaque SDK transport owner for the wait being cancelled.
-    pub owner_id: SdkWaitOwnerId,
-    /// Wait ID allocated by the SDK under `owner_id`.
-    pub wait_id: SdkWaitId,
 }
 
 /// Request payload for `list-panes`.

@@ -1,10 +1,11 @@
 #![cfg(unix)]
 
+#[path = "../../../tests/support/executable_fixture.rs"]
+mod executable_fixture;
+
 mod common;
 
 use std::error::Error;
-use std::fs;
-use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -770,10 +771,7 @@ fn process_exists(pid: u32) -> TestResult<bool> {
 
 fn write_executable_script(root: &Path, name: &str, body: &str) -> TestResult<PathBuf> {
     let path = root.join(name);
-    fs::write(&path, body)?;
-    let mut permissions = fs::metadata(&path)?.permissions();
-    permissions.set_mode(0o755);
-    fs::set_permissions(&path, permissions)?;
+    executable_fixture::write_executable(&path, body, 0o755)?;
     Ok(path)
 }
 

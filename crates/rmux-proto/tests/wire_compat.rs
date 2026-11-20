@@ -91,8 +91,8 @@ struct UnreleasedV6DisplayMessageExtRequest {
 }
 
 #[test]
-fn unreleased_v6_display_message_layout_is_rejected_after_v8_cut() {
-    assert_eq!(RMUX_WIRE_VERSION, 8);
+fn unreleased_v6_display_message_layout_is_rejected_after_current_cut() {
+    assert_eq!(RMUX_WIRE_VERSION, 9);
     let target = Some(Target::Session(
         SessionName::new("alpha").expect("valid session name"),
     ));
@@ -122,7 +122,7 @@ fn unreleased_v6_display_message_layout_is_rejected_after_v8_cut() {
         })
         .expect("unreleased v6 request serializes"),
     );
-    let mut frame = vec![RMUX_FRAME_MAGIC, 8];
+    let mut frame = vec![RMUX_FRAME_MAGIC, RMUX_WIRE_VERSION as u8];
     frame.extend_from_slice(
         &u32::try_from(payload.len())
             .expect("test payload fits u32")

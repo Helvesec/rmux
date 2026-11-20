@@ -5,7 +5,7 @@ use rmux_proto::{
     HookLifecycle, HookName, NewSessionRequest, Request, Response, ScopeSelector, SessionName,
     SetHookMutationRequest, ShowBufferRequest, TerminalSize, WaitForMode, WaitForRequest,
 };
-use tokio::sync::oneshot;
+use tokio::sync::{oneshot, watch};
 
 use super::*;
 
@@ -23,7 +23,7 @@ async fn create_session(handler: &RequestHandler, name: &str) -> SessionName {
             environment: None,
         }))
         .await;
-    assert!(matches!(response, Response::NewSession(_)), "{response:?}");
+    crate::session_fixture::assert_new_session(&response);
     session
 }
 
@@ -150,10 +150,16 @@ async fn full_outbox_and_stuck_hook_are_forced_at_the_shared_deadline() {
         "the synchronously reserved fourth ticket waits behind the blocked commit turn"
     );
 
+    let (_progress, progress_rx) = watch::channel(());
     let deadline = Instant::now() + Duration::from_millis(50);
-    let outcome =
-        drain_lifecycle_hooks_before_deadline(&handler, hook_shutdown, &mut hook_task, deadline)
-            .await;
+    let mut bound = HookDrainBound::new(Duration::from_millis(50), progress_rx, || false);
+    let outcome = drain_lifecycle_hooks_while_progressing(
+        &handler,
+        hook_shutdown,
+        &mut hook_task,
+        &mut bound,
+    )
+    .await;
 
     assert_eq!(outcome, LifecycleHookShutdownOutcome::Forced);
     assert!(
@@ -208,10 +214,16 @@ async fn normal_shutdown_drains_already_accepted_and_queued_hooks() {
     emit_focus(&handler, &session, "queued").await;
     signal_wait_for(&handler, "shutdown-normal-outbox-hook").await;
 
+    let (_progress, progress_rx) = watch::channel(());
     let deadline = Instant::now() + Duration::from_secs(2);
-    let outcome =
-        drain_lifecycle_hooks_before_deadline(&handler, hook_shutdown, &mut hook_task, deadline)
-            .await;
+    let mut bound = HookDrainBound::new(Duration::from_secs(2), progress_rx, || false);
+    let outcome = drain_lifecycle_hooks_while_progressing(
+        &handler,
+        hook_shutdown,
+        &mut hook_task,
+        &mut bound,
+    )
+    .await;
 
     assert_eq!(outcome, LifecycleHookShutdownOutcome::Drained);
     assert!(Instant::now() < deadline);
@@ -233,8 +245,101 @@ async fn normal_shutdown_drains_already_accepted_and_queued_hooks() {
 
 #[tokio::test]
 async fn ready_drain_wins_when_it_ties_the_deadline() {
-    assert_eq!(
-        complete_before_deadline(Instant::now(), async { 7_u8 }).await,
-        Some(7)
+    let (_progress, progress_rx) = watch::channel(());
+    let mut bound = HookDrainBound::new(Duration::ZERO, progress_rx, || true);
+    assert_eq!(bound.complete(async { 7_u8 }).await, Some(7));
+}
+
+/// Emits one hook completion every `interval`, `count` times.
+fn spawn_hook_completions(interval: Duration, count: u32) -> (watch::Receiver<()>, JoinHandle<()>) {
+    let (progress, progress_rx) = watch::channel(());
+    let completions = tokio::spawn(async move {
+        for _ in 0..count {
+            tokio::time::sleep(interval).await;
+            progress.send_replace(());
+        }
+    });
+    (progress_rx, completions)
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_drain_that_keeps_finishing_hooks_outlives_its_grace() {
+    let grace = Duration::from_millis(100);
+    let (progress_rx, completions) = spawn_hook_completions(grace / 2, 20);
+    let mut shown = 0_u32;
+    let mut bound = HookDrainBound::new(grace, progress_rx, || {
+        shown += 1;
+        true
+    });
+
+    let started = Instant::now();
+    let drained = bound.complete(tokio::time::sleep(grace * 8)).await;
+
+    assert_eq!(drained, Some(()), "visible progress keeps the drain open");
+    assert!(started.elapsed() >= grace * 8);
+    drop(bound);
+    assert!(
+        shown >= 10,
+        "each completion is shown to the waiting client: {shown}"
     );
+    completions.await.expect("completion producer");
+}
+
+#[tokio::test(start_paused = true)]
+async fn progress_no_client_can_see_keeps_the_single_grace() {
+    let grace = Duration::from_millis(100);
+    let (progress_rx, completions) = spawn_hook_completions(grace / 2, 20);
+    let mut bound = HookDrainBound::new(grace, progress_rx, || false);
+
+    let started = Instant::now();
+    let drained = bound.complete(tokio::time::sleep(grace * 8)).await;
+
+    assert_eq!(drained, None, "an unseen drain cannot outlast the client");
+    assert_eq!(started.elapsed(), grace);
+    completions.abort();
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_stuck_hook_is_forced_one_grace_after_the_last_completion() {
+    let grace = Duration::from_millis(100);
+    let (progress_rx, completions) = spawn_hook_completions(grace / 2, 3);
+    let mut bound = HookDrainBound::new(grace, progress_rx, || true);
+
+    let started = Instant::now();
+    let drained = bound.complete(std::future::pending::<()>()).await;
+
+    assert_eq!(drained, None);
+    let last_completion = grace / 2 * 3;
+    assert!(
+        (last_completion + grace..=last_completion + grace + grace / 10)
+            .contains(&started.elapsed()),
+        "forced {:?} after the start",
+        started.elapsed()
+    );
+    completions.await.expect("completion producer");
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_stretch_in_which_the_server_could_not_run_is_not_hook_inactivity() {
+    let grace = Duration::from_millis(100);
+    let (_progress, progress_rx) = watch::channel(());
+    let mut bound = HookDrainBound::new(grace, progress_rx, || true);
+
+    let started = Instant::now();
+    let drained = bound
+        .complete(async {
+            // The bound starts counting first. Then the whole server is stopped for a hundred
+            // graces, and the hook ends half a grace after the server runs again.
+            tokio::task::yield_now().await;
+            tokio::time::advance(grace * 100).await;
+            tokio::time::sleep(grace / 2).await;
+        })
+        .await;
+
+    assert_eq!(
+        drained,
+        Some(()),
+        "a frozen server did not observe its hooks idle"
+    );
+    assert!(started.elapsed() >= grace * 100);
 }

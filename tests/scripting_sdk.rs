@@ -166,6 +166,126 @@ fn list_panes_json_preserves_newlines_in_string_fields() -> Result<(), Box<dyn E
 }
 
 #[test]
+fn list_panes_json_framing_preserves_cwd_and_filter_values() -> Result<(), Box<dyn Error>> {
+    let harness = CliHarness::new("scripting-json-pane-framing")?;
+    let _daemon = harness.start_hidden_daemon()?;
+    for (index, name) in [
+        "unit\x1fseparator",
+        "row\x1eseparator",
+        "line\nbreak",
+        "é雪🦀",
+        "all\x1f\x1e\n雪",
+    ]
+    .iter()
+    .enumerate()
+    {
+        let cwd = harness.tmpdir().join(name);
+        fs::create_dir_all(&cwd)?;
+        let session = format!("framing{index}");
+        assert_success(
+            &harness.run_with(&["new-session", "-d", "-s", &session], |command| {
+                command.current_dir(&cwd);
+            })?,
+        );
+        let expected = fs::canonicalize(&cwd)?.to_string_lossy().into_owned();
+        for filter in [
+            None,
+            Some("1"),
+            Some("#{pane_current_path}"),
+            Some("value\x1f\x1e\n雪"),
+        ] {
+            let mut args = vec!["list-panes", "-t", &session, "--json"];
+            if let Some(filter) = filter {
+                args.extend(["-f", filter]);
+            }
+            let value = run_json(&harness, &args)?;
+            let panes = value.as_array().expect("panes array");
+            assert_eq!(panes.len(), 1);
+            assert_object_keys(&panes[0], "conformance/list_panes_keys.txt");
+            assert_eq!(panes[0]["pane_current_path"], expected);
+            assert_eq!(panes[0]["session_name"], session);
+            assert_eq!(panes[0]["window_index"], 0);
+            assert_eq!(panes[0]["pane_index"], 0);
+            assert_eq!(panes[0]["pane_active"], true);
+            assert_eq!(panes[0]["pane_dead"], false);
+            assert!(panes[0]["pane_width"].as_u64().is_some());
+            assert!(panes[0]["pane_height"].as_u64().is_some());
+            assert!(panes[0]["pane_id"].as_str().unwrap().starts_with('%'));
+            assert!(panes[0]["pane_current_command"].is_string());
+        }
+    }
+    Ok(())
+}
+
+#[test]
+fn list_panes_json_framing_keeps_empty_and_multiple_rows() -> Result<(), Box<dyn Error>> {
+    let harness = CliHarness::new("scripting-json-pane-framing-rows")?;
+    let _daemon = harness.start_hidden_daemon()?;
+    assert_eq!(
+        run_json(&harness, &["list-panes", "-a", "--json"])?,
+        serde_json::json!([])
+    );
+    let mut expected = Vec::new();
+    for (index, name) in ["first\x1f\n雪", "second\x1e\né"].iter().enumerate() {
+        let cwd = harness.tmpdir().join(name);
+        fs::create_dir_all(&cwd)?;
+        let session = format!("rows{index}");
+        assert_success(
+            &harness.run_with(&["new-session", "-d", "-s", &session], |command| {
+                command.current_dir(&cwd);
+            })?,
+        );
+        assert_success(&harness.run(&[
+            "split-window",
+            "-h",
+            "-t",
+            &session,
+            "-c",
+            cwd.to_str().unwrap(),
+        ])?);
+        let path = fs::canonicalize(&cwd)?.to_string_lossy().into_owned();
+        expected.extend([path.clone(), path]);
+    }
+    expected.sort();
+    for filter in [None, Some("#{pane_current_path}")] {
+        let mut args = vec!["list-panes", "-a", "--json"];
+        if let Some(filter) = filter {
+            args.extend(["-f", filter]);
+        }
+        let value = run_json(&harness, &args)?;
+        let mut actual: Vec<_> = value
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|pane| pane["pane_current_path"].as_str().unwrap().to_owned())
+            .collect();
+        actual.sort();
+        assert_eq!(actual, expected);
+    }
+    for filter in ["0", ""] {
+        assert_eq!(
+            run_json(&harness, &["list-panes", "-a", "--json", "-f", filter])?,
+            serde_json::json!([])
+        );
+    }
+    let selected = run_json(
+        &harness,
+        &[
+            "list-panes",
+            "-s",
+            "-t",
+            "rows0",
+            "--json",
+            "-f",
+            "#{pane_active}",
+        ],
+    )?;
+    assert_eq!(selected.as_array().unwrap().len(), 1);
+    assert_eq!(selected[0]["pane_active"], true);
+    Ok(())
+}
+
+#[test]
 fn json_conflicts_with_format_strings() -> Result<(), Box<dyn Error>> {
     let harness = CliHarness::new("scripting-json-conflict")?;
     let _daemon = harness.start_hidden_daemon()?;

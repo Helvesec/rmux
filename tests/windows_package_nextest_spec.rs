@@ -15,6 +15,25 @@ fn function_body<'a>(source: &'a str, name: &str, next_name: &str) -> &'a str {
 
 #[test]
 fn package_verifier_tolerates_process_exit_during_cleanup() {
+    #[cfg(windows)]
+    {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        let powershell =
+            std::path::PathBuf::from(std::env::var_os("SystemRoot").expect("Windows system root"))
+                .join("System32/WindowsPowerShell/v1.0/powershell.exe");
+        let output = std::process::Command::new(powershell)
+            .args(["-NoProfile", "-ExecutionPolicy", "Bypass", "-File"])
+            .arg(root.join("tests/windows_package_cleanup_spec.ps1"))
+            .arg(root.join("scripts/verify-package-windows.ps1"))
+            .output()
+            .expect("run native package cleanup regression");
+        assert!(
+            output.status.success(),
+            "native package cleanup failed:\n{}\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
     let stop = function_body(VERIFIER, "Stop-ProcessIfRunning", "Remove-PackageDaemon");
     assert!(stop.contains("$Process.HasExited"));
     assert!(stop.contains("$Process.Kill()"));
@@ -29,6 +48,7 @@ fn package_verifier_tolerates_process_exit_during_cleanup() {
         "Stop-ProcessIfRunning $Daemon.Process",
         "Stop-ProcessIfRunning $process",
         "Stop-ProcessIfRunning $concurrentInstaller",
+        "Stop-ProcessIfRunning $killer",
     ] {
         assert!(
             VERIFIER.contains(caller),

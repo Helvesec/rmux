@@ -1,20 +1,22 @@
-use std::collections::HashMap;
+use std::collections::BTreeSet;
 
 use rmux_core::{
-    alternate_screen_enter_sequence, alternate_screen_exit_sequence, input::mode, parse_colour,
-    OptionStore, Session,
+    alternate_screen_enter_sequence, alternate_screen_exit_sequence, cursor_style_from_option,
+    input::mode, parse_colour, OptionStore,
 };
 #[cfg(test)]
 use rmux_core::{COLOUR_DEFAULT, COLOUR_FLAG_256, COLOUR_NONE, COLOUR_TERMINAL};
-use rmux_proto::{ClientTerminalContext, OptionName};
+use rmux_proto::OptionName;
 
 use crate::pane_screen_state::PaneScreenState;
 
 mod capabilities;
 mod client_title;
 mod colours;
+mod context;
 mod defaults;
 mod features;
+mod report;
 mod templates;
 
 #[cfg(test)]
@@ -25,11 +27,12 @@ pub(crate) use client_title::{
 #[cfg(test)]
 use colours::colour_to_rgb;
 use colours::colour_to_rgb_string;
+pub(crate) use context::OuterTerminalContext;
 pub(crate) use templates::encode_base64;
 #[cfg(test)]
 use templates::sanitize_osc_payload;
 use templates::{
-    render_int_template, render_open_close, render_string_string_template, render_string_template,
+    render_clipboard_template, render_int_template, render_open_close, render_string_template,
     render_sync_template, sync_toggle,
 };
 
@@ -69,81 +72,9 @@ impl MouseTrackingMode {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
-pub(crate) struct OuterTerminalContext {
-    term: Option<String>,
-    colorterm: Option<String>,
-    term_program: Option<String>,
-    term_program_version: Option<String>,
-    terminal_features: Vec<String>,
-    utf8: bool,
-}
-
-impl OuterTerminalContext {
-    pub(crate) fn from_environment(environment: Option<&HashMap<String, String>>) -> Self {
-        let Some(environment) = environment else {
-            return Self::default();
-        };
-
-        Self {
-            term: copy_environment_value(environment, "TERM"),
-            colorterm: copy_environment_value(environment, "COLORTERM"),
-            term_program: copy_environment_value(environment, "TERM_PROGRAM"),
-            term_program_version: copy_environment_value(environment, "TERM_PROGRAM_VERSION"),
-            terminal_features: Vec::new(),
-            utf8: false,
-        }
-    }
-
-    pub(crate) fn with_client_terminal(mut self, client_terminal: &ClientTerminalContext) -> Self {
-        self.terminal_features = client_terminal
-            .terminal_features
-            .iter()
-            .flat_map(|value| value.split(','))
-            .map(str::trim)
-            .filter(|feature| !feature.is_empty())
-            .map(ToOwned::to_owned)
-            .collect();
-        self.utf8 = client_terminal.utf8;
-        self
-    }
-
-    pub(crate) fn term_name(&self) -> &str {
-        self.term.as_deref().unwrap_or("")
-    }
-
-    fn term_program(&self) -> &str {
-        self.term_program.as_deref().unwrap_or("")
-    }
-
-    fn colorterm(&self) -> &str {
-        self.colorterm.as_deref().unwrap_or("")
-    }
-
-    pub(crate) fn terminal_features(&self) -> &[String] {
-        &self.terminal_features
-    }
-
-    pub(crate) fn explicit_features_string(&self) -> String {
-        OuterTerminal::from_feature_names(self.terminal_features()).features_string()
-    }
-
-    pub(crate) fn utf8(&self) -> bool {
-        self.utf8
-    }
-
-    #[cfg(test)]
-    pub(crate) fn from_pairs(values: &[(&str, &str)]) -> Self {
-        let environment = values
-            .iter()
-            .map(|(name, value)| ((*name).to_owned(), (*value).to_owned()))
-            .collect::<HashMap<_, _>>();
-        Self::from_environment(Some(&environment))
-    }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub(crate) struct OuterTerminal {
     context: OuterTerminalContext,
+    reported_features: BTreeSet<String>,
     default_colours: bool,
     supports_256: bool,
     supports_rgb: bool,
@@ -195,6 +126,9 @@ pub(crate) struct OuterTerminal {
 }
 
 impl OuterTerminal {
+    pub(crate) fn has_bracketed_paste(&self) -> bool {
+        self.enable_bpaste.is_some()
+    }
     pub(crate) fn context(&self) -> &OuterTerminalContext {
         &self.context
     }
@@ -269,6 +203,8 @@ impl OuterTerminal {
         }
         bytes.extend_from_slice(b"\x1b[0m\x1b[H\x1b[2J");
         bytes.extend_from_slice(alternate_screen_exit_sequence(self.context.term_name()));
+        // The shell-facing cursor must be visible after alternate-screen state is restored.
+        bytes.extend_from_slice(b"\x1b[?25h");
         bytes
     }
 
@@ -359,7 +295,7 @@ impl OuterTerminal {
 
     pub(crate) fn render_prelude(
         &self,
-        session: &Session,
+        session: rmux_core::ManagedSessionView<'_>,
         options: &OptionStore,
         cursor_scope: CursorScope,
         title: ClientTitleUpdate<'_>,
@@ -387,37 +323,52 @@ impl OuterTerminal {
         bytes
     }
 
-    pub(crate) fn resolve_cursor_style(
+    pub(crate) fn resolve_cursor_style_state(
         &self,
-        session: &Session,
+        session: rmux_core::ManagedSessionView<'_>,
         options: &OptionStore,
         pane_state: Option<&PaneScreenState>,
         cursor_scope: CursorScope,
-    ) -> u32 {
+    ) -> rmux_core::ResolvedCursorStyle {
         let session_name = session.name();
         let active_window = session.active_window_index();
         let active_pane = session.active_pane_index();
         match cursor_scope {
             CursorScope::Pane => {
                 let pane_cursor = pane_state.map_or(0, |state| state.cursor_style);
-                if pane_cursor != 0 {
-                    pane_cursor
-                } else {
-                    parse_cursor_style_option(options.resolve_for_pane(
-                        session_name,
-                        active_window,
-                        active_pane,
-                        OptionName::CursorStyle,
-                    ))
-                }
+                let default_cursor = cursor_style_from_option(options.resolve_for_pane(
+                    session_name,
+                    active_window,
+                    active_pane,
+                    OptionName::CursorStyle,
+                ));
+                rmux_core::resolve_cursor_style_state(
+                    pane_cursor,
+                    pane_state.map_or(0, |state| state.mode),
+                    default_cursor,
+                )
             }
-            CursorScope::Prompt => parse_cursor_style_option(
+            CursorScope::Prompt => cursor_style_from_option(
                 options.resolve(Some(session_name), OptionName::PromptCursorStyle),
-            ),
-            CursorScope::CommandPrompt => parse_cursor_style_option(
+            )
+            .into(),
+            CursorScope::CommandPrompt => cursor_style_from_option(
                 options.resolve(Some(session_name), OptionName::PromptCommandCursorStyle),
-            ),
+            )
+            .into(),
         }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn resolve_cursor_style(
+        &self,
+        session: rmux_core::ManagedSessionView<'_>,
+        options: &OptionStore,
+        pane_state: Option<&PaneScreenState>,
+        cursor_scope: CursorScope,
+    ) -> u32 {
+        self.resolve_cursor_style_state(session, options, pane_state, cursor_scope)
+            .style()
     }
 
     pub(crate) fn encode_forced_clipboard_set(&self, bytes: &[u8]) -> Option<Vec<u8>> {
@@ -437,7 +388,7 @@ impl OuterTerminal {
     fn encode_clipboard_payload(&self, bytes: &[u8]) -> Option<Vec<u8>> {
         let template = self.clipboard_template.as_deref()?;
         let encoded = encode_base64(bytes);
-        let rendered = render_string_string_template(template, "", &encoded);
+        let rendered = render_clipboard_template(template, &encoded)?;
         Some(rendered.into_bytes())
     }
 
@@ -510,20 +461,50 @@ impl OuterTerminal {
         Some(render_int_template(template, style))
     }
 
+    #[cfg(test)]
     pub(crate) fn render_cursor_style_transition(
         &self,
         previous: Option<u32>,
         current: u32,
     ) -> Option<String> {
+        self.render_cursor_state_transition(previous.map(Into::into), current.into())
+    }
+
+    pub(crate) fn render_cursor_state_transition(
+        &self,
+        previous: Option<rmux_core::ResolvedCursorStyle>,
+        current: rmux_core::ResolvedCursorStyle,
+    ) -> Option<String> {
         if previous == Some(current) {
             return None;
         }
-        if current == 0 {
-            return previous
-                .filter(|style| *style != 0)
-                .and_then(|_| self.render_cursor_style_reset());
+        if current.style() != 0 {
+            return self.render_cursor_style(current.style()).or_else(|| {
+                previous
+                    .is_some_and(|state| state.default_blink().is_some())
+                    .then(|| "\x1b[0 q".to_owned())
+            });
         }
-        self.render_cursor_style(current)
+
+        let mut sequence = String::new();
+        let reset_needed = previous.is_some_and(|state| {
+            state.style() != 0
+                || (state.default_blink().is_some() && current.default_blink().is_none())
+        });
+        if reset_needed {
+            if let Some(reset) = self.render_cursor_style_reset() {
+                sequence.push_str(reset.as_str());
+            } else {
+                // DEC mode 12 is usable without the terminfo cursor-style
+                // capabilities. DECSCUSR 0 is then the only shape-neutral way
+                // to relinquish cursor presentation authority.
+                sequence.push_str("\x1b[0 q");
+            }
+        }
+        if let Some(blink) = current.default_blink() {
+            sequence.push_str(if blink { "\x1b[?12h" } else { "\x1b[?12l" });
+        }
+        (!sequence.is_empty()).then_some(sequence)
     }
 
     fn render_cursor_style_reset(&self) -> Option<String> {
@@ -551,25 +532,6 @@ impl OuterTerminal {
     fn render_sync_sequence(&self, mode: u32) -> Option<String> {
         let template = self.sync_template.as_deref()?;
         Some(render_sync_template(template, mode))
-    }
-}
-
-fn copy_environment_value(environment: &HashMap<String, String>, name: &str) -> Option<String> {
-    environment
-        .get(name)
-        .cloned()
-        .filter(|value| !value.is_empty())
-}
-
-fn parse_cursor_style_option(value: Option<&str>) -> u32 {
-    match value.unwrap_or("default") {
-        "blinking-block" => 1,
-        "block" => 2,
-        "blinking-underline" => 3,
-        "underline" => 4,
-        "blinking-bar" => 5,
-        "bar" => 6,
-        _ => 0,
     }
 }
 

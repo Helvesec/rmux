@@ -3,12 +3,13 @@ use std::sync::OnceLock;
 
 use super::version::{current_windows_version, WindowsVersion};
 
-// These ConPTY compatibility bits are intentionally backend-private. Microsoft
-// Learn documents only `PSEUDOCONSOLE_INHERIT_CURSOR`; Windows Terminal and
-// OpenConsole use these bits to request modern ConPTY behavior.
+// Preserve the inbox compatibility selection and fallback used before the
+// companion runtime was introduced. These bits do not establish OSC support:
+// Microsoft's side-by-side API interprets 0x8 as glyph measurement, not output
+// passthrough. They must never be applied to the companion API.
 const PSEUDOCONSOLE_RESIZE_QUIRK: u32 = 0x2;
 const PSEUDOCONSOLE_WIN32_INPUT_MODE: u32 = 0x4;
-const PSEUDOCONSOLE_PASSTHROUGH_MODE: u32 = 0x8;
+const LEGACY_INPUT_COMPATIBILITY_BIT: u32 = 0x8;
 const PASSTHROUGH_MIN_BUILD: u32 = 22_621;
 const DISABLE_PASSTHROUGH_ENV: &str = "RMUX_CONPTY_NO_PASSTHROUGH";
 
@@ -65,7 +66,7 @@ fn select_conpty_flags(version: Option<WindowsVersion>, passthrough_disabled: bo
     let mut bits = base_flags();
     let passthrough = !passthrough_disabled && version.is_some_and(supports_passthrough);
     if passthrough {
-        bits |= PSEUDOCONSOLE_PASSTHROUGH_MODE;
+        bits |= LEGACY_INPUT_COMPATIBILITY_BIT;
     }
     ConptyFlags { bits, passthrough }
 }
@@ -103,7 +104,7 @@ mod tests {
             flags.bits(),
             PSEUDOCONSOLE_RESIZE_QUIRK
                 | PSEUDOCONSOLE_WIN32_INPUT_MODE
-                | PSEUDOCONSOLE_PASSTHROUGH_MODE
+                | LEGACY_INPUT_COMPATIBILITY_BIT
         );
         assert!(flags.uses_passthrough());
     }

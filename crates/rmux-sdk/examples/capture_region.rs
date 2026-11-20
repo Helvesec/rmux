@@ -1,6 +1,5 @@
 use rmux_sdk::{Rect, Result};
 
-#[path = "support/terminal_example_fixture.rs"]
 mod terminal_example_fixture;
 
 #[tokio::main(flavor = "current_thread")]

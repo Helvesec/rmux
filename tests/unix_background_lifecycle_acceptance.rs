@@ -4,7 +4,6 @@ mod common;
 
 use std::error::Error;
 use std::fs;
-use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 use std::thread;
@@ -403,7 +402,7 @@ impl HookShutdownBurst {
             } else {
                 " </dev/null >/dev/null 2>&1"
             };
-            fs::write(
+            common::executable_fixture::write_executable(
                 &script,
                 format!(
                     "#!/bin/sh\n\
@@ -422,10 +421,8 @@ impl HookShutdownBurst {
                      wait \"$child\"\n",
                     state = shell_quote(&state_dir),
                 ),
+                0o700,
             )?;
-            let mut permissions = fs::metadata(&script)?.permissions();
-            permissions.set_mode(0o700);
-            fs::set_permissions(&script, permissions)?;
             scripts.push(script);
             state_dirs.push(state_dir);
         }

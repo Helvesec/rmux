@@ -2,7 +2,6 @@ use std::time::Duration;
 
 use rmux_sdk::{PaneSet, PaneSetVisibleTextOutcome, Result, RmuxError, TerminalLoadState};
 
-#[path = "support/terminal_example_fixture.rs"]
 mod terminal_example_fixture;
 
 #[tokio::main(flavor = "current_thread")]

@@ -1,7 +1,7 @@
 //! Inert SDK command specification DTOs.
 //!
-//! The types in this module hold caller intent and map to `rmux-proto`
-//! request payloads. They do not open IPC streams, start daemons, inspect
+//! The types in this module hold caller intent. They do not expose protocol
+//! conversions, open IPC streams, start daemons, inspect
 //! processes, probe endpoint paths, parse tmux command text, or resolve
 //! targets.
 
@@ -26,16 +26,14 @@ pub enum ProcessCommandSpec {
     Shell(String),
 }
 
-impl From<ProcessCommandSpec> for rmux_proto::ProcessCommand {
-    fn from(value: ProcessCommandSpec) -> Self {
-        match value {
-            ProcessCommandSpec::Argv(argv) => Self::Argv(argv),
-            ProcessCommandSpec::Shell(command) => Self::Shell(command),
+impl ProcessCommandSpec {
+    pub(crate) fn into_proto(self) -> rmux_proto::ProcessCommand {
+        match self {
+            Self::Argv(argv) => rmux_proto::ProcessCommand::Argv(argv),
+            Self::Shell(command) => rmux_proto::ProcessCommand::Shell(command),
         }
     }
-}
 
-impl ProcessCommandSpec {
     pub(crate) fn is_empty(&self) -> bool {
         match self {
             Self::Argv(argv) => argv.is_empty() || argv.first().is_some_and(String::is_empty),
@@ -103,7 +101,7 @@ impl ProcessSpec {
     ) {
         (
             self.command,
-            self.process_command.map(rmux_proto::ProcessCommand::from),
+            self.process_command.map(ProcessCommandSpec::into_proto),
             self.environment,
         )
     }
@@ -170,24 +168,6 @@ pub struct ClientTerminalSpec {
     pub utf8: bool,
 }
 
-impl From<ClientTerminalSpec> for rmux_proto::ClientTerminalContext {
-    fn from(value: ClientTerminalSpec) -> Self {
-        Self {
-            terminal_features: value.terminal_features,
-            utf8: value.utf8,
-        }
-    }
-}
-
-impl From<rmux_proto::ClientTerminalContext> for ClientTerminalSpec {
-    fn from(value: rmux_proto::ClientTerminalContext) -> Self {
-        Self {
-            terminal_features: value.terminal_features,
-            utf8: value.utf8,
-        }
-    }
-}
-
 /// SDK value object for `new-session`.
 #[derive(Debug, Default, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct NewSessionSpec {
@@ -223,31 +203,6 @@ pub struct NewSessionSpec {
     pub print_format: Option<String>,
 }
 
-impl From<NewSessionSpec> for rmux_proto::NewSessionExtRequest {
-    fn from(value: NewSessionSpec) -> Self {
-        let (command, process_command, environment) = value.process.into_proto_parts();
-        Self {
-            session_name: value.session_name,
-            working_directory: value.working_directory,
-            detached: value.detached,
-            size: value.size.map(Into::into),
-            environment,
-            group_target: value.group_target,
-            attach_if_exists: value.reuse.attach_if_exists,
-            detach_other_clients: value.reuse.detach_other_clients,
-            kill_other_clients: value.reuse.kill_other_clients,
-            flags: value.reuse.flags,
-            window_name: value.window_name,
-            print_session_info: value.print_session_info,
-            print_format: value.print_format,
-            command,
-            process_command,
-            client_environment: None,
-            skip_environment_update: value.reuse.skip_environment_update,
-        }
-    }
-}
-
 /// SDK value object for `attach-session`.
 #[derive(Debug, Default, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AttachSessionSpec {
@@ -271,27 +226,10 @@ pub struct AttachSessionSpec {
     pub client_size: Option<TerminalSizeSpec>,
 }
 
-impl From<AttachSessionSpec> for rmux_proto::AttachSessionExt2Request {
-    fn from(value: AttachSessionSpec) -> Self {
-        Self {
-            target: value.target,
-            target_spec: value.target_spec,
-            detach_other_clients: value.reuse.detach_other_clients,
-            kill_other_clients: value.reuse.kill_other_clients,
-            read_only: value.reuse.read_only,
-            skip_environment_update: value.reuse.skip_environment_update,
-            flags: value.reuse.flags,
-            working_directory: value.working_directory,
-            client_terminal: value.client_terminal.into(),
-            client_size: value.client_size.map(Into::into),
-        }
-    }
-}
-
 /// Reserved wire-v5 control-mode subscription fields for `refresh-client`.
 ///
-/// RMUX 0.9 does not implement these fields. Populating either field produces
-/// a request that the server rejects fail-closed.
+/// RMUX 0.9 does not implement these fields. They remain inert values here;
+/// the corresponding protocol fields are rejected by the server when populated.
 #[derive(Debug, Default, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SubscriptionSpec {
     /// Reserved subscription-update field; unsupported by RMUX 0.9.
@@ -349,30 +287,7 @@ pub struct RefreshClientSpec {
     pub colour_report: Option<String>,
 }
 
-impl From<RefreshClientSpec> for rmux_proto::RefreshClientRequest {
-    fn from(value: RefreshClientSpec) -> Self {
-        Self {
-            target_client: value.target_client,
-            adjustment: value.adjustment,
-            clear_pan: value.clear_pan,
-            pan_left: value.pan_left,
-            pan_right: value.pan_right,
-            pan_up: value.pan_up,
-            pan_down: value.pan_down,
-            status_only: value.status_only,
-            clipboard_query: value.clipboard_query,
-            flags: value.flags,
-            flags_alias: value.flags_alias,
-            subscriptions: value.subscriptions.subscriptions,
-            subscriptions_format: value.subscriptions.subscriptions_format,
-            control_size: value.control_size,
-            colour_report: value.colour_report,
-        }
-    }
-}
-
-/// Low-level split orientation used by [`SplitSpec`] and the script-level
-/// `RmuxCommand` API.
+/// Low-level split orientation used by [`SplitSpec`] and command DTOs.
 ///
 /// Variants follow tmux's flag convention (pane arrangement). Prefer the
 /// ergonomic [`SplitDirection`](crate::SplitDirection) (`Right`/`Left`/`Up`/
@@ -388,24 +303,6 @@ pub enum SplitDirectionSpec {
     Horizontal,
 }
 
-impl From<SplitDirectionSpec> for rmux_proto::SplitDirection {
-    fn from(value: SplitDirectionSpec) -> Self {
-        match value {
-            SplitDirectionSpec::Vertical => Self::Vertical,
-            SplitDirectionSpec::Horizontal => Self::Horizontal,
-        }
-    }
-}
-
-impl From<rmux_proto::SplitDirection> for SplitDirectionSpec {
-    fn from(value: rmux_proto::SplitDirection) -> Self {
-        match value {
-            rmux_proto::SplitDirection::Vertical => Self::Vertical,
-            rmux_proto::SplitDirection::Horizontal => Self::Horizontal,
-        }
-    }
-}
-
 /// SDK split target.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum SplitTargetSpec {
@@ -413,33 +310,6 @@ pub enum SplitTargetSpec {
     Session(SessionName),
     /// Split the addressed pane directly.
     Pane(PaneRef),
-}
-
-impl From<SplitTargetSpec> for rmux_proto::SplitWindowTarget {
-    fn from(value: SplitTargetSpec) -> Self {
-        match value {
-            SplitTargetSpec::Session(session_name) => Self::Session(session_name),
-            SplitTargetSpec::Pane(target) => Self::Pane(target.into()),
-        }
-    }
-}
-
-impl From<rmux_proto::SplitWindowTarget> for SplitTargetSpec {
-    fn from(value: rmux_proto::SplitWindowTarget) -> Self {
-        match value {
-            rmux_proto::SplitWindowTarget::Session(session_name) => Self::Session(session_name),
-            rmux_proto::SplitWindowTarget::Pane(target) => Self::Pane(target.into()),
-        }
-    }
-}
-
-impl From<&SplitTargetSpec> for rmux_proto::SplitWindowTarget {
-    fn from(value: &SplitTargetSpec) -> Self {
-        match value {
-            SplitTargetSpec::Session(session_name) => Self::Session(session_name.clone()),
-            SplitTargetSpec::Pane(target) => Self::Pane(target.into()),
-        }
-    }
 }
 
 /// SDK value object for `split-window`.
@@ -459,23 +329,5 @@ pub struct SplitSpec {
     pub process: ProcessSpec,
 }
 
-impl From<SplitSpec> for rmux_proto::SplitWindowExtRequest {
-    fn from(value: SplitSpec) -> Self {
-        let (command, process_command, environment) = value.process.into_proto_parts();
-        Self {
-            target: value.target.into(),
-            direction: value.direction.into(),
-            before: value.before,
-            environment,
-            command,
-            process_command,
-            start_directory: None,
-            keep_alive_on_exit: None,
-            detached: false,
-            size: None,
-            preserve_zoom: false,
-            full_size: false,
-            stdin_payload: None,
-        }
-    }
-}
+#[cfg(test)]
+mod request_tests;

@@ -1,0 +1,264 @@
+name: Verify bounded premerge rehearsal
+description: Verify and seal or reproduce the permitted nonpublishing candidate
+
+runs:
+  using: composite
+  steps:
+    - name: Require the bounded rehearsal route and stage
+      shell: bash
+      run: |
+        set -euo pipefail
+        test "$RMUX_CANDIDATE_PROFILE" = premerge-rehearsal-v1
+        case "$RMUX_REHEARSAL_STAGE" in
+          seal) test "$GITHUB_WORKFLOW" = 'Release candidate shadow sealer' ;;
+          simulate) test "$GITHUB_WORKFLOW" = 'Release promotion simulation' ;;
+          *) exit 1 ;;
+        esac
+        test "$GITHUB_EVENT_NAME" = workflow_dispatch
+        test "$GITHUB_REF" = refs/heads/release/0.11.0
+        test "$GITHUB_SHA" = "$RMUX_EXPECTED_SOURCE_SHA"
+        test "$GITHUB_RUN_ATTEMPT" = 1
+
+    - name: Bind the reviewed squash and permit before API access
+      shell: bash
+      run: >-
+        python3 scripts/release/prepare-candidate-route.py
+        --candidate-profile "$RMUX_CANDIDATE_PROFILE"
+        --expected-source-sha "$RMUX_EXPECTED_SOURCE_SHA"
+        --release-intent-id "$RMUX_RELEASE_INTENT_ID"
+        --planned-release-ref "$RMUX_PLANNED_RELEASE_REF"
+        --release-kind "$RMUX_RELEASE_KIND"
+        --permit-output "$RMUX_REHEARSAL_PERMIT_FILE"
+        --github-output "$GITHUB_OUTPUT"
+
+    - name: Verify the exact prior shadow manifest artifact
+      if: env.RMUX_REHEARSAL_STAGE == 'simulate'
+      env:
+        GH_TOKEN: ${{ github.token }}
+      shell: bash
+      run: |
+        set -euo pipefail
+        [[ "$RMUX_MANIFEST_SHA256" =~ ^[0-9a-f]{64}$ ]]
+        python3 scripts/release/actions-artifact.py verify \
+          --repository "$GITHUB_REPOSITORY" \
+          --run-id "$RMUX_MANIFEST_RUN_ID" \
+          --artifact-id "$RMUX_MANIFEST_ARTIFACT_ID" \
+          --name "rmux-premerge-manifest-$RMUX_CANDIDATE_RUN_ID" \
+          --expected-source-sha "$RMUX_EXPECTED_SOURCE_SHA" \
+          --expected-digest "$RMUX_MANIFEST_ARTIFACT_DIGEST" \
+          --expected-workflow-id 316223904 \
+          --expected-workflow-path .github/workflows/release-shadow.yml \
+          --expected-event workflow_dispatch \
+          --expected-head-branch release/0.11.0 \
+          --max-attempts 1
+
+    - name: Download the exact prior shadow manifest
+      if: env.RMUX_REHEARSAL_STAGE == 'simulate'
+      uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
+      with:
+        artifact-ids: ${{ env.RMUX_MANIFEST_ARTIFACT_ID }}
+        merge-multiple: true
+        path: ${{ runner.temp }}/sealed-rehearsal
+        github-token: ${{ github.token }}
+        repository: ${{ github.repository }}
+        run-id: ${{ env.RMUX_MANIFEST_RUN_ID }}
+
+    - name: Verify the exact completed candidate run
+      env:
+        GH_TOKEN: ${{ github.token }}
+      shell: bash
+      run: |
+        set -euo pipefail
+        test "$(git rev-parse HEAD)" = "$RMUX_EXPECTED_SOURCE_SHA"
+        scripts/release/verify-fast-run.py \
+          --candidate-profile "$RMUX_CANDIDATE_PROFILE" \
+          --rehearsal-permit "$RMUX_REHEARSAL_PERMIT_FILE" \
+          --repository "$GITHUB_REPOSITORY" \
+          --run-id "$RMUX_CANDIDATE_RUN_ID" \
+          --expected-source-sha "$RMUX_EXPECTED_SOURCE_SHA" \
+          --kind candidate \
+          > "$RUNNER_TEMP/candidate-run-proof.json"
+
+    - id: artifacts
+      name: Resolve the exact eleven candidate artifacts
+      env:
+        GH_TOKEN: ${{ github.token }}
+      shell: bash
+      run: |
+        set -euo pipefail
+        resolution="$RUNNER_TEMP/candidate-artifact-resolution.json"
+        scripts/release/verify-candidate-artifacts.py resolve \
+          --candidate-profile "$RMUX_CANDIDATE_PROFILE" \
+          --rehearsal-permit "$RMUX_REHEARSAL_PERMIT_FILE" \
+          --repository "$GITHUB_REPOSITORY" \
+          --candidate-run-id "$RMUX_CANDIDATE_RUN_ID" \
+          --expected-source-sha "$RMUX_EXPECTED_SOURCE_SHA" \
+          --output "$resolution"
+        artifact_ids=$(python3 - "$resolution" <<'PY'
+        import json
+        import pathlib
+        import sys
+
+        value = json.loads(pathlib.Path(sys.argv[1]).read_text(encoding="utf-8"))
+        artifacts = value.get("artifacts")
+        if not isinstance(artifacts, list) or len(artifacts) != 11:
+            raise SystemExit("candidate artifact resolution must contain eleven artifacts")
+        identifiers = [item.get("artifact_id") for item in artifacts]
+        if any(type(identifier) is not int or identifier <= 0 for identifier in identifiers):
+            raise SystemExit("candidate artifact IDs must be positive integers")
+        if len(identifiers) != len(set(identifiers)):
+            raise SystemExit("candidate artifact IDs must be unique")
+        print(",".join(str(identifier) for identifier in identifiers))
+        PY
+        )
+        echo "artifact_ids=$artifact_ids" >> "$GITHUB_OUTPUT"
+
+    - name: Download only the resolved artifact IDs
+      uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
+      with:
+        artifact-ids: ${{ steps.artifacts.outputs.artifact_ids }}
+        path: ${{ runner.temp }}/rmux-candidate-download
+        github-token: ${{ github.token }}
+        repository: ${{ github.repository }}
+        run-id: ${{ env.RMUX_CANDIDATE_RUN_ID }}
+
+    - id: identity
+      name: Recover and bind the selected fast run ID
+      shell: bash
+      run: |
+        set -euo pipefail
+        intent="$RUNNER_TEMP/rmux-candidate-download/rmux-fast-proof-$RMUX_EXPECTED_SOURCE_SHA/candidate-intent.json"
+        fast_run_id=$(python3 - "$intent" "$RMUX_EXPECTED_SOURCE_SHA" "$RMUX_RELEASE_INTENT_ID" "$RMUX_PLANNED_RELEASE_REF" "$RMUX_RELEASE_KIND" <<'PY'
+        import json
+        import pathlib
+        import sys
+
+        value = json.loads(pathlib.Path(sys.argv[1]).read_text(encoding="utf-8"))
+        expected = {
+            "source_git_sha": sys.argv[2],
+            "release_intent_id": sys.argv[3],
+            "planned_release_ref": sys.argv[4],
+            "release_kind": sys.argv[5],
+            "candidate_run_attempt": 1,
+        }
+        for field, wanted in expected.items():
+            if value.get(field) != wanted:
+                raise SystemExit(f"candidate intent {field} differs")
+        run_id = value.get("fast_run_id")
+        if type(run_id) is not int or run_id <= 0:
+            raise SystemExit("candidate intent fast run ID is invalid")
+        print(run_id)
+        PY
+        )
+        echo "fast_run_id=$fast_run_id" >> "$GITHUB_OUTPUT"
+
+    - name: Verify every downloaded record, binding, and byte
+      env:
+        RMUX_FAST_RUN_ID: ${{ steps.identity.outputs.fast_run_id }}
+      shell: bash
+      run: |
+        set -euo pipefail
+        scripts/release/verify-candidate-artifacts.py verify-downloaded \
+          --candidate-profile "$RMUX_CANDIDATE_PROFILE" \
+          --rehearsal-permit "$RMUX_REHEARSAL_PERMIT_FILE" \
+          --repository "$GITHUB_REPOSITORY" \
+          --candidate-run-id "$RMUX_CANDIDATE_RUN_ID" \
+          --expected-source-sha "$RMUX_EXPECTED_SOURCE_SHA" \
+          --fast-run-id "$RMUX_FAST_RUN_ID" \
+          --release-intent-id "$RMUX_RELEASE_INTENT_ID" \
+          --planned-release-ref "$RMUX_PLANNED_RELEASE_REF" \
+          --release-kind "$RMUX_RELEASE_KIND" \
+          --resolution "$RUNNER_TEMP/candidate-artifact-resolution.json" \
+          --downloads-dir "$RUNNER_TEMP/rmux-candidate-download" \
+          --output "$RUNNER_TEMP/verified-candidate-artifacts.json"
+
+    - id: gh
+      name: Install the pinned attestation verifier
+      shell: bash
+      run: |
+        set -euo pipefail
+        install_root="$RUNNER_TEMP/rmux-gh-2.93.0"
+        test ! -e "$install_root"
+        scripts/release/install-gh-2.93.0.sh "$install_root"
+        echo "binary=$install_root/gh" >> "$GITHUB_OUTPUT"
+
+    - name: Verify every build-provenance signature offline
+      env:
+        GH_TOKEN: ${{ github.token }}
+        RMUX_GH_BINARY: ${{ steps.gh.outputs.binary }}
+      shell: bash
+      run: >-
+        scripts/release/verify-candidate-attestations.sh
+        "$RUNNER_TEMP/rmux-candidate-download"
+        "$RMUX_EXPECTED_SOURCE_SHA"
+        "$RMUX_GH_BINARY"
+        "$RMUX_CANDIDATE_PROFILE"
+        "$RMUX_REHEARSAL_PERMIT_FILE"
+
+    - name: Recompute the immutable policy root
+      shell: bash
+      run: |
+        set -euo pipefail
+        scripts/release/policy-root.py \
+          --source-sha "$RMUX_EXPECTED_SOURCE_SHA" \
+          --output "$RUNNER_TEMP/release-policy-root.json"
+
+    - name: Seal or reproduce the versioned rehearsal manifest
+      shell: bash
+      run: |
+        set -euo pipefail
+        download="$RUNNER_TEMP/rmux-candidate-download"
+        proof="$download/rmux-fast-proof-$RMUX_EXPECTED_SOURCE_SHA"
+        common=(
+          --candidate-profile "$RMUX_CANDIDATE_PROFILE"
+          --rehearsal-permit "$RMUX_REHEARSAL_PERMIT_FILE"
+          --fast-proof "$proof/fast-proof.json"
+          --candidate-intent "$proof/candidate-intent.json"
+          --policy-root "$RUNNER_TEMP/release-policy-root.json"
+          --canonical-artifacts "$RUNNER_TEMP/verified-candidate-artifacts.json"
+        )
+        for platform in linux-aarch64 linux-x86_64 macos-aarch64 macos-x86_64 windows-x86_64; do
+          common+=(
+            --build-record "$platform=$download/rmux-canonical-$platform-$RMUX_EXPECTED_SOURCE_SHA/canonical-build-record.json"
+            --artifact-binding "$platform=$download/rmux-canonical-provenance-$platform-$RMUX_EXPECTED_SOURCE_SHA/canonical-artifact-binding.json"
+          )
+        done
+        manifest="$RUNNER_TEMP/candidate-manifest.json"
+        case "$RMUX_REHEARSAL_STAGE" in
+          seal)
+            common+=(--candidate-proof "$RUNNER_TEMP/candidate-run-proof.json")
+            scripts/release/candidate-manifest.py create "${common[@]}" --output "$manifest"
+            scripts/release/candidate-manifest.py verify "${common[@]}" --manifest "$manifest"
+            ;;
+          simulate)
+            python3 scripts/release/premerge-simulation.py "${common[@]}" \
+              --sealed-dir "$RUNNER_TEMP/sealed-rehearsal" \
+              --current-candidate-proof "$RUNNER_TEMP/candidate-run-proof.json" \
+              --manifest-sha256 "$RMUX_MANIFEST_SHA256" \
+              --output "$RUNNER_TEMP/premerge-simulation.json"
+            ;;
+          *) exit 1 ;;
+        esac
+
+    - name: Persist only the versioned rehearsal evidence
+      if: env.RMUX_REHEARSAL_STAGE == 'seal'
+      uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+      with:
+        name: rmux-premerge-manifest-${{ env.RMUX_CANDIDATE_RUN_ID }}
+        path: |
+          ${{ runner.temp }}/candidate-manifest.json
+          ${{ runner.temp }}/candidate-run-proof.json
+          ${{ runner.temp }}/release-policy-root.json
+          ${{ runner.temp }}/verified-candidate-artifacts.json
+        if-no-files-found: error
+        retention-days: 7
+        compression-level: 0
+
+    - name: Persist the nonpublishing promotion boundary result
+      if: env.RMUX_REHEARSAL_STAGE == 'simulate'
+      uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+      with:
+        name: rmux-premerge-simulation-${{ env.RMUX_CANDIDATE_RUN_ID }}
+        path: ${{ runner.temp }}/premerge-simulation.json
+        if-no-files-found: error
+        retention-days: 7

@@ -2,7 +2,6 @@
 //! producing action so there is no race window where the text could appear
 //! before we start watching.
 
-#[path = "sdk_demo_helpers/mod.rs"]
 mod sdk_demo_helpers;
 
 #[tokio::main]

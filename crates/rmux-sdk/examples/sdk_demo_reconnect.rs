@@ -9,7 +9,6 @@
 
 use rmux_sdk::Result;
 
-#[path = "sdk_demo_helpers/mod.rs"]
 mod sdk_demo_helpers;
 
 #[tokio::main]
@@ -24,7 +23,7 @@ async fn main() -> Result<()> {
     use rmux_sdk::{Rmux, SessionName};
     let rmux = Rmux::builder().connect_or_start().await?;
     let session = rmux
-        .session(SessionName::try_from("api-server".to_owned())?)
+        .session(SessionName::new("api-server").expect("valid static session name"))
         .await?;
     assert!(session.exists().await?);
     // example:end

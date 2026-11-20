@@ -2,15 +2,18 @@ use std::io;
 use std::path::PathBuf;
 
 #[cfg(windows)]
-use std::fs::{self, OpenOptions};
+use std::fs::{File, OpenOptions};
 #[cfg(windows)]
 use std::io::Write;
 #[cfg(windows)]
 use std::path::Path;
 
+mod limit;
+
 #[cfg(unix)]
-#[path = "buffer_file_io/unix.rs"]
-mod platform;
+mod unix;
+#[cfg(unix)]
+use unix as platform;
 
 #[cfg(unix)]
 pub(crate) fn run_internal_fifo_reader_helper<I>(arguments: I) -> Option<i32>
@@ -20,8 +23,9 @@ where
     platform::run_internal_fifo_reader_helper(arguments)
 }
 #[cfg(windows)]
-#[path = "buffer_file_io/windows.rs"]
-mod platform;
+mod windows;
+#[cfg(windows)]
+use windows as platform;
 
 #[cfg(unix)]
 pub(crate) async fn read(path: PathBuf) -> io::Result<Vec<u8>> {
@@ -34,7 +38,7 @@ pub(crate) async fn read(path: PathBuf) -> io::Result<Vec<u8>> {
         return platform::read(path, kind).await;
     }
 
-    tokio::task::spawn_blocking(move || fs::read(path))
+    tokio::task::spawn_blocking(move || limit::read_regular_file(File::open(path)?))
         .await
         .map_err(|error| io::Error::other(format!("buffer file reader failed: {error}")))?
 }

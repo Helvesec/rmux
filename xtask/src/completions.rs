@@ -49,8 +49,14 @@ impl fmt::Display for Shell {
     }
 }
 
+/// What the generator wrote, as the shell it belongs to and the file it
+/// produced. The caller reports both, so a consumer can match a generated
+/// file to the shell it completes without repeating this generator's naming.
 #[cfg(not(test))]
-pub(crate) fn generate(output_dir: &Path, shells: &[Shell]) -> Result<Vec<PathBuf>, String> {
+pub(crate) fn generate(
+    output_dir: &Path,
+    shells: &[Shell],
+) -> Result<Vec<(Shell, PathBuf)>, String> {
     std::fs::create_dir_all(output_dir).map_err(|error| {
         format!(
             "failed to create completion output directory {}: {error}",
@@ -74,13 +80,16 @@ pub(crate) fn generate(output_dir: &Path, shells: &[Shell]) -> Result<Vec<PathBu
             Shell::Elvish => generate_to(Elvish, &mut command, "rmux", output_dir),
         }
         .map_err(|error| format!("failed to generate {shell} completions: {error}"))?;
-        generated.push(path);
+        generated.push((*shell, path));
     }
 
     Ok(generated)
 }
 
 #[cfg(test)]
-pub(crate) fn generate(_output_dir: &Path, _shells: &[Shell]) -> Result<Vec<PathBuf>, String> {
+pub(crate) fn generate(
+    _output_dir: &Path,
+    _shells: &[Shell],
+) -> Result<Vec<(Shell, PathBuf)>, String> {
     Err("completion generation is covered by cargo check for the xtask binary".to_owned())
 }

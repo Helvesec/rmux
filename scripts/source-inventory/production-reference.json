@@ -1,0 +1,29 @@
+{
+  "authority": "D65 / D57",
+  "parser_binaries_sha256": {
+    "linux": "c68b0ba6a336daff11323bca3b091ed58002bef47841c09df1ddba7149ef8e11",
+    "macos": "a005d6bfb3c8783f786e4308f484b9521f2eacd084f185bd3dd6b24ad4d6f52b"
+  },
+  "parser_inputs_sha256": {
+    "Cargo.lock": "b3c949e38a361c1bcc703e3cead5fef6217ff20cb0be9f7f0ff043bec309bd01",
+    "Cargo.toml": "1a27dda8ccf690fe5825944f9f196b088de44390ede9f5fe284818e1192a5b78",
+    "src/cfg.rs": "e3e59f373e5ca79001490f39813cd86c2129c89e37f28ab2949496ba3b100333",
+    "src/main.rs": "e80d98578702f9817a95c3b5e8292658f917f001ed39d6bdfb61fec84c976f7b",
+    "src/template.rs": "bbf68778ac1b155a810c5e9212a4fcf52a34699e8fff6e1063b1a99382873fc0"
+  },
+  "production_lines": 343521,
+  "revision": "ea435dddd3fba0e2c9e8e7c8d97150b0712ed21b",
+  "schema": 1,
+  "tool_inputs_sha256": {
+    "Cargo.lock": "b3c949e38a361c1bcc703e3cead5fef6217ff20cb0be9f7f0ff043bec309bd01",
+    "Cargo.toml": "1a27dda8ccf690fe5825944f9f196b088de44390ede9f5fe284818e1192a5b78",
+    "compare.py": "e5246676bfd99e2d76d1b027b22e1ce0fe866ee4dab039822185cf4b3cbe5981",
+    "inventory.py": "1e42a70c663237f1f4d2c361a9ab5a7e3d8ff99998518e693aebb045116a08f4",
+    "model.py": "74789a5c8cc21f9746f5aaeddcb41909ff7d41433c0c1272503bdafe102aee45",
+    "src/cfg.rs": "e3e59f373e5ca79001490f39813cd86c2129c89e37f28ab2949496ba3b100333",
+    "src/main.rs": "e80d98578702f9817a95c3b5e8292658f917f001ed39d6bdfb61fec84c976f7b",
+    "src/template.rs": "bbf68778ac1b155a810c5e9212a4fcf52a34699e8fff6e1063b1a99382873fc0",
+    "test_inventory.py": "ec55263cacd42f10cbb92c8869635a8d635a1aaffdd108b016578ec9bbb0824b",
+    "test_repository_classification.py": "3d49f10a3d24d99be17914672192d2f90a836d3426446180073556aa9750d52f"
+  }
+}

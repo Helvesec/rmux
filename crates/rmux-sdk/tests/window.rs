@@ -1,9 +1,11 @@
 #![cfg(unix)]
 
+#[path = "../../../tests/support/executable_fixture.rs"]
+mod executable_fixture;
+
 mod common;
 
 use std::error::Error;
-use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -16,8 +18,8 @@ use rmux_proto::{
     SetOptionMode, SetOptionRequest, WindowListEntry, WindowTarget,
 };
 use rmux_sdk::{
-    EnsureSession, RmuxBuilder, RmuxError, SessionName, SplitDirection, WindowCloseOutcome,
-    WindowRef,
+    EnsureSession, PaneProcessState, RmuxBuilder, RmuxError, SessionName, SplitDirection,
+    WindowCloseOutcome, WindowRef,
 };
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::UnixStream;
@@ -204,13 +206,11 @@ async fn session_new_window_builder_runs_shell_and_spawn_commands() -> TestResul
 
     let direct_marker = "sdk_new_window_direct_single_argv_ready";
     let direct_script = workdir.join("single argv script");
-    std::fs::write(
+    executable_fixture::write_executable(
         &direct_script,
         format!("#!/bin/sh\nprintf '{direct_marker}\\n'\ncat\n"),
+        0o755,
     )?;
-    let mut permissions = std::fs::metadata(&direct_script)?.permissions();
-    permissions.set_mode(0o755);
-    std::fs::set_permissions(&direct_script, permissions)?;
     let direct_window = session
         .new_window_with()
         .detached(true)
@@ -343,6 +343,58 @@ async fn window_split_info_pane_listing_ids_and_idempotent_close_use_daemon_path
             target: WindowRef::new(session.name().clone(), 1)
         }
     );
+
+    harness.finish().await
+}
+
+#[tokio::test]
+async fn window_info_reports_live_process_and_exit_code_of_each_pane() -> TestResult {
+    let _lock = LIVE_DAEMON_LOCK.lock().await;
+    let harness = Harness::start("window-info-exit").await?;
+    let rmux = harness.rmux();
+    let session = EnsureSession::named(session_name("sdkwininfoexit"))
+        .create_only()
+        .argv(["/bin/sleep", "60"])
+        .ensure(&rmux)
+        .await?;
+    let root = session.pane(0, 0);
+    let root_id = root.id().await?.expect("root pane has id");
+    let exited = root
+        .split_with(SplitDirection::Down)
+        .spawn(["sh", "-c", "exit 3"])
+        .keep_alive_on_exit(true)
+        .await?;
+    let exited_id = exited.id().await?.expect("split child has id");
+
+    let window = session.window(0);
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let info = loop {
+        let info = window.info().await?;
+        let process = &info
+            .pane(exited_id)
+            .ok_or("window info omitted the exited pane")?
+            .process;
+        if matches!(process, PaneProcessState::Exited) {
+            break info;
+        }
+        if Instant::now() >= deadline {
+            return Err(format!("window info never reported the exit: {process:?}").into());
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    };
+
+    let dead = info.pane(exited_id).expect("exited pane stays listed");
+    assert_eq!(
+        dead.exit_state.as_ref().and_then(|state| state.code),
+        Some(3)
+    );
+    let running = info.pane(root_id).expect("root pane stays listed");
+    assert!(
+        matches!(running.process, PaneProcessState::Running { pid: Some(_) }),
+        "running pane must report its pid, got {:?}",
+        running.process
+    );
+    assert!(running.exit_state.is_none());
 
     harness.finish().await
 }

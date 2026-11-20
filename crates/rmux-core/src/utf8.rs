@@ -4,10 +4,15 @@ use crate::OptionStore;
 use rmux_proto::OptionName;
 use unicode_width::UnicodeWidthChar;
 
+mod fold;
+
+use fold::fold_text_cells;
+
 const UTF8_ZWJ: char = '\u{200D}';
 const UTF8_VS16: char = '\u{FE0F}';
 const HANGUL_FILLER: char = '\u{3164}';
-const MAX_COMBINED_BYTES: usize = 21;
+// tmux's UTF8_SIZE cell payload bound.
+const MAX_COMBINED_BYTES: usize = 32;
 
 const DEFAULT_WIDTH_OVERRIDES: &[WidthOverride] = &[
     WidthOverride::single(0x261D, 2),
@@ -71,16 +76,80 @@ struct WidthOverride {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-struct TextCell {
-    text: String,
-    width: u8,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum CombineResult {
     Standalone { width: u8 },
     Combined { text: String, width: u8 },
+    Overflow(CombinedSequenceDiscard),
     Discard,
+}
+
+/// Tracks the unstored tail of a combined cell after its byte bound is reached.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) enum CombinedSequenceDiscard {
+    #[default]
+    None,
+    AwaitingJoinedCharacter,
+    Extensions,
+}
+
+/// Decides whether the next character remains part of a discarded tail.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum CombinedSequenceAction {
+    Combine,
+    Discard,
+    Standalone,
+}
+
+impl CombinedSequenceDiscard {
+    fn after_overflow(ch: char) -> Self {
+        if ch == UTF8_ZWJ {
+            Self::AwaitingJoinedCharacter
+        } else {
+            Self::Extensions
+        }
+    }
+
+    pub(crate) const fn is_active(self) -> bool {
+        !matches!(self, Self::None)
+    }
+
+    pub(crate) fn clear(&mut self) {
+        *self = Self::None;
+    }
+
+    pub(crate) fn action_for(&mut self, ch: char, config: &Utf8Config) -> CombinedSequenceAction {
+        if matches!(self, Self::None) {
+            return CombinedSequenceAction::Combine;
+        }
+        if ch.len_utf8() < 2 {
+            self.clear();
+            return CombinedSequenceAction::Combine;
+        }
+
+        let extension = ch == UTF8_ZWJ
+            || ch == UTF8_VS16
+            || config.width(ch) == 0
+            || is_skin_tone_modifier(u32::from(ch));
+        match *self {
+            Self::None => CombinedSequenceAction::Combine,
+            Self::AwaitingJoinedCharacter if extension => CombinedSequenceAction::Discard,
+            Self::AwaitingJoinedCharacter => {
+                *self = Self::Extensions;
+                CombinedSequenceAction::Discard
+            }
+            Self::Extensions if ch == UTF8_ZWJ => {
+                *self = Self::AwaitingJoinedCharacter;
+                CombinedSequenceAction::Discard
+            }
+            Self::Extensions if extension => CombinedSequenceAction::Discard,
+            Self::Extensions => {
+                self.clear();
+                // The discarded grapheme ends before this character. Force a
+                // fresh cell so a 29-31 byte ZWJ prefix cannot re-arm itself.
+                CombinedSequenceAction::Standalone
+            }
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -174,28 +243,26 @@ pub fn text_width(value: &str, config: &Utf8Config) -> usize {
         .sum()
 }
 
-/// Truncates a string to the requested display width.
+/// Truncates a string to the requested display width as a source-byte prefix.
 #[must_use]
 pub fn truncate_to_width(value: &str, width: usize, config: &Utf8Config) -> String {
     if value.is_ascii() && config.ascii_is_identity_width() {
         return value[..value.len().min(width)].to_owned();
     }
-    let mut output = String::new();
     let mut used = 0_usize;
-
+    let mut source_end = 0_usize;
     for cell in fold_text_cells(value, config) {
         let cell_width = usize::from(cell.width);
         if cell_width != 0 && used.saturating_add(cell_width) > width {
             break;
         }
-        output.push_str(&cell.text);
         used = used.saturating_add(cell_width);
+        source_end = cell.source.end;
     }
-
-    output
+    value[..source_end].to_owned()
 }
 
-/// Truncates a string from the left, keeping the rightmost text cells that fit.
+/// Truncates a string from the left as a source-byte suffix of fitting cells.
 #[must_use]
 pub fn truncate_right_to_width(value: &str, width: usize, config: &Utf8Config) -> String {
     if value.is_ascii() && config.ascii_is_identity_width() {
@@ -214,10 +281,10 @@ pub fn truncate_right_to_width(value: &str, width: usize, config: &Utf8Config) -
         start = index;
     }
 
-    cells[start..]
-        .iter()
-        .map(|cell| cell.text.as_str())
-        .collect()
+    let source_start = cells
+        .get(start)
+        .map_or(value.len(), |cell| cell.source.start);
+    value[source_start..].to_owned()
 }
 
 pub(crate) fn combine_char(
@@ -259,7 +326,19 @@ pub(crate) fn combine_char(
             HangulJamoState::Composable => {}
             HangulJamoState::NotHangulJamo => {
                 let should_force_wide = single_codepoint(previous_text)
-                    .is_some_and(|previous_ch| utf8_should_combine(previous_ch, ch));
+                    .is_some_and(|previous_ch| utf8_should_combine(previous_ch, ch))
+                    || previous_width == 2
+                        && is_skin_tone_modifier(u32::from(ch))
+                        && previous_text
+                            .chars()
+                            .next()
+                            .is_some_and(|root_ch| emoji_accepts_skin_tone(u32::from(root_ch)))
+                        && previous_text
+                            .chars()
+                            .next_back()
+                            .is_some_and(|previous_ch| {
+                                emoji_accepts_skin_tone(u32::from(previous_ch))
+                            });
                 if should_force_wide {
                     force_wide = true;
                 } else if !utf8_has_zwj(previous_text) {
@@ -271,8 +350,11 @@ pub(crate) fn combine_char(
         force_wide = true;
     }
 
-    if previous_text.len().saturating_add(ch.len_utf8()) > MAX_COMBINED_BYTES {
+    if previous_text.len() >= MAX_COMBINED_BYTES && !zero_width {
         return CombineResult::Standalone { width };
+    }
+    if previous_text.len().saturating_add(ch.len_utf8()) > MAX_COMBINED_BYTES {
+        return CombineResult::Overflow(CombinedSequenceDiscard::after_overflow(ch));
     }
 
     let mut text = previous_text.to_owned();
@@ -285,31 +367,6 @@ pub(crate) fn combine_char(
     };
 
     CombineResult::Combined { text, width }
-}
-
-fn fold_text_cells(value: &str, config: &Utf8Config) -> Vec<TextCell> {
-    let mut cells: Vec<TextCell> = Vec::new();
-
-    for ch in value.chars() {
-        let previous = cells.last().map(|cell| (cell.text.as_str(), cell.width));
-        match combine_char(previous, ch, config) {
-            CombineResult::Standalone { width } => {
-                cells.push(TextCell {
-                    text: ch.to_string(),
-                    width,
-                });
-            }
-            CombineResult::Combined { text, width } => {
-                if let Some(cell) = cells.last_mut() {
-                    cell.text = text;
-                    cell.width = width;
-                }
-            }
-            CombineResult::Discard => {}
-        }
-    }
-
-    cells
 }
 
 fn option_flag_is_on(value: &str) -> bool {

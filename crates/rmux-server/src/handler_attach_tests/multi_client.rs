@@ -585,6 +585,86 @@ async fn refresh_prunes_dead_attach_and_recomputes_latest_size() {
     );
 }
 
+/// Issue #72 (Helvesec/rmux): when the smallest client vanished without
+/// `detach-client`, no `client-detached` hook ran and the window stayed at the
+/// departed client's size. Cover both abrupt departures: a closed attach
+/// channel pruned by refresh, and the attach stream ending (`finish_attach`).
+#[tokio::test]
+async fn issue_72_abrupt_client_departure_runs_client_detached_hook_and_regrows_window() {
+    for (label, prune_on_refresh) in [("pruned", true), ("finished", false)] {
+        let handler = RequestHandler::new();
+        let session = session_name(&format!("issue72-{label}"));
+        create_session_with_size(
+            &handler,
+            session.clone(),
+            TerminalSize {
+                cols: 100,
+                rows: 30,
+            },
+        )
+        .await;
+        let hooked = handler
+            .handle(Request::SetHookMutation(
+                rmux_proto::SetHookMutationRequest {
+                    scope: ScopeSelector::Global,
+                    hook: rmux_proto::HookName::ClientDetached,
+                    command: Some(format!(
+                        "if-shell -F '#{{==:#{{hook_client}},{}}}' 'set-buffer -b issue72-detached ok' 'set-buffer -b issue72-detached bad'",
+                        attached_client_name(202)
+                    )),
+                    lifecycle: rmux_proto::HookLifecycle::Persistent,
+                    append: false,
+                    unset: false,
+                    run_immediately: false,
+                    index: None,
+                },
+            ))
+            .await;
+        assert!(
+            matches!(hooked, Response::SetHook(_)),
+            "{label}: {hooked:?}"
+        );
+
+        let (_large_id, _large_rx) = register_sized_attach(
+            &handler,
+            101,
+            &session,
+            TerminalSize {
+                cols: 175,
+                rows: 40,
+            },
+        )
+        .await;
+        let (small_id, small_rx) =
+            register_sized_attach(&handler, 202, &session, TerminalSize { cols: 69, rows: 20 })
+                .await;
+        assert_eq!(
+            attached_session_size(&handler, &session).await,
+            content_size_for_default_status(TerminalSize { cols: 69, rows: 20 }),
+            "{label}: the window first follows the latest (small) client"
+        );
+
+        let mut lifecycle_events = handler.subscribe_lifecycle_events();
+        drop(small_rx);
+        if prune_on_refresh {
+            handler.refresh_attached_session(&session).await;
+        } else {
+            handler.finish_attach(202, small_id).await;
+        }
+        drain_lifecycle_events(&handler, &mut lifecycle_events).await;
+
+        wait_for_named_buffer(&handler, "issue72-detached", b"ok").await;
+        assert_eq!(
+            attached_session_size(&handler, &session).await,
+            content_size_for_default_status(TerminalSize {
+                cols: 175,
+                rows: 40
+            }),
+            "{label}: the window must regrow to the remaining client"
+        );
+    }
+}
+
 #[tokio::test]
 async fn targeted_refresh_prunes_dead_attach_and_recomputes_latest_size() {
     let handler = RequestHandler::new();
@@ -963,7 +1043,7 @@ async fn different_requester_pids_reject_ambiguous_cross_process_attach_control(
                 environment: None,
             }))
             .await;
-        assert!(matches!(created, Response::NewSession(_)));
+        crate::session_fixture::assert_new_session(&created);
     }
 
     let (first_tx, mut first_rx) = mpsc::unbounded_channel();
@@ -1026,7 +1106,7 @@ async fn attach_session_without_target_prefers_an_unattached_session() {
                 environment: None,
             }))
             .await;
-        assert!(matches!(created, Response::NewSession(_)));
+        crate::session_fixture::assert_new_session(&created);
     }
 
     let (control_tx, _control_rx) = mpsc::unbounded_channel();
@@ -1068,7 +1148,7 @@ async fn attach_session_without_target_prefers_the_most_recent_unattached_sessio
                 environment: None,
             }))
             .await;
-        assert!(matches!(created, Response::NewSession(_)));
+        crate::session_fixture::assert_new_session(&created);
     }
 
     sleep(Duration::from_secs(1)).await;
@@ -1113,7 +1193,7 @@ async fn switch_client_last_session_recalls_the_previous_session() {
                 environment: None,
             }))
             .await;
-        assert!(matches!(created, Response::NewSession(_)));
+        crate::session_fixture::assert_new_session(&created);
     }
 
     let (control_tx, mut control_rx) = mpsc::unbounded_channel();
@@ -1194,7 +1274,7 @@ async fn kill_session_clears_attached_last_session_references() {
                 environment: None,
             }))
             .await;
-        assert!(matches!(created, Response::NewSession(_)));
+        crate::session_fixture::assert_new_session(&created);
     }
 
     let (control_tx, mut control_rx) = mpsc::unbounded_channel();
@@ -1533,7 +1613,7 @@ async fn create_session_with_size(
             environment: None,
         }))
         .await;
-    assert!(matches!(created, Response::NewSession(_)));
+    crate::session_fixture::assert_new_session(&created);
 }
 
 async fn register_sized_attach(
@@ -1734,3 +1814,6 @@ async fn drain_lifecycle_events(
         }
     }
 }
+
+mod client_last_session;
+mod issue36_split_client_context;

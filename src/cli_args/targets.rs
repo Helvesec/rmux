@@ -91,6 +91,23 @@ pub(super) fn parse_session_name(value: &str) -> Result<SessionName, String> {
     SessionName::new(value.to_owned()).map_err(|error| error.to_string())
 }
 
+/// Parses text naming an existing session, read as its canonical stored name.
+pub(super) fn parse_session_target(value: &str) -> Result<SessionName, String> {
+    SessionName::from_canonical(value).map_err(|error| error.to_string())
+}
+
+pub(super) fn parse_current_session_target_spec(value: &str) -> Result<TargetSpec, String> {
+    // An empty target selects the current session at execution time;
+    // it is not an empty literal session name.
+    if value.is_empty() {
+        return Ok(TargetSpec {
+            raw: String::new(),
+            exact: None,
+        });
+    }
+    parse_target_spec(value)
+}
+
 pub(crate) fn parse_target_spec(value: &str) -> Result<TargetSpec, String> {
     let parse_value = exact_match_target(value);
 

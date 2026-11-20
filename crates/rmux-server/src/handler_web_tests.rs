@@ -1,5 +1,15 @@
+#[path = "handler_web_destroy_rehome_tests.rs"]
+mod destroy_rehome;
+#[path = "handler_web_initial_render_tests.rs"]
+mod initial_render;
+#[path = "handler_web_scene_test_support.rs"]
+mod scene_fixture;
+#[path = "handler_web_slow_reader_tests.rs"]
+mod slow_reader;
 use super::*;
 use crate::daemon::ShutdownHandle;
+#[cfg(test)]
+use crate::session_fixture::SessionSetupExt as _;
 use rmux_core::events::SubscriptionLimits;
 use rmux_proto::WebShareCreatedResponse;
 use rmux_proto::{encode_attach_message, AttachMessage};
@@ -12,6 +22,156 @@ use rmux_proto::{
 };
 use tokio::io::AsyncWriteExt;
 use tokio::time::{sleep, timeout, Duration, Instant};
+
+#[tokio::test]
+async fn web_backspace_and_native_attach_deliver_the_same_erase_byte() {
+    let handler = RequestHandler::new();
+    let session = new_session(&handler, "web-backspace-erase").await;
+    let target = PaneTarget::new(session.clone(), 0);
+    let native_pid = std::process::id();
+    let (control_tx, _control_rx) = tokio::sync::mpsc::unbounded_channel();
+    handler
+        .register_attach(native_pid, session, control_tx)
+        .await;
+    for (erase, option) in [(0x7f, "^?"), (0x08, "C-h")] {
+        {
+            let mut state = handler.state.lock().await;
+            state
+                .options
+                .set(
+                    ScopeSelector::Global,
+                    OptionName::Backspace,
+                    option.to_owned(),
+                    SetOptionMode::Replace,
+                )
+                .expect("configure erase byte");
+            state.start_pane_input_capture_for_test(&target);
+        }
+        handler
+            .web_send_text(&target.clone().into(), "abc".to_owned())
+            .await
+            .unwrap();
+        handler
+            .web_send_text(&target.clone().into(), "\x7f".to_owned())
+            .await
+            .unwrap();
+        handler
+            .handle_attached_live_input_for_test(native_pid, b"\x7f")
+            .await
+            .unwrap();
+        let state = handler.state.lock().await;
+        assert_eq!(
+            state.pane_input_capture_for_test(&target),
+            Some(vec![b'a', b'b', b'c', erase, erase])
+        );
+    }
+}
+
+#[tokio::test]
+async fn web_scene_render_allows_independent_session_lookup() {
+    use crate::web::{OutboundQueueResult, WebSocketOutbound, WEB_OUTBOUND_BYTES_MAX};
+    let (slow, _slow_reader) = WebSocketOutbound::stalled_for_test();
+    let (healthy, _healthy_reader) = WebSocketOutbound::stalled_for_test();
+    assert_eq!(
+        slow.queue_frame(vec![0; WEB_OUTBOUND_BYTES_MAX]),
+        OutboundQueueResult::Queued
+    );
+    assert_eq!(slow.queue_frame(vec![0]), OutboundQueueResult::Backpressure);
+    assert_eq!(
+        healthy.queue_frame(b"independent".to_vec()),
+        OutboundQueueResult::Queued
+    );
+    let handler = RequestHandler::new();
+    let session = new_session(&handler, "web-scene-lock").await;
+    let independent = new_session(&handler, "web-independent").await;
+    let target = {
+        let state = handler.state.lock().await;
+        WebSessionTarget::new(
+            session.clone(),
+            state.sessions.session(&session).unwrap().id(),
+        )
+    };
+    let state = handler.state.clone();
+    let observed = std::rc::Rc::new(std::cell::Cell::new(false));
+    let observed_render = observed.clone();
+    WebSceneProjection::observe_next_render(move || {
+        let state = state.try_lock().expect(
+            "Web scene rendering must leave the global state available to independent operations",
+        );
+        assert!(state.sessions.session(&independent).is_some());
+        observed_render.set(true);
+    });
+    handler
+        .web_session_snapshot(&target)
+        .await
+        .expect("session snapshot");
+    assert!(observed.get(), "the real Web scene renderer was exercised");
+    assert_eq!(slow.queue_frame(vec![0]), OutboundQueueResult::Backpressure);
+    assert_eq!(
+        healthy.queue_snapshot(b"scene".to_vec()),
+        OutboundQueueResult::Queued
+    );
+}
+
+#[tokio::test]
+async fn web_resnapshot_recovers_poisoned_transcript() {
+    let handler = RequestHandler::new();
+    // The live pane reader publishes whatever the child prints. A shell prompt
+    // landing before the capture would move the boundary this test pins.
+    let response = handler
+        .handle(Request::SetOption(SetOptionRequest {
+            scope: ScopeSelector::Global,
+            option: OptionName::DefaultCommand,
+            value: crate::test_shell::stdin_discard_command(),
+            mode: SetOptionMode::Replace,
+        }))
+        .await;
+    assert!(matches!(response, Response::SetOption(_)), "{response:?}");
+    let session = new_session(&handler, "web-poison-policy").await;
+    let target = PaneTarget::new(session.clone(), 0);
+    // The quiet child does not silence the ConPTY startup preamble; it must
+    // land before the boundary read below, not between it and the capture.
+    handler.wait_for_pane_startup_output_for_test(&target).await;
+    let (output, transcript) = {
+        let state = handler.state.lock().await;
+        (
+            state.pane_output_for_target(&session, 0, 0).unwrap(),
+            state.transcript_handle(&target).unwrap(),
+        )
+    };
+    let (published_from, _) = output.subscribe_live_from_now();
+    crate::pane_io::publish_pane_bytes_for_test(&transcript, &output, b"WEB_CAPTURE".to_vec());
+    let expected = transcript
+        .lock()
+        .capture_main(Default::default(), Default::default());
+    transcript.poison_for_test();
+    let (snapshot, mut receiver) = handler
+        .web_resnapshot(&target.into())
+        .await
+        .expect("Web recovers at the output boundary");
+    let mut terminal = rmux_core::TerminalScreen::new(
+        TerminalSize {
+            cols: snapshot.cols,
+            rows: snapshot.rows,
+        },
+        64,
+    );
+    terminal.feed(
+        snapshot
+            .recovery_keyframe
+            .as_deref()
+            .expect("recovery keyframe"),
+    );
+    assert_eq!(
+        terminal
+            .screen()
+            .capture_transcript(Default::default(), Default::default()),
+        expected
+    );
+    assert_eq!(snapshot.output_sequence, published_from + 1);
+    assert!(receiver.try_recv_observed().is_none());
+    assert!(std::panic::catch_unwind(|| drop(transcript.lock())).is_err());
+}
 
 #[tokio::test]
 async fn shutdown_rejects_web_pane_text_key_and_session_mutations() {
@@ -175,7 +335,7 @@ async fn shutdown_drains_a_web_session_mutation_admitted_before_close() {
             .session(&session_name)
             .expect("session survives")
             .windows()
-            .len(),
+            .count(),
         2,
         "the admitted session mutation commits before shutdown can seal"
     );
@@ -525,7 +685,7 @@ async fn web_pane_stream_resnapshots_instead_of_forwarding_cross_boundary_rep() 
             rmux_core::ScreenCaptureRange::default(),
             rmux_core::GridRenderOptions::default(),
         ),
-        transcript.lock().expect("transcript lock").capture_main(
+        transcript.lock().capture_main(
             rmux_core::ScreenCaptureRange::default(),
             rmux_core::GridRenderOptions::default(),
         )
@@ -872,7 +1032,7 @@ async fn web_session_snapshot_tracks_canonical_session_size() {
         let mut state = handler.state.lock().await;
         state
             .sessions
-            .session_mut(&session_name)
+            .session_setup(&session_name)
             .expect("session exists")
             .resize_terminal(TerminalSize { cols: 60, rows: 10 });
     }
@@ -940,7 +1100,7 @@ async fn web_session_snapshot_uses_content_geometry_without_reapplying_status_ro
                 .expect("bottom pane transcript"),
         )
     };
-    transcript.lock().expect("transcript lock").append_bytes(
+    transcript.lock().append_bytes(
         b"00\r\n01\r\n02\r\n03\r\n04\r\n05\r\n06\r\n07\r\n08\r\n09\r\n\
               10\r\n11\r\n12\r\n13\r\n14\r\n15\r\n16\r\n17\r\n18\r\n19\r\n\
               20\r\n21\r\n22\r\n23\r\n24\r\n25\r\n26\r\n27\r\n28\r\n29\r\n",
@@ -1016,6 +1176,547 @@ async fn web_session_snapshot_uses_content_geometry_without_reapplying_status_ro
     assert_eq!(
         (scroll_frame.pane.cols, scroll_frame.pane.rows),
         (bottom.cols, bottom.rows)
+    );
+    assert!(
+        session_stream
+            .snapshot
+            .accepts_rectangular_patch(&scroll_frame),
+        "a stable scene without floats keeps the pane-frame fast path"
+    );
+}
+
+#[tokio::test]
+async fn web_session_scrollback_preserves_frontmost_signed_floating_scene() {
+    let handler = RequestHandler::new();
+    scene_fixture::pin_ready_producer(&handler).await;
+    let session_name = new_session_with_size(
+        &handler,
+        "websession-floating-scene",
+        TerminalSize { cols: 20, rows: 10 },
+    )
+    .await;
+    set_session_status(&handler, &session_name, "off").await;
+    handler
+        .wait_for_pane_startup_to_finish_for_test(&PaneTarget::with_window(
+            session_name.clone(),
+            0,
+            0,
+        ))
+        .await;
+    assert!(matches!(
+        handler
+            .handle(Request::SplitWindow(SplitWindowRequest {
+                target: SplitWindowTarget::Session(session_name.clone()),
+                direction: SplitDirection::Vertical,
+                before: false,
+                environment: None,
+            }))
+            .await,
+        Response::SplitWindow(_)
+    ));
+    handler
+        .wait_for_pane_startup_to_finish_for_test(&PaneTarget::with_window(
+            session_name.clone(),
+            0,
+            1,
+        ))
+        .await;
+
+    // Native startup output must be consumed before this fixture owns the
+    // scene contents. Input startup completion alone does not establish that.
+    scene_fixture::settle_ready_producers(&handler, &session_name).await;
+
+    let (session_id, tiled_id, floating_id) = {
+        let mut state = handler.state.lock().await;
+        let target = WindowTarget::with_window(session_name.clone(), 0);
+        state
+            .sessions
+            .window_layout_context_mut(&target)
+            .expect("window layout context")
+            .float_pane(
+                1,
+                rmux_core::FloatingPaneRect::new(-3, 2, 8, 4).expect("floating rectangle"),
+            )
+            .expect("pane becomes floating");
+        let session = state
+            .sessions
+            .session(&session_name)
+            .expect("session exists");
+        let tiled_id = session.window().pane(0).expect("tiled pane").id();
+        let floating_id = session.window().pane(1).expect("floating pane").id();
+        let session_id = session.id();
+
+        let mut tiled = b"\x1b[2J\x1b[H".to_vec();
+        for _ in 0..20 {
+            tiled.extend_from_slice(b"BBBBBBBBBBBBBBBBBBBB\r\n");
+        }
+        state
+            .append_bytes_to_pane_transcript_for_test(&session_name, 0, 0, &tiled)
+            .expect("tiled scrollback");
+        state
+            .append_bytes_to_pane_transcript_for_test(
+                &session_name,
+                0,
+                1,
+                b"\x1b[2J\x1b[H01234567\r\n01234567\r\n01234567\r\n01234567",
+            )
+            .expect("floating contents");
+        (session_id, tiled_id, floating_id)
+    };
+    let target = crate::web::WebSessionTarget::new(session_name.clone(), session_id);
+    let snapshot = handler
+        .web_session_snapshot_with_scrolls(&target, None, &HashMap::from([(tiled_id, 0)]))
+        .await
+        .expect("floating Web snapshot");
+
+    let floating = snapshot
+        .view
+        .panes
+        .iter()
+        .find(|pane| pane.id == floating_id.as_u32())
+        .expect("floating metadata");
+    assert_eq!(
+        (floating.x, floating.y, floating.cols, floating.rows),
+        (0, 2, 5, 4),
+        "Web metadata must describe the scene-visible floating surface"
+    );
+
+    let mut rendered = rmux_core::TerminalScreen::new(snapshot.size, 0);
+    rendered.feed(&snapshot.ansi_bytes());
+    let mut cell = None;
+    let mut column = 0_usize;
+    assert!(rendered.screen().visit_visible_line_cells(2, 1, |value| {
+        if column == 0 {
+            cell = Some(value.text().to_owned());
+        }
+        column += 1;
+    }));
+    assert_eq!(
+        cell.as_deref(),
+        Some("3"),
+        "scrolling the rear pane must not repaint the signed front pane"
+    );
+
+    let state = handler.state.lock().await;
+    let mouse =
+        crate::mouse::layout_for_session(&state, &session_name, 1).expect("mouse scene projection");
+    let front = mouse
+        .panes
+        .iter()
+        .max_by_key(|pane| pane.layer)
+        .expect("frontmost mouse pane");
+    assert_eq!(front.pane_id, floating_id);
+    assert_eq!(front.coordinates().relative_position(0, 2), Some((3, 0)));
+    drop(state);
+
+    assert!(
+        handler
+            .web_session_pane_scroll_frame(&target, tiled_id, 0, None)
+            .await
+            .expect("scroll patch decision")
+            .is_none(),
+        "floating scenes must use the complete session keyframe"
+    );
+
+    {
+        let mut state = handler.state.lock().await;
+        state
+            .sessions
+            .window_layout_context_mut(&WindowTarget::with_window(session_name.clone(), 0))
+            .expect("window layout context")
+            .move_floating_pane(1, 4, 1)
+            .expect("floating translation");
+    }
+    let moved = handler
+        .web_session_snapshot_with_scrolls(&target, None, &HashMap::from([(tiled_id, 0)]))
+        .await
+        .expect("translated floating Web snapshot");
+    assert!(
+        snapshot.requires_keyframe_for(&moved),
+        "translation must select a complete keyframe"
+    );
+    let moved_float = moved
+        .view
+        .panes
+        .iter()
+        .find(|pane| pane.id == floating_id.as_u32())
+        .expect("translated floating metadata");
+    assert_eq!(
+        (
+            moved_float.x,
+            moved_float.y,
+            moved_float.cols,
+            moved_float.rows,
+        ),
+        (4, 1, 8, 4)
+    );
+
+    {
+        let mut state = handler.state.lock().await;
+        state
+            .sessions
+            .window_layout_context_mut(&WindowTarget::with_window(session_name.clone(), 0))
+            .expect("window layout context")
+            .resize_floating_pane(1, 6, 3)
+            .expect("floating resize");
+    }
+    let resized = handler
+        .web_session_snapshot_with_scrolls(&target, None, &HashMap::from([(tiled_id, 0)]))
+        .await
+        .expect("resized floating Web snapshot");
+    assert!(
+        moved.requires_keyframe_for(&resized),
+        "resize must select a complete keyframe"
+    );
+    let resized_float = resized
+        .view
+        .panes
+        .iter()
+        .find(|pane| pane.id == floating_id.as_u32())
+        .expect("resized floating metadata");
+    assert_eq!(
+        (
+            resized_float.x,
+            resized_float.y,
+            resized_float.cols,
+            resized_float.rows,
+        ),
+        (4, 1, 6, 3)
+    );
+}
+
+#[tokio::test]
+async fn web_session_floating_scrollback_uses_canonical_scrollbar_projection() {
+    let handler = RequestHandler::new();
+    // The floating pane's scrollback is written below; a shell prompt landing
+    // after it would scroll the first row this test pins out of view.
+    handler.pin_quiet_default_command_for_test().await;
+    let session_name = new_session_with_size(
+        &handler,
+        "websession-floating-scrollbar",
+        TerminalSize { cols: 20, rows: 10 },
+    )
+    .await;
+    set_session_status(&handler, &session_name, "off").await;
+    handler
+        .wait_for_pane_startup_output_for_test(&PaneTarget::with_window(session_name.clone(), 0, 0))
+        .await;
+    assert!(matches!(
+        handler
+            .handle(Request::SplitWindow(SplitWindowRequest {
+                target: SplitWindowTarget::Session(session_name.clone()),
+                direction: SplitDirection::Vertical,
+                before: false,
+                environment: None,
+            }))
+            .await,
+        Response::SplitWindow(_)
+    ));
+    handler
+        .wait_for_pane_startup_output_for_test(&PaneTarget::with_window(session_name.clone(), 0, 1))
+        .await;
+    for (option, value) in [
+        (OptionName::PaneScrollbars, "on"),
+        (OptionName::PaneScrollbarsPosition, "left"),
+        (OptionName::PaneScrollbarsStyle, "width=1,pad=1"),
+    ] {
+        assert!(matches!(
+            handler
+                .handle(Request::SetOption(SetOptionRequest {
+                    scope: ScopeSelector::Window(WindowTarget::with_window(
+                        session_name.clone(),
+                        0,
+                    )),
+                    option,
+                    value: value.to_owned(),
+                    mode: SetOptionMode::Replace,
+                }))
+                .await,
+            Response::SetOption(_)
+        ));
+    }
+
+    let (session_id, floating_id) = {
+        let mut state = handler.state.lock().await;
+        state
+            .sessions
+            .window_layout_context_mut(&WindowTarget::with_window(session_name.clone(), 0))
+            .expect("window layout context")
+            .float_pane(
+                1,
+                rmux_core::FloatingPaneRect::new(2, 2, 8, 4).expect("floating rectangle"),
+            )
+            .expect("pane becomes floating");
+        let session = state.sessions.session(&session_name).expect("session");
+        let floating_id = session.window().pane(1).expect("floating pane").id();
+        let session_id = session.id();
+        state
+            .append_bytes_to_pane_transcript_for_test(
+                &session_name,
+                0,
+                1,
+                b"ABCDEF\r\nGHIJKL\r\nMNOPQR\r\nSTUVWX\r\nYZ0123\r\n456789\r\n",
+            )
+            .expect("floating scrollback");
+        (session_id, floating_id)
+    };
+    let target = crate::web::WebSessionTarget::new(session_name.clone(), session_id);
+    let snapshot = handler
+        .web_session_snapshot_with_scrolls(&target, None, &HashMap::from([(floating_id, 0)]))
+        .await
+        .expect("floating scrollbar Web snapshot");
+
+    let floating = snapshot
+        .view
+        .panes
+        .iter()
+        .find(|pane| pane.id == floating_id.as_u32())
+        .expect("floating metadata");
+    assert_eq!(
+        (floating.x, floating.y, floating.cols, floating.rows),
+        (4, 2, 6, 4),
+        "Web metadata must use the renderer's left-scrollbar content projection"
+    );
+
+    let mut rendered = rmux_core::TerminalScreen::new(snapshot.size, 0);
+    rendered.feed(&snapshot.ansi_bytes());
+    let mut text = String::new();
+    assert!(rendered.screen().visit_visible_line_cells(2, 20, |cell| {
+        text.push_str(cell.text());
+    }));
+    assert_eq!(
+        text.chars().nth(4),
+        Some('A'),
+        "scrollback content must begin after the canonical scrollbar and padding"
+    );
+
+    let state = handler.state.lock().await;
+    let mouse =
+        crate::mouse::layout_for_session(&state, &session_name, 1).expect("mouse scene projection");
+    let floating_mouse = mouse
+        .panes
+        .iter()
+        .max_by_key(|pane| pane.layer)
+        .expect("floating mouse pane");
+    assert_eq!(floating_mouse.pane_id, floating_id);
+    assert_eq!(
+        floating_mouse.coordinates().relative_position(4, 2),
+        Some((0, 0))
+    );
+    assert_eq!(floating_mouse.coordinates().relative_position(2, 2), None);
+}
+
+#[tokio::test]
+async fn web_session_floating_order_is_canonical_and_invalidates_presentation() {
+    let handler = RequestHandler::new();
+    let session_name = new_session_with_size(
+        &handler,
+        "websession-floating-order",
+        TerminalSize { cols: 20, rows: 10 },
+    )
+    .await;
+    set_session_status(&handler, &session_name, "off").await;
+    handler
+        .wait_for_pane_startup_to_finish_for_test(&PaneTarget::with_window(
+            session_name.clone(),
+            0,
+            0,
+        ))
+        .await;
+    for pane_index in 1..=2 {
+        assert!(matches!(
+            handler
+                .handle(Request::SplitWindow(SplitWindowRequest {
+                    target: SplitWindowTarget::Session(session_name.clone()),
+                    direction: SplitDirection::Vertical,
+                    before: false,
+                    environment: None,
+                }))
+                .await,
+            Response::SplitWindow(_)
+        ));
+        handler
+            .wait_for_pane_startup_to_finish_for_test(&PaneTarget::with_window(
+                session_name.clone(),
+                0,
+                pane_index,
+            ))
+            .await;
+    }
+
+    let (session_id, rear_id, front_id) = {
+        let mut state = handler.state.lock().await;
+        let target = WindowTarget::with_window(session_name.clone(), 0);
+        let mut layout = state
+            .sessions
+            .window_layout_context_mut(&target)
+            .expect("window layout context");
+        layout
+            .float_pane(
+                1,
+                rmux_core::FloatingPaneRect::new(2, 1, 8, 4).expect("rear rectangle"),
+            )
+            .expect("rear floating pane");
+        layout
+            .float_pane(
+                2,
+                rmux_core::FloatingPaneRect::new(4, 2, 8, 4).expect("front rectangle"),
+            )
+            .expect("front floating pane");
+        let session = state.sessions.session(&session_name).expect("session");
+        (
+            session.id(),
+            session.window().pane(1).expect("rear pane").id(),
+            session.window().pane(2).expect("front pane").id(),
+        )
+    };
+    let target = crate::web::WebSessionTarget::new(session_name.clone(), session_id);
+    let before = handler
+        .web_session_snapshot_with_scrolls(&target, None, &HashMap::new())
+        .await
+        .expect("ordered floating scene");
+    assert_eq!(
+        before
+            .view
+            .panes
+            .iter()
+            .rev()
+            .take(2)
+            .map(|pane| pane.id)
+            .collect::<Vec<_>>(),
+        vec![front_id.as_u32(), rear_id.as_u32()]
+    );
+
+    {
+        let mut state = handler.state.lock().await;
+        state
+            .sessions
+            .window_layout_context_mut(&WindowTarget::with_window(session_name, 0))
+            .expect("window layout context")
+            .raise_floating_pane(1)
+            .expect("raise rear float");
+    }
+    let after = handler
+        .web_session_snapshot_with_scrolls(&target, None, &HashMap::new())
+        .await
+        .expect("raised floating scene");
+    assert_eq!(
+        after
+            .view
+            .panes
+            .iter()
+            .rev()
+            .take(2)
+            .map(|pane| pane.id)
+            .collect::<Vec<_>>(),
+        vec![rear_id.as_u32(), front_id.as_u32()]
+    );
+    assert!(
+        before.requires_keyframe_for(&after),
+        "a z-order and occlusion change must select a complete keyframe"
+    );
+}
+
+#[tokio::test]
+async fn linked_web_sessions_capture_the_same_canonical_window_scene() {
+    let handler = RequestHandler::new();
+    let owner = new_session_with_size(
+        &handler,
+        "web-scene-linked-owner",
+        TerminalSize { cols: 20, rows: 10 },
+    )
+    .await;
+    let peer = new_session_with_size(
+        &handler,
+        "web-scene-linked-peer",
+        TerminalSize { cols: 20, rows: 10 },
+    )
+    .await;
+    set_session_status(&handler, &owner, "off").await;
+    set_session_status(&handler, &peer, "off").await;
+    for session_name in [&owner, &peer] {
+        handler
+            .wait_for_pane_startup_to_finish_for_test(&PaneTarget::with_window(
+                session_name.clone(),
+                0,
+                0,
+            ))
+            .await;
+    }
+
+    assert!(matches!(
+        handler
+            .handle(Request::LinkWindow(LinkWindowRequest {
+                source: WindowTarget::with_window(owner.clone(), 0),
+                target: WindowTarget::with_window(peer.clone(), 1),
+                after: false,
+                before: false,
+                kill_destination: false,
+                detached: true,
+            }))
+            .await,
+        Response::LinkWindow(_)
+    ));
+
+    let (owner_id, peer_id, owner_window_id, peer_own_window_id, peer_window_id) = {
+        let state = handler.state.lock().await;
+        let owner_session = state.sessions.session(&owner).expect("owner session");
+        let peer_session = state.sessions.session(&peer).expect("peer session");
+        (
+            owner_session.id(),
+            peer_session.id(),
+            owner_session.window_at(0).expect("owner window").id(),
+            peer_session.window_at(0).expect("peer own window").id(),
+            peer_session.window_at(1).expect("linked peer window").id(),
+        )
+    };
+    assert_eq!(owner_window_id, peer_window_id);
+
+    let owner_snapshot = handler
+        .web_session_snapshot_with_scrolls(
+            &crate::web::WebSessionTarget::new(owner.clone(), owner_id),
+            Some(WebSessionWindowSelection::new(0, owner_window_id)),
+            &HashMap::new(),
+        )
+        .await
+        .expect("owner scene snapshot");
+    let peer_own_snapshot = handler
+        .web_session_snapshot_with_scrolls(
+            &crate::web::WebSessionTarget::new(peer.clone(), peer_id),
+            Some(WebSessionWindowSelection::new(0, peer_own_window_id)),
+            &HashMap::new(),
+        )
+        .await
+        .expect("peer own-window snapshot");
+    assert!(
+        owner_snapshot.requires_keyframe_for(&peer_own_snapshot),
+        "equal geometry from another WindowId is another presentation"
+    );
+    let peer_snapshot = handler
+        .web_session_snapshot_with_scrolls(
+            &crate::web::WebSessionTarget::new(peer.clone(), peer_id),
+            Some(WebSessionWindowSelection::new(1, peer_window_id)),
+            &HashMap::new(),
+        )
+        .await
+        .expect("linked scene snapshot");
+    assert!(
+        !owner_snapshot.requires_keyframe_for(&peer_snapshot),
+        "equal contexts for one canonical WindowId must capture one scene"
+    );
+
+    set_session_status(&handler, &peer, "2").await;
+    let peer_status_snapshot = handler
+        .web_session_snapshot_with_scrolls(
+            &crate::web::WebSessionTarget::new(peer, peer_id),
+            Some(WebSessionWindowSelection::new(1, peer_window_id)),
+            &HashMap::new(),
+        )
+        .await
+        .expect("linked scene with another context");
+    assert!(
+        owner_snapshot.requires_keyframe_for(&peer_status_snapshot),
+        "one WindowId resolved in another context requires a new keyframe"
     );
 }
 
@@ -1394,7 +2095,7 @@ async fn web_kill_pane_drains_after_kill_pane_inline_hook() {
             .session(&hook_target)
             .expect("hook target survives")
             .windows()
-            .len(),
+            .count(),
         2,
         "the after-kill hook must run outside the Web request identity guard"
     );
@@ -1449,7 +2150,7 @@ async fn web_session_identity_guard_preserves_recreated_name() {
         .session(&session_name)
         .expect("replacement session survives stale web request");
     assert_ne!(replacement.id(), stale_session_id);
-    assert_eq!(replacement.windows().len(), 1);
+    assert_eq!(replacement.windows().count(), 1);
 }
 
 #[tokio::test]
@@ -1529,6 +2230,108 @@ async fn web_window_identity_guard_preserves_recreated_slot() {
         .and_then(|session| session.window_at(1))
         .expect("replacement window survives stale web request");
     assert_ne!(replacement.id(), stale_window_id);
+}
+
+#[tokio::test]
+async fn web_session_view_selection_rejects_missing_and_recycled_window_identity() {
+    let handler = RequestHandler::new();
+    let session_name = new_session(&handler, "web-view-window-identity-aba").await;
+    assert!(matches!(
+        handler
+            .handle(Request::NewWindow(Box::new(NewWindowRequest {
+                target: session_name.clone(),
+                name: Some("selected".to_owned()),
+                detached: true,
+                environment: None,
+                command: None,
+                process_command: None,
+                start_directory: None,
+                target_window_index: Some(1),
+                insert_at_target: false,
+            })))
+            .await,
+        Response::NewWindow(_)
+    ));
+    let (session_id, selected_window_id) = {
+        let state = handler.state.lock().await;
+        let session = state.sessions.session(&session_name).expect("session");
+        (
+            session.id(),
+            session.window_at(1).expect("selected window").id(),
+        )
+    };
+    let session_target = crate::web::WebSessionTarget::new(session_name.clone(), session_id);
+    let created = create_share(
+        &handler,
+        share_request(WebShareScope::Session(session_name.clone())),
+    )
+    .await;
+    let stream = handler
+        .open_web_share(
+            &token_from_url(created.spectator_url.as_deref().expect("spectator URL")),
+            None,
+        )
+        .await
+        .expect("session share opens");
+    let WebShareStream::Session(mut stream) = stream else {
+        panic!("expected session stream");
+    };
+    let selection = handler
+        .web_session_select_window_for_view(&session_target, stream.attach_pid(), 1)
+        .await
+        .expect("spectator selection succeeds")
+        .expect("selected window exists");
+    assert_eq!(selection.window_id(), selected_window_id);
+    stream.select_window_for_view(selection);
+
+    assert!(matches!(
+        handler
+            .handle(Request::KillWindow(KillWindowRequest {
+                target: WindowTarget::with_window(session_name.clone(), 1),
+                kill_all_others: false,
+            }))
+            .await,
+        Response::KillWindow(_)
+    ));
+    let missing = handler
+        .web_session_snapshot_with_scrolls(
+            &session_target,
+            stream.selected_window(),
+            &HashMap::new(),
+        )
+        .await;
+    assert!(
+        missing.is_err(),
+        "a persisted Web view must refuse a vanished selected WindowId"
+    );
+
+    assert!(matches!(
+        handler
+            .handle(Request::NewWindow(Box::new(NewWindowRequest {
+                target: session_name,
+                name: Some("replacement".to_owned()),
+                detached: true,
+                environment: None,
+                command: None,
+                process_command: None,
+                start_directory: None,
+                target_window_index: Some(1),
+                insert_at_target: false,
+            })))
+            .await,
+        Response::NewWindow(_)
+    ));
+    let recycled = handler
+        .web_session_snapshot_with_scrolls(
+            &session_target,
+            stream.selected_window(),
+            &HashMap::new(),
+        )
+        .await;
+    assert!(
+        recycled.is_err(),
+        "a persisted Web view must refuse a replacement in the selected index"
+    );
 }
 
 #[tokio::test]
@@ -1774,6 +2577,57 @@ async fn web_session_operator_resize_reaches_attached_session() {
     .expect("browser resize reaches the attached session as external and content geometry");
 }
 
+#[tokio::test]
+async fn passive_web_session_view_does_not_contribute_native_pane_focus() {
+    let handler = RequestHandler::new();
+    let session_name = new_session(&handler, "web-focus-provenance").await;
+    let created = create_share(
+        &handler,
+        CreateWebShareRequest {
+            operator: true,
+            spectator: false,
+            max_spectators: None,
+            max_operators: None,
+            ..share_request(WebShareScope::Session(session_name.clone()))
+        },
+    )
+    .await;
+    let operator_token = token_from_url(created.operator_url.as_deref().expect("operator URL"));
+    let web_stream = handler
+        .open_web_share(&operator_token, None)
+        .await
+        .expect("session web share opens");
+    assert!(matches!(web_stream, WebShareStream::Session(_)));
+
+    {
+        let mut state = handler.state.lock().await;
+        state
+            .append_bytes_to_pane_transcript_for_test(&session_name, 0, 0, b"\x1b[?1004h")
+            .expect("pane enables focus reporting");
+    }
+    let native_pid = std::process::id();
+    let (control_tx, _control_rx) = tokio::sync::mpsc::unbounded_channel();
+    handler
+        .register_attach(native_pid, session_name.clone(), control_tx)
+        .await;
+    let target = PaneTarget::new(session_name.clone(), 0);
+    {
+        let state = handler.state.lock().await;
+        state.start_pane_input_capture_for_test(&target);
+    }
+    handler
+        .handle_attached_live_input_for_test(native_pid, b"\x1b[O")
+        .await
+        .expect("native focus-out succeeds");
+
+    let state = handler.state.lock().await;
+    assert_eq!(
+        state.pane_input_capture_for_test(&target),
+        Some(b"\x1b[O".to_vec()),
+        "the virtual attach must not keep the native pane aggregate focused"
+    );
+}
+
 fn contains_subslice(haystack: &[u8], needle: &[u8]) -> bool {
     haystack
         .windows(needle.len())
@@ -1822,10 +2676,7 @@ async fn web_session_pane_scroll_frame_degrades_when_recovery_metadata_is_bounde
         "x".repeat(crate::pane_recovery::MAX_RECOVERY_HYPERLINK_ENTRY_BYTES)
     );
     payload.extend_from_slice(format!("\x1b]8;;{uri}\x1b\\X\x1b]8;;\x1b\\").as_bytes());
-    transcript
-        .lock()
-        .expect("transcript lock")
-        .append_bytes(&payload);
+    transcript.lock().append_bytes(&payload);
 
     let session_target = crate::web::WebSessionTarget::new(session_name, session_id);
     let frame = handler
@@ -1888,7 +2739,6 @@ async fn web_session_snapshot_degrades_for_a_copy_mode_pane_with_bounded_out_met
     );
     transcript
         .lock()
-        .expect("transcript lock")
         .append_bytes(format!("\x1b]8;;{uri}\x1b\\X\x1b]8;;\x1b\\").as_bytes());
     let response = handler
         .handle(Request::CopyMode(CopyModeRequest {
@@ -1958,8 +2808,8 @@ async fn new_session_with_size(
     size: TerminalSize,
 ) -> SessionName {
     let session_name = SessionName::new(name).expect("valid session");
-    assert!(matches!(
-        handler
+    crate::session_fixture::assert_new_session(
+        &handler
             .handle(Request::NewSession(NewSessionRequest {
                 session_name: session_name.clone(),
                 detached: true,
@@ -1967,8 +2817,7 @@ async fn new_session_with_size(
                 environment: None,
             }))
             .await,
-        Response::NewSession(_)
-    ));
+    );
     session_name
 }
 

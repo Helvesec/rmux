@@ -1,0 +1,164 @@
+{
+  "schema": 1,
+  "criterion": "2A.options",
+  "axis_order": ["os", "route", "input_position", "terminal", "sequence", "outcome", "operation"],
+  "axes": {
+    "os": ["linux", "macos", "windows"],
+    "route": ["cli.typed", "cli.by-name", "startup", "source-file", "queue-binding", "control-mode", "sdk", "attach"],
+    "input_position": ["before-input", "after-input"],
+    "terminal": ["tty", "non-tty"],
+    "sequence": ["isolated", "chained"],
+    "outcome": ["success", "error", "eof", "cancellation"],
+    "operation": ["default", "replace", "append", "unset", "unset-pane-overrides", "only-if-unset", "quiet", "format", "array-index"]
+  },
+  "scope_selectors": {
+    "server": ["server-global"],
+    "session": ["session-global", "session-local"],
+    "window": ["window-global", "window-local"],
+    "pane": ["pane-local"]
+  },
+  "oracle_identity": {
+    "version": "tmux 3.7b",
+    "source_sha": "e802909de06012a4df6209d55e86487c56223163",
+    "archive_sha256": "87f2e99e3b685973f2ca002ffd6ed7e51a5744f7009daae5a15670b6d532db96",
+    "symbol": "options_table[]",
+    "source_bytes": 52331,
+    "source_sha256": "c1245a284d540f4c5160617c2f762718b9bc264236c5cf1524b34f51621b56c2"
+  },
+  "native_cell_ids": ["wire:MessageLimit|server-global|linux|cli.by-name|after-input|tty|isolated|success|replace", "wire:PaneBorderFormat|window-global|linux|cli.by-name|before-input|non-tty|isolated|success|default", "wire:PaneBorderLines|window-global|linux|cli.by-name|before-input|non-tty|isolated|success|default", "wire:PaneBorderStyle|window-global|linux|cli.by-name|before-input|non-tty|isolated|success|default"],
+  "recipe": {
+    "option_id": "wire:MessageLimit",
+    "startup": "set-option -s exit-empty off\nset-option -g default-shell /bin/bash\nset-option -g status off\nset-option -gw automatic-rename off\n",
+    "markers": {"first": "OPTIONS_BANK_FIRST_030", "last": "OPTIONS_BANK_LAST_030", "append": "OPTIONS_BANK_APPEND_030"},
+    "token": "options-bank-private-helper-030",
+    "steps": ["start-private-foreground-server", "one-private-inert-pane", "attach-private-pty", "set-limit-1000", "display-first", "display-last", "query-history-before", "set-limit-1", "query-value", "query-history-after", "append-third", "query-history-append", "independent-full-show-options-inventories", "close-owned-processes"],
+    "obligation": "The two messages are preloaded before mutation; displayed value1, cardinality1, FIRST=LAST=0 and exactly HH:MM: client-<observer PID> command: show-messages retained. Additional append observation cannot replace this assertion.",
+    "oracle_observer_risk": "Measured tmux 3.7b logs show-messages before reading and evicts FIRST/LAST at limit1. Require the executing observer PID; normalize only its time/PID after validation."
+  },
+  "context_semantics": {
+    "input_position": "Option operation before or after the input consumed by its real effect; CLI argument/parser positions still need concrete recipes.",
+    "terminal": "Presence of a private attached TTY consumer; detached CLI transport itself may use pipes.",
+    "sequence": "One isolated option mutation or a chained command/binding queue.",
+    "outcome": "Expected successful effect, rejected input, input EOF, or cancellation; concrete per-route observations remain required.",
+    "operation": "Default/read/effect or the indicated set-option flag family. Unsupported combinations remain required FAIL_MISSING until applicability is validated."
+  },
+  "limits": {"product_seconds": 300, "cleanup_seconds": 45, "sessions": 1, "windows": 2, "panes": 4, "helpers": 4, "logs_bytes": 33554432},
+  "unimplemented": ["Mac and Windows native adapters", "Per-option real consumer recipes beyond message-limit", "Detailed CLI argument positions and invalid scope recipes", "Validation of route/flag applicability; no automatic exclusion"],
+  "receipt_binding": {
+    "schema": 1,
+    "cell": {
+      "scope": "server-global",
+      "os": "linux",
+      "route": "cli.by-name",
+      "input_position": "after-input",
+      "terminal": "tty",
+      "sequence": "isolated",
+      "outcome": "success",
+      "operation": "replace"
+    },
+    "operations": [
+      {
+        "role": "preload-first",
+        "step": "display-first",
+        "argv": [
+          "display-message",
+          "-c",
+          "$client",
+          "$first"
+        ]
+      },
+      {
+        "role": "preload-last",
+        "step": "display-last",
+        "argv": [
+          "display-message",
+          "-c",
+          "$client",
+          "$last"
+        ]
+      },
+      {
+        "role": "before",
+        "step": "query-history-before",
+        "argv": [
+          "show-messages"
+        ]
+      },
+      {
+        "role": "mutation",
+        "step": "set-limit-1",
+        "argv": [
+          "set-option",
+          "-s",
+          "$option",
+          "1"
+        ]
+      },
+      {
+        "role": "value",
+        "step": "query-value",
+        "argv": [
+          "show-options",
+          "-sv",
+          "$option"
+        ]
+      },
+      {
+        "role": "after",
+        "step": "query-history-after",
+        "argv": [
+          "show-messages"
+        ]
+      }
+    ],
+    "kind": "message-limit-preloaded-v1"
+  },
+  "default_recipe": {
+    "schema": 1,
+    "kind": "global-window-default-v1",
+    "cell": {
+      "scope": "window-global",
+      "os": "linux",
+      "route": "cli.by-name",
+      "input_position": "before-input",
+      "terminal": "non-tty",
+      "sequence": "isolated",
+      "outcome": "success",
+      "operation": "default"
+    },
+    "option_ids": [
+      "wire:PaneBorderFormat",
+      "wire:PaneBorderLines",
+      "wire:PaneBorderStyle"
+    ],
+    "operations": [
+      {
+        "role": "inventory",
+        "argv": [
+          "show-options",
+          "-gw"
+        ]
+      },
+      {
+        "role": "named",
+        "argv": [
+          "show-options",
+          "-gw",
+          "$option"
+        ]
+      },
+      {
+        "role": "value",
+        "argv": [
+          "show-options",
+          "-gwv",
+          "$option"
+        ]
+      }
+    ],
+    "startup": "set-option -s exit-empty off\nset-option -g default-shell /bin/bash\nset-option -g status off\nset-option -gw automatic-rename off\n",
+    "token": "options-bank-default-helper-034",
+    "obligation": "Read the global default through unfiltered, named and value-only CLI. Exact independent oracle bytes required. This proves only default/read serialization, never rendering or message payload retention.",
+    "oracle_baseline": "Measured tmux3.7b full raw window listing033; new independently closed oracle required before candidate."
+  }
+}

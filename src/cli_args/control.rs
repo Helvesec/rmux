@@ -72,6 +72,31 @@ mod tests {
     use super::{initial_control_command_lines, render_control_command_lines};
 
     #[test]
+    fn canonical_reparse_control_lines_preserve_controls_after_slashes() {
+        for prefix in ["/", "C:\\", "\\\\host\\share\\", "é/", "🚀/"] {
+            for ch in (1u8..=31).chain([127]).map(char::from) {
+                let expected = format!("{prefix}{ch}tail/$HOME/'\"");
+                let arguments =
+                    ["echo-alias", &expected, ";", "display-message", "end"].map(OsString::from);
+                let lines = initial_control_command_lines(&arguments).unwrap();
+                assert_eq!(lines.len(), 2);
+                let parsed = CommandParser::new()
+                    .with_command_aliases(["echo-alias=display-message".to_owned()])
+                    .parse_one_group(&lines[0])
+                    .unwrap();
+                assert_eq!(parsed.commands()[0].name(), "display-message");
+                assert_eq!(
+                    parsed.commands()[0].arguments()[0].as_string(),
+                    Some(expected.as_str()),
+                    "{:?}",
+                    lines[0]
+                );
+                assert_eq!(lines[1], "display-message end");
+            }
+        }
+    }
+
+    #[test]
     fn command_free_control_mode_uses_tmux_default_command() {
         let lines = initial_control_command_lines(&[]).expect("control lines");
 

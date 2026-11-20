@@ -2,6 +2,7 @@ use std::path::Path;
 
 use rmux_proto::{BreakPaneRequest, JoinPaneRequest, MovePaneRequest, PaneSplitSize};
 
+use super::super::window_commands::resolve_link_window_target;
 use super::super::{
     resolve_pane_target_or_current, resolve_pane_target_spec, resolve_window_target_spec,
     run_command_resolved, ExitFailure,
@@ -75,15 +76,17 @@ pub(in crate::cli) fn run_break_pane(
     run_command_resolved(socket_path, "break-pane", move |connection| {
         let source =
             resolve_pane_target_or_current(connection, args.source.as_ref(), "break-pane")?;
-        let target = args
-            .target
-            .as_ref()
-            .map(|target| resolve_window_target_spec(connection, target, true))
-            .transpose()?;
+        // tmux 3.7b breaks into the current session, not the source pane's one.
+        let target = match args.target.as_ref() {
+            Some(target) => resolve_window_target_spec(connection, target, true)?,
+            None => {
+                resolve_link_window_target(connection, None, args.after, args.before, "break-pane")?
+            }
+        };
         connection
             .break_pane(BreakPaneRequest {
                 source,
-                target,
+                target: Some(target),
                 name: args.name,
                 detached: args.detached,
                 after: args.after,

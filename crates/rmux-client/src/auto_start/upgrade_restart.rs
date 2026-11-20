@@ -9,14 +9,14 @@ use rmux_proto::{Response, CAPABILITY_WEB_SHARE};
 use crate::{connect_or_absent, upgrade, ConnectResult, Connection};
 use tracing::debug;
 
-use super::{
-    is_transient_connect_error, probe_connected_server, spawn_hidden_daemon_for, AutoStartConfig,
-    AutoStartError,
-};
+use super::{is_transient_connect_error, probe_connected_server, AutoStartConfig, AutoStartError};
 #[cfg(windows)]
-use rmux_sdk::bootstrap::startup_windows::{
+use rmux_bootstrap::startup_windows::{
     connect_or_start_blocking_selected_with, DEFAULT_STARTUP_DEADLINE, STARTUP_POLL_INTERVAL,
 };
+
+#[cfg(not(unix))]
+use super::spawn_hidden_daemon_for;
 
 const SEAMLESS_RESTART_TIMEOUT: Duration = Duration::from_secs(5);
 const SEAMLESS_RESTART_POLL_INTERVAL: Duration = Duration::from_millis(50);
@@ -199,6 +199,13 @@ fn restart_hidden_daemon(
 
     #[cfg(not(windows))]
     {
+        #[cfg(unix)]
+        let startup_owner = super::startup_owner::launch(binary_path, socket_path, config)
+            .map_err(|error| AutoStartError::Launch {
+                path: binary_path.to_path_buf(),
+                error,
+            })?;
+        #[cfg(not(unix))]
         spawn_hidden_daemon_for(binary_path, socket_path, config).map_err(|error| {
             AutoStartError::Launch {
                 path: binary_path.to_path_buf(),
@@ -206,6 +213,8 @@ fn restart_hidden_daemon(
             }
         })?;
         let connection = wait_for_connected_server(socket_path, config)?;
+        #[cfg(unix)]
+        startup_owner.release();
         Ok(ReadyServerConnection::new(connection, socket_path))
     }
 }

@@ -10,13 +10,15 @@ use rmux_proto::{
     ResizePaneTargetActionRequest, ResolveTargetType, RespawnPaneRequest,
 };
 
-#[path = "pane_commands/split.rs"]
+#[cfg(all(test, unix))]
+#[path = "pane_commands/resize_transport_tests.rs"]
+mod resize_transport_tests;
 mod split;
-#[path = "pane_commands/transfer.rs"]
+mod split_key;
 mod transfer;
 
 use super::json_output::{
-    filter_delimited_json_output, list_panes_json_format, write_list_panes_json,
+    length_prefixed_filter_format, list_panes_json_format, write_list_panes_json,
 };
 use super::{
     cli_target_actions_enabled, expect_command_output, expect_command_success, list_session_names,
@@ -26,8 +28,8 @@ use super::{
     target_action_needs_legacy_retry, write_lines_output, ExitFailure,
 };
 use crate::cli_args::{
-    LastPaneArgs, ListPanesArgs, PipePaneArgs, ResizePaneArgs, RespawnPaneArgs, SelectPaneArgs,
-    TargetSpec,
+    parse_target_spec, LastPaneArgs, ListPanesArgs, PipePaneArgs, ResizePaneArgs, RespawnPaneArgs,
+    SelectPaneArgs, TargetSpec,
 };
 
 pub(super) use split::run_split_window;
@@ -39,17 +41,23 @@ pub(super) fn run_last_pane(args: LastPaneArgs, socket_path: &Path) -> Result<i3
     run_command_resolved(socket_path, "last-pane", move |connection| {
         let target =
             resolve_window_target_or_current(connection, args.target.as_ref(), "last-pane")?;
-        let input_disabled = if args.enable_input {
-            Some(false)
-        } else if args.disable_input {
-            Some(true)
-        } else {
-            None
-        };
+        let input_disabled = input_disabled_flag(args.enable_input, args.disable_input);
         connection
             .last_pane_with_options(target, args.keep_zoom, input_disabled)
             .map_err(ExitFailure::from_client)
     })
+}
+
+/// Maps `-e`/`-d` of `last-pane` and `select-pane` to the input state the
+/// addressed pane receives; tmux 3.7b gives `-e` precedence.
+fn input_disabled_flag(enable_input: bool, disable_input: bool) -> Option<bool> {
+    if enable_input {
+        Some(false)
+    } else if disable_input {
+        Some(true)
+    } else {
+        None
+    }
 }
 
 pub(super) fn run_pipe_pane(args: PipePaneArgs, socket_path: &Path) -> Result<i32, ExitFailure> {
@@ -93,11 +101,11 @@ pub(super) fn run_list_panes(args: ListPanesArgs, socket_path: &Path) -> Result<
     let json = args.json;
     let default_format = list_panes_default_format(args.all_sessions, args.session_scope);
     let format = if json {
-        Some(list_panes_server_format(
-            Some(&list_panes_json_format()),
-            args.filter.as_deref(),
-            default_format,
-        ))
+        let fields = list_panes_json_format();
+        Some(match args.filter.as_deref() {
+            Some(filter) => length_prefixed_filter_format(filter, &fields),
+            None => fields,
+        })
     } else {
         Some(list_panes_server_format(
             args.format.as_deref(),
@@ -137,13 +145,6 @@ pub(super) fn run_list_panes(args: ListPanesArgs, socket_path: &Path) -> Result<
             .map_err(ExitFailure::from_client)?;
         let output = expect_command_output(&response, "list-panes")?;
         if json {
-            let filtered;
-            let output = if args.filter.is_some() {
-                filtered = filter_delimited_json_output(output, "list-panes")?;
-                &filtered
-            } else {
-                output
-            };
             json_stdout.extend_from_slice(output.stdout());
             continue;
         }
@@ -156,7 +157,10 @@ pub(super) fn run_list_panes(args: ListPanesArgs, socket_path: &Path) -> Result<
         }
     }
     if json {
-        return write_list_panes_json(&CommandOutput::from_stdout(json_stdout));
+        return write_list_panes_json(
+            &CommandOutput::from_stdout(json_stdout),
+            args.filter.is_some(),
+        );
     }
     write_lines_output(&lines)
 }
@@ -266,6 +270,20 @@ pub(super) fn run_select_pane(
     socket_path: &Path,
 ) -> Result<i32, ExitFailure> {
     let keep_zoom = args.keep_zoom;
+    // `-l` comes first: like tmux 3.7b, `select-pane -l -d/-e` toggles the
+    // last pane's input (`-e` wins) without selecting it.
+    if args.last {
+        let input_disabled = input_disabled_flag(args.enable_input, args.disable_input);
+        let mut connection = connect(socket_path)
+            .map_err(|error| ExitFailure::from_client_connect(socket_path, error))?;
+        let target =
+            resolve_window_target_or_current(&mut connection, args.target.as_ref(), "select-pane")?;
+        let response = connection
+            .last_pane_with_options(target, keep_zoom, input_disabled)
+            .map_err(ExitFailure::from_client)?;
+        expect_command_success(response, "last-pane")?;
+        return Ok(0);
+    }
     if args.disable_input || args.enable_input {
         let mut connection = connect(socket_path)
             .map_err(|error| ExitFailure::from_client_connect(socket_path, error))?;
@@ -278,22 +296,11 @@ pub(super) fn run_select_pane(
                 target,
                 None,
                 args.style.clone(),
-                Some(args.disable_input),
+                input_disabled_flag(args.enable_input, args.disable_input),
                 keep_zoom,
             )
             .map_err(ExitFailure::from_client)?;
         expect_command_success(response, "select-pane")?;
-        return Ok(0);
-    }
-    if args.last {
-        let mut connection = connect(socket_path)
-            .map_err(|error| ExitFailure::from_client_connect(socket_path, error))?;
-        let target =
-            resolve_window_target_or_current(&mut connection, args.target.as_ref(), "select-pane")?;
-        let response = connection
-            .last_pane_with_zoom(target, keep_zoom)
-            .map_err(ExitFailure::from_client)?;
-        expect_command_success(response, "last-pane")?;
         return Ok(0);
     }
 
@@ -342,6 +349,38 @@ pub(super) fn run_resize_pane(
     args: ResizePaneArgs,
     socket_path: &Path,
 ) -> Result<i32, ExitFailure> {
+    if args.position_x.is_some() || args.position_y.is_some() {
+        return super::alias_fallback::resize_pane_position::run(socket_path, args);
+    }
+    // Modes take precedence over the sequential width/height execution path.
+    if !args.trim_below && !args.zoom {
+        if let Some(crate::cli_args::ResizePaneSize::DeferredError(message)) = args.rows {
+            let mut connection = connect(socket_path)
+                .map_err(|error| ExitFailure::from_client_connect(socket_path, error))?;
+            let target = resolve_pane_target_or_current(
+                &mut connection,
+                args.target.as_ref(),
+                "resize-pane",
+            )?;
+            let size = if resize_pane_uses_percent(&args) {
+                Some(resize_pane_window_size(&mut connection, &target)?)
+            } else {
+                None
+            };
+            let columns = args
+                .columns
+                .and_then(|n| n.resolve(size.as_ref().map_or(0, |s| s.0)));
+            let response = connection
+                .resize_pane_axes(rmux_proto::ResizePaneAxesRequest {
+                    target,
+                    columns,
+                    rows: Err(rmux_proto::RmuxError::Server(message.to_owned())),
+                })
+                .map_err(ExitFailure::from_client)?;
+            expect_command_success(response, "resize-pane")?;
+            return Ok(0);
+        }
+    }
     if !cli_target_actions_enabled() || resize_pane_uses_percent(&args) {
         return run_resize_pane_legacy(args, socket_path);
     }
@@ -372,15 +411,50 @@ fn run_resize_pane_legacy(args: ResizePaneArgs, socket_path: &Path) -> Result<i3
     let window_size = resize_pane_uses_percent(&args)
         .then(|| resize_pane_window_size(&mut connection, &target))
         .transpose()?;
-    let adjustment = resize_pane_adjustment(args, window_size);
+    let adjustment = resize_pane_adjustment(
+        args,
+        window_size
+            .as_ref()
+            .map(|(width, height, _)| (*width, *height)),
+    );
 
-    connection
-        .resize_pane(target, adjustment)
+    let response = match window_size {
+        Some((_, _, pane_id)) if cli_target_actions_enabled() => {
+            let response = connection.resize_pane_target_action(ResizePaneTargetActionRequest {
+                target: Some(pane_id.clone()),
+                adjustment,
+            });
+            if target_action_needs_legacy_retry(&response) {
+                drop(connection);
+                return run_percent_resize_legacy_by_id(socket_path, &pane_id, adjustment);
+            } else {
+                response
+            }
+        }
+        _ => connection.resize_pane(target, adjustment),
+    };
+    response
         .map_err(ExitFailure::from_client)
         .and_then(|response| {
             expect_command_success(response, "resize-pane")?;
             Ok(0)
         })
+}
+
+fn run_percent_resize_legacy_by_id(
+    socket_path: &Path,
+    pane_id: &str,
+    adjustment: ResizePaneAdjustment,
+) -> Result<i32, ExitFailure> {
+    let mut connection = connect(socket_path)
+        .map_err(|error| ExitFailure::from_client_connect(socket_path, error))?;
+    let stable_target = parse_target_spec(pane_id).map_err(|error| ExitFailure::new(1, error))?;
+    let stable_target = resolve_pane_target_spec(&mut connection, &stable_target)?;
+    let response = connection
+        .resize_pane(stable_target, adjustment)
+        .map_err(ExitFailure::from_client)?;
+    expect_command_success(response, "resize-pane")?;
+    Ok(0)
 }
 
 fn resize_pane_uses_percent(args: &ResizePaneArgs) -> bool {
@@ -448,22 +522,25 @@ fn resize_pane_adjustment(
 fn resize_pane_window_size(
     connection: &mut Connection,
     target: &rmux_proto::PaneTarget,
-) -> Result<(u16, u16), ExitFailure> {
+) -> Result<(u16, u16, String), ExitFailure> {
     let response = connection
         .list_panes_in_window(
             target.session_name().clone(),
             Some(target.window_index()),
-            Some("#{pane_index}\t#{pane-base-index}\t#{window_width}\t#{window_height}".to_owned()),
+            Some(
+                "#{pane_index}\t#{pane-base-index}\t#{window_width}\t#{window_height}\t#{pane_id}"
+                    .to_owned(),
+            ),
         )
         .map_err(ExitFailure::from_client)?;
     let output = expect_command_output(&response, "list-panes")?;
     let stdout = String::from_utf8_lossy(output.stdout());
-    let (width, height) = stdout
+    let ((width, height), pane_id) = stdout
         .lines()
         .find_map(|line| {
             let mut fields = line.split('\t');
             listed_pane_index_matches_target(target, fields.next()?, fields.next()?)
-                .then(|| fields.next().zip(fields.next()))
+                .then(|| fields.next().zip(fields.next()).zip(fields.next()))
                 .flatten()
         })
         .ok_or_else(|| {
@@ -478,5 +555,5 @@ fn resize_pane_window_size(
     let height = height.parse::<u16>().map_err(|error| {
         ExitFailure::new(1, format!("invalid resize-pane window height: {error}"))
     })?;
-    Ok((width, height))
+    Ok((width, height, pane_id.to_owned()))
 }

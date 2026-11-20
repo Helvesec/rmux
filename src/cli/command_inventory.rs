@@ -25,6 +25,19 @@ pub(super) fn run_list_commands(
     write_lines_output(&lines)
 }
 
+pub(super) fn invocation_is_local(groups: &[Vec<String>], control_mode: u8) -> bool {
+    if control_mode != 0 || groups.len() != 1 {
+        return false;
+    }
+    let Some(name) = groups[0]
+        .iter()
+        .find(|arg| !rmux_core::command_parser::is_parse_time_assignment(arg))
+    else {
+        return false;
+    };
+    rmux_core::command_parser::lookup_command(name).is_ok_and(|entry| entry.name == "list-commands")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

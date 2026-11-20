@@ -17,7 +17,7 @@ use super::pane_exit::PaneExitStatus;
 pub(super) const SCHEMA_VERSION: u8 = 1;
 pub(super) const DEFAULT_TIMEOUT: Duration = Duration::from_secs(30);
 pub(super) const DEFAULT_STABLE_FOR: Duration = Duration::from_millis(300);
-pub(super) const POLL_INTERVAL: Duration = Duration::from_millis(25);
+pub(super) use rmux_sdk::automation::POLL_INTERVAL;
 
 pub(super) fn check_disabled(env_name: &str, command_name: &str) -> Result<(), ExitFailure> {
     if std::env::var_os(env_name).is_some() {
@@ -31,6 +31,14 @@ pub(super) fn check_disabled(env_name: &str, command_name: &str) -> Result<(), E
 
 pub(super) fn connect_cli(socket_path: &Path) -> Result<Connection, ExitFailure> {
     connect(socket_path).map_err(|error| ExitFailure::from_client_connect(socket_path, error))
+}
+
+pub(super) fn connect_wait(
+    socket_path: &Path,
+    deadline: rmux_bootstrap::deadline::StartupDeadline,
+) -> Result<Connection, ExitFailure> {
+    rmux_client::connection::connect_with_deadline(socket_path, deadline)
+        .map_err(|error| ExitFailure::from_client_connect(socket_path, error))
 }
 
 pub(super) fn resolve_pane_slot(
@@ -91,36 +99,15 @@ pub(super) fn pane_snapshot(
 }
 
 pub(super) fn visible_lines(snapshot: &PaneSnapshotResponse) -> Vec<String> {
-    let cols = usize::from(snapshot.cols);
-    let rows = usize::from(snapshot.rows);
-    let mut lines = Vec::with_capacity(rows);
-    for row in 0..rows {
-        let start = row.saturating_mul(cols);
-        let end = start.saturating_add(cols).min(snapshot.cells.len());
-        lines.push(visible_line_from_cells(&snapshot.cells[start..end]));
-    }
-    lines
+    rmux_sdk::automation::project_snapshot(snapshot).visible_lines()
 }
 
 pub(super) fn visible_text(snapshot: &PaneSnapshotResponse) -> String {
-    visible_lines(snapshot).join("\n")
+    rmux_sdk::automation::project_snapshot(snapshot).visible_text()
 }
 
 pub(super) fn visible_line_from_cells(cells: &[PaneSnapshotCell]) -> String {
-    let mut line = String::new();
-    for cell in cells {
-        if !cell.padding {
-            line.push_str(&cell.text);
-        }
-    }
-    trim_trailing_spaces(&mut line);
-    line
-}
-
-fn trim_trailing_spaces(value: &mut String) {
-    while value.ends_with(' ') {
-        value.pop();
-    }
+    rmux_sdk::automation::render_wire_cells(cells)
 }
 
 #[derive(Debug, Clone)]
@@ -132,28 +119,14 @@ pub(super) struct TextMatch {
 }
 
 pub(super) fn find_visible_text(snapshot: &PaneSnapshotResponse, needle: &str) -> Vec<TextMatch> {
-    if needle.is_empty() {
-        return Vec::new();
-    }
-
-    (0..usize::from(snapshot.rows))
-        .flat_map(|row| {
-            let rendered = rendered_row(snapshot, row);
-            literal_match_ranges(&rendered.text, needle)
-                .into_iter()
-                .filter_map(move |(start, end)| {
-                    let start_coord = rendered.coords.get(start)?;
-                    let end_coord = end
-                        .checked_sub(1)
-                        .and_then(|index| rendered.coords.get(index))?;
-                    Some(TextMatch {
-                        row,
-                        col: start_coord.start_col,
-                        end_col: end_coord.end_col,
-                        text: rendered.text.get(start..end)?.to_owned(),
-                    })
-                })
-                .collect::<Vec<_>>()
+    rmux_sdk::automation::project_snapshot(snapshot)
+        .find_text_all(needle)
+        .into_iter()
+        .map(|found| TextMatch {
+            row: usize::from(found.start_row),
+            col: usize::from(found.start_col),
+            end_col: usize::from(found.end_col),
+            text: found.text,
         })
         .collect()
 }
@@ -172,64 +145,6 @@ pub(super) fn matches_json(matches: &[TextMatch]) -> Value {
             })
             .collect(),
     )
-}
-
-#[derive(Debug)]
-struct RenderedRow {
-    text: String,
-    coords: Vec<ByteCoord>,
-}
-
-#[derive(Debug, Clone, Copy)]
-struct ByteCoord {
-    start_col: usize,
-    end_col: usize,
-}
-
-fn rendered_row(snapshot: &PaneSnapshotResponse, row: usize) -> RenderedRow {
-    let cols = usize::from(snapshot.cols);
-    let start = row.saturating_mul(cols);
-    let end = start.saturating_add(cols).min(snapshot.cells.len());
-    let mut text = String::new();
-    let mut coords = Vec::new();
-    for (relative_col, cell) in snapshot.cells[start..end].iter().enumerate() {
-        if cell.padding {
-            continue;
-        }
-        let cell_start = text.len();
-        text.push_str(&cell.text);
-        let width = usize::from(cell.width.max(1));
-        let cell_end_col = relative_col.saturating_add(width).min(cols);
-        coords.extend(text[cell_start..].bytes().map(|_| ByteCoord {
-            start_col: relative_col,
-            end_col: cell_end_col,
-        }));
-    }
-    trim_trailing_spaces(&mut text);
-    coords.truncate(text.len());
-    RenderedRow { text, coords }
-}
-
-fn literal_match_ranges(haystack: &str, needle: &str) -> Vec<(usize, usize)> {
-    let mut ranges = Vec::new();
-    let mut search_start = 0;
-    while search_start <= haystack.len() {
-        let Some(relative) = haystack[search_start..].find(needle) else {
-            break;
-        };
-        let start = search_start + relative;
-        let end = start + needle.len();
-        ranges.push((start, end));
-        search_start = next_char_boundary_after(haystack, start);
-    }
-    ranges
-}
-
-fn next_char_boundary_after(value: &str, index: usize) -> usize {
-    value[index..]
-        .chars()
-        .next()
-        .map_or(value.len() + 1, |character| index + character.len_utf8())
 }
 
 pub(super) fn write_json(value: &Value) -> Result<i32, ExitFailure> {
@@ -391,8 +306,12 @@ fn write_all_stdout(stdout: &mut impl Write, bytes: &[u8]) -> Result<(), ExitFai
     }
 }
 
-pub(super) fn timeout_deadline(timeout: Option<Duration>) -> Instant {
-    Instant::now() + timeout.unwrap_or(DEFAULT_TIMEOUT)
+pub(super) fn timeout_deadline(
+    timeout: Option<Duration>,
+) -> rmux_bootstrap::deadline::StartupDeadline {
+    rmux_bootstrap::deadline::StartupDeadline::from_timeout(Some(
+        timeout.unwrap_or(DEFAULT_TIMEOUT),
+    ))
 }
 
 pub(super) fn duration_millis(duration: Duration) -> u64 {

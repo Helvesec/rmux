@@ -175,19 +175,74 @@ fn bare_relative_custom_socket_uses_current_directory() -> Result<(), Box<dyn Er
 #[test]
 fn version_branding_stays_rmux_for_rmux_binary_and_tmux_for_shim() -> Result<(), Box<dyn Error>> {
     let harness = CliHarness::new("version-shim")?;
-    let rmux = harness.run(&["-V"])?;
-    assert_status_success(&rmux);
-    assert!(
-        stdout(&rmux).starts_with("rmux "),
-        "stdout={}",
-        stdout(&rmux)
-    );
-
     let shim = harness.tmpdir().join("tmux");
-    symlink(env!("CARGO_BIN_EXE_rmux"), &shim)?;
-    let tmux = Command::new(&shim).arg("-V").output()?;
-    assert_status_success(&tmux);
-    assert_eq!(stdout(&tmux), "tmux 3.4\n");
+    symlink(
+        rmux_os::build_identity::cargo_binary(env!("CARGO_BIN_EXE_rmux")),
+        &shim,
+    )?;
+
+    for args in [&["-V"][..], &["-V", "-x"][..]] {
+        let rmux = harness.run(args)?;
+        assert_status_success(&rmux);
+        assert_eq!(
+            stdout(&rmux),
+            format!("rmux {}\n", env!("CARGO_PKG_VERSION")),
+            "args={args:?}"
+        );
+        assert!(!harness.socket_path().exists(), "args={args:?}");
+
+        let tmux = Command::new(&shim)
+            .args(args)
+            .env("RMUX_TMPDIR", harness.tmpdir())
+            .env_remove("RMUX")
+            .env_remove("TMUX")
+            .output()?;
+        assert_status_success(&tmux);
+        assert_eq!(stdout(&tmux), "tmux 3.4\n", "args={args:?}");
+        assert!(!harness.socket_path().exists(), "args={args:?}");
+    }
+    Ok(())
+}
+
+#[test]
+fn tmux_personality_keeps_long_version_rejection() -> Result<(), Box<dyn Error>> {
+    let harness = CliHarness::new("long-version-shim")?;
+    let shim = harness.tmpdir().join("tmux");
+    symlink(
+        rmux_os::build_identity::cargo_binary(env!("CARGO_BIN_EXE_rmux")),
+        &shim,
+    )?;
+    for args in [
+        &["--version"][..],
+        &["--version", "-V"][..],
+        &["-u", "--version"][..],
+    ] {
+        for internal_override in [false, true] {
+            let mut command = Command::new(if internal_override {
+                Path::new(rmux_os::build_identity::cargo_binary(env!(
+                    "CARGO_BIN_EXE_rmux"
+                )))
+            } else {
+                &shim
+            });
+            command
+                .args(args)
+                .env("RMUX_TMPDIR", harness.tmpdir())
+                .env_remove("TMUX")
+                .env_remove("TMUX_PANE");
+            if internal_override {
+                command.env("RMUX_INTERNAL_INVOKED_AS_TMUX", "1");
+            } else {
+                command.env_remove("RMUX_INTERNAL_INVOKED_AS_TMUX");
+            }
+            let actual = command.output()?;
+            let rejected = harness.run(&["--nope"])?;
+            assert_eq!(actual.status, rejected.status, "{args:?}");
+            assert_eq!(actual.stdout, rejected.stdout, "{args:?}");
+            assert_eq!(actual.stderr, rejected.stderr, "{args:?}");
+        }
+    }
+    assert!(!harness.socket_path().exists());
     Ok(())
 }
 
@@ -205,6 +260,25 @@ fn doctor_tmux_dropin_reports_missing_shim_and_suggests_setup() -> Result<(), Bo
     Ok(())
 }
 
+/// The product links the program it is running. A direct build runs Cargo's
+/// file; an identity build runs a retained copy through a launcher, which is a
+/// different program, so only the copy's bytes can prove it is Cargo's output.
+#[track_caller]
+fn assert_shim_reaches_executed_rmux(target: &Path) -> Result<(), Box<dyn Error>> {
+    let cargo_output = env!("CARGO_BIN_EXE_rmux");
+    let linked = fs::canonicalize(target)?;
+    if rmux_os::build_identity::cargo_binary(cargo_output) == cargo_output {
+        assert_eq!(linked, fs::canonicalize(cargo_output)?);
+    } else {
+        assert!(
+            fs::read(&linked)? == fs::read(cargo_output)?,
+            "shim target {} is not the bytes of Cargo's rmux at {cargo_output}",
+            linked.display()
+        );
+    }
+    Ok(())
+}
+
 #[test]
 fn setup_tmux_shim_creates_local_bin_symlink() -> Result<(), Box<dyn Error>> {
     let harness = CliHarness::new("setup-tmux-shim")?;
@@ -218,11 +292,7 @@ fn setup_tmux_shim_creates_local_bin_symlink() -> Result<(), Box<dyn Error>> {
     assert_status_success(&output);
     assert!(stdout(&output).contains("created:"));
     let shim = home.join(".local").join("bin").join("tmux");
-    let target = fs::read_link(&shim)?;
-    assert_eq!(
-        fs::canonicalize(target)?,
-        fs::canonicalize(env!("CARGO_BIN_EXE_rmux"))?
-    );
+    assert_shim_reaches_executed_rmux(&fs::read_link(&shim)?)?;
 
     let tmux = Command::new(&shim).arg("-V").output()?;
     assert_status_success(&tmux);
@@ -238,7 +308,10 @@ fn setup_tmux_shim_targets_stable_rmux_invocation_path() -> Result<(), Box<dyn E
     fs::create_dir_all(&home)?;
     fs::create_dir_all(&profile_bin)?;
     let profile_rmux = profile_bin.join("rmux");
-    symlink(env!("CARGO_BIN_EXE_rmux"), &profile_rmux)?;
+    symlink(
+        rmux_os::build_identity::cargo_binary(env!("CARGO_BIN_EXE_rmux")),
+        &profile_rmux,
+    )?;
 
     let output = Command::new("rmux")
         .args(["setup", "tmux-shim"])
@@ -246,7 +319,7 @@ fn setup_tmux_shim_targets_stable_rmux_invocation_path() -> Result<(), Box<dyn E
         .env("PATH", &profile_bin)
         .env(
             "RMUX_INTERNAL_PUBLIC_BINARY_PATH",
-            env!("CARGO_BIN_EXE_rmux"),
+            rmux_os::build_identity::cargo_binary(env!("CARGO_BIN_EXE_rmux")),
         )
         .output()?;
 
@@ -277,8 +350,14 @@ fn setup_tmux_shim_refreshes_previous_homebrew_binary() -> Result<(), Box<dyn Er
     fs::create_dir_all(&current_store)?;
     let old_rmux = old_store.join("rmux");
     let current_rmux = current_store.join("rmux");
-    fs::copy(env!("CARGO_BIN_EXE_rmux"), &old_rmux)?;
-    fs::copy(env!("CARGO_BIN_EXE_rmux"), &current_rmux)?;
+    fs::copy(
+        rmux_os::build_identity::cargo_binary(env!("CARGO_BIN_EXE_rmux")),
+        &old_rmux,
+    )?;
+    fs::copy(
+        rmux_os::build_identity::cargo_binary(env!("CARGO_BIN_EXE_rmux")),
+        &current_rmux,
+    )?;
     let shim = bin.join("tmux");
     symlink(&old_rmux, &shim)?;
 
@@ -323,8 +402,14 @@ fn setup_tmux_shim_refreshes_previous_nix_store_binary() -> Result<(), Box<dyn E
     fs::create_dir_all(&current_store)?;
     let old_rmux = old_store.join("rmux");
     let current_rmux = current_store.join("rmux");
-    fs::copy(env!("CARGO_BIN_EXE_rmux"), &old_rmux)?;
-    fs::copy(env!("CARGO_BIN_EXE_rmux"), &current_rmux)?;
+    fs::copy(
+        rmux_os::build_identity::cargo_binary(env!("CARGO_BIN_EXE_rmux")),
+        &old_rmux,
+    )?;
+    fs::copy(
+        rmux_os::build_identity::cargo_binary(env!("CARGO_BIN_EXE_rmux")),
+        &current_rmux,
+    )?;
     let shim = bin.join("tmux");
     symlink(&old_rmux, &shim)?;
 

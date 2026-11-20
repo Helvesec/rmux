@@ -1,0 +1,93 @@
+name: Bounded premerge rehearsal verification
+
+on:
+  workflow_call:
+    inputs:
+      stage:
+        required: true
+        type: string
+      candidate_run_id:
+        required: true
+        type: string
+      expected_source_sha:
+        required: true
+        type: string
+      release_intent_id:
+        required: true
+        type: string
+      planned_release_ref:
+        required: true
+        type: string
+      release_kind:
+        required: true
+        type: string
+      candidate_manifest_run_id:
+        required: false
+        default: ""
+        type: string
+      candidate_manifest_artifact_id:
+        required: false
+        default: ""
+        type: string
+      candidate_manifest_artifact_digest:
+        required: false
+        default: ""
+        type: string
+      candidate_manifest_sha256:
+        required: false
+        default: ""
+        type: string
+
+permissions: {}
+
+jobs:
+  verify-rehearsal:
+    name: Verify the permitted premerge candidate without publication authority
+    runs-on: ubuntu-22.04
+    timeout-minutes: 15
+    permissions:
+      actions: read
+      contents: read
+    env:
+      RMUX_REHEARSAL_STAGE: ${{ inputs.stage }}
+      RMUX_CANDIDATE_PROFILE: premerge-rehearsal-v1
+      RMUX_REHEARSAL_PERMIT: ${{ vars.RMUX_PREMERGE_REHEARSAL_PERMIT }}
+      RMUX_MANIFEST_RUN_ID: ${{ inputs.candidate_manifest_run_id }}
+      RMUX_MANIFEST_ARTIFACT_ID: ${{ inputs.candidate_manifest_artifact_id }}
+      RMUX_MANIFEST_ARTIFACT_DIGEST: ${{ inputs.candidate_manifest_artifact_digest }}
+      RMUX_MANIFEST_SHA256: ${{ inputs.candidate_manifest_sha256 }}
+      RMUX_CANDIDATE_RUN_ID: ${{ inputs.candidate_run_id }}
+      RMUX_EXPECTED_SOURCE_SHA: ${{ inputs.expected_source_sha }}
+      RMUX_RELEASE_INTENT_ID: ${{ inputs.release_intent_id }}
+      RMUX_PLANNED_RELEASE_REF: ${{ inputs.planned_release_ref }}
+      RMUX_RELEASE_KIND: ${{ inputs.release_kind }}
+    steps:
+      - name: Reject untrusted inputs before checkout or API access
+        shell: bash
+        run: |
+          set -euo pipefail
+          [[ "$RMUX_CANDIDATE_RUN_ID" =~ ^[1-9][0-9]*$ ]]
+          [[ "$RMUX_EXPECTED_SOURCE_SHA" =~ ^[0-9a-f]{40}$ ]]
+          [[ "$RMUX_RELEASE_INTENT_ID" =~ ^[A-Za-z0-9._:-]{8,128}$ ]]
+          [[ "$RMUX_PLANNED_RELEASE_REF" =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-rc\.[0-9]+)?$ ]]
+          [[ "$RMUX_RELEASE_KIND" =~ ^(shadow|rc|stable)$ ]]
+          case "$RMUX_REHEARSAL_STAGE" in
+            seal) test "$GITHUB_WORKFLOW" = 'Release candidate shadow sealer' ;;
+            simulate) test "$GITHUB_WORKFLOW" = 'Release promotion simulation' ;;
+            *) exit 1 ;;
+          esac
+          test "$GITHUB_EVENT_NAME" = workflow_dispatch
+          test "$GITHUB_REF" = refs/heads/release/0.11.0
+          test "$GITHUB_SHA" = "$RMUX_EXPECTED_SOURCE_SHA"
+          test "$GITHUB_RUN_ATTEMPT" = 1
+
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 2
+          persist-credentials: false
+
+      - name: Verify the bounded rehearsal
+        uses: ./.github/actions/premerge-rehearsal
+        env:
+          RMUX_REHEARSAL_PERMIT_FILE: ${{ runner.temp }}/rehearsal-permit.json

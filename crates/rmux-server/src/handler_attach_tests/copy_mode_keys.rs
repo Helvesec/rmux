@@ -184,7 +184,99 @@ async fn attached_copy_mode_vi_search_and_selection_keys_resolve_from_the_table(
         .handle_attached_live_input_for_test(requester_pid, b"/P0-LINE-12\r ")
         .await
         .expect("copy-mode attached keys");
-    wait_for_pane_mode_status(&handler, &alpha, "1:copy-mode:1:1\n").await;
+    wait_for_pane_mode_status(&handler, &alpha, "1:copy-mode:0:1\n").await;
+}
+
+#[tokio::test]
+async fn attached_copy_mode_ctrl_q_detaches_without_cancelling_saved_view() {
+    for (mode, table) in [("vi", "copy-mode-vi"), ("emacs", "copy-mode")] {
+        for input in [b"\x11".as_slice(), b"\x1b[113;5u".as_slice()] {
+            let handler = RequestHandler::new();
+            let requester_pid = std::process::id();
+            let alpha = session_name("alpha");
+            let mut control_rx =
+                create_quiet_attached_session(&handler, requester_pid, &alpha).await;
+            let target = PaneTarget::new(alpha.clone(), 0);
+            let content = (0..60)
+                .map(|line| format!("line-{line}\r\n"))
+                .collect::<String>();
+            replace_transcript_contents(
+                &handler,
+                &target,
+                TerminalSize { cols: 80, rows: 24 },
+                content.as_bytes(),
+            )
+            .await;
+            assert!(matches!(
+                handler
+                    .handle(Request::SetOption(SetOptionRequest {
+                        scope: ScopeSelector::Window(WindowTarget::with_window(alpha.clone(), 0)),
+                        option: OptionName::ModeKeys,
+                        value: mode.to_owned(),
+                        mode: SetOptionMode::Replace,
+                    }))
+                    .await,
+                Response::SetOption(_)
+            ));
+            assert!(matches!(
+                handler
+                    .handle(Request::BindKey(Box::new(rmux_proto::BindKeyRequest {
+                        table_name: table.to_owned(),
+                        key: "C-q".to_owned(),
+                        note: None,
+                        repeat: false,
+                        command: Some(vec!["detach-client".to_owned()]),
+                    })))
+                    .await,
+                Response::BindKey(_)
+            ));
+            assert!(matches!(
+                handler
+                    .handle(Request::CopyMode(CopyModeRequest {
+                        target: Some(target.clone()),
+                        page_down: false,
+                        exit_on_scroll: false,
+                        hide_position: false,
+                        mouse_drag_start: false,
+                        cancel_mode: false,
+                        scrollbar_scroll: false,
+                        source: None,
+                        page_up: false,
+                    }))
+                    .await,
+                Response::CopyMode(_)
+            ));
+            for command in ["history-top", "begin-selection", "cursor-down"] {
+                assert!(matches!(
+                    send_attached_copy_mode_command(&handler, &target, &[command]).await,
+                    Response::SendKeys(_)
+                ));
+            }
+            let transcript = handler
+                .state
+                .lock()
+                .await
+                .transcript_handle(&target)
+                .expect("transcript");
+            let before = transcript.lock().copy_mode_summary().expect("copy mode");
+            assert!(before.scroll_position > 0);
+            assert!(before.selection_present);
+            drain_attach_controls(&mut control_rx);
+            handler
+                .handle_attached_live_input_for_test(requester_pid, input)
+                .await
+                .expect("Ctrl+Q input");
+            let mut detached = false;
+            while let Ok(control) = control_rx.try_recv() {
+                detached |= matches!(control, AttachControl::Detach);
+            }
+            assert!(
+                detached,
+                "{mode} Ctrl+Q must dispatch detach-client, not plain q"
+            );
+            assert_eq!(transcript.lock().copy_mode_summary(), Some(before));
+        }
+    }
 }
 
 #[tokio::test]
@@ -236,7 +328,7 @@ async fn attached_copy_mode_q_exits_and_refreshes_normal_surface() {
         .handle_attached_live_input_for_test(requester_pid, b"/P0-LINE-12\r ")
         .await
         .expect("copy-mode search/select attached keys");
-    wait_for_pane_mode_status(&handler, &alpha, "1:copy-mode:1:1\n").await;
+    wait_for_pane_mode_status(&handler, &alpha, "1:copy-mode:0:1\n").await;
     drain_attach_controls(&mut control_rx);
 
     handler
@@ -347,7 +439,7 @@ async fn assert_grouped_copy_mode_refresh_fanout(label: &str, automatic_rename: 
             skip_environment_update: false,
         })))
         .await;
-    assert!(matches!(grouped, Response::NewSession(_)), "{grouped:?}");
+    crate::session_fixture::assert_new_session(&grouped);
     let (second_tx, mut second_rx) = mpsc::unbounded_channel();
     handler
         .register_attach(second_pid, beta.clone(), second_tx)
@@ -582,7 +674,7 @@ async fn attached_copy_mode_copies_selection_to_buffer_and_exits_cleanly() {
     ));
     assert_eq!(
         pane_mode_status(&handler, &alpha).await,
-        "1:copy-mode:1:1\n",
+        "1:copy-mode:0:1\n",
         "search and word selection should be active before copy"
     );
     drain_attach_controls(&mut control_rx);

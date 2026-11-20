@@ -10,17 +10,25 @@ param(
     [switch]$RequireReleaseArtifact,
     [string]$ExpectedGitSha = $env:RMUX_EXPECTED_GIT_SHA,
     [string]$CtrlMatrixEvidence = "",
-    [string]$NextestArchive = ""
+    [string]$NextestArchive = "",
+    # JSON pins both delivered archives, installed inventories and finite bounds.
+    [string]$ArchivePairPlan = "",
+    [switch]$ExplicitRollback,
+    [switch]$Uninstall
 )
 
 Set-StrictMode -Version Latest
 $ErrorActionPreference = "Stop"
+. (Join-Path $PSScriptRoot "conpty/runtime.ps1")
+. (Join-Path $PSScriptRoot "packaging/layout-tool.ps1")
 $assertCargoFilter = Join-Path $PSScriptRoot "assert-cargo-filter-nonempty.ps1"
 
 function Fail([string]$Message) {
     Write-Error "error: $Message"
     exit 1
 }
+
+
 
 function Invoke-NativeCapture([string]$Program, [string[]]$Arguments) {
     $previousErrorActionPreference = $ErrorActionPreference
@@ -30,7 +38,8 @@ function Invoke-NativeCapture([string]$Program, [string[]]$Arguments) {
         $ErrorActionPreference = "Continue"
         $output = & $Program @Arguments 2>&1
         $status = $LASTEXITCODE
-    } finally {
+    } 
+finally {
         $ErrorActionPreference = $previousErrorActionPreference
     }
 
@@ -496,11 +505,9 @@ function AssertArchiveInstaller([string]$InstallScript, [string]$Root) {
     # rmux-daemon.exe is checked next to the installed rmux.exe (bin\), where the
     # hidden-daemon resolver looks for it; checking it at the install root would
     # pass even when the daemon is unreachable at runtime.
-    foreach ($required in @("bin\rmux.exe", "libexec\rmux\rmux.exe", "bin\rmux-daemon.exe", "share\rmux\artifact-metadata.json")) {
-        if (-not (Test-Path -LiteralPath (Join-Path $installRoot $required) -PathType Leaf)) {
-            Fail "install.ps1 did not install required file: $required"
-        }
-    }
+    # Every projected destination of the same payload, after installation.
+    Invoke-LayoutTool @("--for-package", $PackageRoot, "check-installed", "--variant", "windows-archive",
+        "--package-root", $PackageRoot, "--prefix", (Split-Path -Parent $installBin)) | Out-Null
 
     $installedBinary = Join-Path $installBin "rmux.exe"
     AssertSuccess $installedBinary @("-V") | Out-Null
@@ -848,6 +855,310 @@ function AssertPackageHygiene([string]$Root) {
     }
 }
 
+# Runs only the explicitly pinned, daemon-absent archive transition. It does
+# not enter the general runtime campaign or invoke the installed daemon.
+function Test-ExactArchivePair([string]$PlanPath, [string]$CurrentArchive, [switch]$ExplicitRollback, [switch]$Uninstall) {
+    $plan = Get-Content -LiteralPath $PlanPath -Raw | ConvertFrom-Json
+    if ($plan.schema -ne 1) { throw 'unsupported archive pair plan' }
+    $root = [IO.Path]::GetFullPath($plan.fresh_root)
+    for ($ancestor=[IO.DirectoryInfo]::new($root); $null -ne $ancestor; $ancestor=$ancestor.Parent) {
+        if ($ancestor.Exists -and ($ancestor.Attributes -band [IO.FileAttributes]::ReparsePoint)) { throw 'pair fixture ancestor is a reparse point' }
+    }
+    if (Test-Path -LiteralPath $root) { throw "archive pair fixture must be new: $root" }
+    if ([IO.Path]::GetFullPath($CurrentArchive) -cne $plan.packages.B.archive) { throw 'B archive differs from plan' }
+    if (-not $Uninstall -and ($plan.packages.A.version -eq $plan.packages.B.version -or $plan.packages.A.source -eq $plan.packages.B.source)) { throw 'pair must cross versions and sources' }
+    if ($plan.lot_seconds -gt 900 -or $plan.process_seconds -gt 60 -or $plan.logs_bytes -gt 67108864) { throw 'pair bounds exceed supported limits' }
+    $drive = [IO.DriveInfo]::new([IO.Path]::GetPathRoot($root))
+    if ($drive.AvailableFreeSpace -lt ($plan.free_floor_bytes + $plan.new_growth_bytes)) { throw 'insufficient pair headroom' }
+    New-Item -ItemType Directory -Path $root | Out-Null
+    $prefix = Join-Path $root 'prefix'
+    $temp = Join-Path $root 'temp'
+    $logs = Join-Path $root 'logs'
+    foreach ($path in @($prefix, $temp, $logs)) { New-Item -ItemType Directory -Path $path | Out-Null }
+    $started = [DateTime]::UtcNow
+    $watch = [Diagnostics.Stopwatch]::StartNew()
+    $commands = [Collections.Generic.List[object]]::new()
+    $result = [ordered]@{ status='FAIL'; started_at=$started.ToString('o'); plan_sha256=(Sha256File $PlanPath); controller_pid=$PID; controller_birth=(Get-Process -Id $PID).StartTime.ToUniversalTime().ToString('o'); commands=$commands; snapshots=[ordered]@{}; packages=[ordered]@{}; daemon_executed=$false; rollback='UNKNOWN'; upgrade='UNKNOWN' }
+    function Save-PairJson($Value, [string]$Name) {
+        $Value | ConvertTo-Json -Depth 30 | Set-Content -LiteralPath (Join-Path $root $Name) -Encoding UTF8
+    }
+    function Assert-PairRelative([string]$Path) {
+        if ($Path -notmatch '^[A-Za-z0-9_][A-Za-z0-9_./-]*$' -or $Path -match '(^|/)\.{1,2}(/|$)|//|/$') { throw "unsafe pair path: $Path" }
+    }
+    function Get-PairSnapshot([string]$Path) {
+        $files = @(); $dirs = @()
+        foreach ($item in @(Get-ChildItem -LiteralPath $Path -Recurse -Force | Sort-Object FullName)) {
+            if ($item.Attributes -band [IO.FileAttributes]::ReparsePoint) { throw "pair reparse point: $($item.FullName)" }
+            $rel = $item.FullName.Substring($Path.Length + 1).Replace('\','/')
+            if ($item.PSIsContainer) { $dirs += $rel } else {
+                $files += [pscustomobject]@{path=$rel; bytes=$item.Length; sha256=(Sha256File $item.FullName); last_write_utc=$item.LastWriteTimeUtc.ToString('o')}
+            }
+        }
+        return [pscustomobject]@{files=@($files); directories=@($dirs)}
+    }
+    function Compare-PairFiles($Actual, $Expected) {
+        $a = @($Actual | ForEach-Object { "$($_.path)`t$($_.bytes)`t$($_.sha256)" } | Sort-Object)
+        $b = @($Expected | ForEach-Object { "$($_.path)`t$($_.bytes)`t$($_.sha256)" } | Sort-Object)
+        if (@(Compare-Object $a $b -CaseSensitive).Count) { throw 'complete installed file population or bytes differ' }
+    }
+    function Invoke-PairProcess([string]$Label, [string]$Program, [string[]]$Arguments, [string]$Checkpoint='') {
+        if ($watch.Elapsed.TotalSeconds -ge ($plan.lot_seconds - $plan.process_seconds - 60)) { throw 'insufficient remaining bounded process time' }
+        foreach ($arg in $Arguments) { if ($arg.Contains('"') -or $arg.EndsWith('\')) { throw 'unsupported process argument quoting' } }
+        $info = [Diagnostics.ProcessStartInfo]::new()
+        $info.FileName=$Program; $info.Arguments=(@($Arguments | ForEach-Object { '"' + $_ + '"' }) -join ' ')
+        $info.WorkingDirectory=$root; $info.UseShellExecute=$false; $info.CreateNoWindow=$true
+        $info.RedirectStandardOutput=$true; $info.RedirectStandardError=$true
+        foreach ($key in @($info.EnvironmentVariables.Keys)) {
+            if ($key -match '^(RMUX|TMUX)') { $info.EnvironmentVariables.Remove($key) }
+        }
+        $info.EnvironmentVariables['TEMP']=$temp; $info.EnvironmentVariables['TMP']=$temp
+        $info.EnvironmentVariables['PATH']=(Join-Path $prefix 'bin') + ';' + (Join-Path $env:SystemRoot 'System32') + ';' + $PSHOME
+        if ($Checkpoint) { $info.EnvironmentVariables['RMUX_INSTALL_TEST_FAIL_AT']=$Checkpoint }
+        $process = [Diagnostics.Process]::new(); $process.StartInfo=$info
+        $stdoutPath=Join-Path $logs ($Label+'.stdout'); $stderrPath=Join-Path $logs ($Label+'.stderr')
+        $stdout=[IO.File]::Open($stdoutPath,'CreateNew','Write','Read'); $stderr=[IO.File]::Open($stderrPath,'CreateNew','Write','Read')
+        $record=[ordered]@{label=$Label; program=$Program; arguments=$Arguments; checkpoint=$Checkpoint; started_at=[DateTime]::UtcNow.ToString('o'); status='RUNNING'}
+        $commands.Add($record)
+        $timer=[Diagnostics.Stopwatch]::StartNew(); $born=$null; $copies=@()
+        try {
+            if (-not $process.Start()) { throw 'process did not start' }
+            $born=$process.StartTime; $record.pid=$process.Id; $record.birth_utc=$born.ToUniversalTime().ToString('o')
+            $copies=@($process.StandardOutput.BaseStream.CopyToAsync($stdout), $process.StandardError.BaseStream.CopyToAsync($stderr))
+            while (-not $process.WaitForExit(100)) {
+                if ($timer.Elapsed.TotalSeconds -gt $plan.process_seconds) { throw "pair process timeout: $Label" }
+                if (($stdout.Length + $stderr.Length) -gt 1048576) { throw "pair output limit: $Label" }
+            }
+            if (-not [Threading.Tasks.Task]::WaitAll([Threading.Tasks.Task[]]$copies, 5000)) { throw 'pair output pipe remained open' }
+            $record.exit_code=$process.ExitCode; $record.status='EXITED'
+        } finally {
+            if ($born -and -not $process.HasExited -and $process.StartTime -eq $born) {
+                # Only the process handle created above and its descendants are
+                # eligible for timeout cleanup; no name-based/global process kill.
+                $killInfo=[Diagnostics.ProcessStartInfo]::new()
+                $killInfo.FileName=Join-Path $env:SystemRoot 'System32/taskkill.exe'
+                $killInfo.Arguments="/PID $($process.Id) /T /F"; $killInfo.UseShellExecute=$false; $killInfo.CreateNoWindow=$true
+                $killer=[Diagnostics.Process]::Start($killInfo)
+                try { if (-not $killer.WaitForExit(10000)) { Stop-ProcessIfRunning $killer; throw 'owned cleanup timeout' } } finally { $killer.Dispose() }
+                if (-not $process.WaitForExit(5000)) { throw 'owned process survived cleanup' }
+                $record.status='TERMINATED_OWNED_TREE'
+            }
+            $stdout.Dispose(); $stderr.Dispose(); $process.Dispose()
+            $record.seconds=$timer.Elapsed.TotalSeconds; $record.finished_at=[DateTime]::UtcNow.ToString('o')
+            Save-PairJson $commands 'commands.json'
+        }
+        $text=(Get-Content -LiteralPath $stdoutPath -Raw) + (Get-Content -LiteralPath $stderrPath -Raw)
+        return [pscustomobject]@{exit_code=$record.exit_code; text=$text}
+    }
+    function Assert-PairVersionHelp([string]$Label, [string]$Version) {
+        foreach ($relative in @('bin/rmux.exe','libexec/rmux/rmux.exe')) {
+            $kind=if ($relative.StartsWith('bin/')) {'dispatcher'} else {'helper'}
+            $exe=Join-Path $prefix $relative
+            $versionResult=Invoke-PairProcess "$Label-$kind-version" $exe @('-V')
+            if ($versionResult.exit_code -ne 0 -or $versionResult.text.Trim() -cne "rmux $Version") { throw "pair version failed: $Label/$kind" }
+            $helpResult=Invoke-PairProcess "$Label-$kind-help" $exe @('--help')
+            if ($helpResult.exit_code -notin @(0,1) -or $helpResult.text -notmatch 'usage: rmux') { throw "pair help failed: $Label/$kind" }
+        }
+    }
+    try {
+        Add-Type -AssemblyName System.IO.Compression.FileSystem
+        $packageNames=if ($Uninstall) {@('B')} else {@('A','B')}
+        foreach ($name in $packageNames) {
+            $package=$plan.packages.$name
+            if ((Get-Item -LiteralPath $package.archive).Length -ne $package.bytes -or (Sha256File $package.archive) -cne $package.sha256) { throw "archive $name identity mismatch" }
+            $archive=[IO.Compression.ZipFile]::OpenRead($package.archive)
+            try {
+                $seen=@{}; $total=0L; $fileCount=0
+                if ($archive.Entries.Count -ne $package.entries) { throw 'archive entry count mismatch' }
+                foreach ($entry in $archive.Entries) {
+                    $relative=$entry.FullName.TrimEnd('/')
+                    Assert-PairRelative $relative
+                    if (-not $relative.StartsWith($package.root_name+'/',[StringComparison]::Ordinal) -and $relative -cne $package.root_name) { throw 'archive root mismatch' }
+                    if ($seen.ContainsKey($relative)) { throw 'duplicate archive path' }; $seen[$relative]=$true
+                    if (($entry.ExternalAttributes -shr 16 -band 61440) -eq 40960) { throw 'archive symlink is not supported' }
+                    $total += $entry.Length
+                    if ($entry.Name) { $fileCount++ }
+                    if ($total -gt $plan.expanded_bytes_max) { throw 'archive expansion limit' }
+                }
+                if ($total -ne $package.expanded_bytes -or $fileCount -ne $package.files.Count) { throw 'archive population mismatch' }
+            } finally { $archive.Dispose() }
+            $extract=Join-Path $root $name
+            [IO.Compression.ZipFile]::ExtractToDirectory($package.archive,$extract)
+            $packageRoot=Join-Path $extract $package.root_name
+            $snapshot=Get-PairSnapshot $packageRoot
+            Compare-PairFiles $snapshot.files $package.files
+            VerifyChecksumManifest $packageRoot (Join-Path $packageRoot 'SHA256SUMS.txt')
+            $metadata=Get-Content -LiteralPath (Join-Path $packageRoot 'share/rmux/artifact-metadata.json') -Raw | ConvertFrom-Json
+            if ($metadata.rmux_version -cne $package.version -or $metadata.git_commit -cne $package.source -or $metadata.git_dirty) { throw "archive $name metadata mismatch" }
+            if ((Sha256File (Join-Path $packageRoot 'install.ps1')) -cne $package.installer_sha256) { throw 'shipped installer mismatch' }
+            $result.packages[$name]=[ordered]@{root=$packageRoot; archive_sha256=$package.sha256; source=$metadata.git_commit; version=$metadata.rmux_version; snapshot=$snapshot}
+        }
+        if ($Uninstall) {
+            if ($plan.PSObject.Properties.Name -notcontains 'candidate_installer' -or
+                    (Sha256File $plan.candidate_installer.path) -cne $plan.candidate_installer.sha256) { throw 'uninstall candidate identity mismatch' }
+            $result.installer_kind='CANDIDATE_NOT_SHIPPED'; $result.transition='verified-B-uninstall'
+            $result.uninstall_cases=[ordered]@{}
+            foreach ($case in @('happy','edited','failure')) {
+                if ($case -ne 'happy') { $prefix=Join-Path $root ('prefix-'+$case); New-Item -ItemType Directory -Path $prefix | Out-Null }
+                $outside=Join-Path $root ('outside-'+$case)
+                foreach ($dir in @((Join-Path $prefix 'unrelated'),(Join-Path $prefix 'user-data'),$outside)) { New-Item -ItemType Directory -Path $dir | Out-Null }
+                [IO.File]::WriteAllText((Join-Path $prefix 'unrelated/keep.txt'),'unrelated owned sentinel')
+                [IO.File]::WriteAllText((Join-Path $prefix 'user-data/config.json'),'{"owned_setting":true}')
+                [IO.File]::WriteAllBytes((Join-Path $prefix 'user-data/data.bin'),[byte[]]@(0,1,2,253,254,255))
+                [IO.File]::WriteAllText((Join-Path $outside 'keep.txt'),'outside owned sentinel')
+                $initial=Get-PairSnapshot $prefix; $outsideBefore=Get-PairSnapshot $outside
+                $row=[ordered]@{status='FAIL';initial=$initial;outside_before=$outsideBefore}
+                $result.uninstall_cases[$case]=$row
+                $installArgs=@('-NoProfile','-NonInteractive','-ExecutionPolicy','Bypass','-File',(Join-Path $result.packages.B.root 'install.ps1'),'-InstallDir',(Join-Path $prefix 'bin'),'-Version',$plan.packages.B.version)
+                $install=Invoke-PairProcess "$case-B-install-verified" $plan.powershell $installArgs
+                $before=Get-PairSnapshot $prefix; $row.installed=$before
+                if ($install.exit_code -ne 0) { throw 'uninstall prerequisite B installation failed' }
+                Compare-PairFiles $before.files (@($plan.packages.B.installed)+@($initial.files))
+                if ($case -eq 'happy') { Assert-PairVersionHelp 'B-before-uninstall' $plan.packages.B.version }
+                $uninstallArgs=@('-NoProfile','-NonInteractive','-ExecutionPolicy','Bypass','-File',$plan.candidate_installer.path,'-Uninstall','-InstallDir',(Join-Path $prefix 'bin'),'-PreviousPackageRoot',$result.packages.B.root)
+                if ($case -eq 'edited') {
+                    [IO.File]::AppendAllText((Join-Path $prefix 'README.md'),"`nowned user modification")
+                    $before=Get-PairSnapshot $prefix; $row.before_edited_refusal=$before
+                }
+                $checkpoint=if ($case -eq 'failure') {'after-remove-package-first'} else {''}
+                $remove=Invoke-PairProcess "$case-uninstall" $plan.powershell $uninstallArgs $checkpoint
+                $after=Get-PairSnapshot $prefix; $row.after_first_call=$after
+                if ($case -eq 'happy') {
+                    if ($remove.exit_code -ne 0) { throw 'verified uninstall failed' }
+                    Compare-PairFiles $after.files $initial.files
+                    $repeat=Invoke-PairProcess 'happy-repeat-uninstall' $plan.powershell $uninstallArgs
+                    $row.after_repeat=Get-PairSnapshot $prefix
+                    if ($repeat.exit_code -eq 0 -or $repeat.text -notmatch 'previous\s+installed\s+identity\s+differs') { throw 'repeated uninstall must refuse missing owned files' }
+                    Compare-PairFiles $row.after_repeat.files $initial.files
+                } elseif ($case -eq 'edited') {
+                    if ($remove.exit_code -eq 0 -or $remove.text -notmatch 'previous\s+installed\s+identity\s+differs') { throw 'modified owned file must refuse uninstall' }
+                    Compare-PairFiles $after.files $before.files
+                } else {
+                    if ($remove.exit_code -eq 0 -or $remove.text -notmatch 'injected\s+installer\s+failure\s+at\s+after-remove-package-first(?=\s|$)' -or $remove.text -notmatch 'previous\s+package\s+restored') { throw 'first-removal recovery diagnostic absent' }
+                    Compare-PairFiles $after.files $before.files
+                    $success=Invoke-PairProcess 'failure-recovered-uninstall' $plan.powershell $uninstallArgs
+                    $row.after_success=Get-PairSnapshot $prefix
+                    if ($success.exit_code -ne 0) { throw 'uninstall after proven recovery failed' }
+                    Compare-PairFiles $row.after_success.files $initial.files
+                }
+                $row.final=Get-PairSnapshot $prefix; $row.outside_after=Get-PairSnapshot $outside; $row.temporary=Get-PairSnapshot $temp
+                Compare-PairFiles $row.outside_after.files $outsideBefore.files
+                if ($row.temporary.files.Count -or $row.temporary.directories.Count) { throw 'uninstall temporary/recovery residue' }
+                if (Test-Path -LiteralPath (Join-Path $prefix '.rmux-install.lock')) { throw 'uninstall lock remains' }
+                $row.status='PASS'; Save-PairJson $result 'result.json'
+            }
+            $result.status='PASS'; return
+        }
+        $sentinelDir=Join-Path $prefix 'unrelated'
+        New-Item -ItemType Directory -Path $sentinelDir | Out-Null
+        [IO.File]::WriteAllText((Join-Path $sentinelDir 'keep.txt'),'archive pair unrelated owned sentinel')
+        if ($ExplicitRollback) {
+            # Operator-requested version rollback, without a failure checkpoint.
+            # User fixtures are distinct from every delivered package path.
+            $userDir=Join-Path $prefix 'user-data'
+            $outside=Join-Path $root 'outside-prefix'
+            foreach ($dir in @($userDir,$outside)) { New-Item -ItemType Directory -Path $dir | Out-Null }
+            [IO.File]::WriteAllText((Join-Path $userDir 'config.json'),'{"owned_user_setting":true}')
+            [IO.File]::WriteAllBytes((Join-Path $userDir 'data.bin'),[byte[]]@(0,1,2,253,254,255))
+            [IO.File]::WriteAllText((Join-Path $outside 'keep.txt'),'outside-prefix owned sentinel')
+            $initial=Get-PairSnapshot $prefix; $outsideBefore=Get-PairSnapshot $outside
+            $result.snapshots['fresh']=$initial; $result.outside_before=$outsideBefore
+            $result.transition='explicit-B-to-A'; $result.installer_kind='SHIPPED_BASELINE'; $result.explicit_rollback='UNKNOWN'
+            $installArgs=@('-NoProfile','-NonInteractive','-ExecutionPolicy','Bypass','-File',(Join-Path $result.packages.B.root 'install.ps1'),'-InstallDir',(Join-Path $prefix 'bin'),'-Version',$plan.packages.B.version)
+            $install=Invoke-PairProcess 'B-install-verified' $plan.powershell $installArgs
+            $before=Get-PairSnapshot $prefix; $result.snapshots['B']=$before; Save-PairJson $before 'B-installed.json'
+            if ($install.exit_code -ne 0) { throw 'verified prerequisite B install failed' }
+            Compare-PairFiles $before.files (@($plan.packages.B.installed)+@($initial.files))
+            Assert-PairVersionHelp 'B' $plan.packages.B.version
+            Save-PairJson (Get-PairSnapshot $prefix) 'before-explicit-rollback.json'
+            $installArgs[5]=Join-Path $result.packages.A.root 'install.ps1'; $installArgs[9]=$plan.packages.A.version
+            if ($plan.PSObject.Properties.Name -contains 'candidate_installer') {
+                $candidate=$plan.candidate_installer
+                if ((Sha256File $candidate.path) -cne $candidate.sha256) { throw 'candidate installer identity mismatch' }
+                $overlay=Join-Path $root 'A-candidate-overlay'
+                Copy-Item -LiteralPath $result.packages.A.root -Destination $overlay -Recurse
+                Copy-Item -LiteralPath $candidate.path -Destination (Join-Path $overlay 'install.ps1') -Force
+                $overlaySnapshot=Get-PairSnapshot $overlay
+                Compare-PairFiles @($overlaySnapshot.files | Where-Object path -cne 'install.ps1') @($plan.packages.A.files | Where-Object path -cne 'install.ps1')
+                $result.installer_kind='CANDIDATE_NOT_SHIPPED'
+                $result.candidate_overlay=[ordered]@{installer_sha256=$candidate.sha256; snapshot=$overlaySnapshot; original_A_installer_sha256=$plan.packages.A.installer_sha256; original_checksum_manifest_unchanged=$true; installer_is_explicit_checksum_exception=$true}
+                $installArgs[5]=Join-Path $overlay 'install.ps1'
+                $installArgs+=@('-PreviousPackageRoot',$result.packages.B.root)
+            }
+            $rollback=Invoke-PairProcess 'A-explicit-rollback-verified' $plan.powershell $installArgs
+            $after=Get-PairSnapshot $prefix; $result.snapshots['A-after-explicit']=$after
+            $result.rollback_temporary=Get-PairSnapshot $temp; $result.outside_after=Get-PairSnapshot $outside
+            $expectedFiles=@($plan.packages.A.installed)+@($initial.files)
+            $expectedPaths=@($expectedFiles | ForEach-Object path)
+            $result.residual_files=@($after.files | Where-Object { $_.path -cnotin $expectedPaths })
+            $result.directory_inventory=$after.directories
+            Save-PairJson $after 'after-explicit-rollback.json'; Save-PairJson $result 'result.json'
+            if ($rollback.exit_code -ne 0) { throw 'explicit B-to-A installer refused or failed' }
+            # Identify target bytes before display commands, including daemon
+            # bytes only. Report obsolete files even if displays are correct.
+            Compare-PairFiles @($after.files | Where-Object { $_.path -cin $expectedPaths }) $expectedFiles
+            Assert-PairVersionHelp 'A-after-explicit' $plan.packages.A.version
+            Compare-PairFiles $result.outside_after.files $outsideBefore.files
+            Compare-PairFiles $after.files $expectedFiles
+            if ($result.rollback_temporary.files.Count -or $result.rollback_temporary.directories.Count) { throw 'explicit rollback backup/temporary residue' }
+            $result.explicit_rollback='PASS'; $result.status='PASS'
+            return
+        }
+        $initial=Get-PairSnapshot $prefix; $result.snapshots['fresh']=$initial
+        $installArgs=@('-NoProfile','-NonInteractive','-ExecutionPolicy','Bypass','-File',(Join-Path $result.packages.A.root 'install.ps1'),'-InstallDir',(Join-Path $prefix 'bin'))
+        $install=Invoke-PairProcess 'A-install-verified' $plan.powershell $installArgs
+        $a=Get-PairSnapshot $prefix; $result.snapshots['A']=$a; Save-PairJson $a 'A-installed.json'
+        if ($install.exit_code -ne 0) { throw 'verified A install failed' }
+        Compare-PairFiles $a.files (@($plan.packages.A.installed) + @($initial.files))
+        Assert-PairVersionHelp 'A' $plan.packages.A.version
+        $installArgs[5]=Join-Path $result.packages.B.root 'install.ps1'
+        # Freeze the actual preimage before invoking the cross-version failure.
+        $before=Get-PairSnapshot $prefix; Save-PairJson $before 'before-failure.json'
+        $failure=Invoke-PairProcess 'B-after-copy-failure' $plan.powershell $installArgs 'after-copy-package'
+        $restored=Get-PairSnapshot $prefix; $result.snapshots['rollback']=$restored
+        $result.rollback_temporary=Get-PairSnapshot $temp
+        $result.rollback_extra_directories=@($restored.directories | Where-Object { $_ -cnotin $before.directories })
+        Save-PairJson $restored 'after-failure.json'
+        Save-PairJson $result 'result.json'
+        if ($failure.exit_code -eq 0 -or $failure.text -notmatch 'injected\s+installer\s+failure\s+at\s+after-copy-package(?=\s|$)' -or $failure.text -notmatch 'previous\s+package\s+restored') { throw 'after-copy failure/restoration diagnostic absent' }
+        Compare-PairFiles $restored.files $before.files
+        if (Test-Path -LiteralPath (Join-Path $prefix '.rmux-install.lock')) { throw 'installer lock remains after rollback' }
+        if ($result.rollback_temporary.files.Count -or $result.rollback_temporary.directories.Count) { throw 'rollback temporary/backup residue' }
+        $result.rollback='PASS'
+        Assert-PairVersionHelp 'restored-A' $plan.packages.A.version
+        Save-PairJson (Get-PairSnapshot $prefix) 'before-upgrade.json'
+        $upgrade=Invoke-PairProcess 'B-upgrade-verified' $plan.powershell $installArgs
+        $b=Get-PairSnapshot $prefix; $result.snapshots['B']=$b; Save-PairJson $b 'B-installed.json'
+        if ($upgrade.exit_code -ne 0) { throw 'verified B upgrade failed' }
+        Compare-PairFiles $b.files (@($plan.packages.B.installed) + @($initial.files))
+        Assert-PairVersionHelp 'B' $plan.packages.B.version
+        $result.final_temporary=Get-PairSnapshot $temp
+        if ($result.final_temporary.files.Count -or $result.final_temporary.directories.Count) { throw 'final temporary/backup residue' }
+        $result.upgrade='PASS'; $result.status='PASS'
+    } catch {
+        $result.error=$_.Exception.Message
+        throw
+    } finally {
+        $result.finished_at=[DateTime]::UtcNow.ToString('o'); $result.seconds=$watch.Elapsed.TotalSeconds
+        $result.free_bytes_after=$drive.AvailableFreeSpace
+        Save-PairJson $result 'result.json'
+    }
+}
+
+if ($Uninstall -and (-not $ArchivePairPlan -or $ExplicitRollback)) { throw "uninstall requires ArchivePairPlan without ExplicitRollback" }
+
+if ($ExplicitRollback -and -not $ArchivePairPlan) { throw "explicit rollback requires ArchivePairPlan" }
+
+if ($ArchivePairPlan) {
+    # Test binding, not value: explicit false switches and empty SHA strings
+    # are still unsupported release-verification requests in pair mode.
+    if ($PSBoundParameters.ContainsKey("RequireReleaseArtifact") -or $PSBoundParameters.ContainsKey("ExpectedGitSha")) {
+        throw "archive pair mode cannot accept explicit RequireReleaseArtifact or ExpectedGitSha; use ordinary mode for release verification"
+    }
+    if ($RunBinary -or $RunDaemonSmoke -or $RunSdkSmoke -or $RunMouseBorderSmoke -or $RunCtrlMatrixSmoke -or $NextestArchive) { throw "archive pair mode cannot enter runtime campaigns" }
+    Test-ExactArchivePair $ArchivePairPlan $Archive -ExplicitRollback:$ExplicitRollback -Uninstall:$Uninstall
+    exit 0
+}
+
 $archiveFull = [System.IO.Path]::GetFullPath($Archive)
 if (-not (Test-Path -LiteralPath $archiveFull -PathType Leaf)) {
     Fail "archive not found: $Archive"
@@ -897,10 +1208,13 @@ try {
     }
     AssertPackageHygiene $packageRoot
 
-    foreach ($required in @("rmux.exe", "libexec/rmux/rmux.exe", "rmux-daemon.exe", "install.ps1", "SHA256SUMS.txt", "share/rmux/artifact-metadata.json", "README.md", "LICENSE-APACHE", "LICENSE-MIT", "rmux.1")) {
-        if (-not (Test-Path -LiteralPath (Join-Path $packageRoot $required))) {
-            Fail "missing package file: $required"
-        }
+    # The layout, and the absence of anything else, come from the one
+    # descriptor every builder and installer projects.
+    Invoke-LayoutTool @("--for-package", $packageRoot, "check-tree", "--variant", "windows-archive", "--root", $packageRoot) | Out-Null
+    $expectedManifest = @(Invoke-LayoutTool @("--for-package", $packageRoot, "manifest", "--variant", "windows-archive"))
+    $shippedManifest = Get-Content -LiteralPath (Join-Path $packageRoot "share/rmux/package-layout.tsv")
+    if ((($expectedManifest | Out-String).Trim()) -cne (($shippedManifest | Out-String).Trim())) {
+        Fail "packaged layout manifest does not match the layout descriptor"
     }
 
     VerifyChecksumManifest $packageRoot (Join-Path $packageRoot "SHA256SUMS.txt")
@@ -911,9 +1225,14 @@ try {
     if ($metadata.artifact_kind -ne "windows-package-binary") {
         Fail "metadata artifact_kind is not windows-package-binary"
     }
-    if ($metadata.package_layout -ne "rmux-windows-package-v2") {
-        Fail "metadata package_layout is not rmux-windows-package-v2"
+    $packageLayoutId = Get-LayoutLine @("--for-package", $packageRoot, "layout-id", "--variant", "windows-archive")
+    if ($metadata.package_layout -ne $packageLayoutId) {
+        Fail "metadata package_layout is not $packageLayoutId"
     }
+    if ($metadata.conpty_runtime_manifest -cne "share/rmux/conpty-runtime.json") {
+        Fail "metadata ConPTY manifest path is invalid"
+    }
+    Assert-ConptyPackage $packageRoot $metadata.target
     if ($RequireReleaseArtifact) {
         if (-not ($metadata.PSObject.Properties.Name -contains "release_artifact") -or
             $metadata.release_artifact -ne $true) {

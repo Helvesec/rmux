@@ -303,6 +303,26 @@ fn resize_pane_rejects_nonexistent_pane_index() {
 }
 
 #[test]
+fn resize_pane_rejects_nonexistent_window_before_pane_index() {
+    let mut session = Session::new(
+        session_name("alpha"),
+        TerminalSize {
+            cols: 120,
+            rows: 40,
+        },
+    );
+
+    let error = session
+        .resize_pane_in_window(5, 9, ResizePaneAdjustment::AbsoluteWidth { columns: 34 })
+        .expect_err("window does not exist");
+
+    assert_eq!(
+        error,
+        RmuxError::invalid_target("alpha:5", "window index does not exist in session")
+    );
+}
+
+#[test]
 fn directional_resize_moves_the_split_border_like_tmux() {
     let mut left = Session::new(session_name("alpha"), TerminalSize { cols: 80, rows: 24 });
     left.split_active_pane().expect("split succeeds");

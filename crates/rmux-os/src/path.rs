@@ -58,7 +58,7 @@ fn canonical_socket_path(path: &Path) -> PathBuf {
     if let Ok(canonical) = std::fs::canonicalize(path) {
         return canonical;
     }
-    match (path.parent(), path.file_name()) {
+    match (parent_or_current(path), path.file_name()) {
         (Some(parent), Some(file_name)) => std::fs::canonicalize(parent)
             .map(|canonical_parent| canonical_parent.join(file_name))
             .unwrap_or_else(|_| path.to_path_buf()),

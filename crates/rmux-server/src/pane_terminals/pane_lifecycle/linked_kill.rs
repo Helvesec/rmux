@@ -1,6 +1,6 @@
 use std::collections::{HashMap, HashSet};
 
-use rmux_core::{PaneId, SessionStore, WindowId};
+use rmux_core::{PaneId, WindowId};
 use rmux_proto::{KillPaneResponse, PaneTarget, RmuxError, SessionName, WindowTarget};
 
 use super::super::{
@@ -28,7 +28,7 @@ pub(in crate::pane_terminals) struct DestroyedLinkedSessionRuntime {
 }
 
 struct LinkedKillSnapshot {
-    sessions: SessionStore,
+    sessions: rmux_core::ManagedStructureCheckpoint,
     options: rmux_core::OptionStore,
     environment: rmux_core::EnvironmentStore,
     hooks: rmux_core::HookStore,
@@ -41,9 +41,9 @@ struct LinkedKillSnapshot {
 }
 
 impl LinkedKillSnapshot {
-    fn capture(state: &HandlerState) -> Self {
-        Self {
-            sessions: state.sessions.clone(),
+    fn capture(state: &HandlerState, names: &[SessionName]) -> Result<Self, RmuxError> {
+        Ok(Self {
+            sessions: state.sessions.checkpoint_structure(names)?,
             options: state.options.clone(),
             environment: state.environment.clone(),
             hooks: state.hooks.clone(),
@@ -53,11 +53,11 @@ impl LinkedKillSnapshot {
             window_link_occurrences: state.window_link_occurrences.clone(),
             next_window_link_group_id: state.next_window_link_group_id,
             next_window_link_occurrence_id: state.next_window_link_occurrence_id,
-        }
+        })
     }
 
-    fn restore(self, state: &mut HandlerState) {
-        state.sessions = self.sessions;
+    fn restore(self, state: &mut HandlerState) -> Result<(), RmuxError> {
+        state.sessions.restore_structure_checkpoint(self.sessions)?;
         state.options = self.options;
         state.environment = self.environment;
         state.hooks = self.hooks;
@@ -67,6 +67,7 @@ impl LinkedKillSnapshot {
         state.window_link_occurrences = self.window_link_occurrences;
         state.next_window_link_group_id = self.next_window_link_group_id;
         state.next_window_link_occurrence_id = self.next_window_link_occurrence_id;
+        Ok(())
     }
 }
 
@@ -85,7 +86,7 @@ impl HandlerState {
             self.runtime_session_name_for_window(&session_name, window_index);
         self.ensure_window_panes_exist(&session_name, window_index, &[pane_id])?;
 
-        let snapshot = LinkedKillSnapshot::capture(self);
+        let mut snapshot = LinkedKillSnapshot::capture(self, std::slice::from_ref(&session_name))?;
         #[cfg(windows)]
         let terminal_pane_ids = self
             .terminals
@@ -110,8 +111,13 @@ impl HandlerState {
         affected_sessions.sort_by(|left, right| left.as_str().cmp(right.as_str()));
         affected_sessions.dedup();
         let commit = (|| {
-            let destroyed_sessions =
-                self.commit_linked_window_removals(&direct_slots, &removals, false, false)?;
+            let destroyed_sessions = self.commit_linked_window_removals(
+                &direct_slots,
+                &removals,
+                false,
+                false,
+                Some(&mut snapshot.sessions),
+            )?;
             let mut reindexed_windows = Vec::new();
             for affected_session in &affected_sessions {
                 if self.sessions.session(affected_session).is_none() {
@@ -134,7 +140,7 @@ impl HandlerState {
         let (destroyed_runtime_plans, reindexed_windows) = match commit {
             Ok(committed) => committed,
             Err(error) => {
-                snapshot.restore(self);
+                snapshot.restore(self)?;
                 restore_linked_pane_runtime(
                     self,
                     &runtime_session_name,
@@ -193,6 +199,7 @@ impl HandlerState {
         removals: &[LinkedWindowRemoval],
         allow_already_removed_windows: bool,
         synchronize_survivors: bool,
+        mut undo: Option<&mut rmux_core::ManagedStructureCheckpoint>,
     ) -> Result<Vec<DestroyedLinkedSessionRuntime>, RmuxError> {
         for slot in direct_slots {
             let _ = self.detach_window_link_slot(&slot.session_name, slot.window_index);
@@ -213,9 +220,9 @@ impl HandlerState {
                     .sessions
                     .session(&session_name)
                     .ok_or_else(|| session_not_found(&session_name))?;
-                session.windows().iter().all(|(window_index, window)| {
+                session.windows().all(|(window_index, window)| {
                     session_removals.iter().any(|removal| {
-                        removal.window_index == *window_index && removal.window_id == window.id()
+                        removal.window_index == window_index && removal.window_id == window.id()
                     })
                 })
             };
@@ -227,12 +234,16 @@ impl HandlerState {
                 let current_runtime_owner = self.sessions.runtime_owner(&session_name);
                 let next_runtime_owner = self.sessions.runtime_owner_transfer_target(&session_name);
                 let removed = self.sessions.remove_session(&session_name)?;
+                let removed_session_id = removed.id().as_u32();
+                if let Some(undo) = undo.as_deref_mut() {
+                    undo.retain_removed(removed.windows);
+                }
                 let _ = self.options.remove_session(&session_name);
                 let _ = self.environment.remove_session(&session_name);
                 let _ = self.hooks.remove_session(&session_name);
                 destroyed_sessions.push(DestroyedLinkedSessionRuntime {
                     session_name,
-                    session_id: removed.id().as_u32(),
+                    session_id: removed_session_id,
                     current_runtime_owner,
                     next_runtime_owner,
                 });
@@ -248,11 +259,12 @@ impl HandlerState {
                     match current_window_id {
                         Some(window_id) if window_id == removal.window_id => {
                             self.clear_auto_named_window(&session_name, removal.window_index);
-                            let session = self
+                            let removed = self
                                 .sessions
-                                .session_mut(&session_name)
-                                .ok_or_else(|| session_not_found(&session_name))?;
-                            session.remove_window(removal.window_index)?;
+                                .remove_window_occurrence_for_teardown(&window_target)?;
+                            if let Some(undo) = undo.as_deref_mut() {
+                                undo.retain_removed(removed);
+                            }
                             let _ = self.options.remove_window(&window_target);
                             let _ = self.hooks.remove_window(&window_target);
                             surviving_sessions.push(session_name.clone());
@@ -328,7 +340,7 @@ impl HandlerState {
         &mut self,
         plan: LinkedWindowTransferRemovalPlan,
     ) -> Result<Vec<DestroyedLinkedSessionRuntime>, RmuxError> {
-        self.commit_linked_window_removals(&plan.direct_slots, &plan.removals, true, false)
+        self.commit_linked_window_removals(&plan.direct_slots, &plan.removals, true, false, None)
     }
 
     pub(in crate::pane_terminals) fn finish_destroyed_linked_session_transfers(
@@ -348,13 +360,14 @@ impl HandlerState {
     fn remove_destroyed_linked_session_runtime(&mut self, session_name: &SessionName) {
         self.remove_window_link_session_slots(session_name);
         #[cfg(windows)]
-        let _ = self.starting_panes.remove(session_name);
+        self.remove_session_starting_panes(session_name);
         for pipe in self.remove_session_pipes(session_name).into_values() {
             pipe.stop();
         }
         let mut removed_outputs = self.remove_session_pane_outputs(session_name);
         removed_outputs.abort_output_readers();
         let _ = self.dead_panes.remove(session_name);
+        let _ = self.kept_dead_pane_preparations.remove(session_name);
         let _ = self.attached_submitted_rows.remove(session_name);
         let _ = self.attached_terminal_pixels.remove(session_name);
         self.auto_named_windows

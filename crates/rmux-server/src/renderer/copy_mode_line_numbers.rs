@@ -1,9 +1,10 @@
 use rmux_core::style::Style;
-use rmux_core::{OptionStore, Pane, Session};
+use rmux_core::{OptionStore, Pane};
 use rmux_proto::OptionName;
 
 use crate::copy_mode::{CopyModeLineNumberLayout, CopyModeRenderSnapshot, CopyModeSummary};
 
+use super::pane_row::RenderedPaneRow;
 use super::pane_screen::pane_cell_overlay_style;
 use super::style_sgr_bytes;
 
@@ -15,7 +16,7 @@ pub(super) struct CopyModeLineNumberRenderer {
 
 impl CopyModeLineNumberRenderer {
     pub(super) fn resolve(
-        session: &Session,
+        session: rmux_core::ManagedSessionView<'_>,
         options: &OptionStore,
         pane: &Pane,
         snapshot: &CopyModeRenderSnapshot,
@@ -42,7 +43,7 @@ impl CopyModeLineNumberRenderer {
         self.layout
     }
 
-    pub(super) fn append_prefix(&self, frame: &mut Vec<u8>, row: usize, pane_cols: u16) {
+    pub(super) fn prefix_row(&self, row: usize, pane_cols: u16) -> RenderedPaneRow {
         let style = if self.layout.row_is_current(row) {
             &self.current_style
         } else {
@@ -51,15 +52,17 @@ impl CopyModeLineNumberRenderer {
         let field_width = self.layout.width().saturating_sub(1);
         let prefix = format!("{:>field_width$} ", self.layout.number(row));
         let visible_width = usize::from(self.layout.physical_width(pane_cols));
+        let mut bytes = Vec::new();
 
-        frame.extend_from_slice(style_sgr_bytes(style, true).as_slice());
-        frame.extend_from_slice(&prefix.as_bytes()[..visible_width.min(prefix.len())]);
-        frame.extend_from_slice(b"\x1b[0m");
+        bytes.extend_from_slice(style_sgr_bytes(style, true).as_slice());
+        bytes.extend_from_slice(&prefix.as_bytes()[..visible_width.min(prefix.len())]);
+        bytes.extend_from_slice(b"\x1b[0m");
+        RenderedPaneRow::new(bytes, u16::try_from(visible_width).unwrap_or(u16::MAX))
     }
 }
 
 pub(super) fn layout_for_snapshot(
-    session: &Session,
+    session: rmux_core::ManagedSessionView<'_>,
     options: &OptionStore,
     pane: &Pane,
     snapshot: &CopyModeRenderSnapshot,
@@ -80,7 +83,7 @@ pub(super) fn layout_for_snapshot(
 }
 
 pub(super) fn layout_for_summary(
-    session: &Session,
+    session: rmux_core::ManagedSessionView<'_>,
     options: &OptionStore,
     pane: &Pane,
     summary: &CopyModeSummary,

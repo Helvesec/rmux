@@ -254,6 +254,46 @@ fn resolves_window_names_prefix_patterns_offsets_and_tokens() {
 }
 
 #[test]
+fn window_index_flag_resolves_existing_names_in_both_stores() {
+    let standalone = populated_store();
+    let mut managed = crate::ManagedSessionStore::new();
+    let alpha = session_name("alpha");
+    let size = TerminalSize { cols: 80, rows: 24 };
+    managed.create_session(alpha.clone(), size).unwrap();
+    for (index, name) in [(1, "editor"), (2, "logs")] {
+        let _ = managed
+            .insert_window_with_initial_pane(&alpha, index, size)
+            .unwrap();
+        managed
+            .rename_window(
+                &WindowTarget::with_window(alpha.clone(), index),
+                name.to_owned(),
+            )
+            .unwrap();
+    }
+    managed
+        .select_window(&WindowTarget::with_window(alpha.clone(), 2))
+        .unwrap();
+
+    let results = [
+        standalone.resolve_unresolved_target(
+            &UnresolvedTarget::new("alpha:editor"),
+            TargetFindType::Window,
+            TargetFindFlags::WINDOW_INDEX,
+            &current(),
+        ),
+        managed.resolve_unresolved_target(
+            &UnresolvedTarget::new("alpha:editor"),
+            TargetFindType::Window,
+            TargetFindFlags::WINDOW_INDEX,
+            &current(),
+        ),
+    ];
+    let expected = Ok(Target::Window(WindowTarget::with_window(alpha, 1)));
+    assert_eq!(results, [expected.clone(), expected]);
+}
+
+#[test]
 fn window_index_flag_allows_nonexistent_window_targets() {
     let store = populated_store();
 
@@ -689,4 +729,32 @@ fn command_metadata_captures_find_type_and_flags() {
     let send_prefix_target = send_prefix.target.expect("target spec");
     assert_eq!(send_prefix_target.find_type, TargetFindType::Pane);
     assert_eq!(send_prefix_target.flags, TargetFindFlags::NONE);
+}
+
+#[test]
+fn session_targets_match_backslash_and_control_names_by_their_stored_text() {
+    // Raw names `b\c` and `b\cd` are stored as `b\\c` and `b\\cd`. tmux 3.7b
+    // finds a session by that stored text first, so `b\\c` is exact even beside
+    // `b\\cd`, and `=` keeps working. RMUX also accepts `t<TAB>b` (tmux refuses
+    // it) and lists it as `t\tb`; that listed text must find it the same way.
+    let mut store = SessionStore::new();
+    for raw_name in ["b\\c", "b\\cd", "t\tb"] {
+        store
+            .create_session(session_name(raw_name), TerminalSize { cols: 80, rows: 24 })
+            .expect("session create succeeds");
+    }
+
+    for (typed, raw_name) in [
+        ("b\\\\c", "b\\c"),
+        ("=b\\\\c", "b\\c"),
+        ("t\\tb", "t\tb"),
+        ("=t\\tb", "t\tb"),
+    ] {
+        let target = resolve(&store, typed, TargetFindType::Session)
+            .unwrap_or_else(|error| panic!("{typed:?} resolves: {error}"));
+        assert_eq!(target, Target::Session(session_name(raw_name)), "{typed:?}");
+    }
+
+    // The raw spelling is not the stored name: tmux reports it missing.
+    resolve(&store, "=b\\c", TargetFindType::Session).expect_err("raw spelling is not stored");
 }

@@ -1,22 +1,30 @@
+#[cfg(test)]
+use crate::session_fixture::SessionSetupExt as _;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use super::RequestHandler;
+use crate::handler::test_support::SERVER_SIGNAL_LIVENESS;
 use crate::pane_io::AttachControl;
 use crate::pane_terminals::PaneLifecycleProcessState;
+use crate::test_shell::final_sink::FinalSinkSlot;
 use rmux_proto::{
     BreakPaneRequest, DisplayPanesRequest, KillPaneRequest, ListPanesRequest, ListWindowsRequest,
-    MovePaneRequest, NewSessionExtRequest, NewSessionRequest, OptionName, PaneKillRequest,
-    PaneRespawnRequest, PaneSnapshotRequest, PaneTarget, PaneTargetRef, PipePaneRequest,
-    ProcessCommand, RenameWindowRequest, Request, ResizePaneAdjustment, ResizePaneRequest,
-    RespawnPaneRequest, Response, ScopeSelector, SelectPaneRequest, SessionName,
-    SetHookMutationRequest, SetOptionMode, SetOptionRequest, SplitDirection, SplitWindowExtRequest,
-    SplitWindowRequest, SplitWindowTarget, TerminalSize, WindowTarget,
+    MovePaneRequest, NewSessionExtRequest, NewSessionRequest, NewWindowRequest, OptionName,
+    PaneInputRequest, PaneKillRequest, PaneRespawnRequest, PaneSnapshotRequest, PaneTarget,
+    PaneTargetRef, PipePaneRequest, ProcessCommand, RenameWindowRequest, Request,
+    ResizePaneAdjustment, ResizePaneRequest, RespawnPaneRequest, Response, ScopeSelector,
+    SelectPaneRequest, SessionName, SetHookMutationRequest, SetOptionMode, SetOptionRequest,
+    SplitDirection, SplitWindowExtRequest, SplitWindowRequest, SplitWindowTarget, TerminalSize,
+    WindowTarget,
 };
 use rmux_proto::{HookLifecycle, HookName};
 use tokio::sync::mpsc;
 use tokio::time::{sleep, timeout};
+
+#[path = "handler_pane_command_tests/split_empty.rs"]
+mod split_empty;
 
 #[cfg(windows)]
 const PROCESS_OUTPUT_FILE_TIMEOUT: Duration = Duration::from_secs(20);
@@ -176,7 +184,7 @@ async fn create_session(handler: &RequestHandler, session_name: &SessionName) {
             environment: None,
         }))
         .await;
-    assert!(matches!(created, rmux_proto::Response::NewSession(_)));
+    crate::session_fixture::assert_new_session(&created);
 }
 
 async fn create_grouped_session(
@@ -205,7 +213,7 @@ async fn create_grouped_session(
             skip_environment_update: false,
         })))
         .await;
-    assert!(matches!(created, Response::NewSession(_)), "{created:?}");
+    crate::session_fixture::assert_new_session(&created);
 }
 
 async fn create_three_pane_window(handler: &RequestHandler, session_name: &SessionName) {
@@ -469,7 +477,7 @@ async fn wait_for_dead_pane(
     window_index: u32,
     pane_index: u32,
 ) {
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    let deadline = tokio::time::Instant::now() + SERVER_SIGNAL_LIVENESS;
     loop {
         let exited = {
             let mut state = handler.state.lock().await;
@@ -493,7 +501,7 @@ async fn wait_for_lifecycle_exit(
     pane_id: rmux_core::PaneId,
     expected_status: i32,
 ) -> (u64, u64) {
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    let deadline = tokio::time::Instant::now() + SERVER_SIGNAL_LIVENESS;
     loop {
         let observed = {
             let state = handler.state.lock().await;
@@ -553,7 +561,7 @@ async fn sticky_lifecycle_state_is_id_keyed_and_redacts_spawn_env() {
             skip_environment_update: false,
         })))
         .await;
-    assert!(matches!(created, rmux_proto::Response::NewSession(_)));
+    crate::session_fixture::assert_new_session(&created);
     handler
         .wait_for_pane_terminal_for_test(&PaneTarget::new(alpha.clone(), 0))
         .await;
@@ -848,8 +856,8 @@ async fn split_window_ext_applies_start_directory_to_spawned_process() {
 async fn detached_split_with_zoom_keeps_original_pane_zoomed() {
     let handler = RequestHandler::new();
     let alpha = session_name("alpha-detached-split-zoom");
-    assert!(matches!(
-        handler
+    crate::session_fixture::assert_new_session(
+        &handler
             .handle(Request::NewSession(NewSessionRequest {
                 session_name: alpha.clone(),
                 detached: true,
@@ -857,8 +865,7 @@ async fn detached_split_with_zoom_keeps_original_pane_zoomed() {
                 environment: None,
             }))
             .await,
-        rmux_proto::Response::NewSession(_)
-    ));
+    );
 
     let response = handler
         .handle(Request::SplitWindowExt(Box::new(SplitWindowExtRequest {
@@ -888,6 +895,83 @@ async fn detached_split_with_zoom_keeps_original_pane_zoomed() {
     assert!(window.is_zoomed());
     assert_eq!(window.active_pane_index(), 0);
     assert_eq!(new_pane.pane_index(), 1);
+}
+
+#[tokio::test]
+async fn split_window_stdin_synchronized_output_discard_allows_later_fail_open_wake() {
+    let handler = RequestHandler::new();
+    let alpha = session_name("split-stdin-sync-timer-rearm");
+    create_session(&handler, &alpha).await;
+    let response = handler
+        .handle(Request::SplitWindowExt(Box::new(SplitWindowExtRequest {
+            target: SplitWindowTarget::Session(alpha.clone()),
+            direction: SplitDirection::Vertical,
+            before: false,
+            environment: None,
+            command: Some(vec![pipe_discard_command()]),
+            process_command: None,
+            start_directory: None,
+            keep_alive_on_exit: None,
+            detached: true,
+            size: None,
+            preserve_zoom: false,
+            full_size: false,
+            stdin_payload: Some(b"\x1b[?2026h\x1b[2J\x1b[HSPLIT_WINDOW_STDIN_PARTIAL".to_vec()),
+        })))
+        .await;
+    let split_target = match response {
+        Response::SplitWindow(response) => response.pane,
+        other => panic!("expected split-window success, got {other:?}"),
+    };
+    handler
+        .wait_for_pane_startup_to_finish_for_test(&split_target)
+        .await;
+    let (transcript, output) = {
+        let state = handler.state.lock().await;
+        (
+            state
+                .transcript_handle(&split_target)
+                .expect("split pane transcript"),
+            state
+                .pane_output_for_target(
+                    split_target.session_name(),
+                    split_target.window_index(),
+                    split_target.pane_index(),
+                )
+                .expect("split pane output"),
+        )
+    };
+    let mut observer = output.subscribe();
+
+    crate::pane_io::publish_pane_bytes_for_test(
+        &transcript,
+        &output,
+        b"\x1b[?2026l\x1b[?2026h\x1b[2J\x1b[HLATER_CHILD_PARTIAL".to_vec(),
+    );
+
+    let invalidation = timeout(Duration::from_secs(3), async {
+        loop {
+            if let crate::pane_io::PaneObservationItem::Invalidated(invalidation) =
+                observer.recv_observed().await
+            {
+                if invalidation.reason == crate::pane_io::PaneInvalidationReason::ParserStateExpired
+                {
+                    break invalidation;
+                }
+            }
+        }
+    })
+    .await
+    .expect("later synchronized admission must arm a one-second fail-open wake");
+    assert_eq!(
+        invalidation.reason,
+        crate::pane_io::PaneInvalidationReason::ParserStateExpired
+    );
+    assert_eq!(
+        transcript.lock().mode() & rmux_core::input::mode::MODE_SYNC,
+        0,
+        "the timed wake must release synchronized presentation"
+    );
 }
 
 #[tokio::test]
@@ -1007,7 +1091,7 @@ async fn pane_output_sequence_advances_when_transcript_changes() {
             skip_environment_update: false,
         })))
         .await;
-    assert!(matches!(created, rmux_proto::Response::NewSession(_)));
+    crate::session_fixture::assert_new_session(&created);
 
     let pane_id = {
         let state = handler.state.lock().await;
@@ -1131,16 +1215,11 @@ async fn move_pane_routes_through_join_semantics() {
     ));
     {
         let mut state = handler.state.lock().await;
-        let pane_id = state.sessions.allocate_pane_id();
         state
             .sessions
-            .session_mut(&alpha)
+            .session_setup(&alpha)
             .expect("session exists")
-            .insert_window_with_initial_pane_with_id(
-                1,
-                TerminalSize { cols: 80, rows: 24 },
-                pane_id,
-            )
+            .insert_window_with_initial_pane(1, TerminalSize { cols: 80, rows: 24 })
             .expect("window insert succeeds");
         state
             .insert_window_terminal(
@@ -1173,10 +1252,14 @@ async fn move_pane_routes_through_join_semantics() {
         }))
         .await;
 
+    // FMT1 R2: `-b` picks the side of the split, never the pane list index.
+    // tmux reinserts the moved pane right after its destination, so it lands at
+    // index 1 behind the destination's 0. Receipt:
+    // `fmt1/oracle-linux/tiled-source-cross-window-before`.
     assert_eq!(
         response,
         rmux_proto::Response::MovePane(rmux_proto::MovePaneResponse {
-            target: PaneTarget::with_window(alpha.clone(), 1, 0),
+            target: PaneTarget::with_window(alpha.clone(), 1, 1),
         })
     );
 
@@ -1268,6 +1351,10 @@ async fn break_pane_print_target_uses_custom_format() {
             .await,
         rmux_proto::Response::SplitWindow(_)
     ));
+    let (control_tx, _control_rx) = mpsc::unbounded_channel();
+    handler
+        .register_attach(std::process::id(), alpha.clone(), control_tx)
+        .await;
 
     let response = handler
         .handle(Request::BreakPane(Box::new(BreakPaneRequest {
@@ -1278,7 +1365,7 @@ async fn break_pane_print_target_uses_custom_format() {
             after: false,
             before: false,
             print_target: true,
-            format: Some("#{window_index}.#{pane_index}".to_owned()),
+            format: Some("#{window_index}.#{pane_index}:#{L:#{client_name}}".to_owned()),
         })))
         .await;
 
@@ -1286,7 +1373,14 @@ async fn break_pane_print_target_uses_custom_format() {
         panic!("expected break-pane response");
     };
     let output = success.command_output().expect("break-pane -P output");
-    assert_eq!(output.stdout(), b"1.0\n");
+    assert_eq!(
+        output.stdout(),
+        format!(
+            "1.0:{}\n",
+            crate::client_names::attached_client_name(std::process::id())
+        )
+        .as_bytes()
+    );
 }
 
 #[tokio::test]
@@ -1342,7 +1436,10 @@ async fn break_pane_implicit_destination_starts_at_base_index() {
     let state = handler.state.lock().await;
     let session = state.sessions.session(&alpha).expect("session survives");
     assert_eq!(
-        session.windows().keys().copied().collect::<Vec<_>>(),
+        session
+            .windows()
+            .map(|(index, _)| index)
+            .collect::<Vec<_>>(),
         vec![1, 2]
     );
 }
@@ -1605,6 +1702,240 @@ async fn respawn_pane_with_kill_flag_applies_directory_environment_and_command()
     let _ = fs::remove_dir_all(cwd);
 }
 
+const NUL_ENVIRONMENT: &str = "RMUX_NUL_WITNESS=bad\0value";
+const VALID_ENVIRONMENT: &str = "RMUX_NUL_WITNESS=valid";
+
+/// Asserts the refusal is the spawn boundary rejecting a NUL, not any error.
+///
+/// The two platforms word it differently - std says "nul byte found in provided
+/// data", the Windows backend says "interior NUL byte in process configuration"
+/// - so the shared, causal part is the typed variant plus the mention of NUL.
+fn assert_nul_spawn_refusal(response: &Response, context: &str) {
+    let Response::Error(error) = response else {
+        panic!("{context}: expected a refusal, got {response:?}");
+    };
+    let rmux_proto::RmuxError::SpawnFailed { message } = &error.error else {
+        panic!("{context}: expected SpawnFailed, got {:?}", error.error);
+    };
+    assert!(
+        message.to_lowercase().contains("nul"),
+        "{context}: the refusal must name the NUL that caused it, got {message:?}"
+    );
+}
+
+async fn pane_identity(
+    handler: &RequestHandler,
+    session: &SessionName,
+) -> (rmux_proto::PaneId, Option<u32>, u64) {
+    let target = PaneTarget::with_window(session.clone(), 0, 0);
+    let state = handler.state.lock().await;
+    let pane_id = state
+        .sessions
+        .session(session)
+        .expect("session exists")
+        .window_at(0)
+        .expect("window exists")
+        .pane(0)
+        .expect("pane exists")
+        .id();
+    let pid = state.pane_pid_in_window(session, 0, 0).ok();
+    let generation = state.pane_output_generation_for_target(&target, pane_id);
+    (pane_id, pid, generation)
+}
+
+async fn send_pane_input(handler: &RequestHandler, session: &SessionName, bytes: &str) {
+    let pane_id = {
+        let state = handler.state.lock().await;
+        state
+            .sessions
+            .session(session)
+            .expect("session exists")
+            .window_at(0)
+            .expect("window exists")
+            .pane(0)
+            .expect("pane exists")
+            .id()
+    };
+    let response = handler
+        .handle(Request::PaneInput(PaneInputRequest {
+            target: PaneTargetRef::by_id(session.clone(), pane_id),
+            keys: vec![bytes.to_owned()],
+            literal: true,
+        }))
+        .await;
+    assert!(
+        matches!(response, Response::SendKeys(_)),
+        "pane input must reach the child, got {response:?}"
+    );
+}
+
+#[tokio::test]
+async fn respawn_pane_rejects_an_interior_nul_and_the_same_child_keeps_reading() {
+    // NUL-R2-RESPAWN-WITNESS. A bare pane count and any Error would also pass on
+    // a refusal unrelated to NUL, or after the old runtime was replaced. So the
+    // pane runs a controlled child that signals READY and reads an exact byte
+    // sequence, and that sequence is split across the refused respawn: only the
+    // original child can accumulate both halves.
+    let handler = RequestHandler::new();
+    let alpha = session_name("respawn-nul-continuity");
+    let slot = FinalSinkSlot::new("respawn-nul", b"BEFORE\nAFTER\n", false);
+
+    let created = handler
+        .handle(Request::NewSessionExt(Box::new(NewSessionExtRequest {
+            session_name: Some(alpha.clone()),
+            working_directory: None,
+            detached: true,
+            size: Some(TerminalSize { cols: 80, rows: 24 }),
+            environment: None,
+            group_target: None,
+            attach_if_exists: false,
+            detach_other_clients: false,
+            kill_other_clients: false,
+            flags: None,
+            window_name: None,
+            print_session_info: false,
+            print_format: None,
+            command: None,
+            process_command: Some(ProcessCommand::Argv(slot.pane_command())),
+            client_environment: None,
+            skip_environment_update: false,
+        })))
+        .await;
+    crate::session_fixture::assert_new_session(&created);
+
+    let target = PaneTarget::with_window(alpha.clone(), 0, 0);
+    handler
+        .wait_for_pane_startup_to_finish_for_test(&target)
+        .await;
+    // READY proves a live child, not a pane still being born. This witness is
+    // deliberately about a running runtime; the Starting cycle keeps its own
+    // contract and is not exercised here.
+    slot.wait_until_ready();
+
+    send_pane_input(&handler, &alpha, "BEFORE\n").await;
+    let before = pane_identity(&handler, &alpha).await;
+    assert!(before.1.is_some(), "the witness needs a live child pid");
+
+    let response = handler
+        .handle(Request::RespawnPane(Box::new(RespawnPaneRequest {
+            target: target.clone(),
+            kill: true,
+            start_directory: None,
+            environment: Some(vec![NUL_ENVIRONMENT.to_owned()]),
+            command: None,
+            process_command: None,
+        })))
+        .await;
+    assert_nul_spawn_refusal(&response, "respawn with an interior NUL");
+
+    let after = pane_identity(&handler, &alpha).await;
+    assert_eq!(
+        after, before,
+        "the refused respawn must not replace the runtime"
+    );
+
+    // The decisive observation: the same child, not a replacement, completes the
+    // capture it had already started.
+    send_pane_input(&handler, &alpha, "AFTER\n").await;
+    slot.assert_application_bytes("the child that survived a refused respawn must keep reading");
+}
+
+#[tokio::test]
+async fn new_window_rejects_an_interior_nul_and_restores_the_session_snapshot() {
+    // NUL-R2-NEW-WINDOW-WITNESS. This boundary captures a session snapshot,
+    // creates, selects and remaps before spawning, then restores on error. The
+    // insertion index is occupied so the refused request exercises the remap
+    // the snapshot is there to undo.
+    let handler = RequestHandler::new();
+    let alpha = session_name("new-window-nul-snapshot");
+    create_session(&handler, &alpha).await;
+    let second = handler
+        .handle(Request::NewWindow(Box::new(NewWindowRequest {
+            target: alpha.clone(),
+            name: Some("occupant".to_owned()),
+            detached: false,
+            environment: None,
+            command: None,
+            start_directory: None,
+            target_window_index: None,
+            insert_at_target: false,
+            process_command: None,
+        })))
+        .await;
+    assert!(matches!(second, Response::NewWindow(_)), "{second:?}");
+
+    async fn snapshot(
+        handler: &RequestHandler,
+        session: &SessionName,
+    ) -> (Vec<(u32, u32, Vec<rmux_proto::PaneId>)>, u32, String) {
+        let state = handler.state.lock().await;
+        let owner = state.sessions.session(session).expect("session exists");
+        let windows = owner
+            .windows()
+            .map(|(index, window)| {
+                (
+                    index,
+                    window.id().as_u32(),
+                    window.panes().iter().map(rmux_core::Pane::id).collect(),
+                )
+            })
+            .collect();
+        // The options are compared by their rendered value so this witness does
+        // not depend on the concrete type staying nameable from here.
+        (
+            windows,
+            owner.active_window_index(),
+            format!("{:?}", state.options),
+        )
+    }
+
+    let before = snapshot(&handler, &alpha).await;
+
+    let refused = handler
+        .handle(Request::NewWindow(Box::new(NewWindowRequest {
+            target: alpha.clone(),
+            name: Some("refused".to_owned()),
+            detached: false,
+            environment: Some(vec![NUL_ENVIRONMENT.to_owned()]),
+            command: None,
+            start_directory: None,
+            target_window_index: Some(1),
+            insert_at_target: true,
+            process_command: None,
+        })))
+        .await;
+    assert_nul_spawn_refusal(&refused, "new-window with an interior NUL");
+
+    let after = snapshot(&handler, &alpha).await;
+    assert_eq!(
+        after, before,
+        "the refused new-window must restore windows, pane identities, selection and options"
+    );
+
+    // The control: the same request with a valid value creates the window, so
+    // the refusal above is the NUL and not the shape of the request.
+    let accepted = handler
+        .handle(Request::NewWindow(Box::new(NewWindowRequest {
+            target: alpha.clone(),
+            name: Some("accepted".to_owned()),
+            detached: false,
+            environment: Some(vec![VALID_ENVIRONMENT.to_owned()]),
+            command: None,
+            start_directory: None,
+            target_window_index: Some(1),
+            insert_at_target: true,
+            process_command: None,
+        })))
+        .await;
+    assert!(matches!(accepted, Response::NewWindow(_)), "{accepted:?}");
+    let created = snapshot(&handler, &alpha).await;
+    assert_eq!(
+        created.0.len(),
+        before.0.len() + 1,
+        "a valid value must still create the window"
+    );
+}
+
 #[tokio::test]
 async fn respawn_pane_reuses_structured_command_cwd_and_private_environment() {
     let handler = RequestHandler::new();
@@ -1639,7 +1970,7 @@ async fn respawn_pane_reuses_structured_command_cwd_and_private_environment() {
             skip_environment_update: false,
         })))
         .await;
-    assert!(matches!(created, Response::NewSession(_)), "{created:?}");
+    crate::session_fixture::assert_new_session(&created);
 
     let initial_cwd_text = expected_spawn_cwd(&initial_cwd);
     let initial_line = respawn_probe_line(&initial_cwd_text, "initial", "argv");
@@ -2247,6 +2578,88 @@ async fn display_panes_without_a_command_keeps_the_active_pane() {
 }
 
 #[tokio::test]
+async fn display_panes_masks_and_restores_native_pane_focus() {
+    let handler = RequestHandler::new();
+    let alpha = session_name("display-panes-focus-mask");
+    let requester_pid = 4_243_u32;
+    create_session(&handler, &alpha).await;
+    let (control_tx, mut control_rx) = mpsc::unbounded_channel();
+    handler
+        .register_attach(requester_pid, alpha.clone(), control_tx)
+        .await;
+    let target = PaneTarget::new(alpha.clone(), 0);
+    {
+        let mut state = handler.state.lock().await;
+        state
+            .append_bytes_to_pane_transcript_for_test(&alpha, 0, 0, b"\x1b[?1004h")
+            .expect("pane enables focus reporting");
+        state.start_pane_input_capture_for_test(&target);
+    }
+
+    let response = handler
+        .handle(Request::DisplayPanes(Box::new(DisplayPanesRequest {
+            target: alpha.clone(),
+            duration_ms: Some(5_000),
+            non_blocking: true,
+            no_command: true,
+            template: None,
+            target_client: None,
+        })))
+        .await;
+    assert!(
+        matches!(response, Response::DisplayPanes(_)),
+        "{response:?}"
+    );
+    let _overlay = control_rx.recv().await.expect("display-panes overlay");
+    {
+        let state = handler.state.lock().await;
+        assert_eq!(
+            state.pane_input_capture_for_test(&target),
+            Some(b"\x1b[O".to_vec())
+        );
+    }
+    handler
+        .handle_attached_live_input_for_test(requester_pid, b"\x1b[O")
+        .await
+        .expect("display-panes passes focus-out to the attach controller");
+    {
+        let active_attach = handler.active_attach.lock().await;
+        let active = &active_attach.by_pid[&requester_pid];
+        assert!(!active.reported_focused);
+        assert!(
+            active.display_panes.is_some(),
+            "focus-out must not close display-panes"
+        );
+    }
+    handler
+        .handle_attached_live_input_for_test(requester_pid, b"\x1b[I")
+        .await
+        .expect("display-panes passes focus-in to the attach controller");
+    {
+        let active_attach = handler.active_attach.lock().await;
+        let active = &active_attach.by_pid[&requester_pid];
+        assert!(active.reported_focused);
+        assert!(
+            active.display_panes.is_some(),
+            "focus-in must not close display-panes"
+        );
+    }
+    handler
+        .handle_attached_live_input_for_test(requester_pid, b"0")
+        .await
+        .expect("display-panes closes on its active pane label");
+    let _clear = control_rx
+        .recv()
+        .await
+        .expect("display-panes clear overlay");
+    let state = handler.state.lock().await;
+    assert_eq!(
+        state.pane_input_capture_for_test(&target),
+        Some(b"\x1b[O\x1b[I".to_vec())
+    );
+}
+
+#[tokio::test]
 async fn display_panes_uses_the_session_option_duration_by_default() {
     let handler = RequestHandler::new();
     let alpha = session_name("alpha");
@@ -2479,13 +2892,17 @@ async fn cross_session_swap_rollback_restores_owner_and_session_pair() {
                 .sessions
                 .session(&owner)
                 .expect("owner exists")
-                .clone(),
-            state.sessions.session(&peer).expect("peer exists").clone(),
+                .test_snapshot(),
+            state
+                .sessions
+                .session(&peer)
+                .expect("peer exists")
+                .test_snapshot(),
             state
                 .sessions
                 .session(&target)
                 .expect("target exists")
-                .clone(),
+                .test_snapshot(),
         );
         state.fail_next_resize_for_test();
         snapshots
@@ -2508,9 +2925,27 @@ async fn cross_session_swap_rollback_restores_owner_and_session_pair() {
     let state = handler.state.lock().await;
     assert_eq!(state.sessions.runtime_owner(&owner), Some(owner.clone()));
     assert_eq!(state.sessions.runtime_owner(&peer), Some(owner.clone()));
-    assert_eq!(state.sessions.session(&owner), Some(&owner_before));
-    assert_eq!(state.sessions.session(&peer), Some(&peer_before));
-    assert_eq!(state.sessions.session(&target), Some(&target_before));
+    assert_eq!(
+        state
+            .sessions
+            .session(&owner)
+            .map(|session| session.test_snapshot()),
+        Some(owner_before)
+    );
+    assert_eq!(
+        state
+            .sessions
+            .session(&peer)
+            .map(|session| session.test_snapshot()),
+        Some(peer_before)
+    );
+    assert_eq!(
+        state
+            .sessions
+            .session(&target)
+            .map(|session| session.test_snapshot()),
+        Some(target_before)
+    );
 }
 
 #[tokio::test]
@@ -2545,6 +2980,506 @@ async fn swap_pane_self_swap_is_a_no_op() {
         matches!(response, rmux_proto::Response::SwapPane(_)),
         "self-swap should succeed as a no-op, got {response:?}"
     );
+}
+
+// Source-bound tmux 3.7b swap oracle: L1-034 plus L1-035's six extra
+// zoom/source/target/-Z cases. These fixtures own real PTYs when executed.
+#[derive(Clone, Copy)]
+pub(super) enum FloatingSwapRoute {
+    SameWindow,
+    CrossWindow,
+    CrossSession,
+    GroupedAlias,
+    GroupedCrossWindow,
+    GroupedCrossSession,
+}
+
+/// Assertions for the admitted RMUX publication contract. These are not a
+/// measured tmux event count/order or an attached-client parity oracle.
+pub(super) async fn assert_swap_layout_publication(
+    handler: &RequestHandler,
+    events: &mut tokio::sync::broadcast::Receiver<super::QueuedLifecycleEvent>,
+    expected: &[rmux_core::WindowId],
+) {
+    let state = handler.state.lock().await;
+    let mut actual = Vec::new();
+    loop {
+        let event = match events.try_recv() {
+            Ok(event) => event,
+            Err(tokio::sync::broadcast::error::TryRecvError::Empty) => break,
+            Err(error) => panic!("layout event evidence lost: {error}"),
+        };
+        match event.event {
+            rmux_core::LifecycleEvent::WindowLayoutChanged { target } => {
+                actual.push(state.sessions.window(&target).unwrap().id());
+            }
+            rmux_core::LifecycleEvent::WindowResized { .. } => {
+                panic!("swap-only layout changes must not invent a window resize");
+            }
+            _ => {}
+        }
+    }
+    actual.sort_by_key(|id| id.as_u32());
+    let mut expected = expected.to_vec();
+    expected.sort_by_key(|id| id.as_u32());
+    expected.dedup();
+    assert_eq!(
+        actual, expected,
+        "one layout publication per changed canonical window"
+    );
+}
+
+#[tokio::test]
+async fn swap_refusal_publishes_only_windows_actually_unzoomed() {
+    for route in [
+        FloatingSwapRoute::SameWindow,
+        FloatingSwapRoute::CrossWindow,
+        FloatingSwapRoute::CrossSession,
+    ] {
+        for (source_zoom, target_zoom) in [(true, true), (false, true), (false, false)] {
+            let mut fixture = floating_swap_fixture(route).await;
+            fixture.zoom(source_zoom, target_zoom).await;
+            let expected = {
+                let state = fixture.handler.state.lock().await;
+                fixture
+                    .windows
+                    .iter()
+                    .filter_map(|(target, _)| {
+                        let window = state.sessions.window(target).unwrap();
+                        window.is_zoomed().then_some(window.id())
+                    })
+                    .collect::<Vec<_>>()
+            };
+            let mut events = fixture.handler.subscribe_lifecycle_events();
+            let response = fixture
+                .handler
+                .handle(Request::SwapPane(rmux_proto::SwapPaneRequest {
+                    source: fixture.source.clone(),
+                    target: fixture.target.clone(),
+                    direction: None,
+                    detached: true,
+                    preserve_zoom: true,
+                }))
+                .await;
+            assert!(
+                matches!(&response, Response::Error(error)
+                if error.error == rmux_proto::RmuxError::Server("cannot swap floating panes".to_owned())),
+                "{response:?}"
+            );
+            assert_swap_layout_publication(&fixture.handler, &mut events, &expected).await;
+            fixture.assert_state_and_runtimes().await;
+            fixture.cleanup().await;
+        }
+    }
+}
+
+#[tokio::test]
+async fn directional_tiled_swap_publishes_only_the_resolved_window() {
+    let mut fixture = floating_swap_fixture(FloatingSwapRoute::CrossSession).await;
+    fixture.zoom(true, false).await;
+    let (source_before, target_before) = {
+        let state = fixture.handler.state.lock().await;
+        (
+            state
+                .sessions
+                .window(&fixture.windows[0].0)
+                .unwrap()
+                .clone(),
+            state
+                .sessions
+                .window(&fixture.windows[1].0)
+                .unwrap()
+                .clone(),
+        )
+    };
+    let mut events = fixture.handler.subscribe_lifecycle_events();
+    // The explicit source is floating and zoomed in another session. -D
+    // instead exchanges the two tiled panes in the target's window.
+    let response = fixture
+        .handler
+        .handle(Request::SwapPane(rmux_proto::SwapPaneRequest {
+            source: fixture.source.clone(),
+            target: fixture.target.clone(),
+            direction: Some(rmux_proto::SwapPaneDirection::Down),
+            detached: true,
+            preserve_zoom: false,
+        }))
+        .await;
+    let Response::SwapPane(response) = response else {
+        panic!("expected tiled swap success");
+    };
+    assert_eq!(response.target, fixture.target);
+    assert_eq!(
+        response.source,
+        PaneTarget::with_window(fixture.target.session_name().clone(), 0, 1)
+    );
+    assert_swap_layout_publication(&fixture.handler, &mut events, &[target_before.id()]).await;
+    {
+        let state = fixture.handler.state.lock().await;
+        assert_eq!(
+            state.sessions.window(&fixture.windows[0].0).unwrap(),
+            &source_before
+        );
+        let target = state.sessions.window(&fixture.windows[1].0).unwrap();
+        assert_eq!(
+            target.pane(0).unwrap().id(),
+            target_before.pane(1).unwrap().id()
+        );
+        assert_eq!(
+            target.pane(1).unwrap().id(),
+            target_before.pane(0).unwrap().id()
+        );
+    }
+    fixture.cleanup().await;
+}
+
+pub(super) async fn floating_swap_command(
+    handler: &RequestHandler,
+    command: &str,
+) -> Result<rmux_proto::CommandOutput, rmux_proto::RmuxError> {
+    handler
+        .execute_parsed_commands_for_test(
+            std::process::id(),
+            rmux_core::command_parser::CommandParser::new()
+                .parse(command)
+                .unwrap(),
+        )
+        .await
+}
+
+pub(super) struct FloatingSwapFixture {
+    pub handler: RequestHandler,
+    pub source: PaneTarget,
+    pub target: PaneTarget,
+    pub windows: Vec<(WindowTarget, rmux_core::Window)>,
+    runtimes: Vec<(rmux_core::PaneId, Option<u32>, u64)>,
+}
+
+pub(super) async fn floating_swap_fixture(route: FloatingSwapRoute) -> FloatingSwapFixture {
+    let handler = RequestHandler::new();
+    floating_swap_command(&handler, "set-option -g status off")
+        .await
+        .unwrap();
+    floating_swap_command(&handler, "set-option -g automatic-rename off")
+        .await
+        .unwrap();
+    floating_swap_command(
+        &handler,
+        &format!(
+            "set-option -g default-command {}",
+            crate::test_shell::command_quote(&pipe_discard_command())
+        ),
+    )
+    .await
+    .unwrap();
+    for command in [
+        "new-session -d -s swap-source -n base -x80 -y24",
+        "split-window -d -h -t swap-source:0.0",
+        "new-pane -d -t swap-source:0.0 -x12 -y4 -X3 -Y2",
+    ] {
+        floating_swap_command(&handler, command).await.unwrap();
+    }
+    let owner = session_name("swap-source");
+    let mut windows = vec![WindowTarget::new(owner.clone())];
+    let mut target = PaneTarget::new(owner.clone(), 0);
+    if matches!(
+        route,
+        FloatingSwapRoute::CrossWindow | FloatingSwapRoute::GroupedCrossWindow
+    ) {
+        for command in [
+            "new-window -d -t swap-source:1 -n other",
+            "split-window -d -h -t swap-source:1.0",
+        ] {
+            floating_swap_command(&handler, command).await.unwrap();
+        }
+        windows.push(WindowTarget::with_window(owner.clone(), 1));
+        target = PaneTarget::with_window(owner.clone(), 1, 0);
+    } else if matches!(
+        route,
+        FloatingSwapRoute::CrossSession | FloatingSwapRoute::GroupedCrossSession
+    ) {
+        for command in [
+            "new-session -d -s swap-target -n other -x80 -y24",
+            "split-window -d -h -t swap-target:0.0",
+        ] {
+            floating_swap_command(&handler, command).await.unwrap();
+        }
+        let other = session_name("swap-target");
+        windows.push(WindowTarget::new(other.clone()));
+        target = PaneTarget::new(other, 0);
+    }
+    let mut source = PaneTarget::new(owner.clone(), 2);
+    if matches!(
+        route,
+        FloatingSwapRoute::GroupedAlias
+            | FloatingSwapRoute::GroupedCrossWindow
+            | FloatingSwapRoute::GroupedCrossSession
+    ) {
+        let peer = session_name("swap-peer");
+        create_grouped_session(&handler, &peer, &owner).await;
+        windows.extend(
+            windows
+                .clone()
+                .into_iter()
+                .filter(|window| window.session_name() == &owner)
+                .map(|window| WindowTarget::with_window(peer.clone(), window.window_index())),
+        );
+        source = PaneTarget::new(peer, 2);
+    }
+    handler.wait_for_initial_panes_for_test().await;
+    let mut snapshots = Vec::new();
+    let mut runtimes = Vec::new();
+    for target in windows {
+        let window = {
+            let state = handler.state.lock().await;
+            state.sessions.window(&target).unwrap().clone()
+        };
+        for pane in window.panes() {
+            handler
+                .wait_for_pane_startup_to_finish_for_test(&PaneTarget::with_window(
+                    target.session_name().clone(),
+                    target.window_index(),
+                    pane.index(),
+                ))
+                .await;
+        }
+        let state = handler.state.lock().await;
+        for pane in window.panes() {
+            let lifecycle = state.pane_lifecycle(pane.id()).unwrap();
+            let PaneLifecycleProcessState::Running { pid } = lifecycle.process else {
+                panic!("fixture pane must be running");
+            };
+            // Creation-bound identities come from the fixture's own live
+            // lifecycle handles, never from a system-wide process inventory.
+            eprintln!(
+                "floating fixture owned pane={} pid={:?} generation={}",
+                pane.id().as_u32(),
+                pid,
+                lifecycle.generation
+            );
+            runtimes.push((pane.id(), pid, lifecycle.generation));
+        }
+        snapshots.push((target, window));
+    }
+    FloatingSwapFixture {
+        handler,
+        source,
+        target,
+        windows: snapshots,
+        runtimes,
+    }
+}
+
+impl FloatingSwapFixture {
+    pub async fn zoom(&mut self, source: bool, target: bool) {
+        let mut seen = std::collections::HashSet::new();
+        for (pane, zoom) in [(&self.source, source), (&self.target, target)] {
+            if !zoom {
+                continue;
+            }
+            let id = {
+                let state = self.handler.state.lock().await;
+                state
+                    .sessions
+                    .session(pane.session_name())
+                    .unwrap()
+                    .window_at(pane.window_index())
+                    .unwrap()
+                    .id()
+            };
+            if seen.insert(id) {
+                // Keep the selected tile; zooming the floating endpoint would
+                // change selection and would no longer be the archived case.
+                assert!(matches!(
+                    self.handler
+                        .handle(Request::ResizePane(ResizePaneRequest {
+                            target: PaneTarget::with_window(
+                                pane.session_name().clone(),
+                                pane.window_index(),
+                                0
+                            ),
+                            adjustment: ResizePaneAdjustment::Zoom,
+                        }))
+                        .await,
+                    Response::ResizePane(_)
+                ));
+            }
+        }
+        // Freeze after the zoom setup: zoom itself may touch selection history
+        // or raise the active float. Only remove the oracle-required zoom in
+        // the expected detached image; keep every other field exact.
+        let state = self.handler.state.lock().await;
+        for (target, expected) in &mut self.windows {
+            *expected = state
+                .sessions
+                .session(target.session_name())
+                .unwrap()
+                .layout_window_snapshot(target.window_index())
+                .unwrap();
+        }
+    }
+
+    pub async fn assert_state_and_runtimes(&self) {
+        let mut state = self.handler.state.lock().await;
+        for (target, expected) in &self.windows {
+            let actual = state.sessions.window(target).unwrap();
+            // Activity is wall-clock seconds bumped by any late pane output (a
+            // ConPTY repaint after a resize); it is not part of this contract.
+            let mut expected = expected.clone();
+            for pane in actual.panes() {
+                assert!(expected.apply_pane_activity_snapshot(
+                    actual.pane_activity_snapshot(pane.id()).unwrap()
+                ));
+            }
+            assert_eq!(
+                actual, &expected,
+                "exact owner, panes, selection/history, stack and canonical geometry"
+            );
+            for pane in expected.panes() {
+                let target = PaneTarget::with_window(
+                    target.session_name().clone(),
+                    target.window_index(),
+                    pane.index(),
+                );
+                let geometry = pane.geometry();
+                let size = TerminalSize::new(geometry.cols(), geometry.rows());
+                assert_eq!(state.pane_lifecycle(pane.id()).unwrap().dimensions(), size);
+                let master = state
+                    .clone_pane_master_if_alive(
+                        target.session_name(),
+                        target.window_index(),
+                        target.pane_index(),
+                    )
+                    .unwrap();
+                let native = master.size().unwrap();
+                assert_eq!((native.cols, native.rows), (size.cols, size.rows));
+                assert_eq!(
+                    state
+                        .transcript_handle(&target)
+                        .unwrap()
+                        .lock()
+                        .screen()
+                        .size(),
+                    size
+                );
+            }
+        }
+        for &(pane, pid, generation) in &self.runtimes {
+            let lifecycle = state.pane_lifecycle(pane).unwrap();
+            assert!(
+                matches!(lifecycle.process, PaneLifecycleProcessState::Running { pid: actual } if actual == pid)
+            );
+            assert_eq!(lifecycle.generation, generation);
+            assert!(lifecycle.exit_state.is_none());
+        }
+    }
+
+    pub async fn cleanup(&self) {
+        assert!(matches!(
+            self.handler
+                .handle(Request::KillServer(rmux_proto::KillServerRequest))
+                .await,
+            Response::KillServer(_)
+        ));
+        // KillServer queues daemon shutdown; this in-process fixture has no
+        // daemon loop to drain it. Use the existing test teardown now, while
+        // the runtime is alive, so each loop iteration waits for its children.
+        self.handler
+            .state
+            .lock()
+            .await
+            .shutdown_terminals_for_test();
+        eprintln!("floating fixture ordinary terminal teardown completed");
+    }
+}
+
+pub(super) async fn floating_swap_refusal_case(
+    route: FloatingSwapRoute,
+    preserve_zoom: bool,
+    reverse: bool,
+    source_zoom: bool,
+    target_zoom: bool,
+) {
+    let mut fixture = floating_swap_fixture(route).await;
+    fixture.zoom(source_zoom, target_zoom).await;
+    let (source, target) = if reverse {
+        (fixture.target.clone(), fixture.source.clone())
+    } else {
+        (fixture.source.clone(), fixture.target.clone())
+    };
+    let response = fixture
+        .handler
+        .handle(Request::SwapPane(rmux_proto::SwapPaneRequest {
+            source,
+            target,
+            direction: None,
+            detached: true,
+            preserve_zoom,
+        }))
+        .await;
+    assert!(
+        matches!(&response, Response::Error(error)
+        if error.error == rmux_proto::RmuxError::Server("cannot swap floating panes".to_owned())),
+        "{response:?}"
+    );
+    fixture.assert_state_and_runtimes().await;
+    // A following self-swap with -Z must not resurrect a refused swap or zoom.
+    let source = fixture.source.clone();
+    assert!(matches!(
+        fixture
+            .handler
+            .handle(Request::SwapPane(rmux_proto::SwapPaneRequest {
+                source: source.clone(),
+                target: source,
+                direction: None,
+                detached: false,
+                preserve_zoom: true,
+            }))
+            .await,
+        Response::SwapPane(_)
+    ));
+    fixture.assert_state_and_runtimes().await;
+    fixture.cleanup().await;
+}
+
+#[tokio::test]
+async fn floating_swap_refusal_unzooms_and_retains_public_runtime_state() {
+    for route in [
+        FloatingSwapRoute::SameWindow,
+        FloatingSwapRoute::CrossWindow,
+        FloatingSwapRoute::CrossSession,
+    ] {
+        for (preserve, reverse, source_zoom, target_zoom) in [
+            (false, false, true, true),
+            (true, false, true, true),
+            (false, true, true, true),
+            (false, false, false, true),
+            (false, false, false, false),
+        ] {
+            floating_swap_refusal_case(route, preserve, reverse, source_zoom, target_zoom).await;
+        }
+    }
+}
+
+#[tokio::test]
+async fn directional_floating_swap_validates_the_resolved_endpoint() {
+    let mut fixture = floating_swap_fixture(FloatingSwapRoute::SameWindow).await;
+    fixture.zoom(true, true).await;
+    // -U resolves pane 2 from anchor 0; the explicit source is unused.
+    let response = fixture
+        .handler
+        .handle(Request::SwapPane(rmux_proto::SwapPaneRequest {
+            source: PaneTarget::new(session_name("missing-unused-source"), 99),
+            target: fixture.target.clone(),
+            direction: Some(rmux_proto::SwapPaneDirection::Up),
+            detached: false,
+            preserve_zoom: true,
+        }))
+        .await;
+    assert!(matches!(response, Response::Error(error)
+        if error.error == rmux_proto::RmuxError::Server("cannot swap floating panes".to_owned())));
+    fixture.assert_state_and_runtimes().await;
+    fixture.cleanup().await;
 }
 
 #[tokio::test]
@@ -2649,7 +3584,7 @@ async fn remain_on_exit_keeps_the_existing_window_name() {
     assert!(matches!(response, rmux_proto::Response::RespawnPane(_)));
     wait_for_dead_pane(&handler, &alpha, 0, 0).await;
 
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    let deadline = tokio::time::Instant::now() + SERVER_SIGNAL_LIVENESS;
     loop {
         let (ready, observation) = {
             let state = handler.state.lock().await;
@@ -2724,7 +3659,7 @@ async fn remain_on_exit_auto_named_window_gets_tmux_dead_suffix_when_unattached(
     assert!(matches!(response, rmux_proto::Response::RespawnPane(_)));
     wait_for_dead_pane(&handler, &alpha, 0, 0).await;
 
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    let deadline = tokio::time::Instant::now() + SERVER_SIGNAL_LIVENESS;
     loop {
         let (ready, observation) = {
             let state = handler.state.lock().await;
@@ -2913,7 +3848,7 @@ async fn pane_snapshot_returns_live_screen_built_via_terminal_parser() {
             skip_environment_update: false,
         })))
         .await;
-    assert!(matches!(created, rmux_proto::Response::NewSession(_)));
+    crate::session_fixture::assert_new_session(&created);
 
     let pane_id = {
         let state = handler.state.lock().await;
@@ -3044,7 +3979,7 @@ async fn pane_snapshot_folds_invalid_utf8_through_parser_not_raw_bytes() {
             skip_environment_update: false,
         })))
         .await;
-    assert!(matches!(created, rmux_proto::Response::NewSession(_)));
+    crate::session_fixture::assert_new_session(&created);
 
     let pane_id = {
         let state = handler.state.lock().await;
@@ -3131,7 +4066,7 @@ async fn pane_snapshot_revision_changes_after_clear_history() {
             skip_environment_update: false,
         })))
         .await;
-    assert!(matches!(created, rmux_proto::Response::NewSession(_)));
+    crate::session_fixture::assert_new_session(&created);
 
     let pane_id = {
         let state = handler.state.lock().await;
@@ -3169,3 +4104,5 @@ async fn pane_snapshot_revision_changes_after_clear_history() {
         "clearing scrollback must change the snapshot revision",
     );
 }
+
+mod pane_identity_characterization;

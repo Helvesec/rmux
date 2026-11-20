@@ -2,7 +2,8 @@ use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
 
 use rmux_client::{
-    connect, detect_context, drive_control_mode, ClientContext, Connection, ControlTransition,
+    connect, detect_context, drive_control_mode, ClientContext, ClientError, Connection,
+    ControlModeStatus, ControlTransition,
 };
 use rmux_proto::request::{
     AttachSessionExt2Request, DetachClientExtRequest, ListClientsRequest, RefreshClientRequest,
@@ -252,13 +253,13 @@ pub(super) fn run_control_mode(
         .map_err(ExitFailure::from_client)?
     {
         ControlTransition::Upgraded(upgrade) => {
-            let control_result = drive_control_mode(upgrade, &[]).map_err(ExitFailure::from_client);
+            let control_result = control_mode_exit_code(drive_control_mode(upgrade, &[]));
             let cleanup_result =
                 shutdown_started_empty_server_at(&endpoint.socket_path(), provenance)
                     .map_err(|error| ExitFailure::new(1, error.to_string()));
-            control_result?;
+            let exit_code = control_result?;
             cleanup_result?;
-            Ok(0)
+            Ok(exit_code)
         }
         ControlTransition::Rejected(Response::Error(ErrorResponse { error })) => {
             Err(ExitFailure::new(1, error.to_string()))
@@ -266,6 +267,21 @@ pub(super) fn run_control_mode(
         ControlTransition::Rejected(response) => {
             Err(unexpected_response("control-mode", &response))
         }
+    }
+}
+
+/// Maps the end of a control session to tmux's exit status. A failed command
+/// of a client that never joined a session exits 1, and so does a server that
+/// vanished without `%exit`: the client has already written
+/// `%exit server exited unexpectedly` to the control stream, as tmux does.
+fn control_mode_exit_code(
+    result: Result<ControlModeStatus, ClientError>,
+) -> Result<i32, ExitFailure> {
+    match result {
+        Ok(ControlModeStatus::Success) => Ok(0),
+        Ok(ControlModeStatus::CommandFailed) => Ok(1),
+        Err(ClientError::UnexpectedEof) => Ok(1),
+        Err(error) => Err(ExitFailure::from_client(error)),
     }
 }
 
@@ -307,23 +323,35 @@ pub(super) fn run_refresh_client(
     args: RefreshClientArgs,
     socket_path: &Path,
 ) -> Result<i32, ExitFailure> {
+    let adjustment =
+        if args.clear_pan || args.pan_left || args.pan_right || args.pan_up || args.pan_down {
+            args.adjustment
+                .as_deref()
+                .map(rmux_core::command_parser::parse_pan_adjustment)
+                .transpose()
+                .map_err(|error| {
+                    ExitFailure::from_client(rmux_client::ClientError::Protocol(error))
+                })?
+        } else {
+            None
+        };
     run_command(socket_path, "refresh-client", move |connection| {
         connection.refresh_client(RefreshClientRequest {
             target_client: args.target_client,
-            adjustment: None,
-            clear_pan: false,
-            pan_left: false,
-            pan_right: false,
-            pan_up: false,
-            pan_down: false,
+            adjustment,
+            clear_pan: args.clear_pan,
+            pan_left: args.pan_left,
+            pan_right: args.pan_right,
+            pan_up: args.pan_up,
+            pan_down: args.pan_down,
             status_only: args.status_only,
             clipboard_query: args.clipboard_query,
             flags: args.flags,
             flags_alias: args.flags_alias,
-            subscriptions: Vec::new(),
-            subscriptions_format: Vec::new(),
+            subscriptions: args.subscriptions,
+            subscriptions_format: args.subscriptions_format,
             control_size: args.control_size,
-            colour_report: None,
+            colour_report: args.colour_report,
         })
     })
 }
@@ -418,6 +446,53 @@ mod tests {
     use std::path::Path;
 
     use super::inherited_rmux_socket_matches_from_env;
+
+    #[cfg(unix)]
+    #[test]
+    fn nested_attach_matches_missing_bare_socket_spellings() {
+        let name = format!("review-nested-{}.sock", std::process::id());
+        let absolute = std::env::current_dir().unwrap().join(&name);
+        assert!(!absolute.exists());
+        for inherited in [&name, &format!("./{name}"), absolute.to_str().unwrap()] {
+            let rmux = format!("{inherited},123,0");
+            for requested in [Path::new(&name), &Path::new(".").join(&name), &absolute] {
+                assert!(inherited_rmux_socket_matches_from_env(
+                    Some(OsStr::new(&rmux)),
+                    requested,
+                ));
+            }
+        }
+        assert!(!inherited_rmux_socket_matches_from_env(
+            Some(OsStr::new(&format!("{name},123,0"))),
+            &absolute.with_file_name("other.sock"),
+        ));
+    }
+
+    #[test]
+    fn lost_control_server_exits_one_without_a_second_diagnostic() {
+        assert_eq!(
+            super::control_mode_exit_code(Ok(rmux_client::ControlModeStatus::Success))
+                .expect("clean end"),
+            0
+        );
+        assert_eq!(
+            super::control_mode_exit_code(Ok(rmux_client::ControlModeStatus::CommandFailed))
+                .expect("a failed command is an exit status, not a stderr diagnostic"),
+            1
+        );
+        assert_eq!(
+            super::control_mode_exit_code(Err(rmux_client::ClientError::UnexpectedEof))
+                .expect("lost server is an exit status, not a stderr diagnostic"),
+            1
+        );
+        let failure = super::control_mode_exit_code(Err(rmux_client::ClientError::Io(
+            std::io::Error::from(std::io::ErrorKind::InvalidData),
+        )))
+        .expect_err("other transport failures keep their diagnostic");
+        assert_eq!(failure.exit_code(), 1);
+        assert!(failure.use_stderr());
+        assert!(!failure.message().is_empty());
+    }
 
     #[test]
     fn nested_attach_only_rewrites_when_inherited_rmux_socket_matches() {

@@ -1,7 +1,7 @@
 use std::ffi::OsString;
 use std::io::{self, ErrorKind, Write};
 
-use rmux_core::formats::TMUX_FORMAT_TABLE_NAMES;
+use rmux_core::formats::tmux_format_variable_descriptors;
 use rmux_proto::{capabilities_for_features, RMUX_WIRE_VERSION};
 use serde_json::json;
 
@@ -22,7 +22,7 @@ pub(super) struct CapabilitiesInvocation {
 pub(super) fn parse_invocation(
     arguments: &[OsString],
 ) -> Result<Option<CapabilitiesInvocation>, ExitFailure> {
-    let Some(command_index) = split_top_level_prefix(arguments) else {
+    let Some(command_index) = crate::cli_top_level::top_level_command_index(arguments) else {
         return Ok(None);
     };
     let Some(command) = arguments
@@ -46,45 +46,6 @@ pub(super) fn run(invocation: CapabilitiesInvocation) -> Result<i32, ExitFailure
     }
 }
 
-fn split_top_level_prefix(arguments: &[OsString]) -> Option<usize> {
-    let mut index = 0;
-
-    while let Some(argument) = arguments.get(index) {
-        let value = argument.to_str()?;
-        if value == "--" {
-            return Some(index + 1);
-        }
-        if !value.starts_with('-') || value == "-" {
-            return Some(index);
-        }
-
-        match value {
-            "-2" | "-D" | "-N" | "-l" | "-u" => {}
-            "-C" | "-v" => {}
-            "-c" | "-f" | "-L" | "-S" | "-T" => {
-                index += 1;
-            }
-            _ if value.starts_with("-L") && value.len() > 2 => {}
-            _ if value.starts_with("-S") && value.len() > 2 => {}
-            _ if value.starts_with("-f") && value.len() > 2 => {}
-            _ if value.starts_with("-T") && value.len() > 2 => {}
-            _ if is_short_flag_cluster(value, "2CDNluv") => {}
-            _ => return Some(index),
-        }
-
-        index += 1;
-    }
-
-    None
-}
-
-fn is_short_flag_cluster(value: &str, allowed: &str) -> bool {
-    value.len() > 2
-        && value.starts_with('-')
-        && !value.starts_with("--")
-        && value.chars().skip(1).all(|flag| allowed.contains(flag))
-}
-
 fn parse_capabilities_format(arguments: &[OsString]) -> Result<CapabilitiesFormat, ExitFailure> {
     let mut format = None;
     for argument in arguments {
@@ -94,7 +55,9 @@ fn parse_capabilities_format(arguments: &[OsString]) -> Result<CapabilitiesForma
             Some("--help") => {
                 return Err(ExitFailure::new_stdout(
                     0,
-                    "usage: rmux capabilities [--human|--json]",
+                    "usage: rmux capabilities [--human|--json]\n\n\
+                     --json: Emit JSON results on stdout; command errors use text on stderr \
+                     with a nonzero exit and empty stdout. Supported unsuccessful results remain JSON",
                 ));
             }
             Some(other) => {
@@ -147,23 +110,29 @@ fn render_human() -> String {
 }
 
 fn write_json() -> Result<i32, ExitFailure> {
+    let report = capabilities_report();
+
+    write_json_value(&report)
+}
+
+fn capabilities_report() -> serde_json::Value {
     let capabilities = compiled_protocol_capabilities()
         .into_iter()
         .chain(["scripting.binary_contract.v1", "scripting.json.v1"])
         .collect::<Vec<_>>();
-    let report = json!({
+    json!({
         "version": env!("CARGO_PKG_VERSION"),
         "binary_contract_version": BINARY_CONTRACT_VERSION,
         "wire_version": RMUX_WIRE_VERSION,
         "public_contract": ["cli", "json-output", "format-tokens", "control-mode"],
         "capabilities": capabilities,
         "json_commands": JSON_COMMANDS,
-        "format_tokens": &TMUX_FORMAT_TABLE_NAMES[..],
+        "format_tokens": tmux_format_variable_descriptors()
+            .map(|descriptor| descriptor.name())
+            .collect::<Vec<_>>(),
         "control_notifications": CONTROL_NOTIFICATIONS,
         "control_mode": control_mode_contract(),
-    });
-
-    write_json_value(&report)
+    })
 }
 
 fn compiled_protocol_capabilities() -> Vec<&'static str> {
@@ -232,7 +201,10 @@ fn write_stdout(output: &str) -> Result<i32, ExitFailure> {
 
 #[cfg(test)]
 mod tests {
-    use super::{compiled_protocol_capabilities, parse_invocation, CapabilitiesFormat};
+    use super::{
+        capabilities_report, compiled_protocol_capabilities, parse_invocation, CapabilitiesFormat,
+    };
+    use rmux_core::formats::TMUX_FORMAT_TABLE_NAMES;
     use rmux_proto::CAPABILITY_WEB_SHARE;
     use std::ffi::OsString;
 
@@ -262,5 +234,21 @@ mod tests {
             compiled_protocol_capabilities().contains(&CAPABILITY_WEB_SHARE),
             cfg!(all(any(unix, windows), feature = "web"))
         );
+    }
+
+    #[test]
+    fn json_format_tokens_are_registered_tmux_inventory_only() {
+        let report = capabilities_report();
+        let tokens = report["format_tokens"]
+            .as_array()
+            .expect("format_tokens array")
+            .iter()
+            .map(|value| value.as_str().expect("string token"))
+            .collect::<Vec<_>>();
+
+        assert_eq!(tokens, TMUX_FORMAT_TABLE_NAMES);
+        assert!(!tokens.contains(&"command"));
+        assert!(!tokens.contains(&"pane_created"));
+        assert!(!tokens.contains(&"session_width"));
     }
 }

@@ -1,10 +1,12 @@
 #![cfg(unix)]
 
+#[path = "../../../tests/support/executable_fixture.rs"]
+mod executable_fixture;
+
 mod common;
 
 use std::error::Error;
 use std::fs;
-use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
 use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
@@ -378,13 +380,11 @@ fn assert_absent_server_does_not_spawn_daemon(label: &str) -> Result<(), Box<dyn
 }
 
 fn write_fake_launcher(launcher_path: &Path, marker_path: &Path) -> Result<(), Box<dyn Error>> {
-    fs::write(
+    executable_fixture::write_executable(
         launcher_path,
         format!("#!/bin/sh\ntouch '{}'\n", marker_path.display()),
+        0o755,
     )?;
-    let mut permissions = fs::metadata(launcher_path)?.permissions();
-    permissions.set_mode(0o755);
-    fs::set_permissions(launcher_path, permissions)?;
     Ok(())
 }
 

@@ -11,20 +11,24 @@ mod automatic_rename;
 mod buffer_file_io;
 #[cfg(any(unix, windows))]
 #[cfg_attr(windows, allow(dead_code))]
+mod client_activity;
 mod client_flags;
 #[cfg(any(unix, windows))]
 mod client_format;
 #[cfg(any(unix, windows))]
 #[cfg_attr(windows, allow(dead_code))]
 mod client_names;
+mod client_viewport;
 #[cfg(any(unix, windows))]
 mod clipboard_protocol;
 #[cfg(any(unix, windows))]
 #[cfg_attr(windows, allow(dead_code))]
 mod clock_mode;
+pub mod config_paths;
 #[cfg(any(unix, windows))]
 #[cfg_attr(windows, allow(dead_code))]
 mod control;
+mod control_colours;
 #[cfg(any(unix, windows))]
 #[cfg_attr(windows, allow(dead_code))]
 mod control_mode;
@@ -42,6 +46,8 @@ mod foreground_probe;
 #[cfg(any(unix, windows))]
 #[cfg_attr(windows, allow(dead_code))]
 mod format_runtime;
+#[cfg(any(unix, windows))]
+mod future;
 #[cfg(any(unix, windows))]
 #[cfg_attr(windows, allow(dead_code))]
 mod handler;
@@ -93,8 +99,9 @@ mod pane_indices;
 mod pane_io;
 #[cfg(unix)]
 mod pane_reader_runtime;
-#[cfg(any(unix, windows))]
 mod pane_recovery;
+#[cfg(any(unix, windows))]
+mod pane_rename_queue;
 #[cfg(any(unix, windows))]
 #[cfg_attr(windows, allow(dead_code))]
 mod pane_screen_state;
@@ -119,7 +126,6 @@ mod pane_transcript;
 #[cfg_attr(windows, allow(dead_code))]
 mod pane_visible_geometry;
 #[cfg(any(unix, windows))]
-mod perf_instrument;
 #[cfg(any(unix, windows))]
 #[cfg_attr(windows, allow(dead_code))]
 mod renderer;
@@ -144,6 +150,7 @@ mod terminal;
 mod test_env;
 #[cfg(test)]
 mod test_shell;
+mod theme;
 #[cfg(any(unix, windows))]
 mod tmux_shim;
 #[cfg(unix)]
@@ -190,3 +197,6 @@ where
 {
     buffer_file_io::run_internal_fifo_reader_helper(arguments)
 }
+
+#[cfg(test)]
+mod session_fixture;

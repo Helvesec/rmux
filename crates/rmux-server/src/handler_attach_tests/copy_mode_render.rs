@@ -307,6 +307,7 @@ async fn attached_mouse_drag_copy_mode_refresh_keeps_prompt_visible() {
         .get_mut(&requester_pid)
         .expect("attached client exists");
     active.mouse.current_event = Some(AttachedMouseEvent {
+        coordinates: None,
         raw: MouseForwardEvent {
             b: 32,
             lb: 0,

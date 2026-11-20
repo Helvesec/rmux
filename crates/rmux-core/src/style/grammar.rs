@@ -122,7 +122,30 @@ pub(super) fn attributes_to_string(attr: u16) -> String {
 
 /// Strips a case-insensitive prefix, returning the remainder with its
 /// original casing intact (important for colour values like `#FF0000`).
+///
+/// User input may place a multi-byte UTF-8 character across the prefix
+/// length; such a value cannot match an ASCII prefix and yields `None`
+/// instead of slicing inside the character.
 pub(super) fn strip_prefix_ci<'a>(value: &'a str, prefix: &str) -> Option<&'a str> {
-    (value.len() >= prefix.len() && value[..prefix.len()].eq_ignore_ascii_case(prefix))
-        .then(|| &value[prefix.len()..])
+    let (head, rest) = value.split_at_checked(prefix.len())?;
+    head.eq_ignore_ascii_case(prefix).then_some(rest)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::strip_prefix_ci;
+
+    #[test]
+    fn strip_prefix_ci_rejects_multibyte_character_across_prefix_length() {
+        assert_eq!(strip_prefix_ci("ab\u{e9}", "fg="), None);
+        assert_eq!(strip_prefix_ci("abcde\u{e9}", "colour"), None);
+        assert_eq!(strip_prefix_ci("\u{e9}", "fg="), None);
+    }
+
+    #[test]
+    fn strip_prefix_ci_keeps_ascii_prefix_and_non_ascii_remainder() {
+        assert_eq!(strip_prefix_ci("FG=\u{e9}", "fg="), Some("\u{e9}"));
+        assert_eq!(strip_prefix_ci("Colour12", "colour"), Some("12"));
+        assert_eq!(strip_prefix_ci("fg", "fg="), None);
+    }
 }

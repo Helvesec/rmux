@@ -7,106 +7,58 @@ use std::thread;
 use rmux_ipc::BlockingLocalStream;
 #[cfg(any(test, windows))]
 use rmux_proto::CONTROL_STDIN_EOF_MARKER;
-use rmux_proto::{
-    ClientTerminalContext, ControlMode, ControlModeRequest, Request, Response, CONTROL_CONTROL_END,
-    CONTROL_CONTROL_START, MAX_INITIAL_CONTROL_COMMANDS,
-};
+use rmux_proto::{ControlMode, CONTROL_CONTROL_END, CONTROL_CONTROL_START};
 #[cfg(any(test, windows))]
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 #[cfg(any(test, windows))]
 use tokio::sync::mpsc as tokio_mpsc;
 
-use crate::{
-    connection::{read_response_frame_exact, Connection, ControlModeUpgrade, ControlTransition},
-    ClientError,
-};
+use crate::{connection::ControlModeUpgrade, ClientError};
 
-#[cfg(unix)]
-#[path = "control/output.rs"]
+mod handshake;
 mod output;
 
-impl Connection {
-    /// Requests a control-mode upgrade and, on success, yields the raw local
-    /// stream for tmux-compatible text control traffic.
-    pub fn begin_control_mode(
-        self,
-        mode: ControlMode,
-        client_terminal: ClientTerminalContext,
-    ) -> Result<ControlTransition, ClientError> {
-        self.begin_control_mode_with_initial_commands(mode, client_terminal, &[])
-    }
+use output::ControlOutputEnd;
+#[cfg(any(test, windows))]
+use output::ControlOutputProgress;
 
-    /// Requests a control-mode upgrade and writes command-line commands across
-    /// the upgrade boundary so the server can frame them as tmux argv commands.
-    pub fn begin_control_mode_with_initial_commands(
-        mut self,
-        mode: ControlMode,
-        client_terminal: ClientTerminalContext,
-        initial_commands: &[String],
-    ) -> Result<ControlTransition, ClientError> {
-        if initial_commands.len() > MAX_INITIAL_CONTROL_COMMANDS {
-            return Err(ClientError::Protocol(rmux_proto::RmuxError::Server(
-                format!(
-                    "too many initial control-mode commands: {} (maximum {MAX_INITIAL_CONTROL_COMMANDS})",
-                    initial_commands.len()
-                ),
-            )));
-        }
-        let initial_command_count = u32::try_from(initial_commands.len()).map_err(|_| {
-            ClientError::Protocol(rmux_proto::RmuxError::Server(
-                "too many initial control-mode commands".to_owned(),
-            ))
-        })?;
-        self.write_request(&Request::ControlMode(ControlModeRequest {
-            mode,
-            client_terminal,
-            initial_command_count,
-        }))?;
-        write_initial_control_commands(self.stream_mut(), initial_commands)?;
-        let response = read_response_frame_exact(self.stream_mut())?;
-
-        match response {
-            Response::ControlMode(response) => Ok(ControlTransition::Upgraded(
-                self.into_control_upgrade(response)?,
-            )),
-            other => Ok(ControlTransition::Rejected(other)),
-        }
-    }
-}
-
-fn write_initial_control_commands<W>(
-    stream: &mut W,
-    initial_commands: &[String],
-) -> Result<(), ClientError>
-where
-    W: Write,
-{
-    for command in initial_commands {
-        stream
-            .write_all(command.as_bytes())
-            .map_err(ClientError::Io)?;
-        stream.write_all(b"\n").map_err(ClientError::Io)?;
-    }
-    Ok(())
+/// Exit status of a control-mode session that ended with its `%exit` record.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ControlModeStatus {
+    /// tmux exits with status 0.
+    Success,
+    /// A command failed in a client that never joined a session, so the
+    /// server ended it once its command-line commands had run; tmux 3.7b
+    /// exits with status 1 (as for `-C attach -t missing`).
+    CommandFailed,
 }
 
 /// Drives a control-mode session using the process stdio streams.
+///
+/// Returns the session's [`ControlModeStatus`] once the server has written
+/// its terminal `%exit` record. Returns [`ClientError::UnexpectedEof`] when the
+/// server closed the control stream without one, as when the server process
+/// dies. Like tmux, the client has then already ended its output with
+/// `%exit server exited unexpectedly` (and the `-CC` terminator), so callers
+/// should exit with status 1 without printing a second diagnostic.
 pub fn drive_control_mode(
     upgrade: ControlModeUpgrade,
     initial_commands: &[String],
-) -> Result<(), ClientError> {
+) -> Result<ControlModeStatus, ClientError> {
     let stdin = io::stdin();
     let stdout = io::stdout();
     drive_control_mode_with_stdio(upgrade, initial_commands, stdin, stdout)
 }
 
 /// Drives a control-mode session using explicit input and output streams.
+///
+/// See [`drive_control_mode`] for the lost-server contract.
 pub fn drive_control_mode_with_stdio<R, W>(
     upgrade: ControlModeUpgrade,
     initial_commands: &[String],
     input: R,
     mut output: W,
-) -> Result<(), ClientError>
+) -> Result<ControlModeStatus, ClientError>
 where
     R: Read + Send + 'static,
     W: Write + Send,
@@ -120,15 +72,18 @@ where
     }
 
     let stream = upgrade.into_stream();
-    let copy_result = drive_control_stream(stream, initial_commands, input, &mut output);
-    if copy_result.is_ok() && output_needs_suffix(mode) {
+    let end = drive_control_stream(stream, initial_commands, input, &mut output)?;
+    if output_needs_suffix(mode) {
         output
             .write_all(CONTROL_CONTROL_END.as_bytes())
             .map_err(ClientError::Io)?;
         output.flush().map_err(ClientError::Io)?;
     }
 
-    copy_result
+    match end {
+        ControlOutputEnd::ExitDelivered(status) => Ok(status),
+        ControlOutputEnd::ServerLost => Err(ClientError::UnexpectedEof),
+    }
 }
 
 #[cfg(unix)]
@@ -137,7 +92,7 @@ fn drive_control_stream<R, W>(
     initial_commands: &[String],
     mut input: R,
     output: &mut W,
-) -> Result<(), ClientError>
+) -> Result<ControlOutputEnd, ClientError>
 where
     R: Read + Send + 'static,
     W: Write + Send,
@@ -160,11 +115,11 @@ where
             .map_err(|_| ClientError::Io(io::Error::other("control input thread panicked")))?;
     }
 
-    copy_result?;
+    let end = copy_result?;
     if let Some(stdin_result) = stdin_result {
         finish_control_input_after_output_closed(stdin_result).map_err(ClientError::Io)?;
     }
-    Ok(())
+    Ok(end)
 }
 
 #[cfg(windows)]
@@ -178,7 +133,7 @@ fn drive_control_stream<R, W>(
     initial_commands: &[String],
     input: R,
     output: &mut W,
-) -> Result<(), ClientError>
+) -> Result<ControlOutputEnd, ClientError>
 where
     R: Read + Send + 'static,
     W: Write + Send,
@@ -192,7 +147,7 @@ where
     });
 
     let (pipe, runtime) = stream.into_async_parts();
-    let copy_result = thread::scope(|scope| {
+    let copy_result: Result<ControlOutputEnd, ClientError> = thread::scope(|scope| {
         let output_thread = scope.spawn(move || write_queued_control_output(output, output_rx));
         let copy_result = runtime
             .block_on(drive_async_control(
@@ -206,8 +161,9 @@ where
             .join()
             .map_err(|_| ClientError::Io(io::Error::other("control output thread panicked")))?;
 
-        copy_result?;
-        output_result.map_err(ClientError::Io)
+        let end = copy_result?;
+        output_result.map_err(ClientError::Io)?;
+        Ok(end)
     });
     let stdin_result = poll_input_thread(&stdin_done_rx)?;
 
@@ -217,11 +173,11 @@ where
             .map_err(|_| ClientError::Io(io::Error::other("control input thread panicked")))?;
     }
 
-    copy_result?;
+    let end = copy_result?;
     if let Some(stdin_result) = stdin_result {
         finish_control_input_after_output_closed(stdin_result).map_err(ClientError::Io)?;
     }
-    Ok(())
+    Ok(end)
 }
 
 fn output_needs_suffix(mode: ControlMode) -> bool {
@@ -314,11 +270,12 @@ async fn drive_async_control<Stream>(
     initial_commands: &[String],
     mut input_rx: tokio_mpsc::Receiver<Vec<u8>>,
     output_tx: tokio_mpsc::Sender<Vec<u8>>,
-) -> io::Result<()>
+) -> io::Result<ControlOutputEnd>
 where
     Stream: AsyncRead + AsyncWrite + Unpin,
 {
     let mut input_closed = false;
+    let mut progress = ControlOutputProgress::default();
     let (mut reader, mut writer) = tokio::io::split(stream);
     write_async_initial_commands(&mut writer, initial_commands).await?;
     let mut buffer = [0_u8; 8192];
@@ -342,16 +299,28 @@ where
             bytes_read = reader.read(&mut buffer) => {
                 let bytes_read = match bytes_read {
                     Ok(bytes_read) => bytes_read,
-                    Err(error) if error.kind() == io::ErrorKind::BrokenPipe => return Ok(()),
+                    Err(error) if error.kind() == io::ErrorKind::BrokenPipe => 0,
                     Err(error) => return Err(error),
                 };
                 if bytes_read == 0 {
-                    return Ok(());
+                    return finish_closed_async_control(&progress, &output_tx).await;
                 }
                 send_control_output(&output_tx, &buffer[..bytes_read]).await?;
+                progress.observe(&buffer[..bytes_read]);
             }
         }
     }
+}
+
+#[cfg(any(test, windows))]
+async fn finish_closed_async_control(
+    progress: &ControlOutputProgress,
+    output_tx: &tokio_mpsc::Sender<Vec<u8>>,
+) -> io::Result<ControlOutputEnd> {
+    if let Some(suffix) = progress.lost_server_suffix() {
+        send_control_output(output_tx, &suffix).await?;
+    }
+    Ok(progress.closed_end())
 }
 
 #[cfg(windows)]
@@ -482,6 +451,71 @@ mod tests {
         assert!(rendered.starts_with(rmux_proto::CONTROL_CONTROL_START));
         assert!(rendered.contains("%exit\n"));
         assert!(rendered.ends_with(rmux_proto::CONTROL_CONTROL_END));
+    }
+
+    fn drive_until_transport_closes(
+        mode: ControlMode,
+        transcript: &'static [u8],
+    ) -> (Result<super::ControlModeStatus, crate::ClientError>, String) {
+        let (left, right) = std::os::unix::net::UnixStream::pair().expect("socket pair");
+        let (input_reader, input_writer) =
+            std::os::unix::net::UnixStream::pair().expect("input socket pair");
+        let server = std::thread::spawn(move || {
+            let mut right = right;
+            right.write_all(transcript).expect("write transcript");
+        });
+        let mut output = Vec::new();
+        let result = drive_control_mode_with_stdio(
+            ControlModeUpgrade {
+                response: ControlModeResponse { mode },
+                stream: left,
+            },
+            &[],
+            input_reader,
+            &mut output,
+        );
+        drop(input_writer);
+        server.join().expect("server thread");
+        (result, String::from_utf8(output).expect("utf8"))
+    }
+
+    #[test]
+    fn plain_control_mode_reports_a_lost_server_like_tmux() {
+        let (result, output) = drive_until_transport_closes(ControlMode::Plain, b"%output %0 $ \n");
+
+        assert!(
+            matches!(result, Err(crate::ClientError::UnexpectedEof)),
+            "a server that vanished without %exit is a failure: {result:?}"
+        );
+        assert_eq!(output, "%output %0 $ \n%exit server exited unexpectedly\n");
+    }
+
+    #[test]
+    fn control_control_mode_reports_a_lost_server_inside_the_dcs_frame() {
+        let (result, output) =
+            drive_until_transport_closes(ControlMode::ControlControl, b"%output %0 $ \n");
+
+        assert!(
+            matches!(result, Err(crate::ClientError::UnexpectedEof)),
+            "a server that vanished without %exit is a failure: {result:?}"
+        );
+        assert_eq!(
+            output,
+            format!(
+                "{}%output %0 $ \n%exit server exited unexpectedly\n{}",
+                rmux_proto::CONTROL_CONTROL_START,
+                rmux_proto::CONTROL_CONTROL_END
+            )
+        );
+    }
+
+    #[test]
+    fn control_mode_with_a_server_exit_record_still_succeeds() {
+        let (result, output) =
+            drive_until_transport_closes(ControlMode::Plain, b"%output %0 $ \n%exit\n");
+
+        result.expect("server-delivered %exit is a clean end");
+        assert_eq!(output, "%output %0 $ \n%exit\n");
     }
 
     #[test]

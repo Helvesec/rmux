@@ -4,11 +4,18 @@ on:
   push:
     branches:
       - main
+      - release/0.11.0
   pull_request:
     branches:
       - main
   workflow_dispatch:
     inputs:
+      candidate_profile:
+        description: Canonical main or explicitly permitted nonpublishing premerge rehearsal
+        required: false
+        default: canonical
+        type: choice
+        options: [canonical, premerge-rehearsal-v1]
       windows_runtime_smoke:
         description: Run native Windows runtime smoke checks
         required: false
@@ -22,17 +29,17 @@ on:
         default: false
         type: boolean
       release_qualification:
-        description: Run the release-only delta after proving an exact fast main run
+        description: Run the release-only delta after proving an exact fast main run (canonical), or an exact permitted premerge fast run
         required: false
         default: false
         type: boolean
       fast_run_id:
-        description: Exact successful main push CI run consumed by release qualification
+        description: Exact successful push CI run on the admitted route
         required: false
         default: ""
         type: string
       expected_source_sha:
-        description: Exact lowercase main SHA shared by the fast run and candidate
+        description: Exact lowercase source SHA shared by the fast run and candidate
         required: false
         default: ""
         type: string
@@ -79,6 +86,8 @@ jobs:
       actions: read
       contents: read
     env:
+      RMUX_CANDIDATE_PROFILE: ${{ inputs.candidate_profile }}
+      RMUX_REHEARSAL_PERMIT: ${{ vars.RMUX_PREMERGE_REHEARSAL_PERMIT }}
       CANDIDATE_EXPECTED_SOURCE_SHA: ${{ inputs.expected_source_sha }}
       CANDIDATE_FAST_RUN_ID: ${{ inputs.fast_run_id }}
       CANDIDATE_RELEASE_INTENT_ID: ${{ inputs.release_intent_id }}
@@ -97,18 +106,39 @@ jobs:
           [[ "$CANDIDATE_RELEASE_INTENT_ID" =~ ^[A-Za-z0-9._:-]{8,128}$ ]]
           [[ "$CANDIDATE_PLANNED_RELEASE_REF" =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-rc\.[0-9]+)?$ ]]
           [[ "$CANDIDATE_RELEASE_KIND" =~ ^(shadow|rc|stable)$ ]]
-          test "$GITHUB_REF" = refs/heads/main
+          case "$RMUX_CANDIDATE_PROFILE" in
+            canonical) test "$GITHUB_REF" = refs/heads/main ;;
+            premerge-rehearsal-v1) test "$GITHUB_REF" = refs/heads/release/0.11.0 ;;
+            *) exit 1 ;;
+          esac
           test "$GITHUB_RUN_ATTEMPT" = 1
           test "$GITHUB_SHA" = "$CANDIDATE_EXPECTED_SOURCE_SHA"
 
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
         with:
           ref: ${{ github.sha }}
+          fetch-depth: 2
           persist-credentials: false
 
+      - id: route
+        name: Bind the reviewed route before API access
+        run: >-
+          python3 scripts/release/prepare-candidate-route.py
+          --candidate-profile "$RMUX_CANDIDATE_PROFILE"
+          --expected-source-sha "$CANDIDATE_EXPECTED_SOURCE_SHA"
+          --release-intent-id "$CANDIDATE_RELEASE_INTENT_ID"
+          --planned-release-ref "$CANDIDATE_PLANNED_RELEASE_REF"
+          --release-kind "$CANDIDATE_RELEASE_KIND"
+          --permit-output "$RUNNER_TEMP/rehearsal-permit.json"
+          --github-output "$GITHUB_OUTPUT"
+
       - name: Validate immutable candidate intent
+        env:
+          RMUX_REHEARSAL_PERMIT_FILE: ${{ steps.route.outputs.rehearsal_permit_file }}
         run: >-
           scripts/release/validate-candidate-intent.py
+          --candidate-profile "$RMUX_CANDIDATE_PROFILE"
+          --rehearsal-permit "$RMUX_REHEARSAL_PERMIT_FILE"
           --expected-source-sha "$CANDIDATE_EXPECTED_SOURCE_SHA"
           --actual-source-sha "$(git rev-parse HEAD)"
           --fast-run-id "$CANDIDATE_FAST_RUN_ID"
@@ -121,9 +151,12 @@ jobs:
 
       - name: Verify the selected fast run and all of its jobs
         env:
+          RMUX_REHEARSAL_PERMIT_FILE: ${{ steps.route.outputs.rehearsal_permit_file }}
           GH_TOKEN: ${{ github.token }}
         run: >-
           scripts/release/verify-fast-run.py
+          --candidate-profile "$RMUX_CANDIDATE_PROFILE"
+          --rehearsal-permit "$RMUX_REHEARSAL_PERMIT_FILE"
           --repository "${{ github.repository }}"
           --run-id "$CANDIDATE_FAST_RUN_ID"
           --expected-source-sha "$CANDIDATE_EXPECTED_SOURCE_SHA"
@@ -189,6 +222,7 @@ jobs:
     needs: verify-fast-evidence
     uses: ./.github/workflows/canonical-native-build.yml
     with:
+      candidate_profile: ${{ inputs.candidate_profile }}
       expected_source_sha: ${{ inputs.expected_source_sha }}
       fast_run_id: ${{ inputs.fast_run_id }}
       fast_nextest_artifact_id: ${{ needs.verify-fast-evidence.outputs.fast_nextest_artifact_id }}
@@ -241,7 +275,8 @@ jobs:
           path: |
             ~/.cargo/git
             ~/.cargo/registry
-            target
+            target/*
+            !target/tmp
           key: cargo-${{ runner.os }}-${{ runner.arch }}-${{ github.job }}-${{ hashFiles('Cargo.lock') }}
           restore-keys: |
             cargo-${{ runner.os }}-${{ runner.arch }}-${{ github.job }}-
@@ -255,6 +290,9 @@ jobs:
 
       - name: cargo clippy
         run: cargo clippy --workspace --all-targets --locked -- -D warnings
+
+      - name: rmux-server no-web test targets
+        run: cargo check -p rmux-server --all-targets --no-default-features --locked
 
       - name: Await-under-lock audit
         run: scripts/audit-await-holding-lock.sh
@@ -282,7 +320,8 @@ jobs:
           path: |
             ~/.cargo/git
             ~/.cargo/registry
-            target
+            target/*
+            !target/tmp
           key: cargo-${{ runner.os }}-${{ runner.arch }}-${{ github.job }}-${{ hashFiles('Cargo.lock') }}
           restore-keys: |
             cargo-${{ runner.os }}-${{ runner.arch }}-${{ github.job }}-
@@ -317,7 +356,8 @@ jobs:
           path: |
             ~/.cargo/git
             ~/.cargo/registry
-            target
+            target/*
+            !target/tmp
           key: cargo-${{ runner.os }}-${{ runner.arch }}-${{ github.job }}-${{ hashFiles('Cargo.lock') }}
           restore-keys: |
             cargo-${{ runner.os }}-${{ runner.arch }}-${{ github.job }}-
@@ -391,7 +431,7 @@ jobs:
       matrix:
         include:
           - group: core
-            packages: -p rmux-types -p rmux-os -p rmux-proto -p rmux-ipc -p rmux-core -p rmux-client -p rmux-render-core -p rmux-web-crypto
+            packages: -p rmux-types -p rmux-os -p rmux-proto -p rmux-ipc -p rmux-core -p rmux-client -p rmux-web-crypto
           - group: pty-sdk
             packages: -p rmux-pty -p rmux-sdk
           - group: server
@@ -414,7 +454,8 @@ jobs:
           path: |
             ~/.cargo/git
             ~/.cargo/registry
-            target
+            target/*
+            !target/tmp
           key: cargo-${{ runner.os }}-${{ runner.arch }}-${{ github.job }}-${{ matrix.group }}-${{ hashFiles('Cargo.lock') }}
           restore-keys: |
             cargo-${{ runner.os }}-${{ runner.arch }}-${{ github.job }}-${{ matrix.group }}-
@@ -424,16 +465,42 @@ jobs:
       - name: Fetch locked dependencies
         run: cargo fetch --locked
 
+      - name: Pinned viewport oracle dependencies
+        if: matrix.group == 'app-ui'
+        run: npm --prefix tests/xterm-oracle ci --ignore-scripts --no-audit --no-fund
+
       - name: cargo test
         run: cargo test --locked --no-fail-fast ${{ matrix.packages }}
 
   linux-source-gates:
     name: Linux source boundary gates
     if: ${{ !(github.event_name == 'workflow_dispatch' && inputs.release_qualification) }}
-    runs-on: ubuntu-latest
+    # Pinned, not ubuntu-latest: actions/setup-python publishes CPython 3.9
+    # for ubuntu-22.04 and ubuntu-24.04 only. 3.9 is end-of-life and has no
+    # ubuntu-26.04 build, so the moving label lost the release-review floor.
+    runs-on: ubuntu-24.04
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
+        with:
+          fetch-depth: 0
+
+      # The policy discovers of scripts/gate-unix-fast.sh, held in step with the
+      # gates by scripts/test_candidate_gate_policy_parity.py.
+      - uses: dtolnay/rust-toolchain@3c5f7ea28cd621ae0bf5283f0e981fb97b8a7af9
+        with:
+          toolchain: "1.96.1"
+
+      - name: Install the candidate gate Python
+        uses: actions/setup-python@e797f83bcb11b83ae66e0230d6156d7c80228e7c # v6.0.0
+        with:
+          python-version: "3.12"
+
+      - name: Candidate identity regression
+        run: python -m unittest discover -s scripts -p 'test_candidate*.py'
+
+      - name: Release policy coverage
+        run: python -B -m unittest discover -s scripts -p test_release_policy_coverage.py
 
       - name: Install the release writer Python baseline
         uses: actions/setup-python@e797f83bcb11b83ae66e0230d6156d7c80228e7c # v6.0.0
@@ -498,6 +565,11 @@ jobs:
       - name: Unsafe policy gate
         run: scripts/unsafe-check.sh
 
+      - name: Release documentation and issue form allowlist
+        run: |
+          python scripts/release_docs_allowlist.py
+          python -m unittest discover -s scripts -p 'test_release_docs*.py'
+
       - name: No network scoped runtime source scan
         run: scripts/no-network-in-runtime.sh
 
@@ -541,7 +613,8 @@ jobs:
           path: |
             ~/.cargo/git
             ~/.cargo/registry
-            target
+            target/*
+            !target/tmp
           key: cargo-${{ runner.os }}-${{ runner.arch }}-${{ github.job }}-${{ hashFiles('Cargo.lock') }}
           restore-keys: |
             cargo-${{ runner.os }}-${{ runner.arch }}-${{ github.job }}-
@@ -602,7 +675,8 @@ jobs:
           path: |
             ~/.cargo/git
             ~/.cargo/registry
-            target
+            target/*
+            !target/tmp
           key: cargo-${{ runner.os }}-${{ runner.arch }}-${{ github.job }}-${{ hashFiles('Cargo.lock') }}
           restore-keys: |
             cargo-${{ runner.os }}-${{ runner.arch }}-${{ github.job }}-
@@ -641,6 +715,8 @@ jobs:
       CARGO_BUILD_JOBS: "4"
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
+        with:
+          fetch-depth: 0
 
       - uses: dtolnay/rust-toolchain@3c5f7ea28cd621ae0bf5283f0e981fb97b8a7af9
         with:
@@ -653,7 +729,8 @@ jobs:
           path: |
             ~/.cargo/git
             ~/.cargo/registry
-            target
+            target/*
+            !target/tmp
           key: cargo-${{ runner.os }}-${{ runner.arch }}-${{ github.job }}-${{ matrix.section }}-${{ hashFiles('Cargo.lock') }}
           restore-keys: |
             cargo-${{ runner.os }}-${{ runner.arch }}-${{ github.job }}-${{ matrix.section }}-
@@ -800,7 +877,8 @@ jobs:
           path: |
             ~/.cargo/git
             ~/.cargo/registry
-            target
+            target/*
+            !target/tmp
           key: cargo-${{ runner.os }}-${{ runner.arch }}-${{ github.job }}-${{ hashFiles('Cargo.lock') }}
           restore-keys: |
             cargo-${{ runner.os }}-${{ runner.arch }}-${{ github.job }}-
@@ -901,7 +979,8 @@ jobs:
           path: |
             ~/.cargo/git
             ~/.cargo/registry
-            target
+            target/*
+            !target/tmp
           key: cargo-${{ matrix.os }}-platform-runtime-${{ hashFiles('Cargo.lock') }}
           restore-keys: |
             cargo-${{ matrix.os }}-platform-runtime-
@@ -987,7 +1066,8 @@ jobs:
           path: |
             ~/.cargo/git
             ~/.cargo/registry
-            target
+            target/*
+            !target/tmp
           key: cargo-windows-latest-nextest-archive-${{ hashFiles('Cargo.lock') }}
           restore-keys: |
             cargo-windows-latest-nextest-archive-
@@ -1042,7 +1122,10 @@ jobs:
       RUST_MIN_STACK: "8388608"
       RUST_TEST_THREADS: "1"
     steps:
+      # Full history: HARNESS043.bundle needs trunk commit b4fe38d082af.
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
+        with:
+          fetch-depth: 0
 
       - uses: dtolnay/rust-toolchain@3c5f7ea28cd621ae0bf5283f0e981fb97b8a7af9
         with:
@@ -1055,7 +1138,8 @@ jobs:
           path: |
             ~/.cargo/git
             ~/.cargo/registry
-            target
+            target/*
+            !target/tmp
           key: cargo-windows-latest-platform-runtime-${{ hashFiles('Cargo.lock') }}-${{ github.sha }}
           restore-keys: |
             cargo-windows-latest-platform-runtime-${{ hashFiles('Cargo.lock') }}-
@@ -1069,6 +1153,19 @@ jobs:
 
       - name: Fetch locked dependencies
         run: cargo fetch --locked
+
+      # The policy discovers of scripts/gate-windows-fast.ps1 on a native
+      # autocrlf checkout: the 043 CR defect was visible only here.
+      - name: Install the candidate gate Python
+        uses: actions/setup-python@e797f83bcb11b83ae66e0230d6156d7c80228e7c # v6.0.0
+        with:
+          python-version: "3.13"
+
+      - name: Candidate identity regression
+        run: python -m unittest discover -s scripts -p 'test_candidate*.py'
+
+      - name: Release policy coverage
+        run: python -B -m unittest discover -s scripts -p test_release_policy_coverage.py
 
       - name: cargo build
         run: cargo build --workspace --locked
@@ -1142,15 +1239,46 @@ jobs:
           name: rmux-windows-nextest-${{ github.sha }}
           path: target
 
+      # Some tests launch nested offline Cargo builds; the archive carries test
+      # binaries, not Cargo's registry.
+      - name: Fetch locked dependencies
+        run: cargo fetch --locked
+
+      # The native candidate gate runs every test image beside the digest-pinned
+      # ConPTY pair. Extracted archives run outside that gate, so stage the same
+      # verified pair beside the test binaries and the rmux daemon they launch.
+      - name: Stage the pinned ConPTY runtime
+        shell: pwsh
+        run: |
+          $stage = Join-Path $env:RUNNER_TEMP "conpty-runtime"
+          ./scripts/conpty/candidate-runtime.ps1 -Stage $stage -Target x86_64-pc-windows-msvc
+          foreach ($directory in @("target/debug", "target/debug/deps")) {
+            New-Item -ItemType Directory -Force -Path $directory | Out-Null
+            foreach ($name in @("conpty.dll", "OpenConsole.exe")) {
+              Copy-Item -LiteralPath (Join-Path $stage $name) -Destination $directory
+            }
+          }
+
+      # Tests below need the candidate identity build and run context, which an
+      # extracted archive cannot provide; the release gate runs the rmux-server
+      # ones under candidate identity and the native gate runs all of them.
       - name: Run Windows test shard
         shell: pwsh
+        env:
+          RMUX_WINDOWS_SHARD_FILTER: >-
+            not binary(public_api_extensibility)
+            and not binary(candidate_identity_children)
+            and not (package(rmux-server) and kind(lib) and (
+            test(/::bracketed_paste_final_sink(_tests)?::/)
+            or test(=handler::pane_command_tests::respawn_pane_rejects_an_interior_nul_and_the_same_child_keeps_reading)
+            or test(/^test_shell::final_sink::windows_byte_child::tests::(the_generated_final_sink_child_has_candidate_identity_before_use|a_fresh_private_build_retains_the_sources_compiler_and_executable_it_used|a_pre_populated_build_target_is_never_selected_as_the_child|a_real_absolute_rustc_override_builds_the_child_with_that_exact_compiler|the_child_reports_a_setup_failure_and_still_acknowledges_teardown)$/)))
         run: |
           cargo nextest run `
             --archive-file target/windows-nextest.tar.zst `
             --extract-to "$env:GITHUB_WORKSPACE" `
             --extract-overwrite `
             --workspace-remap "$env:GITHUB_WORKSPACE" `
-            --filterset "not binary(public_api_extensibility)" `
+            --filterset "$env:RMUX_WINDOWS_SHARD_FILTER" `
             --partition "slice:${{ matrix.shard }}/18" `
             --no-fail-fast `
             --retries 0 `
@@ -1224,7 +1352,8 @@ jobs:
           path: |
             ~/.cargo/git
             ~/.cargo/registry
-            target
+            target/*
+            !target/tmp
           key: windows-package-${{ runner.os }}-${{ runner.arch }}-rust-1.96.1-${{ hashFiles('Cargo.lock', 'scripts/package-windows.ps1', 'scripts/verify-package-windows.ps1') }}
           restore-keys: |
             windows-package-${{ runner.os }}-${{ runner.arch }}-rust-1.96.1-
@@ -1418,7 +1547,8 @@ jobs:
           path: |
             ~/.cargo/git
             ~/.cargo/registry
-            target
+            target/*
+            !target/tmp
           key: cargo-${{ runner.os }}-${{ runner.arch }}-${{ github.job }}-${{ hashFiles('Cargo.lock') }}
           restore-keys: |
             cargo-${{ runner.os }}-${{ runner.arch }}-${{ github.job }}-
@@ -1453,7 +1583,8 @@ jobs:
           path: |
             ~/.cargo/git
             ~/.cargo/registry
-            target
+            target/*
+            !target/tmp
           key: cargo-${{ runner.os }}-${{ runner.arch }}-${{ github.job }}-${{ hashFiles('Cargo.lock') }}
           restore-keys: |
             cargo-${{ runner.os }}-${{ runner.arch }}-${{ github.job }}-

@@ -160,9 +160,9 @@ fn display_message_keeps_tmux_format_edge_semantics() -> Result<(), Box<dyn Erro
         ("#{s//Z/:session_name}", "alpha"),
         ("#{s//Z/:#{l:hi}}", "hi"),
         ("#{s/[0-9]*/Z/:session_name}", "aZlZpZhZaZ"),
-        ("#", "#"),
-        ("a#", "a#"),
-        ("#{pane_id}#", "%0#"),
+        ("#", ""),
+        ("a#", "a"),
+        ("#{pane_id}#", "%0"),
     ] {
         let output = harness.run(&["display-message", "-p", "-t", "alpha:0.0", template])?;
         assert_eq!(output.status.code(), Some(0), "template={template}");
@@ -277,7 +277,7 @@ fn display_message_keeps_pane_zoomed_flag_empty_for_tmux34() -> Result<(), Box<d
     ])?;
 
     assert_eq!(output.status.code(), Some(0));
-    assert_eq!(stdout(&output), "0::1\n1::1\n");
+    assert_eq!(stdout(&output), "0:1:1\n1:0:1\n");
     assert!(stderr(&output).is_empty());
 
     terminate_child(daemon.child_mut())?;

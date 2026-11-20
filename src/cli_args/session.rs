@@ -1,7 +1,8 @@
 use clap::{ArgAction, Args};
 use rmux_proto::SessionName;
 
-use super::{parse_session_name, parse_target_spec, TargetSpec};
+use super::targets::parse_current_session_target_spec;
+use super::{parse_session_name, parse_session_target, parse_target_spec, TargetSpec};
 
 #[derive(Debug, Clone, Args)]
 pub(crate) struct NewSessionArgs {
@@ -27,7 +28,7 @@ pub(crate) struct NewSessionArgs {
     pub(crate) print_session_info: bool,
     #[arg(short = 's', value_parser = parse_session_name)]
     pub(crate) session_name: Option<SessionName>,
-    #[arg(short = 't', value_parser = parse_session_name)]
+    #[arg(short = 't', value_parser = parse_session_target)]
     pub(crate) group_target: Option<SessionName>,
     #[arg(short = 'X', action = ArgAction::SetTrue)]
     pub(crate) kill_other_clients: bool,
@@ -72,7 +73,7 @@ pub(crate) struct AttachSessionArgs {
     pub(crate) flags: Vec<String>,
     #[arg(short = 'r', action = ArgAction::SetTrue)]
     pub(crate) read_only: bool,
-    #[arg(short = 't', value_parser = parse_target_spec, allow_hyphen_values = true)]
+    #[arg(short = 't', value_parser = parse_current_session_target_spec, allow_hyphen_values = true)]
     pub(crate) target: Option<TargetSpec>,
     #[arg(short = 'x', action = ArgAction::SetTrue)]
     pub(crate) kill_other_clients: bool,
@@ -80,6 +81,13 @@ pub(crate) struct AttachSessionArgs {
 
 #[derive(Debug, Clone, Args)]
 pub(crate) struct ClientTargetArgs {
+    #[arg(short = 't', allow_hyphen_values = true)]
+    pub(crate) target: Option<String>,
+}
+
+#[derive(Debug, Clone, Args)]
+pub(crate) struct HasSessionArgs {
+    // Resolve target syntax only after checking the live session inventory.
     #[arg(short = 't', allow_hyphen_values = true)]
     pub(crate) target: Option<String>,
 }

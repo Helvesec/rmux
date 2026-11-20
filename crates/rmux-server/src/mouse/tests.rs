@@ -7,9 +7,11 @@ use super::{
 };
 use crate::copy_mode::CopyModeLineNumberLayout;
 use crate::pane_terminals::HandlerState;
-use rmux_core::{key_string_lookup_string, PaneGeometry, PaneId};
+use crate::status_lines::status_line_count;
+use rmux_core::{key_string_lookup_string, ManagedPaneSplit, PaneGeometry, PaneId};
 use rmux_proto::{
-    OptionName, PaneTarget, ScopeSelector, SessionName, SetOptionMode, TerminalSize, WindowTarget,
+    OptionName, PaneTarget, ScopeSelector, SessionName, SetOptionMode, SplitDirection,
+    TerminalSize, WindowTarget,
 };
 use std::time::Instant;
 
@@ -19,6 +21,7 @@ fn pane_target(index: u32) -> PaneTarget {
 
 fn layout() -> MouseLayout {
     MouseLayout {
+        client_viewport: false,
         session_id: 1,
         status_at: Some(0),
         status_lines: 1,
@@ -61,9 +64,11 @@ fn layout() -> MouseLayout {
         active_pane: Some(PaneId::new(0)),
         panes: vec![
             PaneMouseTarget {
+                projection: None,
                 pane_id: PaneId::new(0),
                 pane_target: Some(pane_target(0)),
                 window_id: 5,
+                layer: 0,
                 geometry: PaneGeometry::new(0, 0, 40, 10),
                 scrollbar: Some(
                     PaneScrollbar::from_view(
@@ -85,9 +90,11 @@ fn layout() -> MouseLayout {
                 }],
             },
             PaneMouseTarget {
+                projection: None,
                 pane_id: PaneId::new(1),
                 pane_target: Some(pane_target(1)),
                 window_id: 5,
+                layer: 0,
                 geometry: PaneGeometry::new(41, 0, 39, 10),
                 scrollbar: None,
                 border_controls: Vec::new(),
@@ -98,9 +105,9 @@ fn layout() -> MouseLayout {
 
 #[test]
 fn status_line_count_accepts_numeric_status_values() {
-    assert_eq!(super::status_line_count(Some("on"), 10), 1);
-    assert_eq!(super::status_line_count(Some("2"), 10), 2);
-    assert_eq!(super::status_line_count(Some("5"), 3), 3);
+    assert_eq!(status_line_count(Some("on"), 10), 1);
+    assert_eq!(status_line_count(Some("2"), 10), 2);
+    assert_eq!(status_line_count(Some("5"), 3), 3);
 }
 
 #[test]
@@ -144,6 +151,118 @@ fn generated_mouse_scrollbar_uses_visible_pane_border_geometry() {
     assert_eq!(scrollbar.slider_h, 7);
 }
 
+#[test]
+fn generated_mouse_layout_uses_scene_visibility_for_zoomed_windows() {
+    let session_name = SessionName::new("mouse-scene-zoom").expect("valid session");
+    let target = WindowTarget::with_window(session_name.clone(), 0);
+    let mut state = HandlerState::default();
+    state
+        .sessions
+        .create_session(session_name.clone(), TerminalSize { cols: 20, rows: 6 })
+        .expect("session created");
+    let created = state
+        .sessions
+        .split_pane(
+            &target,
+            0,
+            ManagedPaneSplit {
+                direction: SplitDirection::Vertical,
+                before: false,
+                detached: false,
+                full_size: false,
+            },
+        )
+        .expect("pane split");
+    state
+        .sessions
+        .window_layout_context_mut(&target)
+        .expect("layout context")
+        .toggle_zoom(created.pane_index)
+        .expect("zoom toggled");
+
+    let layout = layout_for_session(&state, &session_name, 1).expect("mouse layout");
+
+    assert_eq!(layout.panes.len(), 1);
+    assert_eq!(layout.panes[0].pane_id, created.pane_id);
+    assert_eq!(layout.panes[0].geometry, PaneGeometry::new(0, 0, 20, 5));
+    assert!(super::pane_content_geometry_for_target(
+        &state,
+        &PaneTarget::with_window(session_name, 0, 0)
+    )
+    .is_none());
+}
+
+#[test]
+fn generated_mouse_layout_uses_addressed_alias_context() {
+    let owner = SessionName::new("mouse-scene-owner").expect("valid session");
+    let alias = SessionName::new("mouse-scene-alias").expect("valid session");
+    let mut state = HandlerState::default();
+    state
+        .sessions
+        .create_session(owner.clone(), TerminalSize { cols: 80, rows: 24 })
+        .expect("owner session created");
+    state
+        .sessions
+        .create_session(
+            alias.clone(),
+            TerminalSize {
+                cols: 100,
+                rows: 30,
+            },
+        )
+        .expect("alias session created");
+    let owner_id = state.sessions.session(&owner).unwrap().window().id();
+    let alias_target = WindowTarget::with_window(alias.clone(), 7);
+    let _ = state
+        .sessions
+        .insert_alias(&alias_target, owner_id)
+        .expect("alias inserted");
+    state
+        .sessions
+        .select_window(&alias_target)
+        .expect("alias selected");
+    state
+        .options
+        .set(
+            ScopeSelector::Global,
+            OptionName::Status,
+            "off".to_owned(),
+            SetOptionMode::Replace,
+        )
+        .expect("status disabled");
+    for (option, value) in [
+        (OptionName::PaneBorderStatus, "bottom"),
+        (OptionName::PaneScrollbars, "on"),
+        (OptionName::PaneScrollbarsPosition, "left"),
+        (OptionName::PaneScrollbarsStyle, "width=2,pad=1"),
+    ] {
+        state
+            .options
+            .set(
+                ScopeSelector::Window(alias_target.clone()),
+                option,
+                value.to_owned(),
+                SetOptionMode::Replace,
+            )
+            .expect("alias option");
+    }
+
+    let owner_layout = layout_for_session(&state, &owner, 1).expect("owner layout");
+    let alias_layout = layout_for_session(&state, &alias, 1).expect("alias layout");
+    let pane = alias_layout.panes.first().expect("alias pane");
+
+    assert_eq!(
+        owner_layout.panes[0].geometry,
+        PaneGeometry::new(0, 0, 80, 24)
+    );
+    assert_eq!(pane.window_id, owner_id.as_u32());
+    assert_eq!(pane.geometry, PaneGeometry::new(3, 0, 77, 23));
+    assert_eq!(
+        pane.pane_target.as_ref().map(PaneTarget::window_index),
+        Some(7)
+    );
+}
+
 fn raw(b: u16, x: u16, y: u16) -> MouseForwardEvent {
     MouseForwardEvent {
         b,
@@ -181,6 +300,28 @@ fn status_ranges_hit_left_right_window_session_user_and_control() {
 
     let control = classify_mouse_event(&mut state, &layout(), raw(0, 22, 0), now).expect("control");
     assert_eq!(control.event.location, MouseLocation::Control(3));
+}
+
+#[test]
+fn hit_testing_prefers_the_frontmost_scene_layer() {
+    let mut state = super::ClientMouseState::default();
+    let mut layout = layout();
+    layout.panes.push(PaneMouseTarget {
+        projection: None,
+        pane_id: PaneId::new(7),
+        pane_target: Some(pane_target(7)),
+        window_id: 5,
+        layer: 2,
+        geometry: PaneGeometry::new(0, 0, 10, 10),
+        scrollbar: None,
+        border_controls: Vec::new(),
+    });
+
+    let hit = classify_mouse_event(&mut state, &layout, raw(0, 5, 5), Instant::now())
+        .expect("front pane hit");
+
+    assert_eq!(hit.event.location, MouseLocation::Pane);
+    assert_eq!(hit.event.pane_id, Some(PaneId::new(7)));
 }
 
 #[test]
@@ -255,6 +396,26 @@ fn click_sequence_resets_on_button_location_or_pane_change() {
 
     let expired = state.expire_click_timer(base + std::time::Duration::from_millis(700), &layout);
     assert!(expired.is_none(), "first click timeout just resets state");
+}
+
+#[test]
+fn delayed_double_click_preserves_the_client_viewport_coordinates() {
+    let mut state = super::ClientMouseState::default();
+    let base = Instant::now();
+    let mut layout = layout();
+    layout.client_viewport = true;
+    let first = classify_mouse_event(&mut state, &layout, raw(0, 5, 5), base).unwrap();
+    let coordinates = first.event.coordinates.expect("client projection");
+    classify_mouse_event(
+        &mut state,
+        &layout,
+        raw(0, 5, 5),
+        base + std::time::Duration::from_millis(100),
+    );
+    let double = state
+        .expire_click_timer(base + std::time::Duration::from_millis(500), &layout)
+        .expect("double click");
+    assert_eq!(double.event.coordinates, Some(coordinates));
 }
 
 #[test]
@@ -728,6 +889,7 @@ fn adjacent_pane_down_moving_away_from_border_stays_pane_drag() {
 #[test]
 fn copy_mode_mouse_context_converts_to_content_coordinates() {
     let event = super::AttachedMouseEvent {
+        coordinates: None,
         raw: raw(0, 10, 6),
         session_id: 1,
         window_id: Some(5),
@@ -749,6 +911,7 @@ fn copy_mode_mouse_context_converts_to_content_coordinates() {
 #[test]
 fn copy_mode_mouse_context_unoffsets_the_line_number_gutter() {
     let mut event = super::AttachedMouseEvent {
+        coordinates: None,
         raw: raw(0, 2, 1),
         session_id: 1,
         window_id: Some(5),
@@ -1264,6 +1427,7 @@ fn pane_border_status_precedes_scrollbar_and_content_hit_regions() {
 #[test]
 fn copy_mode_mouse_context_returns_none_without_pane_id() {
     let event = super::AttachedMouseEvent {
+        coordinates: None,
         raw: raw(0, 5, 5),
         session_id: 1,
         window_id: Some(5),

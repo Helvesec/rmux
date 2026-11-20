@@ -167,3 +167,13 @@ fn nested_parentheses_in_job_expansion() {
         "xy"
     );
 }
+
+#[test]
+fn colour_modifier_renders_non_ascii_operands_as_empty_like_tmux() {
+    // tmux 3.7b printed "" for each non-ASCII operand and "800000" for red.
+    let context = FormatContext::new();
+    for format in ["#{c:abcde\u{e9}}", "#{c:\u{e9}}", "#{c:colour\u{e9}}"] {
+        assert_eq!(render_template(format, &context), "", "{format:?}");
+    }
+    assert_eq!(render_template("#{c:red}", &context), "800000");
+}

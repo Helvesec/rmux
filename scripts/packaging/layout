@@ -1,0 +1,20 @@
+#!/usr/bin/env sh
+# Runs the package layout projection tool with an interpreter that really
+# answers. RMUX_PYTHON wins; otherwise python3 then python, each accepted only
+# once it has reported a Python 3 version: Windows ships a python3 stub that
+# opens the Store instead of running.
+set -eu
+
+tool_dir="$(cd "$(dirname "$0")" && pwd)"
+
+for candidate in ${RMUX_PYTHON:-} python3 python; do
+  [ -n "$candidate" ] || continue
+  command -v "$candidate" >/dev/null 2>&1 || continue
+  version="$("$candidate" --version 2>&1 || true)"
+  case "$version" in
+    "Python 3"*) exec "$candidate" "$tool_dir/layout_dispatch.py" "$@" ;;
+  esac
+done
+
+printf 'error: package layout: a working python3 is required\n' >&2
+exit 2

@@ -1,6 +1,187 @@
 use super::*;
 
 #[test]
+fn l12_tree_preview_unicode_is_not_always_empty() {
+    use rmux_core::input::GridAttr;
+    use rmux_proto::OptionScopeSelector;
+
+    type PreviewVector<'a> = (&'a str, usize, u16, bool, &'a [&'a str], Option<usize>);
+
+    // Frozen from tmux 3.7b on Linux, with a 20x24 source and a (width+4)x24
+    // chooser, status off and empty preview labels. Each vector was measured
+    // with the session, window and pane selected. Empty strings are wide-cell
+    // continuations; e + combining acute remains one cell (pyte reports NFC).
+    let vectors: &[PreviewVector<'_>] = &[
+        (
+            "界e\u{301}ABCDEFGHijklmnop",
+            8,
+            4,
+            true,
+            &[" ", "e\u{301}", "A", "B", "C", "D", "E", "F"],
+            Some(2),
+        ),
+        (
+            "界e\u{301}ABCDEFGHijklmnop",
+            7,
+            4,
+            true,
+            &[" ", "e\u{301}", "A", "B", "C", "D", "E"],
+            Some(2),
+        ),
+        (
+            "界e\u{301}ABCDEFGHijklmnop",
+            9,
+            4,
+            true,
+            &["界", "", "e\u{301}", "A", "B", "C", "D", "E", "F"],
+            Some(3),
+        ),
+        (
+            "0123456789abcdef",
+            8,
+            6,
+            true,
+            &["3", "4", "5", "6", "7", "8", "9", "a"],
+            Some(2),
+        ),
+        (
+            "abcdef界Z",
+            7,
+            1,
+            true,
+            &["a", "b", "c", "d", "e", "f", " "],
+            Some(0),
+        ),
+        (
+            "e\u{301}界🙂Z",
+            8,
+            1,
+            true,
+            &["e\u{301}", "界", "", "🙂", "", "Z", " ", " "],
+            Some(0),
+        ),
+        (
+            "界e\u{301}ABCDEFGHijklmnop",
+            8,
+            4,
+            false,
+            &["界", "", "e\u{301}", "A", "B", "C", "D", "E"],
+            None,
+        ),
+    ];
+    for &(text, width, cursor, visible, expected, reverse) in vectors {
+        let mut state = HandlerState::default();
+        let source = SessionName::new("source").unwrap();
+        let host = SessionName::new("host").unwrap();
+        let source_size = TerminalSize { cols: 20, rows: 24 };
+        let host_size = TerminalSize {
+            cols: width as u16 + 4,
+            rows: 24,
+        };
+        state
+            .sessions
+            .create_session(source.clone(), source_size)
+            .unwrap();
+        state
+            .sessions
+            .create_session(host.clone(), host_size)
+            .unwrap();
+        let pane_id = state
+            .sessions
+            .session(&source)
+            .unwrap()
+            .active_pane()
+            .unwrap()
+            .id();
+        state.g6_install_pane_transcript(&source, 0, pane_id, source_size);
+        let bytes = format!(
+            "{text}\x1b[1;{cursor}H\x1b[?25{}",
+            if visible { 'h' } else { 'l' }
+        );
+        state
+            .append_bytes_to_pane_transcript_for_test(&source, 0, 0, bytes.as_bytes())
+            .unwrap();
+        for (scope, name, value) in [
+            (OptionScopeSelector::SessionGlobal, "status", "off"),
+            (
+                OptionScopeSelector::WindowGlobal,
+                "tree-mode-preview-format",
+                "",
+            ),
+            (OptionScopeSelector::WindowGlobal, "mode-style", "reverse"),
+        ] {
+            state
+                .options
+                .set_by_name(
+                    scope,
+                    name,
+                    Some(value.into()),
+                    SetOptionMode::Replace,
+                    false,
+                    false,
+                    false,
+                )
+                .unwrap();
+        }
+        state.ensure_live_window_link_occurrences();
+        let mut mode = test_mode(12);
+        mode.session_name = host.clone();
+        mode.session_id = state.sessions.session(&host).unwrap().id();
+        mode.preview_mode = PreviewMode::Normal;
+        let build =
+            super::super::mode_tree_tree_build::build_tree_items(&mode, &state, &[]).unwrap();
+        mode.expanded.extend(build.items.keys().cloned());
+        let build =
+            super::super::mode_tree_tree_build::build_tree_items(&mode, &state, &[]).unwrap();
+        for depth in 0..=2 {
+            let item = build.items.values().find(|item| item.depth == depth && matches!(
+                &item.action, ModeTreeAction::TreeTarget { session_name, .. } if session_name == &source
+            )).unwrap();
+            mode.selected_id = Some(item.id.clone());
+            let selected_row = build.visible.iter().position(|id| id == &item.id).unwrap();
+            let frame = render_mode_tree_overlay(&state, &mode, &build);
+            let mut screen = Screen::new(host_size, 0);
+            InputParser::new().parse(&frame, &mut screen);
+            let preview = screen.absolute_line_view(13).unwrap();
+            let cells = &preview.cells()[2..width + 2];
+            assert!(
+                cells.iter().any(|cell| !cell.text().trim().is_empty()),
+                "always-empty preview canary: {text:?}, width={width}, depth={depth}"
+            );
+            for (x, (cell, want)) in cells.iter().zip(expected).enumerate() {
+                assert_eq!(
+                    if cell.is_padding() { "" } else { cell.text() },
+                    *want,
+                    "text={text:?}, width={width}, depth={depth}, column={x}"
+                );
+                assert_eq!(cell.is_padding(), want.is_empty());
+                if !want.is_empty() {
+                    let columns = if matches!(*want, "界" | "🙂") {
+                        2
+                    } else {
+                        1
+                    };
+                    assert_eq!(cell.width(), columns, "grapheme occupies oracle columns");
+                }
+                assert_eq!(
+                    (cell.attr() & GridAttr::REVERSE) != 0,
+                    reverse == Some(x),
+                    "cursor: text={text:?}, width={width}, depth={depth}, column={x}"
+                );
+            }
+            for row in 0..12 {
+                let line = screen.absolute_line_view(row).unwrap();
+                assert_eq!(
+                    (line.cells()[0].attr() & GridAttr::REVERSE) != 0,
+                    row == selected_row,
+                    "selection must stay on the represented item at depth {depth}"
+                );
+            }
+        }
+    }
+}
+
+#[test]
 fn tree_preview_layout_matches_tmux_gutters_when_not_all_items_fit() {
     let layout = tree_preview_layout(5, 2, 60).expect("layout");
     assert_eq!(layout.start, 1);
@@ -19,21 +200,23 @@ fn render_tree_columns_preview_draws_real_columns_and_label_boxes() {
     let lines = render_tree_columns_preview(
         vec![
             PreviewColumn {
-                label: " 0:alpha ".to_owned(),
-                label_area_width: 29,
+                label: PreviewLabel {
+                    text: "0:alpha".into(),
+                    style: active,
+                },
                 lines: vec!["left".to_owned(); 7],
             },
             PreviewColumn {
-                label: " 1:beta ".to_owned(),
-                label_area_width: 30,
+                label: PreviewLabel {
+                    text: "1:beta".into(),
+                    style: inactive,
+                },
                 lines: vec!["right".to_owned(); 7],
             },
         ],
         0,
         60,
         7,
-        &inactive,
-        &active,
         &utf8,
     );
 
@@ -44,7 +227,7 @@ fn render_tree_columns_preview_draws_real_columns_and_label_boxes() {
     assert!(lines.iter().any(|line| line.contains("0:alpha")));
     assert!(lines.iter().any(|line| line.contains("1:beta")));
     assert!(
-        lines.iter().any(|line| line.contains("#[fg=red] 0:alpha ")),
+        lines.iter().any(|line| line.contains("#[fg=red]0:alpha")),
         "active preview label should carry display-panes-active-colour"
     );
 }
@@ -104,76 +287,32 @@ fn preview_lines_for_screen_uses_tmux_horizontal_cursor_window() {
 
 #[test]
 fn render_preview_segment_row_pads_empty_preview_rows_to_full_width() {
-    let inactive = Style::default();
     let column = PreviewColumn {
-        label: " 0 ".to_owned(),
-        label_area_width: 8,
+        label: PreviewLabel {
+            text: "0".into(),
+            style: Style::default(),
+        },
         lines: vec![String::new()],
     };
 
-    let rendered = render_preview_segment_row(
-        &column,
-        0,
-        8,
-        column.label_area_width,
-        5,
-        &inactive,
-        &Utf8Config::default(),
-    );
+    let rendered = render_preview_segment_row(&column, 0, 8, 5, &Utf8Config::default());
 
     assert_eq!(rendered, "        ");
 }
 
 #[test]
 fn render_preview_segment_row_preserves_formatted_preview_lines() {
-    let inactive = Style::default();
     let column = PreviewColumn {
-        label: " 0 ".to_owned(),
-        label_area_width: 6,
+        label: PreviewLabel {
+            text: "0".into(),
+            style: Style::default(),
+        },
         lines: vec!["#[fg=green]abcdef#[default]".to_owned()],
     };
 
-    let rendered = render_preview_segment_row(
-        &column,
-        0,
-        6,
-        column.label_area_width,
-        5,
-        &inactive,
-        &Utf8Config::default(),
-    );
+    let rendered = render_preview_segment_row(&column, 0, 6, 5, &Utf8Config::default());
 
     assert_eq!(rendered, "#[fg=green]abcdef#[default]");
-}
-
-#[test]
-fn tree_window_preview_label_matches_tmux_padding() {
-    assert_eq!(tree_window_preview_label(3), " 3 ");
-}
-
-#[test]
-fn render_preview_segment_row_uses_tmux_ceiling_centre_for_box_labels() {
-    let inactive = Style::default();
-    let column = PreviewColumn {
-        label: " 3 ".to_owned(),
-        label_area_width: 8,
-        lines: Vec::new(),
-    };
-
-    let rendered = render_preview_segment_row(
-        &column,
-        3,
-        7,
-        column.label_area_width,
-        5,
-        &inactive,
-        &Utf8Config::default(),
-    );
-
-    assert!(
-        rendered.starts_with("  │"),
-        "tmux centres the pane box label with div_ceil, got {rendered:?}"
-    );
 }
 
 #[test]

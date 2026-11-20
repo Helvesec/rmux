@@ -5,8 +5,8 @@ async fn display_message_pane_synchronized_reflects_window_option() {
     let handler = RequestHandler::new();
     let alpha = session_name("alpha");
 
-    assert!(matches!(
-        handler
+    crate::session_fixture::assert_new_session(
+        &handler
             .handle(Request::NewSession(NewSessionRequest {
                 session_name: alpha.clone(),
                 detached: true,
@@ -14,8 +14,7 @@ async fn display_message_pane_synchronized_reflects_window_option() {
                 environment: None,
             }))
             .await,
-        Response::NewSession(_)
-    ));
+    );
     assert!(matches!(
         handler
             .handle(Request::SetOption(SetOptionRequest {

@@ -505,6 +505,8 @@ async fn live_attach_palette_response_is_correlated_to_the_current_pane() {
 
     let first = PaneTarget::with_window(alpha.clone(), 0, 0);
     let second = PaneTarget::with_window(alpha.clone(), 0, 1);
+    handler.disable_pane_focus_reports_for_test(&first).await;
+    handler.disable_pane_focus_reports_for_test(&second).await;
     let selected = handler
         .handle(Request::SelectPane(Box::new(SelectPaneRequest {
             target: first.clone(),

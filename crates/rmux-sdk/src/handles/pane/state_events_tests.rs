@@ -15,6 +15,9 @@ use tokio::time::{timeout, Duration};
 
 use super::Pane;
 
+#[path = "state_values_tests.rs"]
+mod values;
+
 fn alpha() -> SessionName {
     SessionName::new("alpha").expect("valid session name")
 }

@@ -39,7 +39,7 @@ impl SignalHandlerState {
     fn reserve_install(&self) -> Result<()> {
         let mut phase = self.lock_phase();
         if *phase != SignalHandlerPhase::Idle {
-            return Err(RmuxError::protocol(rmux_proto::RmuxError::Server(
+            return Err(RmuxError::from_proto(rmux_proto::RmuxError::Server(
                 "owned session signal handlers are already installed".to_owned(),
             )));
         }
@@ -55,11 +55,13 @@ impl SignalHandlerState {
                 *phase = SignalHandlerPhase::Disarmed;
                 Ok(())
             }
-            SignalHandlerPhase::Firing => Err(RmuxError::protocol(rmux_proto::RmuxError::Server(
-                "owned-session signal cleanup is already in progress".to_owned(),
-            ))),
+            SignalHandlerPhase::Firing => {
+                Err(RmuxError::from_proto(rmux_proto::RmuxError::Server(
+                    "owned-session signal cleanup is already in progress".to_owned(),
+                )))
+            }
             SignalHandlerPhase::Finished => {
-                Err(RmuxError::protocol(rmux_proto::RmuxError::Server(
+                Err(RmuxError::from_proto(rmux_proto::RmuxError::Server(
                     "owned-session signal cleanup has already finished".to_owned(),
                 )))
             }
@@ -241,7 +243,7 @@ async fn run_signal_cleanup(
 #[cfg(any(unix, windows))]
 fn current_runtime() -> Result<tokio::runtime::Handle> {
     tokio::runtime::Handle::try_current().map_err(|error| {
-        RmuxError::protocol(rmux_proto::RmuxError::Server(format!(
+        RmuxError::from_proto(rmux_proto::RmuxError::Server(format!(
             "owned session signal handlers require a Tokio runtime: {error}"
         )))
     })

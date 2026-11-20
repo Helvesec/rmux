@@ -104,3 +104,39 @@ fn previous_layout_preserves_session_targets_for_runtime_resolution() {
         _ => panic!("expected PreviousLayout command"),
     }
 }
+
+#[test]
+fn window_snapshot_commands_parse_as_explicit_rmux_commands() {
+    let cli = parse_args(&["export-window-snapshot", "-t", "alpha:3"]).unwrap();
+    match cli.command.expect("parsed command") {
+        super::Command::ExportWindowSnapshot(args) => {
+            assert_eq!(args.target.as_ref().expect("target").to_string(), "alpha:3");
+        }
+        other => panic!("expected ExportWindowSnapshot command, got {other:?}"),
+    }
+
+    let cli = parse_args(&["restore-window-snapshot", "-t", "alpha:3", "snapshot.json"]).unwrap();
+    match cli.command.expect("parsed command") {
+        super::Command::RestoreWindowSnapshot(args) => {
+            assert_eq!(args.target.as_ref().expect("target").to_string(), "alpha:3");
+            assert_eq!(
+                args.snapshot_path,
+                std::path::PathBuf::from("snapshot.json")
+            );
+        }
+        other => panic!("expected RestoreWindowSnapshot command, got {other:?}"),
+    }
+}
+
+#[test]
+fn select_layout_still_treats_snapshot_json_as_legacy_layout_operand() {
+    let json = r#"{"version":1,"floating":[]}"#;
+    let cli = parse_args(&["select-layout", "-t", "alpha:0", json]).unwrap();
+
+    match cli.command.expect("parsed command") {
+        super::Command::SelectLayout(args) => {
+            assert_eq!(args.layout.as_deref(), Some(json));
+        }
+        other => panic!("expected SelectLayout command, got {other:?}"),
+    }
+}

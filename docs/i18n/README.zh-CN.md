@@ -43,7 +43,7 @@
 > [!NOTE]
 > RMUX 现在具备 E2E Web 复用功能。[在文档中了解更多。](../web-share.md)
 >
-> RMUX 现在提供 Python 和 TypeScript SDK：[librmux](https://pypi.org/project/librmux/)、[@rmux/sdk](https://www.npmjs.com/package/@rmux/sdk)。
+> 历史 Python/TypeScript SDK 面向 RMUX 0.6：[librmux 0.6.1](https://pypi.org/project/librmux/0.6.1/)、[@rmux/sdk 0.6.5](https://www.npmjs.com/package/@rmux/sdk/v/0.6.5)。它们不属于 RMUX 1.0 的分发和 SDK 支持范围。
 >
 > 如需提出功能请求或报告问题，请[提交 issue](https://github.com/Helvesec/rmux/issues)。
 
@@ -234,18 +234,27 @@ rmux web-share --tunnel-provider localhost-run
 
 ## 🧰 脚本与 API
 
-SDK 会连接到本地 RMUX daemon，并为自动化暴露 sessions、panes、
-streams、waits 和 snapshots。
+Rust SDK 使用本地 daemon 的类型化 IPC。历史 Python/TypeScript 包调用单独安装的
+RMUX CLI。它们被排除在新的 RMUX 1.0 分发、捆绑实现以及 SDK 支持、制品、构建和
+打包清单的支持项之外。明确的里程碑
+[Post-1.0 Python/TypeScript SDK qualification](../ROADMAP.md#post-10-pythontypescript-sdk-qualification)
+安排在 RMUX 1.0 之后；参见 [SDK 范围](../scripting-sdk.md#additional-language-sdk-scope)。
 
 ```sh
 cargo add rmux-sdk
-pip install librmux
-npm install @rmux/sdk
+```
+
+以下仅为历史版本示例：`librmux 0.6.1` 面向 RMUX 0.6.1；
+`@rmux/sdk 0.6.5` 面向 RMUX 0.6.x。这些不是 RMUX 1.0 的安装说明。
+
+```sh
+pip install librmux==0.6.1
+npm install @rmux/sdk@0.6.5
 ```
 
 - Rust SDK：[`rmux-sdk`](https://crates.io/crates/rmux-sdk)
-- Python SDK：[`librmux`](https://pypi.org/project/librmux/)
-- TypeScript SDK：[`@rmux/sdk`](https://www.npmjs.com/package/@rmux/sdk)
+- Python SDK：[`librmux 0.6.1` — RMUX 0.6.1](https://pypi.org/project/librmux/0.6.1/)
+- TypeScript SDK：[`@rmux/sdk 0.6.5` — RMUX 0.6.x](https://www.npmjs.com/package/@rmux/sdk/v/0.6.5)
 
 <a id="documentation"></a>
 
@@ -307,7 +316,6 @@ fn render(snapshot: PaneSnapshot, area: Rect, buffer: &mut Buffer) {
 | `rmux-server` | Tokio daemon 和 request dispatch | support crate |
 | `rmux-client` | 本地 IPC client 和 attach plumbing | support crate |
 | `rmux` | CLI 和隐藏 daemon entrypoint | public binary |
-| `rmux-render-core` | 共享 snapshot rendering core | workspace-internal |
 
 <a id="platform-support"></a>
 
@@ -338,7 +346,7 @@ set -as terminal-features 'xterm-kitty:kitty-graphics'
 set -as terminal-features 'xterm*:sixel'
 ```
 
-SIXEL passthrough 由自动化 Unix PTY attach 回归套件覆盖。在 Windows 上，如果 OS 支持，RMUX 会启用现代 ConPTY passthrough，但 SIXEL 显示仍取决于外层终端。排查问题时可设置 `RMUX_CONPTY_NO_PASSTHROUGH=1` 来禁用该 backend mode。
+SIXEL passthrough 由自动化 Unix PTY attach 回归套件覆盖。在 Windows 上，转发 OSC 查询和响应需要在托管 pane 的可执行文件（通常为 `rmux-daemon.exe`）旁放置同版本的 Microsoft `conpty.dll` 和 `OpenConsole.exe`（1.24.2607.10001 或更高）。当前打包脚本不包含这两个可选运行时文件。OSC 验证并不能证明 SIXEL 显示，后者还取决于外层终端。设置 `RMUX_CONPTY_NO_PASSTHROUGH=1` 会选择系统控制台并禁用历史粘贴兼容位。
 
 <a id="verification"></a>
 

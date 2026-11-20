@@ -1533,108 +1533,106 @@ fn tmux_compat_control_mode_top_level_terminal_runtime_overrides_when_frozen_tmu
 #[test]
 fn tmux_compat_new_window_control_mode_start_directory_and_shell_command_when_frozen_tmux_is_available(
 ) -> Result<(), Box<dyn Error>> {
-    let harness = TmuxCompatHarness::new("tmux-compat-new-window-control-mode-spawn")?;
-    let Some(tmux_binary) = frozen_tmux_or_skip(&harness)? else {
-        return Ok(());
-    };
-    let config = tmux_compat_config();
-    let start_directory = harness.tmpdir().join("new-window-cwd");
-    fs::create_dir_all(&start_directory)?;
-    let start_directory = start_directory.to_string_lossy().into_owned();
-
-    let create = harness.run_pair_with(
-        &tmux_binary,
-        &["new-session", "-d", "-s", "alpha"],
-        config.clone(),
-    )?;
-    assert_quiet_success(&create);
-
-    let commands = format!(
-        "new-window -d -t alpha -c {} -- sh -c 'pwd; printf \"ARGV0=[%s]\\n\" \"$0\"; printf \"ARGV=\"; for arg in \"$@\"; do printf \"[%s]\" \"$arg\"; done; printf \"\\n\"; printf \"shell=quoted ; value\\n\"; exec sleep 30' foo 'bar baz'\n",
-        shell_quote(&start_directory)
-    );
-    let tmux_run = run_tmux_control_mode(&harness, &tmux_binary, &commands)?;
-    let rmux_run = run_rmux_control_mode(&harness, &commands)?;
-    assert_eq!(tmux_run.status_code, Some(0));
-    assert_eq!(rmux_run.status_code, Some(0));
-    assert!(tmux_run.stderr.is_empty());
-    assert!(rmux_run.stderr.is_empty());
-
-    let expected_lines = vec![
-        start_directory.clone(),
-        "ARGV0=[foo]".to_owned(),
-        "ARGV=[bar baz]".to_owned(),
-        "shell=quoted ; value".to_owned(),
-    ];
-    let capture = wait_for_pair_run(
-        &harness,
-        &tmux_binary,
-        &["capture-pane", "-p", "-t", "alpha:1.0"],
-        config,
-        Duration::from_secs(5),
-        |run| {
-            run.tmux.status_code == Some(0)
-                && run.rmux.status_code == Some(0)
-                && nonempty_capture_lines(&run.tmux.stdout_string()) == expected_lines
-                && nonempty_capture_lines(&run.rmux.stdout_string()) == expected_lines
-        },
-    )?;
-    assert_exact_tmux_compat(&capture);
-
-    Ok(())
+    assert_control_mode_spawn("new-window -d -t alpha", "alpha:1.0")
 }
 
 #[test]
 fn tmux_compat_respawn_window_control_mode_start_directory_and_shell_command_when_frozen_tmux_is_available(
 ) -> Result<(), Box<dyn Error>> {
-    let harness = TmuxCompatHarness::new("tmux-compat-respawn-window-control-mode-spawn")?;
-    let Some(tmux_binary) = frozen_tmux_or_skip(&harness)? else {
-        return Ok(());
-    };
-    let config = tmux_compat_config();
-    let start_directory = harness.tmpdir().join("respawn-window-cwd");
-    fs::create_dir_all(&start_directory)?;
-    let start_directory = start_directory.to_string_lossy().into_owned();
+    assert_control_mode_spawn("respawn-window -k -t alpha:0", "alpha:0.0")
+}
 
-    let create = harness.run_pair_with(
-        &tmux_binary,
-        &["new-session", "-d", "-s", "alpha"],
-        config.clone(),
-    )?;
-    assert_quiet_success(&create);
+fn assert_control_mode_spawn(action: &str, target: &str) -> Result<(), Box<dyn Error>> {
+    for directory_name in [
+        "cwd".to_owned(),
+        format!("cwd with spaces {}", "x".repeat(96)),
+    ] {
+        for narrow in [true, false] {
+            let harness = TmuxCompatHarness::new("tmux-compat-control-mode-spawn")?;
+            let Some(tmux_binary) = frozen_tmux_or_skip(&harness)? else {
+                return Ok(());
+            };
+            let config = tmux_compat_config();
+            let start_directory = harness.tmpdir().join(&directory_name);
+            fs::create_dir_all(&start_directory)?;
+            let start_directory = start_directory.to_string_lossy().into_owned();
+            // Cover both wrapped and unwrapped output independently of the
+            // checkout's temporary-root length. Bytes overestimate UTF-8 width.
+            let width = if narrow {
+                80
+            } else {
+                start_directory.len() + 80
+            };
+            let width = width.to_string();
+            let create = harness.run_pair_with(
+                &tmux_binary,
+                &["new-session", "-d", "-s", "alpha", "-x", &width, "-y", "24"],
+                config.clone(),
+            )?;
+            assert_quiet_success(&create);
 
-    let commands = format!(
-        "respawn-window -k -t alpha:0 -c {} -- sh -c 'pwd; printf \"ARGV0=[%s]\\n\" \"$0\"; printf \"ARGV=\"; for arg in \"$@\"; do printf \"[%s]\" \"$arg\"; done; printf \"\\n\"; printf \"shell=quoted ; value\\n\"; exec sleep 30' foo 'bar baz'\n",
-        shell_quote(&start_directory)
-    );
-    let tmux_run = run_tmux_control_mode(&harness, &tmux_binary, &commands)?;
-    let rmux_run = run_rmux_control_mode(&harness, &commands)?;
-    assert_eq!(tmux_run.status_code, Some(0));
-    assert_eq!(rmux_run.status_code, Some(0));
-    assert!(tmux_run.stderr.is_empty());
-    assert!(rmux_run.stderr.is_empty());
+            let commands = format!(
+                "{action} -c {} -- sh -c 'pwd; printf \"ARGV0=[%s]\\n\" \"$0\"; printf \"ARGV=\"; for arg in \"$@\"; do printf \"[%s]\" \"$arg\"; done; printf \"\\n\"; printf \"shell=quoted ; value\\n\"; exec sleep 30' foo 'bar baz'\n",
+                shell_quote(&start_directory)
+            );
+            let tmux_run = run_tmux_control_mode(&harness, &tmux_binary, &commands)?;
+            let rmux_run = run_rmux_control_mode(&harness, &commands)?;
+            assert_eq!(tmux_run.status_code, Some(0));
+            assert_eq!(rmux_run.status_code, Some(0));
+            assert!(tmux_run.stderr.is_empty());
+            assert!(rmux_run.stderr.is_empty());
 
-    let expected_lines = vec![
-        start_directory.clone(),
-        "ARGV0=[foo]".to_owned(),
-        "ARGV=[bar baz]".to_owned(),
-        "shell=quoted ; value".to_owned(),
-    ];
-    let capture = wait_for_pair_run(
-        &harness,
-        &tmux_binary,
-        &["capture-pane", "-p", "-t", "alpha:0.0"],
-        config,
-        Duration::from_secs(5),
-        |run| {
-            run.tmux.status_code == Some(0)
-                && run.rmux.status_code == Some(0)
-                && nonempty_capture_lines(&run.tmux.stdout_string()) == expected_lines
-                && nonempty_capture_lines(&run.rmux.stdout_string()) == expected_lines
-        },
-    )?;
-    assert_exact_tmux_compat(&capture);
+            let geometry = harness.run_pair_with(
+                &tmux_binary,
+                &["display-message", "-p", "-t", target, "#{pane_width}"],
+                config.clone(),
+            )?;
+            assert_exact_tmux_compat(&geometry);
+            assert_eq!(geometry.tmux.status_code, Some(0));
+            assert_eq!(geometry.tmux.stdout_string(), format!("{width}\n"));
 
+            let expected_lines = vec![
+                start_directory,
+                "ARGV0=[foo]".to_owned(),
+                "ARGV=[bar baz]".to_owned(),
+                "shell=quoted ; value".to_owned(),
+            ];
+            // tmux 3.7b -J joins soft wraps while preserving shell newlines.
+            // A physical 80-column capture can split even the cwd alone.
+            let capture = wait_for_pair_run(
+                &harness,
+                &tmux_binary,
+                &["capture-pane", "-p", "-J", "-t", target],
+                config.clone(),
+                Duration::from_secs(5),
+                |run| {
+                    run.tmux.status_code == Some(0)
+                        && run.rmux.status_code == Some(0)
+                        && nonempty_capture_lines(&run.tmux.stdout_string()) == expected_lines
+                        && nonempty_capture_lines(&run.rmux.stdout_string()) == expected_lines
+                },
+            )?;
+            assert_exact_tmux_compat(&capture);
+            assert!(capture.tmux.stderr.is_empty());
+
+            // Keep raw screen parity as a separate assertion: joining must not
+            // hide a different wrap layout or collapse explicit shell newlines.
+            let raw = harness.run_pair_with(
+                &tmux_binary,
+                &["capture-pane", "-p", "-t", target],
+                config,
+            )?;
+            assert_exact_tmux_compat(&raw);
+            assert_eq!(raw.tmux.status_code, Some(0));
+            assert!(raw.tmux.stderr.is_empty());
+            let raw_lines = nonempty_capture_lines(&raw.tmux.stdout_string());
+            if !narrow {
+                assert_eq!(raw_lines, expected_lines);
+            } else if directory_name.len() > 80 {
+                assert!(raw_lines.len() > expected_lines.len());
+            }
+        }
+    }
     Ok(())
 }
 

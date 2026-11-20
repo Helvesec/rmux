@@ -8,6 +8,10 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use rmux_proto::{CONTROL_CONTROL_END, CONTROL_CONTROL_START};
 
+#[path = "support/startup_stderr.rs"]
+mod startup_stderr;
+use startup_stderr::assert_startup_output;
+
 /// Upper bound on how long a freshly spawned interactive shell may keep
 /// `#{pane_current_path}` pointed at a startup helper's directory.
 ///
@@ -296,9 +300,9 @@ fn cold_start_config_alias_applies_to_first_builtin_product_divergence(
         OsStr::new("new-session"),
     ])?;
 
+    assert_startup_output(&output, 0, b"", cfg!(windows));
     assert_success(&output)?;
     assert_eq!(String::from_utf8(output.stdout)?, "ok\n");
-    assert!(output.stderr.is_empty());
     assert_eq!(
         harness.stdout(["list-sessions", "-F", "#{session_name}"])?,
         "aliased\n"
@@ -338,6 +342,40 @@ fn cold_start_config_alias_respects_no_start_server() -> Result<(), Box<dyn Erro
 }
 
 #[test]
+fn queued_server_startup_loads_later_alias_after_nonstarting_command() -> Result<(), Box<dyn Error>>
+{
+    let harness = AcceptanceHarness::new("queued-server-startup-later-alias")?;
+    let config = harness.tmpdir().join("cold-start-alias.conf");
+    fs::write(
+        &config,
+        "set-option -s command-alias[20] 'probe=display-message -p OK'\n",
+    )?;
+
+    let output = harness.run([
+        OsStr::new("-f"),
+        config.as_os_str(),
+        OsStr::new("set-option"),
+        OsStr::new("-g"),
+        OsStr::new("status"),
+        OsStr::new("off"),
+        OsStr::new(";"),
+        OsStr::new("new-session"),
+        OsStr::new("-d"),
+        OsStr::new("-s"),
+        OsStr::new("hold"),
+        OsStr::new(";"),
+        OsStr::new("probe"),
+    ])?;
+
+    assert_startup_output(&output, 0, b"", cfg!(windows));
+    assert_success(&output)?;
+    assert_eq!(String::from_utf8(output.stdout)?, "OK\n");
+    harness.success(["has-session", "-t", "hold"])?;
+    assert_eq!(harness.stdout(["show-options", "-gv", "status"])?, "off\n");
+    Ok(())
+}
+
+#[test]
 fn cold_start_config_alias_applies_to_later_command_group() -> Result<(), Box<dyn Error>> {
     let harness = AcceptanceHarness::new("cold-start-later-command-alias")?;
     let config = harness.tmpdir().join("cold-start-alias.conf");
@@ -357,9 +395,9 @@ fn cold_start_config_alias_applies_to_later_command_group() -> Result<(), Box<dy
         OsStr::new("probe"),
     ])?;
 
+    assert_startup_output(&output, 0, b"", cfg!(windows));
     assert_success(&output)?;
     assert_eq!(String::from_utf8(output.stdout)?, "OK\n");
-    assert!(output.stderr.is_empty());
     harness.success(["has-session", "-t", "hold"])?;
     Ok(())
 }
@@ -386,9 +424,9 @@ fn cold_start_assignment_before_builtin_preserves_later_config_alias_product_div
         OsStr::new("probe"),
     ])?;
 
+    assert_startup_output(&output, 0, b"", cfg!(windows));
     assert_success(&output)?;
     assert_eq!(String::from_utf8(output.stdout)?, "x\n");
-    assert!(output.stderr.is_empty());
     assert_eq!(
         harness.stdout(["show-environment", "-g", "FOO"])?,
         "FOO=x\n"
@@ -799,10 +837,9 @@ fn control_mode_validates_flags_and_keeps_literal_newlines_in_one_command(
         1,
         "{injected_stdout:?}"
     );
-    assert!(
-        injected_stdout.contains("--bad\\n%exit"),
-        "{injected_stdout:?}"
-    );
+    // tmux 3.7b diagnoses the invalid flag character '-', not the whole token.
+    let expected_injected = "command list-sessions: invalid flag --\n%exit\n";
+    assert_eq!(injected_stdout, expected_injected);
 
     let injected_control_control = harness.run(["-CC", "list-sessions", "--bad\n%exit"])?;
     assert_eq!(injected_control_control.status.code(), Some(1));
@@ -820,10 +857,7 @@ fn control_mode_validates_flags_and_keeps_literal_newlines_in_one_command(
         vec!["%exit"],
         "{injected_control_control_stdout:?}"
     );
-    assert!(
-        inner.contains("--bad\\n%exit"),
-        "{injected_control_control_stdout:?}"
-    );
+    assert_eq!(inner, expected_injected);
 
     let injected_value = harness.run([
         "-C",
@@ -1276,7 +1310,9 @@ impl Drop for AcceptanceHarness {
 }
 
 fn rmux_binary() -> &'static Path {
-    Path::new(env!("CARGO_BIN_EXE_rmux"))
+    Path::new(rmux_os::build_identity::cargo_binary(env!(
+        "CARGO_BIN_EXE_rmux"
+    )))
 }
 
 /// Names a packaged tiny CLI for the commands that client dispatches directly.

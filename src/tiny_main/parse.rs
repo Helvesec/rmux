@@ -5,400 +5,136 @@ use std::path::PathBuf;
 use rmux_proto::request::{AttachSessionExt2Request, NewSessionExtRequest};
 use rmux_proto::{
     CapturePaneTargetActionRequest, OptionScopeSelector, PaneTarget, ResizePaneAdjustment,
-    ResizePaneRelativeDirection, ResizePaneTargetActionRequest, SessionName, SplitDirection,
+    ResizePaneRelativeDirection, ResizePaneTargetActionRequest, SessionName,
     SplitWindowTargetActionRequest, Target, TerminalSize, WindowTarget,
 };
 
+use crate::cli_args::schema;
 use crate::client_terminal::client_terminal_context_from_parts;
 
-pub(super) struct TinyDisplayMessage {
-    pub(super) target: Option<Target>,
-    pub(super) message: Option<String>,
-}
+mod admission;
+use admission::{canonical, Tail};
 
-pub(super) struct TinySendKeys {
-    pub(super) raw_target: String,
-    pub(super) keys: Vec<String>,
-}
-
-pub(super) struct TinySourceFile {
-    pub(super) paths: Vec<String>,
-}
-
-pub(super) struct TinyHasSession {
-    pub(super) target: SessionName,
-}
-
-pub(super) struct TinyListWindows {
-    pub(super) target: SessionName,
-}
-
-pub(super) enum TinyListPanes {
-    AllSessions,
-    Target {
-        target: SessionName,
-        target_window_index: Option<u32>,
-    },
-}
-
-pub(super) struct TinyNewWindow {
-    pub(super) target: SessionName,
-    pub(super) name: Option<String>,
-    pub(super) detached: bool,
-    pub(super) command: Option<Vec<String>>,
-    pub(super) start_directory: Option<PathBuf>,
-}
-
-pub(super) struct TinyKillSession {
-    pub(super) target: SessionName,
-}
-
-pub(super) struct TinyShowOptions {
-    pub(super) scope: OptionScopeSelector,
-}
-
-pub(super) struct TinyRenameWindow {
-    pub(super) target: WindowTarget,
-    pub(super) name: String,
-}
-
-pub(super) struct TinySelectWindow {
-    pub(super) target: WindowTarget,
-}
-
-pub(super) struct TinyKillPane {
-    pub(super) target: PaneTarget,
-}
-
-pub(super) struct TinyJoinPane {
-    pub(super) source: PaneTarget,
-    pub(super) target: PaneTarget,
-    pub(super) detached: bool,
-}
-
-pub(super) struct TinySetOption {
-    pub(super) scope: OptionScopeSelector,
-    pub(super) option: String,
-    pub(super) value: String,
-}
+mod types;
+pub(super) use types::*;
 
 pub(super) fn parse_has_session(args: &[OsString]) -> Option<TinyHasSession> {
-    if has_queue_separator(args) {
+    if args.iter().filter(|arg| *arg == "-t").count() != 1 {
         return None;
     }
-
-    let mut target = None;
-    let mut index = 0;
-    while index < args.len() {
-        let arg = args[index].to_str()?;
-        match arg {
-            "-t" => {
-                if target.is_some() {
-                    return None;
-                }
-                index += 1;
-                target = Some(TinyHasSession {
-                    target: parse_session_name(args.get(index)?.to_str()?)?,
-                });
-            }
-            _ => return None,
-        }
-        index += 1;
-    }
-
-    target
+    let parsed = canonical::<schema::HasSession>(args, "t", Tail::None)?;
+    Some(TinyHasSession {
+        target: parse_session_name(parsed.target.as_deref()?)?,
+    })
 }
 
 pub(super) fn parse_list_windows(args: &[OsString]) -> Option<TinyListWindows> {
-    if has_queue_separator(args) {
+    if args.iter().filter(|arg| *arg == "-t").count() != 1 {
         return None;
     }
-
-    let mut target = None;
-    let mut index = 0;
-    while index < args.len() {
-        let arg = args[index].to_str()?;
-        match arg {
-            "-t" => {
-                if target.is_some() {
-                    return None;
-                }
-                index += 1;
-                target = Some(parse_session_name(args.get(index)?.to_str()?)?);
-            }
-            "-a" | "-F" | "-f" | "--json" => return None,
-            _ => return None,
-        }
-        index += 1;
-    }
-
-    Some(TinyListWindows { target: target? })
+    let parsed = canonical::<schema::ListWindows>(args, "t", Tail::None)?;
+    Some(TinyListWindows {
+        target: parse_session_name(parsed.target?.raw())?,
+    })
 }
 
 pub(super) fn parse_list_panes(args: &[OsString]) -> Option<TinyListPanes> {
-    if has_queue_separator(args) {
+    if args
+        .iter()
+        .filter(|arg| *arg == "-t" || *arg == "-a")
+        .count()
+        != 1
+    {
         return None;
     }
-
-    let mut all_sessions = false;
-    let mut target = None;
-    let mut index = 0;
-    while index < args.len() {
-        let arg = args[index].to_str()?;
-        match arg {
-            "-a" => {
-                if all_sessions || target.is_some() {
-                    return None;
-                }
-                all_sessions = true;
-            }
-            "-t" => {
-                if all_sessions || target.is_some() {
-                    return None;
-                }
-                index += 1;
-                target = Some(parse_list_panes_target(args.get(index)?.to_str()?)?);
-            }
-            "-s" | "-F" | "-f" | "--json" => return None,
-            _ => return None,
-        }
-        index += 1;
+    let parsed = canonical::<schema::ListPanes>(args, "ta", Tail::None)?;
+    if parsed.all_sessions {
+        Some(TinyListPanes::AllSessions)
+    } else {
+        parse_list_panes_target(parsed.target?.raw())
     }
-
-    if all_sessions {
-        return Some(TinyListPanes::AllSessions);
-    }
-    target
 }
 
 pub(super) fn parse_capture_pane(args: &[OsString]) -> Option<CapturePaneTargetActionRequest> {
-    if has_queue_separator(args) {
+    let parsed = canonical::<schema::CapturePane>(args, "ptSE", Tail::None)?;
+    if !parsed.print {
         return None;
     }
-
-    let mut target = None;
-    let mut start = None;
-    let mut end = None;
-    let mut print = false;
-    let mut index = 0;
-    while index < args.len() {
-        let arg = args[index].to_str()?;
-        match arg {
-            "-p" => print = true,
-            "-t" => {
-                index += 1;
-                target = Some(args.get(index)?.to_str()?.to_owned());
-            }
-            "-S" => {
-                index += 1;
-                let (value, absolute) = parse_capture_bound(args.get(index)?.to_str()?)?;
-                if absolute {
-                    return None;
-                }
-                start = value;
-            }
-            "-E" => {
-                index += 1;
-                let (value, absolute) = parse_capture_bound(args.get(index)?.to_str()?)?;
-                if absolute {
-                    return None;
-                }
-                end = value;
-            }
-            _ => return None,
+    let bound = |value: Option<String>| -> Option<Option<i64>> {
+        match value {
+            None => Some(None),
+            Some(value) => value.parse::<i64>().ok().map(Some),
         }
-        index += 1;
-    }
-    if !print {
-        return None;
-    }
-
+    };
     Some(CapturePaneTargetActionRequest {
-        target,
-        start,
-        end,
-        print,
-        buffer_name: None,
-        alternate: false,
-        escape_ansi: false,
-        escape_sequences: false,
-        include_format: false,
-        hyperlinks: false,
-        line_numbers: false,
-        join_wrapped: false,
-        use_mode_screen: false,
-        preserve_trailing_spaces: false,
-        do_not_trim_spaces: false,
-        pending_input: false,
-        quiet: false,
+        target: parsed.target.map(|target| target.raw().to_owned()),
+        start: bound(parsed.start)?,
+        end: bound(parsed.end)?,
+        print: parsed.print,
+        buffer_name: parsed.buffer_name,
+        alternate: parsed.alternate,
+        escape_ansi: parsed.escape_ansi,
+        escape_sequences: parsed.escape_sequences,
+        include_format: parsed.include_format,
+        hyperlinks: parsed.hyperlinks,
+        line_numbers: parsed.line_numbers,
+        join_wrapped: parsed.join_wrapped,
+        use_mode_screen: parsed.use_mode_screen,
+        preserve_trailing_spaces: parsed.preserve_trailing_spaces,
+        do_not_trim_spaces: parsed.do_not_trim_spaces,
+        pending_input: parsed.pending_input,
+        quiet: parsed.quiet,
         start_is_absolute: false,
         end_is_absolute: false,
     })
 }
 
 pub(super) fn parse_split_window(args: &[OsString]) -> Option<SplitWindowTargetActionRequest> {
-    if has_queue_separator(args) {
-        return None;
-    }
-
-    let mut target = None;
-    let mut direction = SplitDirection::Vertical;
-    let mut detached = false;
-    let mut before = false;
-    let mut start_directory = None;
-    let mut size = None;
-    let mut preserve_zoom = false;
-    let mut full_size = false;
-    let mut keep_alive_on_exit = false;
-    let mut command = None;
-    let mut index = 0;
-    while index < args.len() {
-        let arg = args[index].to_str()?;
-        match arg {
-            "--" => {
-                index += 1;
-                command = parse_command_tail(&args[index..])?;
-                break;
-            }
-            "-h" => direction = SplitDirection::Horizontal,
-            "-v" => direction = SplitDirection::Vertical,
-            "-d" => detached = true,
-            "-b" => before = true,
-            "-Z" => preserve_zoom = true,
-            "-f" => full_size = true,
-            "-k" => keep_alive_on_exit = true,
-            "-t" => {
-                index += 1;
-                target = Some(args.get(index)?.to_str()?.to_owned());
-            }
-            "-c" => {
-                index += 1;
-                start_directory = Some(PathBuf::from(args.get(index)?));
-            }
-            "-l" => {
-                index += 1;
-                size = Some(args.get(index)?.to_str()?.to_owned());
-            }
-            value if value.starts_with('-') => return None,
-            _ => {
-                command = parse_command_tail(&args[index..])?;
-                break;
-            }
-        }
-        index += 1;
-    }
-
+    let parsed = canonical::<schema::SplitWindow>(args, "hvdbZfktcl", Tail::Command)?;
     Some(SplitWindowTargetActionRequest {
-        target,
-        direction,
-        before,
+        direction: parsed.direction(),
+        size: parsed.size_spec(),
+        target: parsed.target.map(|target| target.raw().to_owned()),
+        before: parsed.before,
         environment: None,
-        command,
+        command: nonempty(parsed.command),
         process_command: None,
-        start_directory,
-        keep_alive_on_exit: keep_alive_on_exit.then_some(true),
-        detached,
-        size,
-        preserve_zoom,
-        full_size,
+        start_directory: parsed.start_directory,
+        keep_alive_on_exit: parsed.keep_alive_on_exit.then_some(true),
+        detached: parsed.detached,
+        preserve_zoom: parsed.preserve_zoom,
+        full_size: parsed.full_size,
         stdin_payload: None,
     })
 }
 
 pub(super) fn parse_new_window(args: &[OsString]) -> Option<TinyNewWindow> {
-    if has_queue_separator(args) {
-        return None;
-    }
-
-    let mut target = None;
-    let mut name = None;
-    let mut detached = false;
-    let mut start_directory = None;
-    let mut command = None;
-    let mut index = 0;
-    while index < args.len() {
-        let arg = args[index].to_str()?;
-        match arg {
-            "--" => {
-                index += 1;
-                command = parse_command_tail(&args[index..])?;
-                break;
-            }
-            "-d" => detached = true,
-            "-t" => {
-                index += 1;
-                target = Some(parse_session_name(args.get(index)?.to_str()?)?);
-            }
-            "-n" => {
-                index += 1;
-                name = Some(args.get(index)?.to_str()?.to_owned());
-            }
-            "-c" => {
-                index += 1;
-                start_directory = Some(PathBuf::from(args.get(index)?));
-            }
-            "-a" | "-b" | "-e" | "-F" | "-k" | "-P" | "-S" => return None,
-            value if value.starts_with('-') => return None,
-            _ => {
-                command = parse_command_tail(&args[index..])?;
-                break;
-            }
-        }
-        index += 1;
-    }
-
+    let parsed = canonical::<schema::NewWindow>(args, "dtnc", Tail::Command)?;
     Some(TinyNewWindow {
-        target: target?,
-        name,
-        detached,
-        command,
-        start_directory,
+        target: parse_session_name(parsed.target?.raw())?,
+        name: parsed.name,
+        detached: parsed.detached,
+        command: nonempty(parsed.command),
+        start_directory: parsed.start_directory,
     })
 }
 
 pub(super) fn parse_kill_session(args: &[OsString]) -> Option<TinyKillSession> {
-    if has_queue_separator(args) {
-        return None;
-    }
-
-    let mut target = None;
-    let mut index = 0;
-    while index < args.len() {
-        let arg = args[index].to_str()?;
-        match arg {
-            "-t" => {
-                index += 1;
-                target = Some(parse_session_name(args.get(index)?.to_str()?)?);
-            }
-            "-a" | "-C" => return None,
-            _ => return None,
-        }
-        index += 1;
-    }
-
-    Some(TinyKillSession { target: target? })
+    let parsed = canonical::<schema::KillSession>(args, "t", Tail::None)?;
+    Some(TinyKillSession {
+        target: parse_session_name(parsed.target?.raw())?,
+    })
 }
 
 pub(super) fn parse_show_options(args: &[OsString], force_window: bool) -> Option<TinyShowOptions> {
-    if has_queue_separator(args) {
+    let parsed = if force_window {
+        canonical::<schema::ShowWindowOptions>(args, "g", Tail::None)?
+    } else {
+        canonical::<schema::ShowOptions>(args, "g", Tail::None)?
+    };
+    if !parsed.global {
         return None;
     }
-
-    let mut global = false;
-    let mut index = 0;
-    while index < args.len() {
-        let arg = args[index].to_str()?;
-        match arg {
-            "-g" => global = true,
-            _ => return None,
-        }
-        index += 1;
-    }
-
-    if !global {
-        return None;
-    }
-
     Some(TinyShowOptions {
         scope: if force_window {
             OptionScopeSelector::WindowGlobal
@@ -409,198 +145,68 @@ pub(super) fn parse_show_options(args: &[OsString], force_window: bool) -> Optio
 }
 
 pub(super) fn parse_rename_window(args: &[OsString]) -> Option<TinyRenameWindow> {
-    if has_queue_separator(args) {
-        return None;
-    }
-
-    let mut target = None;
-    let mut name = None;
-    let mut index = 0;
-    while index < args.len() {
-        let arg = args[index].to_str()?;
-        match arg {
-            "-t" => {
-                index += 1;
-                target = Some(parse_window_target(args.get(index)?.to_str()?)?);
-            }
-            value if value.starts_with('-') => return None,
-            _ => {
-                if name.is_some() || index + 1 != args.len() {
-                    return None;
-                }
-                name = Some(arg.to_owned());
-            }
-        }
-        index += 1;
-    }
-
+    let parsed = canonical::<schema::RenameWindow>(args, "t", Tail::Single)?;
     Some(TinyRenameWindow {
-        target: target?,
-        name: name?,
+        target: parse_window_target(parsed.target?.raw())?,
+        name: parsed.new_name,
     })
 }
 
 pub(super) fn parse_select_window(args: &[OsString]) -> Option<TinySelectWindow> {
-    if has_queue_separator(args) {
-        return None;
-    }
-
-    let mut target = None;
-    let mut index = 0;
-    while index < args.len() {
-        let arg = args[index].to_str()?;
-        match arg {
-            "-t" => {
-                index += 1;
-                target = Some(parse_window_target(args.get(index)?.to_str()?)?);
-            }
-            _ => return None,
-        }
-        index += 1;
-    }
-
-    Some(TinySelectWindow { target: target? })
+    let parsed = canonical::<schema::SelectWindow>(args, "t", Tail::None)?;
+    Some(TinySelectWindow {
+        target: parse_window_target(parsed.target?.raw())?,
+    })
 }
 
 pub(super) fn parse_kill_pane(args: &[OsString]) -> Option<TinyKillPane> {
-    if has_queue_separator(args) {
-        return None;
-    }
-
-    let mut target = None;
-    let mut index = 0;
-    while index < args.len() {
-        let arg = args[index].to_str()?;
-        match arg {
-            "-t" => {
-                index += 1;
-                target = Some(parse_pane_target(args.get(index)?.to_str()?)?);
-            }
-            "-a" => return None,
-            _ => return None,
-        }
-        index += 1;
-    }
-
-    Some(TinyKillPane { target: target? })
+    let parsed = canonical::<schema::KillPane>(args, "t", Tail::None)?;
+    Some(TinyKillPane {
+        target: parse_pane_target(parsed.target?.raw())?,
+    })
 }
 
 pub(super) fn parse_join_pane(args: &[OsString]) -> Option<TinyJoinPane> {
-    if has_queue_separator(args) {
-        return None;
-    }
-
-    let mut source = None;
-    let mut target = None;
-    let mut detached = false;
-    let mut index = 0;
-    while index < args.len() {
-        let arg = args[index].to_str()?;
-        match arg {
-            "-d" => detached = true,
-            "-s" => {
-                index += 1;
-                source = Some(parse_pane_target(args.get(index)?.to_str()?)?);
-            }
-            "-t" => {
-                index += 1;
-                target = Some(parse_pane_target(args.get(index)?.to_str()?)?);
-            }
-            "-b" | "-f" | "-h" | "-l" | "-p" | "-v" => return None,
-            _ => return None,
-        }
-        index += 1;
-    }
-
+    let parsed = canonical::<schema::JoinPane>(args, "dst", Tail::None)?;
     Some(TinyJoinPane {
-        source: source?,
-        target: target?,
-        detached,
+        source: parse_pane_target(parsed.source?.raw())?,
+        target: parse_pane_target(parsed.target?.raw())?,
+        detached: parsed.detached,
     })
 }
 
 pub(super) fn parse_set_option(args: &[OsString], force_window: bool) -> Option<TinySetOption> {
-    if has_queue_separator(args) {
+    let parsed = if force_window {
+        canonical::<schema::SetWindowOption>(args, "g", Tail::Values)?
+    } else {
+        canonical::<schema::SetOption>(args, "g", Tail::Values)?
+    };
+    if !parsed.global {
         return None;
     }
-
-    let mut global = false;
-    let mut values = Vec::new();
-    let mut index = 0;
-    while index < args.len() {
-        let arg = args[index].to_str()?;
-        match arg {
-            "-g" => global = true,
-            "-a" | "-F" | "-o" | "-q" | "-s" | "-u" | "-U" | "-w" | "-p" | "-t" => return None,
-            value if value.starts_with('-') => return None,
-            _ => values.push(arg.to_owned()),
-        }
-        index += 1;
-    }
-
-    if !global || values.len() != 2 {
-        return None;
-    }
-
-    let option = values.remove(0);
-    let value = values.remove(0);
     let scope = if force_window {
         OptionScopeSelector::WindowGlobal
     } else {
-        rmux_core::default_global_scope_for_option_name(&option).ok()?
+        rmux_core::default_global_scope_for_option_name(&parsed.option).ok()?
     };
-
     Some(TinySetOption {
         scope,
-        option,
-        value,
+        option: parsed.option,
+        value: parsed.value?,
     })
 }
 
 pub(super) fn parse_attach_session(args: &[OsString]) -> Option<AttachSessionExt2Request> {
-    if nested_multiplexer_context() || has_queue_separator(args) {
-        return None;
-    }
-
-    let mut target_spec = None;
-    let mut detach_other_clients = false;
-    let mut kill_other_clients = false;
-    let mut read_only = false;
-    let mut skip_environment_update = false;
-    let mut working_directory = None;
-    let mut index = 0;
-    while index < args.len() {
-        let arg = args[index].to_str()?;
-        match arg {
-            "-t" => {
-                index += 1;
-                target_spec = Some(args.get(index)?.to_str()?.to_owned());
-            }
-            "-d" => detach_other_clients = true,
-            "-x" => {
-                detach_other_clients = true;
-                kill_other_clients = true;
-            }
-            "-r" => read_only = true,
-            "-E" => skip_environment_update = true,
-            "-c" => {
-                index += 1;
-                working_directory = Some(args.get(index)?.to_str()?.to_owned());
-            }
-            _ => return None,
-        }
-        index += 1;
-    }
-
+    let parsed = canonical::<schema::AttachSession>(args, "tdxrEc", Tail::None)?;
     Some(AttachSessionExt2Request {
         target: None,
-        target_spec,
-        detach_other_clients,
-        kill_other_clients,
-        read_only,
-        skip_environment_update,
+        target_spec: parsed.target.map(|target| target.raw().to_owned()),
+        detach_other_clients: parsed.detach_other_clients || parsed.kill_other_clients,
+        kill_other_clients: parsed.kill_other_clients,
+        read_only: parsed.read_only,
+        skip_environment_update: parsed.skip_environment_update,
         flags: None,
-        working_directory,
+        working_directory: parsed.working_directory,
         client_terminal: client_terminal_context_from_parts(
             Vec::new(),
             infer_client_utf8_from_env(),
@@ -610,282 +216,109 @@ pub(super) fn parse_attach_session(args: &[OsString]) -> Option<AttachSessionExt
 }
 
 pub(super) fn parse_new_session(args: &[OsString]) -> Option<NewSessionExtRequest> {
-    if has_queue_separator(args) {
+    let parsed = canonical::<schema::NewSession>(args, "dEsncxy", Tail::Command)?;
+    if !parsed.detached || parsed.cols == Some(0) || parsed.rows == Some(0) {
         return None;
     }
-
-    let mut session_name = None;
-    let mut working_directory = None;
-    let mut detached = false;
-    let mut cols = None;
-    let mut rows = None;
-    let mut window_name = None;
-    let mut skip_environment_update = false;
-    let mut command = None;
-    let mut index = 0;
-    while index < args.len() {
-        let arg = args[index].to_str()?;
-        match arg {
-            "--" => {
-                index += 1;
-                command = parse_command_tail(&args[index..])?;
-                break;
-            }
-            "-d" => detached = true,
-            "-E" => skip_environment_update = true,
-            "-s" => {
-                index += 1;
-                session_name = Some(SessionName::new(args.get(index)?.to_str()?).ok()?);
-            }
-            "-n" => {
-                index += 1;
-                window_name = Some(args.get(index)?.to_str()?.to_owned());
-            }
-            "-c" => {
-                index += 1;
-                working_directory = Some(args.get(index)?.to_str()?.to_owned());
-            }
-            "-x" => {
-                index += 1;
-                cols = Some(parse_nonzero_u16(args.get(index)?.to_str()?)?);
-            }
-            "-y" => {
-                index += 1;
-                rows = Some(parse_nonzero_u16(args.get(index)?.to_str()?)?);
-            }
-            value if value.starts_with('-') => return None,
-            _ => {
-                command = parse_command_tail(&args[index..])?;
-                break;
-            }
-        }
-        index += 1;
-    }
-
-    if !detached {
-        return None;
-    }
-
     Some(NewSessionExtRequest {
-        session_name,
-        working_directory: working_directory.or_else(current_working_directory_string),
-        detached: true,
-        size: build_terminal_size(cols, rows),
+        session_name: parsed.session_name,
+        working_directory: parsed
+            .working_directory
+            .or_else(current_working_directory_string),
+        detached: parsed.detached,
+        size: build_terminal_size(parsed.cols, parsed.rows),
         environment: None,
-        group_target: None,
-        attach_if_exists: false,
-        detach_other_clients: false,
-        kill_other_clients: false,
+        group_target: parsed.group_target,
+        attach_if_exists: parsed.attach_if_exists,
+        detach_other_clients: parsed.detach_other_clients,
+        kill_other_clients: parsed.kill_other_clients,
         flags: None,
-        window_name,
-        print_session_info: false,
-        print_format: None,
-        command,
+        window_name: parsed.window_name,
+        print_session_info: parsed.print_session_info,
+        print_format: parsed.print_format,
+        command: nonempty(parsed.command),
         process_command: None,
         client_environment: invoking_client_environment(),
-        skip_environment_update,
+        skip_environment_update: parsed.skip_environment_update,
     })
 }
 
 pub(super) fn parse_display_message(args: &[OsString]) -> Option<TinyDisplayMessage> {
-    if has_queue_separator(args) {
+    let parsed = canonical::<schema::DisplayMessage>(args, "ptF", Tail::Single)?;
+    if !parsed.print || (parsed.format.is_some() && !parsed.message.is_empty()) {
         return None;
     }
-
-    let mut target = None;
-    let mut format = None;
-    let mut message = None;
-    let mut print = false;
-    let mut index = 0;
-    while index < args.len() {
-        let arg = args[index].to_str()?;
-        match arg {
-            "--" => {
-                index += 1;
-                message = parse_single_tail(&args[index..])?;
-                break;
-            }
-            "-p" => print = true,
-            "-t" => {
-                index += 1;
-                let raw_target = args.get(index)?.to_str()?;
-                if raw_target.contains(':') {
-                    return None;
-                }
-                target = Some(parse_target(raw_target)?);
-            }
-            "-F" => {
-                index += 1;
-                format = Some(args.get(index)?.to_str()?.to_owned());
-            }
-            "-a" | "-I" | "-l" | "-N" | "-v" | "--json" => return None,
-            "-c" | "-d" => return None,
-            value if value.starts_with('-') => return None,
-            _ => {
-                message = parse_single_tail(&args[index..])?;
-                break;
-            }
-        }
-        index += 1;
-    }
-
-    if !print || (format.is_some() && message.is_some()) {
-        return None;
-    }
-
+    let target = match parsed.target {
+        Some(target) if target.contains(':') => return None,
+        Some(target) => Some(parse_target(&target)?),
+        None => None,
+    };
     Some(TinyDisplayMessage {
         target,
-        message: format.or(message),
+        message: parsed.format.or_else(|| parsed.message.into_iter().next()),
     })
 }
 
 pub(super) fn parse_send_keys(args: &[OsString]) -> Option<TinySendKeys> {
-    if has_queue_separator(args) {
-        return None;
-    }
-
-    let mut target = None;
-    let mut keys = Vec::new();
-    let mut index = 0;
-    while index < args.len() {
-        let arg = args[index].to_str()?;
-        match arg {
-            "--" => {
-                index += 1;
-                keys = parse_string_tail(&args[index..])?;
-                break;
-            }
-            "-t" => {
-                index += 1;
-                let raw_target = args.get(index)?.to_str()?;
-                let _ = parse_pane_target(raw_target)?;
-                target = Some(raw_target.to_owned());
-            }
-            "-F" | "-H" | "-l" | "-K" | "-M" | "-p" | "-R" | "-X" => return None,
-            "-N" | "-c" => return None,
-            value if value.starts_with('-') => return None,
-            _ => {
-                keys = parse_string_tail(&args[index..])?;
-                break;
-            }
-        }
-        index += 1;
-    }
-
+    let parsed = canonical::<schema::SendKeys>(args, "t", Tail::Values)?;
     Some(TinySendKeys {
-        raw_target: target?,
-        keys,
+        raw_target: parsed.target?.raw().to_owned(),
+        keys: parsed.keys,
     })
 }
 
 pub(super) fn parse_source_file(args: &[OsString]) -> Option<TinySourceFile> {
-    if nested_multiplexer_context() || has_queue_separator(args) {
+    if nested_multiplexer_context() {
         return None;
     }
-
-    let paths = match args.first().and_then(|arg| arg.to_str())? {
-        "--" => parse_source_paths(&args[1..])?,
-        "-F" | "-n" | "-q" | "-v" | "-t" => return None,
-        value if value.starts_with('-') => return None,
-        _ => parse_source_paths(args)?,
-    };
-
-    Some(TinySourceFile {
-        paths: (!paths.is_empty()).then_some(paths)?,
-    })
+    let parsed = canonical::<schema::SourceFile>(args, "", Tail::Command)?;
+    let paths = parsed.paths;
+    if paths.is_empty() || paths.iter().any(|path| path == "-") {
+        return None;
+    }
+    Some(TinySourceFile { paths })
 }
 
 pub(super) fn parse_resize_pane(args: &[OsString]) -> Option<ResizePaneTargetActionRequest> {
-    if has_queue_separator(args) {
-        return None;
-    }
-
     let normalized = args
         .iter()
-        .map(|arg| arg.to_str().map(ToOwned::to_owned))
+        .map(|arg| arg.to_str().map(str::to_owned))
         .collect::<Option<Vec<_>>>()?;
-    let args = rmux_core::tmux_precedence::normalize_tmux_precedence("resize-pane", normalized)
-        .into_iter()
-        .map(OsString::from)
-        .collect::<Vec<_>>();
-
-    let mut target = None;
-    let mut columns = None;
-    let mut rows = None;
-    let mut relative = None;
-    let mut zoom = false;
-    let mut index = 0;
-    while index < args.len() {
-        let arg = args[index].to_str()?;
-        match arg {
-            "-t" => {
-                index += 1;
-                target = Some(args.get(index)?.to_str()?.to_owned());
-            }
-            "-x" => {
-                index += 1;
-                columns = Some(args.get(index)?.to_str()?.parse::<u16>().ok()?);
-            }
-            "-y" => {
-                index += 1;
-                rows = Some(args.get(index)?.to_str()?.parse::<u16>().ok()?);
-            }
-            "-L" => {
-                if relative.is_some() {
-                    return None;
-                }
-                let (cells, consumed) = parse_optional_relative_cells(&args, index)?;
-                if reject_trailing_args_after_direction_delta(&args, index, consumed) {
-                    return None;
-                }
-                relative = Some((ResizePaneRelativeDirection::Left, cells));
-                index += consumed;
-            }
-            "-R" => {
-                if relative.is_some() {
-                    return None;
-                }
-                let (cells, consumed) = parse_optional_relative_cells(&args, index)?;
-                if reject_trailing_args_after_direction_delta(&args, index, consumed) {
-                    return None;
-                }
-                relative = Some((ResizePaneRelativeDirection::Right, cells));
-                index += consumed;
-            }
-            "-U" => {
-                if relative.is_some() {
-                    return None;
-                }
-                let (cells, consumed) = parse_optional_relative_cells(&args, index)?;
-                if reject_trailing_args_after_direction_delta(&args, index, consumed) {
-                    return None;
-                }
-                relative = Some((ResizePaneRelativeDirection::Up, cells));
-                index += consumed;
-            }
-            "-D" => {
-                if relative.is_some() {
-                    return None;
-                }
-                let (cells, consumed) = parse_optional_relative_cells(&args, index)?;
-                if reject_trailing_args_after_direction_delta(&args, index, consumed) {
-                    return None;
-                }
-                relative = Some((ResizePaneRelativeDirection::Down, cells));
-                index += consumed;
-            }
-            "-Z" => zoom = true,
-            _ => return None,
-        }
-        index += 1;
-    }
-
-    let adjustment = if zoom {
-        ResizePaneAdjustment::Zoom
-    } else {
-        resize_adjustment(columns, rows, relative)
+    let normalized =
+        rmux_core::tmux_precedence::normalize_tmux_precedence("resize-pane", normalized)
+            .into_iter()
+            .map(OsString::from)
+            .collect::<Vec<_>>();
+    let parsed = canonical::<schema::ResizePane>(&normalized, "txyLRUDZ", Tail::Resize)?;
+    let cells = |size| match size {
+        None => Some(None),
+        Some(crate::cli_args::ResizePaneSize::Cells(value)) => Some(Some(value)),
+        _ => None,
     };
-    Some(ResizePaneTargetActionRequest { target, adjustment })
+    let relative = parsed
+        .left
+        .map(|n| (ResizePaneRelativeDirection::Left, n))
+        .or_else(|| {
+            parsed
+                .right
+                .map(|n| (ResizePaneRelativeDirection::Right, n))
+        })
+        .or_else(|| parsed.up.map(|n| (ResizePaneRelativeDirection::Up, n)))
+        .or_else(|| parsed.down.map(|n| (ResizePaneRelativeDirection::Down, n)));
+    let columns = cells(parsed.columns)?;
+    let rows = cells(parsed.rows)?;
+    Some(ResizePaneTargetActionRequest {
+        target: parsed.target.map(|target| target.raw().to_owned()),
+        adjustment: if parsed.zoom {
+            ResizePaneAdjustment::Zoom
+        } else {
+            resize_adjustment(columns, rows, relative)
+        },
+    })
+}
+
+fn nonempty(values: Vec<String>) -> Option<Vec<String>> {
+    (!values.is_empty()).then_some(values)
 }
 
 pub(super) fn has_queue_separator(args: &[OsString]) -> bool {
@@ -897,41 +330,6 @@ fn argument_has_queue_terminator(argument: &str) -> bool {
     argument
         .strip_suffix(';')
         .is_some_and(|stripped| !stripped.ends_with('\\'))
-}
-
-fn parse_capture_bound(value: &str) -> Option<(Option<i64>, bool)> {
-    if value == "-" {
-        return Some((None, true));
-    }
-    value.parse::<i64>().ok().map(|value| (Some(value), false))
-}
-
-fn parse_command_tail(args: &[OsString]) -> Option<Option<Vec<String>>> {
-    if args.is_empty() {
-        return None;
-    }
-    args.iter()
-        .map(|arg| arg.to_str().map(ToOwned::to_owned))
-        .collect::<Option<Vec<_>>>()
-        .map(Some)
-}
-
-fn parse_single_tail(args: &[OsString]) -> Option<Option<String>> {
-    let [value] = args else {
-        return None;
-    };
-    value.to_str().map(|value| Some(value.to_owned()))
-}
-
-fn parse_string_tail(args: &[OsString]) -> Option<Vec<String>> {
-    args.iter()
-        .map(|arg| arg.to_str().map(ToOwned::to_owned))
-        .collect()
-}
-
-fn parse_source_paths(args: &[OsString]) -> Option<Vec<String>> {
-    let paths = parse_string_tail(args)?;
-    paths.iter().all(|path| path != "-").then_some(paths)
 }
 
 fn parse_target(value: &str) -> Option<Target> {
@@ -998,25 +396,6 @@ fn tmux_selector_target(value: &str) -> bool {
     )
 }
 
-fn parse_optional_relative_cells(args: &[OsString], flag_index: usize) -> Option<(u16, usize)> {
-    let Some(next) = args.get(flag_index + 1).and_then(|arg| arg.to_str()) else {
-        return Some((1, 0));
-    };
-    if next.starts_with('-') {
-        return Some((1, 0));
-    }
-    let cells = next.parse::<u16>().ok()?;
-    (cells != 0).then_some((cells, 1))
-}
-
-fn reject_trailing_args_after_direction_delta(
-    args: &[OsString],
-    flag_index: usize,
-    consumed: usize,
-) -> bool {
-    consumed != 0 && flag_index + 1 + consumed < args.len()
-}
-
 fn resize_adjustment(
     columns: Option<u16>,
     rows: Option<u16>,
@@ -1049,11 +428,6 @@ fn resize_adjustment(
     }
 }
 
-fn parse_nonzero_u16(value: &str) -> Option<u16> {
-    let value = value.parse::<u16>().ok()?;
-    (value != 0).then_some(value)
-}
-
 fn build_terminal_size(cols: Option<u16>, rows: Option<u16>) -> Option<TerminalSize> {
     match (cols, rows) {
         (None, None) => None,
@@ -1070,7 +444,7 @@ fn current_working_directory_string() -> Option<String> {
         .map(|path| path.to_string_lossy().into_owned())
 }
 
-fn nested_multiplexer_context() -> bool {
+pub(super) fn nested_multiplexer_context() -> bool {
     env::var_os("RMUX").is_some_and(|value| !value.is_empty())
         || env::var_os("TMUX").is_some_and(|value| !value.is_empty())
 }

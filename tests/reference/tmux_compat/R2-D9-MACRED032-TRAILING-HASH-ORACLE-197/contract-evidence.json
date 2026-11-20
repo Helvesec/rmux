@@ -1,0 +1,124 @@
+{
+  "at": "2026-10-15T22:01:41.637538+00:00",
+  "head": "6dd1c1e6d29a3b3a4cf06188a1f543b8159f713d",
+  "files": [
+    {
+      "path": "$HOME/Projects/rmux-s1146-format-hash-20261015/tests/display_message.rs",
+      "sha256": "a8a569c64adfaa8ffecaee886e14a4a04dd368e23aa11a4064dd73d02fddd27e",
+      "size": 16834
+    },
+    {
+      "path": "$HOME/Projects/rmux-s1146-format-hash-20261015/crates/rmux-core/src/formats/expand.rs",
+      "sha256": "bfe240ff8e7a9d65ad4d68d2d2e4708a755590d979d0cd5ba688e6f492ae76f4",
+      "size": 8833
+    },
+    {
+      "path": "$HOME/Projects/rmux-s1146-format-hash-20261015/crates/rmux-core/src/formats/tests.rs",
+      "sha256": "e03c296befb3d8d48c6ff8a65a25cdd7af8a731ad4d9ba221bf8024cf81306cb",
+      "size": 5007
+    },
+    {
+      "path": "$HOME/Projects/rmux-s1146-format-hash-20261015/crates/rmux-core/src/formats/tests/skip_and_modifiers.rs",
+      "sha256": "776004ebba943d509e7d13a6d7ef26f8987572c583a9b1d01276123c5bdeeca2",
+      "size": 6928
+    },
+    {
+      "path": "$HOME/Projects/rmux-s1146-format-hash-20261015/crates/rmux-core/src/formats/tests/defaults_context.rs",
+      "sha256": "2b0069521f39d41e51145092205e066d86355ee1766c68f0f2c283dd5db12957",
+      "size": 7986
+    },
+    {
+      "path": "$HOME/Projects/rmux-s1146-format-hash-20261015/crates/rmux-core/src/formats/tests/transformations.rs",
+      "sha256": "04a67f6c192b103b34261d60905f9c152409b37fd538f69b79661b0b15083525",
+      "size": 15412
+    },
+    {
+      "path": "$HOME/Projects/rmux-s1146-format-hash-20261015/docs/tmux-compat-decisions.md",
+      "sha256": "009f40a58b8f4c4986f3bdb4db00c696c2793da4d9526a3afeab6261252fb5ff",
+      "size": 1454
+    },
+    {
+      "path": "$HOME/Projects/rmux-s1146-format-hash-20261015/tests/reference/tmux_compat/divergences.toml",
+      "sha256": "3652c6cedbb1466dd9bcdc8ec2479a227a014afd16bb9389fa6a971f6005bf2a",
+      "size": 22724
+    },
+    {
+      "path": "$HOME/Projects/rmux-s1146-format-hash-20261015/CHANGELOG.md",
+      "sha256": "4d430da0209290b0baef135edbaefcf0eae3a0ded43c3cb90dd1acf4ccab5177",
+      "size": 25752
+    },
+    {
+      "path": "private-record:decisions/[redacted]-20261003.md",
+      "sha256": "784675ee5ee799ed74863b6b8ee0218d0e85caf8a9a2b829d729a64fd2dc7163",
+      "size": 270313
+    },
+    {
+      "path": "private-record:jobs/R2-D9-MACRED032-TRAILING-HASH-ORACLE-197.json",
+      "sha256": "80cc9c2deacdf77c02ead9e6d63f716838dfb31817b2fb5b68a681d7e04cbc8c",
+      "size": 2414
+    },
+    {
+      "path": "private-record:results/S1-L191-MACRED032-TRAILING-HASH-CODE-146/REMISE.md",
+      "sha256": "1eaeaec1927dae63e7a73b24d7256f6cc7d3e13ecdd7f33fee465223c842fb68",
+      "size": 1532
+    },
+    {
+      "path": "private-record:s1-146/native-red-0.log",
+      "sha256": "d205fb28c0b59a2be01ad7d719d081c5708a9f3411dbd0e5172cf4363160aed8",
+      "size": 6341
+    },
+    {
+      "path": "private-record:s1-146/native-red-1.log",
+      "sha256": "55dd1339d5ccc03aab6de1449ef6f68b29b38d4d2cafdeb0a4fcd194210ae5e4",
+      "size": 22077
+    },
+    {
+      "path": "private-record:s1-146/native-red-2.log",
+      "sha256": "31abb229dc3f646e7f0c3f05bc56a5211c92764f9e9f28fe81d745bc8619a40e",
+      "size": 2265
+    },
+    {
+      "path": "private-record:INT267/MACOS-RED-TRACES.json",
+      "sha256": "a836c00bf1790081e1ff2860b5dd79a95e3f9d25b247bf038d93b9882684589d",
+      "size": 209271
+    }
+  ],
+  "frozen_cli": {
+    "vectors": 29,
+    "assertions_per_vector": [
+      "exit=0",
+      "stdout=expected+LF",
+      "stderr empty"
+    ],
+    "trailing_rows": [
+      [
+        "#",
+        "#"
+      ],
+      [
+        "a#",
+        "a#"
+      ],
+      [
+        "#{pane_id}#",
+        "%0#"
+      ]
+    ]
+  },
+  "published_divergence": {
+    "id": "C-D36",
+    "summary": "A trailing bare format marker remains literal",
+    "inventory": "bounded",
+    "tests": [
+      "crates/rmux-core/src/formats/tests/transformations.rs::trailing_bare_hash_is_literal_product_divergence"
+    ]
+  },
+  "history": {
+    "integration_commit": "commit 7ad3957f2f7839dc38138210576a91a7ac47ad63\nAuthor:     Example Integrator <integrator@example.invalid>\nAuthorDate: Mon Sep 28 00:14:44 2026 +0200\nCommit:     Example Integrator <integrator@example.invalid>\nCommitDate: Mon Sep 28 00:14:44 2026 +0200\n\n    Integrate accepted L6-038 trailing-hash format correction\n",
+    "integration_diff": "diff --git a/crates/rmux-core/src/formats/expand.rs b/crates/rmux-core/src/formats/expand.rs\nindex 825c8b9b6..ccdd03e68 100644\n--- a/crates/rmux-core/src/formats/expand.rs\n+++ b/crates/rmux-core/src/formats/expand.rs\n@@ -47,9 +47,8 @@ where\n         // We have a `#`. Peek at next char.\n         i += 1;\n         if i >= bytes.len() {\n-            // Keep trailing `#` literal. tmux drops it, but rmux treats a bare\n-            // marker as text unless it starts a complete expansion.\n-            out.push('#');\n+            // tmux stops at an incomplete final marker (format_expand1).\n+            // Escaped pairs have already emitted their literal hash.\n             break;\n         }\n \ndiff --git a/crates/rmux-core/src/formats/tests/defaults_context.rs b/crates/rmux-core/src/formats/tests/defaults_context.rs\nindex 96c4af95f..61feb9bc8 100644\n--- a/crates/rmux-core/src/formats/tests/defaults_context.rs\n+++ b/crates/rmux-core/src/formats/tests/defaults_context.rs\n@@ -127,11 +127,11 @@ fn malformed_or_empty_expressions_keep_compatibility_behavior() {\n #[test]\n fn edge_case_empty_template_and_boundary_hash_patterns() {\n     assert_eq!(render_template(\"\", &StaticWindowValues), \"\");\n-    assert_eq!(render_template(\"#\", &StaticWindowValues), \"#\");\n+    assert_eq!(render_template(\"#\", &StaticWindowValues), \"\");\n     assert_eq!(render_template(\"##\", &StaticWindowValues), \"#\");\n-    assert_eq!(render_template(\"###\", &StaticWindowValues), \"##\");\n+    assert_eq!(render_template(\"###\", &StaticWindowValues), \"#\");\n     assert_eq!(render_template(\"####\", &StaticWindowValues), \"##\");\n-    assert_eq!(render_template(\"text#\", &StaticWindowValues), \"text#\");\n+    assert_eq!(render_template(\"text#\", &StaticWindowValues), \"text\");\n     assert_eq!(render_template(\"#{}\", &StaticWindowValues), \"\");\n     // Unclosed `#{` — tmux drops everything from `#` onward.\n     assert_eq!(render_template(\"#{\", &StaticWindowValues), \"\");\ndiff --git a/crates/rmux-core/src/formats/tests/transformations.rs b/crates/rmux-core/src/formats/tests/transformations.rs\nindex 8ed88113a..12524123d 100644\n--- a/crates/rmux-core/src/formats/tests/transformations.rs\n+++ b/crates/rmux-core/src/formats/tests/transformations.rs\n@@ -168,8 +168,30 @@ fn substitution_uses_regex_and_case_insensitive_flag() {\n }\n \n #[test]\n-fn trailing_bare_hash_is_literal_product_divergence() {\n-    assert_eq!(render_template(\"prefix#\", &StaticWindowValues), \"prefix#\");\n+fn trailing_bare_hash_stops_expansion_like_tmux() {\n+    // tmux 3.7b format_expand1 stops at NUL after consuming the marker.\n+    // The independent Linux oracle also emits \"before\\n\" for \"before#\".\n+    for (input, expected) in [\n+        (\"#\", \"\"),\n+        (\"prefix#\", \"prefix\"),\n+        (\"é#\", \"é\"),\n+        (\"prefix##\", \"prefix#\"),\n+        (\"prefix###\", \"prefix#\"),\n+        (\"#{l:#}\", \"\"),\n+        (\"#{l:##}\", \"#\"),\n+        (\"#{session_name}#\", \"alpha\"),\n+    ] {\n+        assert_eq!(\n+            render_template(input, &StaticWindowValues),\n+            expected,\n+            \"{input}\"\n+        );\n+        assert_eq!(\n+            super::super::render_template_preserving_jobs(input, &StaticWindowValues),\n+            expected,\n+            \"preserving jobs: {input}\"\n+        );\n+    }\n }\n \n // -----------------------------------------------------------------------\n@@ -477,12 +499,12 @@ fn modifier_dirname_no_slash() {\n \n #[test]\n fn trailing_hash_in_various_positions() {\n-    assert_eq!(render_template(\"abc#\", &StaticWindowValues), \"abc#\");\n+    assert_eq!(render_template(\"abc#\", &StaticWindowValues), \"abc\");\n     assert_eq!(\n         render_template(\"#{session_name}#\", &StaticWindowValues),\n-        \"alpha#\"\n+        \"alpha\"\n     );\n-    assert_eq!(render_template(\"#####\", &StaticWindowValues), \"###\");\n+    assert_eq!(render_template(\"#####\", &StaticWindowValues), \"##\");\n }\n \n #[test]\n",
+    "ledger_at_integration": "\nsummary = \"A trailing bare format marker remains literal\"\ninventory = \"bounded\"\ntests = [\"crates/rmux-core/src/formats/tests/transformations.rs::trailing_bare_hash_is_literal_product_divergence\"]\n\n",
+    "ancestor_exit": 0
+  },
+  "trace_hash_matches_original": true,
+  "criterion_C2": "FAIL: current published C-D36 contradicts parity implementation and core tests; frozen expectation cannot be declared defective without resolving the contract."
+}

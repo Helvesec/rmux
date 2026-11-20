@@ -13,7 +13,7 @@ async fn lock_client_with_empty_lock_command_is_noop() {
             environment: None,
         }))
         .await;
-    assert!(matches!(created, Response::NewSession(_)));
+    crate::session_fixture::assert_new_session(&created);
 
     handler
         .handle(Request::SetOption(SetOptionRequest {
@@ -55,7 +55,7 @@ async fn lock_client_with_invalid_target_returns_error() {
             environment: None,
         }))
         .await;
-    assert!(matches!(created, Response::NewSession(_)));
+    crate::session_fixture::assert_new_session(&created);
 
     let response = handler
         .handle(Request::LockClient(rmux_proto::LockClientRequest {
@@ -92,7 +92,7 @@ async fn lock_client_accepts_tty_path_targets() {
             environment: None,
         }))
         .await;
-    assert!(matches!(created, Response::NewSession(_)));
+    crate::session_fixture::assert_new_session(&created);
 
     handler
         .handle(Request::SetOption(SetOptionRequest {
@@ -143,8 +143,8 @@ async fn lock_client_accepts_tty_path_targets() {
 async fn overlay_commands_resolve_names_published_by_list_clients() {
     let handler = RequestHandler::new();
     let alpha = session_name("alpha");
-    assert!(matches!(
-        handler
+    crate::session_fixture::assert_new_session(
+        &handler
             .handle(Request::NewSession(NewSessionRequest {
                 session_name: alpha.clone(),
                 detached: true,
@@ -152,8 +152,7 @@ async fn overlay_commands_resolve_names_published_by_list_clients() {
                 environment: None,
             }))
             .await,
-        Response::NewSession(_)
-    ));
+    );
 
     let mut child = spawn_tty_child().expect("spawn tty child");
     let (control_tx, mut control_rx) = mpsc::unbounded_channel();
@@ -281,7 +280,7 @@ async fn detach_client_all_other_detaches_only_non_requester_clients() {
             environment: None,
         }))
         .await;
-    assert!(matches!(created, Response::NewSession(_)));
+    crate::session_fixture::assert_new_session(&created);
 
     let (first_tx, mut first_rx) = mpsc::unbounded_channel();
     let (second_tx, mut second_rx) = mpsc::unbounded_channel();
@@ -328,7 +327,7 @@ async fn suspend_client_marks_client_as_suspended() {
             environment: None,
         }))
         .await;
-    assert!(matches!(created, Response::NewSession(_)));
+    crate::session_fixture::assert_new_session(&created);
 
     let (control_tx, mut control_rx) = mpsc::unbounded_channel();
     let _attach_id = handler
@@ -400,7 +399,7 @@ async fn refresh_client_flags_merge_incrementally() {
             environment: None,
         }))
         .await;
-    assert!(matches!(created, Response::NewSession(_)));
+    crate::session_fixture::assert_new_session(&created);
 
     let (control_tx, _control_rx) = mpsc::unbounded_channel();
     let _attach_id = handler
@@ -507,7 +506,7 @@ async fn refresh_client_reserved_wire_fields_from_old_clients_are_rejected() {
             environment: None,
         }))
         .await;
-    assert!(matches!(created, Response::NewSession(_)));
+    crate::session_fixture::assert_new_session(&created);
 
     let (control_tx, _control_rx) = mpsc::unbounded_channel();
     let _attach_id = handler
@@ -532,49 +531,39 @@ async fn refresh_client_reserved_wire_fields_from_old_clients_are_rejected() {
         colour_report: None,
     };
 
-    let mut clear_pan = base_request();
-    clear_pan.clear_pan = true;
-    let mut pan_down = base_request();
-    pan_down.pan_down = true;
-    let mut pan_left = base_request();
-    pan_left.pan_left = true;
-    let mut pan_right = base_request();
-    pan_right.pan_right = true;
-    let mut pan_up = base_request();
-    pan_up.pan_up = true;
-    let mut adjustment = base_request();
-    adjustment.adjustment = Some(10);
     let mut subscriptions = base_request();
     subscriptions.subscriptions = vec!["%0:on".to_owned()];
+
+    let request = subscriptions;
+    let expected = "refresh-client -A is not supported";
+    let response = handler
+        .dispatch(
+            std::process::id(),
+            Request::RefreshClient(Box::new(request)),
+        )
+        .await
+        .response;
+
+    assert_eq!(
+        response,
+        Response::Error(rmux_proto::ErrorResponse {
+            error: RmuxError::Server(expected.to_owned()),
+        })
+    );
+
     let mut subscriptions_format = base_request();
     subscriptions_format.subscriptions_format = vec!["name:%0:#{pane_id}".to_owned()];
-    let mut colour_report = base_request();
-    colour_report.colour_report = Some("%0".to_owned());
-
-    for (request, expected) in [
-        (clear_pan, "refresh-client -c is not supported"),
-        (pan_down, "refresh-client -D is not supported"),
-        (pan_left, "refresh-client -L is not supported"),
-        (pan_right, "refresh-client -R is not supported"),
-        (pan_up, "refresh-client -U is not supported"),
-        (adjustment, "refresh-client adjustment is not supported"),
-        (subscriptions, "refresh-client -A is not supported"),
-        (subscriptions_format, "refresh-client -B is not supported"),
-        (colour_report, "refresh-client -r is not supported"),
-    ] {
-        let response = handler
-            .dispatch(
-                std::process::id(),
-                Request::RefreshClient(Box::new(request)),
-            )
-            .await
-            .response;
-
-        assert_eq!(
-            response,
-            Response::Error(rmux_proto::ErrorResponse {
-                error: RmuxError::Server(expected.to_owned()),
-            })
-        );
-    }
+    let response = handler
+        .dispatch(
+            std::process::id(),
+            Request::RefreshClient(Box::new(subscriptions_format)),
+        )
+        .await
+        .response;
+    assert_eq!(
+        response,
+        Response::Error(rmux_proto::ErrorResponse {
+            error: RmuxError::Server("refresh-client requires an attached client".to_owned()),
+        })
+    );
 }

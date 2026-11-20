@@ -11,6 +11,9 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
+from sdk_distribution_policy import applies, chocolatey_archive, native_archive
+from notice_assets import SUFFIX, package_files, verify_contents
+
 ROOT = Path(__file__).resolve().parents[2]
 CONTRACT = ROOT / ".github/release/canonical-build-contract.json"
 SAFE_PATH = re.compile(r"[A-Za-z0-9._+@=-]+(?:/[A-Za-z0-9._+@=-]+)*")
@@ -112,6 +115,8 @@ def load_contract(path: Path) -> tuple[dict[str, Any], dict[str, dict[str, Any]]
 
 
 def asset_role(relative: str, platform: dict[str, Any]) -> str:
+    if relative.endswith(SUFFIX):
+        return asset_role(relative[:-len(SUFFIX)], platform) + "-notice"
     if relative == "SHA256SUMS.txt":
         return "checksums"
     archive_suffix = f".{platform['archive_format']}"
@@ -149,7 +154,7 @@ def verify_asset_roles(files: list[dict[str, Any]], platform: dict[str, Any]) ->
     ):
         raise ValueError("canonical supplemental role contract is invalid")
     expected.update(supplemental)
-    roles = [item["role"] for item in files]
+    roles = [item["role"] for item in package_files(files)]
     if set(roles) != expected or len(roles) != len(expected):
         raise ValueError(
             f"canonical asset roles differ: expected={sorted(expected)}, "
@@ -181,7 +186,9 @@ def verify_checksums(directory: Path, files: list[dict[str, Any]]) -> None:
         )
 
 
-def asset_files(directory: Path, platform: dict[str, Any]) -> list[dict[str, Any]]:
+def asset_files(
+    directory: Path, platform: dict[str, Any], version: str
+) -> list[dict[str, Any]]:
     if directory.is_symlink():
         raise ValueError("assets path must be one real directory")
     root = directory.resolve(strict=True)
@@ -216,7 +223,14 @@ def asset_files(directory: Path, platform: dict[str, Any]) -> list[dict[str, Any
     if not files:
         raise ValueError("canonical bundle has no assets")
     verify_asset_roles(files, platform)
+    verify_contents(root, files)
     verify_checksums(root, files)
+    if applies(version):
+        for item in files:
+            if item["role"] == "archive":
+                native_archive(root / item["path"], platform, version)
+            elif item["role"] == "chocolatey-package":
+                chocolatey_archive(root / item["path"])
     return files
 
 
@@ -317,7 +331,10 @@ def create(args: argparse.Namespace) -> str:
         },
         "build_policy": contract["build_policy"],
         "created_at": created_at,
-        "files": asset_files(args.assets_dir, platform),
+        "files": asset_files(
+            args.assets_dir, platform,
+            args.planned_release_ref.removeprefix("v").split("-rc.", maxsplit=1)[0],
+        ),
     }
     args.output.parent.mkdir(parents=True, exist_ok=True)
     args.output.write_text(
@@ -429,7 +446,10 @@ def verify(args: argparse.Namespace) -> str:
     recorded_files = record.get("files")
     if not isinstance(recorded_files, list):
         raise ValueError("canonical build record files must be an array")
-    actual_files = asset_files(args.assets_dir, platform)
+    actual_files = asset_files(
+        args.assets_dir, platform,
+        args.planned_release_ref.removeprefix("v").split("-rc.", maxsplit=1)[0],
+    )
     if recorded_files != actual_files:
         raise ValueError("downloaded canonical asset set or digest changed")
     digest = sha256_file(args.record)
@@ -451,7 +471,10 @@ def write_subjects(args: argparse.Namespace) -> None:
     platform = platforms.get(platform_record.get("key"))
     if platform is None:
         raise ValueError("canonical build record platform is unknown")
-    actual_files = asset_files(args.assets_dir, platform)
+    actual_files = asset_files(
+        args.assets_dir, platform,
+        record["planned_release_ref"].removeprefix("v").split("-rc.", maxsplit=1)[0],
+    )
     if recorded_files != actual_files:
         raise ValueError("canonical build subjects differ from the build record")
     lines = [f"{item['sha256']}  assets/{item['path']}" for item in actual_files]

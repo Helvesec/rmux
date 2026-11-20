@@ -200,10 +200,7 @@ async fn fill_transcript(handler: &RequestHandler, target: &PaneTarget) {
             .expect("pane transcript must exist")
     };
     let size = TerminalSize { cols: 80, rows: 24 };
-    let history_limit = transcript
-        .lock()
-        .expect("pane transcript mutex must not be poisoned")
-        .history_limit();
+    let history_limit = transcript.lock().history_limit();
     let mut screen = rmux_core::Screen::new(size, history_limit);
     let mut parser = rmux_core::input::InputParser::new();
     let mut content = Vec::new();
@@ -211,10 +208,7 @@ async fn fill_transcript(handler: &RequestHandler, target: &PaneTarget) {
         content.extend_from_slice(format!("line {line}\r\n").as_bytes());
     }
     parser.parse(&content, &mut screen);
-    transcript
-        .lock()
-        .expect("pane transcript mutex must not be poisoned")
-        .set_screen_for_test(screen);
+    transcript.lock().set_screen_for_test(screen);
 }
 
 // --------------------------------------------------------------------------
@@ -895,11 +889,7 @@ async fn in_copy_mode(handler: &RequestHandler, target: &PaneTarget) -> bool {
     let transcript = state
         .transcript_handle(target)
         .expect("pane transcript must exist");
-    let in_mode = transcript
-        .lock()
-        .expect("pane transcript mutex must not be poisoned")
-        .copy_mode_state()
-        .is_some();
+    let in_mode = transcript.lock().copy_mode_state().is_some();
     in_mode
 }
 
@@ -1457,4 +1447,32 @@ async fn mode_tree_overlay_still_wins_over_the_copy_mode_table() {
         "",
         "the copy-mode binding must not fire while the mode tree is open"
     );
+}
+
+#[tokio::test]
+async fn root_escape_binding_wins_on_the_bare_escape_path() {
+    let handler = RequestHandler::new();
+    let alpha = session_name("root-escape");
+    let requester_pid = std::process::id();
+    create_quiet_input_session(&handler, &alpha).await;
+    let _control_rx = attach(&handler, requester_pid, &alpha).await;
+    bind(
+        &handler,
+        "root",
+        "Escape",
+        &["set-option", "-g", PROBE, "HIT-Escape"],
+    )
+    .await;
+    let mut pending_input = Vec::new();
+    handler
+        .handle_attached_live_input(requester_pid, &mut pending_input, b"\x1b")
+        .await
+        .expect("retain Escape");
+    assert_eq!(pending_input, b"\x1b");
+    assert!(!handler
+        .flush_attached_pending_escape_input(requester_pid, &mut pending_input)
+        .await
+        .expect("dispatch completed Escape"));
+    assert_eq!(probe_value(&handler, PROBE).await, "HIT-Escape");
+    assert!(pending_input.is_empty());
 }

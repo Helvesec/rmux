@@ -1,9 +1,10 @@
 //! Acceptance test for revision-driven redraw progression.
 //!
-//! The server supplies a strictly monotone `PaneSnapshot::revision` whenever
-//! visible pane state changes. `ratatui-rmux` must treat each changed revision
-//! as one redraw opportunity and must never skip a later snapshot in a normal
-//! progression.
+//! The daemon advances `PaneSnapshot::revision` when a capture observes a
+//! state that differs from the pane's previous capture; a change that no
+//! capture observed does not advance it. `ratatui-rmux` must treat each changed
+//! revision as one redraw opportunity and must never skip a later snapshot in a
+//! normal progression.
 
 use ratatui_core::buffer::Buffer;
 use ratatui_core::layout::Rect;

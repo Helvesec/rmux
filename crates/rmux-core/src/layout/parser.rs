@@ -1,3 +1,4 @@
+use crate::PaneId;
 use rmux_proto::RmuxError;
 
 use super::{LayoutCell, LayoutDirection, LayoutGeometry};
@@ -7,11 +8,16 @@ const MAX_LAYOUT_PARSE_DEPTH: usize = 128;
 pub(super) struct LayoutParser<'a> {
     input: &'a str,
     offset: usize,
+    next_leaf: u32,
 }
 
 impl<'a> LayoutParser<'a> {
     pub(super) const fn new(input: &'a str) -> Self {
-        Self { input, offset: 0 }
+        Self {
+            input,
+            offset: 0,
+            next_leaf: 0,
+        }
     }
 
     pub(super) fn is_eof(&self) -> bool {
@@ -89,7 +95,11 @@ impl<'a> LayoutParser<'a> {
                     children,
                 ))
             }
-            Some(',') | Some('}') | Some(']') | None => Ok(LayoutCell::pane(geometry)),
+            Some(',') | Some('}') | Some(']') | None => {
+                let id = PaneId::new(self.next_leaf);
+                self.next_leaf += 1;
+                Ok(LayoutCell::pane(id, geometry))
+            }
             _ => Err(RmuxError::Server("invalid layout".to_owned())),
         }
     }

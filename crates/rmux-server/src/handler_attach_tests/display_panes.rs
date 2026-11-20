@@ -5,8 +5,8 @@ async fn attached_prefix_q_repaints_status_line_after_status_message() {
     let handler = RequestHandler::new();
     let requester_pid = std::process::id();
     let alpha = session_name("alpha");
-    assert!(matches!(
-        handler
+    crate::session_fixture::assert_new_session(
+        &handler
             .handle(Request::NewSession(NewSessionRequest {
                 session_name: alpha.clone(),
                 detached: true,
@@ -14,8 +14,7 @@ async fn attached_prefix_q_repaints_status_line_after_status_message() {
                 environment: None,
             }))
             .await,
-        Response::NewSession(_)
-    ));
+    );
     let (control_tx, mut control_rx) = mpsc::unbounded_channel();
     handler
         .register_attach(requester_pid, alpha.clone(), control_tx)
@@ -809,6 +808,7 @@ async fn attached_prefix_q_inside_choose_tree_restores_the_tree_overlay_without_
                         break overlay;
                     }
                 }
+                AttachControl::CoalescedPopupOverlay(_) => panic!("unexpected popup overlay"),
                 AttachControl::AdvancePersistentOverlayState(_) => {}
                 AttachControl::Switch(_) => {}
                 AttachControl::Refresh => {}
@@ -919,3 +919,6 @@ async fn old_display_panes_timer_cannot_clear_same_pid_replacement_state() {
         "same-PID replacement display-panes state must survive the old timer"
     );
 }
+
+mod display_panes_session;
+mod display_panes_session_action;

@@ -1,11 +1,14 @@
 #![cfg(unix)]
 
+#[path = "support/executable_fixture.rs"]
+mod executable_fixture;
+
 use serde_json::{json, Value};
 use std::collections::BTreeMap;
 use std::fs;
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
-use std::os::unix::fs::{symlink, PermissionsExt};
+use std::os::unix::fs::symlink;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -203,16 +206,20 @@ fn write_json(path: &Path, value: &Value) {
 }
 
 fn sha256(path: &Path) -> String {
-    let output = Command::new("sha256sum")
+    let output = Command::new("python3")
+        .args([
+            "-c",
+            "import hashlib, pathlib, sys; print(hashlib.sha256(pathlib.Path(sys.argv[1]).read_bytes()).hexdigest())",
+        ])
         .arg(path)
         .output()
-        .expect("run sha256sum");
+        .unwrap_or_else(|error| panic!("hash publisher fixture {}: {error}", path.display()));
     assert!(output.status.success());
     String::from_utf8(output.stdout)
-        .expect("sha256sum UTF-8")
+        .expect("SHA-256 UTF-8")
         .split_whitespace()
         .next()
-        .expect("sha256sum output")
+        .expect("SHA-256 output")
         .to_owned()
 }
 
@@ -341,16 +348,12 @@ fn fixture(active: bool) -> Fixture {
         }]),
     );
     let gh_verifier = root.join("gh");
-    fs::write(
+    executable_fixture::write_executable(
         &gh_verifier,
         format!("#!/bin/sh\ncat '{}'\n", verification.display()),
+        0o700,
     )
     .expect("write fake attestation verifier");
-    let mut permissions = fs::metadata(&gh_verifier)
-        .expect("fake verifier metadata")
-        .permissions();
-    permissions.set_mode(0o700);
-    fs::set_permissions(&gh_verifier, permissions).expect("make fake verifier executable");
     let envelope = root.join("promotion-authorization-envelope.json");
     write_json(
         &envelope,

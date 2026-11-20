@@ -10,16 +10,28 @@ mod colour;
 mod commands;
 mod csi_helpers;
 mod dispatch;
+mod extended_keys;
+mod keyboard;
 pub mod mode;
+mod mode_query;
 mod params;
 mod passthrough;
+mod program_status_osc;
 mod recovery;
+mod rgb;
 mod sgr;
+mod shell_marks;
+mod state_machine;
 mod states;
 mod tables;
+mod theme;
+pub use extended_keys::ExtendedKeyPolicy;
+
+pub use theme::{ThemeAction, ThemeEvent};
 #[cfg(test)]
 mod tests;
 mod writer;
+pub use rgb::colour_to_rgb;
 
 pub use cell::{CellState, GridAttr, SavedState};
 pub use colour::{
@@ -28,10 +40,10 @@ pub use colour::{
 };
 pub use dispatch::{CsiCommand, DcsPayload, EscCommand, InputAction, OscCommand, ScreenWriter};
 pub use params::{InputParam, ParamType};
+pub(crate) use shell_marks::ShellMark;
 pub use states::InputState;
 
 use params::ParamList;
-use states::Transition;
 
 use crate::terminal_passthrough::MAX_TERMINAL_PASSTHROUGH_PAYLOAD_BYTES;
 
@@ -110,10 +122,14 @@ pub struct InputParser {
     /// Raw parameter buffer.
     param_buf: [u8; PARAM_BUF_MAX],
     param_len: usize,
+    keyboard_parameters: Vec<u8>,
+    keyboard_parameters_overlong: bool,
 
     /// Dynamic input/string buffer.
     input_buf: Vec<u8>,
     input_buf_max: usize,
+    /// OSC 133 waiting for the second byte of ST.
+    pending_shell_integration: Option<String>,
     /// Which terminator ended the string.
     input_end: InputEndType,
 
@@ -135,7 +151,7 @@ pub struct InputParser {
     last_char: Option<char>,
     /// Whether this parse call emitted a printable character before REP.
     printed_in_current_parse: bool,
-    /// A typed REP transition consumed parser state that ANSI cannot restore.
+    /// Parsing consumed state a raw ANSI continuation cannot restore.
     recovery_rebase_required: bool,
 
     /// Bytes accumulated since last ground state, for control-mode catch-up.
@@ -147,12 +163,15 @@ pub struct InputParser {
 
     /// Reply buffer: replies to be sent back to the PTY.
     reply_buf: Vec<u8>,
+    theme_events: Vec<ThemeEvent>,
+    theme_events_enabled: bool,
     /// Dropped terminal passthrough events caused by parser string limits.
     terminal_passthrough_dropped_count: u64,
 
     /// Application-set OSC 10/11/12 colours (fg, bg, cursor). The daemon does
     /// not invent colours for an unknown attached terminal palette.
     osc_colours: [Option<String>; 3],
+    pub(crate) query_colours: [Option<[u8; 3]>; 2],
 }
 
 impl InputParser {
@@ -167,8 +186,11 @@ impl InputParser {
             interm_len: 0,
             param_buf: [0; PARAM_BUF_MAX],
             param_len: 0,
+            keyboard_parameters: Vec::new(),
+            keyboard_parameters_overlong: false,
             input_buf: Vec::with_capacity(INPUT_BUF_START),
             input_buf_max: INPUT_BUF_MAX,
+            pending_shell_integration: None,
             input_end: InputEndType::St,
             param_list: ParamList::new(),
             cell: CellState::default(),
@@ -183,37 +205,12 @@ impl InputParser {
             since_ground: Vec::new(),
             ground_timer_active: false,
             reply_buf: Vec::new(),
+            theme_events: Vec::new(),
+            theme_events_enabled: false,
             terminal_passthrough_dropped_count: 0,
             osc_colours: [None, None, None],
+            query_colours: [None, None],
         }
-    }
-
-    /// Returns an application-defined colour for an OSC 10/11/12 query.
-    pub(crate) fn osc_colour(&self, slot: OscColourSlot) -> Option<&str> {
-        self.osc_colours[slot.index()].as_deref()
-    }
-
-    /// Records an application-set OSC 10/11/12 colour so later queries
-    /// round-trip the value.
-    pub(crate) fn set_osc_colour(&mut self, slot: OscColourSlot, value: &str) {
-        // A stored colour is reflected verbatim to every later query, so bound
-        // it to a sane colour-spec length: otherwise a pane could set a huge
-        // (up to input-buffer-sized) value and then flood queries in one read
-        // batch, amplifying it into unbounded reply memory and OOM-ing the
-        // daemon. A real X11 / `rgb:` / `#rrggbb` spec is far shorter; longer
-        // values are not colours and are left unstored, so queries keep
-        // answering the prior value or remain silent when the palette is
-        // unknown.
-        const OSC_COLOUR_MAX_LEN: usize = 64;
-        if value.len() > OSC_COLOUR_MAX_LEN {
-            return;
-        }
-        self.osc_colours[slot.index()] = Some(value.to_owned());
-    }
-
-    /// Resets an OSC colour back to unknown (OSC 110/111/112).
-    pub(crate) fn reset_osc_colour(&mut self, slot: OscColourSlot) {
-        self.osc_colours[slot.index()] = None;
     }
 
     /// Updates the maximum regular string buffer size used for OSC/DCS input.
@@ -238,9 +235,7 @@ impl InputParser {
 
     /// Returns and drains terminal passthrough drops caused by parser limits.
     pub(crate) fn take_terminal_passthrough_dropped_count(&mut self) -> u64 {
-        let dropped = self.terminal_passthrough_dropped_count;
-        self.terminal_passthrough_dropped_count = 0;
-        dropped
+        std::mem::take(&mut self.terminal_passthrough_dropped_count)
     }
 
     /// Returns and drains accumulated since-ground bytes.
@@ -279,6 +274,7 @@ impl InputParser {
 
     /// Resets the parser to ground state.
     pub fn reset_to_ground(&mut self) {
+        self.pending_shell_integration = None;
         self.clear();
         self.state = InputState::Ground;
         self.flags = 0;
@@ -372,161 +368,10 @@ impl InputParser {
         true
     }
 
-    fn find_transition(&self) -> Transition {
-        self.state.transition_for_byte(self.ch)
-    }
-
-    fn execute_transition<W: ScreenWriter + ?Sized>(&mut self, trans: Transition, writer: &mut W) {
-        // Any state except print stops collect_end equivalent.
-        if !matches!(
-            trans.handler,
-            states::Handler::Print | states::Handler::TopBitSet
-        ) {
-            writer.collect_end();
-        }
-
-        // Execute handler; if it returns true, skip state transition.
-        let skip_state = match trans.handler {
-            states::Handler::None => false,
-            states::Handler::Print => self.handle_print(writer),
-            states::Handler::C0Dispatch => self.handle_c0_dispatch(writer),
-            states::Handler::EscDispatch => self.handle_esc_dispatch(writer),
-            states::Handler::CsiDispatch => self.handle_csi_dispatch(writer),
-            states::Handler::DcsDispatch => self.handle_dcs_dispatch(writer),
-            states::Handler::Intermediate => self.handle_intermediate(),
-            states::Handler::Parameter => self.handle_parameter(),
-            states::Handler::Input => self.handle_input(),
-            states::Handler::TopBitSet => self.handle_top_bit_set(writer),
-            states::Handler::EndBel => self.handle_end_bel(),
-        };
-
-        if skip_state {
-            return;
-        }
-
-        if self.should_recover_tmux_passthrough_osc_bel() {
-            self.input_end = InputEndType::Bel;
-            self.handle_dcs_dispatch(writer);
-            self.set_state(InputState::Ground, writer);
-            return;
-        }
-
-        if let Some(next) = trans.next_state {
-            self.set_state(next, writer);
-        }
-
-        // If not in ground state, save byte to since_ground.
-        if self.state != InputState::Ground && self.since_ground.len() < self.input_buf_max {
-            self.since_ground.push(self.ch);
-        }
-    }
-
-    fn set_state<W: ScreenWriter + ?Sized>(&mut self, next: InputState, writer: &mut W) {
-        // Call exit handler for current state.
-        self.exit_state(writer);
-        self.state = next;
-        // Call enter handler for new state.
-        self.enter_state(writer);
-    }
-
-    fn enter_state<W: ScreenWriter + ?Sized>(&mut self, writer: &mut W) {
-        match self.state {
-            InputState::Ground => self.enter_ground(),
-            InputState::EscEnter => self.clear(),
-            InputState::CsiEnter => self.clear(),
-            InputState::DcsEnter => self.enter_dcs(),
-            InputState::OscString => self.enter_osc(),
-            InputState::ApcString => self.enter_apc(),
-            InputState::RenameString => self.enter_rename(),
-            InputState::ConsumeSt => self.enter_rename(), // same as rename in tmux
-            _ => {}
-        }
-        let _ = writer; // writer not needed for enter handlers currently
-    }
-
-    fn exit_state<W: ScreenWriter + ?Sized>(&mut self, writer: &mut W) {
-        match self.state {
-            InputState::OscString => self.exit_osc(writer),
-            InputState::ApcString => self.exit_apc(writer),
-            InputState::RenameString => self.exit_rename(writer),
-            _ => {}
-        }
-    }
-
-    fn clear(&mut self) {
-        self.ground_timer_active = false;
-        self.interm_buf = [0; INTERM_BUF_MAX];
-        self.interm_len = 0;
-        self.param_buf = [0; PARAM_BUF_MAX];
-        self.param_len = 0;
-        self.input_buf.clear();
-        self.input_end = InputEndType::St;
-        self.flags &= !INPUT_DISCARD;
-    }
-
-    fn enter_ground(&mut self) {
-        self.ground_timer_active = false;
-        self.since_ground.clear();
-        // Shrink input buffer back to start size.
-        if self.input_buf.capacity() > INPUT_BUF_START {
-            self.input_buf = Vec::with_capacity(INPUT_BUF_START);
-        }
-    }
-
-    fn enter_dcs(&mut self) {
-        self.clear();
-        self.ground_timer_active = true;
-        self.flags &= !INPUT_LAST;
-    }
-
-    fn enter_osc(&mut self) {
-        self.clear();
-        self.ground_timer_active = true;
-        self.flags &= !INPUT_LAST;
-    }
-
-    fn enter_apc(&mut self) {
-        self.clear();
-        self.ground_timer_active = true;
-        self.flags &= !INPUT_LAST;
-    }
-
-    fn enter_rename(&mut self) {
-        self.clear();
-        self.ground_timer_active = true;
-        self.flags &= !INPUT_LAST;
-    }
-
-    fn exit_osc<W: ScreenWriter + ?Sized>(&mut self, writer: &mut W) {
-        if self.flags & INPUT_DISCARD != 0 {
-            return;
-        }
-        dispatch::dispatch_osc(self, writer);
-    }
-
-    fn exit_apc<W: ScreenWriter + ?Sized>(&mut self, writer: &mut W) {
-        if self.flags & INPUT_DISCARD != 0 {
-            return;
-        }
-        if passthrough::is_kitty_graphics_apc(&self.input_buf) {
-            writer.apc_passthrough(&self.input_buf);
-            return;
-        }
-        let buf = String::from_utf8_lossy(&self.input_buf).into_owned();
-        writer.set_title(&buf);
-    }
-
-    fn exit_rename<W: ScreenWriter + ?Sized>(&mut self, writer: &mut W) {
-        if self.flags & INPUT_DISCARD != 0 {
-            return;
-        }
-        let buf = String::from_utf8_lossy(&self.input_buf).into_owned();
-        writer.set_window_name(&buf);
-    }
-
     /// Stop any in-progress UTF-8 sequence and emit U+FFFD.
     fn stop_utf8<W: ScreenWriter + ?Sized>(&mut self, writer: &mut W) {
         if self.utf8_started {
+            writer.collect_end();
             writer.collect_add('\u{FFFD}', &self.cell);
             self.utf8_started = false;
             self.utf8_len = 0;
@@ -564,6 +409,7 @@ impl InputParser {
     }
 
     fn handle_parameter(&mut self) -> bool {
+        self.collect_keyboard_parameter();
         if self.param_len >= PARAM_BUF_MAX - 1 {
             self.flags |= INPUT_DISCARD;
         } else {
@@ -612,30 +458,6 @@ impl InputParser {
                 && (self.input_buf.first() == Some(&b'q') || self.input_buf.starts_with(b"tmux;")))
     }
 
-    fn should_recover_tmux_passthrough_osc_bel(&self) -> bool {
-        if self.state != InputState::DcsHandler || self.ch != 0x07 || self.interm_len != 0 {
-            return false;
-        }
-
-        let Some(payload) = self.input_buf.strip_prefix(b"tmux;") else {
-            return false;
-        };
-
-        payload.starts_with(b"\x1b]") || payload.first() == Some(&0x9d)
-    }
-
-    fn handle_end_bel(&mut self) -> bool {
-        self.input_end = InputEndType::Bel;
-        false
-    }
-
-    fn handle_c0_dispatch<W: ScreenWriter + ?Sized>(&mut self, writer: &mut W) -> bool {
-        self.stop_utf8(writer);
-        dispatch::dispatch_c0(self, writer);
-        self.flags &= !INPUT_LAST;
-        false
-    }
-
     fn handle_esc_dispatch<W: ScreenWriter + ?Sized>(&mut self, writer: &mut W) -> bool {
         if self.flags & INPUT_DISCARD != 0 {
             return false;
@@ -646,6 +468,10 @@ impl InputParser {
     }
 
     fn handle_csi_dispatch<W: ScreenWriter + ?Sized>(&mut self, writer: &mut W) -> bool {
+        if self.dispatch_keyboard_control(writer) {
+            self.flags &= !INPUT_LAST;
+            return false;
+        }
         if self.flags & INPUT_DISCARD != 0 {
             return false;
         }
@@ -668,15 +494,9 @@ impl InputParser {
         if !self.utf8_started {
             self.utf8_started = true;
             self.utf8_len = 0;
-            // Determine expected byte count from first byte.
-            let expected = if self.ch & 0xE0 == 0xC0 {
-                2
-            } else if self.ch & 0xF0 == 0xE0 {
-                3
-            } else if self.ch & 0xF8 == 0xF0 {
-                4
-            } else {
-                // Invalid start byte.
+            // tmux utf8_open: only C2..DF, E0..EF and F0..F4 open a sequence;
+            // any other byte is one U+FFFD on its own.
+            let Some(expected) = utf8_sequence_size(self.ch) else {
                 self.stop_utf8(writer);
                 return false;
             };
@@ -686,41 +506,26 @@ impl InputParser {
             return false;
         }
 
-        // Continuation byte.
-        if self.ch & 0xC0 != 0x80 {
-            // Not a valid continuation: emit replacement and re-process.
-            self.stop_utf8(writer);
-            // Re-start UTF-8 with current byte if it's a start byte.
-            if self.ch >= 0x80 {
-                return self.handle_top_bit_set(writer);
-            }
-            return false;
-        }
-
-        self.utf8_buf[self.utf8_len as usize] = self.ch;
+        // tmux utf8_append: every top-bit byte is consumed until the size
+        // announced by the lead byte is reached, even one that is not a
+        // continuation; such a byte only makes the whole sequence one U+FFFD.
+        self.utf8_buf[usize::from(self.utf8_len)] = self.ch;
         self.utf8_len += 1;
 
         if self.utf8_len < self.utf8_expected {
             return false; // More bytes expected.
         }
 
-        // Complete: decode.
+        // Complete: decode. A non-continuation byte, an overlong form or a
+        // surrogate fails here and yields a single U+FFFD for the sequence.
+        let decoded = std::str::from_utf8(&self.utf8_buf[..usize::from(self.utf8_len)])
+            .ok()
+            .and_then(|s| s.chars().next());
+        let Some(c) = decoded else {
+            self.stop_utf8(writer);
+            return false;
+        };
         self.utf8_started = false;
-        let bytes = &self.utf8_buf[..self.utf8_len as usize];
-        let s = match std::str::from_utf8(bytes) {
-            Ok(s) => s,
-            Err(_) => {
-                writer.collect_add('\u{FFFD}', &self.cell);
-                return false;
-            }
-        };
-        let c = match s.chars().next() {
-            Some(c) => c,
-            None => {
-                writer.collect_add('\u{FFFD}', &self.cell);
-                return false;
-            }
-        };
 
         writer.collect_add(c, &self.cell);
 
@@ -748,7 +553,7 @@ impl InputParser {
     }
 
     /// Returns and clears the signal that raw recovery needs an authoritative
-    /// rebase because REP consumed parser-only state from an earlier feed.
+    /// rebase for inter-feed REP or a cursor reset using a configured default.
     #[must_use]
     pub(crate) fn take_recovery_rebase_required(&mut self) -> bool {
         std::mem::take(&mut self.recovery_rebase_required)
@@ -758,5 +563,17 @@ impl InputParser {
 impl Default for InputParser {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+/// Byte count announced by a UTF-8 lead byte, as tmux `utf8_open` accepts it,
+/// or `None` for a byte that cannot open a sequence (C0, C1, F5..FF and the
+/// continuation range).
+const fn utf8_sequence_size(lead: u8) -> Option<u8> {
+    match lead {
+        0xC2..=0xDF => Some(2),
+        0xE0..=0xEF => Some(3),
+        0xF0..=0xF4 => Some(4),
+        _ => None,
     }
 }

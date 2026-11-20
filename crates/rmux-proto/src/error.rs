@@ -1,8 +1,5 @@
 //! Shared protocol error types.
 
-use serde::{Deserialize, Serialize};
-use thiserror::Error;
-
 use crate::{PaneId, SessionName};
 
 /// Stable daemon message when a respawn refuses to replace a live pane.
@@ -14,113 +11,114 @@ pub const PROCESS_COMMAND_EMPTY_MESSAGE: &str = "process command must not be emp
 /// Stable daemon message prefix for owned-session lease loss.
 pub const OWNED_SESSION_LEASE_LOST_MESSAGE_PREFIX: &str = "owned session lease lost";
 
-/// Shared protocol and validation errors.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Error)]
-pub enum RmuxError {
+mod registry;
+use registry::define_errors;
+
+define_errors! {
     /// A session name was empty.
     #[error("invalid session name: session names must be non-empty")]
-    EmptySessionName,
+    EmptySessionName [] => Self::EmptySessionName, "empty_session_name";
     /// A session name contained `:` or `.`.
     #[error("invalid session name: session names must not contain ':' or '.'")]
-    InvalidSessionNameCharacter,
+    InvalidSessionNameCharacter [] => Self::InvalidSessionNameCharacter, "invalid_session_name_character";
     /// A target string failed exact detached parsing.
     #[error("invalid target '{value}': {reason}")]
-    InvalidTarget {
+    InvalidTarget [{
         /// The original target string.
         value: String,
         /// The validation failure reason.
         reason: String,
-    },
+    }] => Self::InvalidTarget { .. }, "invalid_target";
     /// An unsupported public command name was requested.
     #[error("unknown command: {0}")]
-    UnknownCommand(String),
+    UnknownCommand [(String)] => Self::UnknownCommand(..), "unknown_command";
     /// A session name collided with an existing session.
     #[error("duplicate session: {0}")]
-    DuplicateSession(String),
+    DuplicateSession [(String)] => Self::DuplicateSession(..), "duplicate_session";
     /// A session target did not resolve.
     #[error("session not found: {0}")]
-    SessionNotFound(String),
+    SessionNotFound [(String)] => Self::SessionNotFound(..), "session_not_found";
     /// The server encountered an unexpected runtime failure.
     #[error("server error: {0}")]
-    Server(String),
+    Server [(String)] => Self::Server(..), "server";
     /// A command surfaced an exact tmux-compatible user-facing error.
     #[error("{0}")]
-    Message(String),
+    Message [(String)] => Self::Message(..), "message";
     /// A `set-option` request violated the supported contract.
     #[error("invalid set-option request: {0}")]
-    InvalidSetOption(String),
+    InvalidSetOption [(String)] => Self::InvalidSetOption(..), "invalid_set_option";
     /// A codec frame claimed a payload larger than the configured maximum.
     #[error("codec frame length {length} exceeds maximum {maximum}")]
-    FrameTooLarge {
+    FrameTooLarge [{
         /// The announced frame payload length.
         length: usize,
         /// The configured maximum payload length.
         maximum: usize,
-    },
+    }] => Self::FrameTooLarge { .. }, "frame_too_large";
     /// A codec frame announced an empty payload.
     #[error("codec frame payloads must not be empty")]
-    EmptyFrame,
+    EmptyFrame [] => Self::EmptyFrame, "empty_frame";
     /// A frame did not start with the RMUX frame magic byte.
     #[error("bad RMUX frame magic: expected 0x52, got 0x{0:02x}")]
-    BadFrameMagic(u8),
+    BadFrameMagic [(u8)] => Self::BadFrameMagic(..), "bad_frame_magic";
     /// A frame used a wire version this build does not support.
     #[error("unsupported RMUX wire version {got}; supported range is {minimum}..={maximum}")]
-    UnsupportedWireVersion {
+    UnsupportedWireVersion [{
         /// The wire version advertised by the frame.
         got: u32,
         /// The minimum supported wire version.
         minimum: u32,
         /// The maximum supported wire version.
         maximum: u32,
-    },
+    }] => Self::UnsupportedWireVersion { .. }, "unsupported_wire_version";
     /// A capability required by the caller is not supported by the daemon.
     #[error(
         "unsupported RMUX capability `{feature}`; supported capabilities: {}",
         supported.join(", ")
     )]
-    UnsupportedCapability {
+    UnsupportedCapability [{
         /// Stable capability id requested by the caller.
         feature: String,
         /// Capability ids supported by the daemon.
         supported: Vec<String>,
-    },
+    }] => Self::UnsupportedCapability { .. }, "unsupported_capability";
     /// A full frame was requested but the buffer stopped early.
     #[error("incomplete frame: expected {expected} payload bytes, received {received}")]
-    IncompleteFrame {
+    IncompleteFrame [{
         /// The payload bytes expected by the frame header.
         expected: usize,
         /// The payload bytes actually available.
         received: usize,
-    },
+    }] => Self::IncompleteFrame { .. }, "incomplete_frame";
     /// Bincode encoding failed.
     #[error("failed to encode frame payload: {0}")]
-    Encode(String),
+    Encode [(String)] => Self::Encode(..), "encode";
     /// Bincode decoding failed.
     #[error("failed to decode frame payload: {0}")]
-    Decode(String),
+    Decode [(String)] => Self::Decode(..), "decode";
     /// A stable pane id did not resolve in the addressed session.
     #[error("invalid target '{session_name}:{pane_id}': pane id does not exist in session")]
-    PaneNotFound {
+    PaneNotFound [{
         /// Session searched for the pane id.
         session_name: SessionName,
         /// Stable pane id requested by the caller.
         pane_id: PaneId,
-    },
+    }] => Self::PaneNotFound { .. }, "pane_not_found";
     /// A pane still has a running process and replacement was not requested.
     #[error("{PANE_STILL_ACTIVE_MESSAGE}")]
-    ProcessStillRunning,
+    ProcessStillRunning [] => Self::ProcessStillRunning, "process_still_running";
     /// A daemon-side process spawn failed.
     #[error("{message}")]
-    SpawnFailed {
+    SpawnFailed [{
         /// Spawn failure diagnostic.
         message: String,
-    },
+    }] => Self::SpawnFailed { .. }, "spawn_failed";
     /// A daemon-side owned-session lease was not found or no longer matches.
     #[error("{OWNED_SESSION_LEASE_LOST_MESSAGE_PREFIX} for {session_name}")]
-    OwnedSessionLeaseLost {
+    OwnedSessionLeaseLost [{
         /// Session whose lease no longer exists or no longer matches.
         session_name: SessionName,
-    },
+    }] => Self::OwnedSessionLeaseLost { .. }, "owned_session_lease_lost";
 }
 
 impl RmuxError {
@@ -130,6 +128,23 @@ impl RmuxError {
         Self::InvalidTarget {
             value: value.into(),
             reason: reason.into(),
+        }
+    }
+
+    /// Returns the text tmux prints for this error when no command-specific
+    /// spelling applies.
+    ///
+    /// Lookup failures keep tmux's own `can't find ...` reason without the
+    /// typed `invalid target '...':` prefix, and server-side messages drop the
+    /// `server error:` prefix. Every other error keeps its typed display.
+    #[must_use]
+    pub fn tmux_message(&self) -> String {
+        match self {
+            Self::InvalidTarget { reason, .. } if reason.starts_with("can't find ") => {
+                reason.clone()
+            }
+            Self::Server(message) => message.clone(),
+            other => other.to_string(),
         }
     }
 
@@ -175,6 +190,30 @@ mod tests {
             .and_then(|bytes| bytes.try_into().ok())
             .expect("enum tag is encoded as leading u32");
         u32::from_le_bytes(tag)
+    }
+
+    #[test]
+    fn tmux_message_drops_typed_prefixes_only_where_tmux_has_none() {
+        assert_eq!(
+            RmuxError::invalid_target("missing", "can't find session: missing").tmux_message(),
+            "can't find session: missing"
+        );
+        assert_eq!(
+            RmuxError::invalid_target("alpha:9", "can't find window: 9").tmux_message(),
+            "can't find window: 9"
+        );
+        assert_eq!(
+            RmuxError::Server("no sessions".to_owned()).tmux_message(),
+            "no sessions"
+        );
+        assert_eq!(
+            RmuxError::invalid_target("alpha:1", "only window index 0 is supported").tmux_message(),
+            "invalid target 'alpha:1': only window index 0 is supported"
+        );
+        assert_eq!(
+            RmuxError::DuplicateSession("alpha".to_owned()).tmux_message(),
+            "duplicate session: alpha"
+        );
     }
 
     #[test]

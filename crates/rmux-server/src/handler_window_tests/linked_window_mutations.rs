@@ -72,7 +72,7 @@ async fn linked_mutation_fixture(handler: &RequestHandler, label: &str) -> Linke
         ] {
             state
                 .sessions
-                .session_mut(target.session_name())
+                .session_setup(target.session_name())
                 .expect("fixture session exists")
                 .select_pane_in_window(target.window_index(), 0)
                 .expect("fixture pane zero selection succeeds");
@@ -272,6 +272,87 @@ async fn pane_selection_resize_failure_rolls_back_every_alias_and_the_shared_run
             .window_runtime_resize_count_for_test(),
         resize_count_before + 2,
         "failed commit and runtime rollback must each issue one bounded resize"
+    );
+}
+
+#[tokio::test]
+async fn stable_id_pane_resize_failure_rolls_back_every_alias_and_the_shared_runtime() {
+    let handler = RequestHandler::new();
+    let fixture = linked_mutation_fixture(&handler, "linked-pane-resize-rollback").await;
+    let window_before = {
+        let state = handler.state.lock().await;
+        state
+            .sessions
+            .session(&fixture.owner)
+            .and_then(|session| session.window_at(0))
+            .expect("owner window exists")
+            .clone()
+    };
+    let terminal_sizes_before = [
+        pane_terminal_size(&handler, &fixture.owner, 0, 0).await,
+        pane_terminal_size(&handler, &fixture.owner, 0, 1).await,
+    ];
+    let resize_count_before = {
+        let mut state = handler.state.lock().await;
+        let count = state.window_runtime_resize_count_for_test();
+        state.fail_next_resize_for_test();
+        count
+    };
+
+    let response = handler
+        .handle(Request::PaneResize(PaneResizeRequest {
+            target: PaneTargetRef::by_id(fixture.owner.clone(), fixture.pane_one_id),
+            // A top/bottom split needs a height change to reach the runtime resize.
+            adjustment: ResizePaneAdjustment::AbsoluteHeight { rows: 12 },
+        }))
+        .await;
+    assert_eq!(
+        response,
+        Response::Error(rmux_proto::ErrorResponse {
+            error: rmux_proto::RmuxError::Server(
+                "injected pane terminal resize failure".to_owned(),
+            ),
+        })
+    );
+
+    let state = handler.state.lock().await;
+    for target in fixture.targets() {
+        assert_eq!(
+            state
+                .sessions
+                .session(target.session_name())
+                .and_then(|session| session.window_at(target.window_index()))
+                .expect("window alias exists"),
+            &window_before,
+            "failed resize left a changed alias at {target}"
+        );
+    }
+    for pane in window_before.panes() {
+        assert_eq!(
+            state
+                .pane_lifecycle(pane.id())
+                .expect("pane lifecycle remains stored")
+                .dimensions(),
+            TerminalSize {
+                cols: pane.geometry().cols(),
+                rows: pane.geometry().rows(),
+            },
+            "failed resize changed lifecycle dimensions for {}",
+            pane.id()
+        );
+    }
+    assert_eq!(
+        state.window_runtime_resize_count_for_test(),
+        resize_count_before + 2,
+        "failed commit and runtime rollback must each issue one bounded resize"
+    );
+    drop(state);
+    assert_eq!(
+        [
+            pane_terminal_size(&handler, &fixture.owner, 0, 0).await,
+            pane_terminal_size(&handler, &fixture.owner, 0, 1).await,
+        ],
+        terminal_sizes_before
     );
 }
 

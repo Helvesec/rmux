@@ -1,6 +1,7 @@
 [package]
+rust-version.workspace = true
 name = "rmux-core"
-version = "0.10.0"
+version = "0.11.0"
 edition.workspace = true
 publish = true
 license.workspace = true
@@ -10,13 +11,24 @@ keywords = ["terminal", "multiplexer", "core"]
 categories = ["command-line-interface"]
 
 [features]
+kitty-keyboard = []
 # Test-only seams for dependent crates' tests. Off by default, so a published
 # build never exposes them.
 test-seams = []
 
 [dependencies]
+base64 = "0.22.1"
+rmux-types = { path = "../rmux-types", version = "0.11.0" }
 chrono = { version = "0.4.42", default-features = false, features = ["clock", "std"] }
 compact_str = "0.8.1"
 regex = "1.12.2"
-rmux-proto = { path = "../rmux-proto", version = "0.10.0" }
+rmux-proto = { path = "../rmux-proto", version = "0.11.0" }
 unicode-width = "0.1"
+
+[dev-dependencies]
+serde_json = "1.0"
+sha2 = "0.10.9"
+
+[[test]]
+name = "kitty_runtime"
+required-features = ["kitty-keyboard"]

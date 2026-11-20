@@ -19,6 +19,8 @@ const QUEUED_SOURCE_FILE_SUCCESS_COMMANDS: &[&str] = &[
     "new-window",
     "clear-prompt-history",
     "show-prompt-history",
+    "set-option",
+    "set-window-option",
 ];
 
 fn queued_source_file_success_command(command_name: &str) -> bool {
@@ -68,6 +70,10 @@ pub(crate) fn expect_command_success(
         Response::PreviousLayout(_) if command_name == "select-layout" => Ok(()),
         Response::NextLayout(_) if command_name == "next-layout" => Ok(()),
         Response::PreviousLayout(_) if command_name == "previous-layout" => Ok(()),
+        Response::RestoreWindowSnapshot(_) if command_name == "restore-window-snapshot" => Ok(()),
+        Response::RestoreWindowSnapshotV2(_) if command_name == "restore-window-snapshot-v2" => {
+            Ok(())
+        }
         Response::ResizePane(_) if command_name == "resize-pane" => Ok(()),
         Response::DisplayPanes(_) if command_name == "display-panes" => Ok(()),
         Response::SelectPane(_) if command_name == "select-pane" => Ok(()),
@@ -151,6 +157,8 @@ pub(crate) fn expect_command_output<'a>(
                     | "server-access"
                     | "run-shell"
                     | "source-file"
+                    | "export-window-snapshot"
+                    | "export-window-snapshot-v2"
             ) =>
         {
             other
@@ -210,6 +218,10 @@ pub(crate) fn response_name(response: &Response) -> &'static str {
         Response::SelectLayout(_) => "select-layout",
         Response::NextLayout(_) => "next-layout",
         Response::PreviousLayout(_) => "previous-layout",
+        Response::ExportWindowSnapshot(_) => "export-window-snapshot",
+        Response::RestoreWindowSnapshot(_) => "restore-window-snapshot",
+        Response::ExportWindowSnapshotV2(_) => "export-window-snapshot-v2",
+        Response::RestoreWindowSnapshotV2(_) => "restore-window-snapshot-v2",
         Response::ResizePane(_) => "resize-pane",
         Response::DisplayPanes(_) => "display-panes",
         Response::ListPanes(_) => "list-panes",

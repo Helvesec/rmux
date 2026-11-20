@@ -74,7 +74,7 @@ async fn create_witness_session(handler: &RequestHandler, session: &SessionName)
             environment: None,
         }))
         .await;
-    assert!(matches!(created, Response::NewSession(_)), "{created:?}");
+    crate::session_fixture::assert_new_session(&created);
 }
 
 /// `alpha:0` linked into `beta:1`, `status off` on both, one `window-size`

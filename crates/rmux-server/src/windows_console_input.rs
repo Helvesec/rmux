@@ -47,6 +47,36 @@ pub(crate) fn write_console_key_then_processed_interrupt(
     Ok(())
 }
 
+/// Queued input that an in-order delivery did not complete.
+///
+/// `remaining` starts with the item whose delivery failed: it may have reached
+/// the console only in part (a key record without its interrupt, a short pipe
+/// write), so it is reported as undelivered rather than counted as sent.
+#[derive(Debug)]
+pub(crate) struct UndeliveredInput<T> {
+    pub(crate) error: io::Error,
+    pub(crate) remaining: Vec<T>,
+}
+
+/// Delivers queued input in order and stops at the first failure.
+///
+/// Later items are never attempted after a failure, because delivering them
+/// would reorder the input. They are handed back with the failing item so the
+/// caller can say exactly what its pane never received.
+pub(crate) fn deliver_in_order<T>(
+    queued: Vec<T>,
+    mut deliver: impl FnMut(&T) -> io::Result<()>,
+) -> Result<(), UndeliveredInput<T>> {
+    let mut queued = queued.into_iter();
+    while let Some(input) = queued.next() {
+        if let Err(error) = deliver(&input) {
+            let remaining = std::iter::once(input).chain(queued).collect();
+            return Err(UndeliveredInput { error, remaining });
+        }
+    }
+    Ok(())
+}
+
 fn is_transient_console_input_error(error: &io::Error) -> bool {
     const ERROR_GEN_FAILURE: i32 = 31;
     error.raw_os_error() == Some(ERROR_GEN_FAILURE)
@@ -149,6 +179,45 @@ mod tests {
         assert_eq!(
             attempts.load(Ordering::SeqCst),
             TRANSIENT_CONSOLE_INPUT_RETRIES + 1
+        );
+    }
+
+    #[test]
+    fn in_order_delivery_delivers_every_item_when_none_fails() {
+        let mut delivered = Vec::new();
+
+        deliver_in_order(vec!['a', 'b', 'c'], |input| {
+            delivered.push(*input);
+            Ok(())
+        })
+        .expect("a delivery without failure succeeds");
+
+        assert_eq!(delivered, ['a', 'b', 'c']);
+    }
+
+    #[test]
+    fn in_order_delivery_hands_back_the_failing_item_and_everything_after_it() {
+        let mut attempted = Vec::new();
+
+        let undelivered = deliver_in_order(vec!['a', 'b', 'c', 'd'], |input| {
+            attempted.push(*input);
+            if *input == 'b' {
+                return Err(io::Error::from_raw_os_error(5));
+            }
+            Ok(())
+        })
+        .expect_err("the failing item stops the delivery");
+
+        assert_eq!(
+            attempted,
+            ['a', 'b'],
+            "nothing after a failure is attempted"
+        );
+        assert_eq!(undelivered.error.raw_os_error(), Some(5));
+        assert_eq!(
+            undelivered.remaining,
+            ['b', 'c', 'd'],
+            "the failing item and every later item must be reported, not dropped"
         );
     }
 }

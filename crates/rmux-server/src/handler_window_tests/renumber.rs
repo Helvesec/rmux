@@ -127,7 +127,10 @@ async fn assert_surviving_renumber_metadata(
         .session(&fixture.session_name)
         .expect("session survives");
     assert_eq!(
-        session.windows().keys().copied().collect::<Vec<_>>(),
+        session
+            .windows()
+            .map(|(index, _)| index)
+            .collect::<Vec<_>>(),
         vec![0, 1]
     );
     let survivor = session.window_at(1).expect("surviving window is reindexed");
@@ -203,7 +206,10 @@ async fn kill_window_renumbers_when_session_option_is_enabled() {
         .session(&alpha)
         .expect("session should exist");
     assert_eq!(
-        session.windows().keys().copied().collect::<Vec<_>>(),
+        session
+            .windows()
+            .map(|(index, _)| index)
+            .collect::<Vec<_>>(),
         vec![0, 1]
     );
     assert_eq!(session.active_window_index(), 0);
@@ -240,7 +246,10 @@ async fn kill_last_pane_renumbers_when_session_option_is_enabled() {
     let state = handler.state.lock().await;
     let session = state.sessions.session(&alpha).expect("session survives");
     assert_eq!(
-        session.windows().keys().copied().collect::<Vec<_>>(),
+        session
+            .windows()
+            .map(|(index, _)| index)
+            .collect::<Vec<_>>(),
         vec![0, 1]
     );
 }
@@ -347,8 +356,7 @@ async fn kill_last_linked_pane_renumbers_each_surviving_session() {
             .session(&owner)
             .expect("owner survives")
             .windows()
-            .keys()
-            .copied()
+            .map(|(index, _)| index)
             .collect::<Vec<_>>(),
         vec![0, 1]
     );
@@ -358,8 +366,7 @@ async fn kill_last_linked_pane_renumbers_each_surviving_session() {
             .session(&alias)
             .expect("alias survives")
             .windows()
-            .keys()
-            .copied()
+            .map(|(index, _)| index)
             .collect::<Vec<_>>(),
         vec![0]
     );
@@ -480,7 +487,10 @@ async fn active_low_window_removals_select_oracle_stable_fallback_after_renumber
         let state = handler.state.lock().await;
         let session = state.sessions.session(&alpha).expect("session survives");
         assert_eq!(
-            session.windows().keys().copied().collect::<Vec<_>>(),
+            session
+                .windows()
+                .map(|(index, _)| index)
+                .collect::<Vec<_>>(),
             vec![0, 1]
         );
         assert_eq!(

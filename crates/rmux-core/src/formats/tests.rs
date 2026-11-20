@@ -1,9 +1,11 @@
 use super::{
-    bounded_format_padding_width, format_skip, format_skip_delimiter,
-    is_known_format_variable_name, is_truthy, render_template, signed_i32_abs_usize, FormatContext,
-    FormatVariable, FormatVariables, DEFAULT_DISPLAY_MESSAGE_FORMAT, DEFAULT_LIST_PANES_FORMAT,
-    DEFAULT_LIST_SESSIONS_FORMAT, DEFAULT_LIST_WINDOWS_FORMAT, FORMAT_PADDING_LIMIT,
-    FORMAT_VARIABLES, TMUX_FORMAT_TABLE_NAMES, TMUX_TIME_FORMAT_VARIABLE_NAMES,
+    bounded_format_padding_width, format_skip, format_skip_delimiter, format_variable_descriptor,
+    format_variable_descriptors, is_known_format_variable_name, is_truthy, render_template,
+    signed_i32_abs_usize, tmux_format_variable_descriptors, tmux_time_format_variable_descriptors,
+    FormatContext, FormatVariable, FormatVariableContext, FormatVariableProvider, FormatVariables,
+    DEFAULT_DISPLAY_MESSAGE_FORMAT, DEFAULT_LIST_PANES_FORMAT, DEFAULT_LIST_SESSIONS_FORMAT,
+    DEFAULT_LIST_WINDOWS_FORMAT, FORMAT_PADDING_LIMIT, FORMAT_VARIABLES, TMUX_FORMAT_TABLE_NAMES,
+    TMUX_TIME_FORMAT_VARIABLE_NAMES,
 };
 use crate::Session;
 use rmux_proto::TerminalSize;
@@ -87,8 +89,56 @@ mod operators;
 #[path = "tests/transformations.rs"]
 mod transformations;
 
+#[path = "tests/path_basename.rs"]
+mod path_basename;
+
+#[path = "tests/path_basename_limit.rs"]
+mod path_basename_limit;
+
+#[path = "tests/path_dirname_limit.rs"]
+mod path_dirname_limit;
+
+#[path = "tests/path_dirname_separators.rs"]
+mod path_dirname_separators;
+
 #[path = "tests/tables_time.rs"]
 mod tables_time;
 
 #[path = "tests/advanced_values.rs"]
 mod advanced_values;
+
+#[path = "tests/build_capability.rs"]
+mod build_capability;
+
+#[path = "tests/hexadecimal_operands.rs"]
+mod hexadecimal_operands;
+
+#[path = "tests/glob_alnum_class.rs"]
+mod glob_alnum_class;
+#[path = "tests/glob_alpha_class.rs"]
+mod glob_alpha_class;
+#[path = "tests/glob_case_class.rs"]
+mod glob_case_class;
+#[path = "tests/glob_classes.rs"]
+mod glob_classes;
+#[path = "tests/glob_digit_class.rs"]
+mod glob_digit_class;
+#[path = "tests/glob_print_class.rs"]
+mod glob_print_class;
+#[path = "tests/glob_punct_class.rs"]
+mod glob_punct_class;
+#[path = "tests/glob_space_class.rs"]
+mod glob_space_class;
+#[path = "tests/glob_star_escape.rs"]
+mod glob_star_escape;
+#[path = "tests/glob_xdigit_class.rs"]
+mod glob_xdigit_class;
+
+#[path = "tests/invalid_substitution.rs"]
+mod invalid_substitution;
+
+#[path = "tests/precision_c_space.rs"]
+mod precision_c_space;
+
+#[path = "tests/expansion_budget.rs"]
+mod expansion_budget;

@@ -91,5 +91,4 @@ fn base64_encode(bytes: &[u8]) -> String {
 /// scripts and their diagnostics, none of which the shell-quoting helpers
 /// above need to know about.
 #[cfg(any(unix, windows))]
-#[path = "test_shell/final_sink.rs"]
 pub(crate) mod final_sink;

@@ -1,6 +1,7 @@
 [package]
+rust-version.workspace = true
 name = "rmux-sdk"
-version = "0.10.0"
+version = "0.11.0"
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
@@ -10,13 +11,15 @@ categories = ["command-line-interface", "asynchronous"]
 publish = true
 
 [dependencies]
+rmux-bootstrap = { path = "../rmux-bootstrap", version = "0.11.0" }
+rmux-types = { path = "../rmux-types", version = "0.11.0", features = ["serde"] }
 crossterm = { version = "0.29.0", default-features = false, features = [
     "events",
     "windows",
 ], optional = true }
-rmux-ipc = { path = "../rmux-ipc", version = "0.10.0" }
-rmux-os = { path = "../rmux-os", version = "0.10.0" }
-rmux-proto = { path = "../rmux-proto", version = "0.10.0" }
+rmux-ipc = { path = "../rmux-ipc", version = "0.11.0" }
+rmux-os = { path = "../rmux-os", version = "0.11.0" }
+rmux-proto = { path = "../rmux-proto", version = "0.11.0" }
 regex = { version = "1", optional = true }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
@@ -24,17 +27,13 @@ tokio = { version = "1.48.0", features = ["fs", "io-util", "macros", "rt", "sync
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
-rustix = { version = "1.1.4", features = ["fs"] }
 signal-hook = "0.3.18"
-# Bootstrap actor needs Unix-specific async I/O plumbing (UnixStream + sleep),
-# scoped to cfg(unix) so the SDK transport-actor manifest stays narrow on
-# every other target.
+# The SDK transport actor uses UnixStream and operation timeouts.
 tokio = { version = "1.48.0", features = ["net", "time"] }
 
 [target.'cfg(windows)'.dependencies]
-# Windows startup race serializes hidden-daemon launch behind a per-user named
-# mutex. The SDK keeps `forbid(unsafe_code)`; FFI lives in `rmux-ipc` and the
-# windows-sys constants imported here are pure data values.
+# The SDK owns async pipe reconnects and signal handling; startup coordination
+# lives in rmux-bootstrap. The windows-sys constants here are pure data values.
 tokio = { version = "1.48.0", features = ["signal", "time"] }
 windows-sys = { version = "0.61.2", features = ["Win32_Foundation"] }
 
@@ -51,3 +50,6 @@ default = ["web"]
 crossterm = ["dep:crossterm"]
 regex = ["dep:regex"]
 web = []
+
+[target.'cfg(unix)'.dev-dependencies]
+rustix = { version = "1.1.4", features = ["event", "pipe", "process"] }

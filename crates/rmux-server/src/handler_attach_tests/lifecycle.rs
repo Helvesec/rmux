@@ -73,19 +73,24 @@ async fn attached_remain_on_exit_strips_the_submitted_exit_line_from_dead_pane_c
         b"\x1b[?1003h".as_slice(),
     ];
     let dead_target = take_switch_target(
-        recv_matching_attach_control(&mut control_rx, "kept-dead pane refresh", |control| {
-            let AttachControl::Switch(target) = control else {
-                return false;
-            };
-            target
-                .with_target(|target| {
-                    let start = target.outer_terminal.attach_start_sequence();
-                    mouse_tracking_enables
-                        .iter()
-                        .all(|enable| !start.windows(enable.len()).any(|window| window == *enable))
-                })
-                .unwrap_or(false)
-        })
+        recv_matching_attach_control_within(
+            SERVER_SIGNAL_LIVENESS,
+            &mut control_rx,
+            "kept-dead pane refresh",
+            |control| {
+                let AttachControl::Switch(target) = control else {
+                    return false;
+                };
+                target
+                    .with_target(|target| {
+                        let start = target.outer_terminal.attach_start_sequence();
+                        mouse_tracking_enables.iter().all(|enable| {
+                            !start.windows(enable.len()).any(|window| window == *enable)
+                        })
+                    })
+                    .unwrap_or(false)
+            },
+        )
         .await,
     );
     let dead_start = dead_target.outer_terminal.attach_start_sequence();
@@ -502,7 +507,7 @@ fn windows_cmd_select_all_bytes() -> Vec<u8> {
 
 #[tokio::test]
 async fn attached_live_input_preserves_split_utf8_sequences() {
-    let handler = RequestHandler::new();
+    let handler = RequestHandler::with_host_shell_for_test();
     let requester_pid = std::process::id();
     let alpha = session_name("alpha");
     #[cfg(windows)]

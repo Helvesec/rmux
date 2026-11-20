@@ -625,8 +625,8 @@ async fn if_shell_format_mode_treats_zero_prefixed_values_as_false_like_tmux() {
 async fn if_shell_format_mode_without_target_uses_preferred_session_context() {
     let handler = RequestHandler::new();
     let alpha = session_name("alpha");
-    assert!(matches!(
-        handler
+    crate::session_fixture::assert_new_session(
+        &handler
             .handle(Request::NewSession(NewSessionRequest {
                 session_name: alpha.clone(),
                 detached: true,
@@ -634,8 +634,7 @@ async fn if_shell_format_mode_without_target_uses_preferred_session_context() {
                 environment: None,
             }))
             .await,
-        Response::NewSession(_)
-    ));
+    );
 
     let response = handler
         .handle(Request::IfShell(Box::new(IfShellRequest {
@@ -672,8 +671,8 @@ async fn if_shell_format_mode_without_target_uses_preferred_session_context() {
 async fn if_shell_missing_explicit_target_is_nonfatal() {
     let handler = RequestHandler::new();
     let alpha = session_name("alpha");
-    assert!(matches!(
-        handler
+    crate::session_fixture::assert_new_session(
+        &handler
             .handle(Request::NewSession(NewSessionRequest {
                 session_name: alpha,
                 detached: true,
@@ -681,8 +680,7 @@ async fn if_shell_missing_explicit_target_is_nonfatal() {
                 environment: None,
             }))
             .await,
-        Response::NewSession(_)
-    ));
+    );
 
     let response = handler
         .handle(Request::IfShell(Box::new(IfShellRequest {
@@ -743,8 +741,8 @@ async fn source_file_if_shell_true_executes_brace_command_list() {
 async fn if_shell_pane_id_target_resolves_like_display_message() {
     let handler = RequestHandler::new();
     let alpha = session_name("alpha");
-    assert!(matches!(
-        handler
+    crate::session_fixture::assert_new_session(
+        &handler
             .handle(Request::NewSession(NewSessionRequest {
                 session_name: alpha.clone(),
                 detached: true,
@@ -752,8 +750,7 @@ async fn if_shell_pane_id_target_resolves_like_display_message() {
                 environment: None,
             }))
             .await,
-        Response::NewSession(_)
-    ));
+    );
 
     let display_message = CommandParser::new()
         .parse("display-message -p -t %0 OKDM")
@@ -788,8 +785,8 @@ async fn queued_if_shell_target_becomes_branch_current_target() {
     let alpha = session_name("alpha");
     let beta = session_name("beta");
     for session in [&alpha, &beta] {
-        assert!(matches!(
-            handler
+        crate::session_fixture::assert_new_session(
+            &handler
                 .handle(Request::NewSession(NewSessionRequest {
                     session_name: session.clone(),
                     detached: true,
@@ -797,8 +794,7 @@ async fn queued_if_shell_target_becomes_branch_current_target() {
                     environment: None,
                 }))
                 .await,
-            Response::NewSession(_)
-        ));
+        );
     }
 
     let parsed = CommandParser::new()
@@ -821,13 +817,15 @@ async fn queued_if_shell_target_becomes_branch_current_target() {
         .session(&alpha)
         .expect("alpha exists")
         .windows()
-        .keys()
-        .copied()
+        .map(|(index, _)| index)
         .collect::<Vec<_>>();
     let beta_session = state.sessions.session(&beta).expect("beta exists");
     assert_eq!(alpha_windows, vec![0]);
     assert_eq!(
-        beta_session.windows().keys().copied().collect::<Vec<_>>(),
+        beta_session
+            .windows()
+            .map(|(index, _)| index)
+            .collect::<Vec<_>>(),
         vec![0, 1]
     );
     assert_eq!(
@@ -845,8 +843,8 @@ async fn queued_if_shell_accepts_compact_format_target_with_attached_value() {
     let alpha = session_name("alpha");
     let beta = session_name("beta");
     for session in [&alpha, &beta] {
-        assert!(matches!(
-            handler
+        crate::session_fixture::assert_new_session(
+            &handler
                 .handle(Request::NewSession(NewSessionRequest {
                     session_name: session.clone(),
                     detached: true,
@@ -854,8 +852,7 @@ async fn queued_if_shell_accepts_compact_format_target_with_attached_value() {
                     environment: None,
                 }))
                 .await,
-            Response::NewSession(_)
-        ));
+        );
     }
 
     let parsed = CommandParser::new()
@@ -882,8 +879,8 @@ async fn queued_if_shell_compact_mouse_target_falls_back_to_current_target() {
     let alpha = session_name("alpha");
     let beta = session_name("beta");
     for session in [&alpha, &beta] {
-        assert!(matches!(
-            handler
+        crate::session_fixture::assert_new_session(
+            &handler
                 .handle(Request::NewSession(NewSessionRequest {
                     session_name: session.clone(),
                     detached: true,
@@ -891,8 +888,7 @@ async fn queued_if_shell_compact_mouse_target_falls_back_to_current_target() {
                     environment: None,
                 }))
                 .await,
-            Response::NewSession(_)
-        ));
+        );
     }
 
     let parsed = CommandParser::new()
@@ -916,8 +912,8 @@ async fn queued_if_shell_separated_mouse_target_falls_back_to_current_target() {
     let alpha = session_name("alpha");
     let beta = session_name("beta");
     for session in [&alpha, &beta] {
-        assert!(matches!(
-            handler
+        crate::session_fixture::assert_new_session(
+            &handler
                 .handle(Request::NewSession(NewSessionRequest {
                     session_name: session.clone(),
                     detached: true,
@@ -925,8 +921,7 @@ async fn queued_if_shell_separated_mouse_target_falls_back_to_current_target() {
                     environment: None,
                 }))
                 .await,
-            Response::NewSession(_)
-        ));
+        );
     }
 
     let parsed = CommandParser::new()
@@ -950,8 +945,8 @@ async fn queued_if_shell_accepts_compact_format_target_with_next_argument() {
     let alpha = session_name("alpha");
     let beta = session_name("beta");
     for session in [&alpha, &beta] {
-        assert!(matches!(
-            handler
+        crate::session_fixture::assert_new_session(
+            &handler
                 .handle(Request::NewSession(NewSessionRequest {
                     session_name: session.clone(),
                     detached: true,
@@ -959,8 +954,7 @@ async fn queued_if_shell_accepts_compact_format_target_with_next_argument() {
                     environment: None,
                 }))
                 .await,
-            Response::NewSession(_)
-        ));
+        );
     }
 
     let parsed = CommandParser::new()
@@ -983,13 +977,15 @@ async fn queued_if_shell_accepts_compact_format_target_with_next_argument() {
         .session(&alpha)
         .expect("alpha exists")
         .windows()
-        .keys()
-        .copied()
+        .map(|(index, _)| index)
         .collect::<Vec<_>>();
     let beta_session = state.sessions.session(&beta).expect("beta exists");
     assert_eq!(alpha_windows, vec![0]);
     assert_eq!(
-        beta_session.windows().keys().copied().collect::<Vec<_>>(),
+        beta_session
+            .windows()
+            .map(|(index, _)| index)
+            .collect::<Vec<_>>(),
         vec![0, 1]
     );
     assert_eq!(
@@ -1028,8 +1024,8 @@ async fn scripted_pane_commands_accept_session_targets_like_tmux() {
     let handler = RequestHandler::new();
     let alpha = session_name("alpha");
 
-    assert!(matches!(
-        handler
+    crate::session_fixture::assert_new_session(
+        &handler
             .handle(Request::NewSession(NewSessionRequest {
                 session_name: alpha.clone(),
                 detached: true,
@@ -1037,8 +1033,7 @@ async fn scripted_pane_commands_accept_session_targets_like_tmux() {
                 environment: None,
             }))
             .await,
-        Response::NewSession(_)
-    ));
+    );
 
     let response = handler
         .handle(Request::IfShell(Box::new(IfShellRequest {
@@ -1082,8 +1077,8 @@ async fn if_shell_shell_mode_uses_bin_sh_environment_and_caller_cwd() {
         ),
     );
 
-    assert!(matches!(
-        handler
+    crate::session_fixture::assert_new_session(
+        &handler
             .handle(Request::NewSession(NewSessionRequest {
                 session_name: alpha.clone(),
                 detached: true,
@@ -1091,8 +1086,7 @@ async fn if_shell_shell_mode_uses_bin_sh_environment_and_caller_cwd() {
                 environment: None,
             }))
             .await,
-        Response::NewSession(_)
-    ));
+    );
     assert!(matches!(
         handler
             .handle(Request::SetOption(SetOptionRequest {
@@ -1165,8 +1159,8 @@ async fn if_shell_shell_mode_uses_windows_shell_environment_and_caller_cwd() {
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from("cmd.exe"));
 
-    assert!(matches!(
-        handler
+    crate::session_fixture::assert_new_session(
+        &handler
             .handle(Request::NewSession(NewSessionRequest {
                 session_name: alpha.clone(),
                 detached: true,
@@ -1174,8 +1168,7 @@ async fn if_shell_shell_mode_uses_windows_shell_environment_and_caller_cwd() {
                 environment: None,
             }))
             .await,
-        Response::NewSession(_)
-    ));
+    );
     assert!(matches!(
         handler
             .handle(Request::SetOption(SetOptionRequest {

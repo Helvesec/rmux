@@ -12,6 +12,9 @@ from io import BytesIO
 from pathlib import Path
 from typing import Any
 
+from sdk_distribution_policy import wasm_package_metadata
+from web_compatibility_contract import validate_browser_contract
+
 SOURCE_SHA = re.compile(r"[0-9a-f]{40}")
 VERSION = re.compile(r"[0-9]+\.[0-9]+\.[0-9]+(?:-rc\.[0-9]+)?")
 PACKAGE_FILES = (
@@ -40,6 +43,7 @@ def validate_identity(source_sha: str, version: str) -> None:
 
 
 def package_files(directory: Path) -> dict[str, Path]:
+    validate_browser_contract()
     root = directory.resolve(strict=True)
     if directory.is_symlink() or not root.is_dir():
         raise ValueError("WASM package must be one real directory")
@@ -143,6 +147,7 @@ def paths(args: argparse.Namespace) -> tuple[Path, Path]:
 def create(args: argparse.Namespace) -> None:
     validate_identity(args.source_sha, args.version)
     files = package_files(args.package_dir)
+    wasm_package_metadata(files["package.json"].read_bytes(), args.version)
     archive, record = paths(args)
     if not args.output_dir.is_dir() or any(
         path.exists() or path.is_symlink() for path in (archive, record)
@@ -164,6 +169,7 @@ def create(args: argparse.Namespace) -> None:
 def verify(args: argparse.Namespace) -> None:
     validate_identity(args.source_sha, args.version)
     files = package_files(args.package_dir)
+    wasm_package_metadata(files["package.json"].read_bytes(), args.version)
     archive, record = paths(args)
     verify_tar(archive, files)
     if read_object(record) != provenance(args.source_sha, args.version, files):

@@ -72,7 +72,7 @@ impl EnsureSession {
     pub fn try_named(session_name: impl AsRef<str>) -> Result<Self> {
         SessionName::new(session_name.as_ref())
             .map(Self::named)
-            .map_err(RmuxError::protocol)
+            .map_err(RmuxError::from)
     }
 
     /// Creates a builder that asks the daemon to assign an automatic name.
@@ -297,7 +297,7 @@ impl EnsureSession {
             session_name: self.session_name.clone(),
             working_directory: self.working_directory.clone(),
             detached: self.detached,
-            size: self.size.map(Into::into),
+            size: self.size.map(TerminalSizeSpec::into_proto),
             environment: self.process.environment.clone(),
             group_target: self.group_target.clone(),
             attach_if_exists,
@@ -312,7 +312,7 @@ impl EnsureSession {
                 .process
                 .process_command
                 .clone()
-                .map(rmux_proto::ProcessCommand::from),
+                .map(ProcessCommandSpec::into_proto),
             client_environment: sdk_client_environment(),
             skip_environment_update: false,
         }
@@ -481,7 +481,7 @@ fn parse_owned_session_id(stdout: &[u8]) -> Result<SessionId> {
 }
 
 fn owned_session_identity_error(reason: &str) -> RmuxError {
-    RmuxError::protocol(rmux_proto::RmuxError::Server(format!(
+    RmuxError::from_proto(rmux_proto::RmuxError::Server(format!(
         "daemon returned invalid owned-session identity: {reason}"
     )))
 }
@@ -540,7 +540,7 @@ async fn reuse_session(
     builder: &EnsureSession,
 ) -> Result<(SessionName, bool)> {
     let Some(session_name) = builder.session_name.clone() else {
-        return Err(RmuxError::protocol(rmux_proto::RmuxError::Server(
+        return Err(RmuxError::from_proto(rmux_proto::RmuxError::Server(
             "reuse-only ensure-session requires an explicit session name".to_owned(),
         )));
     };
@@ -551,9 +551,9 @@ async fn reuse_session(
     {
         Ok((session_name, false))
     } else {
-        Err(RmuxError::protocol(rmux_proto::RmuxError::SessionNotFound(
-            session_name.to_string(),
-        )))
+        Err(RmuxError::from_proto(
+            rmux_proto::RmuxError::SessionNotFound(session_name.to_string()),
+        ))
     }
 }
 
@@ -563,10 +563,8 @@ fn redact_builder_environment_error(error: RmuxError, builder: &EnsureSession) -
 
 fn is_duplicate_session_error(error: &RmuxError) -> bool {
     matches!(
-        error,
-        RmuxError::Protocol {
-            source: rmux_proto::RmuxError::DuplicateSession(_),
-        }
+        error.protocol_source(),
+        Some(rmux_proto::RmuxError::DuplicateSession(_))
     )
 }
 

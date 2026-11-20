@@ -1,6 +1,13 @@
 #!/usr/bin/env sh
 set -eu
 
+repo_root=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
+cd "$repo_root"
+if [ -z "${RMUX_IDENTITY_HEAD:-}" ]; then
+  exec python3 "$repo_root/scripts/candidate_identity.py" with -- sh "$0" "$@"
+fi
+python3 "$repo_root/scripts/candidate_identity.py" validate
+
 root="${RMUX_SDK_SMOKE_ROOT:-/tmp/rmux-sdk-v1-smoke-$$}"
 socket="$root/daemon.sock"
 lock="$socket.startup-lock"
@@ -34,6 +41,7 @@ export RMUX_TMPDIR="${RMUX_TMPDIR:-/tmp}"
 export RMUX_SDK_SMOKE_ROOT="$root"
 
 cargo test -p rmux-sdk --locked --test smoke_v1 -- --nocapture
+python3 "$repo_root/scripts/check_candidate_cleanup.py"
 
 if [ -e "$socket" ]; then
   echo "SDK smoke left socket behind: $socket" >&2

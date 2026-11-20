@@ -1,0 +1,12 @@
+# Source population declarations read by test_descendant_transport.py (S2372).
+# A lot that adds a .rs file appends exactly one line per added file:
+# {"path": "<path>.rs", "introduced_commit": "<40-hex commit that adds the path>", "counts": {"production": N}, "physical_lines": N}
+# counts are measured by inventory.py; their sum is physical_lines. Rows are
+# append-only and merged with merge=union, so neighbouring declarations never conflict.
+{"path": "crates/rmux-server/src/handler/client_support/current_client.rs", "introduced_commit": "23373d99a64617639c08aeb3402f31cc1ad09c8e", "counts": {"production": 223, "tests": 70}, "physical_lines": 293}
+{"path": "crates/rmux-server/src/handler_client/control_send_keys_target_tests.rs", "introduced_commit": "ec7231775a93691f331da10e7ba39d88a4162096", "counts": {"tests": 192}, "physical_lines": 192}
+{"path": "crates/rmux-sdk/tests/session/exact_name.rs", "introduced_commit": "f7459b9bb3c548c12bf876a387644e642122a928", "counts": {"tests": 294}, "physical_lines": 294}
+{"path": "crates/rmux-core/src/screen/line_edit_outside_region_tests.rs", "introduced_commit": "09f417d87713ed97c74584d98d46b8356287e279", "counts": {"tests": 260}, "physical_lines": 260}
+{"path": "crates/rmux-core/src/formats/tests/glob_star_escape.rs", "introduced_commit": "63ef8442b310bbb1f7d78bb5799494fdaaaa40d8", "counts": {"tests": 235}, "physical_lines": 235}
+{"path": "tests/support/executable_fixture.rs", "introduced_commit": "a11296362ed1bd9f6a6db18b63422102e849dd3c", "counts": {"tests": 79}, "physical_lines": 79}
+{"path": "tests/executable_fixture_spec.rs", "introduced_commit": "a11296362ed1bd9f6a6db18b63422102e849dd3c", "counts": {"tests": 116}, "physical_lines": 116}

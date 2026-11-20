@@ -16,7 +16,8 @@
 
 use rmux_core::input::{InputParser, ScreenWriter};
 use rmux_core::{
-    text_width, truncate_to_width, GridRenderOptions, Screen, ScreenCaptureRange, Utf8Config,
+    text_width, truncate_right_to_width, truncate_to_width, GridRenderOptions, Screen,
+    ScreenCaptureRange, Utf8Config,
 };
 use rmux_proto::TerminalSize;
 use std::time::{Duration, Instant};
@@ -462,6 +463,19 @@ fn fuzz_resize_reflow_wide_placement_gap_cycles_match_tmux_text() {
 
 fn truncate_check(input: &str, width: usize) {
     let cfg = Utf8Config::default();
+    let full_width = text_width(input, &cfg);
+    if full_width != 0 {
+        assert_eq!(
+            truncate_to_width(input, full_width, &cfg),
+            input,
+            "full-width left truncation must be lossless for {input:?}"
+        );
+        assert_eq!(
+            truncate_right_to_width(input, full_width, &cfg),
+            input,
+            "full-width right truncation must be lossless for {input:?}"
+        );
+    }
     let truncated = truncate_to_width(input, width, &cfg);
     let actual_width = text_width(&truncated, &cfg);
     assert!(
@@ -469,18 +483,21 @@ fn truncate_check(input: &str, width: usize) {
         "truncate_to_width({input:?}, {width}) -> {truncated:?} (width {actual_width} > {width})"
     );
     assert!(
-        truncated.chars().count() <= input.chars().count(),
-        "truncate produced more characters than input!"
+        input.starts_with(&truncated),
+        "truncate_to_width returned non-prefix {truncated:?} for {input:?}"
     );
-    // Every char in `truncated` must appear at least once in `input` — we
-    // intentionally do not require strict substring because the truncator may
-    // drop dangling combining/ZWJ codepoints that don't fold into a grapheme.
-    for ch in truncated.chars() {
-        assert!(
-            input.contains(ch),
-            "truncated produced char {ch:?} absent from input {input:?}"
-        );
-    }
+
+    let truncated = truncate_right_to_width(input, width, &cfg);
+    let actual_width = text_width(&truncated, &cfg);
+    assert!(
+        actual_width <= width,
+        "truncate_right_to_width({input:?}, {width}) -> {truncated:?} \
+         (width {actual_width} > {width})"
+    );
+    assert!(
+        input.ends_with(&truncated),
+        "truncate_right_to_width returned non-suffix {truncated:?} for {input:?}"
+    );
 }
 
 #[test]

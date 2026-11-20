@@ -1,5 +1,5 @@
 use rmux_core::{PaneGeometry, PaneId, Utf8Config};
-use rmux_proto::{RmuxError, SessionName, TerminalSize};
+use rmux_proto::{OptionName, RmuxError, SessionName, TerminalSize};
 #[cfg(windows)]
 use rmux_pty::PtyChild;
 use rmux_pty::PtyMaster;
@@ -7,8 +7,8 @@ use rmux_pty::PtyMaster;
 #[cfg(windows)]
 use crate::pane_io::spawn_pane_exit_watcher;
 use crate::pane_io::{
-    pane_output_channel, spawn_pane_output_reader, PaneAlertCallback, PaneExitCallback,
-    PaneOutputSender,
+    pane_output_channel_with_read_demand, spawn_pane_output_reader, PaneAlertCallback,
+    PaneExitCallback, PaneOutputSender,
 };
 use crate::pane_terminals::HandlerState;
 use crate::pane_transcript::{PaneTranscript, SharedPaneTranscript};
@@ -24,15 +24,39 @@ pub(in crate::pane_terminals) struct PaneOutputSpawn {
 }
 
 impl HandlerState {
-    #[cfg(windows)]
-    pub(in crate::pane_terminals) fn insert_pending_pane_output(
+    fn configure_transcript_input_policy(
+        &self,
+        session_name: &SessionName,
+        pane_id: PaneId,
+        transcript: &mut PaneTranscript,
+    ) {
+        transcript.set_utf8_config(Utf8Config::from_options(&self.options));
+        transcript.set_input_buffer_limit(self.input_buffer_limit());
+        transcript.set_extended_key_policy(self.options.resolve(None, OptionName::ExtendedKeys));
+        transcript
+            .set_cursor_default_style(self.cursor_default_style_for_pane_id(session_name, pane_id));
+        transcript.set_alternate_screen_enabled(
+            self.alternate_screen_enabled_for_pane_id(session_name, pane_id),
+        );
+        transcript
+            .set_title_rename_enabled(self.title_rename_enabled_for_pane_id(session_name, pane_id));
+        transcript.set_rename_policy(
+            self.allow_rename_for_pane_id(session_name, pane_id),
+            self.rename_owner_for_pane_id(session_name, pane_id),
+        );
+        transcript.set_scroll_on_clear(self.scroll_on_clear_for_pane_id(session_name, pane_id));
+    }
+
+    /// Installs output state independently of whether a child will be started.
+    pub(in crate::pane_terminals) fn insert_pane_output_state(
         &mut self,
         session_name: &SessionName,
         pane_id: PaneId,
         geometry: PaneGeometry,
         initial_title: Option<String>,
     ) -> Result<u64, RmuxError> {
-        let transcript = PaneTranscript::shared(
+        let transcript = PaneTranscript::shared_for_pane(
+            pane_id,
             self.history_limit_for_session(session_name),
             TerminalSize {
                 cols: geometry.cols(),
@@ -40,20 +64,19 @@ impl HandlerState {
             },
         );
         {
-            let mut transcript = transcript
-                .lock()
-                .expect("pane transcript mutex must not be poisoned");
-            transcript.set_utf8_config(Utf8Config::from_options(&self.options));
-            transcript.set_input_buffer_limit(self.input_buffer_limit());
-            transcript.set_alternate_screen_enabled(
-                self.alternate_screen_enabled_for_pane_id(session_name, pane_id),
-            );
-            transcript.set_title_rename_enabled(
-                self.title_rename_enabled_for_pane_id(session_name, pane_id),
-            );
+            let mut transcript = transcript.lock();
+            let control = transcript.control_colours.query_colours()[1];
+            let _ = transcript
+                .theme
+                .refresh_clients(self.theme_clients_for_pane(pane_id), control);
+            self.configure_transcript_input_policy(session_name, pane_id, &mut transcript);
         }
         seed_initial_pane_title(&transcript, initial_title.as_deref());
-        let pane_output = pane_output_channel();
+        let pane_output = pane_output_channel_with_read_demand(
+            self.pane_output_read_demand.clone(),
+            rmux_core::events::DEFAULT_OUTPUT_RING_CAPACITY,
+            rmux_core::events::DEFAULT_RECENT_LIVE_BUFFER_CAPACITY,
+        );
 
         if self
             .transcripts
@@ -92,12 +115,14 @@ impl HandlerState {
         if let Some(dead_panes) = self.dead_panes.get_mut(session_name) {
             let _ = dead_panes.remove(&pane_id);
         }
+        if let Some(preparations) = self.kept_dead_pane_preparations.get_mut(session_name) {
+            let _ = preparations.remove(&pane_id);
+        }
         self.update_pane_lifecycle_output_sequence(pane_id, generation);
         self.clear_attached_submitted_line(session_name, pane_id);
         Ok(generation)
     }
 
-    #[cfg(windows)]
     pub(in crate::pane_terminals) fn activate_pending_pane_output(
         &mut self,
         session_name: &SessionName,
@@ -130,6 +155,26 @@ impl HandlerState {
             })?;
         let generation = self.pane_output_generation(session_name, pane_id);
         pane_output.set_generation(generation);
+        // Deferred preparation creates the transcript before the child exists.
+        // Installation may use newer geometry; commit it before readers publish
+        // output, preserving the pending transcript and its output generation.
+        let size = TerminalSize {
+            cols: spawn.geometry.cols(),
+            rows: spawn.geometry.rows(),
+        };
+        if transcript.needs_resize(size) {
+            pane_output.mutate_transcript(
+                &transcript,
+                crate::pane_io::PaneInvalidationReason::Resize,
+                |transcript| {
+                    let changed = transcript.screen().size() != size;
+                    if changed {
+                        transcript.resize(size);
+                    }
+                    ((), changed)
+                },
+            );
+        }
         #[cfg(windows)]
         let eof_state = crate::pane_io::PaneOutputEofState::default();
         #[cfg(windows)]
@@ -138,6 +183,7 @@ impl HandlerState {
                 session_name.clone(),
                 pane_id,
                 exit_watcher,
+                pane_output.clone(),
                 Some(generation),
                 eof_state.clone(),
                 spawn.pane_exit_callback.clone(),
@@ -184,113 +230,16 @@ impl HandlerState {
         pane_id: PaneId,
         spawn: PaneOutputSpawn,
     ) -> Result<(), RmuxError> {
-        let transcript = PaneTranscript::shared(
-            self.history_limit_for_session(session_name),
-            TerminalSize {
-                cols: spawn.geometry.cols(),
-                rows: spawn.geometry.rows(),
-            },
-        );
-        {
-            let mut transcript = transcript
-                .lock()
-                .expect("pane transcript mutex must not be poisoned");
-            transcript.set_utf8_config(Utf8Config::from_options(&self.options));
-            transcript.set_input_buffer_limit(self.input_buffer_limit());
-            transcript.set_alternate_screen_enabled(
-                self.alternate_screen_enabled_for_pane_id(session_name, pane_id),
-            );
-            transcript.set_title_rename_enabled(
-                self.title_rename_enabled_for_pane_id(session_name, pane_id),
-            );
-        }
-        seed_initial_pane_title(&transcript, spawn.initial_title.as_deref());
-        let pane_output = pane_output_channel();
-
-        if self
-            .transcripts
-            .get(session_name)
-            .is_some_and(|panes| panes.contains_key(&pane_id))
-        {
-            return Err(RmuxError::Server(format!(
-                "pane transcript already exists for pane id {} in session {}",
-                pane_id.as_u32(),
-                session_name
-            )));
-        }
-
-        if self
-            .pane_outputs
-            .get(session_name)
-            .is_some_and(|panes| panes.contains_key(&pane_id))
-        {
-            return Err(RmuxError::Server(format!(
-                "pane output channel already exists for pane id {} in session {}",
-                pane_id.as_u32(),
-                session_name
-            )));
-        }
-
         #[cfg(unix)]
-        let reader_runtime = self.pane_reader_runtime()?;
-        self.transcripts
-            .entry(session_name.clone())
-            .or_default()
-            .insert(pane_id, transcript.clone());
-        self.pane_outputs
-            .entry(session_name.clone())
-            .or_default()
-            .insert(pane_id, pane_output.clone());
-        let generation = self.advance_pane_output_generation(session_name, pane_id);
-        pane_output.set_generation(generation);
-        if let Some(dead_panes) = self.dead_panes.get_mut(session_name) {
-            let _ = dead_panes.remove(&pane_id);
-        }
-        self.update_pane_lifecycle_output_sequence(pane_id, generation);
-        #[cfg(windows)]
-        let eof_state = crate::pane_io::PaneOutputEofState::default();
-        #[cfg(windows)]
-        if let Some(exit_watcher) = spawn.exit_watcher {
-            spawn_pane_exit_watcher(
-                session_name.clone(),
-                pane_id,
-                exit_watcher,
-                Some(generation),
-                eof_state.clone(),
-                spawn.pane_exit_callback.clone(),
-            );
-        }
-        self.clear_attached_submitted_line(session_name, pane_id);
-        #[cfg(unix)]
-        let output_reader_task = spawn_pane_output_reader(
-            session_name.clone(),
+        let _ = self.pane_reader_runtime()?;
+        self.insert_pane_output_state(
+            session_name,
             pane_id,
-            spawn.output_reader,
-            transcript,
-            pane_output,
-            Some(generation),
-            spawn.pane_alert_callback,
-            spawn.pane_exit_callback,
-            reader_runtime,
-        );
-        #[cfg(windows)]
-        spawn_pane_output_reader(
-            session_name.clone(),
-            pane_id,
-            spawn.output_reader,
-            transcript,
-            pane_output,
-            Some(generation),
-            eof_state,
-            spawn.pane_alert_callback,
-            spawn.pane_exit_callback,
-        );
-        #[cfg(unix)]
-        self.pane_output_readers
-            .entry(session_name.clone())
-            .or_default()
-            .insert(pane_id, output_reader_task);
-        Ok(())
+            spawn.geometry,
+            spawn.initial_title.clone(),
+        )?;
+        self.activate_pending_pane_output(session_name, pane_id, spawn)
+            .map(|_| ())
     }
 
     pub(in crate::pane_terminals) fn reset_pane_output(
@@ -299,7 +248,7 @@ impl HandlerState {
         pane_id: PaneId,
         spawn: PaneOutputSpawn,
     ) -> Result<(), RmuxError> {
-        self.reset_pane_output_with_sender(session_name, pane_id, spawn, None)
+        self.reset_pane_output_with_sender(session_name, pane_id, spawn, None, None)
     }
 
     pub(in crate::pane_terminals) fn reset_pane_output_with_sender(
@@ -308,8 +257,10 @@ impl HandlerState {
         pane_id: PaneId,
         spawn: PaneOutputSpawn,
         retained_sender: Option<PaneOutputSender>,
+        retained_colours: Option<crate::control_colours::PaneControlColours>,
     ) -> Result<(), RmuxError> {
-        let transcript = PaneTranscript::shared(
+        let transcript = PaneTranscript::shared_for_pane(
+            pane_id,
             self.history_limit_for_session(session_name),
             TerminalSize {
                 cols: spawn.geometry.cols(),
@@ -317,19 +268,33 @@ impl HandlerState {
             },
         );
         {
-            let mut transcript = transcript
-                .lock()
-                .expect("pane transcript mutex must not be poisoned");
-            transcript.set_utf8_config(Utf8Config::from_options(&self.options));
-            transcript.set_input_buffer_limit(self.input_buffer_limit());
-            transcript.set_alternate_screen_enabled(
-                self.alternate_screen_enabled_for_pane_id(session_name, pane_id),
-            );
-            transcript.set_title_rename_enabled(
-                self.title_rename_enabled_for_pane_id(session_name, pane_id),
-            );
+            // Reports belong to the stable pane, unlike the application's
+            // terminal state. A same-ID respawn retains them (tmux 3.7b).
+            let colours = retained_colours
+                .or_else(|| {
+                    self.transcripts
+                        .get(session_name)
+                        .and_then(|panes| panes.get(&pane_id))
+                        .map(|old| old.lock().control_colours.clone())
+                })
+                .unwrap_or_default();
+            let mut transcript = transcript.lock();
+            transcript.control_colours = colours;
+            let control = transcript.control_colours.query_colours()[1];
+            let _ = transcript
+                .theme
+                .refresh_clients(self.theme_clients_for_pane(pane_id), control);
+            self.configure_transcript_input_policy(session_name, pane_id, &mut transcript);
         }
-        seed_initial_pane_title(&transcript, spawn.initial_title.as_deref());
+        let retained_title = self
+            .transcripts
+            .get(session_name)
+            .and_then(|panes| panes.get(&pane_id))
+            .map(|old| old.lock().title().to_owned());
+        seed_initial_pane_title(
+            &transcript,
+            retained_title.as_deref().or(spawn.initial_title.as_deref()),
+        );
         #[cfg(unix)]
         let reader_runtime = self.pane_reader_runtime()?;
         if retained_sender.is_some()
@@ -356,6 +321,7 @@ impl HandlerState {
             .entry(session_name.clone())
             .or_default()
             .insert(pane_id, transcript.clone());
+        let read_demand = self.pane_output_read_demand.clone();
         let pane_output = match retained_sender {
             Some(sender) => {
                 self.pane_outputs
@@ -369,13 +335,22 @@ impl HandlerState {
                 .entry(session_name.clone())
                 .or_default()
                 .entry(pane_id)
-                .or_insert_with(pane_output_channel)
+                .or_insert_with(|| {
+                    pane_output_channel_with_read_demand(
+                        read_demand,
+                        rmux_core::events::DEFAULT_OUTPUT_RING_CAPACITY,
+                        rmux_core::events::DEFAULT_RECENT_LIVE_BUFFER_CAPACITY,
+                    )
+                })
                 .clone(),
         };
         let generation = self.advance_pane_output_generation(session_name, pane_id);
         pane_output.reset_generation(generation);
         if let Some(dead_panes) = self.dead_panes.get_mut(session_name) {
             let _ = dead_panes.remove(&pane_id);
+        }
+        if let Some(preparations) = self.kept_dead_pane_preparations.get_mut(session_name) {
+            let _ = preparations.remove(&pane_id);
         }
         self.update_pane_lifecycle_output_sequence(pane_id, generation);
         #[cfg(windows)]
@@ -386,6 +361,7 @@ impl HandlerState {
                 session_name.clone(),
                 pane_id,
                 exit_watcher,
+                pane_output.clone(),
                 Some(generation),
                 eof_state.clone(),
                 spawn.pane_exit_callback.clone(),
@@ -437,9 +413,7 @@ fn seed_initial_pane_title(transcript: &SharedPaneTranscript, initial_title: Opt
             &fallback
         }
     };
-    let mut transcript = transcript
-        .lock()
-        .expect("pane transcript mutex must not be poisoned");
+    let mut transcript = transcript.lock();
     if transcript.title().is_empty() {
         transcript.set_title(title);
     }

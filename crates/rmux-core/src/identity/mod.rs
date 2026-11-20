@@ -1,18 +1,34 @@
 //! Identity vocabulary surface used by `rmux-core` consumers.
 //!
 //! The canonical identity newtypes (`SessionName`, `SessionId`,
-//! `WindowId`, `PaneId`) are defined exactly once in `rmux-proto`. This
+//! `WindowId`, `PaneId`) are defined exactly once in `rmux-types`. This
 //! module re-exports those types so `rmux-core` consumers can address
 //! them through a single core-side surface regardless of which crate
 //! originally introduced the value. Allocation, lookup, and resolution
 //! remain in `rmux-core::session`; nothing in this module mutates
 //! identity state.
 
-pub use rmux_proto::{PaneId, SessionId, SessionName, WindowId};
+pub use rmux_types::{PaneId, SessionId, SessionName, WindowId};
 
 #[cfg(test)]
 mod tests {
     use super::{PaneId, SessionId, SessionName, WindowId};
+
+    #[test]
+    fn core_identity_values_are_owned_by_rmux_types() {
+        let name: rmux_types::SessionName = SessionName::new("a\\n:b.c").unwrap();
+        let core: crate::SessionName = name;
+        let proto: rmux_proto::SessionName = core;
+        assert_eq!(proto.as_str(), "a\\\\n_b_c");
+        let session: rmux_types::SessionId = crate::SessionId::new(u32::MAX);
+        let window: rmux_types::WindowId = crate::WindowId::new(0);
+        let pane: rmux_types::PaneId = crate::pane::PaneId::new(u32::MAX);
+        let _: (
+            rmux_proto::SessionId,
+            rmux_proto::WindowId,
+            rmux_proto::PaneId,
+        ) = (session, window, pane);
+    }
 
     #[test]
     fn core_identity_re_export_matches_proto_definition() {

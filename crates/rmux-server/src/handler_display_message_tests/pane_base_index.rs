@@ -22,8 +22,8 @@ fn default_list_pane_labels(output: &CommandOutput) -> Vec<&str> {
 async fn pane_index_formats_use_window_local_pane_base_index() {
     let handler = RequestHandler::new();
     let alpha = session_name("alpha");
-    assert!(matches!(
-        handler
+    crate::session_fixture::assert_new_session(
+        &handler
             .handle(Request::NewSession(NewSessionRequest {
                 session_name: alpha.clone(),
                 detached: true,
@@ -31,8 +31,7 @@ async fn pane_index_formats_use_window_local_pane_base_index() {
                 environment: None,
             }))
             .await,
-        Response::NewSession(_)
-    ));
+    );
     assert!(matches!(
         handler
             .handle(Request::SplitWindow(SplitWindowRequest {
@@ -128,8 +127,8 @@ async fn default_list_panes_uses_global_pane_base_index_without_window_override(
             .await,
         Response::SetOption(_)
     ));
-    assert!(matches!(
-        handler
+    crate::session_fixture::assert_new_session(
+        &handler
             .handle(Request::NewSession(NewSessionRequest {
                 session_name: beta.clone(),
                 detached: true,
@@ -137,8 +136,7 @@ async fn default_list_panes_uses_global_pane_base_index_without_window_override(
                 environment: None,
             }))
             .await,
-        Response::NewSession(_)
-    ));
+    );
     assert!(matches!(
         handler
             .handle(Request::SplitWindow(SplitWindowRequest {
@@ -186,8 +184,8 @@ async fn default_list_panes_uses_global_pane_base_index_without_window_override(
 async fn target_resolution_uses_visible_pane_base_index() {
     let handler = RequestHandler::new();
     let alpha = session_name("alpha");
-    assert!(matches!(
-        handler
+    crate::session_fixture::assert_new_session(
+        &handler
             .handle(Request::NewSession(NewSessionRequest {
                 session_name: alpha.clone(),
                 detached: true,
@@ -195,8 +193,7 @@ async fn target_resolution_uses_visible_pane_base_index() {
                 environment: None,
             }))
             .await,
-        Response::NewSession(_)
-    ));
+    );
     assert!(matches!(
         handler
             .handle(Request::SplitWindow(SplitWindowRequest {

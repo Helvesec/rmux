@@ -229,7 +229,10 @@ async fn move_window_source_session_with_remaining_window_keeps_attached_client(
         .session(&source)
         .expect("source session survives with its remaining window");
     assert_eq!(
-        source_session.windows().keys().copied().collect::<Vec<_>>(),
+        source_session
+            .windows()
+            .map(|(index, _)| index)
+            .collect::<Vec<_>>(),
         vec![0]
     );
 }
@@ -417,9 +420,9 @@ async fn move_window_kill_duplicate_alias_moves_group_peer_alerts_by_occurrence(
     create_grouped_session(&handler, peer.as_str(), &owner).await;
     {
         let mut state = handler.state.lock().await;
-        let peer_session = state
+        let mut peer_session = state
             .sessions
-            .session_mut(&peer)
+            .session_setup(&peer)
             .expect("group peer exists");
         assert!(peer_session.add_winlink_alert_flags(0, rmux_core::WINLINK_BELL));
         assert!(peer_session.add_winlink_alert_flags(2, rmux_core::WINLINK_ACTIVITY));
@@ -470,9 +473,9 @@ async fn move_window_reindex_remaps_group_peer_duplicate_alias_alerts_by_occurre
     create_grouped_session(&handler, peer.as_str(), &owner).await;
     {
         let mut state = handler.state.lock().await;
-        let peer_session = state
+        let mut peer_session = state
             .sessions
-            .session_mut(&peer)
+            .session_setup(&peer)
             .expect("group peer exists");
         assert!(peer_session.add_winlink_alert_flags(1, rmux_core::WINLINK_ACTIVITY));
         assert!(peer_session.add_winlink_alert_flags(2, rmux_core::WINLINK_BELL));
@@ -511,9 +514,9 @@ async fn move_window_relative_remaps_group_peer_duplicate_alias_alerts_by_occurr
     create_grouped_session(&handler, peer.as_str(), &owner).await;
     {
         let mut state = handler.state.lock().await;
-        let peer_session = state
+        let mut peer_session = state
             .sessions
-            .session_mut(&peer)
+            .session_setup(&peer)
             .expect("group peer exists");
         peer_session
             .select_window(1)
@@ -933,11 +936,17 @@ async fn move_window_across_sessions_migrates_the_terminal_ownership_map() {
     let alpha_session = state.sessions.session(&alpha).expect("alpha should exist");
     let beta_session = state.sessions.session(&beta).expect("beta should exist");
     assert_eq!(
-        alpha_session.windows().keys().copied().collect::<Vec<_>>(),
+        alpha_session
+            .windows()
+            .map(|(index, _)| index)
+            .collect::<Vec<_>>(),
         vec![0]
     );
     assert_eq!(
-        beta_session.windows().keys().copied().collect::<Vec<_>>(),
+        beta_session
+            .windows()
+            .map(|(index, _)| index)
+            .collect::<Vec<_>>(),
         vec![0, 4]
     );
     assert_eq!(
@@ -1130,11 +1139,17 @@ async fn move_window_rejects_cross_session_move_within_same_session_group() {
     let alpha_session = state.sessions.session(&alpha).expect("alpha should remain");
     let beta_session = state.sessions.session(&beta).expect("beta should remain");
     assert_eq!(
-        alpha_session.windows().keys().copied().collect::<Vec<_>>(),
+        alpha_session
+            .windows()
+            .map(|(index, _)| index)
+            .collect::<Vec<_>>(),
         vec![0]
     );
     assert_eq!(
-        beta_session.windows().keys().copied().collect::<Vec<_>>(),
+        beta_session
+            .windows()
+            .map(|(index, _)| index)
+            .collect::<Vec<_>>(),
         vec![0]
     );
     assert_eq!(alpha_session.pane_id_in_window(0, 0), Some(shared_pane_id));
@@ -1176,11 +1191,17 @@ async fn move_window_relative_rejects_cross_session_move_within_same_session_gro
     let alpha_session = state.sessions.session(&alpha).expect("alpha should remain");
     let beta_session = state.sessions.session(&beta).expect("beta should remain");
     assert_eq!(
-        alpha_session.windows().keys().copied().collect::<Vec<_>>(),
+        alpha_session
+            .windows()
+            .map(|(index, _)| index)
+            .collect::<Vec<_>>(),
         vec![0]
     );
     assert_eq!(
-        beta_session.windows().keys().copied().collect::<Vec<_>>(),
+        beta_session
+            .windows()
+            .map(|(index, _)| index)
+            .collect::<Vec<_>>(),
         vec![0]
     );
 }
@@ -1503,7 +1524,10 @@ async fn move_window_within_session_restores_the_killed_destination_when_resize_
     let state = handler.state.lock().await;
     let session = state.sessions.session(&alpha).expect("alpha should exist");
     assert_eq!(
-        session.windows().keys().copied().collect::<Vec<_>>(),
+        session
+            .windows()
+            .map(|(index, _)| index)
+            .collect::<Vec<_>>(),
         vec![0, 1]
     );
     assert_eq!(session.pane_id_in_window(0, 0), Some(source_pane_id));
@@ -1547,7 +1571,10 @@ async fn move_window_reindex_compacts_sparse_window_indices() {
     let state = handler.state.lock().await;
     let session = state.sessions.session(&alpha).expect("alpha should exist");
     assert_eq!(
-        session.windows().keys().copied().collect::<Vec<_>>(),
+        session
+            .windows()
+            .map(|(index, _)| index)
+            .collect::<Vec<_>>(),
         vec![0, 1, 2]
     );
 }
@@ -1587,7 +1614,10 @@ async fn move_window_reindex_with_source_ignores_source_and_renumbers_target_ses
     assert!(alpha_session.window_at(3).is_some());
     let beta_session = state.sessions.session(&beta).expect("beta should exist");
     assert_eq!(
-        beta_session.windows().keys().copied().collect::<Vec<_>>(),
+        beta_session
+            .windows()
+            .map(|(index, _)| index)
+            .collect::<Vec<_>>(),
         vec![0, 1]
     );
 }
@@ -1627,8 +1657,7 @@ async fn move_window_reindex_ignores_source_in_target_without_window_lifecycle_e
             .session(&alpha)
             .expect("target session survives reindex")
             .windows()
-            .keys()
-            .copied()
+            .map(|(index, _)| index)
             .collect::<Vec<_>>(),
         vec![0, 1, 2]
     );
@@ -1677,7 +1706,10 @@ async fn move_window_reindex_with_window_target_renumbers_target_session() {
     let state = handler.state.lock().await;
     let session = state.sessions.session(&alpha).expect("alpha should exist");
     assert_eq!(
-        session.windows().keys().copied().collect::<Vec<_>>(),
+        session
+            .windows()
+            .map(|(index, _)| index)
+            .collect::<Vec<_>>(),
         vec![0, 1, 2]
     );
 }
@@ -1716,12 +1748,18 @@ async fn move_window_reindex_with_source_and_window_target_ignores_source() {
     let state = handler.state.lock().await;
     let alpha_session = state.sessions.session(&alpha).expect("alpha should exist");
     assert_eq!(
-        alpha_session.windows().keys().copied().collect::<Vec<_>>(),
+        alpha_session
+            .windows()
+            .map(|(index, _)| index)
+            .collect::<Vec<_>>(),
         vec![0, 2, 5]
     );
     let beta_session = state.sessions.session(&beta).expect("beta should exist");
     assert_eq!(
-        beta_session.windows().keys().copied().collect::<Vec<_>>(),
+        beta_session
+            .windows()
+            .map(|(index, _)| index)
+            .collect::<Vec<_>>(),
         vec![0, 1]
     );
 }
@@ -1770,7 +1808,10 @@ async fn move_window_after_source_already_after_target_matches_tmux_gap_shape() 
     let state = handler.state.lock().await;
     let session = state.sessions.session(&alpha).expect("alpha should exist");
     assert_eq!(
-        session.windows().keys().copied().collect::<Vec<_>>(),
+        session
+            .windows()
+            .map(|(index, _)| index)
+            .collect::<Vec<_>>(),
         vec![0, 1, 3]
     );
     assert_eq!(session.pane_id_in_window(1, 0), Some(source_pane_id));
@@ -1825,7 +1866,10 @@ async fn move_window_before_source_is_target_matches_tmux_gap_shape() {
     let state = handler.state.lock().await;
     let session = state.sessions.session(&alpha).expect("alpha should exist");
     assert_eq!(
-        session.windows().keys().copied().collect::<Vec<_>>(),
+        session
+            .windows()
+            .map(|(index, _)| index)
+            .collect::<Vec<_>>(),
         vec![0, 2, 3]
     );
     assert_eq!(session.pane_id_in_window(0, 0), Some(source_pane_id));
@@ -1875,7 +1919,10 @@ async fn move_window_reindex_starts_at_base_index() {
     let state = handler.state.lock().await;
     let session = state.sessions.session(&alpha).expect("alpha should exist");
     assert_eq!(
-        session.windows().keys().copied().collect::<Vec<_>>(),
+        session
+            .windows()
+            .map(|(index, _)| index)
+            .collect::<Vec<_>>(),
         vec![2, 3, 4]
     );
 }
@@ -1998,11 +2045,17 @@ async fn move_window_across_sessions_restores_terminal_ownership_when_resize_fai
     let alpha_session = state.sessions.session(&alpha).expect("alpha should exist");
     let beta_session = state.sessions.session(&beta).expect("beta should exist");
     assert_eq!(
-        alpha_session.windows().keys().copied().collect::<Vec<_>>(),
+        alpha_session
+            .windows()
+            .map(|(index, _)| index)
+            .collect::<Vec<_>>(),
         vec![0, 1]
     );
     assert_eq!(
-        beta_session.windows().keys().copied().collect::<Vec<_>>(),
+        beta_session
+            .windows()
+            .map(|(index, _)| index)
+            .collect::<Vec<_>>(),
         vec![0, 4]
     );
     assert_eq!(alpha_session.pane_id_in_window(1, 0), Some(moved_pane_id));

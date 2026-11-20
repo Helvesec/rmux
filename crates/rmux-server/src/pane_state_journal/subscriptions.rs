@@ -64,6 +64,7 @@ impl PaneStateJournal {
                 closed: false,
                 closed_revision: None,
                 closed_reason: None,
+                closed_seeded: false,
                 evicted_state_revision_before_close: 0,
             },
         );
@@ -72,7 +73,49 @@ impl PaneStateJournal {
             &mut self.subscription_generation_counts,
             (pane_id, generation),
         );
+        self.seed_subscription_if_pane_closed(id);
         Ok(id)
+    }
+
+    /// A subscription created after its pane already closed must still
+    /// receive the terminal event: its cursor starts at or past the close
+    /// revision, so replay would filter the record out and nothing else
+    /// would ever deliver it. Seed the subscription's closed state from the
+    /// pane's most recent retained Closed record so `read_after`'s existing
+    /// synthesis path hands over the one terminal event. A close whose
+    /// record was evicted stays open: no invented reason is delivered.
+    fn seed_subscription_if_pane_closed(&mut self, id: PaneStateSubscriptionId) {
+        let Some(subscription) = self.subscriptions.get(&id) else {
+            return;
+        };
+        if !self.closed_panes.contains(&subscription.pane_id) {
+            return;
+        }
+        let Some((revision, reason)) =
+            self.records
+                .iter()
+                .rev()
+                .find_map(|record| match &record.change {
+                    PaneStateChange::Closed { reason }
+                        if record.pane_id == subscription.pane_id =>
+                    {
+                        Some((record.revision, *reason))
+                    }
+                    _ => None,
+                })
+        else {
+            return;
+        };
+        let Some(subscription) = self.subscriptions.get_mut(&id) else {
+            return;
+        };
+        subscription.evicted_state_revision_before_close =
+            evicted_revisions_for_subscription(&self.evicted_revisions, subscription)
+                .max_matching_state_change(subscription.include);
+        subscription.closed = true;
+        subscription.closed_seeded = true;
+        subscription.closed_revision = Some(revision);
+        subscription.closed_reason = Some(reason);
     }
 
     pub(crate) fn unsubscribe(
@@ -123,10 +166,9 @@ impl PaneStateJournal {
             self.closed_pane_order.push_back(pane_id);
             self.prune_closed_panes();
         }
-        let has_open_subscription = self
-            .subscriptions
-            .values()
-            .any(|subscription| subscription.pane_id == pane_id && !subscription.closed);
+        let has_open_subscription = self.subscriptions.values().any(|subscription| {
+            subscription.pane_id == pane_id && subscription.awaiting_close_delivery()
+        });
         let should_record_close = newly_closed || has_open_subscription;
         if should_record_close {
             for subscription in self.subscriptions.values_mut() {
@@ -146,9 +188,12 @@ impl PaneStateJournal {
     ) {
         let evicted_revisions = &self.evicted_revisions;
         for subscription in self.subscriptions.values_mut() {
+            // A seeded subscription waits for the pane's final close: re-point
+            // it at the newer record instead of delivering the stale seeded
+            // close.
             if subscription.pane_id == pane_id
                 && subscription.closed
-                && subscription.closed_revision.is_none()
+                && (subscription.closed_seeded || subscription.closed_revision.is_none())
             {
                 subscription.evicted_state_revision_before_close =
                     evicted_revisions_for_subscription(evicted_revisions, subscription)

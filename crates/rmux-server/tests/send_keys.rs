@@ -226,7 +226,7 @@ async fn send_keys_writes_to_the_correct_pane_through_the_socket() -> Result<(),
             environment: None,
         }))
         .await?;
-    assert!(matches!(created, Response::NewSession(_)));
+    crate::common::assert_new_session(&created);
 
     let (_, mut attach_stream) = ClientConnection::connect(&socket_path)
         .await?
@@ -322,7 +322,7 @@ async fn send_keys_targets_the_correct_pane_in_a_multi_pane_session() -> Result<
             environment: None,
         }))
         .await?;
-    assert!(matches!(created, Response::NewSession(_)));
+    crate::common::assert_new_session(&created);
 
     let split = client
         .send_request(&Request::SplitWindow(SplitWindowRequest {
@@ -425,7 +425,7 @@ async fn send_keys_ctrl_c_interrupts_a_real_pane_process() -> Result<(), Box<dyn
             environment: None,
         }))
         .await?;
-    assert!(matches!(created, Response::NewSession(_)));
+    crate::common::assert_new_session(&created);
 
     let (_, mut attach_stream) = ClientConnection::connect(&socket_path)
         .await?

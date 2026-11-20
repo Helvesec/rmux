@@ -1,5 +1,7 @@
 use super::RequestHandler;
 use crate::pane_io::AttachControl;
+#[cfg(test)]
+use crate::session_fixture::SessionSetupExt as _;
 use rmux_proto::{
     DisplayMessageRequest, HookLifecycle, HookName, KillPaneRequest, KillSessionRequest,
     KillWindowRequest, LastPaneRequest, LastWindowRequest, LayoutName, LinkWindowRequest,
@@ -140,7 +142,7 @@ async fn create_session(handler: &RequestHandler, name: &str) {
             skip_environment_update: false,
         })))
         .await;
-    assert!(matches!(created, Response::NewSession(_)));
+    crate::session_fixture::assert_new_session(&created);
 }
 
 async fn create_grouped_session(handler: &RequestHandler, name: &str, group_target: &SessionName) {
@@ -168,7 +170,7 @@ async fn create_grouped_session(handler: &RequestHandler, name: &str, group_targ
             skip_environment_update: false,
         })))
         .await;
-    assert!(matches!(created, Response::NewSession(_)));
+    crate::session_fixture::assert_new_session(&created);
 }
 
 async fn create_session_with_size(handler: &RequestHandler, name: &str, size: TerminalSize) {
@@ -239,18 +241,13 @@ fn quiet_window_test_command() -> Vec<String> {
 
 async fn insert_window(handler: &RequestHandler, session_name: &SessionName, window_index: u32) {
     let mut state = handler.state.lock().await;
-    let pane_id = state.sessions.allocate_pane_id();
     {
-        let session = state
+        let mut session = state
             .sessions
-            .session_mut(session_name)
+            .session_setup(session_name)
             .expect("session should exist");
         session
-            .insert_window_with_initial_pane_with_id(
-                window_index,
-                TerminalSize { cols: 90, rows: 30 },
-                pane_id,
-            )
+            .insert_window_with_initial_pane(window_index, TerminalSize { cols: 90, rows: 30 })
             .expect("window insert succeeds");
     }
     state
@@ -404,6 +401,8 @@ mod linked_window_mutations;
 
 #[path = "handler_window_tests/resize_respawn.rs"]
 mod resize_respawn;
+#[path = "handler_window_tests/respawn_title.rs"]
+mod respawn_title;
 
 #[path = "handler_window_tests/resize_window_client_size.rs"]
 mod resize_window_client_size;
@@ -413,3 +412,9 @@ mod respawn_linked_refresh;
 
 #[path = "handler_window_tests/respawn_linked_guard.rs"]
 mod respawn_linked_guard;
+
+#[path = "handler_window_tests/pane_options_renumber.rs"]
+mod pane_options_renumber;
+
+#[path = "handler_window_tests/respawn_dead.rs"]
+mod respawn_dead;

@@ -22,11 +22,11 @@ impl HandlerState {
         let slots = self
             .sessions
             .iter()
+            .map(|session| (session.name(), session))
             .flat_map(|(session_name, session)| {
                 session
                     .windows()
-                    .keys()
-                    .copied()
+                    .map(|(index, _)| index)
                     .map(move |window_index| (session_name.clone(), window_index))
             })
             .collect::<Vec<_>>();
@@ -65,19 +65,19 @@ impl HandlerState {
     ) -> Option<WindowTarget> {
         self.sessions
             .iter()
+            .map(|session| (session.name(), session))
             .flat_map(|(session_name, session)| {
                 session
                     .windows()
-                    .iter()
                     .filter(move |(window_index, window)| {
                         window.id() == window_id
-                            && self.window_link_occurrence_id(session_name, **window_index)
+                            && self.window_link_occurrence_id(session_name, *window_index)
                                 == Some(occurrence_id)
                     })
                     .map(move |(window_index, _)| {
                         (
                             session.id(),
-                            WindowTarget::with_window(session_name.clone(), *window_index),
+                            WindowTarget::with_window(session_name.clone(), window_index),
                         )
                     })
             })

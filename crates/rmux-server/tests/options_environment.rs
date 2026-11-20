@@ -26,7 +26,7 @@ async fn set_option_round_trips_and_invalid_variants_fail_cleanly() -> Result<()
         }),
     )
     .await?;
-    assert!(matches!(created, Response::NewSession(_)));
+    crate::common::assert_new_session(&created);
 
     let global_status = send_request(
         &socket_path,
@@ -142,7 +142,7 @@ async fn set_environment_round_trips_and_requires_existing_sessions() -> Result<
         }),
     )
     .await?;
-    assert!(matches!(created, Response::NewSession(_)));
+    crate::common::assert_new_session(&created);
 
     let global = send_request(
         &socket_path,

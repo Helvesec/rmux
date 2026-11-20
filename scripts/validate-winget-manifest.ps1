@@ -14,6 +14,8 @@ param(
 Set-StrictMode -Version Latest
 $ErrorActionPreference = "Stop"
 
+. (Join-Path $PSScriptRoot "packaging/layout-tool.ps1")
+
 function Fail([string]$Message) {
     Write-Error "error: $Message"
     exit 1
@@ -206,7 +208,8 @@ $localeManifest = "$stem.locale.en-US.yaml"
 $asset = "rmux-$versionValue-windows-x86_64.zip"
 $packageDir = "rmux-$versionValue-windows-x86_64"
 $expectedUrl = "https://github.com/$Repository/releases/download/$ReleaseTag/$asset"
-$expectedRelativePath = "$packageDir\rmux.exe"
+$expectedRelativePath = Get-LayoutLine @("nested-exe", "--package-name", $packageDir)
+$expectedCommandAlias = Get-LayoutLine @("command-alias", "--consumer", "winget")
 $expectedSha256 = ReadChecksum $Checksums $asset
 $owner = $Repository.Split('/')[0]
 
@@ -225,7 +228,7 @@ AssertManifestValue "PackageVersion" $versionValue
 AssertManifestValue "InstallerType" "zip"
 AssertManifestValue "NestedInstallerType" "portable"
 AssertManifestValue "RelativeFilePath" $expectedRelativePath
-AssertManifestValue "PortableCommandAlias" "rmux"
+AssertManifestValue "PortableCommandAlias" $expectedCommandAlias
 AssertManifestValue "ArchiveBinariesDependOnPath" "true"
 AssertManifestLine "Dependencies:"
 AssertManifestLine "PackageDependencies:"

@@ -14,9 +14,12 @@ fn command_names(input: &str) -> Vec<String> {
         .collect()
 }
 
+#[path = "new_pane_tests.rs"]
+mod new_pane;
+
 #[test]
 fn frozen_command_inventory_has_expected_entries_and_aliases() {
-    assert_eq!(COMMAND_TABLE.len(), 90);
+    assert_eq!(COMMAND_TABLE.len(), 91);
     assert_eq!(lookup_command("new").unwrap().name, "new-session");
     assert_eq!(lookup_command("ls").unwrap().name, "list-sessions");
     assert_eq!(lookup_command("splitw").unwrap().name, "split-window");
@@ -42,14 +45,6 @@ fn lookup_rejects_unknown_commands_with_tmux_diagnostic() {
     assert_eq!(
         lookup_command("wait-pane").unwrap_err().to_string(),
         "unknown command: wait-pane"
-    );
-    assert_eq!(
-        lookup_command("new-pane").unwrap_err().to_string(),
-        "unknown command: new-pane"
-    );
-    assert_eq!(
-        lookup_command("newp").unwrap_err().to_string(),
-        "unknown command: newp"
     );
 }
 
@@ -118,6 +113,52 @@ fn parses_escape_sequences() {
         commands.commands()[0].arguments()[0].as_string(),
         Some("\x07\x08\x1b\x0c \x0b\r\n\tA☺")
     );
+}
+
+fn parsed_first_argument(source: &str) -> String {
+    CommandParser::new().parse(source).unwrap().commands()[0].arguments()[0]
+        .as_string()
+        .unwrap()
+        .to_owned()
+}
+
+#[test]
+fn octal_escapes_append_bytes_that_form_utf8() {
+    // Measured on tmux 3.7b with `set -g @o ...; show -gv @o | od -tx1`.
+    for (source, expected) in [
+        (r#"display-message "\303\251""#, "\u{e9}"),
+        (r#"display-message \303\251"#, "\u{e9}"),
+        (r#"display-message "\342\224\202x""#, "\u{2502}x"),
+        (r#"display-message "\101\303\251B""#, "A\u{e9}B"),
+        (r#"display-message "\303""\251""#, "\u{e9}"),
+        ("display-message \"\\303\\\n\\251\"", "\u{e9}"),
+        (r#"display-message '\303\251'"#, r"\303\251"),
+    ] {
+        assert_eq!(parsed_first_argument(source), expected, "{source}");
+    }
+}
+
+#[test]
+fn octal_escapes_that_cannot_form_utf8_become_replacement_characters_product_divergence() {
+    // C-D97: tmux 3.7b keeps these bytes raw (`\377` is ff, `\303x` is
+    // c3 78); RMUX arguments are strings, so each invalid sequence reads as a
+    // raw invalid byte of a sourced file does: one U+FFFD per maximal invalid
+    // subpart.
+    for (source, expected) in [
+        (r#"display-message "\377""#, "\u{fffd}"),
+        (r#"display-message "\303x""#, "\u{fffd}x"),
+        (r#"display-message "a\251b""#, "a\u{fffd}b"),
+        (r#"display-message "\303\303\251""#, "\u{fffd}\u{e9}"),
+        (r#"display-message "\342\224""#, "\u{fffd}"),
+        (r#"display-message "\303\u00a9""#, "\u{fffd}\u{a9}"),
+        (r#"display-message "\300\200""#, "\u{fffd}\u{fffd}"),
+        (
+            r#"display-message "\355\240\200""#,
+            "\u{fffd}\u{fffd}\u{fffd}",
+        ),
+    ] {
+        assert_eq!(parsed_first_argument(source), expected, "{source}");
+    }
 }
 
 #[test]
@@ -1180,4 +1221,43 @@ fn modest_block_and_conditional_nesting_still_parses() {
     CommandParser::new()
         .parse(&conds)
         .expect("nested conditionals parse");
+}
+
+#[path = "tests/reparse.rs"]
+mod reparse;
+
+#[test]
+fn only_a_percent_directive_reads_parse_time_format_values() {
+    let conditional = "%if #{pane_active}\nlist-sessions\n%else\ndisplay-message ok\n%endif";
+    assert!(CommandParser::source_reads_parse_time_formats(conditional));
+    assert!(CommandParser::source_reads_parse_time_formats(
+        "list-sessions\n%if 1\n%elif #{pane_active}\n%endif"
+    ));
+    for source in [
+        "display-message -p \"#{hook}:#{option_name}\"",
+        "set-option -g @value 1 ; list-sessions",
+        "{ list-sessions }",
+    ] {
+        assert!(
+            !CommandParser::source_reads_parse_time_formats(source),
+            "{source:?}"
+        );
+    }
+
+    let names = |parser: CommandParser, source: &str| {
+        parser
+            .parse(source)
+            .expect("command parses")
+            .commands()
+            .iter()
+            .map(|command| command.name().to_owned())
+            .collect::<Vec<_>>()
+    };
+    let active = CommandParser::new().with_format_value("pane_active", "1");
+    assert_ne!(
+        names(active.clone(), conditional),
+        names(CommandParser::new(), conditional)
+    );
+    let plain = "display-message -p \"#{pane_active}\" ; list-sessions";
+    assert_eq!(names(active, plain), names(CommandParser::new(), plain));
 }

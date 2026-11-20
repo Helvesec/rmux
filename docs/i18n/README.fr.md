@@ -43,7 +43,7 @@
 > [!NOTE]
 > RMUX dispose maintenant d'une fonctionnalité de multiplexage web E2E. [En savoir plus dans la documentation.](../web-share.md)
 >
-> RMUX fournit maintenant des SDK Python et TypeScript : [librmux](https://pypi.org/project/librmux/), [@rmux/sdk](https://www.npmjs.com/package/@rmux/sdk).
+> Les SDK Python/TypeScript historiques ciblent RMUX 0.6 : [librmux 0.6.1](https://pypi.org/project/librmux/0.6.1/) et [@rmux/sdk 0.6.5](https://www.npmjs.com/package/@rmux/sdk/v/0.6.5). Ils sont exclus des distributions et du support SDK de RMUX 1.0.
 >
 > Pour une demande de fonctionnalité ou un signalement, veuillez [ouvrir une issue](https://github.com/Helvesec/rmux/issues).
 
@@ -238,18 +238,28 @@ Points d'entrée utiles :
 
 ## 🧰 Scripts & API
 
-Les SDK se connectent au daemon RMUX local et exposent sessions, panes,
-streams, waits et snapshots pour l'automatisation.
+Le SDK Rust utilise le contrat IPC typé du daemon local. Les wrappers historiques
+Python/TypeScript invoquent une CLI RMUX installée séparément. Ils sont exclus
+des nouvelles distributions RMUX 1.0, des implémentations embarquées et des
+entrées positives de support SDK, d’artefacts, de build et de packaging.
+Le jalon [Post-1.0 Python/TypeScript SDK qualification](../ROADMAP.md#post-10-pythontypescript-sdk-qualification)
+a lieu après RMUX 1.0 ; voir le [périmètre SDK](../scripting-sdk.md#additional-language-sdk-scope).
 
 ```sh
 cargo add rmux-sdk
-pip install librmux
-npm install @rmux/sdk
+```
+
+Exemples historiques uniquement : `librmux 0.6.1` cible RMUX 0.6.1 ;
+`@rmux/sdk 0.6.5` cible RMUX 0.6.x. Ce ne sont pas des instructions pour RMUX 1.0.
+
+```sh
+pip install librmux==0.6.1
+npm install @rmux/sdk@0.6.5
 ```
 
 - SDK Rust : [`rmux-sdk`](https://crates.io/crates/rmux-sdk)
-- SDK Python : [`librmux`](https://pypi.org/project/librmux/)
-- SDK TypeScript : [`@rmux/sdk`](https://www.npmjs.com/package/@rmux/sdk)
+- SDK Python : [`librmux 0.6.1` — RMUX 0.6.1](https://pypi.org/project/librmux/0.6.1/)
+- SDK TypeScript : [`@rmux/sdk 0.6.5` — RMUX 0.6.x](https://www.npmjs.com/package/@rmux/sdk/v/0.6.5)
 
 <a id="documentation"></a>
 
@@ -311,7 +321,6 @@ fn render(snapshot: PaneSnapshot, area: Rect, buffer: &mut Buffer) {
 | `rmux-server` | Daemon Tokio et dispatch des requêtes | crate de support |
 | `rmux-client` | Client IPC local et plomberie du mode attach | crate de support |
 | `rmux` | CLI et point d'entrée daemon masqué | binaire public |
-| `rmux-render-core` | Coeur de rendu snapshot partagé | interne au workspace |
 
 <a id="platform-support"></a>
 
@@ -342,7 +351,7 @@ set -as terminal-features 'xterm-kitty:kitty-graphics'
 set -as terminal-features 'xterm*:sixel'
 ```
 
-Le passthrough SIXEL est couvert par la suite de régression automatisée Unix PTY attach. Sur Windows, RMUX active le passthrough ConPTY moderne quand l'OS le supporte, mais l'affichage SIXEL dépend toujours du terminal externe. Définissez `RMUX_CONPTY_NO_PASSTHROUGH=1` pour désactiver ce mode backend lors d'un diagnostic.
+Le passthrough SIXEL est couvert par la suite de régression automatisée Unix PTY attach. Sur Windows, le passage des requêtes et réponses OSC nécessite les fichiers Microsoft `conpty.dll` et `OpenConsole.exe` de même version, 1.24.2607.10001 ou ultérieure, à côté de l'exécutable qui héberge le pane, généralement `rmux-daemon.exe`. Les scripts de packaging actuels n'incluent pas ces fichiers optionnels. Cela ne prouve pas l'affichage SIXEL, qui dépend aussi du terminal externe. `RMUX_CONPTY_NO_PASSTHROUGH=1` sélectionne la console système et désactive le bit historique de compatibilité du collage.
 
 <a id="verification"></a>
 

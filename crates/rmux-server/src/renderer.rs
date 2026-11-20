@@ -1,41 +1,40 @@
+#[cfg(test)]
+pub(crate) mod initial_render_observer;
 use rmux_core::input::{
     mode, Colour, GridAttr, COLOUR_DEFAULT, COLOUR_FLAG_256, COLOUR_FLAG_RGB, COLOUR_NONE,
     COLOUR_TERMINAL,
 };
 use rmux_core::style::{parse_colour, Style};
-use rmux_core::{text_width as tmux_text_width, OptionStore, Pane, PaneGeometry, Screen, Session};
+use rmux_core::{text_width as tmux_text_width, OptionStore, Pane, PaneGeometry, Screen};
 
+use crate::client_format::ClientLoopSnapshot;
 use crate::copy_mode::CopyModeRenderSnapshot;
 use crate::format_runtime::{render_runtime_template, RuntimeFormatContext};
 use crate::pane_terminals::HandlerState;
-use crate::pane_visible_geometry::visible_pane_content_geometry;
-#[path = "renderer/borders.rs"]
 mod borders;
-#[path = "renderer/client_title.rs"]
 mod client_title;
-#[path = "renderer/clock_mode.rs"]
 mod clock_mode;
-#[path = "renderer/copy_mode_line_numbers.rs"]
 mod copy_mode_line_numbers;
-#[path = "renderer/copy_mode_position.rs"]
 mod copy_mode_position;
 #[cfg(test)]
 #[path = "renderer/copy_mode_tests.rs"]
 mod copy_mode_tests;
-#[path = "renderer/display_panes.rs"]
 mod display_panes;
-#[path = "renderer/format_draw.rs"]
+mod fill;
+#[cfg(test)]
+#[path = "renderer/fill_tests.rs"]
+mod fill_tests;
 mod format_draw;
-#[path = "renderer/overlay.rs"]
 mod overlay;
-#[path = "renderer/pane_delta.rs"]
 mod pane_delta;
-#[path = "renderer/pane_screen.rs"]
+mod pane_row;
 mod pane_screen;
-#[path = "renderer/pane_scrollbar.rs"]
 mod pane_scrollbar;
-#[path = "renderer/status.rs"]
+mod popup_cursor;
+mod projection;
 mod status;
+#[cfg(feature = "web")]
+mod web_scene;
 #[cfg(test)]
 use borders::{border_cells, BorderCell, BorderStyle};
 use borders::{
@@ -53,7 +52,8 @@ pub(crate) use display_panes::{
     render_display_panes_clear_with_base, render_display_panes_overlay,
 };
 pub(crate) use format_draw::{
-    format_draw_content_width, format_draw_line, render_formatted_line, FormattedLine,
+    format_draw_content_width, format_draw_line, render_formatted_line,
+    render_formatted_line_segment, write_formatted_cells, FormattedLine,
 };
 #[allow(unused_imports)]
 pub(crate) use overlay::{
@@ -61,19 +61,26 @@ pub(crate) use overlay::{
     MenuRenderItem, MenuRenderSpec, OverlayMousePosition, OverlayPositionContext, OverlayRect,
     PopupContent, PopupRenderSpec,
 };
-pub(crate) use pane_delta::{PaneRenderDelta, PaneRenderDeltaFrame, PaneRenderSnapshot};
-pub(crate) use pane_screen::{
-    pane_default_style, render_copy_mode_pane_screen,
-    render_copy_mode_pane_screen_preserving_prompt_cursor, render_pane_screen,
-    render_pane_screen_preserving_prompt_cursor, styled_pane_screen, truncate_rendered_pane_line,
+pub(crate) use pane_delta::{
+    PaneRenderDelta, PaneRenderDeltaFrame, PaneRenderInputs, PaneRenderSnapshot,
 };
+pub(crate) use pane_row::truncate_rendered_pane_line;
+pub(crate) use pane_screen::{
+    render_copy_mode_pane_screen, render_copy_mode_pane_screen_preserving_prompt_cursor,
+    render_pane_screen, render_pane_screen_preserving_prompt_cursor,
+};
+pub(crate) use popup_cursor::{render_popup_cursor, PopupCursor};
+use projection::{ProjectedPaneScrollbarContext, TerminalSceneProjection};
+mod pane_palette;
 #[cfg(test)]
 use status::status_bar_runs;
-pub(crate) use status::StatusGeometry;
 use status::{
     format_status_message_line, prompt_status_runs, render_status_bar, sanitize_status_text,
     status_bar_lines, status_message_y, status_runs_width, StatusBarRenderRequest,
 };
+pub(crate) use status::{render_prompt, StatusGeometry};
+#[cfg(feature = "web")]
+pub(crate) use web_scene::{WebPaneProjectionContext, WebSceneProjection};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct RenderedPrompt {
@@ -84,13 +91,13 @@ pub(crate) struct RenderedPrompt {
 }
 
 #[cfg(test)]
-pub(crate) fn render(session: &Session, options: &OptionStore) -> Vec<u8> {
+pub(crate) fn render(session: rmux_core::ManagedSessionView<'_>, options: &OptionStore) -> Vec<u8> {
     render_with_attached_count_and_prompt(session, options, 0, None)
 }
 
 #[allow(dead_code)]
 pub(crate) fn render_with_attached_count(
-    session: &Session,
+    session: rmux_core::ManagedSessionView<'_>,
     options: &OptionStore,
     attached_count: usize,
 ) -> Vec<u8> {
@@ -98,7 +105,7 @@ pub(crate) fn render_with_attached_count(
 }
 
 pub(crate) fn render_with_attached_count_and_prompt(
-    session: &Session,
+    session: rmux_core::ManagedSessionView<'_>,
     options: &OptionStore,
     attached_count: usize,
     prompt: Option<&RenderedPrompt>,
@@ -117,18 +124,22 @@ pub(crate) fn render_with_attached_count_and_prompt(
 #[derive(Clone, Copy, Default)]
 pub(crate) struct StatusRenderContext<'a> {
     pub(crate) prompt: Option<&'a RenderedPrompt>,
+    pub(crate) client: Option<&'a crate::client_format::ClientFormatBindings>,
     pub(crate) pane_title: Option<&'a str>,
     pub(crate) state: Option<&'a HandlerState>,
     pub(crate) key_table: Option<&'a str>,
     pub(crate) socket_path: Option<&'a std::path::Path>,
+    pub(crate) client_loop_snapshots: Option<&'a [ClientLoopSnapshot]>,
 }
 
 pub(crate) fn render_with_attached_count_prompt_and_pane_title(
-    session: &Session,
+    session: rmux_core::ManagedSessionView<'_>,
     options: &OptionStore,
     attached_count: usize,
     context: StatusRenderContext<'_>,
 ) -> Vec<u8> {
+    #[cfg(test)]
+    initial_render_observer::observe();
     let geometry = StatusGeometry::for_session(session, options);
     let mut frame = Vec::new();
 
@@ -136,7 +147,15 @@ pub(crate) fn render_with_attached_count_prompt_and_pane_title(
         frame.extend_from_slice(b"\x1b[0m\x1b[H\x1b[2J");
     }
 
-    if !session.window().is_zoomed() && session.window().pane_count() > 1 {
+    // The background comes first: it owns only the cells nothing else draws, so
+    // the frames, the status line and the pane bodies the caller appends all
+    // paint over it. A zoom clear runs before it because that clear erases the
+    // margins too.
+    frame.extend_from_slice(fill::render_outside_fill(session, options).as_slice());
+
+    if !session.window().is_zoomed()
+        && (session.window().pane_count() > 1 || !session.window().floating_stack().is_empty())
+    {
         frame.extend_from_slice(
             render_cells(runtime_border_cells(session, options, geometry).as_slice()).as_slice(),
         );
@@ -152,10 +171,12 @@ pub(crate) fn render_with_attached_count_prompt_and_pane_title(
             geometry,
             attached_count,
             prompt: context.prompt,
+            client: context.client,
             pane_title: context.pane_title,
             state: context.state,
             key_table: context.key_table,
             socket_path: context.socket_path,
+            client_loop_snapshots: context.client_loop_snapshots,
         })
         .as_slice(),
     );
@@ -163,7 +184,7 @@ pub(crate) fn render_with_attached_count_prompt_and_pane_title(
 }
 
 pub(crate) fn render_pane_border_status_lines(
-    session: &Session,
+    session: rmux_core::ManagedSessionView<'_>,
     options: &OptionStore,
     state: Option<&HandlerState>,
 ) -> Vec<u8> {
@@ -172,7 +193,7 @@ pub(crate) fn render_pane_border_status_lines(
 }
 
 pub(crate) fn render_pane_cursor(
-    session: &Session,
+    session: rmux_core::ManagedSessionView<'_>,
     options: &OptionStore,
     pane: &Pane,
     screen: &Screen,
@@ -189,7 +210,7 @@ pub(crate) fn render_pane_cursor(
 }
 
 pub(crate) fn render_copy_mode_pane_cursor(
-    session: &Session,
+    session: rmux_core::ManagedSessionView<'_>,
     options: &OptionStore,
     pane: &Pane,
     snapshot: &CopyModeRenderSnapshot,
@@ -208,7 +229,7 @@ pub(crate) fn render_copy_mode_pane_cursor(
 }
 
 fn render_pane_cursor_for_view(
-    session: &Session,
+    session: rmux_core::ManagedSessionView<'_>,
     options: &OptionStore,
     pane: &Pane,
     screen: &Screen,
@@ -216,93 +237,66 @@ fn render_pane_cursor_for_view(
     alternate_on: bool,
     line_numbers: Option<crate::copy_mode::CopyModeLineNumberLayout>,
 ) -> Vec<u8> {
-    let geometry = StatusGeometry::for_session(session, options);
-    let Some(raw_pane_geometry) =
-        visible_pane_geometry(session, options, pane, geometry.content_rows)
-    else {
+    let scene_projection = TerminalSceneProjection::resolve(session, options);
+    let Some(projection) = scene_projection.pane_projection(
+        session,
+        options,
+        pane,
+        ProjectedPaneScrollbarContext {
+            history_size: screen.history_size(),
+            alternate_on,
+            copy_mode_scroll_position: copy_mode_active.then_some(0),
+        },
+    ) else {
         return Vec::new();
     };
-    let pane_geometry = crate::pane_scrollbar::PaneScrollbarConfig::resolve(
-        options,
-        session.name(),
-        session.active_window_index(),
-        pane.index(),
-    )
-    .content_geometry(raw_pane_geometry, alternate_on, copy_mode_active);
+    let Some(pane_geometry) = projection.terminal_geometry() else {
+        return Vec::new();
+    };
     if pane_geometry.cols() == 0 || pane_geometry.rows() == 0 {
         return Vec::new();
     }
-    let (cursor_x, cursor_y) = screen.cursor_position();
+    let (raw_cursor_x, cursor_y) = screen.cursor_position();
     let cursor_x = line_numbers.map_or_else(
-        || cursor_x.min(u32::from(pane_geometry.cols().saturating_sub(1))) as u16,
-        |layout| layout.cursor_x(pane_geometry.cols(), cursor_x),
+        || raw_cursor_x.min(u32::from(projection.source_width().saturating_sub(1))) as u16,
+        |layout| layout.cursor_x(projection.source_width(), raw_cursor_x),
     );
-    let x = pane_geometry.x().saturating_add(cursor_x);
-    let y = pane_geometry
-        .y()
-        .saturating_add(geometry.content_y_offset)
-        .saturating_add(cursor_y.min(u32::from(pane_geometry.rows().saturating_sub(1))) as u16);
-    let mut frame = cursor_position_bytes(y, x);
-    if screen.mode() & mode::MODE_CURSOR == 0 {
-        frame.extend_from_slice(b"\x1b[?25l");
-    } else {
+    let position = projection.visible_terminal_cursor(cursor_x, cursor_y);
+    let mut frame = position
+        .map(|(x, y)| cursor_position_bytes(y, x))
+        .unwrap_or_default();
+    if screen.mode() & mode::MODE_CURSOR != 0 && position.is_some() {
         frame.extend_from_slice(b"\x1b[?25h");
+    } else {
+        frame.extend_from_slice(b"\x1b[?25l");
     }
     frame
 }
 
 pub(crate) fn visible_pane_terminal_geometry(
-    session: &Session,
+    session: rmux_core::ManagedSessionView<'_>,
     options: &OptionStore,
     pane: &Pane,
     alternate_on: bool,
     copy_mode_active: bool,
 ) -> Option<PaneGeometry> {
-    let geometry = StatusGeometry::for_session(session, options);
-    visible_pane_geometry(session, options, pane, geometry.content_rows).map(|pane_geometry| {
-        let pane_geometry = crate::pane_scrollbar::PaneScrollbarConfig::resolve(
+    TerminalSceneProjection::resolve(session, options)
+        .pane_projection(
+            session,
             options,
-            session.name(),
-            session.active_window_index(),
-            pane.index(),
+            pane,
+            ProjectedPaneScrollbarContext {
+                history_size: 0,
+                alternate_on,
+                copy_mode_scroll_position: copy_mode_active.then_some(0),
+            },
         )
-        .content_geometry(pane_geometry, alternate_on, copy_mode_active);
-        PaneGeometry::new(
-            pane_geometry.x(),
-            pane_geometry.y().saturating_add(geometry.content_y_offset),
-            pane_geometry.cols(),
-            pane_geometry.rows(),
-        )
-    })
-}
-
-fn visible_pane_geometry(
-    session: &Session,
-    options: &OptionStore,
-    pane: &Pane,
-    content_rows: u16,
-) -> Option<PaneGeometry> {
-    if session.window().is_zoomed() && pane.index() != session.active_pane_index() {
-        return None;
-    }
-
-    let geometry = if session.window().is_zoomed() {
-        let size = session.window().size();
-        PaneGeometry::new(0, 0, size.cols, content_rows)
-    } else {
-        pane.geometry()
-    };
-    Some(visible_pane_content_geometry(
-        options,
-        session.name(),
-        session.active_window_index(),
-        geometry,
-        content_rows,
-    ))
+        .filter(|projection| !projection.spans().is_empty())
+        .and_then(|projection| projection.terminal_geometry())
 }
 
 pub(crate) fn render_status_only_with_attached_count_and_prompt(
-    session: &Session,
+    session: rmux_core::ManagedSessionView<'_>,
     options: &OptionStore,
     attached_count: usize,
     context: StatusRenderContext<'_>,
@@ -314,15 +308,17 @@ pub(crate) fn render_status_only_with_attached_count_and_prompt(
         geometry,
         attached_count,
         prompt: context.prompt,
+        client: context.client,
         pane_title: context.pane_title,
         state: context.state,
         key_table: context.key_table,
         socket_path: context.socket_path,
+        client_loop_snapshots: context.client_loop_snapshots,
     })
 }
 
 pub(crate) fn render_status_message(
-    session: &Session,
+    session: rmux_core::ManagedSessionView<'_>,
     options: &OptionStore,
     message: &str,
 ) -> Vec<u8> {
@@ -578,5 +574,10 @@ const ATTR_CODES: &[(u16, i32)] = &[
 #[path = "renderer/erase_wrap_tests.rs"]
 mod erase_wrap_tests;
 #[cfg(test)]
+#[path = "renderer/status_justify_tests.rs"]
+mod status_justify_tests;
+#[cfg(test)]
 #[path = "renderer/tests.rs"]
 mod tests;
+
+pub(crate) use projection::window_scene;

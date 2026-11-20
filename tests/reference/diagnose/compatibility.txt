@@ -1,0 +1,14 @@
+compatibility:
+  registry: tests/reference/tmux_compat/divergences.toml
+  scope: static commands; runtime expansion and includes are not evaluated
+  trust: loading configuration may execute commands; diagnose never executes them
+  - ~/inspection.conf: static-only
+    commands: bind-key,display-message,run-shell,set-environment,source-file
+  - ~/invalid.conf: parse-error
+    commands: none
+  - ~/oversized.conf: too-large
+    commands: none
+  - ~/input.fifo: not-regular
+    commands: none
+  - ~/inspection.conf: static-only
+    commands: bind-key,display-message,run-shell,set-environment,source-file

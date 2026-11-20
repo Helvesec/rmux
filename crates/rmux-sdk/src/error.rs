@@ -13,6 +13,14 @@ use crate::diagnostics;
 use crate::wait::WaitTimeoutError;
 use crate::{PaneId, SessionName};
 
+mod protocol;
+pub use protocol::ProtocolError;
+
+#[cfg(test)]
+mod tests;
+#[cfg(test)]
+mod transport_tests;
+
 const PROTOCOL_HINT: &str =
     "check the request and daemon state, then retry after correcting the request";
 const TRANSPORT_HINT: &str = "verify the rmux daemon is running and the endpoint is reachable";
@@ -39,8 +47,8 @@ pub enum RmuxError {
     /// A protocol-level daemon response or local protocol validation failure.
     #[non_exhaustive]
     Protocol {
-        /// Lower-crate protocol diagnostic preserved as the source error.
-        source: rmux_proto::RmuxError,
+        /// SDK-owned diagnostic preserved as the source error.
+        source: ProtocolError,
     },
     /// A local transport failure while communicating with the daemon.
     #[non_exhaustive]
@@ -115,13 +123,24 @@ impl RmuxError {
         }
     }
 
-    /// Creates an SDK protocol error from a lower-crate protocol diagnostic.
+    /// Creates an SDK protocol error from an SDK-owned diagnostic.
     ///
-    /// Negotiation and capability mismatches are normalized to
-    /// [`RmuxError::Unsupported`] so callers can use [`RmuxError::feature`] and
-    /// [`RmuxError::hint`] without parsing lower-crate display text.
+    /// Use [`ProtocolError::new`] for a caller-supplied diagnostic. Transport
+    /// errors are converted privately by the SDK; the former public protocol
+    /// error/response conversions have been removed before 1.0.
     #[must_use]
-    pub fn protocol(error: rmux_proto::RmuxError) -> Self {
+    pub fn protocol(source: ProtocolError) -> Self {
+        Self::Protocol { source }
+    }
+
+    pub(crate) fn protocol_source(&self) -> Option<&rmux_proto::RmuxError> {
+        match self {
+            Self::Protocol { source } => Some(&source.inner),
+            _ => None,
+        }
+    }
+
+    pub(crate) fn from_proto(error: rmux_proto::RmuxError) -> Self {
         match error {
             rmux_proto::RmuxError::UnsupportedWireVersion {
                 got,
@@ -258,25 +277,19 @@ fn map_known_protocol_error(source: rmux_proto::RmuxError) -> RmuxError {
                 message: rmux_proto::RmuxError::OwnedSessionLeaseLost { session_name }.to_string(),
             }
         }
-        source => RmuxError::Protocol { source },
-    }
-}
-
-impl From<rmux_proto::RmuxError> for RmuxError {
-    fn from(error: rmux_proto::RmuxError) -> Self {
-        Self::protocol(error)
-    }
-}
-
-impl From<rmux_proto::ErrorResponse> for RmuxError {
-    fn from(response: rmux_proto::ErrorResponse) -> Self {
-        Self::protocol(response.error)
+        inner => RmuxError::protocol(ProtocolError { inner }),
     }
 }
 
 impl From<io::Error> for RmuxError {
     fn from(error: io::Error) -> Self {
         Self::transport("communicate with rmux daemon", error)
+    }
+}
+
+impl From<crate::SessionNameError> for RmuxError {
+    fn from(_: crate::SessionNameError) -> Self {
+        Self::from_proto(rmux_proto::RmuxError::EmptySessionName)
     }
 }
 
@@ -444,6 +457,7 @@ trait NonCloneGuard {}
 impl<T: Clone> NonCloneGuard for T {}
 impl NonCloneGuard for RmuxError {}
 impl NonCloneGuard for CollectError {}
+impl NonCloneGuard for ProtocolError {}
 
 const _: fn() = sdk_errors_remain_non_clone;
 
@@ -453,6 +467,7 @@ fn sdk_errors_remain_non_clone() {
 
     assert_non_clone_guard::<RmuxError>();
     assert_non_clone_guard::<CollectError>();
+    assert_non_clone_guard::<ProtocolError>();
 }
 
 fn write_numbered_error(

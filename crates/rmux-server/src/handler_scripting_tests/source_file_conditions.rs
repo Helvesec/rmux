@@ -338,8 +338,8 @@ async fn source_file_ignores_server_scope_for_non_server_options_like_tmux() {
     let root = temp_root("set-option-server-scope");
     fs::create_dir_all(&root).expect("create temp root");
     let alpha = session_name("alpha");
-    assert!(matches!(
-        handler
+    crate::session_fixture::assert_new_session(
+        &handler
             .handle(Request::NewSession(NewSessionRequest {
                 session_name: alpha.clone(),
                 detached: true,
@@ -347,8 +347,7 @@ async fn source_file_ignores_server_scope_for_non_server_options_like_tmux() {
                 environment: None,
             }))
             .await,
-        Response::NewSession(_)
-    ));
+    );
 
     let response = handler
         .handle(Request::SourceFile(Box::new(SourceFileRequest {
@@ -389,8 +388,8 @@ async fn source_file_routes_window_show_commands_and_global_show_scope_compatibi
     let root = temp_root("show-options-compat");
     fs::create_dir_all(&root).expect("create temp root");
     let alpha = session_name("alpha");
-    assert!(matches!(
-        handler
+    crate::session_fixture::assert_new_session(
+        &handler
             .handle(Request::NewSession(NewSessionRequest {
                 session_name: alpha.clone(),
                 detached: true,
@@ -398,8 +397,7 @@ async fn source_file_routes_window_show_commands_and_global_show_scope_compatibi
                 environment: None,
             }))
             .await,
-        Response::NewSession(_)
-    ));
+    );
 
     let response = handler
         .handle(Request::SourceFile(Box::new(SourceFileRequest {
@@ -416,6 +414,7 @@ set -gq status off\n\
 set -gw pane-border-style fg=colour3\n\
 set-window-option -g pane-active-border-style fg=colour5\n\
 set -gw copy-mode-selection-style bg=cyan,fg=black\n\
+set -g copy-mode-selection-style bg=yellow,fg=black\n\
 set-option -ag status-left append\n\
 	show-options -gqsv -t alpha message-limit\n\
 show-options -gqv status\n\
@@ -432,7 +431,7 @@ show-window-options -g -v copy-mode-selection-style\n"
             .command_output()
             .unwrap_or_else(|| panic!("queued show-options output, got {response:?}"))
             .stdout(),
-        b"77\noff\nfg=colour3\nfg=colour5\nbg=cyan,fg=black\n"
+        b"77\noff\nfg=colour3\nfg=colour5\nbg=yellow,fg=black\n"
     );
 }
 
@@ -442,8 +441,8 @@ async fn source_file_show_options_quiet_suppresses_missing_options_with_current_
     let root = temp_root("show-options-quiet-missing");
     fs::create_dir_all(&root).expect("create temp root");
     let alpha = session_name("alpha");
-    assert!(matches!(
-        handler
+    crate::session_fixture::assert_new_session(
+        &handler
             .handle(Request::NewSession(NewSessionRequest {
                 session_name: alpha.clone(),
                 detached: true,
@@ -451,8 +450,7 @@ async fn source_file_show_options_quiet_suppresses_missing_options_with_current_
                 environment: None,
             }))
             .await,
-        Response::NewSession(_)
-    ));
+    );
 
     let response = handler
         .handle(Request::SourceFile(Box::new(SourceFileRequest {
@@ -485,8 +483,8 @@ async fn source_file_set_option_p_preserves_explicit_pane_target() {
     let root = temp_root("set-option-pane-target");
     fs::create_dir_all(&root).expect("create temp root");
     let alpha = session_name("alpha");
-    assert!(matches!(
-        handler
+    crate::session_fixture::assert_new_session(
+        &handler
             .handle(Request::NewSession(NewSessionRequest {
                 session_name: alpha.clone(),
                 detached: true,
@@ -494,8 +492,7 @@ async fn source_file_set_option_p_preserves_explicit_pane_target() {
                 environment: None,
             }))
             .await,
-        Response::NewSession(_)
-    ));
+    );
 
     let response = handler
         .handle(Request::SourceFile(Box::new(SourceFileRequest {
@@ -529,8 +526,8 @@ async fn source_file_set_option_format_expands_value_before_storage() {
     let root = temp_root("set-option-format");
     fs::create_dir_all(&root).expect("create temp root");
     let alpha = session_name("alpha");
-    assert!(matches!(
-        handler
+    crate::session_fixture::assert_new_session(
+        &handler
             .handle(Request::NewSession(NewSessionRequest {
                 session_name: alpha.clone(),
                 detached: true,
@@ -538,8 +535,7 @@ async fn source_file_set_option_format_expands_value_before_storage() {
                 environment: None,
             }))
             .await,
-        Response::NewSession(_)
-    ));
+    );
 
     let response = handler
         .handle(Request::SourceFile(Box::new(SourceFileRequest {
@@ -574,8 +570,8 @@ async fn source_file_set_option_format_expands_socket_path() {
     let root = temp_root("set-option-socket-path");
     fs::create_dir_all(&root).expect("create temp root");
     let alpha = session_name("alpha");
-    assert!(matches!(
-        handler
+    crate::session_fixture::assert_new_session(
+        &handler
             .handle(Request::NewSession(NewSessionRequest {
                 session_name: alpha.clone(),
                 detached: true,
@@ -583,8 +579,7 @@ async fn source_file_set_option_format_expands_socket_path() {
                 environment: None,
             }))
             .await,
-        Response::NewSession(_)
-    ));
+    );
 
     let response = handler
         .handle(Request::SourceFile(Box::new(SourceFileRequest {
@@ -742,8 +737,8 @@ async fn source_file_without_target_uses_preferred_session_for_parse_time_format
     let root = temp_root("source-file-implicit-target");
     fs::create_dir_all(&root).expect("create temp root");
     let alpha = session_name("alpha");
-    assert!(matches!(
-        handler
+    crate::session_fixture::assert_new_session(
+        &handler
             .handle(Request::NewSession(NewSessionRequest {
                 session_name: alpha,
                 detached: true,
@@ -751,8 +746,7 @@ async fn source_file_without_target_uses_preferred_session_for_parse_time_format
                 environment: None,
             }))
             .await,
-        Response::NewSession(_)
-    ));
+    );
 
     let response = handler
         .handle(Request::SourceFile(Box::new(SourceFileRequest {

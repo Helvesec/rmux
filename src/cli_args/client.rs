@@ -4,7 +4,26 @@ use super::{parse_target_spec, TargetSpec};
 
 #[derive(Debug, Clone, Args)]
 pub(crate) struct RefreshClientArgs {
-    #[arg(short = 'C')]
+    #[arg(short = 'c', action = ArgAction::SetTrue)]
+    pub(crate) clear_pan: bool,
+    #[arg(short = 'D', action = ArgAction::SetTrue)]
+    pub(crate) pan_down: bool,
+    #[arg(short = 'L', action = ArgAction::SetTrue)]
+    pub(crate) pan_left: bool,
+    #[arg(short = 'R', action = ArgAction::SetTrue)]
+    pub(crate) pan_right: bool,
+    #[arg(short = 'U', action = ArgAction::SetTrue)]
+    pub(crate) pan_up: bool,
+    #[arg(value_name = "adjustment")]
+    pub(crate) adjustment: Option<String>,
+    #[arg(short = 'A', action = ArgAction::Append, allow_hyphen_values = true)]
+    pub(crate) subscriptions: Vec<String>,
+    #[arg(short = 'B', action = ArgAction::Append, allow_hyphen_values = true)]
+    pub(crate) subscriptions_format: Vec<String>,
+    #[arg(short = 'r', allow_hyphen_values = true)]
+    pub(crate) colour_report: Option<String>,
+    /// Global WxH or W,H; window @id:WxH; @id: removes its size.
+    #[arg(short = 'C', value_name = "size")]
     pub(crate) control_size: Option<String>,
     #[arg(short = 'f')]
     pub(crate) flags: Option<String>,
@@ -16,6 +35,23 @@ pub(crate) struct RefreshClientArgs {
     pub(crate) status_only: bool,
     #[arg(short = 't', allow_hyphen_values = true)]
     pub(crate) target_client: Option<String>,
+}
+
+impl RefreshClientArgs {
+    pub(super) fn validate(self) -> Result<Self, clap::Error> {
+        if self.clear_pan || self.pan_left || self.pan_right || self.pan_up || self.pan_down {
+            return Ok(self);
+        }
+        if let Some(size) = self.control_size.as_deref() {
+            rmux_core::command_parser::ControlClientSize::parse(size).map_err(|error| {
+                clap::Error::raw(
+                    clap::error::ErrorKind::ValueValidation,
+                    format!("invalid value '{size}' for '-C <size>': {error}"),
+                )
+            })?;
+        }
+        Ok(self)
+    }
 }
 
 #[derive(Debug, Clone, Args)]

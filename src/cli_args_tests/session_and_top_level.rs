@@ -483,7 +483,7 @@ fn has_session_preserves_exact_target_marker_in_attached_short_value() {
     let cli = parse_args(&["has-session", "-t=foo"]).unwrap();
     match cli.command.expect("parsed command") {
         super::super::Command::HasSession(args) => {
-            assert_eq!(target_text(&args.target), "=foo");
+            assert_eq!(args.target.as_deref(), Some("=foo"));
         }
         _ => panic!("expected HasSession command"),
     }
@@ -559,5 +559,67 @@ fn list_sessions_preserves_equals_in_attached_format_value() {
             assert_eq!(args.format.as_deref(), Some("=#{session_name}"));
         }
         _ => panic!("expected ListSessions command"),
+    }
+}
+
+#[test]
+fn legacy_q_is_a_noop_in_raw_public_and_extension_parsing() {
+    for (control, subject) in [
+        (vec!["list-sessions"], vec!["-qq", "list-sessions"]),
+        (vec!["-u", "list-sessions"], vec!["-quq", "list-sessions"]),
+        (
+            vec!["-Lname", "list-sessions"],
+            vec!["-qLname", "list-sessions"],
+        ),
+        (
+            vec!["-f", "-q", "list-sessions"],
+            vec!["-q", "-f", "-q", "list-sessions"],
+        ),
+        (vec!["-c", "-q"], vec!["-q", "-c", "-q"]),
+        (vec!["--", "-q"], vec!["-q", "--", "-q"]),
+        (vec!["", "-q"], vec!["-q", "", "-q"]),
+        (
+            vec!["set-option", "-q", "@test", "on"],
+            vec!["-q", "set-option", "-q", "@test", "on"],
+        ),
+    ] {
+        let raw = |args: &[&str]| {
+            super::super::parse_raw_cli(std::iter::once("rmux").chain(args.iter().copied()))
+        };
+        assert_eq!(
+            format!("{:?}", raw(&subject)),
+            format!("{:?}", raw(&control)),
+            "{subject:?}"
+        );
+        assert_eq!(
+            format!("{:?}", parse_args(&subject)),
+            format!("{:?}", parse_args(&control)),
+            "{subject:?}"
+        );
+        let scan = |args: &[&str]| {
+            super::super::scan_top_level_command(
+                &args.iter().map(OsString::from).collect::<Vec<_>>(),
+            )
+        };
+        assert_eq!(
+            format!("{:?}", scan(&subject)),
+            format!("{:?}", scan(&control)),
+            "{subject:?}"
+        );
+    }
+    for prefix in [vec![], vec!["-q"], vec!["-qq"]] {
+        for command_q in [false, true] {
+            let mut args = prefix.clone();
+            args.push("set-option");
+            if command_q {
+                args.push("-q");
+            }
+            args.extend(["@test", "on"]);
+            let cli = parse_args(&args).unwrap();
+            let super::super::Command::SetOption(options) = cli.command.unwrap() else {
+                panic!("set-option");
+            };
+            assert_eq!(options.quiet, command_q);
+        }
     }
 }

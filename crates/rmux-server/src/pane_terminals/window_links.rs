@@ -4,9 +4,7 @@ use rmux_proto::SessionName;
 
 use super::HandlerState;
 
-#[path = "window_links/aliases.rs"]
 mod aliases;
-#[path = "window_links/occurrences.rs"]
 mod occurrences;
 pub(crate) use occurrences::WindowLinkOccurrenceId;
 

@@ -4,6 +4,8 @@
 
 use super::super::mode_tree_order::{pane_item_id, session_item_id};
 use super::*;
+#[cfg(test)]
+use crate::session_fixture::SessionSetupExt as _;
 
 use crate::control::{ControlModeUpgrade, ControlServerEvent, CONTROL_SERVER_EVENT_CAPACITY};
 use rmux_proto::NewWindowRequest;
@@ -16,7 +18,7 @@ const NOTIFICATION_POLL: Duration = Duration::from_millis(25);
 const NOTIFICATION_SETTLE: Duration = Duration::from_millis(250);
 
 /// Frozen tmux 3.7b oracle, measured 2026-07-25
-/// (`.rmux-audit/oracle/scenario_switch_destination.py`): a 101x41 client
+/// (`oracle/scenario_switch_destination.py`): a 101x41 client
 /// switching onto a session whose only other client is a 60x20 control client
 /// stores the 101x41 terminal size while the default one-line status leaves a
 /// 101x40 content layout, and that control client receives
@@ -299,9 +301,9 @@ async fn choose_tree_pane_switch_keeps_the_control_selection_model_current() {
     ) = {
         let mut state = handler.state.lock().await;
         state.ensure_live_window_link_occurrences();
-        let session = state
+        let mut session = state
             .sessions
-            .session_mut(&target)
+            .session_setup(&target)
             .expect("target session exists");
         session
             .select_pane_in_window(1, 0)
@@ -438,8 +440,8 @@ async fn choose_tree_pane_switch_keeps_the_control_selection_model_current() {
 }
 
 async fn create_test_session(handler: &RequestHandler, session_name: &SessionName) {
-    assert!(matches!(
-        handler
+    crate::session_fixture::assert_new_session(
+        &handler
             .handle(Request::NewSession(NewSessionRequest {
                 session_name: session_name.clone(),
                 detached: true,
@@ -447,8 +449,7 @@ async fn create_test_session(handler: &RequestHandler, session_name: &SessionNam
                 environment: None,
             }))
             .await,
-        Response::NewSession(_)
-    ));
+    );
 }
 
 fn control_size_request(

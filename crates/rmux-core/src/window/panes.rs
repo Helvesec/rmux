@@ -15,6 +15,9 @@ impl Window {
         let Some(pane) = self.pane(pane_index) else {
             return false;
         };
+        if self.is_floating_pane_id(pane.id()) {
+            return false;
+        }
         let geometry = pane.geometry();
         let axis_size = match direction {
             SplitDirection::Vertical => geometry.cols(),
@@ -64,6 +67,7 @@ impl Window {
         before: bool,
         detached: bool,
     ) -> u32 {
+        self.reconcile_borrowed_pane_owners();
         assert!(
             position < self.panes.len(),
             "split target position must reference an existing pane"
@@ -71,6 +75,11 @@ impl Window {
         assert!(
             self.panes.iter().all(|pane| pane.id() != pane_id),
             "pane id must be unique within a window"
+        );
+        let target_id = self.panes[position].id();
+        assert!(
+            self.is_tiled_pane_id(target_id),
+            "split target must be a tiled pane"
         );
         self.auto_unzoom();
         self.layout = layout_for_split(direction);
@@ -87,7 +96,8 @@ impl Window {
         );
         let split = self.layout_tree.as_mut().is_some_and(|tree| {
             tree.split_leaf(
-                position,
+                target_id,
+                pane_id,
                 LayoutDirection::from_split_direction(direction),
                 before,
             )
@@ -109,8 +119,8 @@ impl Window {
 
     /// Finalizes pane numbering after a split. A detached spawn (tmux `-d`,
     /// oracle-probed 2026-07-09) keeps the active pane, the last pane, and
-    /// every active_point untouched (`select-pane -l` after `split -d`
-    /// errors "no last pane"); a non-detached split activates the new pane,
+    /// every active_point untouched (`select-pane -l` after a second
+    /// `split -d` errors "no last pane"); a non-detached split activates the new pane,
     /// records the previous one as last, and stamps active_point only when
     /// the active identity actually changed.
     pub(crate) fn commit_split_renumber(
@@ -133,6 +143,7 @@ impl Window {
     }
 
     pub(crate) fn extract_pane(&mut self, pane_index: u32) -> Option<Pane> {
+        self.reconcile_borrowed_pane_owners();
         let position = self.pane_position(pane_index)?;
         self.auto_unzoom();
         let previous_active_pane_id = self.active_pane().map(Pane::id)?;
@@ -145,6 +156,7 @@ impl Window {
             Some(previous_active_pane_id)
         };
         let removed = self.panes.remove(position);
+        let removed_was_floating = self.remove_floating_pane_id(removed.id());
         let next_last_pane_id = if removed.index() == self.active_pane {
             None
         } else {
@@ -154,11 +166,13 @@ impl Window {
         if self.panes.is_empty() {
             self.layout_tree = None;
             self.custom_layout = false;
+        } else if removed_was_floating {
+            self.apply_layout_tree();
         } else {
             let removed = self
                 .layout_tree
                 .as_mut()
-                .is_some_and(|tree| tree.remove_leaf(position));
+                .is_some_and(|tree| tree.remove_leaf(removed.id()));
             if !removed {
                 self.rebuild_named_layout_tree(self.layout);
             } else {
@@ -176,6 +190,9 @@ impl Window {
             self.active_pane = removed.index();
             self.last_pane = None;
         }
+        if removed.id() == previous_active_pane_id {
+            self.raise_active_floating_pane();
+        }
         Some(removed)
     }
 
@@ -188,6 +205,7 @@ impl Window {
     }
 
     pub(crate) fn remove_other_panes(&mut self, pane_index: u32) -> Option<Vec<PaneId>> {
+        self.reconcile_borrowed_pane_owners();
         let keep_pane_id = self.pane(pane_index)?.id();
         let removed_pane_ids = self
             .panes
@@ -201,6 +219,9 @@ impl Window {
         }
 
         self.auto_unzoom();
+        for pane_id in &removed_pane_ids {
+            self.remove_floating_pane_id(*pane_id);
+        }
         self.panes.retain(|pane| pane.id() == keep_pane_id);
         self.renumber_single_pane_to_zero();
         Some(removed_pane_ids)
@@ -216,11 +237,20 @@ impl Window {
             self.last_pane = Some(self.active_pane);
             self.active_pane = pane_index;
             self.mark_pane_active(pane_index);
-        } else if let Some(pane) = self.pane_mut(pane_index) {
+        } else if let Some(pane) = self.managed_pane_mut(pane_index) {
             pane.touch_activity();
         }
+        self.raise_active_floating_pane();
 
         true
+    }
+
+    fn raise_active_floating_pane(&mut self) {
+        self.reconcile_borrowed_pane_owners();
+        if let Some(pane_id) = self.active_pane().map(Pane::id) {
+            // Tiled panes have no placement; raising preserves visibility and geometry.
+            self.floating_stack.raise(pane_id);
+        }
     }
 
     pub(crate) fn select_pane_by_id(&mut self, pane_id: PaneId) -> bool {
@@ -263,7 +293,7 @@ impl Window {
             .max()
             .unwrap_or(0)
             .saturating_add(1);
-        if let Some(pane) = self.pane_mut(pane_index) {
+        if let Some(pane) = self.managed_pane_mut(pane_index) {
             pane.set_active_point(next_active_point);
             pane.touch_activity();
         }
@@ -298,18 +328,26 @@ impl Window {
     }
 
     pub(crate) fn renumber_single_pane_to_zero(&mut self) {
+        self.reconcile_borrowed_pane_owners();
         if self.panes.len() != 1 {
             return;
         }
 
+        let pane_id = self.panes[0].id();
         self.panes[0].set_index(0);
-        self.panes[0].set_geometry(PaneGeometry::new(0, 0, self.size.cols, self.size.rows));
         self.next_pane_index = 1;
         self.active_pane = 0;
         self.last_pane = None;
         self.layout = LayoutName::MainVertical;
         self.last_layout = None;
-        self.layout_tree = Some(LayoutTree::single(self.size));
+        if self.is_floating_pane_id(pane_id) {
+            self.layout_tree = None;
+            self.floating_stack.retain_pane_ids(&[pane_id]);
+        } else {
+            self.panes[0].set_geometry(PaneGeometry::new(0, 0, self.size.cols, self.size.rows));
+            self.layout_tree = Some(LayoutTree::single(self.size, pane_id));
+            self.floating_stack = super::FloatingStack::default();
+        }
         self.custom_layout = false;
         self.old_layout = None;
         self.zoomed = false;
@@ -379,10 +417,11 @@ impl Window {
         self.renumber_panes_by_position(active_pane_id, last_pane_id);
         if previous_active_pane_id != Some(active_pane_id) {
             self.mark_pane_active(self.active_pane);
+            self.raise_active_floating_pane();
         }
     }
 
-    fn allocate_pane_index(&mut self) -> u32 {
+    pub(super) fn allocate_pane_index(&mut self) -> u32 {
         let next_pane_index = self.next_pane_index;
         assert_ne!(next_pane_index, u32::MAX, "pane index space exhausted");
         self.next_pane_index = next_pane_index + 1;

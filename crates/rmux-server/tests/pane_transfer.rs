@@ -30,20 +30,19 @@ async fn break_pane_last_source_window_to_other_session_removes_source_session(
     let hidden = session_name("hidden");
 
     for session in [&source, &hidden] {
-        assert!(matches!(
-            client
+        crate::common::assert_new_session(
+            &client
                 .send_request(&Request::NewSession(NewSessionRequest {
                     session_name: session.clone(),
                     detached: true,
                     size: Some(TerminalSize {
                         cols: 120,
-                        rows: 40
+                        rows: 40,
                     }),
                     environment: None,
                 }))
                 .await?,
-            Response::NewSession(_)
-        ));
+        );
     }
 
     assert_eq!(
@@ -113,30 +112,29 @@ async fn break_pane_last_grouped_source_removes_entire_source_group() -> Result<
     let hidden = session_name("hidden");
 
     for session in [&source, &hidden] {
-        assert!(matches!(
-            client
+        crate::common::assert_new_session(
+            &client
                 .send_request(&Request::NewSession(NewSessionRequest {
                     session_name: session.clone(),
                     detached: true,
                     size: Some(TerminalSize {
                         cols: 120,
-                        rows: 40
+                        rows: 40,
                     }),
                     environment: None,
                 }))
                 .await?,
-            Response::NewSession(_)
-        ));
+        );
     }
-    assert!(matches!(
-        client
+    crate::common::assert_new_session(
+        &client
             .send_request(&Request::NewSessionExt(Box::new(NewSessionExtRequest {
                 session_name: Some(grouped.clone()),
                 working_directory: None,
                 detached: true,
                 size: Some(TerminalSize {
                     cols: 120,
-                    rows: 40
+                    rows: 40,
                 }),
                 environment: None,
                 group_target: Some(source.clone()),
@@ -153,8 +151,7 @@ async fn break_pane_last_grouped_source_removes_entire_source_group() -> Result<
                 skip_environment_update: false,
             })))
             .await?,
-        Response::NewSession(_)
-    ));
+    );
 
     assert!(matches!(
         client
@@ -203,20 +200,19 @@ async fn join_pane_last_source_window_to_other_session_removes_source_session(
     let hidden = session_name("hidden");
 
     for session in [&source, &hidden] {
-        assert!(matches!(
-            client
+        crate::common::assert_new_session(
+            &client
                 .send_request(&Request::NewSession(NewSessionRequest {
                     session_name: session.clone(),
                     detached: true,
                     size: Some(TerminalSize {
                         cols: 120,
-                        rows: 40
+                        rows: 40,
                     }),
                     environment: None,
                 }))
                 .await?,
-            Response::NewSession(_)
-        ));
+        );
     }
 
     assert_eq!(
@@ -283,30 +279,29 @@ async fn join_pane_last_grouped_source_removes_entire_source_group() -> Result<(
     let hidden = session_name("hidden");
 
     for session in [&source, &hidden] {
-        assert!(matches!(
-            client
+        crate::common::assert_new_session(
+            &client
                 .send_request(&Request::NewSession(NewSessionRequest {
                     session_name: session.clone(),
                     detached: true,
                     size: Some(TerminalSize {
                         cols: 120,
-                        rows: 40
+                        rows: 40,
                     }),
                     environment: None,
                 }))
                 .await?,
-            Response::NewSession(_)
-        ));
+        );
     }
-    assert!(matches!(
-        client
+    crate::common::assert_new_session(
+        &client
             .send_request(&Request::NewSessionExt(Box::new(NewSessionExtRequest {
                 session_name: Some(grouped.clone()),
                 working_directory: None,
                 detached: true,
                 size: Some(TerminalSize {
                     cols: 120,
-                    rows: 40
+                    rows: 40,
                 }),
                 environment: None,
                 group_target: Some(source.clone()),
@@ -323,8 +318,7 @@ async fn join_pane_last_grouped_source_removes_entire_source_group() -> Result<(
                 skip_environment_update: false,
             })))
             .await?,
-        Response::NewSession(_)
-    ));
+    );
 
     assert!(matches!(
         client
@@ -376,8 +370,8 @@ async fn pane_transfer_commands_move_live_ptys_between_windows() -> Result<(), B
     let swap_source_path = root.join("swap-source.txt");
     let swap_target_path = root.join("swap-target.txt");
 
-    assert!(matches!(
-        client
+    crate::common::assert_new_session(
+        &client
             .send_request(&Request::NewSession(NewSessionRequest {
                 session_name: session.clone(),
                 detached: true,
@@ -388,8 +382,7 @@ async fn pane_transfer_commands_move_live_ptys_between_windows() -> Result<(), B
                 environment: None,
             }))
             .await?,
-        Response::NewSession(_)
-    ));
+    );
 
     assert_eq!(
         client

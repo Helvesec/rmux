@@ -3,7 +3,6 @@
 
 use rmux_sdk::{PaneRespawnOptions, ProcessSpec};
 
-#[path = "sdk_demo_helpers/mod.rs"]
 mod sdk_demo_helpers;
 
 #[tokio::main]

@@ -9,11 +9,22 @@ use rmux_proto::{
     PaneStateSnapshot, PaneStateSubscriptionId, Request, Response, SubscribePaneStateRequest,
     CAPABILITY_SDK_PANE_BY_ID, CAPABILITY_SDK_PANE_FOREGROUND, CAPABILITY_SDK_PANE_STATE_EVENTS,
 };
+use serde::{Deserialize, Serialize};
 
 use super::foreground::ForegroundState;
 use super::target::{is_stale_pane_id_target_error, stale_slot_error};
 
-pub use rmux_proto::PaneStateClosedReason;
+/// Terminal reason for a pane-state stream close event.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[non_exhaustive]
+pub enum PaneStateClosedReason {
+    /// The pane process exited and the pane was removed.
+    Exited,
+    /// The pane process died but remain-on-exit kept the pane around.
+    DiedKept,
+    /// The pane was killed by an explicit RMUX operation.
+    Killed,
+}
 
 const PANE_STATE_BATCH_SIZE: u16 = 256;
 
@@ -269,7 +280,7 @@ impl PaneStateEventStream {
                 Response::PaneStateCursor(response) => {
                     self.next_revision = response.next_revision;
                     self.pending
-                        .extend(response.events.into_iter().map(PaneStateEvent::from));
+                        .extend(response.events.into_iter().map(PaneStateEvent::from_dto));
                 }
                 Response::PaneStateLag(response) => {
                     self.pending.push_back(PaneStateEvent::Lagged {
@@ -347,8 +358,8 @@ impl std::fmt::Debug for PaneStateEventStream {
     }
 }
 
-impl From<PaneStateEventDto> for PaneStateEvent {
-    fn from(value: PaneStateEventDto) -> Self {
+impl PaneStateEvent {
+    fn from_dto(value: PaneStateEventDto) -> Self {
         match value {
             PaneStateEventDto::TitleChanged {
                 revision,
@@ -393,8 +404,8 @@ impl From<PaneStateEventDto> for PaneStateEvent {
             } => Self::ForegroundChanged {
                 revision,
                 pane_id,
-                old_state: ForegroundState::from(old_state),
-                new_state: ForegroundState::from(new_state),
+                old_state: ForegroundState::from_dto(old_state),
+                new_state: ForegroundState::from_dto(new_state),
             },
             PaneStateEventDto::Closed {
                 revision,
@@ -403,7 +414,7 @@ impl From<PaneStateEventDto> for PaneStateEvent {
             } => Self::Closed {
                 revision,
                 pane_id,
-                reason,
+                reason: close_reason_from_dto(reason),
             },
             _ => unreachable!("unknown pane-state event variant from this rmux-proto version"),
         }
@@ -418,17 +429,26 @@ fn snapshot_event(pane_id: PaneId, snapshot: PaneStateSnapshot) -> PaneStateEven
         options: snapshot
             .options
             .into_iter()
-            .map(PaneStateOption::from)
+            .map(PaneStateOption::from_dto)
             .collect(),
-        foreground: snapshot.foreground.map(ForegroundState::from),
+        foreground: snapshot.foreground.map(ForegroundState::from_dto),
     }
 }
 
-impl From<ProtoPaneOptionEntry> for PaneStateOption {
-    fn from(value: ProtoPaneOptionEntry) -> Self {
+impl PaneStateOption {
+    fn from_dto(value: ProtoPaneOptionEntry) -> Self {
         Self {
             name: value.name,
             value: value.value,
         }
+    }
+}
+
+fn close_reason_from_dto(value: rmux_proto::PaneStateClosedReason) -> PaneStateClosedReason {
+    match value {
+        rmux_proto::PaneStateClosedReason::Exited => PaneStateClosedReason::Exited,
+        rmux_proto::PaneStateClosedReason::DiedKept => PaneStateClosedReason::DiedKept,
+        rmux_proto::PaneStateClosedReason::Killed => PaneStateClosedReason::Killed,
+        _ => unreachable!("unknown pane-state close reason from this rmux-proto version"),
     }
 }

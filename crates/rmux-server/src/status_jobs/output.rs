@@ -72,6 +72,21 @@ impl StatusJobOutputCapture {
         Ok(CaptureProgress::Pending)
     }
 
+    pub(super) fn last_complete_line(&self, consumed: usize) -> Option<(usize, String)> {
+        let end = self.output.iter().rposition(|byte| *byte == b'\n')?;
+        if end < consumed {
+            return None;
+        }
+        let start = self.output[..end]
+            .iter()
+            .rposition(|byte| *byte == b'\n')
+            .map_or(0, |i| i + 1);
+        let line = self.output[start..end]
+            .strip_suffix(b"\r")
+            .unwrap_or(&self.output[start..end]);
+        Some((end + 1, String::from_utf8_lossy(line).into_owned()))
+    }
+
     pub(super) fn into_output(self) -> Vec<u8> {
         self.output
     }

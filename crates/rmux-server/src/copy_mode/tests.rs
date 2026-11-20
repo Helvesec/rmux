@@ -10,7 +10,7 @@ fn build_screen(cols: u16, rows: u16, content: &str) -> Screen {
     screen
 }
 
-fn test_context() -> CopyModeCommandContext {
+pub(super) fn test_context() -> CopyModeCommandContext {
     CopyModeCommandContext {
         mode_keys: ModeKeys::Emacs,
         line_number_mode: CopyModeLineNumberMode::Off,
@@ -21,6 +21,59 @@ fn test_context() -> CopyModeCommandContext {
         refresh_screen: None,
         mouse: None,
     }
+}
+
+#[test]
+fn unchanged_resize_preserves_scrollback_cursor_selection_and_search() {
+    for context in [test_context(), vi_context()] {
+        let size = TerminalSize { cols: 20, rows: 3 };
+        let screen = build_screen(
+            20,
+            3,
+            "line1\r\nline2\r\nline3\r\nline4\r\nline5\r\nline6\r\n",
+        );
+        let mut state = CopyModeState::new(screen, None, false, &context, true, true);
+        // begin-selection clears search marks (tmux CLEAR_ALWAYS), so search
+        // last to hold scrollback, selection and search state together.
+        for (command, args) in [
+            ("history-top", Vec::new()),
+            ("begin-selection", Vec::new()),
+            ("cursor-down", Vec::new()),
+            ("search-forward", vec!["line2".to_owned()]),
+        ] {
+            assert!(
+                state.execute_command(command, &args, &context).is_ok(),
+                "{command}"
+            );
+        }
+        let summary = state.summary();
+        let view = state.render_screen();
+        assert!(summary.scroll_position > 0);
+        assert!(summary.selection_present);
+        assert!(summary.search_present);
+        // Both the initial attach and the subsequent client-size notification
+        // can apply the same dimensions; neither should alter copy mode.
+        state.resize(size);
+        state.resize(size);
+        assert_eq!(state.summary(), summary);
+        assert_eq!(state.render_screen(), view);
+    }
+}
+
+#[test]
+fn changed_resize_still_reflows_copy_mode_and_clears_selection() {
+    let mut state =
+        CopyModeState::for_test(build_screen(20, 3, "line1\r\nline2\r\nline3\r\nline4\r\n"));
+    let context = test_context();
+    assert!(state.execute_command("history-top", &[], &context).is_ok());
+    assert!(state
+        .execute_command("begin-selection", &[], &context)
+        .is_ok());
+    assert!(state.summary().selection_present);
+    let size = TerminalSize { cols: 12, rows: 5 };
+    state.resize(size);
+    assert_eq!(state.render_screen().size(), size);
+    assert!(!state.summary().selection_present);
 }
 
 #[test]
@@ -1361,6 +1414,67 @@ fn mark_and_jump_to_mark() {
 
     let _ = state.execute_command("jump-to-mark", &[], &ctx);
     assert_eq!(state.cursor, mark_pos, "should jump back to mark position");
+}
+
+fn numbered_lines(count: usize, width: usize) -> String {
+    (1..=count).map(|n| format!("{n:0width$}\r\n")).collect()
+}
+
+/// Jump to the saved mark, then take the motion that read its line (R3319 H1).
+fn jump_to_mark_and_step_left(state: &mut CopyModeState) {
+    let ctx = test_context();
+    assert!(state.execute_command("jump-to-mark", &[], &ctx).is_ok());
+    assert!(state.execute_command("cursor-left", &[], &ctx).is_ok());
+    assert!(state.cursor.y < state.total_lines());
+    let _ = state.summary();
+}
+
+#[test]
+fn refresh_from_shorter_screen_keeps_mark_inside_backing() {
+    let mut state = CopyModeState::for_test(build_screen(20, 3, &numbered_lines(50, 4)));
+    let ctx = test_context();
+    assert!(state.execute_command("history-bottom", &[], &ctx).is_ok());
+    assert!(state.execute_command("set-mark", &[], &ctx).is_ok());
+    assert!(state.mark.is_some_and(|mark| mark.y >= 3));
+
+    // clear-history then refresh-from-pane, or refresh-from-pane on a
+    // shorter `-s` source, hands copy mode a backing with fewer lines than the
+    // mark's row.
+    state.refresh_from_screen(build_screen(20, 3, "short\r\n"));
+
+    assert_eq!(state.total_lines(), 3);
+    assert_eq!(state.mark, Some(CopyPosition { x: 0, y: 2 }));
+    jump_to_mark_and_step_left(&mut state);
+}
+
+#[test]
+fn reflowing_resize_keeps_mark_inside_backing() {
+    // Thirty-character lines wrap onto three ten-column rows each.
+    let mut state = CopyModeState::for_test(build_screen(10, 3, &numbered_lines(20, 30)));
+    let ctx = test_context();
+    assert!(state.execute_command("history-bottom", &[], &ctx).is_ok());
+    assert!(state.execute_command("set-mark", &[], &ctx).is_ok());
+    let marked_row = state.mark.expect("set-mark stores the mark").y;
+
+    state.resize(TerminalSize { cols: 40, rows: 3 });
+
+    assert!(
+        state.total_lines() <= marked_row,
+        "the reflow must shorten the backing"
+    );
+    let mark = state.mark.expect("resize keeps the mark");
+    assert_eq!(mark.y, state.total_lines() - 1);
+    jump_to_mark_and_step_left(&mut state);
+}
+
+#[test]
+fn jump_to_mark_clamps_a_mark_past_the_backing() {
+    let mut state = CopyModeState::for_test(build_screen(20, 3, "short\r\n"));
+    // A backing change that forgot `clamp_mark` leaves the mark here.
+    state.mark = Some(CopyPosition { x: 7, y: 40 });
+
+    jump_to_mark_and_step_left(&mut state);
+    assert_eq!(state.cursor.y, state.total_lines() - 1);
 }
 
 #[test]

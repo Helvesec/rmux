@@ -1,4 +1,5 @@
 use super::*;
+use crate::formats::{render_template, FormatContext};
 
 #[test]
 fn osc_4_palette() {
@@ -30,6 +31,18 @@ fn osc_133_shell_integration() {
     assert!(w.has_call("osc_shell_integration("));
 }
 
+#[test]
+fn osc_133_writer_receives_complete_payload_only_after_terminator() {
+    for data in ["A;aid=x", "B", "C", "D;7", "unknown"] {
+        let mut parser = InputParser::new();
+        let mut writer = RecordingWriter::new(80, 24);
+        parser.parse(format!("\x1b]133;{data}\x1b").as_bytes(), &mut writer);
+        assert!(!writer.has_call("osc_shell_integration("));
+        parser.parse(b"\\", &mut writer);
+        assert!(writer.has_call(&format!("osc_shell_integration({data:?})")));
+    }
+}
+
 // ─── DCS tests ─────────────────────────────────────────────────────
 
 #[test]
@@ -51,19 +64,31 @@ fn dcs_passthrough_tmux_prefix_decodes_doubled_inner_escape() {
 }
 
 #[test]
-fn dcs_tmux_wrapped_osc_bel_without_outer_st_recovers_to_ground() {
-    let (p, w) = parse(b"\x1bPtmux;\x1b]4;0;?\x07AFTER");
-    assert_eq!(p.state(), InputState::Ground);
-    assert!(w.has_call("dcs_passthrough(\"\\u{1b}]4;0;?\\u{7}\")"));
-    assert_eq!(w.chars, vec!['A', 'F', 'T', 'E', 'R']);
+fn dcs_tmux_wrapped_osc_bel_without_outer_st_waits_for_explicit_timeout() {
+    assert_unterminated_dcs_waits_for_timeout(b"\x1bPtmux;\x1b]4;0;?\x07AFTER");
 }
 
 #[test]
-fn dcs_tmux_wrapped_osc_bel_recovers_after_doubled_inner_escape() {
-    let (p, w) = parse(b"\x1bPtmux;\x1b\x1b]4;0;?\x07AFTER");
-    assert_eq!(p.state(), InputState::Ground);
-    assert!(w.has_call("dcs_passthrough(\"\\u{1b}]4;0;?\\u{7}\")"));
-    assert_eq!(w.chars, vec!['A', 'F', 'T', 'E', 'R']);
+fn dcs_tmux_wrapped_osc_bel_with_doubled_escape_waits_for_explicit_timeout() {
+    assert_unterminated_dcs_waits_for_timeout(b"\x1bPtmux;\x1b\x1b]4;0;?\x07AFTER");
+}
+
+fn assert_unterminated_dcs_waits_for_timeout(packet: &[u8]) {
+    // A read boundary cannot distinguish missing ST from a fragmented DCS.
+    // The existing server timeout discards the incomplete string; it does
+    // not dispatch a guessed payload or replay its bytes into the grid.
+    let (mut parser, mut writer) = parse(packet);
+    assert_eq!(parser.state(), InputState::DcsHandler);
+    assert!(parser.ground_timer_active());
+    assert!(!writer.has_call("dcs_passthrough("));
+    assert!(writer.chars.is_empty());
+
+    parser.ground_timer_expired();
+    assert_eq!(parser.state(), InputState::Ground);
+    assert!(!parser.ground_timer_active());
+    parser.parse(b"RECOVERED", &mut writer);
+    assert_eq!(writer.chars, "RECOVERED".chars().collect::<Vec<_>>());
+    assert!(!writer.has_call("dcs_passthrough("));
 }
 
 #[test]
@@ -104,6 +129,61 @@ fn dcs_decrqss_unrecognized() {
 fn dcs_decrqss_is_not_sixel() {
     let (_p, w) = parse(b"\x1bP$qm\x1b\\");
     assert!(!w.has_call("sixel_passthrough"));
+}
+
+/// Whether a primary DA response advertises SIXEL, i.e. carries parameter `4`.
+///
+/// Measured on the pinned tmux 3.7b oracle pair, both built from the same
+/// source tree: without `ENABLE_SIXEL` the reply is `ESC[?1;2c`, and with
+/// `--enable-sixel` it is `ESC[?1;2;4c`.
+fn primary_da_advertises_sixel(reply: &str) -> bool {
+    reply
+        .strip_prefix("\x1b[?")
+        .and_then(|params| params.strip_suffix('c'))
+        .is_some_and(|params| params.split(';').any(|param| param == "4"))
+}
+
+#[test]
+fn bare_q_dcs_stays_classified_as_sixel_without_claiming_server_support() {
+    // Naming a sequence is not supporting it. RMUX recognises a bare `q`-final
+    // DCS unconditionally and hands the payload to the transient passthrough
+    // path, but `#{sixel_support}` reports what tmux reports: `ENABLE_SIXEL`,
+    // which compiles in a retained, scalable, croppable, redrawable
+    // server-side image store, a text fallback for clients that cannot render
+    // images, and a SIXEL-bearing primary DA. RMUX has the parser and none of
+    // the store, so classification and advertised capability are asserted
+    // independently here rather than defined in terms of each other.
+    let (_p, w) = parse(b"\x1bPq#0!10~\x1b\\");
+    assert!(
+        w.has_call("sixel_passthrough(\"q#0!10~\")"),
+        "a bare `q`-final DCS must still be classified as SIXEL passthrough"
+    );
+    assert_eq!(
+        render_template("#{sixel_support}", &FormatContext::new()),
+        "0",
+        "DCS dispatch must not be advertised as tmux server SIXEL support"
+    );
+}
+
+#[test]
+fn primary_device_attributes_agree_with_the_advertised_sixel_capability() {
+    // tmux drives both answers from the one build flag, so the pair cannot
+    // disagree. Pinned 3.7b oracle pair:
+    //   without `ENABLE_SIXEL`  -> DA `ESC[?1;2c`,   `#{sixel_support}` = 0
+    //   with    `--enable-sixel` -> DA `ESC[?1;2;4c`, `#{sixel_support}` = 1
+    // RMUX answers its children the non-SIXEL DA, so the token owes `0`.
+    // Reporting `1` beside `ESC[?1;2c` tells an application that images are
+    // supported and then denies them at the capability handshake.
+    let (parser, _w) = parse(b"\x1b[c");
+    let reply = String::from_utf8_lossy(&parser.reply_buf).into_owned();
+    assert_eq!(reply, "\x1b[?1;2c", "child-facing primary DA moved");
+
+    let token = render_template("#{sixel_support}", &FormatContext::new());
+    assert_eq!(
+        primary_da_advertises_sixel(&reply),
+        token == "1",
+        "`#{{sixel_support}}` = {token} disagrees with primary DA {reply:?}"
+    );
 }
 
 // ─── INPUT_LAST and REP tests ──────────────────────────────────────
@@ -312,4 +392,30 @@ fn osc_11_oversized_set_is_not_stored_so_queries_cannot_amplify() {
         p.reply_buf.len()
     );
     assert!(p.reply_buf.is_empty());
+}
+
+// ─── OSC 7501 program status ────────────────────────────────────────
+
+#[test]
+fn osc_7501_query_is_silent_for_writers_without_program_status() {
+    // A writer that does not store reports must not advertise support:
+    // only the primary DA that follows the query is answered.
+    let (p, w) = parse(b"\x1b]7501;?\x1b\\\x1b[c");
+    assert_eq!(p.reply_buf, b"\x1b[?1;2c");
+    assert!(!w.has_call("osc_program_status("));
+}
+
+#[test]
+fn osc_7501_query_is_answered_by_the_pane_screen_before_primary_da() {
+    // Product divergence: tmux 3.7b ignores OSC 7501 and answers only the DA.
+    let reply = "\x1b]7501;?:states=idle,working,done,blocked,error:kinds=permission,question,auth";
+    for (terminator, query) in [("\x1b\\", "\x1b]7501;?\x1b\\"), ("\x07", "\x1b]7501;?\x07")] {
+        let mut parser = InputParser::new();
+        let mut screen = crate::Screen::new(rmux_proto::TerminalSize { cols: 80, rows: 24 }, 10);
+        parser.parse(format!("{query}\x1b[c").as_bytes(), &mut screen);
+        assert_eq!(
+            String::from_utf8_lossy(&parser.reply_buf),
+            format!("{reply}{terminator}\x1b[?1;2c")
+        );
+    }
 }

@@ -38,6 +38,21 @@ fn styled_format_width_truncation_and_padding_ignore_inline_clauses() {
 }
 
 #[test]
+fn gh219_right_format_modifier_keeps_an_overlong_zwj_source_suffix() {
+    let value = "AB👩\u{200D}❤\u{FE0F}\u{200D}💋\u{200D}👨X";
+    let suffix = &value[1..];
+    let context = FormatContext::new()
+        .with_named_value("plain", value)
+        .with_named_value("styled", format!("#[fg=blue]{value}"));
+
+    assert_eq!(render_template("#{=-4:plain}", &context), suffix);
+    assert_eq!(
+        render_template("#{=-4:styled}", &context),
+        format!("#[fg=blue]{suffix}")
+    );
+}
+
+#[test]
 fn negative_modifier_bounds_do_not_overflow() {
     assert_eq!(signed_i32_abs_usize(i32::MIN), 2_147_483_648);
     assert_eq!(
@@ -153,8 +168,30 @@ fn substitution_uses_regex_and_case_insensitive_flag() {
 }
 
 #[test]
-fn trailing_bare_hash_is_literal_product_divergence() {
-    assert_eq!(render_template("prefix#", &StaticWindowValues), "prefix#");
+fn trailing_bare_hash_stops_expansion_like_tmux() {
+    // tmux 3.7b format_expand1 stops at NUL after consuming the marker.
+    // The independent Linux oracle also emits "before\n" for "before#".
+    for (input, expected) in [
+        ("#", ""),
+        ("prefix#", "prefix"),
+        ("é#", "é"),
+        ("prefix##", "prefix#"),
+        ("prefix###", "prefix#"),
+        ("#{l:#}", ""),
+        ("#{l:##}", "#"),
+        ("#{session_name}#", "alpha"),
+    ] {
+        assert_eq!(
+            render_template(input, &StaticWindowValues),
+            expected,
+            "{input}"
+        );
+        assert_eq!(
+            super::super::render_template_preserving_jobs(input, &StaticWindowValues),
+            expected,
+            "preserving jobs: {input}"
+        );
+    }
 }
 
 // -----------------------------------------------------------------------
@@ -221,6 +258,30 @@ fn modifier_length() {
     );
 }
 
+#[test]
+fn client_loop_result_uses_surrounding_modifiers() {
+    struct LoopValues;
+
+    impl FormatVariables for LoopValues {
+        fn format_value(&self, _variable: FormatVariable) -> Option<String> {
+            None
+        }
+
+        fn format_loop(
+            &self,
+            scope: char,
+            _body: &str,
+            _current_body: Option<&str>,
+            _count_only: bool,
+        ) -> Option<String> {
+            (scope == 'L').then(|| "a b".to_owned())
+        }
+    }
+
+    assert_eq!(render_template("#{n;L:ignored}", &LoopValues), "3");
+    assert_eq!(render_template("#{q;L:ignored}", &LoopValues), "a\\ b");
+}
+
 // -----------------------------------------------------------------------
 // New tests — style pass-through
 // -----------------------------------------------------------------------
@@ -231,6 +292,26 @@ fn style_passthrough() {
         render_template("#[fg=red]hello#[default]", &StaticWindowValues),
         "#[fg=red]hello#[default]"
     );
+}
+
+#[test]
+fn style_expressions_expand_but_single_character_aliases_remain_literal() {
+    for (input, expected) in [
+        ("#[fg=#{?1,red,blue}]#S", "#[fg=blue]alpha"),
+        ("##[fg=#{?1,red,blue}]#S", "##[fg=blue]alpha"),
+        ("#[fg=#S]#S", "#[fg=#S]alpha"),
+        (
+            "#[fg=#{?1,red,blue}]#[default]AFTER",
+            "#[fg=blue]#[default]AFTER",
+        ),
+        ("#[unterminated-#{session_name}", "#[unterminated-alpha"),
+    ] {
+        assert_eq!(
+            render_template(input, &StaticWindowValues),
+            expected,
+            "{input}"
+        );
+    }
 }
 
 // -----------------------------------------------------------------------
@@ -418,12 +499,12 @@ fn modifier_dirname_no_slash() {
 
 #[test]
 fn trailing_hash_in_various_positions() {
-    assert_eq!(render_template("abc#", &StaticWindowValues), "abc#");
+    assert_eq!(render_template("abc#", &StaticWindowValues), "abc");
     assert_eq!(
         render_template("#{session_name}#", &StaticWindowValues),
-        "alpha#"
+        "alpha"
     );
-    assert_eq!(render_template("#####", &StaticWindowValues), "###");
+    assert_eq!(render_template("#####", &StaticWindowValues), "##");
 }
 
 #[test]

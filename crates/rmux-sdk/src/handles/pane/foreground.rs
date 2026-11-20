@@ -4,21 +4,37 @@ use rmux_proto::{
     ForegroundFieldSource, ForegroundSourcesDto, ForegroundStateDto, PaneForegroundStateRequest,
     Request, Response, CAPABILITY_SDK_PANE_BY_ID, CAPABILITY_SDK_PANE_FOREGROUND,
 };
+use serde::{Deserialize, Serialize};
 
 /// Source labels for best-effort foreground fields.
-pub use rmux_proto::ForegroundFieldSource as ForegroundSource;
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[non_exhaustive]
+pub enum ForegroundSource {
+    /// Read from the foreground process or foreground process group.
+    Process,
+    /// Read from the root pane process.
+    RootProcess,
+    /// Read from the terminal OSC 7 path.
+    Osc7,
+    /// Read from the pane launch profile.
+    Profile,
+    /// Read from the session environment.
+    Environment,
+    /// Read from RMUX's runtime window-name cache.
+    RuntimeName,
+}
 
 /// Per-field source report for best-effort foreground state.
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct ForegroundSources {
     /// Source for `pid`.
-    pub pid: Option<ForegroundFieldSource>,
+    pub pid: Option<ForegroundSource>,
     /// Source for `command`.
-    pub command: Option<ForegroundFieldSource>,
+    pub command: Option<ForegroundSource>,
     /// Source for `cwd`.
-    pub cwd: Option<ForegroundFieldSource>,
+    pub cwd: Option<ForegroundSource>,
     /// Source for `exe`.
-    pub exe: Option<ForegroundFieldSource>,
+    pub exe: Option<ForegroundSource>,
 }
 
 /// Best-effort pane foreground process state.
@@ -61,7 +77,7 @@ pub(super) async fn foreground_state(
                 (
                     response.pane_id,
                     response.revision,
-                    ForegroundState::from(state),
+                    ForegroundState::from_dto(state),
                 )
             }))
         }
@@ -69,25 +85,37 @@ pub(super) async fn foreground_state(
     }
 }
 
-impl From<ForegroundStateDto> for ForegroundState {
-    fn from(value: ForegroundStateDto) -> Self {
+impl ForegroundState {
+    pub(super) fn from_dto(value: ForegroundStateDto) -> Self {
         Self {
             pid: value.pid,
             command: value.command,
             cwd: value.cwd,
             exe: value.exe,
-            sources: ForegroundSources::from(value.sources),
+            sources: ForegroundSources::from_dto(value.sources),
         }
     }
 }
 
-impl From<ForegroundSourcesDto> for ForegroundSources {
-    fn from(value: ForegroundSourcesDto) -> Self {
+impl ForegroundSources {
+    fn from_dto(value: ForegroundSourcesDto) -> Self {
         Self {
-            pid: value.pid,
-            command: value.command,
-            cwd: value.cwd,
-            exe: value.exe,
+            pid: value.pid.map(source_from_dto),
+            command: value.command.map(source_from_dto),
+            cwd: value.cwd.map(source_from_dto),
+            exe: value.exe.map(source_from_dto),
         }
+    }
+}
+
+fn source_from_dto(value: ForegroundFieldSource) -> ForegroundSource {
+    match value {
+        ForegroundFieldSource::Process => ForegroundSource::Process,
+        ForegroundFieldSource::RootProcess => ForegroundSource::RootProcess,
+        ForegroundFieldSource::Osc7 => ForegroundSource::Osc7,
+        ForegroundFieldSource::Profile => ForegroundSource::Profile,
+        ForegroundFieldSource::Environment => ForegroundSource::Environment,
+        ForegroundFieldSource::RuntimeName => ForegroundSource::RuntimeName,
+        _ => unreachable!("unknown foreground source variant from this rmux-proto version"),
     }
 }

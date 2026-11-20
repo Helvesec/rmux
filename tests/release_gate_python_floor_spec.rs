@@ -140,6 +140,35 @@ fn release_gate_python_steps_run_without_tomllib() {
 }
 
 #[test]
+#[cfg(unix)]
+fn native_identity_consumers_import_without_tomllib() {
+    let program = r#"
+import importlib.util
+from pathlib import Path
+import sys
+sys.modules['tomllib'] = None
+scripts = Path(sys.argv[1]) / 'scripts'
+sys.path.insert(0, str(scripts))
+for name in ('candidate_identity_consumers', 'candidate_identity_manifest',
+             'candidate_identity_units', 'native_input_collector',
+             'native_input_windows_command'):
+    spec = importlib.util.spec_from_file_location(name, scripts / (name + '.py'))
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+"#;
+    let output = Command::new("python3")
+        .args(["-I", "-S", "-B", "-c", program])
+        .arg(repo_root())
+        .output()
+        .expect("run isolated Python identity imports");
+    assert!(
+        output.status.success(),
+        "{}",
+        describe("identity imports", &output)
+    );
+}
+
+#[test]
 #[cfg(target_os = "macos")]
 fn release_gate_python_steps_run_with_macos_system_python() {
     let interpreter = PathBuf::from("/usr/bin/python3");
@@ -250,5 +279,98 @@ fn both_release_gates_self_test_the_toml_reader_before_reading_manifests() {
     assert!(
         windows_self_test < windows_changelog,
         "the Windows gate must prove the TOML reader before a manifest step depends on it"
+    );
+}
+
+#[test]
+#[cfg(unix)]
+fn release_ledger_inventory_contract_is_bidirectional() {
+    let script = "tests/release_ledger_inventory.py";
+    let output = run_with(Path::new("python3"), script, &[], None);
+    assert!(output.status.success(), "{}", describe(script, &output));
+}
+
+/// Runner images for which `actions/setup-python` publishes a CPython 3.9 x64
+/// build, read from the `actions/python-versions` `versions-manifest.json` of
+/// 2026-11-11: 3.9.25 exists for 22.04 and 24.04, never for 26.04. A moving `-latest` label is refused,
+/// because the floor disappeared when `ubuntu-latest` became `ubuntu-26.04`.
+const PYTHON_FLOOR_IMAGES: [&str; 2] = ["ubuntu-22.04", "ubuntu-24.04"];
+
+/// `(job, runs-on)` for every job of `workflow` that installs Python 3.9.
+fn python_floor_jobs(workflow: &str) -> Vec<(String, String)> {
+    let Some((_, jobs)) = workflow.split_once("\njobs:\n") else {
+        return Vec::new();
+    };
+    let mut found = Vec::new();
+    let mut job: Option<(String, Option<String>, bool)> = None;
+    let mut flush = |job: &mut Option<(String, Option<String>, bool)>| {
+        if let Some((name, runner, floor)) = job.take() {
+            if floor {
+                found.push((name, runner.unwrap_or_default()));
+            }
+        }
+    };
+    for line in jobs.lines() {
+        let is_job_key = line.starts_with("  ")
+            && !line.starts_with("   ")
+            && line.trim_end().ends_with(':')
+            && !line.trim_start().starts_with('#');
+        if is_job_key {
+            flush(&mut job);
+            job = Some((line.trim().trim_end_matches(':').to_owned(), None, false));
+        } else if let Some((_, runner, floor)) = job.as_mut() {
+            if let Some(label) = line.strip_prefix("    runs-on:") {
+                *runner = Some(label.trim().to_owned());
+            }
+            if line.trim() == "python-version: \"3.9\"" {
+                *floor = true;
+            }
+        }
+    }
+    flush(&mut job);
+    found
+}
+
+#[test]
+fn python_floor_jobs_run_on_an_image_that_publishes_python_3_9() {
+    let ci = include_str!("../.github/workflows/ci.yml");
+    let ci_jobs = python_floor_jobs(ci);
+    assert!(
+        ci_jobs.iter().any(|(name, _)| name == "linux-source-gates"),
+        "CI no longer installs the release-review Python floor: {ci_jobs:?}"
+    );
+
+    let root = repo_root();
+    let mut offenders = Vec::new();
+    for workflow in fs::read_dir(root.join(".github/workflows")).expect("read workflows") {
+        let path = workflow.expect("workflow entry").path();
+        let text = fs::read_to_string(&path).expect("read workflow");
+        for (job, runner) in python_floor_jobs(&text) {
+            if !PYTHON_FLOOR_IMAGES.contains(&runner.as_str()) {
+                let relative = path.strip_prefix(&root).unwrap_or(&path);
+                offenders.push(format!("{}: {job} runs-on {runner:?}", relative.display()));
+            }
+        }
+    }
+    offenders.sort();
+    assert!(
+        offenders.is_empty(),
+        "setup-python has no CPython 3.9 for these runners: {offenders:#?}"
+    );
+}
+
+#[test]
+fn python_floor_job_parser_reads_the_runner_of_each_floor_job() {
+    let workflow = "on: push\njobs:\n  moving:\n    runs-on: ubuntu-latest\n    steps:\n      \
+        - uses: actions/setup-python@v6\n        with:\n          python-version: \"3.9\"\n  \
+        modern:\n    runs-on: ubuntu-latest\n    steps:\n      - run: true\n          \
+        python-version: \"3.12\"\n  pinned:\n    runs-on: ubuntu-24.04\n    steps:\n          \
+        python-version: \"3.9\"\n";
+    assert_eq!(
+        python_floor_jobs(workflow),
+        vec![
+            ("moving".to_owned(), "ubuntu-latest".to_owned()),
+            ("pinned".to_owned(), "ubuntu-24.04".to_owned()),
+        ]
     );
 }

@@ -1,6 +1,8 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+
+
 # Exercises the caller-cwd contract through a real packaged `tiny-cli` client.
 #
 # A tiny build selects its dispatcher on `debug_assertions`, so the binary a
@@ -18,6 +20,10 @@ die() {
 
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$repo_root"
+if [ -z "${RMUX_IDENTITY_HEAD:-}" ]; then
+  exec "${RMUX_PYTHON:-python3}" "$repo_root/scripts/candidate_identity.py" with -- /bin/bash "$repo_root/scripts/tiny-cli-cwd-routes.sh" "$@"
+fi
+"${RMUX_PYTHON:-python3}" "$repo_root/scripts/candidate_identity.py" validate
 
 case "$(uname -s)" in
   Linux|Darwin) ;;
@@ -28,7 +34,7 @@ esac
 # The tiny client needs `debug_assertions` off, which is a different profile
 # from the one the workspace tests use.  Keeping it in its own target directory
 # means neither build invalidates the other.
-tiny_target="${CARGO_TARGET_DIR%/}-tiny-cli"
+tiny_target="${CARGO_TARGET_DIR%/}/tiny-cli"
 
 printf '[tiny-routes] target=%s\n' "$CARGO_TARGET_DIR"
 printf '[tiny-routes] tiny_target=%s\n' "$tiny_target"
@@ -37,7 +43,7 @@ printf '[tiny-routes] building the full helper\n'
 CARGO_TARGET_DIR="$CARGO_TARGET_DIR" cargo build --locked --bin rmux
 
 printf '[tiny-routes] building the tiny client\n'
-CARGO_TARGET_DIR="$tiny_target" cargo build --locked --bin rmux \
+cargo build --target-dir "$tiny_target" --locked --bin rmux \
   --features tiny-cli --config profile.dev.debug-assertions=false
 
 full_helper="$CARGO_TARGET_DIR/debug/rmux"

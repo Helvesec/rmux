@@ -1,6 +1,6 @@
 use super::Screen;
 use crate::grid::GridLineFlags;
-use crate::input::InputParser;
+use crate::input::{InputParser, COLOUR_DEFAULT};
 use crate::{GridRenderOptions, ScreenCaptureRange};
 use rmux_proto::TerminalSize;
 
@@ -159,5 +159,51 @@ fn complete_erase_boundary_is_preserved_on_alternate_screen() {
             )
             .expect("saved main screen"),
         b"MAIN\n\n\n\n\n\n"
+    );
+}
+
+/// One character per column: the glyph, `.` for a default blank, `#` for a
+/// blank painted with the `SGR 41` background, `?` for anything else.
+fn background_map(screen: &Screen) -> Vec<String> {
+    (0..u32::from(SIZE.rows))
+        .map(|y| {
+            let line = screen.grid().visible_line(y).expect("visible row");
+            (0..u32::from(SIZE.cols))
+                .map(|x| {
+                    let cell = line.cell(x).unwrap_or_default();
+                    let blank = matches!(cell.text(), "" | " ");
+                    match (blank, cell.bg()) {
+                        (true, COLOUR_DEFAULT) => '.',
+                        (true, 1) => '#',
+                        (false, COLOUR_DEFAULT) => cell.text().chars().next().unwrap_or('?'),
+                        _ => '?',
+                    }
+                })
+                .collect()
+        })
+        .collect()
+}
+
+/// tmux 3.7b paints every cell `ED 0` erases with the background the parser
+/// holds: `screen_write_clearendofscreen` passes `bg` to both of its
+/// `grid_view_clear` calls, whole rows included, as the advertised `bce`
+/// capability promises.
+#[test]
+fn erase_below_paints_whole_rows_with_the_active_background() {
+    let screen = screen_with(b"aaaa\r\nbbbb\r\ncccc\x1b[2;3H\x1b[41m\x1b[J\x1b[m");
+    assert_eq!(
+        background_map(&screen),
+        ["aaaa....", "bb######", "########", "########", "########", "########"]
+    );
+}
+
+/// `ED 1` below the first row: `screen_write_clearstartofscreen` passes the
+/// same `bg` to the rows above the cursor as to the cursor row.
+#[test]
+fn erase_above_paints_whole_rows_with_the_active_background() {
+    let screen = screen_with(b"aaaa\r\nbbbb\r\ncccc\x1b[2;3H\x1b[41m\x1b[1J\x1b[m");
+    assert_eq!(
+        background_map(&screen),
+        ["########", "###b....", "cccc....", "........", "........", "........"]
     );
 }

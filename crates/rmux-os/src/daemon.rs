@@ -4,6 +4,36 @@
 //! daemon. CLI and SDK call sites should use these helpers instead of copying
 //! platform flags or Unix session setup locally.
 
+#[cfg(unix)]
+mod startup_owner;
+#[cfg(unix)]
+pub use startup_owner::take_startup_owner;
+
+mod startup_ready;
+pub use startup_ready::StartupReadyNotification;
+
+#[cfg(target_os = "linux")]
+mod linux;
+#[cfg(target_os = "linux")]
+use linux::{inherited_fd_scan_limit, mark_inherited_fds_close_on_exec_except};
+#[cfg(unix)]
+mod inherited_fds;
+#[cfg(all(unix, not(target_os = "linux")))]
+use inherited_fds::inherited_fd_scan_limit;
+#[cfg(unix)]
+use inherited_fds::mark_inherited_fds_close_on_exec_fallback_except;
+#[cfg(target_os = "linux")]
+pub use linux::signal_startup_ready_fd;
+
+#[cfg(windows)]
+mod windows_launch;
+#[cfg(windows)]
+pub use windows_launch::{launch_hidden_daemon, WindowsDaemonChild};
+#[cfg(windows)]
+mod windows_ready;
+#[cfg(windows)]
+pub use windows_ready::{signal_startup_ready_event, StartupReadyEvent};
+
 use std::io;
 use std::process::{Child, Command};
 
@@ -103,130 +133,6 @@ pub const fn should_retry_hidden_daemon_without_breakaway(_error: &io::Error) ->
     false
 }
 
-/// Writes a single readiness notification to an inherited Linux eventfd.
-#[cfg(target_os = "linux")]
-pub fn signal_startup_ready_fd(ready_fd: RawFd) -> io::Result<()> {
-    if ready_fd < 0 {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidInput,
-            "startup readiness fd must be non-negative",
-        ));
-    }
-
-    let bytes = 1_u64.to_ne_bytes();
-    // SAFETY: `ready_fd` is supplied by the parent rmux client as an inherited
-    // eventfd. Borrowing it does not transfer ownership, and `write` only
-    // touches the kernel object referenced by this descriptor.
-    let fd = unsafe { std::os::fd::BorrowedFd::borrow_raw(ready_fd) };
-    let written = rustix::io::write(fd, &bytes).map_err(io::Error::from)?;
-    if written == bytes.len() {
-        return Ok(());
-    }
-
-    Err(io::Error::new(
-        io::ErrorKind::WriteZero,
-        "short eventfd readiness write",
-    ))
-}
-
-/// A named Win32 event used to notify a launcher that a hidden daemon bound its pipe.
-#[cfg(windows)]
-#[derive(Debug)]
-pub struct StartupReadyEvent {
-    handle: HANDLE,
-    name: OsString,
-}
-
-#[cfg(windows)]
-impl StartupReadyEvent {
-    /// Creates a new unsignaled manual-reset event with a unique local name.
-    pub fn new() -> io::Result<Self> {
-        for _ in 0..64 {
-            let name = unique_startup_ready_event_name();
-            let wide = wide_event_name(&name)?;
-            // SAFETY: the name is a NUL-terminated UTF-16 buffer and the
-            // default security descriptor is suitable for a same-user child
-            // process launched immediately after event creation.
-            let handle = unsafe { CreateEventW(std::ptr::null(), 1, 0, wide.as_ptr()) };
-            if handle.is_null() {
-                return Err(io::Error::last_os_error());
-            }
-
-            // A collision is exceptionally unlikely but easy to handle. The
-            // event name is passed to the daemon; if we created a preexisting
-            // object an unrelated peer could release our wait too early.
-            if unsafe { GetLastError() } == ERROR_ALREADY_EXISTS {
-                // SAFETY: `handle` was returned by `CreateEventW` above and
-                // is no longer needed after detecting the name collision.
-                let _ = unsafe { CloseHandle(handle) };
-                continue;
-            }
-
-            return Ok(Self { handle, name });
-        }
-
-        Err(io::Error::new(
-            io::ErrorKind::AlreadyExists,
-            "could not allocate a unique rmux startup readiness event",
-        ))
-    }
-
-    /// Returns the event name to pass to the hidden daemon.
-    #[must_use]
-    pub fn name(&self) -> &OsStr {
-        self.name.as_os_str()
-    }
-
-    /// Waits until the daemon signals readiness, returning `false` on timeout.
-    pub fn wait(&self, timeout: Duration) -> io::Result<bool> {
-        let timeout_ms = duration_to_wait_millis(timeout);
-        // SAFETY: `self.handle` is owned by this object and remains valid for
-        // the duration of the wait.
-        match unsafe { WaitForSingleObject(self.handle, timeout_ms) } {
-            WAIT_OBJECT_0 => Ok(true),
-            WAIT_TIMEOUT => Ok(false),
-            WAIT_FAILED => Err(io::Error::last_os_error()),
-            other => Err(io::Error::other(format!(
-                "unexpected startup readiness wait result {other}"
-            ))),
-        }
-    }
-}
-
-#[cfg(windows)]
-impl Drop for StartupReadyEvent {
-    fn drop(&mut self) {
-        // SAFETY: `handle` is owned by this object and closed exactly once.
-        let _ = unsafe { CloseHandle(self.handle) };
-    }
-}
-
-/// Signals a named Win32 startup readiness event created by the launcher.
-#[cfg(windows)]
-pub fn signal_startup_ready_event(name: &OsStr) -> io::Result<()> {
-    let wide = wide_event_name(name)?;
-    // SAFETY: the name is a NUL-terminated UTF-16 buffer. The handle, if
-    // returned, is closed before this function exits.
-    let handle = unsafe { OpenEventW(EVENT_MODIFY_STATE, 0, wide.as_ptr()) };
-    if handle.is_null() {
-        return Err(io::Error::last_os_error());
-    }
-
-    // SAFETY: `handle` is an event handle opened with EVENT_MODIFY_STATE.
-    let result = unsafe { SetEvent(handle) };
-    let error = if result == 0 {
-        Some(io::Error::last_os_error())
-    } else {
-        None
-    };
-    // SAFETY: `handle` was returned by `OpenEventW` above.
-    let _ = unsafe { CloseHandle(handle) };
-    match error {
-        Some(error) => Err(error),
-        None => Ok(()),
-    }
-}
-
 #[cfg(unix)]
 fn configure_hidden_daemon_command_impl(command: &mut Command, _allow_job_breakaway: bool) {
     configure_hidden_daemon_command_impl_preserving(command, _allow_job_breakaway, &[]);
@@ -241,174 +147,27 @@ fn configure_hidden_daemon_command_impl_preserving(
     let mut preserved_fds = preserved_fds.to_vec();
     preserved_fds.sort_unstable();
     preserved_fds.dedup();
+    let scan_limit =
+        inherited_fd_scan_limit().map_err(|error| error.raw_os_error().unwrap_or(libc::EIO));
     // SAFETY: The closure runs after fork and before exec in the daemon child.
     // It only marks inherited descriptors close-on-exec and calls `setsid`;
     // both operations stay inside libc/rustix OS boundaries and avoid touching
     // parent-owned Rust state.
     unsafe {
         command.pre_exec(move || {
-            mark_inherited_fds_close_on_exec_except(&preserved_fds)?;
+            mark_inherited_fds_close_on_exec_except(&preserved_fds, scan_limit)?;
             rustix::process::setsid().map_err(io::Error::from)?;
             Ok(())
         });
     }
 }
 
-#[cfg(target_os = "linux")]
-fn mark_inherited_fds_close_on_exec_except(preserved_fds: &[RawFd]) -> io::Result<()> {
-    if mark_inherited_fd_ranges_close_on_exec(preserved_fds)? {
-        return Ok(());
-    }
-
-    mark_inherited_fds_close_on_exec_fallback_except(preserved_fds)
-}
-
-#[cfg(target_os = "linux")]
-fn mark_inherited_fd_ranges_close_on_exec(preserved_fds: &[RawFd]) -> io::Result<bool> {
-    let mut start = 3_u32;
-
-    for &fd in preserved_fds {
-        if fd < 3 {
-            continue;
-        }
-        let Ok(fd) = u32::try_from(fd) else {
-            continue;
-        };
-        if start < fd && !close_range_cloexec(start, fd - 1)? {
-            return Ok(false);
-        }
-        clear_close_on_exec(fd as libc::c_int)?;
-        start = fd.saturating_add(1);
-    }
-
-    if !close_range_cloexec(start, u32::MAX)? {
-        return Ok(false);
-    }
-    Ok(true)
-}
-
-#[cfg(target_os = "linux")]
-fn close_range_cloexec(first: u32, last: u32) -> io::Result<bool> {
-    if first > last {
-        return Ok(true);
-    }
-
-    // SAFETY: `close_range` with `CLOSE_RANGE_CLOEXEC` does not close file
-    // descriptors or dereference Rust memory; it only asks the kernel to mark
-    // inherited descriptors in the supplied range close-on-exec in the child
-    // process.
-    let result = unsafe {
-        libc::syscall(
-            libc::SYS_close_range,
-            first,
-            last,
-            libc::CLOSE_RANGE_CLOEXEC,
-        )
-    };
-    if result == 0 {
-        return Ok(true);
-    }
-
-    let error = io::Error::last_os_error();
-    match error.raw_os_error() {
-        Some(libc::ENOSYS | libc::EINVAL) => Ok(false),
-        _ => Err(error),
-    }
-}
-
 #[cfg(all(unix, not(target_os = "linux")))]
-fn mark_inherited_fds_close_on_exec_except(preserved_fds: &[RawFd]) -> io::Result<()> {
-    mark_inherited_fds_close_on_exec_fallback_except(preserved_fds)
-}
-
-#[cfg(unix)]
-const FALLBACK_FD_SCAN_LIMIT: libc::c_int = 16_384;
-
-#[cfg(unix)]
-fn mark_inherited_fds_close_on_exec_fallback_except(preserved_fds: &[RawFd]) -> io::Result<()> {
-    let max_fd = inherited_fd_scan_limit();
-
-    for fd in 3..max_fd {
-        if preserved_fds.contains(&fd) {
-            clear_close_on_exec(fd)?;
-            continue;
-        }
-
-        // SAFETY: `fcntl(F_GETFD)` observes descriptor flags for an integer fd.
-        // Invalid descriptors are reported as EBADF and handled below.
-        let flags = fcntl_getfd_retry(fd)?;
-        if flags == -1 {
-            let error = io::Error::last_os_error();
-            if error.raw_os_error() == Some(libc::EBADF) {
-                continue;
-            }
-            return Err(error);
-        }
-
-        // SAFETY: `fd` was accepted by `F_GETFD`; `F_SETFD` only updates that
-        // descriptor's close-on-exec flag and reports races via EBADF.
-        let result = fcntl_setfd_retry(fd, flags | libc::FD_CLOEXEC)?;
-        if result == -1 {
-            let error = io::Error::last_os_error();
-            if error.raw_os_error() == Some(libc::EBADF) {
-                continue;
-            }
-            return Err(error);
-        }
-    }
-
-    Ok(())
-}
-
-#[cfg(unix)]
-fn clear_close_on_exec(fd: libc::c_int) -> io::Result<()> {
-    let flags = fcntl_getfd_retry(fd)?;
-    if flags == -1 {
-        return Err(io::Error::last_os_error());
-    }
-    let result = fcntl_setfd_retry(fd, flags & !libc::FD_CLOEXEC)?;
-    if result == -1 {
-        return Err(io::Error::last_os_error());
-    }
-    Ok(())
-}
-
-#[cfg(unix)]
-fn inherited_fd_scan_limit() -> libc::c_int {
-    let mut limit = std::mem::MaybeUninit::<libc::rlimit>::uninit();
-    // SAFETY: `limit` points to writable storage for `getrlimit`.
-    let result = unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, limit.as_mut_ptr()) };
-    if result != 0 {
-        return 1024;
-    }
-    // SAFETY: `getrlimit` succeeded and initialized `limit`.
-    let limit = unsafe { limit.assume_init() };
-    let soft = limit.rlim_cur.min(libc::c_int::MAX as libc::rlim_t);
-    libc::c_int::try_from(soft)
-        .unwrap_or(libc::c_int::MAX)
-        .clamp(3, FALLBACK_FD_SCAN_LIMIT)
-}
-
-#[cfg(unix)]
-fn fcntl_getfd_retry(fd: libc::c_int) -> io::Result<libc::c_int> {
-    loop {
-        // SAFETY: `fcntl(F_GETFD)` observes descriptor flags for an integer fd.
-        let result = unsafe { libc::fcntl(fd, libc::F_GETFD) };
-        if result != -1 || io::Error::last_os_error().raw_os_error() != Some(libc::EINTR) {
-            return Ok(result);
-        }
-    }
-}
-
-#[cfg(unix)]
-fn fcntl_setfd_retry(fd: libc::c_int, flags: libc::c_int) -> io::Result<libc::c_int> {
-    loop {
-        // SAFETY: `fcntl(F_SETFD)` mutates only fd flags for the supplied fd.
-        let result = unsafe { libc::fcntl(fd, libc::F_SETFD, flags) };
-        if result != -1 || io::Error::last_os_error().raw_os_error() != Some(libc::EINTR) {
-            return Ok(result);
-        }
-    }
+fn mark_inherited_fds_close_on_exec_except(
+    preserved_fds: &[RawFd],
+    scan_limit: Result<RawFd, i32>,
+) -> io::Result<()> {
+    mark_inherited_fds_close_on_exec_fallback_except(preserved_fds, scan_limit)
 }
 
 #[cfg(windows)]
@@ -671,4 +430,22 @@ mod tests {
             "startup readiness event should become signaled"
         );
     }
+    #[test]
+    fn readiness_notification_uses_the_same_named_event_transport() {
+        let ready = StartupReadyEvent::new().unwrap();
+        let notification = StartupReadyNotification::from_event_name(ready.name().to_owned());
+        let cloned = notification.clone();
+        assert!(!ready.wait(Duration::from_millis(1)).unwrap());
+        notification.signal().unwrap();
+        assert!(ready.wait(Duration::from_millis(100)).unwrap());
+        cloned.signal().unwrap();
+        let invalid = StartupReadyNotification::from_event_name(OsString::from("bad\0name"));
+        assert_eq!(
+            invalid.signal().unwrap_err().kind(),
+            io::ErrorKind::InvalidInput
+        );
+    }
 }
+
+#[cfg(all(test, unix))]
+mod fd_tests;

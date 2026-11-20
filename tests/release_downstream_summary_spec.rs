@@ -240,7 +240,7 @@ fn ten_results_feed_site_then_exact_final_summary() {
     assert_fixture(&format!(
         "{FIXTURE}\n{}",
         r#"
-with tempfile.TemporaryDirectory(dir=pathlib.Path.cwd()) as root:
+with tempfile.TemporaryDirectory(dir=pathlib.Path.cwd().parent) as root:
     _, _, _, pre_path, pre, final = build(root)
     if pre['phase'] != 'pre-site' or pre['result_count'] != 10:
         raise SystemExit('pre-site result cardinality changed')
@@ -261,7 +261,7 @@ fn aggregation_rejects_missing_results_wrong_receipt_and_wrong_state() {
     assert_fixture(&format!(
         "{FIXTURE}\n{}",
         r#"
-with tempfile.TemporaryDirectory(dir=pathlib.Path.cwd()) as root:
+with tempfile.TemporaryDirectory(dir=pathlib.Path.cwd().parent) as root:
     plan_path, plan = write_plan(root)
     references = {
         channel: write_reference(root, channel, plan_path, plan, index)
@@ -331,7 +331,7 @@ fn final_phase_rejects_changed_pre_site_summary_and_request_binds_digest() {
     assert_fixture(&format!(
         "{FIXTURE}\n{}",
         r#"
-with tempfile.TemporaryDirectory(dir=pathlib.Path.cwd()) as root:
+with tempfile.TemporaryDirectory(dir=pathlib.Path.cwd().parent) as root:
     plan_path, plan, references, pre_path, pre, _ = build(root)
     changed = copy.deepcopy(pre)
     changed['advertised_channels'] = ['apt_rpm']

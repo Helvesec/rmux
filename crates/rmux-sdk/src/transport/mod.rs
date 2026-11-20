@@ -110,20 +110,23 @@ impl TransportClient {
             return Err(failure.to_error(&operation));
         }
 
+        let deadline = self.call_deadline();
         let (reply, response) = oneshot::channel();
-        self.run_with_deadline(&operation, async {
-            self.commands
-                .send(ActorMessage::Request {
-                    request,
-                    operation: operation.clone(),
-                    reply,
-                })
-                .await
-                .map_err(|_| self.closed_error(&operation))?;
+        self.enqueue_within_deadline(
+            &operation,
+            deadline,
+            ActorMessage::Request {
+                request,
+                operation: operation.clone(),
+                reply,
+            },
+        )
+        .await?;
 
-            // Once queued, the actor owns this FIFO exchange. If the
-            // caller drops its future, the actor must still consume and
-            // validate the response so later requests remain aligned.
+        // Once queued, the actor owns this FIFO exchange. If the caller drops
+        // its future, the actor must still consume and validate the response
+        // so later requests remain aligned.
+        self.run_with_deadline(&operation, deadline, async {
             response.await.map_err(|_| self.closed_error(&operation))?
         })
         .await
@@ -143,21 +146,23 @@ impl TransportClient {
         })?;
         // The operation deadline covers dispatch through the daemon's armed
         // acknowledgement. The returned wait owns its separate match timeout.
+        let deadline = self.call_deadline();
+        self.enqueue_within_deadline(
+            &operation,
+            deadline,
+            ActorMessage::ArmedRequest {
+                request,
+                operation: operation.clone(),
+                reply,
+                armed,
+                wait_id,
+            },
+        )
+        .await?;
         let mut cancellation = OrderedResponseGuard::new(self);
+        cancellation.arm();
         let armed_result = self
-            .run_with_deadline(&operation, async {
-                self.commands
-                    .send(ActorMessage::ArmedRequest {
-                        request,
-                        operation: operation.clone(),
-                        reply,
-                        armed,
-                        wait_id,
-                    })
-                    .await
-                    .map_err(|_| self.closed_error(&operation))?;
-                cancellation.arm();
-
+            .run_with_deadline(&operation, deadline, async {
                 armed_response
                     .await
                     .map_err(|_| self.closed_error(&operation))?
@@ -185,7 +190,7 @@ impl TransportClient {
         let (reply, response) = oneshot::channel();
         let mut cancellation = OrderedResponseGuard::new(self);
         let result = self
-            .run_with_deadline(TRANSPORT_SHUTDOWN_OPERATION, async {
+            .run_with_deadline(TRANSPORT_SHUTDOWN_OPERATION, self.call_deadline(), async {
                 self.commands
                     .send(ActorMessage::Shutdown { reply })
                     .await
@@ -241,13 +246,46 @@ impl TransportClient {
             .to_error(operation)
     }
 
-    async fn run_with_deadline<F, T>(&self, operation: &str, future: F) -> Result<T>
+    /// The deadline one transport call shares between waiting for a command
+    /// queue slot and waiting for its response.
+    fn call_deadline(&self) -> OperationDeadline {
+        self.operation_deadline
+            .unwrap_or_else(|| OperationDeadline::from_timeout(self.default_timeout))
+    }
+
+    /// Hands one command to the actor before `deadline` expires.
+    ///
+    /// Expiry here fails only this caller: the command never reached the
+    /// actor, so it holds no FIFO response slot that a later response could
+    /// be misattributed to, and the shared transport stays usable.
+    async fn enqueue_within_deadline(
+        &self,
+        operation: &str,
+        deadline: OperationDeadline,
+        message: ActorMessage,
+    ) -> Result<()> {
+        let send = self.commands.send(message);
+        let sent = match deadline.remaining_timeout() {
+            None => send.await,
+            Some(remaining) => tokio::time::timeout(remaining, send)
+                .await
+                .map_err(|_| deadline_failure(deadline, remaining).to_error(operation))?,
+        };
+        sent.map_err(|_| self.closed_error(operation))
+    }
+
+    /// Awaits an exchange the actor already owns. Expiry aborts the shared
+    /// transport, because a late response would otherwise be assigned to the
+    /// next request in FIFO order.
+    async fn run_with_deadline<F, T>(
+        &self,
+        operation: &str,
+        deadline: OperationDeadline,
+        future: F,
+    ) -> Result<T>
     where
         F: Future<Output = Result<T>>,
     {
-        let deadline = self
-            .operation_deadline
-            .unwrap_or_else(|| OperationDeadline::from_timeout(self.default_timeout));
         let Some(remaining) = deadline.remaining_timeout() else {
             return future.await;
         };
@@ -255,8 +293,7 @@ impl TransportClient {
         match tokio::time::timeout(remaining, future).await {
             Ok(result) => result,
             Err(_) => {
-                let requested = deadline.requested_timeout().unwrap_or(remaining);
-                let failure = TransportFailure::timed_out(requested);
+                let failure = deadline_failure(deadline, remaining);
                 self.abort_with(failure.clone());
                 Err(failure.to_error(operation))
             }
@@ -267,6 +304,10 @@ impl TransportClient {
         self.state.set_terminal_failure(failure.clone());
         self.actor.abort();
     }
+}
+
+fn deadline_failure(deadline: OperationDeadline, remaining: Duration) -> TransportFailure {
+    TransportFailure::timed_out(deadline.requested_timeout().unwrap_or(remaining))
 }
 
 impl fmt::Debug for TransportClient {

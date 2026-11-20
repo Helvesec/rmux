@@ -1,12 +1,13 @@
 #![cfg(unix)]
 
+#[path = "../../../tests/support/executable_fixture.rs"]
+mod executable_fixture;
+
 use std::ffi::OsStr;
 use std::fs;
-use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
-use rmux_sdk::bootstrap::discovery::SDK_DAEMON_BINARY_ENV;
 use rmux_sdk::{Rmux, RmuxError};
 
 static ENV_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
@@ -17,7 +18,7 @@ async fn cmd_injects_resolved_unix_endpoint_and_preserves_process_output() {
     let root = TestRoot::new("sdk-cmd");
     let fake_rmux = root.path().join("fake-rmux.sh");
     write_fake_rmux(&fake_rmux);
-    let _binary = EnvGuard::set(SDK_DAEMON_BINARY_ENV, fake_rmux.as_os_str());
+    let _binary = EnvGuard::set("RMUX_SDK_DAEMON_BINARY", fake_rmux.as_os_str());
 
     let socket = root.path().join("daemon.sock");
     let rmux = Rmux::builder().unix_socket(&socket).build();
@@ -47,7 +48,7 @@ async fn cmd_applies_the_facade_operation_timeout_to_the_child_tree() {
     let root = TestRoot::new("sdk-cmd-timeout");
     let fake_rmux = root.path().join("fake-rmux.sh");
     write_fake_rmux(&fake_rmux);
-    let _binary = EnvGuard::set(SDK_DAEMON_BINARY_ENV, fake_rmux.as_os_str());
+    let _binary = EnvGuard::set("RMUX_SDK_DAEMON_BINARY", fake_rmux.as_os_str());
 
     let socket = root.path().join("daemon.sock");
     let rmux = Rmux::builder()
@@ -77,14 +78,12 @@ async fn cmd_applies_the_facade_operation_timeout_to_the_child_tree() {
 }
 
 fn write_fake_rmux(path: &Path) {
-    fs::write(
+    executable_fixture::write_executable(
         path,
         "#!/bin/sh\nfor arg in \"$@\"; do printf '%s\\n' \"$arg\"; done\nprintf 'stderr-line\\n' >&2\nif [ \"${1-}\" = \"-S\" ]; then shift 2; fi\nif [ \"${1-}\" = \"hang\" ]; then sleep 30; fi\nexit 7\n",
+        0o755,
     )
     .expect("write fake rmux");
-    let mut permissions = fs::metadata(path).expect("fake metadata").permissions();
-    permissions.set_mode(0o755);
-    fs::set_permissions(path, permissions).expect("make fake executable");
 }
 
 struct EnvGuard {

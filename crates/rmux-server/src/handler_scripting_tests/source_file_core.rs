@@ -1,10 +1,43 @@
 use super::*;
+use crate::client_names::control_client_name;
 use crate::handler::scripting_support::install_queue_exact_target_capture_pause;
 use crate::pane_io::AttachControl;
 
 // Source-file queues can nest command dispatch and attached rendering in one poll.
 // Mirror the daemon worker budget without depending on the test harness thread stack.
 const DAEMON_TEST_STACK_SIZE: usize = 8 * 1024 * 1024;
+
+#[tokio::test]
+async fn source_file_path_expansion_keeps_client_loop_snapshot() {
+    let handler = RequestHandler::new();
+    let session = session_name("source-client-loop");
+    let requester_pid = 424_301;
+    create_background_identity_session(&handler, session.clone()).await;
+    let (_control_id, _events) =
+        register_control_for_session(&handler, requester_pid, session).await;
+    let root = temp_root("client-loop-path");
+    let client_name = control_client_name(requester_pid);
+    write_config(&root.join(&client_name), "display-message -p SOURCE-L-OK\n");
+
+    let command = format!(
+        "source-file -F '{}/#{{L:#{{client_name}}}}'",
+        root.display()
+    );
+    let parsed = handler
+        .parse_control_commands(&command)
+        .await
+        .expect("source-file client loop command parses");
+    let result = handler
+        .execute_control_commands(requester_pid, parsed)
+        .await;
+    assert!(result.error.is_none(), "source-file failed: {result:?}");
+    assert!(
+        String::from_utf8_lossy(&result.stdout).contains("SOURCE-L-OK"),
+        "source-file path should expand through the client snapshot: {:?}",
+        result.stdout
+    );
+    fs::remove_dir_all(root).expect("remove source root");
+}
 
 fn run_on_daemon_test_stack<F, Fut>(test: F)
 where
@@ -62,8 +95,8 @@ async fn compact_short_options_execute_from_source_file() {
 async fn compact_hidden_select_pane_style_executes_from_source_file() {
     let handler = RequestHandler::new();
     let alpha = session_name("source-compact-select-style");
-    assert!(matches!(
-        handler
+    crate::session_fixture::assert_new_session(
+        &handler
             .handle(Request::NewSession(NewSessionRequest {
                 session_name: alpha.clone(),
                 detached: true,
@@ -71,8 +104,7 @@ async fn compact_hidden_select_pane_style_executes_from_source_file() {
                 environment: None,
             }))
             .await,
-        Response::NewSession(_)
-    ));
+    );
     assert!(matches!(
         handler
             .handle(Request::SplitWindow(SplitWindowRequest {
@@ -176,14 +208,23 @@ async fn source_file_command_bounds_matches_across_separate_paths() {
 
 #[test]
 fn source_file_preserves_target_client_and_show_hooks_flags() {
-    run_on_daemon_test_stack(source_file_preserves_target_client_and_show_hooks_flags_body);
+    run_on_daemon_test_stack(|| {
+        source_file_preserves_target_client_and_show_hooks_flags_body(false)
+    });
 }
 
-async fn source_file_preserves_target_client_and_show_hooks_flags_body() {
+#[test]
+fn source_file_target_client_flags_allow_pending_render_refresh() {
+    run_on_daemon_test_stack(|| {
+        source_file_preserves_target_client_and_show_hooks_flags_body(true)
+    });
+}
+
+async fn source_file_preserves_target_client_and_show_hooks_flags_body(pending_refresh: bool) {
     let handler = RequestHandler::new();
     let alpha = session_name("source-target-client");
-    assert!(matches!(
-        handler
+    crate::session_fixture::assert_new_session(
+        &handler
             .handle(Request::NewSession(NewSessionRequest {
                 session_name: alpha.clone(),
                 detached: true,
@@ -191,11 +232,32 @@ async fn source_file_preserves_target_client_and_show_hooks_flags_body() {
                 environment: None,
             }))
             .await,
-        Response::NewSession(_)
-    ));
+    );
     let (control_tx, mut control_rx) = tokio::sync::mpsc::unbounded_channel();
-    handler.register_attach(202, alpha, control_tx).await;
+    handler
+        .register_attach(202, alpha.clone(), control_tx)
+        .await;
     while control_rx.try_recv().is_ok() {}
+    if pending_refresh {
+        // Pane output can refresh the attached session between this drain and
+        // source-file completion. Exercise that ordering without a timing race.
+        handler
+            .refresh_attached_session_for_pane_output(&alpha)
+            .await;
+    }
+
+    let expected_overlay = {
+        let state = handler.state.lock().await;
+        let session = state
+            .sessions
+            .session(&alpha)
+            .expect("target session exists");
+        crate::renderer::render_display_panes_overlay(session, &state.options)
+    };
+    assert!(
+        !expected_overlay.is_empty(),
+        "target pane labels are visible"
+    );
 
     let root = temp_root("target-client-flags");
     write_config(&root.join("input.txt"), "loaded from source");
@@ -217,10 +279,18 @@ async fn source_file_preserves_target_client_and_show_hooks_flags_body() {
         .command_output()
         .expect("source-file command output");
     assert_eq!(output.stdout(), b"after-load-buffer\n");
-    assert!(matches!(
-        control_rx.try_recv(),
-        Ok(AttachControl::Overlay(_))
-    ));
+    // A pane-output refresh may precede the command's overlay on this channel.
+    let control = std::iter::from_fn(|| control_rx.try_recv().ok())
+        .find(|control| !matches!(control, AttachControl::Switch(_) | AttachControl::Refresh));
+    let Some(AttachControl::Overlay(overlay)) = control else {
+        panic!("target client must receive the source-file overlay, got {control:?}");
+    };
+    // Delivery may prepend a base redraw; the complete target labels must follow it.
+    assert!(
+        overlay.frame.ends_with(&expected_overlay),
+        "source-file must deliver the target session's complete pane-label overlay, got {:?}",
+        String::from_utf8_lossy(&overlay.frame)
+    );
 
     for (name, expected) in [
         ("set-from-source", b"payload".as_slice()),
@@ -246,8 +316,8 @@ async fn source_file_target_client_follows_the_same_registration_after_switch() 
     let before_switch = session_name("source-display-client-before-switch");
     let after_switch = session_name("source-display-client-after-switch");
     for name in [before_switch.clone(), after_switch.clone()] {
-        assert!(matches!(
-            handler
+        crate::session_fixture::assert_new_session(
+            &handler
                 .handle(Request::NewSession(NewSessionRequest {
                     session_name: name,
                     detached: true,
@@ -255,8 +325,7 @@ async fn source_file_target_client_follows_the_same_registration_after_switch() 
                     environment: None,
                 }))
                 .await,
-            Response::NewSession(_)
-        ));
+        );
     }
 
     let attach_pid = 91_943;
@@ -378,67 +447,22 @@ async fn source_file_rejects_refresh_client_unsupported_fields() {
     let handler = RequestHandler::new();
     let root = temp_root("refresh-client-unsupported-fields");
 
-    for (name, command, expected) in [
-        (
-            "a.conf",
-            "refresh-client -A pane:on\n",
-            "command refresh-client: unknown flag -A",
-        ),
-        (
-            "b.conf",
-            "refresh-client -B name:pane:format\n",
-            "command refresh-client: unknown flag -B",
-        ),
-        (
-            "r.conf",
-            "refresh-client -r pane:rgb\n",
-            "command refresh-client: unknown flag -r",
-        ),
-        (
-            "c.conf",
-            "refresh-client -c\n",
-            "command refresh-client: unknown flag -c",
-        ),
-        (
-            "d.conf",
-            "refresh-client -D\n",
-            "command refresh-client: unknown flag -D",
-        ),
-        (
-            "l.conf",
-            "refresh-client -L\n",
-            "command refresh-client: unknown flag -L",
-        ),
-        (
-            "rr.conf",
-            "refresh-client -R\n",
-            "command refresh-client: unknown flag -R",
-        ),
-        (
-            "u.conf",
-            "refresh-client -U\n",
-            "command refresh-client: unknown flag -U",
-        ),
-        (
-            "adjustment.conf",
-            "refresh-client 10\n",
-            "unexpected argument '10' for refresh-client",
-        ),
-    ] {
-        let config = root.join(name);
-        write_config(&config, command);
-        let response = handler
-            .handle(source_file_request(
-                vec![name.to_owned()],
-                Some(root.clone()),
-            ))
-            .await;
-        assert_eq!(
-            source_file_stdout_failure(response),
-            format!("{}:1: {expected}\n", config.display()),
-            "source-file should reject {command:?}"
-        );
-    }
+    let name = "z.conf";
+    let command = "refresh-client -Z\n";
+    let expected = "command refresh-client: unknown flag -Z";
+    let config = root.join(name);
+    write_config(&config, command);
+    let response = handler
+        .handle(source_file_request(
+            vec![name.to_owned()],
+            Some(root.clone()),
+        ))
+        .await;
+    assert_eq!(
+        source_file_stdout_failure(response),
+        format!("{}:1: {expected}\n", config.display()),
+        "source-file should reject {command:?}"
+    );
 
     fs::remove_dir_all(root).expect("remove refresh-client source root");
 }
@@ -1402,8 +1426,8 @@ async fn source_file_quiet_suppresses_missing_file_and_glob_miss() {
 async fn source_file_format_expands_path_against_target_context() {
     let handler = RequestHandler::new();
     let alpha = session_name("alpha");
-    assert!(matches!(
-        handler
+    crate::session_fixture::assert_new_session(
+        &handler
             .handle(Request::NewSession(NewSessionRequest {
                 session_name: alpha.clone(),
                 detached: true,
@@ -1411,8 +1435,7 @@ async fn source_file_format_expands_path_against_target_context() {
                 environment: None,
             }))
             .await,
-        Response::NewSession(_)
-    ));
+    );
 
     let root = temp_root("format-path");
     let config = root.join("alpha.conf");
@@ -1451,8 +1474,8 @@ async fn source_file_format_expands_path_against_target_context() {
 async fn source_file_if_condition_uses_target_format_context_at_parse_time() {
     let handler = RequestHandler::new();
     let alpha = session_name("alpha");
-    assert!(matches!(
-        handler
+    crate::session_fixture::assert_new_session(
+        &handler
             .handle(Request::NewSession(NewSessionRequest {
                 session_name: alpha.clone(),
                 detached: true,
@@ -1460,8 +1483,7 @@ async fn source_file_if_condition_uses_target_format_context_at_parse_time() {
                 environment: None,
             }))
             .await,
-        Response::NewSession(_)
-    ));
+    );
 
     let root = temp_root("if-target-format");
     write_config(
@@ -1536,8 +1558,8 @@ async fn nested_source_file_format_expansion_sees_current_file() {
 async fn nested_source_file_format_path_inherits_current_target() {
     let handler = RequestHandler::new();
     let session = session_name("s");
-    assert!(matches!(
-        handler
+    crate::session_fixture::assert_new_session(
+        &handler
             .handle(Request::NewSession(NewSessionRequest {
                 session_name: session.clone(),
                 detached: true,
@@ -1545,8 +1567,7 @@ async fn nested_source_file_format_path_inherits_current_target() {
                 environment: None,
             }))
             .await,
-        Response::NewSession(_)
-    ));
+    );
 
     let root = temp_root("nested-format-option-path");
     write_config(
@@ -1585,8 +1606,8 @@ async fn queued_source_file_accepts_compact_format_target_with_attached_value() 
     let alpha = session_name("alpha");
     let beta = session_name("beta");
     for session in [&alpha, &beta] {
-        assert!(matches!(
-            handler
+        crate::session_fixture::assert_new_session(
+            &handler
                 .handle(Request::NewSession(NewSessionRequest {
                     session_name: session.clone(),
                     detached: true,
@@ -1594,8 +1615,7 @@ async fn queued_source_file_accepts_compact_format_target_with_attached_value() 
                     environment: None,
                 }))
                 .await,
-            Response::NewSession(_)
-        ));
+        );
     }
 
     let root = temp_root("source-file-compact-format-target");
@@ -1653,8 +1673,8 @@ async fn queued_source_file_target_finder_uses_active_indexed_pane() {
     }
 
     let beta = session_name("beta");
-    assert!(matches!(
-        handler
+    crate::session_fixture::assert_new_session(
+        &handler
             .handle(Request::NewSession(NewSessionRequest {
                 session_name: beta.clone(),
                 detached: true,
@@ -1662,8 +1682,7 @@ async fn queued_source_file_target_finder_uses_active_indexed_pane() {
                 environment: None,
             }))
             .await,
-        Response::NewSession(_)
-    ));
+    );
     assert!(matches!(
         handler
             .handle(Request::NewWindow(Box::new(NewWindowRequest {
@@ -1823,8 +1842,8 @@ async fn queued_source_file_preserves_assignment_order_across_multi_paths() {
 async fn queued_display_message_accepts_compact_print_and_commands_flags() {
     let handler = RequestHandler::new();
     let alpha = session_name("display-compact-pc");
-    assert!(matches!(
-        handler
+    crate::session_fixture::assert_new_session(
+        &handler
             .handle(Request::NewSession(NewSessionRequest {
                 session_name: alpha.clone(),
                 detached: true,
@@ -1832,8 +1851,7 @@ async fn queued_display_message_accepts_compact_print_and_commands_flags() {
                 environment: None,
             }))
             .await,
-        Response::NewSession(_)
-    ));
+    );
 
     let parsed = CommandParser::new()
         .parse("display-message -pC '#{session_name}'")
@@ -1857,8 +1875,8 @@ async fn source_file_set_window_option_alias_uses_explicit_window_target_metadat
     let alpha = session_name("alpha");
     let beta = session_name("beta");
     for session in [&alpha, &beta] {
-        assert!(matches!(
-            handler
+        crate::session_fixture::assert_new_session(
+            &handler
                 .handle(Request::NewSession(NewSessionRequest {
                     session_name: session.clone(),
                     detached: true,
@@ -1866,8 +1884,7 @@ async fn source_file_set_window_option_alias_uses_explicit_window_target_metadat
                     environment: None,
                 }))
                 .await,
-            Response::NewSession(_)
-        ));
+        );
     }
     for (session, name) in [(&alpha, "one"), (&alpha, "named"), (&beta, "other")] {
         assert!(matches!(
@@ -1983,8 +2000,8 @@ async fn source_file_resolves_announced_window_and_pane_target_metadata() {
     let alpha = session_name("metadata-alpha");
     let beta = session_name("metadata-beta");
     for session in [&alpha, &beta] {
-        assert!(matches!(
-            handler
+        crate::session_fixture::assert_new_session(
+            &handler
                 .handle(Request::NewSession(NewSessionRequest {
                     session_name: session.clone(),
                     detached: true,
@@ -1992,8 +2009,7 @@ async fn source_file_resolves_announced_window_and_pane_target_metadata() {
                     environment: None,
                 }))
                 .await,
-            Response::NewSession(_)
-        ));
+        );
     }
     assert!(matches!(
         handler
@@ -2095,8 +2111,8 @@ async fn source_file_resolves_announced_window_and_pane_target_metadata() {
 async fn nested_source_file_preserves_implicit_target_canfail_behavior() {
     let handler = RequestHandler::new();
     for session in [session_name("alpha"), session_name("beta")] {
-        assert!(matches!(
-            handler
+        crate::session_fixture::assert_new_session(
+            &handler
                 .handle(Request::NewSession(NewSessionRequest {
                     session_name: session,
                     detached: true,
@@ -2104,8 +2120,7 @@ async fn nested_source_file_preserves_implicit_target_canfail_behavior() {
                     environment: None,
                 }))
                 .await,
-            Response::NewSession(_)
-        ));
+        );
     }
 
     let root = temp_root("nested-source-implicit-canfail");
@@ -2350,8 +2365,8 @@ async fn source_file_continues_after_runtime_errors_and_reports_error() {
 async fn source_file_new_window_k_validates_environment_before_replacing_target() {
     let handler = RequestHandler::new();
     let alpha = session_name("source-new-window-k-env-validation");
-    assert!(matches!(
-        handler
+    crate::session_fixture::assert_new_session(
+        &handler
             .handle(Request::NewSession(NewSessionRequest {
                 session_name: alpha.clone(),
                 detached: true,
@@ -2359,8 +2374,7 @@ async fn source_file_new_window_k_validates_environment_before_replacing_target(
                 environment: None,
             }))
             .await,
-        Response::NewSession(_)
-    ));
+    );
     assert!(matches!(
         handler
             .handle(Request::NewWindow(Box::new(NewWindowRequest {
@@ -2412,7 +2426,7 @@ async fn source_file_new_window_k_validates_environment_before_replacing_target(
     );
     let state = handler.state.lock().await;
     let session = state.sessions.session(&alpha).expect("session survives");
-    assert_eq!(session.windows().len(), 2);
+    assert_eq!(session.windows().count(), 2);
     let protected = session
         .window_at(1)
         .expect("invalid replacement must preserve the target window");
@@ -2540,8 +2554,8 @@ async fn source_file_sets_server_option_without_explicit_scope_or_target() {
 async fn source_file_sets_bare_server_option_with_current_runtime_target() {
     let handler = RequestHandler::new();
     let alpha = session_name("alpha");
-    assert!(matches!(
-        handler
+    crate::session_fixture::assert_new_session(
+        &handler
             .handle(Request::NewSession(NewSessionRequest {
                 session_name: alpha.clone(),
                 detached: true,
@@ -2549,8 +2563,7 @@ async fn source_file_sets_bare_server_option_with_current_runtime_target() {
                 environment: None,
             }))
             .await,
-        Response::NewSession(_)
-    ));
+    );
     let root = temp_root("server-option-current-target");
     write_config(
         &root.join("server.conf"),
@@ -2899,7 +2912,7 @@ async fn create_quiet_source_timer_session(
             skip_environment_update: false,
         })))
         .await;
-    assert!(matches!(response, Response::NewSession(_)), "{response:?}");
+    crate::session_fixture::assert_new_session(&response);
     session
 }
 

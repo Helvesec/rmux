@@ -80,7 +80,7 @@ impl<'a> SessionFinder<'a> {
     /// Returns every session matching this query.
     pub async fn all(self) -> Result<Vec<DiscoveredSession>> {
         let exact_name = match &self.name {
-            Some(name) => Some(SessionName::new(name).map_err(RmuxError::protocol)?),
+            Some(name) => Some(SessionName::new(name).map_err(RmuxError::from)?),
             None => None,
         };
         let rmux = self.rmux.begin_operation_handle().await?;
@@ -111,9 +111,9 @@ impl<'a> SessionFinder<'a> {
                 .next()
                 .expect("single match length guarantees one entry")
                 .session),
-            count => Err(RmuxError::protocol(rmux_proto::RmuxError::Server(format!(
-                "strict session discovery violation: expected 1 match, found {count}"
-            )))),
+            count => Err(RmuxError::from_proto(rmux_proto::RmuxError::Server(
+                format!("strict session discovery violation: expected 1 match, found {count}"),
+            ))),
         }
     }
 }
@@ -228,7 +228,7 @@ impl<'a> PaneFinder<'a> {
 
 async fn discover_panes(rmux: &Rmux, filters: &PaneFilters) -> Result<Vec<DiscoveredPane>> {
     let exact_session = match &filters.session {
-        Some(session_name) => Some(SessionName::new(session_name).map_err(RmuxError::protocol)?),
+        Some(session_name) => Some(SessionName::new(session_name).map_err(RmuxError::from)?),
         None => None,
     };
     let rmux = rmux.begin_operation_handle().await?;
@@ -442,7 +442,7 @@ fn parse_u32(value: &str, field: &str) -> Result<u32> {
 }
 
 fn strict_discovery_error(count: usize, filters: &PaneFilters) -> RmuxError {
-    RmuxError::protocol(rmux_proto::RmuxError::Server(format!(
+    RmuxError::from_proto(rmux_proto::RmuxError::Server(format!(
         "strict pane discovery violation: expected 1 match, found {count}; query: {}",
         filters.describe()
     )))
@@ -488,7 +488,7 @@ impl PaneFilters {
 }
 
 fn parse_error(message: impl Into<String>) -> RmuxError {
-    RmuxError::protocol(rmux_proto::RmuxError::Server(message.into()))
+    RmuxError::from_proto(rmux_proto::RmuxError::Server(message.into()))
 }
 
 #[cfg(test)]

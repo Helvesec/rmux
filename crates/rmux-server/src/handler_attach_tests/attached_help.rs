@@ -1,3 +1,4 @@
+use super::attached_help_close::{open_help_seen, recv_help_close};
 use super::*;
 use crate::handler::overlay_support::ClientOverlayState;
 
@@ -116,6 +117,10 @@ async fn attached_help_scrolls_a_short_terminal_from_first_to_last_line() {
     let last = lines.last().expect("last help line");
 
     let frame = open_help(&handler, attach_pid, &mut control_rx).await;
+    assert!(
+        frame.ends_with("\u{1b}[?25l"),
+        "static help must hide the unrelated pane cursor"
+    );
     assert!(
         frame.contains(first),
         "initial help must expose the first line"
@@ -264,9 +269,9 @@ async fn attached_help_escape_closes_without_leaking_to_the_pane() {
     let handler = RequestHandler::new();
     let attach_pid = std::process::id();
     let alpha = session_name("help-escape");
-    let mut control_rx = create_attached_session(&handler, attach_pid, &alpha).await;
+    let mut control_rx = create_quiet_attached_session(&handler, attach_pid, &alpha).await;
     drain_attach_controls(&mut control_rx);
-    let _ = open_help(&handler, attach_pid, &mut control_rx).await;
+    let opened = open_help_seen(&handler, attach_pid, &mut control_rx).await;
     let before = capture_pane_print(&handler, PaneTarget::new(alpha, 0)).await;
 
     let mut pending_input = Vec::new();
@@ -279,8 +284,15 @@ async fn attached_help_escape_closes_without_leaking_to_the_pane() {
         .await
         .expect("help Escape flush succeeds");
     assert!(pending_input.is_empty());
-    let clear = recv_overlay_frame(&mut control_rx, "help Escape close").await;
-    assert!(clear.is_empty(), "Escape must clear the help overlay");
+    let redraws = recv_help_close(
+        &handler,
+        attach_pid,
+        &mut control_rx,
+        &opened,
+        "help Escape close",
+    )
+    .await;
+    assert_eq!(redraws, 0, "nothing redrew the help before its close");
     let after = capture_pane_print(&handler, PaneTarget::new(session_name("help-escape"), 0)).await;
     assert_eq!(after, before, "Escape must not reach the underlying pane");
 }
@@ -454,8 +466,8 @@ async fn attached_help_rename_rekeys_and_switch_closes_instead_of_rerouting() {
     let beta = session_name("help-beta");
     let gamma = session_name("help-gamma");
     let mut control_rx = create_attached_session(&handler, attach_pid, &alpha).await;
-    assert!(matches!(
-        handler
+    crate::session_fixture::assert_new_session(
+        &handler
             .handle(Request::NewSession(NewSessionRequest {
                 session_name: beta.clone(),
                 detached: true,
@@ -463,8 +475,7 @@ async fn attached_help_rename_rekeys_and_switch_closes_instead_of_rerouting() {
                 environment: None,
             }))
             .await,
-        Response::NewSession(_)
-    ));
+    );
     drain_attach_controls(&mut control_rx);
 
     let _ = open_help(&handler, attach_pid, &mut control_rx).await;

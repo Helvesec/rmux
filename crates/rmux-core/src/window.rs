@@ -1,9 +1,12 @@
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use rmux_proto::{LayoutName, RmuxError, RotateWindowDirection, SplitDirection, TerminalSize};
+use rmux_proto::{LayoutName, RotateWindowDirection, TerminalSize};
 
-use crate::layout::{LayoutDirection, LayoutTree};
+use crate::layout::LayoutTree;
 use crate::{Pane, PaneGeometry, PaneId, WindowId};
+
+mod manual_size;
+pub use manual_size::ManualWindowSize;
 
 /// Runtime alert flag bitset shared by window queue state and winlink-visible state.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -77,7 +80,7 @@ pub const WINLINK_ALERTFLAGS: AlertFlags =
 /// new pane immediately after its split target while still assigning the next
 /// sequential pane index. Stable pane IDs remain independent from those
 /// window-local display indices, which may contain gaps after deletion.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, Eq)]
 pub struct Window {
     id: WindowId,
     panes: Vec<Pane>,
@@ -87,9 +90,14 @@ pub struct Window {
     layout: LayoutName,
     last_layout: Option<LayoutName>,
     layout_tree: Option<LayoutTree>,
+    floating_stack: FloatingStack,
+    resize_topology: rmux_proto::RmuxWindowResizeTopology,
+    // Slot owners captured only while the public API permits whole-pane replacement.
+    borrowed_pane_owners: Option<Vec<PaneId>>,
     custom_layout: bool,
     old_layout: Option<String>,
     size: TerminalSize,
+    manual_size: ManualWindowSize,
     name: Option<String>,
     automatic_rename: bool,
     zoomed: bool,
@@ -102,21 +110,41 @@ pub struct Window {
     requested_main_width: Option<u16>,
     // `resize-pane -y` sets an explicit main-pane height; otherwise layout derives it.
     requested_main_height: Option<u16>,
+    // `tiled-layout-max-columns` as resolved when the layout was selected, kept
+    // so later rebuilds of the same named layout use the same bound.
+    // `None` is unbounded, which is also what the option's `0` means.
+    tiled_max_columns: Option<u16>,
+    // Where the last float this window placed for itself was put, which is what
+    // an omitted `-X`/`-Y` walks forward from (`layout.c:1399-1417`). Zero is
+    // the source's own "nothing placed yet". The pair belongs to the window, so
+    // every link of it shares one cascade and another window starts its own.
+    // It is history, not layout: the source assigns it in the omitted branch
+    // before anything is placed and never puts it back, so it stays out of
+    // `WindowCheckpoint` and an opening that fails afterwards still moves the
+    // cascade on — without which a window whose next step this crate refuses
+    // would propose that same step for ever.
+    last_new_pane_x: i32,
+    last_new_pane_y: i32,
 }
 
-#[path = "window/activity.rs"]
 mod activity;
-#[path = "window/layout_cycle.rs"]
+mod checkpoint;
+mod floating;
+mod mutable_pane;
+mod new_pane;
+pub(crate) use checkpoint::WindowCheckpoint;
+pub use floating::{FloatingPanePlacement, FloatingPaneRect, FloatingPaneRequest, FloatingStack};
+pub(crate) use pane_insertion::PaneInsertionTarget;
 mod layout_cycle;
-#[path = "window/layout_ops.rs"]
 mod layout_ops;
-#[path = "window/panes.rs"]
+pub(crate) mod pane_insertion;
+mod pane_transfer;
 mod panes;
-#[path = "window/zoom.rs"]
+mod resize_topology;
+mod snapshot;
 mod zoom;
 
 pub use activity::WindowPaneActivity;
-use panes::layout_for_split;
 
 impl Window {
     /// Creates the single V1 window with its initial pane.
@@ -139,10 +167,14 @@ impl Window {
             last_pane: None,
             layout: LayoutName::MainVertical,
             last_layout: None,
-            layout_tree: Some(LayoutTree::single(size)),
+            layout_tree: Some(LayoutTree::single(size, pane_id)),
+            floating_stack: FloatingStack::default(),
+            resize_topology: rmux_proto::RmuxWindowResizeTopology::default(),
+            borrowed_pane_owners: None,
             custom_layout: false,
             old_layout: None,
             size,
+            manual_size: ManualWindowSize::new(size),
             name: None,
             automatic_rename: true,
             zoomed: false,
@@ -153,6 +185,10 @@ impl Window {
             activity_at: now,
             requested_main_width: None,
             requested_main_height: None,
+            tiled_max_columns: None,
+            // Nothing has been placed yet, which is the source's own zero.
+            last_new_pane_x: 0,
+            last_new_pane_y: 0,
         };
         window.recalculate_geometry();
         window
@@ -177,11 +213,14 @@ impl Window {
     }
 
     /// Returns a mutable pane reference for the given stable pane index.
+    ///
+    /// Replacing the value transfers its occupied layout cell to the new pane.
     #[must_use]
     pub fn pane_mut(&mut self, pane_index: u32) -> Option<&mut Pane> {
-        self.panes
-            .iter_mut()
-            .find(|pane| pane.index() == pane_index)
+        let position = self.pane_position(pane_index)?;
+        self.borrowed_pane_owners
+            .get_or_insert_with(|| self.panes.iter().map(Pane::id).collect());
+        Some(&mut self.panes[position])
     }
 
     /// Returns the active pane index owned by the window.
@@ -194,6 +233,26 @@ impl Window {
     #[must_use]
     pub const fn last_pane_index(&self) -> Option<u32> {
         self.last_pane
+    }
+
+    /// Returns the pane `last-pane` and `select-pane -l` address: the recorded
+    /// last pane, else, in a window of exactly two panes (floating panes
+    /// included, as tmux 3.7b counts them), the pane that is not active.
+    ///
+    /// Resolving the pane changes nothing, so `-d`/`-e` can toggle its input
+    /// without selecting it.
+    #[must_use]
+    pub fn last_pane_or_two_pane_fallback(&self) -> Option<u32> {
+        if let Some(last) = self.last_pane {
+            return Some(last);
+        }
+        if self.pane_count() != 2 {
+            return None;
+        }
+        self.panes
+            .iter()
+            .map(Pane::index)
+            .find(|&index| index != self.active_pane)
     }
 
     /// Returns the active pane when the window invariant is satisfied.
@@ -214,7 +273,8 @@ impl Window {
         self.layout
     }
 
-    /// Returns the content size used by the layout tree and pane PTYs.
+    /// Returns the fixed window viewport. Canonical tiled content and pane PTYs
+    /// can exceed this extent after a root-axis transfer; scenes clip separately.
     #[must_use]
     pub const fn size(&self) -> TerminalSize {
         self.size
@@ -223,9 +283,8 @@ impl Window {
     /// Returns the tmux-compatible serialized layout tree for the window.
     #[must_use]
     pub fn layout_dump(&self) -> String {
-        self.layout_tree
-            .as_ref()
-            .map_or_else(String::new, |tree| tree.dump(&self.panes))
+        self.current_layout_tree()
+            .map_or_else(String::new, |tree| tree.dump())
     }
 
     /// Saves the current serialized layout as the tmux-compatible old layout.
@@ -294,6 +353,7 @@ impl Window {
     /// Resets this window to a single pane with a fresh pane ID, preserving the window id,
     /// name, and size. Returns the new pane ID.
     pub(crate) fn respawn(&mut self, pane_id: PaneId) -> PaneId {
+        self.reconcile_borrowed_pane_owners();
         let size = self.size;
         self.panes = vec![Pane::new_with_id(
             pane_id,
@@ -305,7 +365,9 @@ impl Window {
         self.last_pane = None;
         self.layout = LayoutName::MainVertical;
         self.last_layout = None;
-        self.layout_tree = Some(LayoutTree::single(size));
+        self.layout_tree = Some(LayoutTree::single(size, pane_id));
+        self.floating_stack = FloatingStack::default();
+        self.resize_topology = rmux_proto::RmuxWindowResizeTopology::default();
         self.custom_layout = false;
         self.old_layout = None;
         self.automatic_rename = true;
@@ -315,7 +377,23 @@ impl Window {
         self.alerts_queued = false;
         self.requested_main_width = None;
         self.requested_main_height = None;
+        self.tiled_max_columns = None;
         pane_id
+    }
+
+    /// Last explicit size, retained while clients constrain the visible geometry.
+    #[must_use]
+    pub const fn manual_size(&self) -> ManualWindowSize {
+        self.manual_size
+    }
+
+    pub(crate) fn mark_manual_size_constrained(&mut self) {
+        self.manual_size.constrained = true;
+    }
+
+    pub(crate) fn set_explicit_size(&mut self, size: TerminalSize) {
+        self.manual_size.size = size;
+        self.set_size(size);
     }
 
     pub(crate) fn set_size(&mut self, size: TerminalSize) {
@@ -351,6 +429,7 @@ impl Window {
         direction: RotateWindowDirection,
         restore_zoom: bool,
     ) {
+        self.reconcile_borrowed_pane_owners();
         if self.panes.len() <= 1 {
             return;
         }
@@ -366,6 +445,7 @@ impl Window {
             .position(|pane| pane.index() == self.active_pane)
             .expect("active pane must exist in window order");
 
+        let old_ids: Vec<_> = self.panes.iter().map(Pane::id).collect();
         match direction {
             RotateWindowDirection::Down => self.panes.rotate_right(1),
             RotateWindowDirection::Up => self.panes.rotate_left(1),
@@ -374,6 +454,14 @@ impl Window {
             pane.set_index(index as u32);
         }
 
+        let replacements: Vec<_> = old_ids
+            .into_iter()
+            .zip(self.panes.iter().map(Pane::id))
+            .collect();
+        if let Some(tree) = &mut self.layout_tree {
+            tree.remap_ids(&replacements);
+        }
+        self.remap_floating_pane_ids(&replacements);
         self.apply_layout_tree();
 
         // tmux keeps the selected slot stable while pane contents rotate, then
@@ -386,201 +474,6 @@ impl Window {
 
         self.pop_zoom();
     }
-
-    pub(crate) fn insert_pane_at_position(
-        &mut self,
-        position: usize,
-        pane: Pane,
-        direction: SplitDirection,
-    ) -> Result<(), RmuxError> {
-        if position > self.panes.len() {
-            return Err(RmuxError::Server(format!(
-                "cannot insert pane at position {position} in a {}-pane window",
-                self.panes.len()
-            )));
-        }
-
-        self.ensure_accepts_pane(&pane, None)?;
-        self.auto_unzoom();
-        self.layout = layout_for_split(direction);
-        self.bump_next_pane_index(pane.index());
-        let inserted_index = pane.index();
-        self.panes.insert(position, pane);
-        if self.panes.len() == 1 {
-            self.active_pane = inserted_index;
-            self.last_pane = None;
-        }
-        if self.panes.len() == 1 {
-            self.layout_tree = Some(LayoutTree::single(self.size));
-            self.apply_layout_tree();
-            return Ok(());
-        }
-
-        let (target_leaf, insert_before_target) = if position == 0 {
-            (0, true)
-        } else {
-            (position - 1, false)
-        };
-        let inserted = self.layout_tree.as_mut().is_some_and(|tree| {
-            tree.split_leaf(
-                target_leaf,
-                LayoutDirection::from_split_direction(direction),
-                insert_before_target,
-            )
-        });
-        if !inserted {
-            self.rebuild_named_layout_tree(self.layout);
-        } else {
-            self.apply_layout_tree();
-        }
-        Ok(())
-    }
-
-    pub(crate) fn move_pane_by_splitting_target(
-        &mut self,
-        source_position: usize,
-        target_position: usize,
-        final_insert_position: usize,
-        direction: SplitDirection,
-        insert_before_target: bool,
-    ) -> Result<PaneId, RmuxError> {
-        let pane_count = self.panes.len();
-        if source_position >= pane_count {
-            return Err(RmuxError::Server(format!(
-                "cannot move missing pane at position {source_position}"
-            )));
-        }
-        if target_position >= pane_count {
-            return Err(RmuxError::Server(format!(
-                "cannot split missing target pane at position {target_position}"
-            )));
-        }
-        if final_insert_position > pane_count.saturating_sub(1) {
-            return Err(RmuxError::Server(format!(
-                "cannot insert moved pane at position {final_insert_position} in a {}-pane window",
-                pane_count.saturating_sub(1)
-            )));
-        }
-
-        self.auto_unzoom();
-        self.layout = layout_for_split(direction);
-
-        let split_insert_position = if insert_before_target {
-            target_position
-        } else {
-            target_position + 1
-        };
-        let source_leaf_after_split = if split_insert_position <= source_position {
-            source_position + 1
-        } else {
-            source_position
-        };
-        let tree = self.layout_tree.as_mut().ok_or_else(|| {
-            RmuxError::Server("cannot move pane without a layout tree".to_owned())
-        })?;
-        if !tree.split_leaf(
-            target_position,
-            LayoutDirection::from_split_direction(direction),
-            insert_before_target,
-        ) {
-            return Err(RmuxError::Server(format!(
-                "cannot split target pane at position {target_position}"
-            )));
-        }
-        if !tree.remove_leaf(source_leaf_after_split) {
-            return Err(RmuxError::Server(format!(
-                "cannot remove source pane leaf at position {source_leaf_after_split}"
-            )));
-        }
-
-        let moved_pane = self.panes.remove(source_position);
-        let moved_pane_id = moved_pane.id();
-        self.panes.insert(final_insert_position, moved_pane);
-        self.apply_layout_tree();
-        Ok(moved_pane_id)
-    }
-
-    pub(crate) fn insert_pane_full_size(
-        &mut self,
-        pane: Pane,
-        direction: SplitDirection,
-        insert_before_target: bool,
-    ) -> Result<(), RmuxError> {
-        self.ensure_accepts_pane(&pane, None)?;
-        self.auto_unzoom();
-        self.layout = layout_for_split(direction);
-        self.bump_next_pane_index(pane.index());
-
-        if insert_before_target {
-            self.panes.insert(0, pane);
-        } else {
-            self.panes.push(pane);
-        }
-
-        let split = self.layout_tree.as_mut().is_some_and(|tree| {
-            tree.split_root(
-                LayoutDirection::from_split_direction(direction),
-                insert_before_target,
-            )
-        });
-        if !split {
-            self.rebuild_named_layout_tree(self.layout);
-        } else {
-            self.apply_layout_tree();
-        }
-        Ok(())
-    }
-
-    pub(crate) fn replace_pane_for_swap(
-        &mut self,
-        pane_index: u32,
-        pane: Pane,
-    ) -> Result<(), RmuxError> {
-        let position = self.pane_position(pane_index).ok_or_else(|| {
-            RmuxError::Server(format!(
-                "cannot replace missing pane index {pane_index} in window {}",
-                self.id
-            ))
-        })?;
-        for (existing_position, existing) in self.panes.iter().enumerate() {
-            if existing_position != position && existing.id() == pane.id() {
-                return Err(RmuxError::Server(format!(
-                    "pane id {} already exists in window {}",
-                    pane.id().as_u32(),
-                    self.id
-                )));
-            }
-        }
-        self.bump_next_pane_index(pane.index());
-        self.panes[position] = pane;
-        self.apply_layout_tree();
-        Ok(())
-    }
-
-    pub(crate) fn swap_panes(&mut self, source_pane_index: u32, target_pane_index: u32) -> bool {
-        let Some(source_position) = self.pane_position(source_pane_index) else {
-            return false;
-        };
-        let Some(target_position) = self.pane_position(target_pane_index) else {
-            return false;
-        };
-        if source_position == target_position {
-            return true;
-        }
-
-        self.auto_unzoom();
-        let active_pane_id = self
-            .active_pane()
-            .expect("active pane must exist before pane swap")
-            .id();
-        let last_pane_id = self
-            .last_pane
-            .and_then(|pane_index| self.pane(pane_index).map(Pane::id));
-        self.panes.swap(source_position, target_position);
-        self.apply_layout_tree();
-        self.renumber_panes_by_position(active_pane_id, last_pane_id);
-        true
-    }
 }
 
 fn current_unix_timestamp() -> i64 {
@@ -592,5 +485,31 @@ fn current_unix_timestamp() -> i64 {
 }
 
 #[cfg(test)]
+#[path = "window/tcol_tests.rs"]
+mod tcol_tests;
+
+#[cfg(test)]
 #[path = "window/tests.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "window/identity_tests.rs"]
+mod identity_tests;
+
+#[cfg(test)]
+#[path = "window/mutable_pane_tests.rs"]
+mod mutable_pane_tests;
+
+#[cfg(test)]
+#[path = "window/floating_tests.rs"]
+mod floating_tests;
+
+#[cfg(test)]
+mod floating_resize_tests;
+
+#[cfg(test)]
+#[path = "window/floating_selection_tests.rs"]
+mod floating_selection_tests;
+#[cfg(test)]
+#[path = "window/snapshot_tests.rs"]
+mod snapshot_tests;

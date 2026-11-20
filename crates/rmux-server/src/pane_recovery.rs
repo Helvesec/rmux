@@ -1,13 +1,19 @@
-use std::collections::VecDeque;
-use std::ops::Range;
-
-use rmux_core::input::{mode, OscColourSlot};
-use rmux_core::{
-    render_dec_modes_for_snapshot, GridRenderOptions, RecoveryRow, RecoveryRowRenderer, Screen,
-};
+use rmux_core::input::OscColourSlot;
+use rmux_core::{render_dec_modes_for_snapshot, GridRenderOptions, RecoveryRowRenderer, Screen};
 use rmux_proto::{RmuxError, DEFAULT_MAX_DETACHED_FRAME_LENGTH, DEFAULT_MAX_FRAME_LENGTH};
 
 use crate::pane_transcript::PaneTranscript;
+
+mod paint;
+mod row_capture;
+mod rows;
+use paint::{
+    append_active_cursor_state, append_cursor_state, append_osc_text, append_rows,
+    append_rows_deque, append_saved_decsc, append_scroll_region, append_tab_stops,
+    append_title_state, encoded_rows_len, encoded_rows_len_deque,
+};
+use row_capture::{recent_history_suffix, render_active_rows, render_saved_rows};
+use rows::{link_row_pair, link_rows};
 
 // Rows are painted back to back and rely on the terminal's own wrap to place a
 // soft-wrapped row's successor, so the paint enables DECAWM before the first
@@ -119,70 +125,6 @@ pub(crate) struct PaneRecoveryKeyframe {
     pub(crate) metadata_complete: bool,
 }
 
-/// One row of the keyframe, with the columns its bytes paint on replay.
-#[derive(Debug)]
-struct RenderedRow {
-    bytes: Vec<u8>,
-    wrapped: bool,
-    columns: u32,
-    leading_columns: u32,
-    trailing_reflow_gap: u32,
-}
-
-impl RenderedRow {
-    fn new(row: RecoveryRow) -> Self {
-        Self {
-            bytes: row.bytes,
-            wrapped: row.wrapped,
-            columns: row.span.columns(),
-            leading_columns: row.span.leading_columns(),
-            trailing_reflow_gap: row.trailing_reflow_gap,
-        }
-    }
-
-    /// Returns whether the replaying terminal moves `next`'s first cell onto
-    /// the following line on its own, reproducing this row exactly.
-    ///
-    /// That happens when the cell no longer fits in the columns this row
-    /// leaves free, and those free columns are precisely the gap a wide glyph
-    /// left behind when it pre-wrapped. Any other shortfall holds blanks that
-    /// belong to this row, and the terminal would paint over them.
-    fn wraps_into(&self, next: &Self, cols: u32) -> bool {
-        self.columns.saturating_add(next.leading_columns) > cols
-            && self.columns.saturating_add(self.trailing_reflow_gap) >= cols
-    }
-
-    /// Fills the row with blanks up to the terminal width.
-    ///
-    /// A soft-wrapped row that paints fewer columns than the terminal has
-    /// leaves the cursor inside the row, so the next row's cells would be
-    /// painted onto it. Only cells past the row's last used cell are missing,
-    /// and those are always default blanks, so plain spaces reproduce them.
-    fn fill_to_width(&mut self, cols: u32) {
-        let missing = cols.saturating_sub(self.columns);
-        if missing == 0 {
-            return;
-        }
-        self.bytes.extend_from_slice(RESET_RENDITION);
-        self.bytes
-            .extend(std::iter::repeat_n(b' ', missing as usize));
-        if self.columns == 0 {
-            self.leading_columns = 1;
-        }
-        self.columns = cols;
-    }
-
-    /// Returns the most bytes [`fill_to_width`](Self::fill_to_width) can add to
-    /// this row while it is being linked to its neighbours.
-    fn reserved_fill_len(&self, cols: u32) -> usize {
-        let missing = cols.saturating_sub(self.columns);
-        if missing == 0 || !(self.wrapped || self.leading_columns == 0) {
-            return 0;
-        }
-        RESET_RENDITION.len().saturating_add(missing as usize)
-    }
-}
-
 /// How much scrolled-off scrollback a recovery keyframe is allowed to replay.
 ///
 /// The keyframe always carries the pane's *visible* state (main viewport, plus
@@ -199,6 +141,7 @@ pub(crate) enum RecoveryHistoryPolicy {
     /// scrollback protocol at all (`PaneScroll` closes the socket with
     /// `scroll_requires_session`), so rows that left the pane before the share
     /// existed must never reach a viewer's browser.
+    #[cfg(any(feature = "web", test))]
     VisibleOnly,
 }
 
@@ -206,6 +149,7 @@ impl RecoveryHistoryPolicy {
     fn history_budget(self, keyframe_headroom: usize) -> usize {
         match self {
             Self::RecentHistory => keyframe_headroom,
+            #[cfg(any(feature = "web", test))]
             Self::VisibleOnly => 0,
         }
     }
@@ -258,6 +202,7 @@ impl PaneRecoveryDraft {
     ///
     /// This is the WebShare pane-surface entry point: it must stay the only
     /// materializer reachable from a shared link.
+    #[cfg(any(feature = "web", test))]
     pub(crate) fn materialize_visible_only(self) -> Result<PaneRecoverySeed, RmuxError> {
         self.materialize_with_history(RecoveryHistoryPolicy::VisibleOnly)
     }
@@ -350,6 +295,7 @@ impl PaneRecoverySeed {
         self.projection.history_bytes()
     }
 
+    #[cfg(feature = "web")]
     pub(crate) const fn alternate(&self) -> bool {
         self.projection.alternate()
     }
@@ -361,7 +307,7 @@ impl PaneRecoverySeed {
 
 impl PaneProjectionSeed {
     pub(crate) fn capture(transcript: &PaneTranscript) -> Result<Self, RmuxError> {
-        let source = transcript.screen();
+        let source = transcript.presentation_screen();
         validate_surface_geometry(source)?;
         let alternate = source.is_alternate();
         let (screen, metadata_complete) = source.clone_recovery_viewport_bounded(
@@ -474,7 +420,7 @@ fn materialize_keyframe(
 
     let mut suffix = Vec::new();
     append_scroll_region(&mut suffix, source);
-    render_dec_modes_for_snapshot(source.mode(), source.cursor_style(), &mut suffix);
+    render_dec_modes_for_snapshot(source.mode(), source.resolved_cursor_style(), &mut suffix);
     append_tab_stops(&mut suffix, source);
     append_saved_decsc(&mut suffix, source, saved_cursor, saved_cell_state);
     append_active_cursor_state(&mut suffix, source, &active_visible, active_cell_state);
@@ -580,392 +526,12 @@ fn validate_surface_geometry(screen: &Screen) -> Result<(), RmuxError> {
     Ok(())
 }
 
-fn render_active_rows(
-    renderer: &RecoveryRowRenderer<'_>,
-    range: Range<usize>,
-    cols: u32,
-) -> Result<Vec<RenderedRow>, RmuxError> {
-    render_rows(range, cols, |row| {
-        renderer.active_row(row, capture_options())
-    })
-}
-
-fn render_saved_rows(
-    renderer: &RecoveryRowRenderer<'_>,
-    range: Range<usize>,
-    cols: u32,
-) -> Result<Vec<RenderedRow>, RmuxError> {
-    render_rows(range, cols, |row| {
-        renderer.saved_row(row, capture_options())
-    })
-}
-
-/// Places every row of a repainted run at its own terminal line.
-///
-/// Rows are painted back to back, so the replaying terminal decides where a
-/// row ends up: a soft-wrapped row hands the next row's first cell to the next
-/// line only when that cell no longer fits in the columns the row leaves free.
-/// [`link_row_pair`] restores that condition wherever the grid no longer
-/// satisfies it, which happens whenever a wrapped row was shortened after it
-/// wrapped (DCH, or a wide glyph that pre-wrapped and left a gap).
-fn link_rows(rows: &mut [RenderedRow], cols: u32) {
-    for index in 1..rows.len() {
-        let (head, tail) = rows.split_at_mut(index);
-        let _ = link_row_pair(head.last_mut(), tail.first_mut(), cols);
-    }
-}
-
-/// Links one repainted row to its successor and returns the bytes that must
-/// separate them.
-///
-/// A row that is not soft-wrapped is separated by CRLF. A soft-wrapped row is
-/// separated by nothing at all: the terminal's own wrap moves to the next line
-/// and marks the row wrapped, which is the only way a replay can reproduce the
-/// flag. That wrap needs a cell to land on, and it must not fit on the wrapped
-/// row, so both rows are filled to the full width when necessary.
-fn link_row_pair(
-    previous: Option<&mut RenderedRow>,
-    next: Option<&mut RenderedRow>,
-    cols: u32,
-) -> &'static [u8] {
-    let (Some(previous), Some(next)) = (previous, next) else {
-        return b"";
-    };
-    if !previous.wrapped {
-        return LINE_BREAK;
-    }
-    if next.leading_columns == 0 {
-        // A row that paints nothing cannot resolve a pending wrap, so the
-        // following rows would climb one line each. Filling it keeps the wrap
-        // and repaints the same blank cells.
-        next.fill_to_width(cols);
-    }
-    if !previous.wraps_into(next, cols) {
-        previous.fill_to_width(cols);
-    }
-    b""
-}
-
-fn render_rows(
-    range: Range<usize>,
-    cols: u32,
-    mut render: impl FnMut(usize) -> Option<RecoveryRow>,
-) -> Result<Vec<RenderedRow>, RmuxError> {
-    let mut rows = Vec::with_capacity(range.len());
-    let mut encoded_len = 0_usize;
-    for row in range {
-        let Some(rendered) = render(row) else {
-            return Err(RmuxError::Server(format!(
-                "terminal row {row} disappeared during recovery capture"
-            )));
-        };
-        let rendered = RenderedRow::new(rendered);
-        encoded_len = encoded_len
-            .saturating_add(LINE_BREAK.len())
-            .saturating_add(ROW_RESET.len())
-            .saturating_add(rendered.bytes.len())
-            .saturating_add(rendered.reserved_fill_len(cols));
-        if encoded_len > MAX_RECOVERY_KEYFRAME_BYTES {
-            return Err(RmuxError::FrameTooLarge {
-                length: encoded_len,
-                maximum: MAX_RECOVERY_KEYFRAME_BYTES,
-            });
-        }
-        rows.push(rendered);
-    }
-    Ok(rows)
-}
-
-fn recent_history_suffix(
-    renderer: &RecoveryRowRenderer<'_>,
-    history_rows: usize,
-    budget: usize,
-    cols: u32,
-) -> Result<VecDeque<RenderedRow>, RmuxError> {
-    let mut retained: VecDeque<RenderedRow> = VecDeque::new();
-    let mut retained_len = 0_usize;
-    let mut end = history_rows;
-    while end > 0 {
-        let remaining = budget.saturating_sub(retained_len);
-        let max_group_rows = remaining / ROW_RESET.len();
-        if max_group_rows == 0 {
-            break;
-        }
-        let mut start = end - 1;
-        let mut group_rows = 1_usize;
-        while start > 0 {
-            let Some(previous_wrapped) = renderer.recovery_history_row_wrapped(start - 1) else {
-                return Err(RmuxError::Server(
-                    "terminal history changed during recovery capture".to_owned(),
-                ));
-            };
-            if !previous_wrapped {
-                break;
-            }
-            if group_rows == max_group_rows {
-                // Every rendered row needs at least ROW_RESET. Once a single
-                // logical line has more rows than can fit, no complete suffix
-                // beginning with that newest line is representable.
-                return Ok(retained);
-            }
-            start -= 1;
-            group_rows += 1;
-        }
-        let Some((mut group, group_len)) =
-            render_history_group_bounded(renderer, start..end, remaining, cols)?
-        else {
-            break;
-        };
-        link_rows(&mut group, cols);
-        let _ = link_row_pair(group.last_mut(), retained.front_mut(), cols);
-        for row in group.into_iter().rev() {
-            retained.push_front(row);
-        }
-        retained_len = retained_len.saturating_add(group_len);
-        end = start;
-    }
-    Ok(retained)
-}
-
-fn render_history_group_bounded(
-    renderer: &RecoveryRowRenderer<'_>,
-    range: Range<usize>,
-    budget: usize,
-    cols: u32,
-) -> Result<Option<(Vec<RenderedRow>, usize)>, RmuxError> {
-    let mut group = Vec::new();
-    let mut encoded_len = 0_usize;
-    for absolute_y in range {
-        let Some(rendered) = renderer.recovery_history_row(absolute_y, capture_options()) else {
-            return Err(RmuxError::Server(
-                "terminal history changed during recovery capture".to_owned(),
-            ));
-        };
-        let rendered = RenderedRow::new(rendered);
-        let next_len = encoded_len
-            .saturating_add(LINE_BREAK.len())
-            .saturating_add(ROW_RESET.len())
-            .saturating_add(rendered.bytes.len())
-            .saturating_add(rendered.reserved_fill_len(cols));
-        if next_len > budget {
-            return Ok(None);
-        }
-        encoded_len = next_len;
-        group.push(rendered);
-    }
-    encoded_len = encoded_len.saturating_add(LINE_BREAK.len());
-    if encoded_len > budget {
-        return Ok(None);
-    }
-    Ok(Some((group, encoded_len)))
-}
-
 fn adjust_history_total(total: usize, captured: usize, recovered: usize) -> usize {
     if recovered >= captured {
         total.saturating_add(recovered - captured)
     } else {
         total.saturating_sub(captured - recovered)
     }
-}
-
-fn append_title_state(out: &mut Vec<u8>, screen: &Screen) -> bool {
-    let mut complete = true;
-    for _ in 0..Screen::title_stack_limit() {
-        out.extend_from_slice(b"\x1b[23;2t");
-    }
-    for title in screen.title_stack() {
-        complete &= append_osc_text(out, 2, title);
-        out.extend_from_slice(b"\x1b[22;2t");
-    }
-    complete &= append_osc_text(out, 2, screen.title());
-    complete
-}
-
-/// Appends a safely replayable OSC value and reports whether it was lossless.
-///
-/// Unicode control characters are omitted instead of being embedded in the
-/// recovery envelope, so callers must include the result in metadata coverage.
-fn append_osc_text(out: &mut Vec<u8>, command: u8, value: &str) -> bool {
-    let mut complete = true;
-    out.extend_from_slice(b"\x1b]");
-    out.extend_from_slice(command.to_string().as_bytes());
-    out.push(b';');
-    for character in value.chars() {
-        if character.is_control() {
-            complete = false;
-            continue;
-        }
-        let mut encoded = [0_u8; 4];
-        out.extend_from_slice(character.encode_utf8(&mut encoded).as_bytes());
-    }
-    out.extend_from_slice(b"\x1b\\");
-    complete
-}
-
-fn append_scroll_region(out: &mut Vec<u8>, screen: &Screen) {
-    let (top, bottom) = screen.scroll_region();
-    let default_bottom = u32::from(screen.size().rows.max(1)).saturating_sub(1);
-    if top != 0 || bottom != default_bottom {
-        out.extend_from_slice(
-            format!(
-                "\x1b[{};{}r",
-                top.saturating_add(1),
-                bottom.saturating_add(1)
-            )
-            .as_bytes(),
-        );
-    }
-}
-
-fn append_tab_stops(out: &mut Vec<u8>, screen: &Screen) {
-    out.extend_from_slice(b"\x1b[3g");
-    for (column, enabled) in screen.tab_stops().iter().copied().enumerate() {
-        if enabled {
-            append_cup(out, column.saturating_add(1) as u32, 1);
-            out.extend_from_slice(b"\x1bH");
-        }
-    }
-}
-
-fn append_saved_decsc(
-    out: &mut Vec<u8>,
-    screen: &Screen,
-    saved_cursor: (u32, u32, bool),
-    saved_cell_state: &[u8],
-) {
-    let (x, y, origin) = saved_cursor;
-    out.extend_from_slice(b"\x1b[?6l");
-    out.extend_from_slice(RESET_RENDITION);
-    out.extend_from_slice(saved_cell_state);
-    if origin {
-        out.extend_from_slice(b"\x1b[?6h");
-        let row = y.saturating_sub(screen.scroll_region().0).saturating_add(1);
-        append_cup(out, x.saturating_add(1), row);
-    } else {
-        append_cup(out, x.saturating_add(1), y.saturating_add(1));
-    }
-    out.extend_from_slice(b"\x1b7");
-    out.extend_from_slice(b"\x1b[?6l");
-}
-
-fn append_active_cursor_state(
-    out: &mut Vec<u8>,
-    screen: &Screen,
-    rows: &[RenderedRow],
-    active_cell_state: &[u8],
-) {
-    let (x, y) = screen.cursor_position();
-    if screen.mode() & mode::MODE_ORIGIN != 0 {
-        out.extend_from_slice(b"\x1b[?6h");
-    } else {
-        out.extend_from_slice(b"\x1b[?6l");
-    }
-    out.extend_from_slice(RESET_RENDITION);
-    append_cursor_state(
-        out,
-        screen,
-        x,
-        y,
-        screen.pending_wrap(),
-        Some(rows),
-        (screen.mode() & mode::MODE_ORIGIN != 0).then(|| screen.scroll_region().0),
-    );
-    out.extend_from_slice(RESET_RENDITION);
-    out.extend_from_slice(active_cell_state);
-    out.extend_from_slice(if screen.mode() & mode::MODE_CURSOR != 0 {
-        b"\x1b[?25h"
-    } else {
-        b"\x1b[?25l"
-    });
-}
-
-fn append_cursor_state(
-    out: &mut Vec<u8>,
-    screen: &Screen,
-    x: u32,
-    y: u32,
-    pending_wrap: bool,
-    lines: Option<&[RenderedRow]>,
-    origin_top: Option<u32>,
-) {
-    let cursor_row = y.saturating_sub(origin_top.unwrap_or(0)).saturating_add(1);
-    if pending_wrap {
-        if let Some(line) = lines.and_then(|lines| lines.get(y as usize)) {
-            append_cup(out, 1, cursor_row);
-            out.extend_from_slice(RESET_RENDITION);
-            out.extend_from_slice(&line.bytes);
-            return;
-        }
-    }
-    let size = screen.size();
-    append_cup(
-        out,
-        x.min(u32::from(size.cols.saturating_sub(1)))
-            .saturating_add(1),
-        cursor_row,
-    );
-}
-
-fn append_cup(out: &mut Vec<u8>, col: u32, row: u32) {
-    out.extend_from_slice(format!("\x1b[{row};{col}H").as_bytes());
-}
-
-/// Separator emitted between two rows that the terminal will not wrap itself.
-///
-/// Rows are linked by [`link_rows`] before they are appended, so a wrapped row
-/// is always followed by a row the terminal wraps onto: only an unwrapped row
-/// needs this separator.
-fn row_separator(previous: Option<&RenderedRow>) -> &'static [u8] {
-    match previous {
-        Some(previous) if previous.wrapped => b"",
-        Some(_) => LINE_BREAK,
-        None => b"",
-    }
-}
-
-fn append_rows(out: &mut Vec<u8>, rows: &[RenderedRow]) {
-    for (index, row) in rows.iter().enumerate() {
-        out.extend_from_slice(row_separator(
-            index.checked_sub(1).map(|previous| &rows[previous]),
-        ));
-        out.extend_from_slice(ROW_RESET);
-        out.extend_from_slice(&row.bytes);
-    }
-}
-
-fn append_rows_deque(out: &mut Vec<u8>, rows: &VecDeque<RenderedRow>) {
-    let mut previous = None;
-    for row in rows {
-        out.extend_from_slice(row_separator(previous));
-        out.extend_from_slice(ROW_RESET);
-        out.extend_from_slice(&row.bytes);
-        previous = Some(row);
-    }
-}
-
-fn encoded_rows_len(rows: &[RenderedRow]) -> usize {
-    rows.iter()
-        .enumerate()
-        .fold(0_usize, |length, (index, row)| {
-            length
-                .saturating_add(
-                    row_separator(index.checked_sub(1).map(|previous| &rows[previous])).len(),
-                )
-                .saturating_add(ROW_RESET.len())
-                .saturating_add(row.bytes.len())
-        })
-}
-
-fn encoded_rows_len_deque(rows: &VecDeque<RenderedRow>) -> usize {
-    let mut previous = None;
-    rows.iter().fold(0_usize, |length, row| {
-        let separator = row_separator(previous).len();
-        previous = Some(row);
-        length
-            .saturating_add(separator)
-            .saturating_add(ROW_RESET.len())
-            .saturating_add(row.bytes.len())
-    })
 }
 
 fn capture_options() -> GridRenderOptions {
@@ -978,15 +544,97 @@ fn capture_options() -> GridRenderOptions {
 }
 
 #[cfg(test)]
+#[path = "pane_recovery/extent_tests.rs"]
+mod extent_tests;
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use crate::pane_transcript::PaneTranscript;
+    use rmux_core::input::mode;
     use rmux_core::{ScreenCaptureRange, TerminalScreen};
     use rmux_proto::TerminalSize;
     use std::io::Write;
     use std::process::{Command, Stdio};
 
     const SIZE: TerminalSize = TerminalSize { cols: 16, rows: 6 };
+
+    fn capture_contains(screen: &Screen, needle: &[u8]) -> bool {
+        screen
+            .capture_transcript(ScreenCaptureRange::default(), GridRenderOptions::default())
+            .windows(needle.len())
+            .any(|window| window == needle)
+    }
+
+    #[test]
+    fn surface_projection_withholds_synchronized_output_without_rewriting_raw_recovery() {
+        let mut transcript = PaneTranscript::new(100, TerminalSize { cols: 32, rows: 4 });
+        transcript.append_bytes(b"\x1b[2J\x1b[HSTABLE_BEFORE_SYNC");
+        transcript.append_bytes(b"\x1b[?2026h\x1b[2J\x1b[HPAUSED_PARTIAL_ONLY");
+
+        let surface = PaneProjectionSeed::capture(&transcript).expect("capture Surface state");
+        assert!(capture_contains(surface.screen(), b"STABLE_BEFORE_SYNC"));
+        assert!(!capture_contains(surface.screen(), b"PAUSED_PARTIAL_ONLY"));
+
+        let raw = PaneRecoveryDraft::capture(&transcript).expect("capture Raw recovery state");
+        assert!(capture_contains(&raw.projection, b"PAUSED_PARTIAL_ONLY"));
+
+        transcript.append_bytes(b"\x1b[2J\x1b[HPAUSED_FINAL\x1b[?2026l");
+        let released = PaneProjectionSeed::capture(&transcript).expect("capture released Surface");
+        assert!(capture_contains(released.screen(), b"PAUSED_FINAL"));
+    }
+
+    #[test]
+    fn recovery_keyframe_uses_effective_cursor_style() {
+        let mut transcript = PaneTranscript::new(100, SIZE);
+        transcript.append_bytes(b"\x1b[6 q\x1b[?12h");
+
+        let keyframe = PaneRecoverySeed::capture(&transcript)
+            .expect("capture recovery state")
+            .keyframe();
+        assert!(
+            keyframe
+                .bytes
+                .windows(b"\x1b[5 q".len())
+                .any(|bytes| bytes == b"\x1b[5 q"),
+            "recovery must serialize the resolved blinking bar: {:?}",
+            keyframe.bytes
+        );
+        assert!(!keyframe
+            .bytes
+            .windows(b"\x1b[6 q".len())
+            .any(|bytes| bytes == b"\x1b[6 q"));
+    }
+
+    #[test]
+    fn recovery_keyframe_resolves_configured_cursor_default() {
+        let mut transcript = PaneTranscript::new(100, SIZE);
+        transcript.set_cursor_default_style(6);
+        transcript.append_bytes(b"\x1b[?12h");
+
+        assert_eq!(transcript.screen().cursor_style(), 0);
+        let keyframe = PaneRecoverySeed::capture(&transcript)
+            .expect("capture recovery state")
+            .keyframe();
+        assert!(keyframe
+            .bytes
+            .windows(b"\x1b[5 q".len())
+            .any(|bytes| bytes == b"\x1b[5 q"));
+    }
+
+    #[test]
+    fn recovery_keyframe_reasserts_blink_for_terminal_default_shape() {
+        let mut transcript = PaneTranscript::new(100, SIZE);
+        transcript.append_bytes(b"\x1b[0 q\x1b[?12h");
+
+        let keyframe = PaneRecoverySeed::capture(&transcript)
+            .expect("capture recovery state")
+            .keyframe();
+        assert!(keyframe
+            .bytes
+            .windows(b"\x1b[0 q\x1b[?12h".len())
+            .any(|bytes| bytes == b"\x1b[0 q\x1b[?12h"));
+    }
 
     fn snapshot_ansi_lines(screen: &Screen) -> Vec<Vec<u8>> {
         screen

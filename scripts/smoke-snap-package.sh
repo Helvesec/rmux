@@ -51,6 +51,11 @@ trap cleanup EXIT
 
 sudo snap install --dangerous --classic "$snap_path"
 
+case "$version" in
+  1.0.*) python3 "$script_dir/release/sdk_distribution_policy.py" \
+    --root /snap/rmux/current --layout snap --version "$version" ;;
+esac
+
 test -f /snap/rmux/current/share/man/man1/rmux.1 ||
   die "snap package did not install rmux.1 manpage"
 test -f /snap/rmux/current/share/bash-completion/completions/rmux ||

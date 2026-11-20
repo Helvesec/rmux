@@ -2,7 +2,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use rmux_proto::{PaneTarget, SessionName};
 
-pub use rmux_proto::PaneId;
+pub use crate::identity::PaneId;
 
 /// A pane rectangle within terminal coordinates.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

@@ -64,7 +64,7 @@ async fn create_quiet_session(handler: &RequestHandler, name: &str) -> SessionNa
             skip_environment_update: false,
         })))
         .await;
-    assert!(matches!(response, Response::NewSession(_)), "{response:?}");
+    crate::session_fixture::assert_new_session(&response);
     handler
         .wait_for_pane_startup_to_finish_for_test(&PaneTarget::new(session.clone(), 0))
         .await;
@@ -98,7 +98,7 @@ async fn create_grouped_quiet_session(
             skip_environment_update: false,
         })))
         .await;
-    assert!(matches!(response, Response::NewSession(_)), "{response:?}");
+    crate::session_fixture::assert_new_session(&response);
     session
 }
 
@@ -329,7 +329,7 @@ async fn queued_pane_hook_does_not_block_an_unrelated_pane_alert() {
         .take_lifecycle_dispatch_receiver()
         .expect("test owns the lifecycle dispatch receiver");
 
-    handler.pane_alert_callback()(PaneAlertEvent {
+    handler.pane_alert_callback().alert(PaneAlertEvent {
         session_name: hooked_session,
         pane_id: hooked_pane_id,
         bell_count: 0,
@@ -353,7 +353,7 @@ async fn queued_pane_hook_does_not_block_an_unrelated_pane_alert() {
     // Leave the hook dispatch receiver undrained. Normal pane-alert delivery
     // queues lifecycle work but does not wait for the hook command to run, so
     // a slow hook cannot retain the pane-alert serialization lock.
-    handler.pane_alert_callback()(PaneAlertEvent {
+    handler.pane_alert_callback().alert(PaneAlertEvent {
         session_name: live_session.clone(),
         pane_id: live_pane_id,
         bell_count: 1,
@@ -420,7 +420,7 @@ async fn exiting_pane_hook_wait_does_not_block_unrelated_pane_alert_flush() {
         .take_lifecycle_dispatch_receiver()
         .expect("test owns the lifecycle dispatch receiver");
 
-    handler.pane_alert_callback()(PaneAlertEvent {
+    handler.pane_alert_callback().alert(PaneAlertEvent {
         session_name: exiting_session,
         pane_id: exiting_pane_id,
         bell_count: 0,
@@ -452,7 +452,7 @@ async fn exiting_pane_hook_wait_does_not_block_unrelated_pane_alert_flush() {
         "exit flush waits for its ordered lifecycle hook"
     );
 
-    handler.pane_alert_callback()(PaneAlertEvent {
+    handler.pane_alert_callback().alert(PaneAlertEvent {
         session_name: live_session.clone(),
         pane_id: live_pane_id,
         bell_count: 1,
@@ -553,7 +553,7 @@ async fn pane_alert_reserves_each_lifecycle_position_immediately_before_emission
             .await;
     });
 
-    handler.pane_alert_callback()(PaneAlertEvent {
+    handler.pane_alert_callback().alert(PaneAlertEvent {
         session_name: session,
         pane_id,
         bell_count: 0,
@@ -713,7 +713,7 @@ async fn exiting_pane_activity_cannot_rearm_silence_after_newer_same_window_acti
         .take_lifecycle_dispatch_receiver()
         .expect("test owns the lifecycle dispatch receiver");
 
-    handler.pane_alert_callback()(PaneAlertEvent {
+    handler.pane_alert_callback().alert(PaneAlertEvent {
         session_name: session.clone(),
         pane_id: exiting_pane_id,
         bell_count: 0,
@@ -750,7 +750,7 @@ async fn exiting_pane_activity_cannot_rearm_silence_after_newer_same_window_acti
         "the exiting activity resets silence exactly once before its hook wait"
     );
 
-    handler.pane_alert_callback()(PaneAlertEvent {
+    handler.pane_alert_callback().alert(PaneAlertEvent {
         session_name: session,
         pane_id: live_pane_id,
         bell_count: 0,
@@ -951,7 +951,7 @@ async fn pane_alert_survives_an_earlier_alias_added_between_prepare_and_apply() 
     }
     let mut lifecycle = handler.subscribe_lifecycle_events();
     handler
-        .apply_prepared_pane_alert_events(vec![prepared])
+        .apply_prepared_pane_alert_events(vec![prepared], Default::default())
         .await;
 
     let expected_targets = [owner_target, alias_target]

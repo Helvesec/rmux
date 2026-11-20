@@ -5,6 +5,7 @@ use rmux_core::{PaneId, WindowId};
 use rmux_proto::{HookName, ScopeSelector, SessionId, Target};
 
 use crate::pane_terminals::WindowLinkOccurrenceId;
+use crate::pane_transcript::with_unavailable_pane_unanswered;
 
 tokio::task_local! {
     static HOOK_EXECUTION: HookExecutionContext;
@@ -55,7 +56,21 @@ pub(crate) enum HookExecutionKind {
     ///
     /// Commands run by lifecycle hooks use tmux's no-hooks state, so they must
     /// not enqueue another lifecycle generation.
-    Lifecycle,
+    Lifecycle(NotificationState),
+}
+
+/// Whether a lifecycle hook still holds its notification's state.
+///
+/// tmux 3.7b `notify_insert_hook()` gives a hook the state captured when the
+/// notification fired (`ne->fs`) while `cmd_find_valid_state()` accepts it,
+/// and starts from `cmd_find_from_nothing()` when it is empty or invalid.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum NotificationState {
+    /// The notification's session, window and pane are all still live.
+    Valid,
+    /// The notification had no state, or its objects are gone; any target
+    /// the hook carries is an rmux substitute, not a tmux state.
+    Invalid,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -72,10 +87,20 @@ impl HookExecutionContext {
         }
     }
 
+    /// A lifecycle hook whose notification state is unknown, which tmux
+    /// treats as no state.
+    #[cfg(test)]
     pub(crate) const fn lifecycle(hook: HookName) -> Self {
+        Self::lifecycle_with_notification_state(hook, NotificationState::Invalid)
+    }
+
+    pub(crate) const fn lifecycle_with_notification_state(
+        hook: HookName,
+        state: NotificationState,
+    ) -> Self {
         Self {
             hook,
-            kind: HookExecutionKind::Lifecycle,
+            kind: HookExecutionKind::Lifecycle(state),
         }
     }
 
@@ -97,6 +122,18 @@ pub(crate) fn lifecycle_hooks_disabled() -> bool {
     // bound the chain after that first generation, including same-hook events.
     HOOK_EXECUTION
         .try_with(|execution| !execution.allows_lifecycle_hook())
+        .unwrap_or(false)
+}
+
+/// Whether this task runs a lifecycle hook without its notification's state.
+/// tmux then starts from `cmd_find_from_nothing()`, so the target rmux
+/// substitutes for a removed object (a vanished pane, an unlinked window) is
+/// not a state the hook inherits.
+pub(crate) fn lifecycle_hook_lacks_notification_state() -> bool {
+    HOOK_EXECUTION
+        .try_with(|execution| {
+            execution.kind == HookExecutionKind::Lifecycle(NotificationState::Invalid)
+        })
         .unwrap_or(false)
 }
 
@@ -142,6 +179,8 @@ where
         .await
 }
 
+/// A hook runs after its request answered, or for no request at all, so a
+/// format it renders observes a poisoned pane rather than failing the request.
 pub(crate) async fn with_hook_execution<T, F>(
     execution: HookExecutionContext,
     formats: Vec<(String, String)>,
@@ -152,7 +191,9 @@ where
 {
     HOOK_EXECUTION
         .scope(execution, async move {
-            HOOK_FORMATS.scope(formats, future).await
+            HOOK_FORMATS
+                .scope(formats, with_unavailable_pane_unanswered(future))
+                .await
         })
         .await
 }

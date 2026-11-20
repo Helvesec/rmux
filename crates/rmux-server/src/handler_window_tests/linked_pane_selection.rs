@@ -65,7 +65,7 @@ async fn linked_two_pane_fixture(handler: &RequestHandler, label: &str) -> Linke
         ] {
             state
                 .sessions
-                .session_mut(target.session_name())
+                .session_setup(target.session_name())
                 .expect("fixture session exists")
                 .select_pane_in_window(target.window_index(), 0)
                 .expect("fixture pane zero selection succeeds");
@@ -196,6 +196,102 @@ async fn select_pane_synchronizes_linked_and_grouped_window_aliases() {
     assert!(
         matches!(refreshed, AttachControl::Switch(_)),
         "{refreshed:?}"
+    );
+}
+
+#[tokio::test]
+async fn focus_aggregation_uses_linked_runtime_instead_of_session_alias() {
+    let handler = RequestHandler::new();
+    let fixture = linked_two_pane_fixture(&handler, "focus-linked").await;
+    let owner_pid = std::process::id();
+    let grouped_pid = owner_pid.saturating_add(1);
+    let pane = PaneTarget::with_window(fixture.owner.clone(), 0, 0);
+    let grouped_pane = PaneTarget::with_window(fixture.grouped_peer.clone(), 0, 0);
+    {
+        let mut state = handler.state.lock().await;
+        state
+            .append_bytes_to_pane_transcript_for_test(&fixture.owner, 0, 0, b"\x1b[?1004h")
+            .expect("shared pane enables focus reporting");
+    }
+    let (owner_tx, _owner_rx) = mpsc::unbounded_channel();
+    handler
+        .register_attach(owner_pid, fixture.owner.clone(), owner_tx)
+        .await;
+    let (grouped_tx, _grouped_rx) = mpsc::unbounded_channel();
+    handler
+        .register_attach(grouped_pid, fixture.grouped_peer.clone(), grouped_tx)
+        .await;
+    {
+        let state = handler.state.lock().await;
+        state.start_pane_input_capture_for_test(&pane);
+        state.start_pane_input_capture_for_test(&grouped_pane);
+    }
+
+    handler
+        .handle_attached_live_input_for_test(owner_pid, b"\x1b[O")
+        .await
+        .expect("first alias focus-out succeeds");
+    {
+        let state = handler.state.lock().await;
+        assert_eq!(state.pane_input_capture_for_test(&pane), Some(Vec::new()));
+        assert_eq!(
+            state.pane_input_capture_for_test(&grouped_pane),
+            Some(Vec::new())
+        );
+    }
+    handler
+        .handle_attached_live_input_for_test(grouped_pid, b"\x1b[O")
+        .await
+        .expect("last alias focus-out succeeds");
+    handler
+        .handle_attached_live_input_for_test(owner_pid, b"\x1b[I")
+        .await
+        .expect("first alias focus-in succeeds");
+    {
+        let state = handler.state.lock().await;
+        assert_eq!(
+            state.pane_input_capture_for_test(&pane),
+            Some(b"\x1b[I".to_vec())
+        );
+        assert_eq!(
+            state.pane_input_capture_for_test(&grouped_pane),
+            Some(b"\x1b[O".to_vec())
+        );
+        state.start_pane_input_capture_for_test(&pane);
+        state.start_pane_input_capture_for_test(&grouped_pane);
+    }
+
+    let switched = handler
+        .handle_switch_client_ext3(
+            owner_pid,
+            rmux_proto::request::SwitchClientExt3Request {
+                target_client: None,
+                target: Some(format!("{}:0.0", fixture.grouped_peer)),
+                key_table: None,
+                last_session: false,
+                next_session: false,
+                previous_session: false,
+                toggle_read_only: false,
+                sort_order: None,
+                skip_environment_update: true,
+                zoom: false,
+            },
+        )
+        .await;
+    assert!(
+        matches!(switched, Response::SwitchClient(_)),
+        "{switched:?}"
+    );
+    let state = handler.state.lock().await;
+    assert_eq!(
+        state.pane_input_capture_for_test(&pane),
+        Some(Vec::new()),
+        "switching a focused client between aliases of one runtime must not emit O,I"
+    );
+    assert_eq!(
+        state.pane_input_capture_for_test(&grouped_pane),
+        Some(Vec::new()),
+        "the same-runtime alias switch must be silent on every route"
     );
 }
 

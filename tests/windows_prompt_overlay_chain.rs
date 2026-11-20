@@ -376,9 +376,10 @@ fn rmux_command(label: &str) -> Command {
 }
 
 fn rmux_binary() -> std::path::PathBuf {
-    std::env::var_os("RMUX_PROMPT_OVERLAY_RMUX_BIN")
+    let selected = std::env::var_os("RMUX_PROMPT_OVERLAY_RMUX_BIN")
         .map(std::path::PathBuf::from)
-        .unwrap_or_else(|| env!("CARGO_BIN_EXE_rmux").into())
+        .unwrap_or_else(|| env!("CARGO_BIN_EXE_rmux").into());
+    rmux_os::build_identity::resolve(selected.as_os_str()).expect("candidate executable identity")
 }
 
 fn assert_success(output: Output, context: &str) -> Result<Output, Box<dyn Error>> {

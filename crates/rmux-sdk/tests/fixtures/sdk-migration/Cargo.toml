@@ -1,0 +1,17 @@
+[package]
+name = "sdk-migration-consumer"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+[workspace]
+
+[dependencies]
+rmux-sdk = { path = "../../..", default-features = false }
+tokio = { version = "=1.52.3", features = ["macros", "rt", "time"] }
+
+[features]
+default = ["web"]
+web = ["rmux-sdk/web"]
+regex = ["rmux-sdk/regex"]
+crossterm = ["rmux-sdk/crossterm"]

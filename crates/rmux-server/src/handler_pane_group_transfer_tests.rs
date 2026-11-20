@@ -7,8 +7,197 @@ use rmux_proto::{
     WindowTarget,
 };
 
+use super::pane_command_tests::{
+    assert_swap_layout_publication, floating_swap_fixture, floating_swap_refusal_case,
+    FloatingSwapRoute,
+};
+
 fn session_name(value: &str) -> SessionName {
     SessionName::new(value).expect("valid session name")
+}
+
+#[tokio::test]
+async fn floating_swap_publication_deduplicates_grouped_window_identities() {
+    for route in [
+        FloatingSwapRoute::GroupedAlias,
+        FloatingSwapRoute::GroupedCrossWindow,
+        FloatingSwapRoute::GroupedCrossSession,
+    ] {
+        let mut fixture = floating_swap_fixture(route).await;
+        fixture.zoom(true, true).await;
+        let expected = fixture
+            .windows
+            .iter()
+            .map(|(_, window)| window.id())
+            .collect::<Vec<_>>();
+        let mut events = fixture.handler.subscribe_lifecycle_events();
+        let response = fixture
+            .handler
+            .handle(Request::SwapPane(SwapPaneRequest {
+                source: fixture.source.clone(),
+                target: fixture.target.clone(),
+                direction: None,
+                detached: true,
+                preserve_zoom: false,
+            }))
+            .await;
+        assert!(matches!(response, Response::Error(error)
+            if error.error == rmux_proto::RmuxError::Server("cannot swap floating panes".to_owned())));
+        assert_swap_layout_publication(&fixture.handler, &mut events, &expected).await;
+        fixture.assert_state_and_runtimes().await;
+        fixture.cleanup().await;
+    }
+}
+
+#[tokio::test]
+async fn floating_refusal_refreshes_an_attached_non_syntactic_group_peer() {
+    let mut fixture = floating_swap_fixture(FloatingSwapRoute::GroupedCrossSession).await;
+    let peer = fixture.source.session_name().clone();
+    let owner = fixture.windows[0].0.session_name().clone();
+    let (control_tx, mut control_rx) = tokio::sync::mpsc::unbounded_channel();
+    fixture
+        .handler
+        .register_attach(42, peer.clone(), control_tx)
+        .await;
+    fixture.zoom(true, true).await;
+    // Reuse the existing attached-group refresh fixture pattern. The quiet
+    // PTYs avoid unrelated output; no native redraw order is asserted here.
+    while let Ok(Some(_)) =
+        tokio::time::timeout(std::time::Duration::from_millis(50), control_rx.recv()).await
+    {}
+    let mut events = fixture.handler.subscribe_lifecycle_events();
+    let response = fixture
+        .handler
+        .handle(Request::SwapPane(SwapPaneRequest {
+            source: PaneTarget::new(owner, 2),
+            target: fixture.target.clone(),
+            direction: None,
+            detached: true,
+            preserve_zoom: true,
+        }))
+        .await;
+    assert!(matches!(response, Response::Error(error)
+        if error.error == rmux_proto::RmuxError::Server("cannot swap floating panes".to_owned())));
+    let control = tokio::time::timeout(std::time::Duration::from_secs(2), control_rx.recv())
+        .await
+        .expect("changed group peer must be refreshed")
+        .expect("attached peer remains connected");
+    let crate::pane_io::AttachControl::Switch(target) = control else {
+        panic!("expected attached refresh, got {control:?}");
+    };
+    let target = target.into_target();
+    assert_eq!(target.session_name, peer);
+    assert!(!target.render_frame.is_empty());
+    assert_eq!(
+        target.active_pane_geometry,
+        fixture.windows[0].1.pane(0).unwrap().geometry(),
+        "the attached refresh carries the restored unzoomed tile geometry"
+    );
+    let expected = fixture
+        .windows
+        .iter()
+        .map(|(_, window)| window.id())
+        .collect::<Vec<_>>();
+    assert_swap_layout_publication(&fixture.handler, &mut events, &expected).await;
+    fixture.assert_state_and_runtimes().await;
+    fixture.cleanup().await;
+}
+
+#[tokio::test]
+async fn grouped_floating_swap_refusal_preserves_all_aliases_and_runtimes() {
+    for route in [
+        FloatingSwapRoute::GroupedAlias,
+        FloatingSwapRoute::GroupedCrossWindow,
+        FloatingSwapRoute::GroupedCrossSession,
+    ] {
+        for preserve in [false, true] {
+            floating_swap_refusal_case(route, preserve, true, true, true).await;
+        }
+    }
+}
+
+#[tokio::test]
+async fn tiled_swap_failure_still_rolls_back_with_a_floating_witness() {
+    for route in [
+        FloatingSwapRoute::GroupedCrossWindow,
+        FloatingSwapRoute::GroupedCrossSession,
+    ] {
+        let mut fixture = floating_swap_fixture(route).await;
+        fixture.zoom(true, true).await;
+        {
+            let mut state = fixture.handler.state.lock().await;
+            for (target, expected) in &mut fixture.windows {
+                *expected = state.sessions.window(target).unwrap().clone();
+            }
+            state.fail_next_resize_for_test();
+        }
+        let response = fixture
+            .handler
+            .handle(Request::SwapPane(SwapPaneRequest {
+                source: PaneTarget::with_window(fixture.source.session_name().clone(), 0, 0),
+                target: fixture.target.clone(),
+                direction: None,
+                detached: true,
+                preserve_zoom: false,
+            }))
+            .await;
+        assert!(
+            matches!(&response, Response::Error(error)
+            if error.error.to_string().contains("injected pane terminal resize failure")),
+            "{response:?}"
+        );
+        fixture.assert_state_and_runtimes().await;
+        fixture.cleanup().await;
+    }
+}
+
+#[tokio::test]
+async fn floating_join_and_move_keep_unrelated_transfer_rollback() {
+    for route in [
+        FloatingSwapRoute::GroupedCrossWindow,
+        FloatingSwapRoute::GroupedCrossSession,
+    ] {
+        for moving in [false, true] {
+            let mut fixture = floating_swap_fixture(route).await;
+            fixture.zoom(true, true).await;
+            {
+                let mut state = fixture.handler.state.lock().await;
+                for (target, expected) in &mut fixture.windows {
+                    *expected = state.sessions.window(target).unwrap().clone();
+                }
+                state.fail_next_resize_for_test();
+            }
+            let request = if moving {
+                Request::MovePane(MovePaneRequest {
+                    source: fixture.source.clone(),
+                    target: fixture.target.clone(),
+                    direction: SplitDirection::Horizontal,
+                    detached: true,
+                    before: false,
+                    full_size: false,
+                    size: None,
+                })
+            } else {
+                Request::JoinPane(JoinPaneRequest {
+                    source: fixture.source.clone(),
+                    target: fixture.target.clone(),
+                    direction: SplitDirection::Horizontal,
+                    detached: true,
+                    before: false,
+                    full_size: false,
+                    size: None,
+                })
+            };
+            let response = fixture.handler.handle(request).await;
+            assert!(
+                matches!(&response, Response::Error(error)
+                if error.error.to_string().contains("injected pane terminal resize failure")),
+                "{response:?}"
+            );
+            fixture.assert_state_and_runtimes().await;
+            fixture.cleanup().await;
+        }
+    }
 }
 
 pub(super) async fn create_session(handler: &RequestHandler, name: &str) -> SessionName {
@@ -21,7 +210,7 @@ pub(super) async fn create_session(handler: &RequestHandler, name: &str) -> Sess
             environment: None,
         }))
         .await;
-    assert!(matches!(response, Response::NewSession(_)), "{response:?}");
+    crate::session_fixture::assert_new_session(&response);
     session_name
 }
 
@@ -52,7 +241,7 @@ pub(super) async fn create_grouped_session(
             skip_environment_update: false,
         })))
         .await;
-    assert!(matches!(response, Response::NewSession(_)), "{response:?}");
+    crate::session_fixture::assert_new_session(&response);
     session_name
 }
 
@@ -108,6 +297,81 @@ async fn set_monitor_silence(handler: &RequestHandler, scope: ScopeSelector, sec
         }))
         .await;
     assert!(matches!(response, Response::SetOption(_)), "{response:?}");
+}
+
+#[tokio::test]
+async fn move_pane_refreshes_cursor_default_for_destination_recovery() {
+    let handler = RequestHandler::new();
+    let session = create_session(&handler, "move-cursor-default").await;
+    split_session(&handler, &session).await;
+    create_window(&handler, &session, 1).await;
+
+    for (window_index, value) in [(0, "underline"), (1, "bar")] {
+        let response = handler
+            .handle(Request::SetOption(SetOptionRequest {
+                scope: ScopeSelector::Window(WindowTarget::with_window(
+                    session.clone(),
+                    window_index,
+                )),
+                option: OptionName::CursorStyle,
+                value: value.to_owned(),
+                mode: SetOptionMode::Replace,
+            }))
+            .await;
+        assert!(matches!(response, Response::SetOption(_)), "{response:?}");
+    }
+
+    let source = PaneTarget::with_window(session.clone(), 0, 1);
+    {
+        let state = handler.state.lock().await;
+        let transcript = state.transcript_handle(&source).expect("source transcript");
+        assert_eq!(transcript.lock().screen().cursor_default_style(), 4);
+    }
+
+    let response = handler
+        .handle(Request::MovePane(MovePaneRequest {
+            source,
+            target: PaneTarget::with_window(session.clone(), 1, 0),
+            direction: SplitDirection::Vertical,
+            detached: true,
+            before: false,
+            full_size: false,
+            size: None,
+        }))
+        .await;
+    let Response::MovePane(response) = response else {
+        panic!("expected move-pane success, got {response:?}");
+    };
+
+    let (raw_style, resolved_style, keyframe) = {
+        let state = handler.state.lock().await;
+        let transcript = state
+            .transcript_handle(&response.target)
+            .expect("moved transcript");
+        let transcript = transcript.lock();
+        let screen = transcript.screen();
+        let keyframe = crate::pane_recovery::PaneRecoverySeed::capture(&transcript)
+            .expect("capture moved pane recovery")
+            .keyframe()
+            .bytes;
+        (
+            screen.cursor_style(),
+            screen.resolved_cursor_style(),
+            keyframe,
+        )
+    };
+    assert_eq!(raw_style, 0);
+    assert_eq!(resolved_style, 6);
+    assert!(keyframe
+        .windows(b"\x1b[6 q".len())
+        .any(|bytes| bytes == b"\x1b[6 q"));
+
+    let remaining = PaneTarget::with_window(session, 0, 0);
+    let state = handler.state.lock().await;
+    let transcript = state
+        .transcript_handle(&remaining)
+        .expect("remaining source transcript");
+    assert_eq!(transcript.lock().screen().cursor_default_style(), 4);
 }
 
 async fn assert_intra_window_transfer_preserves_unrelated_silence_timer(
@@ -174,10 +438,23 @@ async fn intra_window_join_and_move_preserve_unrelated_silence_deadlines() {
 #[tokio::test]
 async fn grouped_break_preserves_peer_timer_and_arms_the_new_peer_window() {
     let handler = RequestHandler::new();
+    // Pane output restarts the silence timers of its window family. A shell
+    // prompt that lands between the two snapshots would re-arm the peer timer
+    // that break-pane must leave alone.
+    handler.pin_quiet_default_command_for_test().await;
     let owner = create_session(&handler, "break-silence-owner").await;
     split_session(&handler, &owner).await;
     let peer = create_grouped_session(&handler, "break-silence-peer", &owner).await;
     handler.wait_for_initial_panes_for_test().await;
+    for pane_index in [0, 1] {
+        handler
+            .wait_for_pane_startup_output_for_test(&PaneTarget::with_window(
+                owner.clone(),
+                0,
+                pane_index,
+            ))
+            .await;
+    }
 
     set_monitor_silence(&handler, ScopeSelector::Session(peer.clone()), "60").await;
     let source_peer = WindowTarget::with_window(peer.clone(), 0);
@@ -229,10 +506,13 @@ pub(super) fn pane_id(
         .expect("pane exists")
 }
 
-fn session_contains_pane(session: &rmux_core::Session, pane_id: rmux_core::PaneId) -> bool {
+fn session_contains_pane(
+    session: rmux_core::ManagedSessionView<'_>,
+    pane_id: rmux_core::PaneId,
+) -> bool {
     session
         .windows()
-        .values()
+        .map(|(_, window)| window)
         .any(|window| window.panes().iter().any(|pane| pane.id() == pane_id))
 }
 
@@ -446,14 +726,14 @@ async fn non_detached_join_between_group_aliases_selects_the_destination_alias()
         state
             .sessions
             .session(&owner)
-            .map(rmux_core::Session::active_window_index),
+            .map(|session| session.active_window_index()),
         Some(0),
     );
     assert_eq!(
         state
             .sessions
             .session(&peer)
-            .map(rmux_core::Session::active_window_index),
+            .map(|session| session.active_window_index()),
         Some(1),
     );
 }
@@ -553,14 +833,14 @@ async fn non_detached_break_between_group_aliases_selects_the_destination_alias(
         state
             .sessions
             .session(&owner)
-            .map(rmux_core::Session::active_window_index),
+            .map(|session| session.active_window_index()),
         Some(0),
     );
     assert_eq!(
         state
             .sessions
             .session(&peer)
-            .map(rmux_core::Session::active_window_index),
+            .map(|session| session.active_window_index()),
         Some(1),
     );
 }
@@ -578,8 +858,12 @@ async fn break_last_pane_between_group_aliases_matches_tmux_rejection() {
                 .sessions
                 .session(&owner)
                 .expect("owner exists")
-                .clone(),
-            state.sessions.session(&peer).expect("peer exists").clone(),
+                .test_snapshot(),
+            state
+                .sessions
+                .session(&peer)
+                .expect("peer exists")
+                .test_snapshot(),
         )
     };
 
@@ -603,8 +887,20 @@ async fn break_last_pane_between_group_aliases_matches_tmux_rejection() {
     }
 
     let state = handler.state.lock().await;
-    assert_eq!(state.sessions.session(&owner), Some(&owner_before));
-    assert_eq!(state.sessions.session(&peer), Some(&peer_before));
+    assert_eq!(
+        state
+            .sessions
+            .session(&owner)
+            .map(|session| session.test_snapshot()),
+        Some(owner_before)
+    );
+    assert_eq!(
+        state
+            .sessions
+            .session(&peer)
+            .map(|session| session.test_snapshot()),
+        Some(peer_before)
+    );
     state
         .pane_profile_in_window(&peer, 0, 0)
         .expect("rejected break must preserve grouped runtime terminal");
@@ -870,13 +1166,17 @@ async fn grouped_peer_cross_session_swap_rollback_restores_model_and_runtimes() 
                 .sessions
                 .session(&owner)
                 .expect("owner exists")
-                .clone(),
-            state.sessions.session(&peer).expect("peer exists").clone(),
+                .test_snapshot(),
+            state
+                .sessions
+                .session(&peer)
+                .expect("peer exists")
+                .test_snapshot(),
             state
                 .sessions
                 .session(&target)
                 .expect("target exists")
-                .clone(),
+                .test_snapshot(),
         );
         state.fail_next_resize_for_test();
         snapshots
@@ -897,9 +1197,27 @@ async fn grouped_peer_cross_session_swap_rollback_restores_model_and_runtimes() 
     );
 
     let state = handler.state.lock().await;
-    assert_eq!(state.sessions.session(&owner), Some(&owner_before));
-    assert_eq!(state.sessions.session(&peer), Some(&peer_before));
-    assert_eq!(state.sessions.session(&target), Some(&target_before));
+    assert_eq!(
+        state
+            .sessions
+            .session(&owner)
+            .map(|session| session.test_snapshot()),
+        Some(owner_before)
+    );
+    assert_eq!(
+        state
+            .sessions
+            .session(&peer)
+            .map(|session| session.test_snapshot()),
+        Some(peer_before)
+    );
+    assert_eq!(
+        state
+            .sessions
+            .session(&target)
+            .map(|session| session.test_snapshot()),
+        Some(target_before)
+    );
     state
         .pane_profile_in_window(&peer, 0, 0)
         .expect("group runtime terminal must be restored");

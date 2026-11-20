@@ -1,6 +1,6 @@
 use std::path::Path;
 
-use rmux_proto::{PaneOutputSubscriptionId, PaneOutputSubscriptionStart, Response};
+use rmux_proto::{PaneOutputSubscriptionId, PaneOutputSubscriptionStart, Response, RmuxError};
 use serde_json::json;
 
 use crate::cli_args::{CollectPaneOutputArgs, StreamPaneArgs};
@@ -15,7 +15,8 @@ use super::common::{
 };
 
 const CURSOR_BATCH_EVENTS: u16 = 128;
-const LINE_BUFFER_MAX: usize = 1_048_576;
+#[cfg(test)]
+use rmux_sdk::automation::LINE_BUFFER_MAX;
 
 pub(crate) fn run_stream_pane(
     args: StreamPaneArgs,
@@ -228,15 +229,22 @@ pub(super) fn subscribe(
     target: rmux_proto::PaneTargetRef,
     start: PaneOutputSubscriptionStart,
 ) -> Result<PaneOutputSubscriptionId, ExitFailure> {
+    try_subscribe(connection, target, start)?.map_err(|error| subscription_refused(&error))
+}
+
+/// Subscribes to pane output and hands back a daemon refusal as its typed
+/// error, so the caller decides on the variant rather than on its message.
+pub(super) fn try_subscribe(
+    connection: &mut rmux_client::Connection,
+    target: rmux_proto::PaneTargetRef,
+    start: PaneOutputSubscriptionStart,
+) -> Result<Result<PaneOutputSubscriptionId, RmuxError>, ExitFailure> {
     match connection
         .subscribe_pane_output_ref(target, start)
         .map_err(ExitFailure::from_client)?
     {
-        Response::SubscribePaneOutput(response) => Ok(response.subscription_id),
-        Response::Error(error) => Err(ExitFailure::new(
-            1,
-            tmux_cli_error_message("stream-pane", &error.error),
-        )),
+        Response::SubscribePaneOutput(response) => Ok(Ok(response.subscription_id)),
+        Response::Error(error) => Ok(Err(error.error)),
         other => Err(ExitFailure::new(
             1,
             format!(
@@ -245,6 +253,10 @@ pub(super) fn subscribe(
             ),
         )),
     }
+}
+
+pub(super) fn subscription_refused(error: &RmuxError) -> ExitFailure {
+    ExitFailure::new(1, tmux_cli_error_message("stream-pane", error))
 }
 
 pub(super) fn poll_output(
@@ -274,6 +286,12 @@ fn poll_output_inner(
         .map_err(ExitFailure::from_client)?
     {
         Response::PaneOutputCursor(response) => {
+            rmux_sdk::automation::validate_subscription_id(
+                "pane-output-cursor",
+                subscription_id,
+                response.subscription_id,
+            )
+            .map_err(|error| ExitFailure::new(1, error.to_string()))?;
             let mut saw_eof = false;
             let chunks = response
                 .events
@@ -294,6 +312,12 @@ fn poll_output_inner(
             })
         }
         Response::PaneOutputLag(response) => {
+            rmux_sdk::automation::validate_subscription_id(
+                "pane-output-lag",
+                subscription_id,
+                response.subscription_id,
+            )
+            .map_err(|error| ExitFailure::new(1, error.to_string()))?;
             if report_lag {
                 write_stderr_line(&format!(
                     "{command_name}: pane output lagged; missed {} events",
@@ -376,29 +400,12 @@ fn split_lines_bounded<F>(
     buffer: &mut Vec<u8>,
     force_flushed: &mut bool,
     bytes: &[u8],
-    mut emit: F,
+    emit: F,
 ) -> Result<(), ExitFailure>
 where
     F: FnMut(Vec<u8>) -> Result<(), ExitFailure>,
 {
-    for byte in bytes {
-        if *byte == b'\n' {
-            if buffer.is_empty() && *force_flushed {
-                *force_flushed = false;
-                continue;
-            }
-            emit(std::mem::take(buffer))?;
-            *force_flushed = false;
-        } else {
-            buffer.push(*byte);
-            *force_flushed = false;
-            if buffer.len() >= LINE_BUFFER_MAX {
-                emit(std::mem::take(buffer))?;
-                *force_flushed = true;
-            }
-        }
-    }
-    Ok(())
+    rmux_sdk::automation::split_lines_bounded(buffer, force_flushed, bytes, emit)
 }
 
 #[cfg(test)]

@@ -4,15 +4,87 @@ use super::{
     PopupContent, PopupRenderSpec,
 };
 use crate::format_runtime::RuntimeFormatContext;
-use rmux_core::{BoxLines, OptionStore, Session, Style};
+use rmux_core::{BoxLines, OptionStore, Style};
 use rmux_proto::{OptionName, ScopeSelector, SessionName, SetOptionMode, TerminalSize};
+
+#[test]
+fn popup_refresh_never_exposes_a_blank_content_row() {
+    use rmux_core::{input::InputParser, GridRenderOptions, Screen};
+
+    // Freeze PR233's visible contract before importing its correction: a
+    // terminal consuming a refresh incrementally must see old or new text,
+    // never a blank intermediate popup. Exercise both rendering entry paths.
+    for border_lines in [BoxLines::None, BoxLines::Single] {
+        for surface in [false, true] {
+            let frame = |text: &str| {
+                render_popup_overlay(&PopupRenderSpec {
+                    rect: OverlayRect {
+                        x: 2,
+                        y: 2,
+                        width: 12,
+                        height: 5,
+                    },
+                    title: String::new(),
+                    style: Style::default(),
+                    border_style: Style::default(),
+                    border_lines,
+                    content: if surface {
+                        PopupContent::Surface(vec![text.as_bytes().to_vec()])
+                    } else {
+                        PopupContent::Text(vec![text.to_owned()])
+                    },
+                })
+            };
+            let mut parser = InputParser::new();
+            let mut screen = Screen::new(TerminalSize { cols: 30, rows: 10 }, 0);
+            parser.parse(&frame("old content"), &mut screen);
+            let row = if border_lines.visible() { 3 } else { 2 };
+            let updated = frame("new");
+            let text_at_row = |screen: &Screen| {
+                String::from_utf8(
+                    screen
+                        .render_visible_line_independent(row, GridRenderOptions::default())
+                        .expect("popup content row"),
+                )
+                .expect("UTF-8 row")
+            };
+            // Each cursor restore ends one drawing operation, so this also
+            // catches a blank prepaint whose cursor starts at the border.
+            let mut start = 0;
+            for end in 1..updated.len() {
+                let restores_cursor = &updated[end - 1..=end] == b"\x1b8"
+                    || (end >= 2 && &updated[end - 2..=end] == b"\x1b[u");
+                if !restores_cursor {
+                    continue;
+                }
+                parser.parse(&updated[start..=end], &mut screen);
+                start = end + 1;
+                let visible = text_at_row(&screen);
+                assert!(
+                    visible.contains("old") || visible.contains("new"),
+                    "blank intermediate row: border={border_lines:?}, surface={surface}, row={visible:?}"
+                );
+            }
+            assert_eq!(start, updated.len(), "complete drawing records");
+            let visible = text_at_row(&screen);
+            assert!(visible.contains("new"));
+            assert!(
+                !visible.contains("content"),
+                "shorter text must erase the tail"
+            );
+        }
+    }
+}
 
 fn session_name(value: &str) -> SessionName {
     SessionName::new(value).expect("valid session name")
 }
 
-fn session_with_windows() -> Session {
-    let mut session = Session::new(session_name("alpha"), TerminalSize { cols: 80, rows: 24 });
+fn session_with_windows() -> crate::session_fixture::SessionFixture {
+    let mut session = crate::session_fixture::SessionFixture::new(
+        session_name("alpha"),
+        TerminalSize { cols: 80, rows: 24 },
+    );
     session
         .create_window(TerminalSize { cols: 80, rows: 24 })
         .expect("window create succeeds");
@@ -21,17 +93,21 @@ fn session_with_windows() -> Session {
 
 #[test]
 fn overlay_position_resolves_tmux_shorthand_positions() {
-    let mut session = Session::new(session_name("alpha"), TerminalSize { cols: 80, rows: 24 });
+    let mut session = crate::session_fixture::SessionFixture::new(
+        session_name("alpha"),
+        TerminalSize { cols: 80, rows: 24 },
+    );
     session.split_active_pane().expect("split succeeds");
     let pane = session
         .window()
         .active_pane()
         .expect("active pane")
         .geometry();
-    let runtime =
-        RuntimeFormatContext::new(rmux_core::formats::FormatContext::from_session(&session))
-            .with_session(&session)
-            .with_window(session.active_window_index(), session.window());
+    let runtime = RuntimeFormatContext::new(
+        rmux_core::formats::FormatContext::new().with_managed_session(session.view()),
+    )
+    .with_session(session.view())
+    .with_window(session.active_window_index(), session.window());
     let rect = resolve_overlay_rect(
         runtime,
         OverlayPositionContext {
@@ -50,6 +126,48 @@ fn overlay_position_resolves_tmux_shorthand_positions() {
     .expect("position resolves");
     assert_eq!(rect.x, 0);
     assert_eq!(rect.y, 13);
+}
+
+#[test]
+fn overlay_centre_matches_measured_tmux_rounding_without_vertical_preclamping() {
+    // `resolve_overlay_rect` serves both display-popup and display-menu. These
+    // top-left coordinates were measured against tmux 3.7b; in particular,
+    // the horizontal one-cell bias is intentional and must remain unchanged.
+    for (size, width, height, expected_x, expected_y) in [
+        (TerminalSize { cols: 80, rows: 24 }, 40, 6, 19, 8),
+        (TerminalSize { cols: 80, rows: 24 }, 40, 8, 19, 7),
+        (TerminalSize { cols: 80, rows: 24 }, 40, 10, 19, 6),
+        (TerminalSize { cols: 80, rows: 24 }, 40, 12, 19, 5),
+        (TerminalSize { cols: 80, rows: 24 }, 40, 20, 19, 1),
+        (TerminalSize { cols: 80, rows: 24 }, 11, 20, 34, 1),
+        (TerminalSize { cols: 80, rows: 30 }, 40, 15, 19, 6),
+        (TerminalSize { cols: 80, rows: 25 }, 40, 12, 19, 6),
+    ] {
+        let session = crate::session_fixture::SessionFixture::new(session_name("centre"), size);
+        let runtime = RuntimeFormatContext::new(
+            rmux_core::formats::FormatContext::new().with_managed_session(session.view()),
+        )
+        .with_session(session.view());
+        let rect = resolve_overlay_rect(
+            runtime,
+            OverlayPositionContext {
+                client_size: size,
+                pane: None,
+                mouse: None,
+                status_at: None,
+                status_lines: 0,
+                window_status_x: None,
+            },
+            None,
+            None,
+            width,
+            height,
+        )
+        .expect("centred overlay fits");
+
+        assert_eq!(rect.x, expected_x, "{size:?}, width {width}");
+        assert_eq!(rect.y, expected_y, "{size:?}, height {height}");
+    }
 }
 
 #[test]
@@ -283,7 +401,7 @@ fn popup_overlay_surface_rows_reset_around_each_row() {
         "a row must start from a known state: {row:?}"
     );
     assert!(
-        row.contains("red\u{1b}[0m\u{1b}8"),
+        row.ends_with("\u{1b}[0m\u{1b}8"),
         "a row must not leak its attributes into the frame: {row:?}"
     );
 }
@@ -337,7 +455,8 @@ fn status_layout_marks_left_window_and_right_ranges() {
         )
         .expect("right option set");
 
-    let layout = status_line_layout(&session, &options, 0, None, None).expect("layout exists");
+    let layout =
+        status_line_layout(session.view(), &options, 0, None, None).expect("layout exists");
     assert!(layout
         .ranges
         .iter()
@@ -381,7 +500,8 @@ fn status_layout_tracks_inline_range_changes_inside_status_left() {
         )
         .expect("left length set");
 
-    let layout = status_line_layout(&session, &options, 0, None, None).expect("layout exists");
+    let layout =
+        status_line_layout(session.view(), &options, 0, None, None).expect("layout exists");
 
     assert!(layout.ranges.iter().any(|range| matches!(
         range.kind,
@@ -391,4 +511,67 @@ fn status_layout_tracks_inline_range_changes_inside_status_left() {
         range.kind,
         crate::status_ranges::StatusRangeType::Control(7)
     ) && range.x == (1..=1)));
+}
+
+#[test]
+fn popup_surface_paints_final_rows_without_a_blank_pass() {
+    let spec = PopupRenderSpec {
+        rect: OverlayRect {
+            x: 2,
+            y: 1,
+            width: 8,
+            height: 2,
+        },
+        title: String::new(),
+        style: Style::default(),
+        border_style: Style::default(),
+        border_lines: BoxLines::None,
+        content: PopupContent::Surface(vec![b"abcdefgh".to_vec(), b"12345678".to_vec()]),
+    };
+    let frame = render_popup_overlay(&spec);
+    let frame = String::from_utf8(frame).unwrap();
+    // There must be no intermediate all-blank surface, even on terminals
+    // which paint the stream before the entire frame has arrived.
+    assert!(!frame.contains("        "));
+    assert_eq!(frame.matches("\x1b[2;3H").count(), 1);
+    assert_eq!(frame.matches("\x1b[3;3H").count(), 1);
+    assert!(frame.contains("abcdefgh"));
+    assert!(frame.contains("12345678"));
+}
+
+#[test]
+fn popup_surface_short_and_missing_rows_erase_old_cells() {
+    use rmux_core::{input::InputParser, Screen};
+    let size = TerminalSize { cols: 12, rows: 5 };
+    let mut screen = Screen::new(size, 0);
+    let mut parser = InputParser::new();
+    parser.parse(b"\x1b[2;3HXXXXXXXX\x1b[3;3HYYYYYYYY", &mut screen);
+    let spec = PopupRenderSpec {
+        rect: OverlayRect {
+            x: 2,
+            y: 1,
+            width: 8,
+            height: 2,
+        },
+        title: String::new(),
+        style: Style::default(),
+        border_style: Style::default(),
+        border_lines: BoxLines::None,
+        content: PopupContent::Surface(vec!["界e\u{301}".as_bytes().to_vec()]),
+    };
+    parser.parse(&render_popup_overlay(&spec), &mut screen);
+    let options = rmux_core::GridRenderOptions {
+        trim_spaces: false,
+        include_empty_cells: true,
+        ..Default::default()
+    };
+    let first = screen
+        .render_visible_line_independent_with_default_style(1, options, &Style::default())
+        .unwrap();
+    let second = screen
+        .render_visible_line_independent_with_default_style(2, options, &Style::default())
+        .unwrap();
+    assert!(!first.contains(&b'X'), "{first:?}");
+    assert!(!second.contains(&b'Y'), "{second:?}");
+    assert!(String::from_utf8(first).unwrap().contains("界e\u{301}"));
 }

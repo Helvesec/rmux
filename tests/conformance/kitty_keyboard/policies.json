@@ -1,0 +1,92 @@
+[
+  {
+    "id": "A-TEXT16",
+    "topic": "Undefined flag16 without8",
+    "status": "sponsor-selected for candidate; distinct review and orchestrator acceptance pending",
+    "selected_disposition": "Query retains requested known bits; event interpretation uses flags & ~16 for masks16..23. Normative output stays null; policy output is separate."
+  },
+  {
+    "id": "A-STACK",
+    "topic": "Stack representation / zero count",
+    "status": "sponsor-selected for candidate; distinct review and orchestrator acceptance pending",
+    "selected_disposition": "Select active-frame arrays, initially[0], distinct screens, capacity16 with oldest eviction, and pop0 no-op. Empty set creates a frame. Internal representation is an RMUX policy; externally required query/pop results are distinguished from it."
+  },
+  {
+    "id": "A-BOUNDS",
+    "topic": "Unspecified recovery limits",
+    "status": "sponsor-selected for candidate; distinct review and orchestrator acceptance pending",
+    "selected_disposition": "Select frame4096 bytes, decimal uint32, text256 scalars, stack16. Overflow/invalid recognized Kitty frame discarded atomically until final/control boundary; do not turn tail into binding input. Limits are provisional safety policy, not a full-protocol exemption; reassess valid long text before advertising full capability. No silent truncation."
+  },
+  {
+    "id": "A-UNKNOWN",
+    "topic": "Unknown fields/bits/keys",
+    "status": "sponsor-selected for candidate; distinct review and orchestrator acceptance pending",
+    "selected_disposition": "Select ignore unknown enhancement bits in query/set results (known mask31), reject mode outside1..3, reject event outside1..3 and modifier outside1..256. Unassigned PUA retains numeric identity with unknown capability, not a known function. Surrogates/out-of-range invalid. Leading zeros accepted."
+  },
+  {
+    "id": "A-TAB",
+    "topic": "Modified C0 exception / errata conflict",
+    "status": "sponsor-selected for candidate; distinct review and orchestrator acceptance pending",
+    "selected_disposition": "Flags0 keep the explicit legacy C0 table. With flag1 without8 select CSI9;6u only for Ctrl+Shift+Tab per erratum; preserve other legacy C0 press cases. With8 use canonical all-key encoding. This is an RMUX interpretation of conflicting prose, not universally dictated bytes."
+  },
+  {
+    "id": "A-OPTIONAL",
+    "topic": "Permitted optional fields",
+    "status": "sponsor-selected for candidate; distinct review and orchestrator acceptance pending",
+    "selected_disposition": "Preferred encoder emits minimum fields and supplied alternate identities when flag4; accepts omitted press1/default modifiers and valid optional alternates. Expected hex for preferred spelling is a serialization selection, not rejection of spec-permitted other spellings."
+  },
+  {
+    "id": "A-LEGACY",
+    "topic": "Terminfo and example ambiguity",
+    "status": "sponsor-selected for candidate; distinct review and orchestrator acceptance pending",
+    "selected_disposition": "Select the explicit pinned-Kitty profile and modifier algorithm over the contradictory Ctrl+r example. Canonical modified F3 is CSI13;5~ by functional table and CPR exclusion despite generic SS3 conversion prose. Preserve unmodified SS3 R and modified F1/F2/F4. Current RMUX terminfo/fallback is a separate unchanged profile; no universal terminfo parity."
+  },
+  {
+    "id": "A-MOK",
+    "topic": "modifyOtherKeys coexistence",
+    "status": "sponsor-selected for candidate; distinct review and orchestrator acceptance pending",
+    "selected_disposition": "Select separate stored modes. Effective Kitty flags select the encoder; pop returns through the Kitty stack and then existing xterm fallback at effective0. No shared bit clearing. Coexistence is an RMUX policy."
+  },
+  {
+    "id": "A-ROUTE",
+    "topic": "Held-key routing and consumption",
+    "status": "sponsor-selected for candidate; distinct review and orchestrator acceptance pending",
+    "selected_disposition": "Capture target, consumer, client generation and runtime generation at press. Repeat/release follow the original live target. Consumed press suppresses application repeat/release. Stale remainders are dropped without fabricated release. The application may retain held state: an explicit lifecycle tradeoff requiring later actual route/focus tests, not native delivery proof."
+  },
+  {
+    "id": "A-LIFE",
+    "topic": "Reset and ownership lifetime",
+    "status": "sponsor-selected for candidate; distinct review and orchestrator acceptance pending",
+    "selected_disposition": "Select RIS resets both pane stacks; DECSTR keeps keyboard state; screen switch preserves distinct stacks, fresh runtime zeroes both. Exit must not reset outer client. Teardown drops held/pending state; reconnect starts new generation. Spec only mandates independent stacks and pop reset, not these extra transitions."
+  },
+  {
+    "id": "A-OUTER",
+    "topic": "Untagged replies and restore",
+    "status": "sponsor-selected for candidate; distinct review and orchestrator acceptance pending",
+    "selected_disposition": "Probe ?u+DA on owned byte stream; push31 only after support known, query to attest accepted flags. Pop only own successful push exactly once on same outer screen before leaving it. Timeout makes untagged stream correlation uncertain: do not assign a later reply to a fresh request without a provable boundary. No blind restore overwrite."
+  },
+  {
+    "id": "A-TEXT-AVAIL",
+    "topic": "Non-BMP, IME and provenance",
+    "status": "sponsor-selected for candidate; distinct review and orchestrator acceptance pending",
+    "selected_disposition": "Decode Unicode scalar values; composition text may span multiple scalars and has key0 when key unavailable. Raw legacy text cannot yield reliable key/repeat/release/layout; preserve text-only identity. Do not infer browser DOM or Windows key-up from render/DTO fields."
+  },
+  {
+    "id": "A-LICENSE",
+    "topic": "Reference and fixture license",
+    "status": "sponsor-selected for candidate; distinct review and orchestrator acceptance pending",
+    "selected_disposition": "New RMUX-authored factual fixtures and paraphrases use MIT OR Apache-2.0 under CONTRIBUTING.md. Exact upstream provenance is retained; upstream source/license remains audit-only. No separate documentation grant or legal-clearance claim."
+  },
+  {
+    "id": "A-EVENT-LEGACY",
+    "topic": "Flag2-only control-chord press spelling",
+    "status": "sponsor-selected for candidate; distinct review and orchestrator acceptance pending",
+    "selected_disposition": "Select legacy press bytes for flag2/6 Ctrl+a without1/8; repeat/release use event-bearing CSI-u. Preserve null normative press output and a separate selected policy output."
+  },
+  {
+    "id": "A-C0-REPEAT",
+    "topic": "C0 repeat exception partition",
+    "selected_disposition": "With flag2/3 without8, Enter/Tab/Backspace repeat uses event-bearing CSI-u; unmodified press keeps legacy C0; release is suppressed. With8+2 all three event kinds are canonical. With8 without2 repeat uses press encoding. Broad legacy prose creates tension, so without8 repeat keeps null normative output. Modified Tab is partitioned explicitly, not generalized to every chord.",
+    "status": "sponsor-selected for candidate; distinct review and orchestrator acceptance pending"
+  }
+]

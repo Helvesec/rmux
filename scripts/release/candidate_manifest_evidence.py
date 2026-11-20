@@ -7,6 +7,7 @@ import json
 import re
 from datetime import datetime, timedelta
 from typing import Any
+from candidate_route import CANONICAL, CandidateRoute
 
 REPOSITORY_ID = 1239918790
 CONTRACT_PATH = ".github/release/candidate-contract.json"
@@ -70,10 +71,12 @@ def timestamp(value: Any, label: str) -> datetime:
 
 
 def validate_proof(
-    proof: dict[str, Any], expected_kind: str, label: str
+    proof: dict[str, Any], expected_kind: str, label: str,
+    route: CandidateRoute = CANONICAL,
 ) -> tuple[datetime, datetime]:
-    exact_keys(proof, PROOF_KEYS, label)
-    if proof["schema_version"] != 1 or proof["kind"] != expected_kind:
+    exact_keys(proof, PROOF_KEYS | route.extra_keys, label)
+    route.validate_record(proof)
+    if proof["kind"] != expected_kind:
         raise ValueError(f"{label} identity changed")
     if proof["repository_id"] != REPOSITORY_ID or proof["run_attempt"] != 1:
         raise ValueError(f"{label} repository or attempt changed")
@@ -133,9 +136,12 @@ def validate_proof(
     return started, verified
 
 
-def validate_intent(intent: dict[str, Any]) -> None:
-    exact_keys(intent, INTENT_KEYS, "candidate intent")
-    if intent["schema_version"] != 1 or intent["repository_id"] != REPOSITORY_ID:
+def validate_intent(intent: dict[str, Any], route: CandidateRoute = CANONICAL) -> None:
+    exact_keys(intent, INTENT_KEYS | route.extra_keys, "candidate intent")
+    route.validate_record(intent)
+    route.validate_intent(intent["source_git_sha"], intent["release_intent_id"],
+                          intent["planned_release_ref"], intent["release_kind"])
+    if intent["repository_id"] != REPOSITORY_ID:
         raise ValueError("candidate intent identity changed")
     if intent["candidate_run_attempt"] != 1:
         raise ValueError("candidate intent requires attempt 1")

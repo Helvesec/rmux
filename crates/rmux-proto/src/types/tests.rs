@@ -41,7 +41,36 @@ fn legacy_single_string_still_uses_shell_mode() {
 
 #[test]
 fn session_name_rejects_empty_values() {
-    assert_eq!(SessionName::new(""), Err(RmuxError::EmptySessionName));
+    assert_eq!(SessionName::new(""), Err(crate::SessionNameError));
+}
+
+#[test]
+fn target_validation_normalizes_each_session_boundary_once() {
+    for raw in ["a\\n.b", "a\\n.b:2", "a\\n.b:2.3"] {
+        let target = Target::parse(raw).unwrap();
+        assert_eq!(target.session_name().as_str(), "a\\n_b");
+        let canonical = serde_json::to_string(&target).unwrap();
+        let decoded: Target = serde_json::from_str(&canonical).unwrap();
+        assert_eq!(decoded, target);
+    }
+}
+
+#[test]
+fn target_session_text_matches_the_name_stored_for_a_backslash_or_control() {
+    // `new -s 'b\c'` stores `b\\c`, as tmux `session_check_name` does. RMUX
+    // also accepts `new -s $'t\tb'` (tmux 3.7b refuses it) and lists the four
+    // characters `t\tb`. Target text is that stored form, so parsing it must
+    // not escape the backslash a second time.
+    for raw_name in ["b\\c", "t\tb", "x\u{1}y"] {
+        let stored = SessionName::new(raw_name).unwrap();
+        for suffix in ["", ":0", ":0.1"] {
+            let typed = format!("{stored}{suffix}");
+            let target = Target::parse(&typed).unwrap();
+            assert_eq!(target.session_name(), &stored, "{typed:?}");
+            assert_eq!(target.to_string(), typed, "{typed:?}");
+            assert_eq!(Target::parse(&target.to_string()).unwrap(), target);
+        }
+    }
 }
 
 #[test]

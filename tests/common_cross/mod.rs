@@ -134,7 +134,9 @@ pub(crate) fn assert_success(output: &Output) -> Result<(), Box<dyn Error>> {
 }
 
 pub(crate) fn rmux_binary() -> &'static Path {
-    Path::new(env!("CARGO_BIN_EXE_rmux"))
+    let path = Path::new(env!("CARGO_BIN_EXE_rmux"));
+    rmux_os::build_identity::resolve(path.as_os_str()).expect("candidate executable identity");
+    path
 }
 
 fn unique_id(label: &str) -> String {

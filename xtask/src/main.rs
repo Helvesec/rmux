@@ -1,6 +1,8 @@
 #![deny(missing_docs)]
 #![deny(rustdoc::broken_intra_doc_links)]
-#![forbid(unsafe_code)]
+// The shared `cli_top_level` owner below carries one reviewed `unsafe` OS-string
+// conversion, so xtask's own code is denied rather than forbidden.
+#![deny(unsafe_code)]
 
 //! Repository maintenance command entry point.
 //!
@@ -10,8 +12,10 @@
 //! - `help` &mdash; print top-level help and exit.
 //! - `feature-inventory` &mdash; validate and render the tracked feature
 //!   inventory.
+//! - `package-inventory` &mdash; export/check Cargo package declarations.
 //! - `generate-completions` &mdash; generate shell completion assets from the
 //!   synthetic RMUX command surface.
+//! - `registry-docs` &mdash; generate and check registry documentation.
 
 use std::env;
 use std::path::PathBuf;
@@ -19,16 +23,36 @@ use std::process::ExitCode;
 
 #[cfg(not(test))]
 #[allow(missing_docs, unused)]
-#[path = "../../src/cli_args.rs"]
+#[path = "../../src/cli_args/mod.rs"]
 mod cli_args;
+// `cli_args` resolves legacy top-level q through the single shared owner, which
+// reads arguments through the platform OS-string conversion. Both are included
+// under the same non-test boundary and the same paths as `src/main.rs`, so the
+// completion generator parses exactly what the `rmux` binary parses. xtask has
+// no `tiny-cli` feature, so the owner's gate reads as the full CLI surface here.
+#[cfg(not(test))]
+#[allow(missing_docs, unexpected_cfgs, unused, unsafe_code)]
+#[path = "../../src/cli_top_level.rs"]
+mod cli_top_level;
 mod completions;
 mod feature_inventory;
+mod msrv;
+#[allow(missing_docs, unused)]
+#[path = "../../crates/rmux-core/src/options/registry/mod.rs"]
+mod option_registry;
+#[cfg(not(test))]
+#[allow(missing_docs, unused)]
+#[path = "../../src/os_string.rs"]
+mod os_string;
+mod package_inventory;
+mod registry_docs;
+mod third_party_notice;
 
 const HELP: &str = "\
 RMUX repository tasks
 
 Usage:
-    cargo run -p xtask -- <command> [args]
+    cargo xtask <command> [args]
 
 Commands:
     --help, -h, help            Print this help text.
@@ -38,10 +62,24 @@ Commands:
                                 Check tracked rmux-sdk source-size exceptions.
     feature-inventory --render-markdown
                                 Render the YAML inventory as a Markdown table.
+    package-inventory --check
+                                Check the Cargo package/feature/target baseline.
+    package-inventory --export
+                                Print it from a clean committed workspace.
+    package-inventory --update
+                                Explicitly replace it from that source.
+    msrv --toolchain-dir <path> --output-dir <new-path> --target-dir <path>
+                                Check the exact Rust floor on this native host.
     generate-completions --output-dir <path> [--shell <name>]...
                                 Generate bash, zsh, fish, PowerShell, and
                                 Elvish completion files. Use --shell to limit
-                                the generated set.";
+                                the generated set.
+    registry-docs --output-dir <path> [--check]
+                                Generate or verify CLI/configuration/man and
+                                divergence reports from implemented registries.
+    third-party-notice --metadata <path> --build-log <path>...
+                      --policy <deny.toml> --output <path>
+                                Render upstream notices for completed builds.";
 
 fn main() -> ExitCode {
     match parse_args(env::args().skip(1)) {
@@ -50,9 +88,51 @@ fn main() -> ExitCode {
             ExitCode::SUCCESS
         }
         Ok(Command::FeatureInventory { mode }) => run_feature_inventory(mode),
+        Ok(Command::Msrv { options }) => match msrv::run(options) {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(error) => {
+                eprintln!("xtask msrv failed: {error}");
+                ExitCode::FAILURE
+            }
+        },
+        Ok(Command::ThirdPartyNotice { args }) => match third_party_notice::run(&args) {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(error) => {
+                eprintln!("xtask third-party-notice failed: {error}");
+                ExitCode::FAILURE
+            }
+        },
+        Ok(Command::PackageInventory { mode }) => {
+            let result = env::current_dir()
+                .map_err(package_inventory::Error::from)
+                .and_then(|root| package_inventory::run(mode, &root));
+            match result {
+                Ok(Some(output)) => {
+                    print!("{output}");
+                    ExitCode::SUCCESS
+                }
+                Ok(None) => ExitCode::SUCCESS,
+                Err(error) => {
+                    eprintln!("xtask package-inventory failed: {error}");
+                    ExitCode::FAILURE
+                }
+            }
+        }
         Ok(Command::GenerateCompletions { output_dir, shells }) => {
             run_generate_completions(&output_dir, &shells)
         }
+        Ok(Command::RegistryDocs { options }) => match registry_docs::run(&options) {
+            Ok(paths) => {
+                for path in paths {
+                    println!("{}", path.display());
+                }
+                ExitCode::SUCCESS
+            }
+            Err(error) => {
+                eprintln!("xtask registry-docs failed: {error}");
+                ExitCode::FAILURE
+            }
+        },
         Err(message) => {
             eprintln!("{message}");
             eprintln!();
@@ -67,9 +147,12 @@ fn run_generate_completions(
     shells: &[completions::Shell],
 ) -> ExitCode {
     match completions::generate(output_dir, shells) {
-        Ok(paths) => {
-            for path in paths {
-                println!("{}", path.display());
+        Ok(generated) => {
+            // One line per generated file: the shell it completes, a tab, and
+            // the path. A packaging consumer joins on that shell instead of
+            // holding a second list of this generator's file names.
+            for (shell, path) in generated {
+                println!("{shell}\t{}", path.display());
             }
             ExitCode::SUCCESS
         }
@@ -98,8 +181,20 @@ fn run_feature_inventory(mode: feature_inventory::Mode) -> ExitCode {
 #[derive(Debug, PartialEq, Eq)]
 enum Command {
     Help,
+    ThirdPartyNotice {
+        args: Vec<String>,
+    },
+    Msrv {
+        options: msrv::Options,
+    },
     FeatureInventory {
         mode: feature_inventory::Mode,
+    },
+    PackageInventory {
+        mode: package_inventory::Mode,
+    },
+    RegistryDocs {
+        options: registry_docs::Options,
     },
     GenerateCompletions {
         output_dir: PathBuf,
@@ -156,7 +251,28 @@ where
                 })?,
             })
         }
+        "registry-docs" => Ok(Command::RegistryDocs {
+            options: registry_docs::Options::parse(args)?,
+        }),
         "generate-completions" => parse_generate_completions_args(args),
+        "third-party-notice" => Ok(Command::ThirdPartyNotice {
+            args: args.collect(),
+        }),
+        "msrv" => Ok(Command::Msrv {
+            options: msrv::Options::parse(args)?,
+        }),
+        "package-inventory" => {
+            let mode = match args.next().as_deref() {
+                Some("--check") => package_inventory::Mode::Check,
+                Some("--export") => package_inventory::Mode::Export,
+                Some("--update") => package_inventory::Mode::Update,
+                _ => return Err("package-inventory requires --check, --export, or --update".into()),
+            };
+            if args.next().is_some() {
+                return Err("package-inventory accepts exactly one mode flag".into());
+            }
+            Ok(Command::PackageInventory { mode })
+        }
         other => Err(format!("unknown xtask command: {other}")),
     }
 }
@@ -198,7 +314,29 @@ where
 mod tests {
     use std::path::PathBuf;
 
-    use super::{completions, feature_inventory, parse_args, Command};
+    use super::{completions, feature_inventory, package_inventory, parse_args, Command};
+
+    #[test]
+    fn package_inventory_modes_are_explicit_and_exclusive() {
+        for (flag, mode) in [
+            ("--check", package_inventory::Mode::Check),
+            ("--export", package_inventory::Mode::Export),
+            ("--update", package_inventory::Mode::Update),
+        ] {
+            assert_eq!(
+                parse_args(["package-inventory", flag]),
+                Ok(Command::PackageInventory { mode })
+            );
+        }
+        for args in [
+            vec!["package-inventory"],
+            vec!["package-inventory", "--unknown"],
+            vec!["package-inventory", "--check", "--update"],
+            vec!["package-inventory", "--check", "--check"],
+        ] {
+            assert!(parse_args(args).is_err());
+        }
+    }
 
     #[test]
     fn no_args_prints_help() {

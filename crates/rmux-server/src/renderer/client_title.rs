@@ -1,15 +1,13 @@
 use std::path::Path;
 
-use rmux_core::{OptionStore, Session};
+use rmux_core::OptionStore;
 use rmux_proto::OptionName;
 
-use crate::client_format::ClientFormatBindings;
+use crate::client_format::{ClientFormatBindings, ClientLoopSnapshot};
 use crate::format_runtime::RuntimeFormatContext;
 use crate::pane_terminals::HandlerState;
 
-use super::status::{
-    active_format_context, render_status_template_jobs_with_profile, status_job_cache_ttl,
-};
+use super::status::{active_format_context, render_status_template_jobs, status_job_cache_ttl};
 
 /// The client-scoped bindings tmux installs with `format_defaults()` before it
 /// expands `set-titles-string`.
@@ -26,6 +24,7 @@ pub(crate) struct ClientTitleContext<'a> {
     pub(crate) key_table: Option<&'a str>,
     pub(crate) socket_path: Option<&'a Path>,
     pub(crate) client: Option<&'a ClientFormatBindings>,
+    pub(crate) client_loop_snapshots: Option<&'a [ClientLoopSnapshot]>,
 }
 
 /// Expands `set-titles-string` for one attached client.
@@ -37,7 +36,7 @@ pub(crate) struct ClientTitleContext<'a> {
 /// an attached client emits no OSC 0 and no OSC 7 even when the terminal
 /// advertises both capabilities, and a `#()` job in the template is never run.
 pub(crate) fn expand_client_title(
-    session: &Session,
+    session: rmux_core::ManagedSessionView<'_>,
     options: &OptionStore,
     context: &ClientTitleContext<'_>,
 ) -> Option<String> {
@@ -68,6 +67,9 @@ pub(crate) fn expand_client_title(
     if let Some(client) = context.client {
         runtime = client.apply(runtime);
     }
+    if let Some(client_loop_snapshots) = context.client_loop_snapshots {
+        runtime = runtime.with_client_loop_snapshots(client_loop_snapshots);
+    }
 
     // tmux expands the title through format_expand_time(), so strftime tokens
     // resolve against the current time and `#(shell-command)` runs as a job.
@@ -75,15 +77,9 @@ pub(crate) fn expand_client_title(
     // later one carries the previous run's stdout, re-run no more often than
     // `status-interval`. That is exactly the daemon's status-job runtime, so
     // the title shares its cache, its concurrency limit and its cancellation.
-    let profile = template
-        .contains("#(")
-        .then(|| runtime.status_job_profile())
-        .flatten();
-    Some(render_status_template_jobs_with_profile(
+    Some(render_status_template_jobs(
         template,
         &runtime,
-        profile.as_ref(),
         status_job_cache_ttl(options, session_name),
-        runtime.status_jobs(),
     ))
 }

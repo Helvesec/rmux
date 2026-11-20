@@ -31,7 +31,7 @@ where
     assert_eq!(
         std::any::TypeId::of::<T>(),
         std::any::TypeId::of::<U>(),
-        "the SDK re-export must resolve to the rmux-proto definition"
+        "all re-exports must resolve to the rmux-types definition"
     );
 }
 
@@ -86,6 +86,59 @@ fn sdk_re_exports_resolve_to_rmux_proto_identity_types() {
     assert_same_type::<SessionId, rmux_proto::SessionId>();
     assert_same_type::<WindowId, rmux_proto::WindowId>();
     assert_same_type::<PaneId, rmux_proto::PaneId>();
+}
+
+#[test]
+fn sdk_identity_values_are_owned_by_rmux_types() {
+    assert_same_type::<SessionName, rmux_types::SessionName>();
+    assert_same_type::<SessionId, rmux_types::SessionId>();
+    assert_same_type::<WindowId, rmux_types::WindowId>();
+    assert_same_type::<PaneId, rmux_types::PaneId>();
+    assert_same_type::<rmux_sdk::SessionNameError, rmux_types::SessionNameError>();
+    let name: rmux_types::SessionName = SessionName::new("a\\n:b.c").unwrap();
+    let old_path: rmux_proto::identity::SessionName = name;
+    let sdk: rmux_sdk::types::SessionName = old_path;
+    assert_eq!(sdk.as_str(), "a\\\\n_b_c");
+}
+
+#[test]
+fn session_validation_retains_sdk_diagnostic_and_opaque_source() {
+    use rmux_sdk::{EnsureSession, ProtocolError, RmuxError, SessionNameError};
+    use std::error::Error;
+
+    fn question_mark() -> rmux_sdk::Result<SessionName> {
+        Ok(SessionName::new("")?)
+    }
+    let validation: SessionNameError = SessionName::new("").unwrap_err();
+    assert!(validation.source().is_none());
+    assert_eq!(
+        validation.to_string(),
+        "invalid session name: session names must be non-empty"
+    );
+    let errors = [
+        question_mark().unwrap_err(),
+        validation.into(),
+        EnsureSession::try_named("").unwrap_err(),
+    ];
+    for error in errors {
+        let RmuxError::Protocol { source, .. } = &error else {
+            panic!("protocol validation")
+        };
+        assert_eq!(format!("{source:?}"), "EmptySessionName");
+        assert_eq!(source.to_string(), validation.to_string());
+        assert!(error.source().unwrap().is::<ProtocolError>());
+        assert!(!error.source().unwrap().is::<rmux_proto::RmuxError>());
+        assert!(source.source().is_none());
+        let diagnostic = rmux_sdk::protocol_diagnostic(&error);
+        assert_eq!(
+            diagnostic.message(),
+            "rmux protocol error: invalid session name: session names must be non-empty"
+        );
+        assert_eq!(
+            diagnostic.hint(),
+            Some("check the request and daemon state, then retry after correcting the request")
+        );
+    }
 }
 
 #[test]
@@ -193,6 +246,25 @@ fn header_is_any_dependency_section(header: &str) -> bool {
 
 const FORBIDDEN_INTERNAL_CRATES: [&str; 4] =
     ["rmux-core", "rmux-server", "rmux-client", "rmux-pty"];
+
+#[test]
+fn identity_owner_is_a_normal_transport_independent_dependency() {
+    let sdk_sections = parse_manifest_sections(include_str!("../Cargo.toml"));
+    assert!(sdk_sections
+        .iter()
+        .any(|(header, body)| header == "dependencies" && body_mentions_crate(body, "rmux-types")));
+    let owner_sections = parse_manifest_sections(include_str!("../../rmux-types/Cargo.toml"));
+    for (header, body) in owner_sections {
+        if header_is_any_dependency_section(&header) {
+            for forbidden in ["rmux-proto", "rmux-sdk", "rmux-core", "rmux-server"] {
+                assert!(
+                    !body_mentions_crate(&body, forbidden),
+                    "owner depends on {forbidden}"
+                );
+            }
+        }
+    }
+}
 
 fn body_mentions_crate(body: &str, crate_name: &str) -> bool {
     body.lines().any(|line| {

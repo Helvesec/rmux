@@ -426,7 +426,7 @@ fn snapshot_from_proto(value: ProtoSnapshot) -> Result<PaneSurfaceSnapshot> {
         revision: value.revision,
     };
     grid.validate_shape().map_err(|error| {
-        RmuxError::protocol(rmux_proto::RmuxError::Server(format!(
+        RmuxError::from_proto(rmux_proto::RmuxError::Server(format!(
             "pane surface response had malformed row-major cell shape: {error}"
         )))
     })?;
@@ -462,11 +462,11 @@ fn snapshot_from_proto(value: ProtoSnapshot) -> Result<PaneSurfaceSnapshot> {
 }
 
 fn invalid_surface_metadata(message: &str) -> RmuxError {
-    RmuxError::protocol(rmux_proto::RmuxError::Server(message.to_owned()))
+    RmuxError::from_proto(rmux_proto::RmuxError::Server(message.to_owned()))
 }
 
 fn wrong_projection() -> RmuxError {
-    RmuxError::protocol(rmux_proto::RmuxError::Server(
+    RmuxError::from_proto(rmux_proto::RmuxError::Server(
         "rmux daemon sent a raw event to a surface stream".to_owned(),
     ))
 }

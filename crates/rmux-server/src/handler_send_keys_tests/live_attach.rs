@@ -1,30 +1,51 @@
 use super::*;
+use crate::handler::pane_support::LiveInputWork;
 use crate::handler::QueuedLifecycleEvent;
 use rmux_core::LifecycleEvent;
 
 const LONG_PREFIX_CHAIN_REPETITIONS: usize = 8_192;
 const LARGE_FOCUS_CHAIN_REPETITIONS: usize = 4_096;
 const PROMPT_CANCEL_CHAIN_REPETITIONS: usize = 512;
-// These stress cases execute one real binding command per repetition in a
-// debug test binary. Keep the 8K recursion regression load and give parallel
-// nextest runs headroom without removing the finite completion bound.
-const LONG_PREFIX_CHAIN_TIMEOUT: Duration = if cfg!(windows) {
-    Duration::from_secs(120)
-} else {
-    Duration::from_secs(60)
-};
-const ITERATIVE_INPUT_CHAIN_TIMEOUT: Duration = if cfg!(windows) {
-    Duration::from_secs(60)
-} else {
-    Duration::from_secs(30)
-};
-const BOUNDED_REROUTE_CHAIN_TIMEOUT: Duration = Duration::from_secs(30);
+// These stress cases bound the work a large frame causes, not the time a loaded
+// host takes to do it. A live input step is handed at most one reroute chunk of
+// the frame (1 KiB) plus the few bytes the client retained before it: a step
+// handed the whole rest of the frame turns reroute copies into quadratic work.
+const LIVE_INPUT_STEP_BYTES_BOUND: usize = 2 * 1024;
+// One frame's steps run one after another from the same few stack depths; a
+// frame handled by recursion starts each key's step deeper on the stack.
+const LIVE_INPUT_STACK_SPAN_BOUND: usize = 256 * 1024;
 const BACKGROUND_RUN_SHELL_TIMEOUT: Duration = if cfg!(windows) {
     // A cold PowerShell process can exceed ten seconds on hosted Windows CI.
     Duration::from_secs(30)
 } else {
     Duration::from_secs(10)
 };
+
+/// A step per key of a frame, and at most one more per reroute chunk the frame is split into.
+fn key_steps(keys: usize, frame_bytes: usize) -> std::ops::RangeInclusive<usize> {
+    keys..=keys + frame_bytes.div_ceil(1024)
+}
+
+/// Asserts that a frame took a number of live input steps within `steps`, each handed a bounded
+/// part of the frame from a bounded stack depth.
+fn assert_live_input_work_bounded(
+    label: &str,
+    work: LiveInputWork,
+    steps: std::ops::RangeInclusive<usize>,
+) {
+    assert!(
+        steps.contains(&work.steps),
+        "{label}: the frame must take {steps:?} live input steps: {work:?}"
+    );
+    assert!(
+        work.largest_step_bytes <= LIVE_INPUT_STEP_BYTES_BOUND,
+        "{label}: a step must not be handed the rest of the frame: {work:?}"
+    );
+    assert!(
+        work.stack_span <= LIVE_INPUT_STACK_SPAN_BOUND,
+        "{label}: steps must not recurse with the frame: {work:?}"
+    );
+}
 
 async fn set_global_hook(handler: &RequestHandler, hook: HookName, command: &str) {
     let response = handler
@@ -92,6 +113,14 @@ async fn enable_mouse(handler: &RequestHandler) {
 #[tokio::test]
 async fn send_keys_uses_runtime_extended_key_format_for_mode_two() {
     let handler = RequestHandler::new();
+    handler
+        .handle(Request::SetOption(SetOptionRequest {
+            scope: ScopeSelector::Global,
+            option: OptionName::ExtendedKeys,
+            value: "on".to_owned(),
+            mode: SetOptionMode::Replace,
+        }))
+        .await;
     let alpha = session_name("alpha");
 
     create_send_keys_test_session(&handler, &alpha).await;
@@ -167,6 +196,193 @@ async fn send_keys_sends_modified_cursor_keys_without_extended_mode() {
 
     capture.finish(&handler, &alpha).await;
     capture.assert_contents(&handler, expected).await;
+}
+
+/// Measured against tmux 3.7b: modified function and editing keys
+/// keep their modifier inside the xterm sequence.
+const MODIFIED_FUNCTION_KEYS_LIKE_TMUX: [(&str, &[u8]); 8] = [
+    ("S-F1", b"\x1b[1;2P"),
+    ("S-F12", b"\x1b[24;2~"),
+    ("M-F5", b"\x1b[15;3~"),
+    ("C-F5", b"\x1b[15;5~"),
+    ("S-NPage", b"\x1b[6;2~"),
+    ("C-PPage", b"\x1b[5;5~"),
+    ("C-DC", b"\x1b[3;5~"),
+    ("C-M-S-IC", b"\x1b[2;8~"),
+];
+
+fn modified_function_keys_like_tmux_bytes() -> Vec<u8> {
+    MODIFIED_FUNCTION_KEYS_LIKE_TMUX
+        .iter()
+        .flat_map(|(_, sequence)| sequence.iter().copied())
+        .collect()
+}
+
+#[tokio::test]
+async fn send_keys_sends_modified_function_and_editing_keys_like_tmux() {
+    let handler = RequestHandler::new();
+    let alpha = session_name("alpha");
+
+    create_send_keys_test_session(&handler, &alpha).await;
+
+    let expected = modified_function_keys_like_tmux_bytes();
+    let capture =
+        RawPaneInputProbe::start(&handler, &alpha, "send-keys-modified-fkeys", expected.len())
+            .await;
+    let response = handler
+        .handle(Request::SendKeys(SendKeysRequest {
+            target: PaneTarget::new(alpha.clone(), 0),
+            keys: MODIFIED_FUNCTION_KEYS_LIKE_TMUX
+                .iter()
+                .map(|(name, _)| (*name).to_owned())
+                .collect(),
+        }))
+        .await;
+    assert_eq!(
+        response,
+        Response::SendKeys(SendKeysResponse {
+            key_count: MODIFIED_FUNCTION_KEYS_LIKE_TMUX.len()
+        })
+    );
+
+    capture.finish(&handler, &alpha).await;
+    capture.assert_contents(&handler, &expected).await;
+}
+
+#[tokio::test]
+async fn live_attach_forwards_modified_function_and_editing_keys_like_tmux() {
+    let handler = RequestHandler::new();
+    let alpha = session_name("alpha");
+    let requester_pid = std::process::id();
+
+    create_send_keys_test_session(&handler, &alpha).await;
+    let (control_tx, _control_rx) = mpsc::unbounded_channel();
+    let _attach_id = handler
+        .register_attach(requester_pid, alpha.clone(), control_tx)
+        .await;
+
+    // The client terminal types the xterm sequences; tmux forwards them intact.
+    let expected = modified_function_keys_like_tmux_bytes();
+    let capture = RawPaneInputProbe::start(
+        &handler,
+        &alpha,
+        "live-attach-modified-fkeys",
+        expected.len(),
+    )
+    .await;
+    for (name, sequence) in MODIFIED_FUNCTION_KEYS_LIKE_TMUX {
+        handler
+            .handle_attached_live_input_for_test(requester_pid, sequence)
+            .await
+            .unwrap_or_else(|error| panic!("{name} input: {error:?}"));
+    }
+
+    capture.finish(&handler, &alpha).await;
+    capture.assert_contents(&handler, &expected).await;
+}
+
+/// Measured against tmux 3.7b: a client terminal that sends Meta as an Escape
+/// prefix (typed, then the pane's bytes). The Escape reaches the pane before
+/// its key; an Escape before xterm Home is tmux's M-Home.
+const ESCAPE_THEN_KEY_LIKE_TMUX: [(&str, &[u8], &[u8]); 9] = [
+    ("Escape F5", b"\x1b\x1b[15~", b"\x1b\x1b[15~"),
+    ("Escape Up", b"\x1b\x1b[A", b"\x1b\x1b[A"),
+    ("Escape DC", b"\x1b\x1b[3~", b"\x1b\x1b[3~"),
+    ("Escape S-F5", b"\x1b\x1b[15;2~", b"\x1b\x1b[15;2~"),
+    ("Escape C-DC", b"\x1b\x1b[3;5~", b"\x1b\x1b[3;5~"),
+    ("Escape S-Up", b"\x1b\x1b[1;2A", b"\x1b\x1b[1;2A"),
+    ("Escape M-Up", b"\x1b\x1b[1;3A", b"\x1b\x1b[1;3A"),
+    ("Escape Home", b"\x1b\x1b[H", b"\x1b[1;3H"),
+    ("Escape SS3 Up", b"\x1b\x1bOA", b"\x1b\x1b[A"),
+];
+
+#[tokio::test]
+async fn live_attach_forwards_escape_then_a_key_in_order_like_tmux() {
+    let handler = RequestHandler::new();
+    let alpha = session_name("alpha");
+    let requester_pid = std::process::id();
+
+    create_send_keys_test_session(&handler, &alpha).await;
+    let (control_tx, _control_rx) = mpsc::unbounded_channel();
+    let _attach_id = handler
+        .register_attach(requester_pid, alpha.clone(), control_tx)
+        .await;
+
+    let expected: Vec<u8> = ESCAPE_THEN_KEY_LIKE_TMUX
+        .iter()
+        .flat_map(|(_, _, sequence)| sequence.iter().copied())
+        .collect();
+    let capture =
+        RawPaneInputProbe::start(&handler, &alpha, "live-attach-escape-key", expected.len()).await;
+    let mut pending_input = Vec::new();
+    for (name, typed, _) in ESCAPE_THEN_KEY_LIKE_TMUX {
+        // One terminal read per key, then escape-time expires, as on a client.
+        handler
+            .handle_attached_live_input(requester_pid, &mut pending_input, typed)
+            .await
+            .unwrap_or_else(|error| panic!("{name} input: {error:?}"));
+        if !pending_input.is_empty() {
+            handler
+                .flush_attached_pending_escape_input(requester_pid, &mut pending_input)
+                .await
+                .unwrap_or_else(|error| panic!("{name} escape-time flush: {error:?}"));
+        }
+    }
+
+    capture.finish(&handler, &alpha).await;
+    capture.assert_contents(&handler, &expected).await;
+}
+
+/// A key's name, the terminal reads it arrives in, and what the pane receives.
+type ReadsThenPane = (&'static str, &'static [&'static [u8]], &'static [u8]);
+
+/// Measured against tmux 3.7b: M-O (`ESC O`, a prefix that escape-time
+/// retains) followed in the same terminal read by a key frame reaches the
+/// pane before that key, also when the frame ends in the next read.
+const META_O_THEN_KEY_LIKE_TMUX: [ReadsThenPane; 4] = [
+    ("M-O Up", &[b"\x1bO\x1b[A"], b"\x1bO\x1b[A"),
+    ("M-O F5", &[b"\x1bO\x1b[15~"], b"\x1bO\x1b[15~"),
+    ("M-O S-Up", &[b"\x1bO\x1b[1;2A"], b"\x1bO\x1b[1;2A"),
+    ("M-O F5 split", &[b"\x1bO\x1b[1", b"5~"], b"\x1bO\x1b[15~"),
+];
+
+#[tokio::test]
+async fn live_attach_forwards_meta_o_before_the_key_frame_read_with_it() {
+    let handler = RequestHandler::new();
+    let alpha = session_name("alpha");
+    let requester_pid = std::process::id();
+
+    create_send_keys_test_session(&handler, &alpha).await;
+    let (control_tx, _control_rx) = mpsc::unbounded_channel();
+    let _attach_id = handler
+        .register_attach(requester_pid, alpha.clone(), control_tx)
+        .await;
+
+    let expected: Vec<u8> = META_O_THEN_KEY_LIKE_TMUX
+        .iter()
+        .flat_map(|(_, _, sequence)| sequence.iter().copied())
+        .collect();
+    let capture =
+        RawPaneInputProbe::start(&handler, &alpha, "live-attach-meta-o-key", expected.len()).await;
+    let mut pending_input = Vec::new();
+    for (name, reads, _) in META_O_THEN_KEY_LIKE_TMUX {
+        for typed in reads {
+            handler
+                .handle_attached_live_input(requester_pid, &mut pending_input, typed)
+                .await
+                .unwrap_or_else(|error| panic!("{name} input: {error:?}"));
+        }
+        // Escape-time expires only after the whole key has been read.
+        if !pending_input.is_empty() {
+            handler
+                .flush_attached_pending_escape_input(requester_pid, &mut pending_input)
+                .await
+                .unwrap_or_else(|error| panic!("{name} escape-time flush: {error:?}"));
+        }
+    }
+
+    capture.finish(&handler, &alpha).await;
+    capture.assert_contents(&handler, &expected).await;
 }
 
 #[cfg(windows)]
@@ -473,7 +689,7 @@ async fn assert_prefix_chunks(
     binding_key: &str,
     chunks: &[&[u8]],
     expected_pane_input: &[u8],
-) {
+) -> LiveInputWork {
     assert_prefix_option_chunks(
         label,
         OptionName::Prefix,
@@ -482,7 +698,7 @@ async fn assert_prefix_chunks(
         chunks,
         expected_pane_input,
     )
-    .await;
+    .await
 }
 
 async fn assert_prefix_option_chunks(
@@ -492,7 +708,7 @@ async fn assert_prefix_option_chunks(
     binding_key: &str,
     chunks: &[&[u8]],
     expected_pane_input: &[u8],
-) {
+) -> LiveInputWork {
     let handler = RequestHandler::new();
     let alpha = session_name(label);
     let requester_pid = std::process::id();
@@ -532,18 +748,21 @@ async fn assert_prefix_option_chunks(
     let capture =
         RawPaneInputProbe::start(&handler, &alpha, label, expected_pane_input.len()).await;
     let mut pending_input = Vec::new();
+    handler.live_input_work.take();
     for chunk in chunks {
         handler
             .handle_attached_live_input(requester_pid, &mut pending_input, chunk)
             .await
             .expect("printable prefix input succeeds");
     }
+    let work = handler.live_input_work.take();
     assert!(pending_input.is_empty());
 
     wait_for_buffer(&handler, "printable-prefix-hit", "yes").await;
     capture.finish(&handler, &alpha).await;
     capture.assert_contents(&handler, expected_pane_input).await;
     control_drain.abort();
+    work
 }
 
 #[tokio::test]
@@ -684,18 +903,17 @@ async fn live_attach_meta_unicode_prefix2_dispatches() {
 #[tokio::test]
 async fn live_attach_active_prefix_table_keeps_large_reroute_chain_bounded() {
     let input = b"yx".repeat(LONG_PREFIX_CHAIN_REPETITIONS);
-    tokio::time::timeout(
-        LONG_PREFIX_CHAIN_TIMEOUT,
-        assert_prefix_chunks(
-            "printable-prefix-active-large",
-            "x",
-            "y",
-            &[b"x".as_slice(), input.as_slice()],
-            b"",
-        ),
+    let work = assert_prefix_chunks(
+        "printable-prefix-active-large",
+        "x",
+        "y",
+        &[b"x".as_slice(), input.as_slice()],
+        b"",
     )
-    .await
-    .expect("active prefix table must keep large reroute work bounded");
+    .await;
+    // Every byte is a key: the active prefix table's binding, then the prefix again.
+    let keys = 1 + input.len();
+    assert_live_input_work_bounded("active prefix table", work, key_steps(keys, keys));
 }
 
 #[tokio::test]
@@ -730,13 +948,17 @@ async fn live_attach_long_prefix_chain_is_processed_iteratively() {
         spawn_accounted_attach_control_drain(&handler, requester_pid, control_rx).await;
     let input = b"\x02X".repeat(LONG_PREFIX_CHAIN_REPETITIONS);
 
-    tokio::time::timeout(
-        LONG_PREFIX_CHAIN_TIMEOUT,
-        handler.handle_attached_live_input_for_test(requester_pid, &input),
-    )
-    .await
-    .expect("long prefix chain must finish without recursive growth")
-    .expect("long prefix chain dispatch succeeds");
+    handler.live_input_work.take();
+    handler
+        .handle_attached_live_input_for_test(requester_pid, &input)
+        .await
+        .expect("long prefix chain dispatch succeeds");
+    // Every byte is a key: the prefix, then its binding.
+    assert_live_input_work_bounded(
+        "long prefix chain",
+        handler.live_input_work.take(),
+        key_steps(input.len(), input.len()),
+    );
 
     control_drain.abort();
     let state = handler.state.lock().await;
@@ -776,16 +998,22 @@ async fn live_attach_prompt_cancel_chain_is_processed_iteratively() {
         .await;
     let control_drain =
         spawn_accounted_attach_control_drain(&handler, requester_pid, control_rx).await;
-    let mut input = b"\x02:\x1b".repeat(PROMPT_CANCEL_CHAIN_REPETITIONS);
+    // C-c cancels each prompt: an Escape that another byte of the same read
+    // follows is that byte's key with Meta (tmux 3.7b `tty_keys_next`).
+    let mut input = b"\x02:\x03".repeat(PROMPT_CANCEL_CHAIN_REPETITIONS);
     input.extend_from_slice(b"\x02X");
 
-    tokio::time::timeout(
-        ITERATIVE_INPUT_CHAIN_TIMEOUT,
-        handler.handle_attached_live_input_for_test(requester_pid, &input),
-    )
-    .await
-    .expect("prompt cancel chain must finish without recursive growth")
-    .expect("prompt cancel chain dispatch succeeds");
+    handler.live_input_work.take();
+    handler
+        .handle_attached_live_input_for_test(requester_pid, &input)
+        .await
+        .expect("prompt cancel chain dispatch succeeds");
+    // Every byte is a key: the prefix, the prompt it opens, the C-c that cancels it.
+    assert_live_input_work_bounded(
+        "prompt cancel chain",
+        handler.live_input_work.take(),
+        key_steps(input.len(), input.len()),
+    );
 
     assert!(!handler.prompt_active(requester_pid).await);
     control_drain.abort();
@@ -803,6 +1031,9 @@ async fn live_attach_menu_close_reroutes_same_chunk_tail_to_pane() {
     let requester_pid = std::process::id();
 
     create_send_keys_test_session(&handler, &alpha).await;
+    handler
+        .disable_pane_focus_reports_for_test(&PaneTarget::new(alpha.clone(), 0))
+        .await;
     let (control_tx, _control_rx) = mpsc::unbounded_channel();
     let _attach_id = handler
         .register_attach(requester_pid, alpha.clone(), control_tx)
@@ -911,6 +1142,9 @@ async fn live_attach_popup_escape_closes_only_after_timeout() {
     let requester_pid = std::process::id();
 
     create_send_keys_test_session(&handler, &alpha).await;
+    handler
+        .disable_pane_focus_reports_for_test(&PaneTarget::new(alpha.clone(), 0))
+        .await;
     let (control_tx, _control_rx) = mpsc::unbounded_channel();
     let _attach_id = handler
         .register_attach(requester_pid, alpha.clone(), control_tx)
@@ -1135,7 +1369,9 @@ async fn live_attach_clock_mode_reroutes_complete_bracketed_paste() {
     let alpha = session_name("clock-paste");
     let requester_pid = std::process::id();
 
-    create_send_keys_test_session(&handler, &alpha).await;
+    // This case requires an unaware pane. An interactive Bash prompt can
+    // asynchronously enable DECSET 2004 and legitimately preserve the wrappers.
+    create_quiet_input_session(&handler, &alpha).await;
     let (control_tx, _control_rx) = mpsc::unbounded_channel();
     let _attach_id = handler
         .register_attach(requester_pid, alpha.clone(), control_tx)
@@ -1277,6 +1513,7 @@ async fn send_keys_m_forwards_the_current_mouse_event_to_the_pane() {
             .get_mut(&requester_pid)
             .expect("attached client exists");
         active.mouse.current_event = Some(AttachedMouseEvent {
+            coordinates: None,
             raw,
             session_id: 0,
             window_id: Some(window_id.as_u32()),
@@ -1380,6 +1617,14 @@ async fn read_only_live_attach_drops_decoded_key_input() {
 #[tokio::test]
 async fn live_attach_shift_enter_csi_u_survives_extended_key_mode() {
     let handler = RequestHandler::new();
+    handler
+        .handle(Request::SetOption(SetOptionRequest {
+            scope: ScopeSelector::Global,
+            option: OptionName::ExtendedKeys,
+            value: "on".to_owned(),
+            mode: SetOptionMode::Replace,
+        }))
+        .await;
     let alpha = session_name("alpha");
     let requester_pid = std::process::id();
 
@@ -2245,6 +2490,1282 @@ async fn live_attach_focus_sequences_are_consumed_at_attach_boundary() {
 }
 
 #[tokio::test]
+async fn live_attach_focus_out_publishes_client_flag_without_blocking_plain_input() {
+    let handler = RequestHandler::new();
+    let alpha = session_name("focus-client-flag");
+    let requester_pid = std::process::id();
+
+    create_send_keys_test_session(&handler, &alpha).await;
+    let (control_tx, _control_rx) = mpsc::unbounded_channel();
+    handler
+        .register_attach(requester_pid, alpha.clone(), control_tx)
+        .await;
+
+    handler
+        .handle_attached_live_input_for_test(requester_pid, b"\x1b[O")
+        .await
+        .expect("focus-out report succeeds");
+    let flags_after_focus_out = {
+        let active_attach = handler.active_attach.lock().await;
+        let active = active_attach
+            .by_pid
+            .get(&requester_pid)
+            .expect("attached client exists");
+        crate::handler::client_runtime_support::format_attached_client_flags(active)
+    };
+    assert_eq!(flags_after_focus_out, "attached");
+
+    let capture = RawPaneInputProbe::start(&handler, &alpha, "unfocused-plain-input", 1).await;
+    handler
+        .handle_attached_live_input_for_test(requester_pid, b"z")
+        .await
+        .expect("plain input remains writable while unfocused");
+    capture.finish(&handler, &alpha).await;
+    capture.assert_contents(&handler, b"z").await;
+
+    let flags_after_plain_input = {
+        let active_attach = handler.active_attach.lock().await;
+        let active = active_attach
+            .by_pid
+            .get(&requester_pid)
+            .expect("attached client exists");
+        crate::handler::client_runtime_support::format_attached_client_flags(active)
+    };
+    assert_eq!(flags_after_plain_input, "attached");
+}
+
+#[tokio::test]
+async fn repeated_focus_out_emits_client_hooks_but_one_pane_edge() {
+    let handler = RequestHandler::new();
+    let alpha = session_name("focus-repeated-out");
+    let requester_pid = std::process::id();
+
+    create_send_keys_test_session(&handler, &alpha).await;
+    {
+        let mut state = handler.state.lock().await;
+        state
+            .append_bytes_to_pane_transcript_for_test(&alpha, 0, 0, b"\x1b[?1004h")
+            .expect("pane enables focus reporting");
+    }
+    let (control_tx, _control_rx) = mpsc::unbounded_channel();
+    handler
+        .register_attach(requester_pid, alpha.clone(), control_tx)
+        .await;
+    let mut lifecycle = handler.subscribe_lifecycle_events();
+    let capture = RawPaneInputProbe::start(&handler, &alpha, "focus-repeated-out", 3).await;
+
+    handler
+        .handle_attached_live_input_for_test(requester_pid, b"\x1b[O\x1b[O")
+        .await
+        .expect("repeated focus-out reports succeed");
+
+    capture.finish(&handler, &alpha).await;
+    capture.assert_contents(&handler, b"\x1b[O").await;
+    let mut client_focus_out = 0;
+    let mut pane_focus_out = 0;
+    while let Ok(event) = lifecycle.try_recv() {
+        match event.event {
+            LifecycleEvent::ClientFocusOut { .. } => client_focus_out += 1,
+            LifecycleEvent::PaneFocusOut { .. } => pane_focus_out += 1,
+            _ => {}
+        }
+    }
+    assert_eq!(client_focus_out, 2);
+    assert_eq!(pane_focus_out, 1);
+}
+
+#[tokio::test]
+async fn pane_focus_out_waits_for_last_focused_native_attach() {
+    let handler = RequestHandler::new();
+    let alpha = session_name("focus-two-attaches");
+    let first_pid = std::process::id();
+    let second_pid = first_pid.saturating_add(1);
+
+    create_send_keys_test_session(&handler, &alpha).await;
+    {
+        let mut state = handler.state.lock().await;
+        state
+            .append_bytes_to_pane_transcript_for_test(&alpha, 0, 0, b"\x1b[?1004h")
+            .expect("pane enables focus reporting");
+    }
+    let (first_tx, _first_rx) = mpsc::unbounded_channel();
+    handler
+        .register_attach(first_pid, alpha.clone(), first_tx)
+        .await;
+    let (second_tx, _second_rx) = mpsc::unbounded_channel();
+    handler
+        .register_attach(second_pid, alpha.clone(), second_tx)
+        .await;
+    let mut lifecycle = handler.subscribe_lifecycle_events();
+    let capture = RawPaneInputProbe::start(&handler, &alpha, "focus-two-attaches", 3).await;
+
+    handler
+        .handle_attached_live_input_for_test(first_pid, b"\x1b[O")
+        .await
+        .expect("first focus-out succeeds");
+    {
+        let state = handler.state.lock().await;
+        assert_eq!(
+            state.pane_input_capture_for_test(&PaneTarget::new(alpha.clone(), 0)),
+            Some(Vec::new())
+        );
+    }
+    let first_focus_events = std::iter::from_fn(|| lifecycle.try_recv().ok())
+        .map(|event| event.event)
+        .filter(|event| {
+            matches!(
+                event,
+                LifecycleEvent::ClientFocusIn { .. }
+                    | LifecycleEvent::ClientFocusOut { .. }
+                    | LifecycleEvent::PaneFocusIn { .. }
+                    | LifecycleEvent::PaneFocusOut { .. }
+            )
+        })
+        .collect::<Vec<_>>();
+    assert!(matches!(
+        first_focus_events.as_slice(),
+        [LifecycleEvent::ClientFocusOut { .. }]
+    ));
+
+    handler
+        .handle_attached_live_input_for_test(second_pid, b"\x1b[O")
+        .await
+        .expect("last focus-out succeeds");
+    capture.finish(&handler, &alpha).await;
+    capture.assert_contents(&handler, b"\x1b[O").await;
+    let remaining = std::iter::from_fn(|| lifecycle.try_recv().ok())
+        .map(|event| event.event)
+        .filter(|event| {
+            matches!(
+                event,
+                LifecycleEvent::ClientFocusIn { .. }
+                    | LifecycleEvent::ClientFocusOut { .. }
+                    | LifecycleEvent::PaneFocusIn { .. }
+                    | LifecycleEvent::PaneFocusOut { .. }
+            )
+        })
+        .collect::<Vec<_>>();
+    assert!(matches!(
+        remaining.as_slice(),
+        [
+            LifecycleEvent::PaneFocusOut { .. },
+            LifecycleEvent::ClientFocusOut { .. }
+        ]
+    ));
+}
+
+#[tokio::test]
+async fn focus_reports_cover_outer_option_and_child_mode_matrix() {
+    let handler = RequestHandler::new();
+    for (index, (case, focus_events, child_focus_mode)) in [
+        ("off-off", false, false),
+        ("off-on", false, true),
+        ("on-off", true, false),
+        ("on-on", true, true),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let alpha = session_name(&format!("focus-matrix-{case}"));
+        let requester_pid = std::process::id().saturating_add(index as u32);
+        create_send_keys_test_session(&handler, &alpha).await;
+        // Native startup may enable focus reporting; finish it before pinning
+        // the child mode so the matrix owns the mode used by both reports.
+        handler
+            .wait_for_pane_startup_to_finish_for_test(&PaneTarget::new(alpha.clone(), 0))
+            .await;
+        let configured = handler
+            .handle(Request::SetOption(SetOptionRequest {
+                scope: ScopeSelector::Global,
+                option: OptionName::FocusEvents,
+                value: if focus_events { "on" } else { "off" }.to_owned(),
+                mode: SetOptionMode::Replace,
+            }))
+            .await;
+        assert!(
+            matches!(configured, Response::SetOption(_)),
+            "{configured:?}"
+        );
+        {
+            let mut state = handler.state.lock().await;
+            state
+                .append_bytes_to_pane_transcript_for_test(
+                    &alpha,
+                    0,
+                    0,
+                    if child_focus_mode {
+                        b"\x1b[?1004h"
+                    } else {
+                        b"\x1b[?1004l"
+                    },
+                )
+                .expect("child focus mode is pinned");
+        }
+        let (control_tx, _control_rx) = mpsc::unbounded_channel();
+        handler
+            .register_attach(requester_pid, alpha.clone(), control_tx)
+            .await;
+        let mut lifecycle = handler.subscribe_lifecycle_events();
+        let expected = if child_focus_mode {
+            b"\x1b[O\x1b[I".as_slice()
+        } else {
+            b"".as_slice()
+        };
+        let target = PaneTarget::new(alpha.clone(), 0);
+        {
+            let state = handler.state.lock().await;
+            state.start_pane_input_capture_for_test(&target);
+        }
+
+        handler
+            .handle_attached_live_input_for_test(requester_pid, b"\x1b[O")
+            .await
+            .expect("focus matrix out report succeeds");
+        handler
+            .handle_attached_live_input_for_test(requester_pid, b"\x1b[I")
+            .await
+            .expect("focus matrix in report succeeds");
+        {
+            let state = handler.state.lock().await;
+            assert_eq!(
+                state.pane_input_capture_for_test(&target),
+                Some(expected.to_vec())
+            );
+        }
+
+        let events = std::iter::from_fn(|| lifecycle.try_recv().ok())
+            .map(|event| event.event)
+            .filter(|event| {
+                matches!(
+                    event,
+                    LifecycleEvent::ClientFocusIn { .. }
+                        | LifecycleEvent::ClientFocusOut { .. }
+                        | LifecycleEvent::PaneFocusIn { .. }
+                        | LifecycleEvent::PaneFocusOut { .. }
+                )
+            })
+            .collect::<Vec<_>>();
+        assert!(matches!(
+            events.as_slice(),
+            [
+                LifecycleEvent::PaneFocusOut { .. },
+                LifecycleEvent::ClientFocusOut { .. },
+                LifecycleEvent::ClientFocusIn { .. },
+                LifecycleEvent::PaneFocusIn { .. }
+            ]
+        ));
+        let active_attach = handler.active_attach.lock().await;
+        assert!(active_attach.by_pid[&requester_pid].reported_focused);
+    }
+}
+
+#[tokio::test]
+async fn split_and_kill_selected_pane_publish_focus_in_commit_order() {
+    let handler = RequestHandler::new();
+    let alpha = session_name("focus-split-kill");
+    let requester_pid = std::process::id();
+    create_send_keys_test_session(&handler, &alpha).await;
+    let first = PaneTarget::with_window(alpha.clone(), 0, 0);
+    {
+        let mut state = handler.state.lock().await;
+        state
+            .append_bytes_to_pane_transcript_for_test(&alpha, 0, 0, b"\x1b[?1004h")
+            .expect("first pane enables focus reporting");
+    }
+    let (control_tx, _control_rx) = mpsc::unbounded_channel();
+    handler
+        .register_attach(requester_pid, alpha.clone(), control_tx)
+        .await;
+    let mut lifecycle = handler.subscribe_lifecycle_events();
+    {
+        let state = handler.state.lock().await;
+        state.start_pane_input_capture_for_test(&first);
+    }
+
+    let rejected = handler
+        .handle(Request::SplitWindow(SplitWindowRequest {
+            target: SplitWindowTarget::Pane(PaneTarget::with_window(alpha.clone(), 0, 99)),
+            direction: SplitDirection::Horizontal,
+            before: false,
+            environment: None,
+        }))
+        .await;
+    assert!(matches!(rejected, Response::Error(_)), "{rejected:?}");
+    {
+        let state = handler.state.lock().await;
+        assert_eq!(
+            state.pane_input_capture_for_test(&first),
+            Some(Vec::new()),
+            "a rejected mutation must not publish focus bytes"
+        );
+    }
+    assert!(
+        lifecycle.try_recv().is_err(),
+        "a rejected mutation must not reserve focus lifecycle effects"
+    );
+
+    let split = handler
+        .handle(Request::SplitWindow(SplitWindowRequest {
+            target: SplitWindowTarget::Session(alpha.clone()),
+            direction: SplitDirection::Horizontal,
+            before: false,
+            environment: None,
+        }))
+        .await;
+    assert!(matches!(split, Response::SplitWindow(_)), "{split:?}");
+    let second = PaneTarget::with_window(alpha.clone(), 0, 1);
+    {
+        let mut state = handler.state.lock().await;
+        assert_eq!(
+            state.pane_input_capture_for_test(&first),
+            Some(b"\x1b[O".to_vec())
+        );
+        state
+            .append_bytes_to_pane_transcript_for_test(&alpha, 0, 1, b"\x1b[?1004h")
+            .expect("second pane enables focus reporting");
+    }
+    let split_events = std::iter::from_fn(|| lifecycle.try_recv().ok())
+        .map(|event| event.event)
+        .filter(|event| {
+            matches!(
+                event,
+                LifecycleEvent::PaneFocusIn { .. }
+                    | LifecycleEvent::PaneFocusOut { .. }
+                    | LifecycleEvent::WindowPaneChanged { .. }
+            )
+        })
+        .collect::<Vec<_>>();
+    assert!(matches!(
+        split_events.as_slice(),
+        [
+            LifecycleEvent::PaneFocusOut { .. },
+            LifecycleEvent::PaneFocusIn { .. },
+            LifecycleEvent::WindowPaneChanged { .. }
+        ]
+    ));
+
+    {
+        let state = handler.state.lock().await;
+        state.start_pane_input_capture_for_test(&first);
+    }
+    let killed = handler
+        .handle(Request::KillPane(rmux_proto::KillPaneRequest {
+            target: second,
+            kill_all_except: false,
+        }))
+        .await;
+    assert!(matches!(killed, Response::KillPane(_)), "{killed:?}");
+    {
+        let state = handler.state.lock().await;
+        assert_eq!(
+            state.pane_input_capture_for_test(&first),
+            Some(b"\x1b[I".to_vec())
+        );
+    }
+    let kill_events = std::iter::from_fn(|| lifecycle.try_recv().ok())
+        .map(|event| event.event)
+        .filter(|event| {
+            matches!(
+                event,
+                LifecycleEvent::PaneFocusIn { .. }
+                    | LifecycleEvent::PaneFocusOut { .. }
+                    | LifecycleEvent::PaneExited { .. }
+                    | LifecycleEvent::PaneDied { .. }
+            )
+        })
+        .collect::<Vec<_>>();
+    assert!(
+        matches!(
+            kill_events.as_slice(),
+            [
+                LifecycleEvent::PaneFocusOut { .. },
+                LifecycleEvent::PaneFocusIn { .. }
+            ]
+        ),
+        "{kill_events:?}"
+    );
+}
+
+#[tokio::test]
+async fn natural_exit_of_focused_pane_drains_focus_before_exit_lifecycle() {
+    let handler = RequestHandler::new();
+    let alpha = session_name("focus-natural-exit");
+    let requester_pid = std::process::id();
+    create_send_keys_test_session(&handler, &alpha).await;
+    let split = handler
+        .handle(Request::SplitWindow(SplitWindowRequest {
+            target: SplitWindowTarget::Session(alpha.clone()),
+            direction: SplitDirection::Horizontal,
+            before: false,
+            environment: None,
+        }))
+        .await;
+    assert!(matches!(split, Response::SplitWindow(_)), "{split:?}");
+
+    let exiting = PaneTarget::with_window(alpha.clone(), 0, 0);
+    let survivor_before = PaneTarget::with_window(alpha.clone(), 0, 1);
+    let selected = handler
+        .handle(Request::SelectPane(Box::new(SelectPaneRequest {
+            target: exiting.clone(),
+            title: None,
+            style: None,
+            input_disabled: None,
+            preserve_zoom: false,
+        })))
+        .await;
+    assert!(matches!(selected, Response::SelectPane(_)), "{selected:?}");
+    {
+        let mut state = handler.state.lock().await;
+        state
+            .append_bytes_to_pane_transcript_for_test(&alpha, 0, 0, b"\x1b[?1004h")
+            .expect("surviving pane enables focus reporting");
+        state
+            .append_bytes_to_pane_transcript_for_test(&alpha, 0, 1, b"\x1b[?1004h")
+            .expect("exiting pane enables focus reporting");
+    }
+    let (control_tx, _control_rx) = mpsc::unbounded_channel();
+    handler
+        .register_attach(requester_pid, alpha.clone(), control_tx)
+        .await;
+    let mut lifecycle = handler.subscribe_lifecycle_events();
+
+    let (pane_id, generation) = {
+        let mut state = handler.state.lock().await;
+        state.start_pane_input_capture_for_test(&survivor_before);
+        state.start_pane_input_capture_for_test(&exiting);
+        let pane_id = state
+            .sessions
+            .session(&alpha)
+            .and_then(|session| session.window_at(0))
+            .and_then(|window| window.pane(0))
+            .map(|pane| pane.id())
+            .expect("focused pane exists");
+        let generation = state.pane_output_generation_for_target(&exiting, pane_id);
+        state
+            .mark_pane_dead_without_exit_details(&exiting)
+            .expect("mark focused pane naturally exited");
+        (pane_id, generation)
+    };
+
+    tokio::time::timeout(
+        Duration::from_secs(2),
+        handler.handle_pane_exit_event(crate::pane_io::PaneExitEvent::eof_published(
+            alpha.clone(),
+            pane_id,
+            Some(generation),
+        )),
+    )
+    .await
+    .expect("focus and pane-exit lifecycle batches must make bounded progress");
+
+    {
+        let state = handler.state.lock().await;
+        assert_eq!(
+            state.pane_input_capture_for_test(&survivor_before),
+            Some(Vec::new()),
+            "the surviving runtime moved away from its old textual slot"
+        );
+        let survivor_after = PaneTarget::with_window(alpha.clone(), 0, 0);
+        assert_eq!(
+            state.pane_input_capture_for_test(&survivor_after),
+            Some(b"\x1b[I".to_vec()),
+            "the reindexed survivor receives focus-in without a stale writer"
+        );
+    }
+    let queued = std::iter::from_fn(|| lifecycle.try_recv().ok())
+        .filter(|event| {
+            matches!(
+                event.event,
+                LifecycleEvent::PaneFocusIn { .. }
+                    | LifecycleEvent::PaneFocusOut { .. }
+                    | LifecycleEvent::PaneExited { .. }
+            )
+        })
+        .collect::<Vec<_>>();
+    let events = queued
+        .iter()
+        .map(|event| event.event.clone())
+        .collect::<Vec<_>>();
+    assert!(
+        matches!(
+            events.as_slice(),
+            [
+                LifecycleEvent::PaneFocusOut { .. },
+                LifecycleEvent::PaneFocusIn { .. },
+                LifecycleEvent::PaneExited { .. }
+            ]
+        ),
+        "{events:?}"
+    );
+    assert_eq!(
+        events[0],
+        LifecycleEvent::PaneFocusOut {
+            target: exiting.clone()
+        }
+    );
+    assert!(queued[0].formats.iter().any(|(name, value)| {
+        name == "hook_pane" && value == &format!("%{}", pane_id.as_u32())
+    }));
+    assert!(queued[0]
+        .formats
+        .iter()
+        .any(|(name, value)| name == "pane_id" && value == &pane_id.to_string()));
+}
+
+#[tokio::test]
+async fn swap_pane_reconciles_focus_by_runtime_after_cross_session_transfer() {
+    let handler = RequestHandler::new();
+    let alpha = session_name("focus-swap-alpha");
+    let beta = session_name("focus-swap-beta");
+    let requester_pid = std::process::id();
+    create_send_keys_test_session(&handler, &alpha).await;
+    create_send_keys_test_session(&handler, &beta).await;
+    let alpha_target = PaneTarget::new(alpha.clone(), 0);
+    let beta_target = PaneTarget::new(beta.clone(), 0);
+    {
+        let mut state = handler.state.lock().await;
+        for session in [&alpha, &beta] {
+            state
+                .append_bytes_to_pane_transcript_for_test(session, 0, 0, b"\x1b[?1004h")
+                .expect("pane enables focus reporting");
+        }
+    }
+    let (control_tx, _control_rx) = mpsc::unbounded_channel();
+    handler
+        .register_attach(requester_pid, alpha.clone(), control_tx)
+        .await;
+    let mut lifecycle = handler.subscribe_lifecycle_events();
+    {
+        let state = handler.state.lock().await;
+        state.start_pane_input_capture_for_test(&alpha_target);
+        state.start_pane_input_capture_for_test(&beta_target);
+    }
+
+    let response = handler
+        .handle(Request::SwapPane(rmux_proto::SwapPaneRequest {
+            source: alpha_target.clone(),
+            target: beta_target.clone(),
+            direction: None,
+            detached: false,
+            preserve_zoom: false,
+        }))
+        .await;
+    assert!(matches!(response, Response::SwapPane(_)), "{response:?}");
+    {
+        let state = handler.state.lock().await;
+        assert_eq!(
+            state.pane_input_capture_for_test(&alpha_target),
+            Some(b"\x1b[I".to_vec())
+        );
+        assert_eq!(
+            state.pane_input_capture_for_test(&beta_target),
+            Some(b"\x1b[O".to_vec())
+        );
+    }
+    let focus_events = std::iter::from_fn(|| lifecycle.try_recv().ok())
+        .map(|event| event.event)
+        .filter(|event| {
+            matches!(
+                event,
+                LifecycleEvent::PaneFocusIn { .. } | LifecycleEvent::PaneFocusOut { .. }
+            )
+        })
+        .collect::<Vec<_>>();
+    assert!(
+        matches!(
+            focus_events.as_slice(),
+            [
+                LifecycleEvent::PaneFocusOut { .. },
+                LifecycleEvent::PaneFocusIn { .. }
+            ]
+        ),
+        "{focus_events:?}"
+    );
+}
+
+#[tokio::test]
+async fn join_and_move_pane_reconcile_focus_when_selected_source_leaves_window() {
+    for (label, join) in [("join", true), ("move", false)] {
+        let handler = RequestHandler::new();
+        let alpha = session_name(&format!("focus-{label}-alpha"));
+        let beta = session_name(&format!("focus-{label}-beta"));
+        let requester_pid = std::process::id();
+        create_send_keys_test_session(&handler, &alpha).await;
+        create_send_keys_test_session(&handler, &beta).await;
+        let split = handler
+            .handle(Request::SplitWindow(SplitWindowRequest {
+                target: SplitWindowTarget::Session(alpha.clone()),
+                direction: SplitDirection::Horizontal,
+                before: false,
+                environment: None,
+            }))
+            .await;
+        assert!(matches!(split, Response::SplitWindow(_)), "{split:?}");
+        let survivor = PaneTarget::with_window(alpha.clone(), 0, 0);
+        let source = PaneTarget::with_window(alpha.clone(), 0, 1);
+        let destination = PaneTarget::new(beta.clone(), 0);
+        {
+            let mut state = handler.state.lock().await;
+            for target in [&survivor, &source, &destination] {
+                state
+                    .append_bytes_to_pane_transcript_for_test(
+                        target.session_name(),
+                        target.window_index(),
+                        target.pane_index(),
+                        b"\x1b[?1004h",
+                    )
+                    .expect("pane enables focus reporting");
+            }
+        }
+        let (control_tx, _control_rx) = mpsc::unbounded_channel();
+        handler
+            .register_attach(requester_pid, alpha.clone(), control_tx)
+            .await;
+        let mut lifecycle = handler.subscribe_lifecycle_events();
+        {
+            let state = handler.state.lock().await;
+            state.start_pane_input_capture_for_test(&survivor);
+            state.start_pane_input_capture_for_test(&source);
+        }
+
+        let response = if join {
+            handler
+                .handle(Request::JoinPane(rmux_proto::JoinPaneRequest {
+                    source: source.clone(),
+                    target: destination.clone(),
+                    direction: SplitDirection::Vertical,
+                    detached: false,
+                    before: false,
+                    full_size: false,
+                    size: None,
+                }))
+                .await
+        } else {
+            handler
+                .handle(Request::MovePane(rmux_proto::MovePaneRequest {
+                    source: source.clone(),
+                    target: destination.clone(),
+                    direction: SplitDirection::Vertical,
+                    detached: false,
+                    before: false,
+                    full_size: false,
+                    size: None,
+                }))
+                .await
+        };
+        assert!(
+            matches!(response, Response::JoinPane(_) | Response::MovePane(_)),
+            "{label}: {response:?}"
+        );
+        {
+            let state = handler.state.lock().await;
+            assert_eq!(
+                state.pane_input_capture_for_test(&survivor),
+                Some(b"\x1b[I".to_vec()),
+                "{label}"
+            );
+        }
+        let focus_events = std::iter::from_fn(|| lifecycle.try_recv().ok())
+            .map(|event| event.event)
+            .filter(|event| {
+                matches!(
+                    event,
+                    LifecycleEvent::PaneFocusIn { .. } | LifecycleEvent::PaneFocusOut { .. }
+                )
+            })
+            .collect::<Vec<_>>();
+        assert!(
+            matches!(
+                focus_events.as_slice(),
+                [
+                    LifecycleEvent::PaneFocusOut { .. },
+                    LifecycleEvent::PaneFocusIn { .. }
+                ]
+            ),
+            "{label}: {focus_events:?}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn detached_break_pane_reconciles_focus_to_source_survivor() {
+    let handler = RequestHandler::new();
+    let alpha = session_name("focus-break-pane");
+    let requester_pid = std::process::id();
+    create_send_keys_test_session(&handler, &alpha).await;
+    let split = handler
+        .handle(Request::SplitWindow(SplitWindowRequest {
+            target: SplitWindowTarget::Session(alpha.clone()),
+            direction: SplitDirection::Horizontal,
+            before: false,
+            environment: None,
+        }))
+        .await;
+    assert!(matches!(split, Response::SplitWindow(_)), "{split:?}");
+    let survivor = PaneTarget::with_window(alpha.clone(), 0, 0);
+    let source = PaneTarget::with_window(alpha.clone(), 0, 1);
+    {
+        let mut state = handler.state.lock().await;
+        for target in [&survivor, &source] {
+            state
+                .append_bytes_to_pane_transcript_for_test(
+                    target.session_name(),
+                    target.window_index(),
+                    target.pane_index(),
+                    b"\x1b[?1004h",
+                )
+                .expect("pane enables focus reporting");
+        }
+    }
+    let (control_tx, _control_rx) = mpsc::unbounded_channel();
+    handler
+        .register_attach(requester_pid, alpha.clone(), control_tx)
+        .await;
+    let mut lifecycle = handler.subscribe_lifecycle_events();
+    {
+        let state = handler.state.lock().await;
+        state.start_pane_input_capture_for_test(&survivor);
+        state.start_pane_input_capture_for_test(&source);
+    }
+
+    let response = handler
+        .handle(Request::BreakPane(Box::new(rmux_proto::BreakPaneRequest {
+            source,
+            target: None,
+            name: None,
+            detached: true,
+            after: false,
+            before: false,
+            print_target: false,
+            format: None,
+        })))
+        .await;
+    assert!(matches!(response, Response::BreakPane(_)), "{response:?}");
+    {
+        let state = handler.state.lock().await;
+        assert_eq!(
+            state.pane_input_capture_for_test(&survivor),
+            Some(b"\x1b[I".to_vec())
+        );
+    }
+    let focus_events = std::iter::from_fn(|| lifecycle.try_recv().ok())
+        .map(|event| event.event)
+        .filter(|event| {
+            matches!(
+                event,
+                LifecycleEvent::PaneFocusIn { .. } | LifecycleEvent::PaneFocusOut { .. }
+            )
+        })
+        .collect::<Vec<_>>();
+    assert!(
+        matches!(
+            focus_events.as_slice(),
+            [
+                LifecycleEvent::PaneFocusOut { .. },
+                LifecycleEvent::PaneFocusIn { .. }
+            ]
+        ),
+        "{focus_events:?}"
+    );
+}
+
+#[tokio::test]
+async fn new_and_kill_selected_window_reconcile_focus_before_window_lifecycle() {
+    let handler = RequestHandler::new();
+    let alpha = session_name("focus-new-kill-window");
+    let requester_pid = std::process::id();
+    create_send_keys_test_session(&handler, &alpha).await;
+    let original = PaneTarget::with_window(alpha.clone(), 0, 0);
+    {
+        let mut state = handler.state.lock().await;
+        state
+            .append_bytes_to_pane_transcript_for_test(&alpha, 0, 0, b"\x1b[?1004h")
+            .expect("original pane enables focus reporting");
+    }
+    let (control_tx, _control_rx) = mpsc::unbounded_channel();
+    handler
+        .register_attach(requester_pid, alpha.clone(), control_tx)
+        .await;
+    let mut lifecycle = handler.subscribe_lifecycle_events();
+    {
+        let state = handler.state.lock().await;
+        state.start_pane_input_capture_for_test(&original);
+    }
+
+    let created = handler
+        .handle(Request::NewWindow(Box::new(rmux_proto::NewWindowRequest {
+            target: alpha.clone(),
+            name: None,
+            detached: false,
+            start_directory: None,
+            environment: None,
+            command: None,
+            process_command: None,
+            target_window_index: None,
+            insert_at_target: false,
+        })))
+        .await;
+    let Response::NewWindow(created) = created else {
+        panic!("expected new-window success, got {created:?}");
+    };
+    {
+        let state = handler.state.lock().await;
+        assert_eq!(
+            state.pane_input_capture_for_test(&original),
+            Some(b"\x1b[O".to_vec())
+        );
+    }
+    let new_events = std::iter::from_fn(|| lifecycle.try_recv().ok())
+        .map(|event| event.event)
+        .filter(|event| {
+            matches!(
+                event,
+                LifecycleEvent::PaneFocusIn { .. }
+                    | LifecycleEvent::PaneFocusOut { .. }
+                    | LifecycleEvent::SessionWindowChanged { .. }
+            )
+        })
+        .collect::<Vec<_>>();
+    assert!(
+        matches!(
+            new_events.as_slice(),
+            [
+                LifecycleEvent::PaneFocusOut { .. },
+                LifecycleEvent::PaneFocusIn { .. },
+                LifecycleEvent::SessionWindowChanged { .. }
+            ]
+        ),
+        "{new_events:?}"
+    );
+
+    {
+        let state = handler.state.lock().await;
+        state.start_pane_input_capture_for_test(&original);
+    }
+    let killed = handler
+        .handle(Request::KillWindow(rmux_proto::KillWindowRequest {
+            target: created.target,
+            kill_all_others: false,
+        }))
+        .await;
+    assert!(matches!(killed, Response::KillWindow(_)), "{killed:?}");
+    {
+        let state = handler.state.lock().await;
+        assert_eq!(
+            state.pane_input_capture_for_test(&original),
+            Some(b"\x1b[I".to_vec())
+        );
+    }
+    let kill_events = std::iter::from_fn(|| lifecycle.try_recv().ok())
+        .map(|event| event.event)
+        .filter(|event| {
+            matches!(
+                event,
+                LifecycleEvent::PaneFocusIn { .. }
+                    | LifecycleEvent::PaneFocusOut { .. }
+                    | LifecycleEvent::WindowUnlinked { .. }
+                    | LifecycleEvent::SessionWindowChanged { .. }
+            )
+        })
+        .collect::<Vec<_>>();
+    let focus_in = kill_events
+        .iter()
+        .position(|event| matches!(event, LifecycleEvent::PaneFocusIn { .. }))
+        .expect("surviving pane receives focus-in");
+    let first_window_event = kill_events
+        .iter()
+        .position(|event| {
+            matches!(
+                event,
+                LifecycleEvent::WindowUnlinked { .. } | LifecycleEvent::SessionWindowChanged { .. }
+            )
+        })
+        .expect("kill-window publishes its lifecycle batch");
+    assert!(focus_in < first_window_event, "{kill_events:?}");
+}
+
+#[tokio::test]
+async fn detach_commits_focus_out_before_client_detached_while_transport_stays_open() {
+    let handler = RequestHandler::new();
+    let alpha = session_name("focus-detach-order");
+    let requester_pid = std::process::id();
+    create_send_keys_test_session(&handler, &alpha).await;
+    let target = PaneTarget::new(alpha.clone(), 0);
+    {
+        let mut state = handler.state.lock().await;
+        state
+            .append_bytes_to_pane_transcript_for_test(&alpha, 0, 0, b"\x1b[?1004h")
+            .expect("pane enables focus reporting");
+    }
+    let (control_tx, mut control_rx) = mpsc::unbounded_channel();
+    let attach_id = handler
+        .register_attach(requester_pid, alpha.clone(), control_tx)
+        .await;
+    let mut lifecycle = handler.subscribe_lifecycle_events();
+    {
+        let state = handler.state.lock().await;
+        state.start_pane_input_capture_for_test(&target);
+    }
+
+    let response = handler
+        .dispatch(
+            requester_pid,
+            Request::DetachClient(rmux_proto::DetachClientRequest),
+        )
+        .await
+        .response;
+    assert!(
+        matches!(response, Response::DetachClient(_)),
+        "{response:?}"
+    );
+    assert!(
+        matches!(
+            control_rx.try_recv(),
+            Ok(crate::pane_io::AttachControl::Detach)
+        ),
+        "detach control remains observable before transport EOF"
+    );
+    {
+        let state = handler.state.lock().await;
+        assert_eq!(
+            state.pane_input_capture_for_test(&target),
+            Some(b"\x1b[O".to_vec())
+        );
+    }
+    {
+        let active_attach = handler.active_attach.lock().await;
+        assert!(
+            active_attach.by_pid[&requester_pid]
+                .closing
+                .load(std::sync::atomic::Ordering::SeqCst),
+            "focus removal is committed by closing, not deferred to EOF"
+        );
+    }
+    let events = std::iter::from_fn(|| lifecycle.try_recv().ok())
+        .map(|event| event.event)
+        .filter(|event| {
+            matches!(
+                event,
+                LifecycleEvent::PaneFocusOut { .. } | LifecycleEvent::ClientDetached { .. }
+            )
+        })
+        .collect::<Vec<_>>();
+    assert!(
+        matches!(
+            events.as_slice(),
+            [
+                LifecycleEvent::PaneFocusOut { .. },
+                LifecycleEvent::ClientDetached { .. }
+            ]
+        ),
+        "{events:?}"
+    );
+
+    handler.finish_attach(requester_pid, attach_id).await;
+}
+
+#[tokio::test]
+async fn renamed_session_resolves_last_focus_out_to_current_runtime_route() {
+    let handler = RequestHandler::new();
+    let alpha = session_name("focus-rename-alpha");
+    let beta = session_name("focus-rename-beta");
+    let requester_pid = std::process::id();
+    create_send_keys_test_session(&handler, &alpha).await;
+    {
+        let mut state = handler.state.lock().await;
+        state
+            .append_bytes_to_pane_transcript_for_test(&alpha, 0, 0, b"\x1b[?1004h")
+            .expect("pane enables focus reporting");
+    }
+    let (control_tx, _control_rx) = mpsc::unbounded_channel();
+    handler
+        .register_attach(requester_pid, alpha.clone(), control_tx)
+        .await;
+    let renamed = handler
+        .handle(Request::RenameSession(rmux_proto::RenameSessionRequest {
+            target: alpha,
+            new_name: beta.clone(),
+        }))
+        .await;
+    assert!(matches!(renamed, Response::RenameSession(_)), "{renamed:?}");
+    let current = PaneTarget::new(beta.clone(), 0);
+    let mut lifecycle = handler.subscribe_lifecycle_events();
+    {
+        let state = handler.state.lock().await;
+        state.start_pane_input_capture_for_test(&current);
+    }
+
+    handler
+        .handle_attached_live_input_for_test(requester_pid, b"\x1b[Oz")
+        .await
+        .expect("renamed focus-out and suffix succeed");
+
+    let state = handler.state.lock().await;
+    assert_eq!(
+        state.pane_input_capture_for_test(&current),
+        Some(b"\x1b[Oz".to_vec())
+    );
+    drop(state);
+    let focus_events = std::iter::from_fn(|| lifecycle.try_recv().ok())
+        .map(|event| event.event)
+        .filter(|event| {
+            matches!(
+                event,
+                LifecycleEvent::PaneFocusOut { .. } | LifecycleEvent::ClientFocusOut { .. }
+            )
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(focus_events.len(), 2, "{focus_events:?}");
+    let LifecycleEvent::PaneFocusOut { target } = &focus_events[0] else {
+        panic!("expected pane-focus-out first, got {:?}", focus_events[0]);
+    };
+    assert_eq!(target.session_name(), &beta);
+    assert!(matches!(
+        focus_events[1],
+        LifecycleEvent::ClientFocusOut { .. }
+    ));
+}
+
+#[tokio::test]
+async fn suspended_native_attach_keeps_its_focus_contribution() {
+    let handler = RequestHandler::new();
+    let alpha = session_name("focus-suspended-contributor");
+    let first_pid = std::process::id();
+    let second_pid = first_pid.saturating_add(1);
+    create_send_keys_test_session(&handler, &alpha).await;
+    {
+        let mut state = handler.state.lock().await;
+        state
+            .append_bytes_to_pane_transcript_for_test(&alpha, 0, 0, b"\x1b[?1004h")
+            .expect("pane enables focus reporting");
+    }
+    let (first_tx, _first_rx) = mpsc::unbounded_channel();
+    handler
+        .register_attach(first_pid, alpha.clone(), first_tx)
+        .await;
+    let (second_tx, _second_rx) = mpsc::unbounded_channel();
+    handler
+        .register_attach(second_pid, alpha.clone(), second_tx)
+        .await;
+    let capture = RawPaneInputProbe::start(&handler, &alpha, "focus-suspended", 3).await;
+
+    let suspended = handler
+        .handle_suspend_client(
+            second_pid,
+            rmux_proto::SuspendClientRequest {
+                target_client: Some(first_pid.to_string()),
+            },
+        )
+        .await;
+    assert!(
+        matches!(suspended, Response::SuspendClient(_)),
+        "{suspended:?}"
+    );
+    handler
+        .handle_attached_live_input_for_test(second_pid, b"\x1b[O")
+        .await
+        .expect("second focus-out succeeds");
+    {
+        let active_attach = handler.active_attach.lock().await;
+        let first = &active_attach.by_pid[&first_pid];
+        assert!(first.suspended);
+        assert!(first.reported_focused);
+    }
+    {
+        let state = handler.state.lock().await;
+        assert_eq!(
+            state.pane_input_capture_for_test(&PaneTarget::new(alpha.clone(), 0)),
+            Some(Vec::new())
+        );
+    }
+
+    handler.handle_attached_unlock(first_pid).await;
+    handler
+        .handle_attached_live_input_for_test(first_pid, b"\x1b[O")
+        .await
+        .expect("last focus-out succeeds after resume");
+    capture.finish(&handler, &alpha).await;
+    capture.assert_contents(&handler, b"\x1b[O").await;
+}
+
+#[tokio::test]
+async fn switch_client_after_focus_out_resets_focus_before_session_change() {
+    let handler = RequestHandler::new();
+    let alpha = session_name("focus-switch-alpha");
+    let beta = session_name("focus-switch-beta");
+    let requester_pid = std::process::id();
+    create_send_keys_test_session(&handler, &alpha).await;
+    create_send_keys_test_session(&handler, &beta).await;
+    {
+        let mut state = handler.state.lock().await;
+        for session in [&alpha, &beta] {
+            state
+                .append_bytes_to_pane_transcript_for_test(session, 0, 0, b"\x1b[?1004h")
+                .expect("pane enables focus reporting");
+        }
+    }
+    let (control_tx, _control_rx) = mpsc::unbounded_channel();
+    handler
+        .register_attach(requester_pid, alpha.clone(), control_tx)
+        .await;
+    handler
+        .handle_attached_live_input_for_test(requester_pid, b"\x1b[O")
+        .await
+        .expect("source focus-out succeeds");
+    let alpha_capture = RawPaneInputProbe::start(&handler, &alpha, "focus-switch-alpha", 0).await;
+    let beta_capture = RawPaneInputProbe::start(&handler, &beta, "focus-switch-beta", 3).await;
+    let mut lifecycle = handler.subscribe_lifecycle_events();
+
+    let response = handler
+        .handle(Request::SwitchClientExt(SwitchClientExtRequest {
+            target: Some(beta.clone()),
+            key_table: None,
+        }))
+        .await;
+    assert!(
+        matches!(response, Response::SwitchClient(_)),
+        "{response:?}"
+    );
+    alpha_capture.finish(&handler, &alpha).await;
+    alpha_capture.assert_contents(&handler, b"").await;
+    beta_capture.finish(&handler, &beta).await;
+    beta_capture.assert_contents(&handler, b"\x1b[I").await;
+    let active_attach = handler.active_attach.lock().await;
+    assert!(active_attach.by_pid[&requester_pid].reported_focused);
+    drop(active_attach);
+
+    let events = std::iter::from_fn(|| lifecycle.try_recv().ok())
+        .map(|event| event.event)
+        .filter(|event| {
+            matches!(
+                event,
+                LifecycleEvent::ClientFocusIn { .. }
+                    | LifecycleEvent::ClientFocusOut { .. }
+                    | LifecycleEvent::PaneFocusIn { .. }
+                    | LifecycleEvent::PaneFocusOut { .. }
+                    | LifecycleEvent::ClientSessionChanged { .. }
+            )
+        })
+        .collect::<Vec<_>>();
+    assert!(matches!(
+        events.as_slice(),
+        [
+            LifecycleEvent::PaneFocusIn { .. },
+            LifecycleEvent::ClientSessionChanged { .. }
+        ]
+    ));
+}
+
+#[tokio::test]
+async fn select_pane_reconciles_effective_focus_with_focus_events_off_product_divergence() {
+    let handler = RequestHandler::new();
+    let alpha = session_name("focus-select-pane");
+    let requester_pid = std::process::id();
+
+    create_send_keys_test_session(&handler, &alpha).await;
+    let focus_events_off = handler
+        .handle(Request::SetOption(SetOptionRequest {
+            scope: ScopeSelector::Global,
+            option: OptionName::FocusEvents,
+            value: "off".to_owned(),
+            mode: SetOptionMode::Replace,
+        }))
+        .await;
+    assert!(
+        matches!(focus_events_off, Response::SetOption(_)),
+        "{focus_events_off:?}"
+    );
+    assert!(matches!(
+        handler
+            .handle(Request::SplitWindow(SplitWindowRequest {
+                target: SplitWindowTarget::Session(alpha.clone()),
+                direction: SplitDirection::Horizontal,
+                before: false,
+                environment: None,
+            }))
+            .await,
+        Response::SplitWindow(_)
+    ));
+    let first = PaneTarget::with_window(alpha.clone(), 0, 0);
+    let second = PaneTarget::with_window(alpha.clone(), 0, 1);
+    assert!(matches!(
+        handler
+            .handle(Request::SelectPane(Box::new(SelectPaneRequest {
+                target: first.clone(),
+                title: None,
+                style: None,
+                input_disabled: None,
+                preserve_zoom: false,
+            })))
+            .await,
+        Response::SelectPane(_)
+    ));
+    {
+        let mut state = handler.state.lock().await;
+        state
+            .append_bytes_to_pane_transcript_for_test(&alpha, 0, 0, b"\x1b[?1004h")
+            .expect("first pane enables focus reporting");
+        state
+            .append_bytes_to_pane_transcript_for_test(&alpha, 0, 1, b"\x1b[?1004h")
+            .expect("second pane enables focus reporting");
+    }
+    let (control_tx, _control_rx) = mpsc::unbounded_channel();
+    handler
+        .register_attach(requester_pid, alpha.clone(), control_tx)
+        .await;
+    let mut lifecycle = handler.subscribe_lifecycle_events();
+    {
+        let state = handler.state.lock().await;
+        state.start_pane_input_capture_for_test(&first);
+        state.start_pane_input_capture_for_test(&second);
+    }
+
+    assert!(matches!(
+        handler
+            .handle(Request::SelectPane(Box::new(SelectPaneRequest {
+                target: second.clone(),
+                title: None,
+                style: None,
+                input_disabled: None,
+                preserve_zoom: false,
+            })))
+            .await,
+        Response::SelectPane(_)
+    ));
+
+    {
+        let state = handler.state.lock().await;
+        assert_eq!(
+            state.pane_input_capture_for_test(&first),
+            Some(b"\x1b[O".to_vec())
+        );
+        assert_eq!(
+            state.pane_input_capture_for_test(&second),
+            Some(b"\x1b[I".to_vec())
+        );
+    }
+    let focus_and_selection = std::iter::from_fn(|| lifecycle.try_recv().ok())
+        .map(|event| event.event)
+        .filter(|event| {
+            matches!(
+                event,
+                LifecycleEvent::PaneFocusIn { .. }
+                    | LifecycleEvent::PaneFocusOut { .. }
+                    | LifecycleEvent::WindowPaneChanged { .. }
+            )
+        })
+        .collect::<Vec<_>>();
+    assert!(matches!(
+        focus_and_selection.as_slice(),
+        [
+            LifecycleEvent::PaneFocusOut { .. },
+            LifecycleEvent::PaneFocusIn { .. },
+            LifecycleEvent::WindowPaneChanged { .. }
+        ]
+    ));
+}
+
+#[tokio::test]
 async fn live_attach_large_focus_chain_has_bounded_reroute_work() {
     let handler = RequestHandler::new();
     let alpha = session_name("large-focus-chain");
@@ -2264,13 +3785,18 @@ async fn live_attach_large_focus_chain_has_bounded_reroute_work() {
 
     let input = b"\x1b[I\x1b[O".repeat(LARGE_FOCUS_CHAIN_REPETITIONS);
     let capture = RawPaneInputProbe::start(&handler, &alpha, "large-focus-chain", 0).await;
-    tokio::time::timeout(
-        BOUNDED_REROUTE_CHAIN_TIMEOUT,
-        handler.handle_attached_live_input_for_test(requester_pid, &input),
-    )
-    .await
-    .expect("large focus chain must not grow reroute work with the whole frame")
-    .expect("large focus chain succeeds");
+    handler.live_input_work.take();
+    handler
+        .handle_attached_live_input_for_test(requester_pid, &input)
+        .await
+        .expect("large focus chain succeeds");
+    // The focus reports are consumed inside the step that decodes them, one reroute chunk
+    // after another.
+    assert_live_input_work_bounded(
+        "large focus chain",
+        handler.live_input_work.take(),
+        1..=input.len().div_ceil(1024),
+    );
 
     capture.finish(&handler, &alpha).await;
     capture.assert_contents(&handler, b"").await;
@@ -2319,7 +3845,10 @@ async fn live_attach_focus_sequences_emit_client_and_pane_hooks_in_order() {
         .expect("live attach focus input");
 
     drain_lifecycle_hooks(&handler, &mut lifecycle).await;
-    wait_for_buffer(&handler, "focus-hooks", "CFI,PFI,PFO,CFO,").await;
+    // The first native spectator focuses the runtime at registration. Its PI
+    // is committed before client-attached; the explicit I is client-only and
+    // the following O contributes PO before CO.
+    wait_for_buffer(&handler, "focus-hooks", "PFI,CFI,PFO,CFO,").await;
 }
 
 #[tokio::test]
@@ -2406,8 +3935,29 @@ async fn live_attach_focus_hook_pane_transition_reloads_bracketed_paste_mode_for
     {
         let mut state = handler.state.lock().await;
         state
-            .append_bytes_to_pane_transcript_for_test(&alpha, 0, 1, b"\x1b[?2004h")
-            .expect("second pane enables bracketed paste mode");
+            .append_bytes_to_pane_transcript_for_test(&alpha, 0, 0, b"\x1b[?1004h")
+            .expect("first pane enables focus reporting");
+        state
+            .append_bytes_to_pane_transcript_for_test(&alpha, 0, 1, b"\x1b[?1004h\x1b[?2004h")
+            .expect("second pane enables focus reporting and bracketed paste mode");
+        assert_ne!(
+            state
+                .transcript_handle(&first)
+                .expect("first pane transcript exists")
+                .lock()
+                .mode()
+                & mode::MODE_FOCUSON,
+            0
+        );
+        assert_ne!(
+            state
+                .transcript_handle(&second)
+                .expect("second pane transcript exists")
+                .lock()
+                .mode()
+                & mode::MODE_FOCUSON,
+            0
+        );
         state.start_pane_input_capture_for_test(&first);
         state.start_pane_input_capture_for_test(&second);
     }
@@ -2430,6 +3980,13 @@ async fn live_attach_focus_hook_pane_transition_reloads_bracketed_paste_mode_for
         .await;
     {
         let mut state = handler.state.lock().await;
+        assert_eq!(
+            state.pane_input_capture_for_test(&first),
+            Some(b"\x1b[I".to_vec()),
+            "native registration publishes one pane-focus-in edge before client input"
+        );
+        assert_eq!(state.pane_input_capture_for_test(&second), Some(Vec::new()));
+        state.start_pane_input_capture_for_test(&first);
         state
             .append_bytes_to_pane_transcript_for_test(&alpha, 0, 0, b"\x1b[?1004l")
             .expect("first pane focus mode reset transcript update");
@@ -2459,9 +4016,12 @@ async fn live_attach_focus_hook_pane_transition_reloads_bracketed_paste_mode_for
             1
         );
         assert_eq!(state.pane_input_capture_for_test(&first), Some(Vec::new()));
+        let mut expected = b"\x1b[I".to_vec();
+        expected.extend_from_slice(paste);
         assert_eq!(
             state.pane_input_capture_for_test(&second),
-            Some(paste.to_vec())
+            Some(expected),
+            "the pane-selection hook publishes one focus-in edge before the same-chunk tail"
         );
     }
 
@@ -2507,8 +4067,30 @@ async fn live_attach_focus_hook_reindexed_pane_identity_reloads_tail_capabilitie
             .pane_id_in_window(0, 1)
             .expect("second pane identity exists");
         state
-            .append_bytes_to_pane_transcript_for_test(&alpha, 0, 1, b"\x1b[?2004h")
-            .expect("surviving pane enables bracketed paste mode");
+            .append_bytes_to_pane_transcript_for_test(&alpha, 0, 0, b"\x1b[?1004h")
+            .expect("removed pane enables focus reporting");
+        state
+            .append_bytes_to_pane_transcript_for_test(&alpha, 0, 1, b"\x1b[?1004h\x1b[?2004h")
+            .expect("surviving pane enables focus reporting and bracketed paste mode");
+        assert_ne!(
+            state
+                .transcript_handle(&target)
+                .expect("removed pane transcript exists")
+                .lock()
+                .mode()
+                & mode::MODE_FOCUSON,
+            0
+        );
+        let surviving = PaneTarget::with_window(alpha.clone(), 0, 1);
+        assert_ne!(
+            state
+                .transcript_handle(&surviving)
+                .expect("surviving pane transcript exists")
+                .lock()
+                .mode()
+                & mode::MODE_FOCUSON,
+            0
+        );
         state.start_pane_input_capture_for_test(&target);
         (removed_pane_id, surviving_pane_id)
     };
@@ -2529,8 +4111,17 @@ async fn live_attach_focus_hook_reindexed_pane_identity_reloads_tail_capabilitie
     let _attach_id = handler
         .register_attach(requester_pid, alpha.clone(), control_tx)
         .await;
+
     {
         let mut state = handler.state.lock().await;
+        let session = state.sessions.session(&alpha).expect("session exists");
+        assert_eq!(session.pane_id_in_window(0, 0), Some(removed_pane_id));
+        assert_eq!(
+            state.pane_input_capture_for_test(&target),
+            Some(b"\x1b[I".to_vec()),
+            "native registration publishes one pane-focus-in edge before client input"
+        );
+        state.start_pane_input_capture_for_test(&target);
         state
             .append_bytes_to_pane_transcript_for_test(&alpha, 0, 0, b"\x1b[?1004l")
             .expect("first pane focus mode reset transcript update");
@@ -2559,9 +4150,12 @@ async fn live_attach_focus_hook_reindexed_pane_identity_reloads_tail_capabilitie
         let session = state.sessions.session(&alpha).expect("session exists");
         assert_eq!(session.pane_id_in_window(0, 0), Some(surviving_pane_id));
         assert_ne!(session.pane_id_in_window(0, 0), Some(removed_pane_id));
+        let mut expected = b"\x1b[I".to_vec();
+        expected.extend_from_slice(paste);
         assert_eq!(
             state.pane_input_capture_for_test(&target),
-            Some(paste.to_vec())
+            Some(expected),
+            "the identity-changing hook publishes one pane-focus-in edge before the same-chunk tail"
         );
     }
 
@@ -2571,19 +4165,52 @@ async fn live_attach_focus_hook_reindexed_pane_identity_reloads_tail_capabilitie
 
 #[tokio::test]
 async fn live_attach_focus_hook_respawn_reloads_same_pane_tail_capabilities() {
+    assert_focus_hook_respawn_reloads_tail_capabilities(None).await;
+}
+
+#[tokio::test]
+async fn live_attach_focus_hook_respawn_reloads_tail_capabilities_of_focus_enabled_replacement() {
+    assert_focus_hook_respawn_reloads_tail_capabilities(Some(b"\x1b[?1004h")).await;
+}
+
+/// The hook's replacement runtime stays focused for this client, so it is
+/// owed one focus-in when its own startup output enables DEC 1004 before the
+/// respawn reconciles focus: the pinned ConPTY preamble does that natively,
+/// the seed does it on every platform. That attributed, generation-checked
+/// edge precedes the tail; the tail itself must still be decoded with the
+/// replacement's capabilities (no bracketed-paste markers).
+async fn assert_focus_hook_respawn_reloads_tail_capabilities(replacement_startup: Option<&[u8]>) {
     let handler = RequestHandler::new();
     let alpha = session_name("focus-respawn-pane-tail");
     let requester_pid = std::process::id();
 
     create_send_keys_test_session(&handler, &alpha).await;
     let target = PaneTarget::with_window(alpha.clone(), 0, 0);
-    {
+    let (pane_id, initial_output_generation) = {
         let mut state = handler.state.lock().await;
         state
-            .append_bytes_to_pane_transcript_for_test(&alpha, 0, 0, b"\x1b[?2004h")
-            .expect("pane enables bracketed paste before respawn");
+            .append_bytes_to_pane_transcript_for_test(&alpha, 0, 0, b"\x1b[?1004h\x1b[?2004h")
+            .expect("pane enables focus reporting and bracketed paste before respawn");
+        assert_ne!(
+            state
+                .transcript_handle(&target)
+                .expect("pane transcript exists before respawn")
+                .lock()
+                .mode()
+                & mode::MODE_FOCUSON,
+            0
+        );
         state.start_pane_input_capture_for_test(&target);
-    }
+        let pane_id = state
+            .sessions
+            .session(&alpha)
+            .and_then(|session| session.pane_id_in_window(0, 0))
+            .expect("pane identity exists before respawn");
+        (
+            pane_id,
+            state.pane_output_generation_for_target(&target, pane_id),
+        )
+    };
 
     let respawn = format!("respawn-pane -k -t {}:0.0", alpha.as_str());
     set_global_hook(&handler, HookName::ClientFocusIn, &respawn).await;
@@ -2601,13 +4228,38 @@ async fn live_attach_focus_hook_respawn_reloads_same_pane_tail_capabilities() {
     let _attach_id = handler
         .register_attach(requester_pid, alpha.clone(), control_tx)
         .await;
+
+    assert_eq!(
+        handler
+            .attached_input_target(requester_pid)
+            .await
+            .expect("attached target exists before respawn hook"),
+        target
+    );
     {
         let mut state = handler.state.lock().await;
+        assert_eq!(
+            state.pane_output_generation_for_target(&target, pane_id),
+            initial_output_generation
+        );
+        assert_eq!(
+            state.pane_input_capture_for_test(&target),
+            Some(b"\x1b[I".to_vec()),
+            "native registration publishes one pane-focus-in edge before client input"
+        );
+        state.start_pane_input_capture_for_test(&target);
         state
             .append_bytes_to_pane_transcript_for_test(&alpha, 0, 0, b"\x1b[?1004l")
             .expect("pane focus mode reset transcript update");
     }
 
+    if let Some(bytes) = replacement_startup {
+        handler
+            .state
+            .lock()
+            .await
+            .seed_next_respawn_startup_output_for_test(bytes);
+    }
     let body = b"MARKER\n";
     let mut input = b"\x1b[I\x1b[200~".to_vec();
     input.extend_from_slice(body);
@@ -2623,15 +4275,48 @@ async fn live_attach_focus_hook_respawn_reloads_same_pane_tail_capabilities() {
     {
         let state = handler.state.lock().await;
         assert_eq!(
+            state
+                .sessions
+                .session(&alpha)
+                .and_then(|session| session.pane_id_in_window(0, 0)),
+            Some(pane_id),
+            "respawn retains the selected pane identity"
+        );
+        let replacement_generation = state.pane_output_generation_for_target(&target, pane_id);
+        assert!(
+            replacement_generation > initial_output_generation,
+            "the focus hook respawns the pane before the same-chunk tail is decoded"
+        );
+        assert_eq!(
+            state.pane_non_focus_input_capture_for_test(&target),
+            Some(body.to_vec()),
+            "only attributed focus reports may join the replacement's tail"
+        );
+        let focus = state.pane_focus_input_capture_for_test(&target);
+        assert!(focus.len() <= 1, "one replacement focus-in edge: {focus:?}");
+        if replacement_startup.is_some() {
+            assert_eq!(focus.len(), 1, "focus-enabled replacement gets its report");
+        }
+        for report in &focus {
+            assert_eq!(report.pane_id, pane_id);
+            assert_eq!(report.generation, replacement_generation);
+            assert_eq!(report.bytes, b"\x1b[I");
+        }
+        let mut expected = focus
+            .iter()
+            .flat_map(|report| report.bytes.clone())
+            .collect::<Vec<_>>();
+        expected.extend_from_slice(body);
+        assert_eq!(
             state.pane_input_capture_for_test(&target),
-            Some(body.to_vec())
+            Some(expected),
+            "the replacement's focus-in edge precedes the same-chunk tail"
         );
         assert_eq!(
             state
                 .transcript_handle(&target)
                 .expect("respawned transcript exists")
                 .lock()
-                .expect("transcript mutex")
                 .mode()
                 & mode::MODE_BRACKETPASTE,
             0
@@ -2739,7 +4424,7 @@ async fn display_message_ignore_keys_keeps_streamed_focus_and_theme_protocol_liv
             .transcript_handle(&PaneTarget::with_window(alpha.clone(), 0, 0))
             .expect("focus transcript");
         assert_ne!(
-            transcript.lock().expect("focus transcript lock").mode() & mode::MODE_FOCUSON,
+            transcript.lock().mode() & mode::MODE_FOCUSON,
             0,
             "focus mode must be active before the ignored message"
         );
@@ -2808,6 +4493,8 @@ async fn display_message_ignore_protocol_reloads_target_after_each_focus_hook() 
     ));
     let first = PaneTarget::with_window(alpha.clone(), 0, 0);
     let second = PaneTarget::with_window(alpha.clone(), 0, 1);
+    handler.disable_pane_focus_reports_for_test(&first).await;
+    handler.disable_pane_focus_reports_for_test(&second).await;
     assert!(matches!(
         handler
             .handle(Request::SelectPane(Box::new(SelectPaneRequest {
@@ -2859,7 +4546,7 @@ async fn display_message_ignore_protocol_reloads_target_after_each_focus_hook() 
         for (target, expected) in [(&first, false), (&second, true)] {
             let transcript = state.transcript_handle(target).expect("focus transcript");
             assert_eq!(
-                transcript.lock().expect("focus transcript lock").mode() & mode::MODE_FOCUSON != 0,
+                transcript.lock().mode() & mode::MODE_FOCUSON != 0,
                 expected,
                 "fixture must pin each pane's focus mode"
             );
@@ -2891,7 +4578,7 @@ async fn display_message_ignore_protocol_reloads_target_after_each_focus_hook() 
         assert_eq!(state.pane_input_capture_for_test(&first), Some(Vec::new()));
         assert_eq!(
             state.pane_input_capture_for_test(&second),
-            Some(b"\x1b[O".to_vec())
+            Some(b"\x1b[I\x1b[O".to_vec())
         );
     }
     let _ = shutdown_tx.send(());
@@ -2916,12 +4603,13 @@ async fn live_attach_focus_sequences_forward_when_pane_focus_mode_is_enabled() {
             .expect("focus mode transcript update");
     }
 
-    let expected = b"\x1b[I\x1b[O";
+    let input = b"\x1b[I\x1b[O";
+    let expected = b"\x1b[O";
     let capture =
         RawPaneInputProbe::start(&handler, &alpha, "live-attach-focus-mode", expected.len()).await;
 
     handler
-        .handle_attached_live_input_for_test(requester_pid, expected)
+        .handle_attached_live_input_for_test(requester_pid, input)
         .await
         .expect("live attach focus mode input");
 
@@ -3745,6 +5433,8 @@ async fn live_attach_mouse_pane_transition_retargets_same_chunk_focus_tail() {
 
     let first = PaneTarget::with_window(alpha.clone(), 0, 0);
     let second = PaneTarget::with_window(alpha.clone(), 0, 1);
+    handler.disable_pane_focus_reports_for_test(&first).await;
+    handler.disable_pane_focus_reports_for_test(&second).await;
     let selected = handler
         .handle(Request::SelectPane(Box::new(SelectPaneRequest {
             target: first.clone(),
@@ -3779,11 +5469,17 @@ async fn live_attach_mouse_pane_transition_retargets_same_chunk_focus_tail() {
     let _attach_id = handler
         .register_attach(requester_pid, alpha.clone(), control_tx)
         .await;
+    {
+        let mut state = handler.state.lock().await;
+        state
+            .append_bytes_to_pane_transcript_for_test(&alpha, 0, 0, b"\x1b[?1004h")
+            .expect("first pane enables focus events after initial attach");
+    }
     let mut lifecycle = handler.subscribe_lifecycle_events();
 
     let mouse_down = format!("\x1b[<0;{};{}M", click_x + 1, click_y + 1);
     let mut input = mouse_down.into_bytes();
-    input.extend_from_slice(b"\x1b[I");
+    input.extend_from_slice(b"\x1b[O");
     let mut pending_input = Vec::new();
     let forwarded = handler
         .handle_attached_live_input_inner(requester_pid, &mut pending_input, &input)
@@ -3804,20 +5500,28 @@ async fn live_attach_mouse_pane_transition_retargets_same_chunk_focus_tail() {
                 .active_pane_index(),
             1
         );
-        assert_eq!(state.pane_input_capture_for_test(&first), Some(Vec::new()));
+        assert_eq!(
+            state.pane_input_capture_for_test(&first),
+            Some(b"\x1b[O".to_vec())
+        );
         assert_eq!(
             state.pane_input_capture_for_test(&second),
-            Some(b"\x1b[I".to_vec())
+            Some(b"\x1b[I\x1b[O".to_vec())
         );
     }
 
-    let mut pane_focus_in_targets = Vec::new();
-    while let Ok(event) = lifecycle.try_recv() {
-        if let LifecycleEvent::PaneFocusIn { target } = event.event {
-            pane_focus_in_targets.push(target);
-        }
-    }
-    assert_eq!(pane_focus_in_targets, vec![second]);
+    let pane_focus = std::iter::from_fn(|| lifecycle.try_recv().ok())
+        .map(|event| event.event)
+        .filter_map(|event| match event {
+            LifecycleEvent::PaneFocusIn { target } => Some((true, target)),
+            LifecycleEvent::PaneFocusOut { target } => Some((false, target)),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        pane_focus,
+        vec![(false, first), (true, second.clone()), (false, second)]
+    );
 }
 
 #[tokio::test]
@@ -3892,6 +5596,15 @@ async fn live_attach_mouse_border_drag_pipeline_preserves_mouse_event() {
 
 #[tokio::test]
 async fn live_attach_sgr_wheel_forwards_when_pane_mouse_any_is_enabled() {
+    assert_live_attach_sgr_wheel_forwarded(64).await;
+}
+
+#[tokio::test]
+async fn live_attach_sgr_wheel_down_forwards_when_pane_mouse_any_is_enabled() {
+    assert_live_attach_sgr_wheel_forwarded(65).await;
+}
+
+async fn assert_live_attach_sgr_wheel_forwarded(button: u16) {
     let handler = RequestHandler::new();
     let alpha = session_name("alpha");
     let requester_pid = std::process::id();
@@ -3914,13 +5627,13 @@ async fn live_attach_sgr_wheel_forwards_when_pane_mouse_any_is_enabled() {
     let expected = encode_mouse_event(
         mode::MODE_MOUSE_ALL | mode::MODE_MOUSE_SGR,
         &MouseForwardEvent {
-            b: 64,
+            b: button,
             lb: 0,
             x: 1,
             y: 1,
             lx: 0,
             ly: 0,
-            sgr_b: 64,
+            sgr_b: button,
             sgr_type: 'M',
             ignore: false,
         },
@@ -3928,11 +5641,19 @@ async fn live_attach_sgr_wheel_forwards_when_pane_mouse_any_is_enabled() {
         1,
     )
     .expect("sgr wheel encodes");
-    let capture =
-        RawPaneInputProbe::start(&handler, &alpha, "live-attach-sgr-wheel", expected.len()).await;
+    let capture = RawPaneInputProbe::start(
+        &handler,
+        &alpha,
+        &format!("live-attach-sgr-wheel-{button}"),
+        expected.len(),
+    )
+    .await;
 
     handler
-        .handle_attached_live_input_for_test(requester_pid, b"\x1b[<64;2;2M")
+        .handle_attached_live_input_for_test(
+            requester_pid,
+            format!("\x1b[<{button};2;2M").as_bytes(),
+        )
         .await
         .expect("live attach wheel input");
 
@@ -3946,7 +5667,7 @@ async fn live_attach_sgr_wheel_forwards_when_pane_mouse_any_is_enabled() {
         .and_then(|active| active.mouse.current_event.as_ref())
         .expect("current wheel event");
     assert_eq!(event.location, MouseLocation::Pane);
-    assert_eq!(event.raw.b, 64);
+    assert_eq!(event.raw.b, button);
     drop(active_attach);
 
     let state = handler.state.lock().await;
@@ -3955,6 +5676,187 @@ async fn live_attach_sgr_wheel_forwards_when_pane_mouse_any_is_enabled() {
             .pane_copy_mode_summary(&alpha, PaneId::new(0))
             .is_none(),
         "mouse-aware applications should receive the wheel event without entering copy-mode"
+    );
+}
+
+#[tokio::test]
+async fn live_attach_unbound_wheel_respects_modes_permissions_and_bindings() {
+    for case in [
+        "mouse-disabled",
+        "cannot-write",
+        "read-only",
+        "bound",
+        "legacy",
+        "unbound-up",
+    ] {
+        let handler = RequestHandler::new();
+        let alpha = session_name("alpha");
+        let requester_pid = std::process::id();
+        create_send_keys_test_session(&handler, &alpha).await;
+        enable_mouse(&handler).await;
+        if case != "mouse-disabled" {
+            let mut state = handler.state.lock().await;
+            let modes = if case == "legacy" {
+                b"\x1b[?1000h".as_slice()
+            } else {
+                b"\x1b[?1003h\x1b[?1006h".as_slice()
+            };
+            state
+                .append_bytes_to_pane_transcript_for_test(&alpha, 0, 0, modes)
+                .expect("mouse modes");
+        }
+        let (control_tx, _control_rx) = mpsc::unbounded_channel();
+        let _attach_id = handler
+            .register_attach(requester_pid, alpha.clone(), control_tx)
+            .await;
+        {
+            let mut active = handler.active_attach.lock().await;
+            let client = active.by_pid.get_mut(&requester_pid).expect("client");
+            if case == "cannot-write" {
+                client.can_write = false;
+            }
+            if case == "read-only" {
+                client
+                    .flags
+                    .insert(crate::client_flags::ClientFlags::READONLY);
+            }
+        }
+        if case == "bound" {
+            let result = handler
+                .handle(Request::BindKey(Box::new(BindKeyRequest {
+                    table_name: "root".into(),
+                    key: "WheelDownPane".into(),
+                    note: None,
+                    repeat: false,
+                    command: Some(vec!["send-keys".into(), "-l".into(), "bound".into()]),
+                })))
+                .await;
+            assert!(matches!(result, Response::BindKey(_)));
+        }
+        if case == "unbound-up" {
+            let result = handler
+                .handle(Request::UnbindKey(UnbindKeyRequest {
+                    table_name: "root".into(),
+                    key: Some("WheelUpPane".into()),
+                    all: false,
+                    quiet: false,
+                }))
+                .await;
+            assert!(matches!(result, Response::UnbindKey(_)));
+        }
+        let expected: &[u8] = match case {
+            "bound" => b"bound",
+            "legacy" => b"\x1b[Ma\x22\x22",
+            "unbound-up" => b"\x1b[<64;2;2M",
+            _ => b"",
+        };
+        let capture = RawPaneInputProbe::start(&handler, &alpha, case, expected.len()).await;
+        let event = if case == "unbound-up" {
+            b"\x1b[<64;2;2M"
+        } else {
+            b"\x1b[<65;2;2M"
+        };
+        handler
+            .handle_attached_live_input_for_test(requester_pid, event)
+            .await
+            .expect(case);
+        capture.finish(&handler, &alpha).await;
+        capture.assert_contents(&handler, expected).await;
+    }
+}
+
+#[tokio::test]
+async fn live_attach_unbound_wheel_uses_hovered_pane_and_relative_coordinates() {
+    assert_unbound_wheel_uses_hovered_pane(false).await;
+}
+
+#[tokio::test]
+async fn live_attach_unbound_wheel_with_startup_focus_uses_hovered_pane_and_relative_coordinates() {
+    assert_unbound_wheel_uses_hovered_pane(true).await;
+}
+
+async fn assert_unbound_wheel_uses_hovered_pane(seed_startup_focus: bool) {
+    let handler = RequestHandler::new();
+    let alpha = session_name("alpha");
+    let requester_pid = std::process::id();
+    create_send_keys_test_session(&handler, &alpha).await;
+    enable_mouse(&handler).await;
+    let result = handler
+        .handle(Request::SplitWindow(SplitWindowRequest {
+            target: SplitWindowTarget::Session(alpha.clone()),
+            direction: SplitDirection::Horizontal,
+            before: false,
+            environment: None,
+        }))
+        .await;
+    assert!(matches!(result, Response::SplitWindow(_)));
+    handler
+        .handle(Request::SelectPane(Box::new(SelectPaneRequest {
+            target: PaneTarget::new(alpha.clone(), 0),
+            title: None,
+            style: None,
+            input_disabled: None,
+            preserve_zoom: false,
+        })))
+        .await;
+    let zero = PaneTarget::with_window(alpha.clone(), 0, 0);
+    let one = PaneTarget::with_window(alpha.clone(), 0, 1);
+    if seed_startup_focus {
+        let mut state = handler.state.lock().await;
+        state
+            .append_bytes_to_pane_transcript_for_test(&alpha, 0, 0, b"\x1b[?1004h")
+            .expect("active pane startup enables focus reports");
+    }
+    // This fixture checks wheel routing, so own its focus-off precondition
+    // after startup (including native ConPTY's DEC 1004 preamble).
+    // Keep capture active across attach and input; do not discard either.
+    handler.disable_pane_focus_reports_for_test(&zero).await;
+    handler.disable_pane_focus_reports_for_test(&one).await;
+    let (x, y) = {
+        let mut state = handler.state.lock().await;
+        state
+            .append_bytes_to_pane_transcript_for_test(&alpha, 0, 1, b"\x1b[?1003h\x1b[?1006h")
+            .expect("mouse modes");
+        state.start_pane_input_capture_for_test(&zero);
+        state.start_pane_input_capture_for_test(&one);
+        let pane = state
+            .sessions
+            .session(&alpha)
+            .expect("session")
+            .window()
+            .pane(1)
+            .expect("pane");
+        (pane.geometry().x() + 3, pane.geometry().y() + 3)
+    };
+    trace_focus_capture(&handler, &zero, "wheel-before-attach").await;
+    let (control_tx, _control_rx) = mpsc::unbounded_channel();
+    let _attach_id = handler
+        .register_attach(requester_pid, alpha.clone(), control_tx)
+        .await;
+    trace_focus_capture(&handler, &zero, "wheel-after-attach").await;
+    handler
+        .handle_attached_live_input_for_test(
+            requester_pid,
+            format!("\x1b[<65;{};{}M", x + 1, y + 1).as_bytes(),
+        )
+        .await
+        .expect("wheel down");
+    trace_focus_capture(&handler, &zero, "wheel-after-input-active").await;
+    trace_focus_capture(&handler, &one, "wheel-after-input-hovered").await;
+    let state = handler.state.lock().await;
+    assert_eq!(state.pane_input_capture_for_test(&zero), Some(vec![]));
+    assert_eq!(
+        state.pane_input_capture_for_test(&one),
+        Some(b"\x1b[<65;4;4M".to_vec())
+    );
+    assert_eq!(
+        state
+            .sessions
+            .session(&alpha)
+            .expect("session")
+            .window()
+            .active_pane_index(),
+        0
     );
 }
 
@@ -4081,21 +5983,14 @@ async fn live_attach_second_click_dispatches_double_click_after_timer() {
         .await;
     assert!(matches!(rebound, Response::BindKey(_)));
 
-    handler
-        .handle_attached_live_input_for_test(requester_pid, b"\x1b[<0;2;2M")
-        .await
-        .expect("first click");
-    handler
-        .handle_attached_live_input_for_test(requester_pid, b"\x1b[<0;2;2M")
-        .await
-        .expect("second click");
-    tokio::time::sleep(Duration::from_millis(350)).await;
+    let clock = handler.install_attached_mouse_click_clock();
+    arm_attached_double_click_timer(&handler, requester_pid).await;
+    clock.allow_expiry();
 
-    let contents = {
-        let state = handler.state.lock().await;
-        state.buffers.get("double-click-timer").map(Vec::from)
-    };
-    assert_eq!(contents.as_deref(), Some(b"ok".as_slice()));
+    assert_eq!(
+        wait_for_buffer_contents(&handler, "double-click-timer", b"ok").await,
+        Some(b"ok".to_vec())
+    );
 }
 
 async fn bind_double_click_timer_buffer(handler: &RequestHandler, buffer_name: &str) {
@@ -4116,20 +6011,38 @@ async fn bind_double_click_timer_buffer(handler: &RequestHandler, buffer_name: &
     assert!(matches!(rebound, Response::BindKey(_)), "{rebound:?}");
 }
 
+/// Sends a double click. Each click is bounded: a click timer that expired
+/// early and holds the handler locks fails the test instead of hanging it.
 async fn arm_attached_double_click_timer(handler: &RequestHandler, requester_pid: u32) {
-    handler
-        .handle_attached_live_input_for_test(requester_pid, b"\x1b[<0;2;2M")
+    for click in ["first click", "second click"] {
+        tokio::time::timeout(
+            Duration::from_secs(2),
+            handler.handle_attached_live_input_for_test(requester_pid, b"\x1b[<0;2;2M"),
+        )
         .await
-        .expect("first click");
-    handler
-        .handle_attached_live_input_for_test(requester_pid, b"\x1b[<0;2;2M")
-        .await
-        .expect("second click");
+        .unwrap_or_else(|_| panic!("{click} is not blocked by a click timer"))
+        .expect(click);
+    }
 }
 
 async fn buffer_contents(handler: &RequestHandler, buffer_name: &str) -> Option<Vec<u8>> {
     let state = handler.state.lock().await;
     state.buffers.get(buffer_name).map(Vec::from)
+}
+
+async fn wait_for_buffer_contents(
+    handler: &RequestHandler,
+    buffer_name: &str,
+    expected: &[u8],
+) -> Option<Vec<u8>> {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
+    loop {
+        let current = buffer_contents(handler, buffer_name).await;
+        if current.as_deref() == Some(expected) || tokio::time::Instant::now() >= deadline {
+            return current;
+        }
+        sleep(Duration::from_millis(10)).await;
+    }
 }
 
 #[tokio::test]
@@ -4177,17 +6090,11 @@ async fn attached_mouse_click_timer_drains_only_its_local_mutation() {
     bind_double_click_timer_buffer(&handler, "mouse-timer-boundary").await;
     let pause = handler.install_attached_mouse_timer_pause();
     arm_attached_double_click_timer(&handler, requester_pid).await;
+    pause.allow_expiry();
 
-    let reached_pause = pause.clone();
-    tokio::time::timeout(
-        Duration::from_secs(2),
-        tokio::task::spawn_blocking(move || {
-            reached_pause.mutation_reached.wait();
-        }),
-    )
-    .await
-    .expect("click timer reaches its local mutation")
-    .expect("mutation waiter joins");
+    tokio::time::timeout(Duration::from_secs(2), pause.mutation_reached.notified())
+        .await
+        .expect("click timer reaches its local mutation");
 
     let close_handler = handler.clone();
     let close = tokio::spawn(async move {
@@ -4203,16 +6110,7 @@ async fn attached_mouse_click_timer_drains_only_its_local_mutation() {
         "shutdown must wait while the click timer owns its local mutation"
     );
 
-    let release_pause = pause.clone();
-    tokio::time::timeout(
-        Duration::from_secs(2),
-        tokio::task::spawn_blocking(move || {
-            release_pause.mutation_release.wait();
-        }),
-    )
-    .await
-    .expect("local click mutation is released")
-    .expect("mutation releaser joins");
+    pause.mutation_release.notify_one();
     tokio::time::timeout(Duration::from_secs(2), pause.dispatch_reached.notified())
         .await
         .expect("expired click reaches the unguarded dispatch boundary");
@@ -4257,27 +6155,12 @@ async fn stale_attached_mouse_click_timer_cannot_mutate_same_pid_replacement() {
         matches!(clock_mode, Response::ClockMode(_)),
         "{clock_mode:?}"
     );
+    pause.allow_expiry();
 
-    let reached_pause = pause.clone();
-    tokio::time::timeout(
-        Duration::from_secs(2),
-        tokio::task::spawn_blocking(move || {
-            reached_pause.mutation_reached.wait();
-        }),
-    )
-    .await
-    .expect("stale click timer reaches its local mutation")
-    .expect("mutation waiter joins");
-    let release_pause = pause.clone();
-    tokio::time::timeout(
-        Duration::from_secs(2),
-        tokio::task::spawn_blocking(move || {
-            release_pause.mutation_release.wait();
-        }),
-    )
-    .await
-    .expect("stale click mutation is released")
-    .expect("mutation releaser joins");
+    tokio::time::timeout(Duration::from_secs(2), pause.mutation_reached.notified())
+        .await
+        .expect("stale click timer reaches its local mutation");
+    pause.mutation_release.notify_one();
     tokio::time::timeout(Duration::from_secs(2), pause.dispatch_reached.notified())
         .await
         .expect("stale click reaches dispatch after its local mutation");
@@ -4319,6 +6202,18 @@ async fn stale_attached_mouse_click_timer_cannot_mutate_same_pid_replacement() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn attached_mouse_click_timer_follows_same_session_identity_rename() {
+    assert_click_timer_follows_rename_after(Duration::ZERO).await;
+}
+
+/// The real click deadline (300 ms) passes before the rename. The click clock
+/// gate must keep the expired timer off the handler locks until the test
+/// allows it; without the gate, the timer takes them and the rename stalls.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn attached_mouse_click_timer_waits_for_expiry_gate_past_its_deadline() {
+    assert_click_timer_follows_rename_after(Duration::from_millis(400)).await;
+}
+
+async fn assert_click_timer_follows_rename_after(follow_up_delay: Duration) {
     let handler = RequestHandler::new();
     let alpha = session_name("mouse-timer-rename-alpha");
     let renamed = session_name("mouse-timer-rename-beta");
@@ -4333,38 +6228,38 @@ async fn attached_mouse_click_timer_follows_same_session_identity_rename() {
     bind_double_click_timer_buffer(&handler, "mouse-timer-rename").await;
     let pause = handler.install_attached_mouse_timer_pause();
     arm_attached_double_click_timer(&handler, requester_pid).await;
+    sleep(follow_up_delay).await;
 
-    let response = handler
-        .handle(Request::RenameSession(rmux_proto::RenameSessionRequest {
+    let response = tokio::time::timeout(
+        Duration::from_secs(2),
+        handler.handle(Request::RenameSession(rmux_proto::RenameSessionRequest {
             target: alpha,
             new_name: renamed.clone(),
-        }))
-        .await;
+        })),
+    )
+    .await
+    .expect("rename is not blocked by a click timer before its expiry gate opens");
     assert!(
         matches!(response, Response::RenameSession(_)),
         "{response:?}"
     );
+    {
+        let active_attach = handler.active_attach.lock().await;
+        let active = active_attach
+            .by_pid
+            .get(&requester_pid)
+            .expect("renamed attach remains active");
+        assert!(
+            active.mouse.click_deadline().is_some() && active.mouse.triple_click_pending,
+            "the double click stays pending until the test opens the expiry gate"
+        );
+    }
+    pause.allow_expiry();
 
-    let reached_pause = pause.clone();
-    tokio::time::timeout(
-        Duration::from_secs(2),
-        tokio::task::spawn_blocking(move || {
-            reached_pause.mutation_reached.wait();
-        }),
-    )
-    .await
-    .expect("renamed click timer reaches its local mutation")
-    .expect("mutation waiter joins");
-    let release_pause = pause.clone();
-    tokio::time::timeout(
-        Duration::from_secs(2),
-        tokio::task::spawn_blocking(move || {
-            release_pause.mutation_release.wait();
-        }),
-    )
-    .await
-    .expect("renamed click mutation is released")
-    .expect("mutation releaser joins");
+    tokio::time::timeout(Duration::from_secs(2), pause.mutation_reached.notified())
+        .await
+        .expect("renamed click timer reaches its local mutation");
+    pause.mutation_release.notify_one();
     tokio::time::timeout(Duration::from_secs(2), pause.dispatch_reached.notified())
         .await
         .expect("renamed click reaches dispatch");
@@ -4408,6 +6303,8 @@ async fn attached_session_switch_resets_click_state_without_clearing_a_new_timer
         .register_attach(requester_pid, alpha, control_tx)
         .await;
     let identity = handler.active_attach_identity_for_test(requester_pid).await;
+    // No timer expires during this test: the clock gate is never opened.
+    let _clock = handler.install_attached_mouse_click_clock();
     arm_attached_double_click_timer(&handler, requester_pid).await;
     let old_token = {
         let active_attach = handler.active_attach.lock().await;
@@ -4524,7 +6421,7 @@ async fn create_mouse_word_session(handler: &RequestHandler, session: &rmux_prot
             skip_environment_update: false,
         })))
         .await;
-    assert!(matches!(created, Response::NewSession(_)), "{created:?}");
+    crate::session_fixture::assert_new_session(&created);
     handler
         .wait_for_pane_startup_to_finish_for_test(&PaneTarget::new(session.clone(), 0))
         .await;
@@ -4542,7 +6439,6 @@ async fn wait_for_pane_text(handler: &RequestHandler, target: &PaneTarget, marke
     while tokio::time::Instant::now() < deadline {
         last = transcript
             .lock()
-            .expect("pane transcript mutex is not poisoned")
             .screen()
             .render_visible_line_independent(0, rmux_core::GridRenderOptions::default())
             .unwrap_or_default();
@@ -4576,6 +6472,8 @@ async fn live_attach_default_double_click_copies_word_from_mouse_pane() {
         .register_attach(requester_pid, alpha.clone(), control_tx)
         .await;
 
+    // Both clicks share the test click clock, so load cannot split them.
+    let clock = handler.install_attached_mouse_click_clock();
     handler
         .handle_attached_live_input_for_test(requester_pid, b"\x1b[<0;2;1M")
         .await
@@ -4584,6 +6482,7 @@ async fn live_attach_default_double_click_copies_word_from_mouse_pane() {
         .handle_attached_live_input_for_test(requester_pid, b"\x1b[<0;2;1M")
         .await
         .expect("second click");
+    clock.allow_expiry();
 
     // The second click arms the double-click timer; the yank lands once it
     // fires. Content is now deterministic (inert pane), so poll for the copy
@@ -4654,8 +6553,13 @@ async fn read_only_live_attach_drops_mouse_forwarding() {
     {
         let mut state = handler.state.lock().await;
         state
-            .append_bytes_to_pane_transcript_for_test(&alpha, 0, 0, b"\x1b[?1003h\x1b[?1006h")
-            .expect("mouse all and sgr transcript update");
+            .append_bytes_to_pane_transcript_for_test(
+                &alpha,
+                0,
+                0,
+                b"\x1b[?1003h\x1b[?1006h\x1b[?1004h",
+            )
+            .expect("mouse and focus transcript update");
     }
 
     let (control_tx, _control_rx) = mpsc::unbounded_channel();
@@ -4673,7 +6577,12 @@ async fn read_only_live_attach_drops_mouse_forwarding() {
             .insert(crate::client_flags::ClientFlags::READONLY);
     }
 
-    let capture = RawPaneInputProbe::start(&handler, &alpha, "read-only-mouse-forwarding", 0).await;
+    let capture = RawPaneInputProbe::start(&handler, &alpha, "read-only-mouse-forwarding", 3).await;
+
+    handler
+        .handle_attached_live_input_for_test(requester_pid, b"\x1b[O")
+        .await
+        .expect("read-only focus report is accepted");
 
     handler
         .handle_attached_live_input_for_test(requester_pid, b"\x1b[<35;2;2M")
@@ -4681,7 +6590,142 @@ async fn read_only_live_attach_drops_mouse_forwarding() {
         .expect("read-only live attach mouse input");
 
     capture.finish(&handler, &alpha).await;
-    capture.assert_contents(&handler, b"").await;
+    capture.assert_contents(&handler, b"\x1b[O").await;
+    let active_attach = handler.active_attach.lock().await;
+    let active = &active_attach.by_pid[&requester_pid];
+    assert!(!active.reported_focused);
+    assert!(active
+        .flags
+        .contains(crate::client_flags::ClientFlags::READONLY));
+}
+
+#[tokio::test]
+async fn read_only_focus_reports_are_acquired_from_fragmented_data_and_keystrokes() {
+    let handler = RequestHandler::new();
+    let alpha = session_name("read-only-focus-input-kinds");
+    let requester_pid = std::process::id();
+    create_send_keys_test_session(&handler, &alpha).await;
+    {
+        let mut state = handler.state.lock().await;
+        state
+            .append_bytes_to_pane_transcript_for_test(&alpha, 0, 0, b"\x1b[?1004h")
+            .expect("pane enables focus reporting");
+    }
+    let (control_tx, _control_rx) = mpsc::unbounded_channel();
+    handler
+        .register_attach(requester_pid, alpha.clone(), control_tx)
+        .await;
+    {
+        let mut active_attach = handler.active_attach.lock().await;
+        active_attach
+            .by_pid
+            .get_mut(&requester_pid)
+            .expect("read-only attach exists")
+            .flags
+            .insert(crate::client_flags::ClientFlags::READONLY);
+    }
+    let target = PaneTarget::new(alpha.clone(), 0);
+    {
+        let state = handler.state.lock().await;
+        state.start_pane_input_capture_for_test(&target);
+    }
+
+    let mut pending_input = Vec::new();
+    handler
+        .handle_attached_live_input_inner(requester_pid, &mut pending_input, b"\x1b[")
+        .await
+        .expect("fragmented Data prefix is retained");
+    assert_eq!(pending_input, b"\x1b[");
+    handler
+        .handle_attached_live_input_inner(requester_pid, &mut pending_input, b"O")
+        .await
+        .expect("fragmented Data focus-out is acquired");
+    assert!(pending_input.is_empty());
+
+    let focus_in = rmux_proto::AttachedKeystroke::new(b"\x1b[I".to_vec());
+    let identity = handler.active_attach_identity_for_test(requester_pid).await;
+    let mut active_emit_cache = None;
+    handler
+        .handle_attached_keystroke_input_with_active_cache_for_identity(
+            identity,
+            &mut pending_input,
+            &focus_in,
+            &mut active_emit_cache,
+        )
+        .await
+        .expect("Keystroke focus-in is acquired");
+    let forbidden = rmux_proto::AttachedKeystroke::new(b"z".to_vec());
+    handler
+        .handle_attached_keystroke_input_with_active_cache_for_identity(
+            identity,
+            &mut pending_input,
+            &forbidden,
+            &mut active_emit_cache,
+        )
+        .await
+        .expect("ordinary read-only keystroke is rejected cleanly");
+
+    let state = handler.state.lock().await;
+    assert_eq!(
+        state.pane_input_capture_for_test(&target),
+        Some(b"\x1b[O\x1b[I".to_vec())
+    );
+    drop(state);
+    let active_attach = handler.active_attach.lock().await;
+    let active = &active_attach.by_pid[&requester_pid];
+    assert!(active.reported_focused);
+    assert!(active
+        .flags
+        .contains(crate::client_flags::ClientFlags::READONLY));
+}
+
+#[tokio::test]
+async fn prompt_preserves_fragmented_outer_focus_reports_for_base_pane() {
+    let handler = RequestHandler::new();
+    let alpha = session_name("prompt-focus-controller");
+    let requester_pid = std::process::id();
+    create_send_keys_test_session(&handler, &alpha).await;
+    {
+        let mut state = handler.state.lock().await;
+        state
+            .append_bytes_to_pane_transcript_for_test(&alpha, 0, 0, b"\x1b[?1004h")
+            .expect("pane enables focus reporting");
+    }
+    let (control_tx, _control_rx) = mpsc::unbounded_channel();
+    handler
+        .register_attach(requester_pid, alpha.clone(), control_tx)
+        .await;
+    handler
+        .handle_attached_live_input_for_test(requester_pid, b"\x02:")
+        .await
+        .expect("default command prompt opens");
+    assert!(handler.prompt_active(requester_pid).await);
+    let target = PaneTarget::new(alpha.clone(), 0);
+    {
+        let state = handler.state.lock().await;
+        state.start_pane_input_capture_for_test(&target);
+    }
+
+    let mut pending_input = Vec::new();
+    handler
+        .handle_attached_live_input_inner(requester_pid, &mut pending_input, b"\x1b[")
+        .await
+        .expect("prompt retains fragmented focus prefix");
+    handler
+        .handle_attached_live_input_inner(requester_pid, &mut pending_input, b"O")
+        .await
+        .expect("prompt focus-out reaches controller");
+
+    assert!(pending_input.is_empty());
+    assert!(handler.prompt_active(requester_pid).await);
+    let state = handler.state.lock().await;
+    assert_eq!(
+        state.pane_input_capture_for_test(&target),
+        Some(b"\x1b[O".to_vec())
+    );
+    drop(state);
+    let active_attach = handler.active_attach.lock().await;
+    assert!(!active_attach.by_pid[&requester_pid].reported_focused);
 }
 
 #[tokio::test]
@@ -4732,7 +6776,7 @@ async fn live_attach_manual_prompt_drag_sequence_does_not_error() {
             environment: None,
         }))
         .await;
-    assert!(matches!(created, Response::NewSession(_)));
+    crate::session_fixture::assert_new_session(&created);
 
     let (control_tx, _control_rx) = mpsc::unbounded_channel();
     let _attach_id = handler

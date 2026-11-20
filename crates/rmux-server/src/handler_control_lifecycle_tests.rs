@@ -31,7 +31,7 @@ async fn new_session(handler: &RequestHandler, session_name: &SessionName) {
             environment: None,
         }))
         .await;
-    assert!(matches!(response, Response::NewSession(_)));
+    crate::session_fixture::assert_new_session(&response);
 }
 
 async fn new_window(handler: &RequestHandler, session_name: &SessionName) -> WindowTarget {
@@ -1018,7 +1018,7 @@ async fn destroy_control_switch_queues_committed_session_change_after_target_dis
     tokio::time::timeout(Duration::from_secs(5), pause.reached.notified())
         .await
         .expect("destroy switch reaches the post-commit pause");
-    handler
+    let _ = handler
         .state
         .lock()
         .await
@@ -1612,7 +1612,7 @@ async fn nonclosing_control_queue_revalidates_session_id_before_implicit_mutatio
         .id();
     let replacement_session_id = {
         let mut state = handler.state.lock().await;
-        state
+        let _ = state
             .sessions
             .remove_session(&alpha)
             .expect("original session removal succeeds");
@@ -2013,7 +2013,116 @@ async fn failed_session_exit_finishes_stale_identity_without_destroying_recreate
     ));
     let state = handler.state.lock().await;
     assert_eq!(
-        state.sessions.session(&alpha).map(rmux_core::Session::id),
+        state.sessions.session(&alpha).map(|session| session.id()),
         Some(new_session_id)
     );
+}
+
+mod lifecycle_characterization;
+
+#[path = "handler_control_lifecycle_tests/switch_cleanup.rs"]
+mod switch_cleanup;
+#[tokio::test]
+async fn switching_last_client_reaps_only_unattached_opted_in_source() {
+    for attached in [false, true] {
+        for resident in [false, true] {
+            for enabled in [false, true] {
+                let handler = RequestHandler::new();
+                let owner = session_name("switch-cleanup-owner");
+                new_session(&handler, &owner).await;
+                let source = create_grouped_session(&handler, "switch-cleanup-view", &owner).await;
+                let destination = session_name("switch-cleanup-destination");
+                new_session(&handler, &destination).await;
+                let pid = std::process::id();
+                let mut attached_receiver = None;
+                let mut control_receiver = None;
+                if attached {
+                    let (tx, rx) = mpsc::unbounded_channel();
+                    handler.register_attach(pid, source.clone(), tx).await;
+                    attached_receiver = Some(rx);
+                } else {
+                    control_receiver =
+                        Some(register_control_session(&handler, pid, source.clone()).await);
+                }
+                let _resident = if resident {
+                    Some(register_control_session(&handler, pid + 1, source.clone()).await)
+                } else {
+                    None
+                };
+                let window_id = {
+                    let mut state = handler.state.lock().await;
+                    state
+                        .options
+                        .set(
+                            ScopeSelector::Session(source.clone()),
+                            OptionName::DestroyUnattached,
+                            if enabled { "on" } else { "off" }.into(),
+                            SetOptionMode::Replace,
+                        )
+                        .unwrap();
+                    state.sessions.session(&owner).unwrap().window().id()
+                };
+                let response = handler
+                    .dispatch(
+                        pid,
+                        Request::SwitchClient(rmux_proto::SwitchClientRequest {
+                            target: destination.clone(),
+                        }),
+                    )
+                    .await
+                    .response;
+                assert!(
+                    matches!(response, Response::SwitchClient(_)),
+                    "{response:?}"
+                );
+                let state = handler.state.lock().await;
+                assert_eq!(
+                    state.sessions.session(&source).is_none(),
+                    enabled && !resident,
+                    "attached={attached}, resident={resident}, enabled={enabled}"
+                );
+                assert_eq!(
+                    state.sessions.session(&owner).unwrap().window().id(),
+                    window_id,
+                    "reaping a grouped view must preserve its owner's window"
+                );
+                assert!(state.sessions.session(&destination).is_some());
+                drop(state);
+                drop(attached_receiver);
+                drop(control_receiver);
+            }
+        }
+    }
+}
+
+#[tokio::test]
+async fn server_exit_tells_a_control_client_every_session_close_and_leaves_it_open() {
+    // tmux 3.7b, measured for kill-server, SIGTERM and SIGINT: a control client
+    // hears one `%sessions-changed` per session the exit closes, its own included,
+    // and only then the shutdown drain's bare `%exit`.
+    let handler = RequestHandler::new();
+    let alpha = session_name("server-exit-alpha");
+    let beta = session_name("server-exit-beta");
+    new_session(&handler, &alpha).await;
+    new_session(&handler, &beta).await;
+    let mut rx = register_control_session(&handler, 42_470, alpha.clone()).await;
+    let _ = drain_control_events(&mut rx);
+
+    // The second stop of the same exit adds nothing.
+    for _ in 0..2 {
+        let killed = handler
+            .handle(Request::KillServer(rmux_proto::KillServerRequest))
+            .await;
+        assert!(matches!(killed, Response::KillServer(_)), "{killed:?}");
+    }
+
+    let events = drain_control_events(&mut rx);
+    assert_has_no_exit(&events);
+    let closes = events
+        .iter()
+        .filter(|event| {
+            matches!(event, ControlServerEvent::Notification(line) if line == "%sessions-changed")
+        })
+        .count();
+    assert_eq!(closes, 2, "{events:?}");
 }

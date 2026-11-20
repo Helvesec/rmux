@@ -1,0 +1,32 @@
+{
+  "schema": 1,
+  "scope": "STATIC_SOURCE_LEDGER_INVENTORY",
+  "catalogue": {
+    "path": "scripts/tmux-shims/catalogue.json",
+    "sha256": "804814f49fb253d801608969087da8795ace16d794a23f16b52d6b8796767aa0"
+  },
+  "inputs": [
+    {
+      "path": "tests/reference/tmux_compat/divergences.toml",
+      "sha256": "dc483eb157f74f7dfcb817a6672aa50a8f7190b850af1d59cbd72cba805c7820"
+    },
+    {
+      "path": "docs/validation/reference-contracts.json",
+      "sha256": "6887a550ad9b7a70bce0163c3cc2fd468e2a0e04f59b28227b5d81dbec7c1831"
+    },
+    {
+      "path": "docs/validation/legacy-scenarios.json",
+      "sha256": "056584e8e032175b7ac35b7e15c0f7108aff3e908ea80b094ea4720af0a36865"
+    },
+    {
+      "path": "tests/reference/tmux_compat/frozen_reference.yaml",
+      "sha256": "6b18ee8ac9a8b2730bd58bb81282fbbd71a1ae3d425459672a1374c40cc53471"
+    }
+  ],
+  "counts": {
+    "sources": 1037,
+    "divergences": 64
+  },
+  "check": "python3 scripts/tmux_shim_inventory.py check",
+  "runtime_credit": false
+}

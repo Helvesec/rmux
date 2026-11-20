@@ -1,4 +1,5 @@
 [package]
+rust-version.workspace = true
 name = "rmux-os"
 version.workspace = true
 edition.workspace = true
@@ -9,8 +10,11 @@ description = "Small OS abstraction layer used by RMUX IPC and terminal integrat
 keywords = ["terminal", "multiplexer", "os"]
 categories = ["os", "command-line-interface"]
 
+[features]
+test-seams = []
+
 [dependencies]
-rmux-types = { path = "../rmux-types", version = "0.10.0" }
+rmux-types = { path = "../rmux-types", version = "0.11.0" }
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2.185"

@@ -22,8 +22,8 @@ async fn client_identity_fixture(
     pid_offset: u32,
 ) -> ClientIdentityFixture {
     let session_name = SessionName::new(label).expect("valid session");
-    assert!(matches!(
-        handler
+    crate::session_fixture::assert_new_session(
+        &handler
             .handle(Request::NewSession(NewSessionRequest {
                 session_name: session_name.clone(),
                 detached: true,
@@ -31,8 +31,7 @@ async fn client_identity_fixture(
                 environment: None,
             }))
             .await,
-        Response::NewSession(_)
-    ));
+    );
 
     let host_pid = std::process::id().saturating_add(pid_offset);
     let victim_pid = host_pid.saturating_add(1);

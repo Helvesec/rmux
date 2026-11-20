@@ -427,7 +427,7 @@ async fn create_session(handler: &RequestHandler, name: &str) -> SessionName {
             environment: None,
         }))
         .await;
-    assert!(matches!(response, Response::NewSession(_)), "{response:?}");
+    crate::session_fixture::assert_new_session(&response);
     handler.wait_for_initial_panes_for_test().await;
     session_name
 }
@@ -558,10 +558,7 @@ async fn publish_pre_destroy_tail(handler: &RequestHandler, target: &PaneTarget)
             .expect("test pane has a transcript");
         (output, transcript)
     };
-    transcript
-        .lock()
-        .expect("test pane transcript mutex")
-        .append_bytes(PRE_DESTROY_TAIL);
+    transcript.lock().append_bytes(PRE_DESTROY_TAIL);
     output.send(PRE_DESTROY_TAIL.to_vec())
 }
 
@@ -810,11 +807,12 @@ async fn pane_target_for_id(
 ) -> Option<PaneTarget> {
     let state = handler.state.lock().await;
     let session = state.sessions.session(session_name)?;
-    session.windows().iter().find_map(|(window_index, window)| {
+    let result = session.windows().find_map(|(window_index, window)| {
         window
             .panes()
             .iter()
             .find(|pane| pane.id() == pane_id)
-            .map(|pane| PaneTarget::with_window(session_name.clone(), *window_index, pane.index()))
-    })
+            .map(|pane| PaneTarget::with_window(session_name.clone(), window_index, pane.index()))
+    });
+    result
 }

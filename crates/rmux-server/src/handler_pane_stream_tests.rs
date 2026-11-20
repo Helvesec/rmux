@@ -29,7 +29,14 @@ const CONNECTION_ID: u64 = 41;
 
 #[cfg(unix)]
 fn quiet_command() -> Vec<String> {
-    vec!["/bin/sh".to_owned(), "-c".to_owned(), "sleep 60".to_owned()]
+    // A pane whose process ends mid-test reports ProcessExited to its streams,
+    // and a test on a loaded host can outlast any short sleep. Outlive every
+    // test instead; closing the PTY hangs the sleep up when the pane goes.
+    vec![
+        "/bin/sh".to_owned(),
+        "-c".to_owned(),
+        "exec sleep 2147483647".to_owned(),
+    ]
 }
 
 #[cfg(windows)]
@@ -73,7 +80,7 @@ async fn test_pane(
             skip_environment_update: false,
         })))
         .await;
-    assert!(matches!(response, Response::NewSession(_)), "{response:?}");
+    crate::session_fixture::assert_new_session(&response);
     let target = PaneTarget::with_window(session, 0, 0);
     handler
         .wait_for_pane_startup_to_finish_for_test(&target)
@@ -257,10 +264,7 @@ async fn raw_recovery_coverage_reports_sanitized_osc_metadata_incomplete() {
         "\x1b]2;courant-界\x1b\\",
         "\x1b]7;file:///rép\u{009d}ertoire/界\x1b\\"
     );
-    transcript
-        .lock()
-        .expect("transcript lock")
-        .append_bytes(payload.as_bytes());
+    transcript.lock().append_bytes(payload.as_bytes());
 
     let subscribed = subscribe(&handler, &target, PaneStreamMode::Raw).await;
     let PaneStreamEvent::RawRebase(rebase) = subscribed.event else {
@@ -593,10 +597,7 @@ async fn raw_stream_rebases_when_new_output_expires_parser_state() {
         cursor(&handler, subscribed.subscription_id).await.as_slice(),
         [PaneStreamEvent::RawBytes(bytes)] if bytes.bytes == b"\x1bPunterminated"
     ));
-    transcript
-        .lock()
-        .expect("transcript lock")
-        .make_ground_timer_due_for_test();
+    transcript.lock().make_ground_timer_due_for_test();
 
     crate::pane_io::publish_pane_bytes_for_test(&transcript, &output, b"AFTER".to_vec());
     let events = cursor(&handler, subscribed.subscription_id).await;
@@ -709,10 +710,7 @@ async fn surface_subscribers_share_one_driver_and_receive_the_same_frame() {
         1
     );
 
-    transcript
-        .lock()
-        .expect("transcript lock")
-        .append_bytes(b"shared");
+    transcript.lock().append_bytes(b"shared");
     output.send(b"shared".to_vec());
     let first_events = cursor(&handler, first.subscription_id).await;
     let second_events = cursor(&handler, second.subscription_id).await;
@@ -744,10 +742,7 @@ async fn surface_exposes_hyperlink_uris_and_dynamic_colors() {
         "\u{1b}]8;;\u{1b}\\"
     )
     .as_bytes();
-    transcript
-        .lock()
-        .expect("transcript lock")
-        .append_bytes(payload);
+    transcript.lock().append_bytes(payload);
     output.send(payload.to_vec());
 
     let subscribed = subscribe(&handler, &target, PaneStreamMode::Surface).await;
@@ -788,10 +783,7 @@ async fn surface_dynamic_color_only_output_emits_a_patch() {
     let subscribed = subscribe(&handler, &target, PaneStreamMode::Surface).await;
     let payload = b"\x1b]10;#abcdef\x1b\\";
 
-    transcript
-        .lock()
-        .expect("transcript lock")
-        .append_bytes(payload);
+    transcript.lock().append_bytes(payload);
     output.send(payload.to_vec());
 
     let events = cursor(&handler, subscribed.subscription_id).await;
@@ -809,10 +801,7 @@ async fn surface_dynamic_color_only_output_emits_a_patch() {
     );
 
     let reset = b"\x1b]110\x1b\\";
-    transcript
-        .lock()
-        .expect("transcript lock")
-        .append_bytes(reset);
+    transcript.lock().append_bytes(reset);
     output.send(reset.to_vec());
     let reset_events = cursor(&handler, subscribed.subscription_id).await;
     let reset_frame = reset_events
@@ -828,10 +817,7 @@ async fn surface_marks_omitted_hyperlink_metadata_incomplete() {
     let (target, output, transcript) = test_pane(&handler).await;
     let uri = format!("https://example.test/{}", "x".repeat(600));
     let payload = format!("\u{1b}]8;;{uri}\u{1b}\\X\u{1b}]8;;\u{1b}\\");
-    transcript
-        .lock()
-        .expect("transcript lock")
-        .append_bytes(payload.as_bytes());
+    transcript.lock().append_bytes(payload.as_bytes());
     output.send(payload.into_bytes());
 
     let subscribed = subscribe(&handler, &target, PaneStreamMode::Surface).await;
@@ -943,7 +929,7 @@ async fn identical_reset_does_not_regress_the_shared_pane_snapshot_revision() {
     // pane whose scrollback is already empty is invalidated without any
     // observable state changing. tmux 3.7b behaves the same way: the grid,
     // cursor and history counters are identical across `clear-history` on an
-    // empty-history pane (.rmux-audit/tmux-3.7b-identical-reset.txt).
+    // empty-history pane (tmux-3.7b-identical-reset.txt).
     output.mutate_transcript(
         &transcript,
         PaneInvalidationReason::ClearHistory,
@@ -1062,10 +1048,7 @@ async fn surface_nonvisual_output_advances_receiver_without_emitting_a_patch() {
     let (target, output, transcript) = test_pane(&handler).await;
     let subscribed = subscribe(&handler, &target, PaneStreamMode::Surface).await;
 
-    transcript
-        .lock()
-        .expect("transcript lock")
-        .append_bytes(b"\x07");
+    transcript.lock().append_bytes(b"\x07");
     output.send(b"\x07".to_vec());
 
     assert!(
@@ -1095,10 +1078,7 @@ async fn surface_delivers_metadata_completeness_changes_with_same_bounded_title(
         (bounded_title.clone(), true),
     ] {
         let bytes = format!("\x1b]2;{title}\x07").into_bytes();
-        transcript
-            .lock()
-            .expect("transcript lock")
-            .append_bytes(&bytes);
+        transcript.lock().append_bytes(&bytes);
         output.send(bytes);
 
         let events = cursor(&handler, subscribed.subscription_id).await;
@@ -1119,10 +1099,7 @@ async fn surface_delivers_metadata_only_completeness_changes() {
     let uri = "x".repeat(crate::pane_recovery::MAX_RECOVERY_HYPERLINK_ENTRY_BYTES + 1);
     let bytes = format!("\x1b]8;;{uri}\x1b\\").into_bytes();
 
-    transcript
-        .lock()
-        .expect("transcript lock")
-        .append_bytes(&bytes);
+    transcript.lock().append_bytes(&bytes);
     output.send(bytes);
 
     let events = cursor(&handler, subscribed.subscription_id).await;
@@ -1139,10 +1116,7 @@ async fn surface_refresh_does_not_hide_exit_published_during_its_rebase_window()
     let (target, output, transcript) = test_pane(&handler).await;
     let subscribed = subscribe(&handler, &target, PaneStreamMode::Surface).await;
 
-    transcript
-        .lock()
-        .expect("transcript lock")
-        .append_bytes(b"visual");
+    transcript.lock().append_bytes(b"visual");
     output.send(b"visual".to_vec());
     output.send(Vec::new());
 
@@ -1170,10 +1144,7 @@ async fn surface_patch_lifecycle_order_is_independent_of_cursor_batch_size() {
         let subscribed = subscribe(&handler, &target, PaneStreamMode::Surface).await;
 
         let send_visual = || {
-            transcript
-                .lock()
-                .expect("transcript lock")
-                .append_bytes(b"visual");
+            transcript.lock().append_bytes(b"visual");
             output.send(b"visual".to_vec());
         };
         if visual_before_exit {
@@ -1247,10 +1218,7 @@ async fn surface_delivers_exit_before_reset_when_visual_output_precedes_eof() {
     let (target, output, transcript) = test_pane(&handler).await;
     let subscribed = subscribe(&handler, &target, PaneStreamMode::Surface).await;
 
-    transcript
-        .lock()
-        .expect("transcript lock")
-        .append_bytes(b"visual");
+    transcript.lock().append_bytes(b"visual");
     output.send(b"visual".to_vec());
     output.send(Vec::new());
     output.set_generation(output.current_generation().saturating_add(1));
@@ -1344,10 +1312,7 @@ async fn assert_kill_drains_buffered_stream_events(
     let raw = subscribe(handler, target, PaneStreamMode::Raw).await;
     let surface = subscribe(handler, target, PaneStreamMode::Surface).await;
 
-    transcript
-        .lock()
-        .expect("transcript lock")
-        .append_bytes(b"killed-tail");
+    transcript.lock().append_bytes(b"killed-tail");
     let tail_sequence = output.send(b"killed-tail".to_vec());
 
     let response = handler.handle(kill).await;
@@ -1532,10 +1497,7 @@ async fn natural_pane_exit_drains_raw_and_surface_streams_before_end() {
         .pane_output_subscription_key_for_test(raw.subscription_id)
         .expect("subscription key");
 
-    transcript
-        .lock()
-        .expect("transcript lock")
-        .append_bytes(b"natural-tail");
+    transcript.lock().append_bytes(b"natural-tail");
     let tail_sequence = output.send(b"natural-tail".to_vec());
     output.send(Vec::new());
     handler
@@ -1656,10 +1618,7 @@ async fn assert_exit_commit_keeps_stream_source_available(
         .pane_output_subscription_key_for_test(subscribed.subscription_id)
         .expect("subscription key");
 
-    transcript
-        .lock()
-        .expect("transcript lock")
-        .append_bytes(b"commit-tail");
+    transcript.lock().append_bytes(b"commit-tail");
     let tail_sequence = output.send(b"commit-tail".to_vec());
     output.mutate_transcript(&transcript, PaneInvalidationReason::Resize, |transcript| {
         transcript.resize(TerminalSize { cols: 13, rows: 4 });
@@ -1815,10 +1774,7 @@ async fn idle_before_exit_does_not_consume_the_pane_stream_drain_window() {
         .expect("subscription key");
 
     tokio::time::sleep(Duration::from_millis(2_100)).await;
-    transcript
-        .lock()
-        .expect("transcript lock")
-        .append_bytes(b"idle-tail");
+    transcript.lock().append_bytes(b"idle-tail");
     output.send(b"idle-tail".to_vec());
     output.send(Vec::new());
     handler
@@ -2195,13 +2151,19 @@ async fn late_stream_subscriptions_are_rejected_while_an_exited_pane_drains() {
     let key = handler
         .pane_output_subscription_key_for_test(active.subscription_id)
         .expect("subscription key");
-    let removed_session = handler
-        .state
-        .lock()
-        .await
-        .sessions
-        .remove_session(target.session_name())
-        .expect("remove session before stream drain");
+    let checkpoint = {
+        let mut state = handler.state.lock().await;
+        let mut checkpoint = state
+            .sessions
+            .checkpoint_structure(&[target.session_name().clone()])
+            .unwrap();
+        let removed = state
+            .sessions
+            .remove_session(target.session_name())
+            .expect("remove session before stream drain");
+        checkpoint.retain_removed(removed.windows);
+        checkpoint
+    };
     handler
         .drain_exited_pane_output_subscriptions(key.clone(), Some(source))
         .await;
@@ -2233,7 +2195,7 @@ async fn late_stream_subscriptions_are_rejected_while_an_exited_pane_drains() {
         .lock()
         .await
         .sessions
-        .insert_existing_session(removed_session)
+        .restore_structure_checkpoint(checkpoint)
         .expect("restore test session");
 }
 

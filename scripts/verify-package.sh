@@ -9,6 +9,7 @@ Verify a local-first RMUX Unix package.
 
 Options:
   --checksums <path>     SHA256SUMS file (default: archive directory)
+  --expected-commit <sha> Require metadata to identify this full source commit
   --run-binary           Execute rmux -V plus helper fallback and daemon smokes
   --require-release-artifact
                          Fail unless metadata marks this as a release artifact
@@ -65,8 +66,7 @@ verify_package_hygiene() {
 
   forbidden="$(
     find "$root" \( \
-      -name .claude -o \
-      -name .codex -o \
+      -name ".?*" -o \
       -name '*.sock' -o \
       -name '*.tmp' -o \
       -name '*.bak' -o \
@@ -84,6 +84,7 @@ archive=""
 checksums=""
 run_binary=0
 require_release_artifact=0
+expected_commit=""
 
 while [ "$#" -gt 0 ]; do
   case "$1" in
@@ -95,6 +96,12 @@ while [ "$#" -gt 0 ]; do
     --run-binary)
       run_binary=1
       shift
+      ;;
+    --expected-commit)
+      [ "$#" -ge 2 ] || die "--expected-commit requires a value"
+      [ -n "$2" ] || die "--expected-commit requires a non-empty value"
+      expected_commit="$2"
+      shift 2
       ;;
     --require-release-artifact)
       require_release_artifact=1
@@ -144,16 +151,46 @@ package_root="$tmpdir/${archive_name%.tar.gz}"
 [ -d "$package_root" ] || die "archive root directory is missing: ${archive_name%.tar.gz}"
 verify_package_hygiene "$package_root"
 
-for required in bin/rmux libexec/rmux/rmux bin/rmux-daemon install.sh LICENSE-APACHE LICENSE-MIT SHA256SUMS.txt share/rmux/artifact-metadata.json share/man/man1/rmux.1; do
-  [ -e "$package_root/$required" ] || die "missing package file: $required"
-done
-[ -x "$package_root/bin/rmux" ] || die "packaged rmux is not executable"
-[ -x "$package_root/libexec/rmux/rmux" ] || die "packaged private helper is not executable"
-[ -x "$package_root/bin/rmux-daemon" ] || die "packaged rmux-daemon is not executable"
+# The layout, its modes and the absence of anything else come from the one
+# descriptor every builder and installer projects.
+"$script_dir/packaging/layout" --for-package "$package_root" check-tree --variant unix-archive --root "$package_root" ||
+  die "package layout does not match the descriptor"
+# The plan the package carries for its own installer is the projection of that
+# same descriptor, so an installer cannot be handed a layout nobody validated.
+"$script_dir/packaging/layout" --for-package "$package_root" manifest --variant unix-archive > "$tmpdir/package-layout.expected" ||
+  die "could not project the package manifest"
+cmp -s "$tmpdir/package-layout.expected" "$package_root/share/rmux/package-layout.tsv" ||
+  die "packaged layout manifest does not match the layout descriptor"
 [ -x "$package_root/install.sh" ] || die "packaged install.sh is not executable"
 verify_checksum_manifest "$package_root" "$package_root/SHA256SUMS.txt"
 
 metadata="$package_root/share/rmux/artifact-metadata.json"
+metadata_commit="$(python3 - "$metadata" "$expected_commit" "$require_release_artifact" <<'PYTHON'
+import json
+from pathlib import Path
+import re
+import sys
+
+try:
+    metadata = json.loads(Path(sys.argv[1]).read_text())
+    commit = metadata.get("git_commit")
+    if not isinstance(commit, str) or not re.fullmatch(r"[0-9a-f]{40}", commit):
+        raise ValueError("git_commit must be a full lowercase SHA")
+    expected = sys.argv[2]
+    if expected and (not re.fullmatch(r"[0-9a-f]{40}", expected) or commit != expected):
+        raise ValueError("git_commit differs from expected commit")
+    if sys.argv[3] == "1":
+        if metadata.get("release_artifact") is not True:
+            raise ValueError("metadata release_artifact is not true")
+        if metadata.get("configuration") != "release":
+            raise ValueError("release artifact metadata configuration is not release")
+        if metadata.get("git_dirty") is not False or metadata.get("skip_build") is not False:
+            raise ValueError("release artifact requires a clean source and a fresh release build")
+    print(commit)
+except (OSError, ValueError, AttributeError) as error:
+    sys.exit("source provenance: " + str(error))
+PYTHON
+)" || die "invalid package source provenance"
 metadata_binary_hash="$(sed -n 's/.*"binary_sha256"[[:space:]]*:[[:space:]]*"\([0-9a-fA-F]\{64\}\)".*/\1/p' "$metadata" | head -n 1 | tr 'A-F' 'a-f')"
 [ -n "$metadata_binary_hash" ] || die "metadata binary_sha256 is missing or invalid"
 packaged_binary_hash="$(sha256_file "$package_root/bin/rmux")"
@@ -172,10 +209,10 @@ metadata_target="$(sed -n 's/.*"target"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1
 case "$metadata_target" in
   *-unknown-linux-gnu)
     glibc_floor_script="$script_dir/glibc-symbol-floor.sh"
-    binary_glibc_min="$($glibc_floor_script "$package_root/bin/rmux")"
-    helper_binary_glibc_min="$($glibc_floor_script "$package_root/libexec/rmux/rmux")"
-    daemon_binary_glibc_min="$($glibc_floor_script "$package_root/bin/rmux-daemon")"
-    package_glibc_min="$($glibc_floor_script \
+    binary_glibc_min="$("$glibc_floor_script" "$package_root/bin/rmux")"
+    helper_binary_glibc_min="$("$glibc_floor_script" "$package_root/libexec/rmux/rmux")"
+    daemon_binary_glibc_min="$("$glibc_floor_script" "$package_root/bin/rmux-daemon")"
+    package_glibc_min="$("$glibc_floor_script" \
       "$package_root/bin/rmux" \
       "$package_root/libexec/rmux/rmux" \
       "$package_root/bin/rmux-daemon")"
@@ -199,15 +236,10 @@ case "$metadata_target" in
 esac
 
 grep -q '"artifact_kind"[[:space:]]*:[[:space:]]*"unix-package-binary"' "$metadata" || die "metadata artifact_kind is not unix-package-binary"
-grep -q '"git_commit"[[:space:]]*:' "$metadata" || die "metadata git_commit is missing"
-grep -q '"package_layout"[[:space:]]*:[[:space:]]*"rmux-package-v2"' "$metadata" || die "metadata package_layout is not rmux-package-v2"
-if [ "$require_release_artifact" -eq 1 ]; then
-  grep -q '"release_artifact"[[:space:]]*:[[:space:]]*true' "$metadata" ||
-    die "metadata release_artifact is not true"
-  grep -q '"configuration"[[:space:]]*:[[:space:]]*"release"' "$metadata" ||
-    die "release artifact metadata configuration is not release"
-fi
-
+package_layout_id="$("$script_dir/packaging/layout" --for-package "$package_root" layout-id --variant unix-archive)" ||
+  die "could not project the package layout identity"
+grep -q "\"package_layout\"[[:space:]]*:[[:space:]]*\"$package_layout_id\"" "$metadata" ||
+  die "metadata package_layout is not $package_layout_id"
 if [ "$run_binary" -eq 1 ]; then
   "$package_root/bin/rmux" -V >/dev/null
   mkdir -p "$tmpdir/home"
@@ -217,6 +249,10 @@ if [ "$run_binary" -eq 1 ]; then
     "$script_dir/smoke-installed-rmux.sh" "$package_root/bin/rmux" >/dev/null
   install_prefix="$tmpdir/install-prefix"
   "$package_root/install.sh" --prefix "$install_prefix" >/dev/null
+  # The same payload, after installation: every projected destination exists.
+  "$script_dir/packaging/layout" --for-package "$package_root" check-installed \
+    --variant unix-archive --package-root "$package_root" --prefix "$install_prefix" ||
+    die "installed layout does not match the descriptor"
   env \
     HOME="$tmpdir/home" \
     PATH="$install_prefix/bin:$install_prefix/libexec/rmux:/usr/bin:/bin" \
@@ -225,6 +261,7 @@ fi
 
 printf 'archive=%s\n' "$archive_abs"
 printf 'sha256=%s\n' "$actual_hash"
+printf 'git_commit=%s\n' "$metadata_commit"
 printf 'binary_sha256=%s\n' "$packaged_binary_hash"
 printf 'daemon_binary_sha256=%s\n' "$packaged_daemon_hash"
 [ -z "$package_glibc_min" ] || printf 'glibc_min=%s\n' "$package_glibc_min"

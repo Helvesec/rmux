@@ -327,7 +327,7 @@ for manager in ('APT', 'RPM'):
     else:
         raise SystemExit(f'{manager} republish was accepted')
 
-with tempfile.TemporaryDirectory() as root:
+with tempfile.TemporaryDirectory(dir=pathlib.Path.cwd().parent) as root:
     root = pathlib.Path(root)
     published = root / 'published'
     staging = root / 'staging'
@@ -484,7 +484,7 @@ def api_artifact(artifact_id, name, digest):
         },
     }
 
-with tempfile.TemporaryDirectory(dir=pathlib.Path.cwd()) as temporary:
+with tempfile.TemporaryDirectory(dir=pathlib.Path.cwd().parent) as temporary:
     root = pathlib.Path(temporary)
     paths = {
         'plan': root / 'downstream-channel-plan.json',
@@ -554,7 +554,7 @@ publisher = importlib.util.module_from_spec(spec)
 assert spec.loader is not None
 spec.loader.exec_module(publisher)
 
-with tempfile.TemporaryDirectory(dir=pathlib.Path.cwd()) as temporary:
+with tempfile.TemporaryDirectory(dir=pathlib.Path.cwd().parent) as temporary:
     root = pathlib.Path(temporary)
     (root / 'PACKAGE_REPOSITORY_BASE').write_text('a' * 40 + '\n', encoding='utf-8')
     required = {

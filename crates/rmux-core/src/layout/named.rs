@@ -1,3 +1,4 @@
+use crate::PaneId;
 use rmux_proto::{LayoutName, TerminalSize};
 
 use super::{
@@ -9,16 +10,17 @@ impl LayoutTree {
     #[must_use]
     pub(crate) fn named(
         layout: LayoutName,
-        pane_count: usize,
+        pane_ids: &[PaneId],
         size: TerminalSize,
         options: LayoutOptions,
     ) -> Self {
+        let pane_count = pane_ids.len();
         if pane_count <= 1 {
-            return Self::single(size);
+            return Self::single(size, pane_ids[0]);
         }
 
         let geometry = LayoutGeometry::new(u32::from(size.cols), u32::from(size.rows), 0, 0);
-        let mut tree = Self::build_named(layout, pane_count, geometry, options);
+        let mut tree = Self::build_named(layout, pane_ids, geometry, options);
         let (minimum_width, minimum_height) = tree.root.minimum_size();
         if geometry.width < minimum_width || geometry.height < minimum_height {
             let clamped_geometry = LayoutGeometry::new(
@@ -27,7 +29,7 @@ impl LayoutTree {
                 0,
                 0,
             );
-            tree = Self::build_named(layout, pane_count, clamped_geometry, options);
+            tree = Self::build_named(layout, pane_ids, clamped_geometry, options);
         }
         tree.root.fix_offsets(0, 0);
         debug_assert!(
@@ -39,44 +41,48 @@ impl LayoutTree {
 
     fn build_named(
         layout: LayoutName,
-        pane_count: usize,
+        pane_ids: &[PaneId],
         geometry: LayoutGeometry,
         options: LayoutOptions,
     ) -> Self {
         match layout {
             LayoutName::EvenHorizontal => {
-                Self::build_even(LayoutDirection::LeftRight, pane_count, geometry)
+                Self::build_even(LayoutDirection::LeftRight, pane_ids, geometry)
             }
             LayoutName::EvenVertical => {
-                Self::build_even(LayoutDirection::TopBottom, pane_count, geometry)
+                Self::build_even(LayoutDirection::TopBottom, pane_ids, geometry)
             }
             LayoutName::MainHorizontal => {
-                Self::build_main_horizontal(pane_count, geometry, options, false)
+                Self::build_main_horizontal(pane_ids, geometry, options, false)
             }
             LayoutName::MainHorizontalMirrored => {
-                Self::build_main_horizontal(pane_count, geometry, options, true)
+                Self::build_main_horizontal(pane_ids, geometry, options, true)
             }
             LayoutName::MainVertical => {
-                Self::build_main_vertical(pane_count, geometry, options, false)
+                Self::build_main_vertical(pane_ids, geometry, options, false)
             }
             LayoutName::MainVerticalMirrored => {
-                Self::build_main_vertical(pane_count, geometry, options, true)
+                Self::build_main_vertical(pane_ids, geometry, options, true)
             }
-            LayoutName::Tiled => Self::build_tiled(pane_count, geometry, options),
+            LayoutName::Tiled => Self::build_tiled(pane_ids, geometry, options),
         }
     }
 
-    fn build_even(direction: LayoutDirection, pane_count: usize, geometry: LayoutGeometry) -> Self {
+    fn build_even(
+        direction: LayoutDirection,
+        pane_ids: &[PaneId],
+        geometry: LayoutGeometry,
+    ) -> Self {
+        let pane_count = pane_ids.len();
+        let mut ids = pane_ids.iter().copied();
         let children = match direction {
             LayoutDirection::LeftRight => split_axis(geometry.width, pane_count)
                 .into_iter()
                 .scan(0_u32, |x, width| {
-                    let child = LayoutCell::pane(LayoutGeometry::new(
-                        width,
-                        geometry.height,
-                        *x,
-                        geometry.y,
-                    ));
+                    let child = LayoutCell::pane(
+                        ids.next().expect("named leaf has a pane"),
+                        LayoutGeometry::new(width, geometry.height, *x, geometry.y),
+                    );
                     *x = x.saturating_add(width).saturating_add(PANE_BORDER_CELLS);
                     Some(child)
                 })
@@ -84,12 +90,10 @@ impl LayoutTree {
             LayoutDirection::TopBottom => split_axis(geometry.height, pane_count)
                 .into_iter()
                 .scan(0_u32, |y, height| {
-                    let child = LayoutCell::pane(LayoutGeometry::new(
-                        geometry.width,
-                        height,
-                        geometry.x,
-                        *y,
-                    ));
+                    let child = LayoutCell::pane(
+                        ids.next().expect("named leaf has a pane"),
+                        LayoutGeometry::new(geometry.width, height, geometry.x, *y),
+                    );
                     *y = y.saturating_add(height).saturating_add(PANE_BORDER_CELLS);
                     Some(child)
                 })
@@ -98,16 +102,17 @@ impl LayoutTree {
 
         Self {
             root: LayoutCell::split(direction, geometry, children),
-            leaf_map: None,
         }
     }
 
     fn build_main_vertical(
-        pane_count: usize,
+        pane_ids: &[PaneId],
         geometry: LayoutGeometry,
         options: LayoutOptions,
         mirrored: bool,
     ) -> Self {
+        let pane_count = pane_ids.len();
+        let mut ids = pane_ids.iter().copied();
         let main_width = resolve_main_pane_size(
             geometry.width,
             options.requested_main_width.map(u32::from),
@@ -118,14 +123,20 @@ impl LayoutTree {
             .saturating_sub(main_width)
             .saturating_sub(PANE_BORDER_CELLS);
 
-        let main = LayoutCell::pane(LayoutGeometry::new(main_width, geometry.height, 0, 0));
+        let main = LayoutCell::pane(
+            ids.next().expect("named leaf has a pane"),
+            LayoutGeometry::new(main_width, geometry.height, 0, 0),
+        );
         let secondary = if pane_count == 2 {
-            LayoutCell::pane(LayoutGeometry::new(
-                secondary_width,
-                geometry.height,
-                main_width + PANE_BORDER_CELLS,
-                0,
-            ))
+            LayoutCell::pane(
+                ids.next().expect("named leaf has a pane"),
+                LayoutGeometry::new(
+                    secondary_width,
+                    geometry.height,
+                    main_width + PANE_BORDER_CELLS,
+                    0,
+                ),
+            )
         } else {
             let secondary_geometry = LayoutGeometry::new(
                 secondary_width,
@@ -136,12 +147,10 @@ impl LayoutTree {
             let children = split_axis(geometry.height, pane_count - 1)
                 .into_iter()
                 .scan(0_u32, |y, height| {
-                    let child = LayoutCell::pane(LayoutGeometry::new(
-                        secondary_width,
-                        height,
-                        secondary_geometry.x,
-                        *y,
-                    ));
+                    let child = LayoutCell::pane(
+                        ids.next().expect("named leaf has a pane"),
+                        LayoutGeometry::new(secondary_width, height, secondary_geometry.x, *y),
+                    );
                     *y = y.saturating_add(height).saturating_add(PANE_BORDER_CELLS);
                     Some(child)
                 })
@@ -149,30 +158,28 @@ impl LayoutTree {
             LayoutCell::split(LayoutDirection::TopBottom, secondary_geometry, children)
         };
 
-        let (children, leaf_map) = if mirrored {
-            let map = mirrored_leaf_map(pane_count);
-            (
-                vec![
-                    shift_cell(secondary, 0, 0),
-                    shift_cell(main, secondary_width + PANE_BORDER_CELLS, 0),
-                ],
-                Some(map),
-            )
+        let children = if mirrored {
+            vec![
+                shift_cell(secondary, 0, 0),
+                shift_cell(main, secondary_width + PANE_BORDER_CELLS, 0),
+            ]
         } else {
-            (vec![main, secondary], None)
+            vec![main, secondary]
         };
 
         let mut root = LayoutCell::split(LayoutDirection::LeftRight, geometry, children);
         root.fix_offsets(0, 0);
-        Self { root, leaf_map }
+        Self { root }
     }
 
     fn build_main_horizontal(
-        pane_count: usize,
+        pane_ids: &[PaneId],
         geometry: LayoutGeometry,
         options: LayoutOptions,
         mirrored: bool,
     ) -> Self {
+        let pane_count = pane_ids.len();
+        let mut ids = pane_ids.iter().copied();
         let main_height = resolve_main_pane_size(
             geometry.height,
             options.requested_main_height.map(u32::from),
@@ -183,14 +190,20 @@ impl LayoutTree {
             .saturating_sub(main_height)
             .saturating_sub(PANE_BORDER_CELLS);
 
-        let main = LayoutCell::pane(LayoutGeometry::new(geometry.width, main_height, 0, 0));
+        let main = LayoutCell::pane(
+            ids.next().expect("named leaf has a pane"),
+            LayoutGeometry::new(geometry.width, main_height, 0, 0),
+        );
         let secondary = if pane_count == 2 {
-            LayoutCell::pane(LayoutGeometry::new(
-                geometry.width,
-                secondary_height,
-                0,
-                main_height + PANE_BORDER_CELLS,
-            ))
+            LayoutCell::pane(
+                ids.next().expect("named leaf has a pane"),
+                LayoutGeometry::new(
+                    geometry.width,
+                    secondary_height,
+                    0,
+                    main_height + PANE_BORDER_CELLS,
+                ),
+            )
         } else {
             let secondary_geometry = LayoutGeometry::new(
                 geometry.width,
@@ -201,12 +214,10 @@ impl LayoutTree {
             let children = split_axis(geometry.width, pane_count - 1)
                 .into_iter()
                 .scan(0_u32, |x, width| {
-                    let child = LayoutCell::pane(LayoutGeometry::new(
-                        width,
-                        secondary_height,
-                        *x,
-                        secondary_geometry.y,
-                    ));
+                    let child = LayoutCell::pane(
+                        ids.next().expect("named leaf has a pane"),
+                        LayoutGeometry::new(width, secondary_height, *x, secondary_geometry.y),
+                    );
                     *x = x.saturating_add(width).saturating_add(PANE_BORDER_CELLS);
                     Some(child)
                 })
@@ -214,25 +225,23 @@ impl LayoutTree {
             LayoutCell::split(LayoutDirection::LeftRight, secondary_geometry, children)
         };
 
-        let (children, leaf_map) = if mirrored {
-            let map = mirrored_leaf_map(pane_count);
-            (
-                vec![
-                    shift_cell(secondary, 0, 0),
-                    shift_cell(main, 0, secondary_height + PANE_BORDER_CELLS),
-                ],
-                Some(map),
-            )
+        let children = if mirrored {
+            vec![
+                shift_cell(secondary, 0, 0),
+                shift_cell(main, 0, secondary_height + PANE_BORDER_CELLS),
+            ]
         } else {
-            (vec![main, secondary], None)
+            vec![main, secondary]
         };
 
         let mut root = LayoutCell::split(LayoutDirection::TopBottom, geometry, children);
         root.fix_offsets(0, 0);
-        Self { root, leaf_map }
+        Self { root }
     }
 
-    fn build_tiled(pane_count: usize, geometry: LayoutGeometry, options: LayoutOptions) -> Self {
+    fn build_tiled(pane_ids: &[PaneId], geometry: LayoutGeometry, options: LayoutOptions) -> Self {
+        let pane_count = pane_ids.len();
+        let mut ids = pane_ids.iter().copied();
         let max_columns = options
             .tiled_max_columns
             .filter(|columns| *columns > 0)
@@ -267,14 +276,18 @@ impl LayoutTree {
 
             let panes_in_row = remaining.min(columns);
             let mut row = if panes_in_row == 1 || columns == 1 {
-                LayoutCell::pane(LayoutGeometry::new(geometry.width, height, 0, row_y))
+                LayoutCell::pane(
+                    ids.next().expect("named leaf has a pane"),
+                    LayoutGeometry::new(geometry.width, height, 0, row_y),
+                )
             } else {
                 let mut children = Vec::new();
                 let mut row_x = 0_u32;
                 for _ in 0..panes_in_row {
-                    children.push(LayoutCell::pane(LayoutGeometry::new(
-                        width, height, row_x, row_y,
-                    )));
+                    children.push(LayoutCell::pane(
+                        ids.next().expect("named leaf has a pane"),
+                        LayoutGeometry::new(width, height, row_x, row_y),
+                    ));
                     row_x = row_x
                         .saturating_add(width)
                         .saturating_add(PANE_BORDER_CELLS);
@@ -316,24 +329,8 @@ impl LayoutTree {
 
         let mut root = LayoutCell::split(LayoutDirection::TopBottom, geometry, rows_cells);
         root.fix_offsets(0, 0);
-        Self {
-            root,
-            leaf_map: None,
-        }
+        Self { root }
     }
-}
-
-/// Builds a leaf map for mirrored layouts where tree order is [secondary..., main]
-/// but pane assignment order is [main, secondary...].
-fn mirrored_leaf_map(pane_count: usize) -> Vec<usize> {
-    let mut map: Vec<usize> = (0..pane_count).collect();
-    if pane_count >= 2 {
-        map[0] = pane_count - 1;
-        for (pane_pos, leaf_idx) in map.iter_mut().enumerate().skip(1) {
-            *leaf_idx = pane_pos - 1;
-        }
-    }
-    map
 }
 
 fn resolve_main_pane_size(total: u32, requested: Option<u32>, default: u32) -> u32 {

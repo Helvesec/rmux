@@ -19,7 +19,7 @@
 
 use rmux_proto::TerminalSize;
 
-use crate::input::{InputParser, InputState, OscColourSlot};
+use crate::input::{InputParser, InputState, OscColourSlot, ScreenWriter};
 use crate::screen::Screen;
 use crate::terminal_passthrough::TerminalPassthrough;
 use crate::utf8::Utf8Config;
@@ -126,6 +126,21 @@ impl TerminalParser {
         self.screen.set_title_rename_enabled(enabled);
     }
 
+    /// Enables or disables window renames requested by pane output.
+    pub(crate) fn set_allow_rename(&mut self, enabled: bool) {
+        self.screen.set_allow_rename(enabled);
+    }
+
+    /// Drains the window-rename requests accepted since the last drain.
+    pub(crate) fn take_window_rename_requests(&mut self) -> Vec<String> {
+        self.screen.take_window_rename_requests()
+    }
+
+    /// Sets whether a whole-screen erase scrolls the visible rows into history.
+    pub(crate) fn set_scroll_on_clear(&mut self, enabled: bool) {
+        self.screen.set_scroll_on_clear(enabled);
+    }
+
     /// Updates the tmux `input-buffer-size` parser limit.
     pub(crate) fn set_input_buffer_limit(&mut self, limit: usize) {
         self.parser.set_input_buffer_limit(limit);
@@ -139,6 +154,12 @@ impl TerminalParser {
     /// Feeds raw PTY output bytes through the parser into the screen.
     pub(crate) fn feed(&mut self, bytes: &[u8]) {
         self.parser.parse(bytes, &mut self.screen);
+    }
+
+    pub(crate) fn feed_with_query_colours(&mut self, bytes: &[u8], colours: [Option<[u8; 3]>; 2]) {
+        self.parser.query_colours = colours;
+        self.feed(bytes);
+        self.parser.query_colours = [None, None];
     }
 
     pub(crate) fn take_recovery_rebase_required(&mut self) -> bool {
@@ -155,6 +176,14 @@ impl TerminalParser {
     /// to the PTY.
     pub(crate) fn take_replies(&mut self) -> Vec<u8> {
         self.parser.take_replies()
+    }
+
+    pub(crate) fn take_theme_events(&mut self) -> Vec<crate::input::ThemeEvent> {
+        self.parser.take_theme_events()
+    }
+
+    pub(crate) fn enable_theme_events(&mut self) {
+        self.parser.enable_theme_events();
     }
 
     /// Returns and drains terminal passthrough events generated while parsing.
@@ -245,11 +274,13 @@ impl TerminalParser {
 
     /// Notifies the parser that the ground timer has expired.
     pub(crate) fn ground_timer_expired(&mut self) {
+        self.screen.collect_end();
         self.parser.ground_timer_expired();
     }
 
     /// Resets the parser state machine to ground.
     pub(crate) fn reset_to_ground(&mut self) {
+        self.screen.collect_end();
         self.parser.reset_to_ground();
     }
 
@@ -259,8 +290,13 @@ impl TerminalParser {
     /// state such as pending control bytes, replies, saved cursor state, and
     /// current cell attributes.
     pub(crate) fn reset_parser(&mut self) {
+        self.screen.collect_end();
         let input_buffer_limit = self.parser.configured_input_buffer_limit();
+        let theme_events_enabled = self.parser.theme_events_enabled();
         self.parser = InputParser::new();
+        if theme_events_enabled {
+            self.parser.enable_theme_events();
+        }
         self.parser.set_input_buffer_limit(input_buffer_limit);
     }
 }
@@ -541,6 +577,41 @@ mod tests {
     }
 
     #[test]
+    fn gh219_parser_resets_and_ground_timer_release_zwj_terminated_cell() {
+        let bounded_prefix = "👩\u{200D}❤\u{FE0F}\u{200D}💋\u{200D}👨\u{200D}";
+        assert_eq!(bounded_prefix.len(), 30);
+        assert_eq!(bounded_prefix.chars().last(), Some('\u{200D}'));
+        let assert_reset = |name: &str, reset: fn(&mut TerminalParser)| {
+            let mut parser = TerminalParser::new(size(8, 1), 2);
+            parser.feed(format!("{bounded_prefix}👨🏽").as_bytes());
+            assert!(!parser.plain_output_forwarding_safe(), "before {name}");
+
+            reset(&mut parser);
+            assert!(
+                !parser.plain_output_forwarding_safe(),
+                "{name} must retain the pending fresh-cell boundary"
+            );
+            parser.feed("中".as_bytes());
+            assert!(
+                parser.plain_output_forwarding_safe(),
+                "after text following {name}"
+            );
+
+            let line = parser
+                .screen()
+                .grid()
+                .visible_line(0)
+                .expect("recovery row");
+            assert_eq!(line.cell(2).expect("following CJK owner").text(), "中");
+            assert!(line.cell(3).expect("following CJK padding").is_padding());
+        };
+
+        assert_reset("reset_to_ground", TerminalParser::reset_to_ground);
+        assert_reset("reset_parser", TerminalParser::reset_parser);
+        assert_reset("ground_timer_expired", TerminalParser::ground_timer_expired);
+    }
+
+    #[test]
     fn plain_output_forwarding_rejects_pending_wrap_and_non_default_modes() {
         let mut pending_wrap = TerminalParser::new(size(8, 3), 4);
         assert!(pending_wrap.plain_output_forwarding_safe());
@@ -617,3 +688,6 @@ mod tests {
         assert!(parser.plain_output_forwarding_safe());
     }
 }
+
+#[cfg(test)]
+mod query_colours_tests;

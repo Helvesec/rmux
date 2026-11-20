@@ -1,23 +1,33 @@
+#[cfg(test)]
+use crate::session_fixture::SessionSetup;
+#[cfg(test)]
+use crate::session_fixture::SessionSetupExt as _;
 use std::collections::{BTreeMap, HashMap, HashSet};
 
+#[cfg(test)]
+use super::pane_terminal_store::native_resize::WindowMutationResizeError;
 use rmux_core::{
-    EnvironmentStore, HookStore, OptionStore, PaneId, Session, SessionStore, WindowId,
+    AttachedWindowGeometry, EnvironmentStore, HookStore, ManagedSessionStore, OptionStore, PaneId,
+    WindowId,
 };
-use rmux_proto::{PaneTarget, RmuxError, SessionName, TerminalPixels, TerminalSize, WindowTarget};
+use rmux_proto::{
+    PaneTarget, RmuxError, SessionId, SessionName, TerminalPixels, TerminalSize, WindowTarget,
+};
 
 use super::{
-    session_not_found, AppliedWindowResizeQueue, HandlerState, PaneExitMetadata,
+    session_not_found, AppliedWindowResizeQueue, HandlerState, PaneExitObservation,
     PaneLifecycleState, WindowLinkGroup, WindowLinkSlot,
 };
 
 pub(crate) struct SessionTransferSnapshot {
-    sessions: SessionStore,
+    sessions: rmux_core::ManagedStructureCheckpoint,
     options: OptionStore,
     environment: EnvironmentStore,
     hooks: HookStore,
     pane_lifecycle: HashMap<PaneId, PaneLifecycleState>,
     attached_terminal_pixels: HashMap<SessionName, TerminalPixels>,
-    dead_panes: HashMap<SessionName, HashMap<PaneId, PaneExitMetadata>>,
+    dead_panes: HashMap<SessionName, HashMap<PaneId, PaneExitObservation>>,
+    kept_dead_pane_preparations: HashMap<SessionName, HashMap<PaneId, u64>>,
     auto_named_windows: HashSet<(SessionName, u32)>,
     window_link_groups: HashMap<u64, WindowLinkGroup>,
     window_link_slots: HashMap<WindowLinkSlot, u64>,
@@ -71,15 +81,16 @@ impl PaneTransferGeometryContext {
 }
 
 impl SessionTransferSnapshot {
-    pub(crate) fn capture(state: &HandlerState) -> Self {
-        Self {
-            sessions: state.sessions.clone(),
+    pub(crate) fn capture(state: &HandlerState, names: &[SessionName]) -> Result<Self, RmuxError> {
+        Ok(Self {
+            sessions: state.sessions.checkpoint_structure(names)?,
             options: state.options.clone(),
             environment: state.environment.clone(),
             hooks: state.hooks.clone(),
             pane_lifecycle: state.pane_lifecycle.clone(),
             attached_terminal_pixels: state.attached_terminal_pixels.clone(),
             dead_panes: state.dead_panes.clone(),
+            kept_dead_pane_preparations: state.kept_dead_pane_preparations.clone(),
             auto_named_windows: state.auto_named_windows.clone(),
             window_link_groups: state.window_link_groups.clone(),
             window_link_slots: state.window_link_slots.clone(),
@@ -87,17 +98,39 @@ impl SessionTransferSnapshot {
             next_window_link_group_id: state.next_window_link_group_id,
             next_window_link_occurrence_id: state.next_window_link_occurrence_id,
             applied_window_resizes: state.applied_window_resizes.clone(),
+        })
+    }
+
+    pub(crate) fn retain_removed(
+        &mut self,
+        windows: impl IntoIterator<Item = Box<rmux_core::Window>>,
+    ) {
+        self.sessions.retain_removed(windows);
+    }
+
+    pub(crate) fn transfer_removed_to(
+        &mut self,
+        outer: &mut rmux_core::ManagedStructureCheckpoint,
+    ) {
+        outer.retain_removed(self.sessions.take_removed());
+    }
+
+    pub(crate) fn retain_transfer(&mut self, transfer: rmux_core::ManagedPaneTransfer) {
+        self.retain_removed(transfer.change.removed_windows);
+        if let Some(removal) = transfer.destroyed_window {
+            self.retain_removed(removal.window);
         }
     }
 
-    pub(crate) fn restore(self, state: &mut HandlerState) {
-        state.sessions = self.sessions;
+    pub(crate) fn restore(self, state: &mut HandlerState) -> Result<(), RmuxError> {
+        state.sessions.restore_structure_checkpoint(self.sessions)?;
         state.options = self.options;
         state.environment = self.environment;
         state.hooks = self.hooks;
         state.pane_lifecycle = self.pane_lifecycle;
         state.attached_terminal_pixels = self.attached_terminal_pixels;
         state.dead_panes = self.dead_panes;
+        state.kept_dead_pane_preparations = self.kept_dead_pane_preparations;
         state.auto_named_windows = self.auto_named_windows;
         state.window_link_groups = self.window_link_groups;
         state.window_link_slots = self.window_link_slots;
@@ -107,6 +140,7 @@ impl SessionTransferSnapshot {
         // A rolled-back geometry change owes no notification: restoring the
         // session model must also retract the resizes it undid.
         state.applied_window_resizes = self.applied_window_resizes;
+        Ok(())
     }
 }
 
@@ -115,8 +149,12 @@ impl WindowGeometrySnapshot {
         let source_window_id = window_id_at(state, &context.source);
         let target_window_id = window_id_at(state, &context.target);
         let mut aliases_by_window = BTreeMap::<WindowId, Vec<(WindowTarget, TerminalSize)>>::new();
-        for (session_name, session) in state.sessions.iter() {
-            for (&window_index, window) in session.windows() {
+        for (session_name, session) in state
+            .sessions
+            .iter()
+            .map(|session| (session.name(), session))
+        {
+            for (window_index, window) in session.windows() {
                 aliases_by_window.entry(window.id()).or_default().push((
                     WindowTarget::with_window(session_name.clone(), window_index),
                     window.size(),
@@ -196,9 +234,8 @@ impl WindowGeometryBefore {
             let Some(session) = state.sessions.session(session_name) else {
                 continue;
             };
-            if let Some((&window_index, window)) = session
+            if let Some((window_index, window)) = session
                 .windows()
-                .iter()
                 .find(|(_, window)| window.id() == self.window_id)
             {
                 return Some((
@@ -209,8 +246,12 @@ impl WindowGeometryBefore {
         }
 
         let mut fallback = None;
-        for (session_name, session) in state.sessions.iter() {
-            for (&window_index, window) in session.windows() {
+        for (session_name, session) in state
+            .sessions
+            .iter()
+            .map(|session| (session.name(), session))
+        {
+            for (window_index, window) in session.windows() {
                 if window.id() != self.window_id {
                     continue;
                 }
@@ -289,22 +330,54 @@ impl HandlerState {
         result
     }
 
-    pub(crate) fn mutate_session_and_resize_active_window_geometry<T, F>(
+    pub(crate) fn mutate_attached_window_geometry_and_resize_terminal<T, F>(
         &mut self,
-        session_name: &SessionName,
+        target: &WindowTarget,
         mutate: F,
     ) -> Result<T, RmuxError>
     where
-        F: FnOnce(&mut Session) -> Result<T, RmuxError>,
+        F: FnOnce(AttachedWindowGeometry<'_>) -> Result<T, RmuxError>,
     {
-        let active_window_index = self
-            .sessions
-            .session(session_name)
-            .ok_or_else(|| session_not_found(session_name))?
-            .active_window_index();
-        self.mutate_session_and_resize_window_terminal(session_name, active_window_index, mutate)
+        self.mutate_store_and_resize_window_terminal_with_family_if(
+            target.session_name(),
+            target.window_index(),
+            |store| mutate(store.attached_window_geometry_mut(target)?),
+            |_| true,
+        )
+        .map(|(result, _)| result)
+        .map_err(RmuxError::from)
     }
 
+    /// Keeps attach recency and geometry in one window transaction while the
+    /// callback receives no access to unrelated session state.
+    pub(crate) fn mutate_touched_attached_window_geometry_and_resize_terminal<T, F>(
+        &mut self,
+        target: &WindowTarget,
+        expected_session_id: SessionId,
+        mutate: F,
+    ) -> Result<T, RmuxError>
+    where
+        F: FnOnce(AttachedWindowGeometry<'_>) -> Result<T, RmuxError>,
+    {
+        self.mutate_store_and_resize_window_terminal_with_family_if(
+            target.session_name(),
+            target.window_index(),
+            |store| {
+                if store
+                    .session(target.session_name())
+                    .is_none_or(|session| session.id() != expected_session_id)
+                {
+                    return Err(session_not_found(target.session_name()));
+                }
+                mutate(store.touched_attached_window_geometry_mut(target)?)
+            },
+            |_| true,
+        )
+        .map(|(result, _)| result)
+        .map_err(RmuxError::from)
+    }
+
+    #[cfg(test)]
     pub(crate) fn mutate_session_and_resize_window_terminal<T, F>(
         &mut self,
         session_name: &SessionName,
@@ -312,7 +385,7 @@ impl HandlerState {
         mutate: F,
     ) -> Result<T, RmuxError>
     where
-        F: FnOnce(&mut Session) -> Result<T, RmuxError>,
+        F: FnOnce(&mut SessionSetup<'_>) -> Result<T, RmuxError>,
     {
         self.mutate_session_and_resize_window_terminal_with_family(
             session_name,
@@ -322,6 +395,7 @@ impl HandlerState {
         .map(|(result, _)| result)
     }
 
+    #[cfg(test)]
     pub(crate) fn mutate_session_and_resize_window_terminal_with_family<T, F>(
         &mut self,
         session_name: &SessionName,
@@ -329,7 +403,7 @@ impl HandlerState {
         mutate: F,
     ) -> Result<(T, Vec<SessionName>), RmuxError>
     where
-        F: FnOnce(&mut Session) -> Result<T, RmuxError>,
+        F: FnOnce(&mut SessionSetup<'_>) -> Result<T, RmuxError>,
     {
         self.mutate_session_and_resize_window_terminal_with_family_if(
             session_name,
@@ -337,137 +411,34 @@ impl HandlerState {
             mutate,
             |_| true,
         )
+        .map_err(RmuxError::from)
     }
 
-    /// The primary chokepoint for mutations scoped to one stored window.
-    ///
-    /// tmux 3.7b keeps the equivalent invariant inside `resize_window()`: a
-    /// window whose size actually changed always publishes
-    /// `window-layout-changed` and then `window-resized`, and control clients see
-    /// the former as `%layout-change`. Publication here is asynchronous, so a
-    /// window whose size really moved is recorded on the state and drained by
-    /// `RequestHandler::publish_applied_window_resizes`. Join/move transfers use
-    /// the mandatory all-window snapshot boundary above to preserve the same
-    /// invariant across stable window identities.
+    /// Runs borrowed fixture setup inside the shared window transaction.
+    #[cfg(test)]
     pub(crate) fn mutate_session_and_resize_window_terminal_with_family_if<T, F, P>(
         &mut self,
         session_name: &SessionName,
         window_index: u32,
         mutate: F,
         should_resize: P,
-    ) -> Result<(T, Vec<SessionName>), RmuxError>
+    ) -> Result<(T, Vec<SessionName>), WindowMutationResizeError>
     where
-        F: FnOnce(&mut Session) -> Result<T, RmuxError>,
+        F: FnOnce(&mut SessionSetup<'_>) -> Result<T, RmuxError>,
         P: FnOnce(&T) -> bool,
     {
-        let geometry_before = self.window_content_size(session_name, window_index);
-        let (result, synchronized_sessions, snapshot) = self
-            .mutate_session_and_synchronize_window_family_with_snapshot(
-                session_name,
-                window_index,
-                mutate,
-            )?;
-
-        if !should_resize(&result) {
-            self.record_window_geometry_change(session_name, window_index, geometry_before);
-            return Ok((result, synchronized_sessions));
-        }
-
-        if let Err(error) = self.resize_window_terminal_runtime(session_name, window_index) {
-            snapshot.restore(self);
-            self.resize_window_terminal_runtime(session_name, window_index)
-                .map_err(|rollback_error| {
-                    RmuxError::Server(format!(
-                        "failed to roll back window runtime for {session_name}:{window_index} after {error}: {rollback_error}"
-                    ))
-                })?;
-            return Err(error);
-        }
-
-        for synchronized_session in &synchronized_sessions {
-            self.sync_pane_lifecycle_dimensions_for_session(synchronized_session);
-        }
-        self.record_window_geometry_change(session_name, window_index, geometry_before);
-        Ok((result, synchronized_sessions))
-    }
-
-    fn record_window_geometry_change(
-        &mut self,
-        session_name: &SessionName,
-        window_index: u32,
-        geometry_before: Option<rmux_proto::TerminalSize>,
-    ) {
-        let geometry_after = self.window_content_size(session_name, window_index);
-        if geometry_after.is_none() || geometry_after == geometry_before {
-            return;
-        }
-        self.record_applied_window_resize(WindowTarget::with_window(
-            session_name.clone(),
-            window_index,
-        ));
-    }
-
-    fn window_content_size(
-        &self,
-        session_name: &SessionName,
-        window_index: u32,
-    ) -> Option<rmux_proto::TerminalSize> {
-        self.sessions
-            .session(session_name)
-            .and_then(|session| session.window_at(window_index))
-            .map(rmux_core::Window::size)
-    }
-
-    pub(crate) fn mutate_session_and_synchronize_window_family<T, F>(
-        &mut self,
-        session_name: &SessionName,
-        window_index: u32,
-        mutate: F,
-    ) -> Result<(T, Vec<SessionName>), RmuxError>
-    where
-        F: FnOnce(&mut Session) -> Result<T, RmuxError>,
-    {
-        self.mutate_session_and_synchronize_window_family_with_snapshot(
+        self.mutate_store_and_resize_window_terminal_with_family_if(
             session_name,
             window_index,
-            mutate,
+            |store| {
+                mutate(
+                    &mut store
+                        .session_setup(session_name)
+                        .ok_or_else(|| session_not_found(session_name))?,
+                )
+            },
+            should_resize,
         )
-        .map(|(result, synchronized_sessions, _)| (result, synchronized_sessions))
-    }
-
-    fn mutate_session_and_synchronize_window_family_with_snapshot<T, F>(
-        &mut self,
-        session_name: &SessionName,
-        window_index: u32,
-        mutate: F,
-    ) -> Result<(T, Vec<SessionName>, SessionTransferSnapshot), RmuxError>
-    where
-        F: FnOnce(&mut Session) -> Result<T, RmuxError>,
-    {
-        let snapshot = SessionTransferSnapshot::capture(self);
-        let result = {
-            let session = self
-                .sessions
-                .session_mut(session_name)
-                .ok_or_else(|| session_not_found(session_name))?;
-            mutate(session)
-        };
-        let result = match result {
-            Ok(result) => result,
-            Err(error) => {
-                snapshot.restore(self);
-                return Err(error);
-            }
-        };
-        let synchronized_sessions =
-            match self.synchronize_linked_window_family_from_slot(session_name, window_index) {
-                Ok(synchronized_sessions) => synchronized_sessions,
-                Err(error) => {
-                    snapshot.restore(self);
-                    return Err(error);
-                }
-            };
-        Ok((result, synchronized_sessions, snapshot))
     }
 
     #[cfg(test)]
@@ -477,30 +448,24 @@ impl HandlerState {
         mutate: F,
     ) -> Result<T, RmuxError>
     where
-        F: FnOnce(&mut Session) -> Result<T, RmuxError>,
+        F: FnOnce(&mut SessionSetup<'_>) -> Result<T, RmuxError>,
     {
-        let previous_session = self
-            .sessions
-            .session(session_name)
-            .cloned()
-            .ok_or_else(|| session_not_found(session_name))?;
-        let result = {
-            let session = self
+        let snapshot = SessionTransferSnapshot::capture(self, std::slice::from_ref(session_name))?;
+        let result = mutate(
+            &mut self
                 .sessions
-                .session_mut(session_name)
-                .ok_or_else(|| session_not_found(session_name))?;
-            mutate(session)
-        };
+                .session_setup(session_name)
+                .ok_or_else(|| session_not_found(session_name))?,
+        );
         let result = match result {
             Ok(result) => result,
             Err(error) => {
-                self.replace_session(session_name, previous_session)?;
+                snapshot.restore(self)?;
                 return Err(error);
             }
         };
-
         if let Err(error) = self.resize_terminals(session_name) {
-            self.restore_session_after_resize_error(session_name, previous_session, &error)?;
+            snapshot.restore(self)?;
             return Err(error);
         }
 
@@ -519,29 +484,24 @@ impl HandlerState {
         finalize_model: A,
     ) -> Result<(T, C), RmuxError>
     where
-        F: FnOnce(&mut Session) -> Result<T, RmuxError>,
+        F: FnOnce(&mut ManagedSessionStore, &mut SessionTransferSnapshot) -> Result<T, RmuxError>,
         M: FnOnce(&mut Self, &T) -> Result<(), RmuxError>,
         R: FnOnce(&mut Self, &T) -> Result<(), RmuxError>,
         A: FnOnce(&mut Self, &T) -> Result<C, RmuxError>,
     {
-        let snapshot = SessionTransferSnapshot::capture(self);
-        let result = {
-            let session = self
-                .sessions
-                .session_mut(session_name)
-                .ok_or_else(|| session_not_found(session_name))?;
-            mutate(session)
-        };
+        let mut snapshot =
+            SessionTransferSnapshot::capture(self, std::slice::from_ref(session_name))?;
+        let result = mutate(&mut self.sessions, &mut snapshot);
         let result = match result {
             Ok(result) => result,
             Err(error) => {
-                snapshot.restore(self);
+                snapshot.restore(self)?;
                 return Err(error);
             }
         };
 
         if let Err(error) = move_runtime(self, &result) {
-            snapshot.restore(self);
+            snapshot.restore(self)?;
             return Err(error);
         }
 
@@ -551,7 +511,7 @@ impl HandlerState {
             Ok(committed) => committed,
             Err(error) => {
                 let runtime_rollback = rollback_runtime(self, &result);
-                snapshot.restore(self);
+                snapshot.restore(self)?;
                 let session_rollback =
                     self.resize_terminals(session_name)
                         .map_err(|rollback_error| {

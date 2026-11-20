@@ -1,11 +1,11 @@
 use rmux_proto::{PaneTarget, RmuxError, SessionName, Target};
 
-use crate::{Pane, SessionStore, Window};
+use crate::{Pane, Window};
 
 use super::matching::{target_for_type, target_not_found, ResolvedParts};
 use super::{MissingCurrentTargetFallback, TargetFindContext, TargetFindFlags, TargetFindType};
 
-impl SessionStore {
+impl super::storage::TargetStore<'_> {
     pub(super) fn current_target_for_type(
         &self,
         find_type: TargetFindType,

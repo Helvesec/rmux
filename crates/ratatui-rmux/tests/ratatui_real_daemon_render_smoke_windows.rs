@@ -11,10 +11,7 @@ use ratatui_core::buffer::Buffer;
 use ratatui_core::layout::Rect;
 use ratatui_core::widgets::Widget;
 use ratatui_rmux::{PaneDriver, PaneState, PaneWidget};
-use rmux_sdk::{
-    bootstrap::discovery::SDK_DAEMON_BINARY_ENV, EnsureSession, EnsureSessionPolicy, RmuxBuilder,
-    SessionName,
-};
+use rmux_sdk::{EnsureSession, EnsureSessionPolicy, RmuxBuilder, SessionName};
 
 #[path = "../../../tests/support/windows_cargo_build.rs"]
 mod windows_cargo_build;
@@ -28,7 +25,7 @@ async fn ratatui_real_daemon_render_smoke_windows() -> TestResult {
     let pipe_name = unique_pipe_name()?;
     let cleanup = Cleanup::new(pipe_name.clone());
     let daemon_binary = rmux_binary()?.to_path_buf();
-    let _daemon_binary_env = EnvGuard::set(SDK_DAEMON_BINARY_ENV, daemon_binary.as_os_str());
+    let _daemon_binary_env = EnvGuard::set("RMUX_SDK_DAEMON_BINARY", daemon_binary.as_os_str());
 
     let rmux = builder(&pipe_name).connect_or_start().await?;
     let session = rmux
@@ -203,7 +200,10 @@ fn cmd_exe() -> String {
 fn rmux_binary() -> TestResult<&'static Path> {
     static RMUX_BINARY: OnceLock<Result<PathBuf, String>> = OnceLock::new();
     match RMUX_BINARY.get_or_init(|| resolve_rmux_binary().map_err(|error| error.to_string())) {
-        Ok(path) => Ok(path.as_path()),
+        Ok(path) => {
+            windows_cargo_build::verify_binary(path)?;
+            Ok(path.as_path())
+        }
         Err(error) => Err(std::io::Error::other(error.clone()).into()),
     }
 }
@@ -303,7 +303,11 @@ impl Drop for Cleanup {
         if !self.armed {
             return;
         }
-        let _ = Command::new(rmux_binary().unwrap_or_else(|_| Path::new("rmux")))
+        let selected = rmux_binary().unwrap_or_else(|_| Path::new("rmux"));
+        let Ok(binary) = windows_cargo_build::verify_binary(selected) else {
+            return;
+        };
+        let _ = Command::new(binary)
             .arg("-S")
             .arg(&self.pipe_name)
             .arg("kill-server")

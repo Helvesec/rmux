@@ -81,7 +81,8 @@ use crate::{PaneId, Result, RmuxError};
 const PANE_OUTPUT_BATCH_SIZE: u16 = 256;
 const POLL_INITIAL_DELAY: Duration = Duration::from_millis(2);
 const POLL_MAX_DELAY: Duration = Duration::from_millis(50);
-const LINE_BUFFER_MAX: usize = 1_048_576;
+#[cfg(test)]
+use crate::automation::LINE_BUFFER_MAX;
 
 /// Where a pane-output stream should anchor its cursor at subscription time.
 ///
@@ -433,27 +434,8 @@ impl PaneSubscription {
         command: &'static str,
         response_id: PaneOutputSubscriptionId,
     ) -> Result<()> {
-        if response_id == self.subscription_id {
-            return Ok(());
-        }
-        Err(subscription_mismatch_error(
-            command,
-            self.subscription_id,
-            response_id,
-        ))
+        crate::automation::validate_subscription_id(command, self.subscription_id, response_id)
     }
-}
-
-fn subscription_mismatch_error(
-    command: &'static str,
-    expected: PaneOutputSubscriptionId,
-    got: PaneOutputSubscriptionId,
-) -> RmuxError {
-    RmuxError::protocol(rmux_proto::RmuxError::Server(format!(
-        "rmux daemon sent subscription id {} in `{command}` response for subscription {}",
-        got.as_u64(),
-        expected.as_u64()
-    )))
 }
 
 fn ingest_cursor(target: &mut VecDeque<PaneOutputChunk>, events: Vec<PaneOutputEvent>) {
@@ -476,10 +458,10 @@ enum RefillOutcome {
 }
 
 fn is_subscription_gone(error: &RmuxError) -> bool {
-    match error {
-        RmuxError::Protocol {
-            source: rmux_proto::RmuxError::Server(message),
-        } => message == "subscription not found" || message == "subscription receiver not found",
+    match error.protocol_source() {
+        Some(rmux_proto::RmuxError::Server(message)) => {
+            message == "subscription not found" || message == "subscription receiver not found"
+        }
         _ => false,
     }
 }
@@ -542,30 +524,17 @@ fn split_lines_bounded(
     bytes: &[u8],
     out: &mut VecDeque<PaneLineItem>,
 ) {
-    for byte in bytes {
-        if *byte == b'\n' {
-            if buffer.is_empty() && *force_flushed {
-                *force_flushed = false;
-                continue;
-            }
-            push_line(buffer, out);
-            *force_flushed = false;
-        } else {
-            buffer.push(*byte);
-            *force_flushed = false;
-            if buffer.len() >= LINE_BUFFER_MAX {
-                push_line(buffer, out);
-                *force_flushed = true;
-            }
-        }
+    let result: std::result::Result<(), std::convert::Infallible> =
+        crate::automation::split_lines_bounded(buffer, force_flushed, bytes, |line| {
+            out.push_back(PaneLineItem::Line {
+                text: String::from_utf8_lossy(&line).into_owned(),
+            });
+            Ok(())
+        });
+    match result {
+        Ok(()) => (),
+        Err(never) => match never {},
     }
-}
-
-fn push_line(buffer: &mut Vec<u8>, out: &mut VecDeque<PaneLineItem>) {
-    let line_bytes = std::mem::take(buffer);
-    out.push_back(PaneLineItem::Line {
-        text: String::from_utf8_lossy(&line_bytes).into_owned(),
-    });
 }
 
 impl std::fmt::Debug for PaneOutputStream {

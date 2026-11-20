@@ -1,8 +1,8 @@
 use std::io::{self, ErrorKind, Write};
 
 use rmux_core::formats::is_truthy;
-use rmux_proto::{CommandOutput, ListClientsResponse, ListWindowsResponse};
-use serde_json::{json, Map, Value};
+use rmux_proto::{CommandOutput, ListClientsResponse};
+use serde_json::{Map, Value};
 
 use super::ExitFailure;
 
@@ -64,7 +64,7 @@ pub(super) fn list_clients_json_format() -> String {
 }
 
 pub(super) fn list_panes_json_format() -> String {
-    json_format(LIST_PANES_FIELDS)
+    length_prefixed_format(LIST_PANES_FIELDS)
 }
 
 pub(super) fn list_sessions_json_format() -> String {
@@ -72,11 +72,44 @@ pub(super) fn list_sessions_json_format() -> String {
 }
 
 pub(super) fn list_windows_json_format() -> String {
-    LIST_WINDOWS_JSON_FIELDS
+    length_prefixed_format(LIST_WINDOWS_JSON_FIELDS)
+}
+
+fn length_prefixed_format(fields: &[JsonField]) -> String {
+    fields
         .iter()
         .map(|field| format!("#{{n:{0}}}:#{{{0}}}", field.name))
         .collect::<Vec<_>>()
         .join("")
+}
+
+pub(super) fn length_prefixed_filter_format(filter: &str, fields: &str) -> String {
+    // Nest the template without turning literal closing braces into syntax.
+    // A trailing hash has no output when the filter is expanded on its own.
+    let mut nested = String::with_capacity(filter.len());
+    let mut depth = 0usize;
+    let mut chars = filter.chars();
+    while let Some(ch) = chars.next() {
+        match ch {
+            '#' => {
+                let Some(next) = chars.next() else { break };
+                if next == '{' {
+                    depth += 1;
+                }
+                nested.push('#');
+                nested.push(next);
+            }
+            '}' if depth == 0 => nested.push_str("#}"),
+            '}' => {
+                depth -= 1;
+                nested.push(ch);
+            }
+            _ => nested.push(ch),
+        }
+    }
+    // The empty literal forces template expansion even for a constant filter;
+    // otherwise n:1 would look up a variable named "1" instead of measuring it.
+    format!("#{{n:#{{l:}}{nested}}}:{nested}{fields}")
 }
 
 fn json_format(fields: &[JsonField]) -> String {
@@ -133,8 +166,17 @@ pub(super) fn write_list_clients_json(response: &ListClientsResponse) -> Result<
     )
 }
 
-pub(super) fn write_list_panes_json(output: &CommandOutput) -> Result<i32, ExitFailure> {
-    write_delimited_output_as_json(output, LIST_PANES_FIELDS, "list-panes")
+pub(super) fn write_list_panes_json(
+    output: &CommandOutput,
+    filtered: bool,
+) -> Result<i32, ExitFailure> {
+    let rows = parse_length_prefixed_rows_with_filter(
+        output.stdout(),
+        LIST_PANES_FIELDS,
+        "list-panes",
+        filtered,
+    )?;
+    write_json_value(&Value::Array(rows), "list-panes")
 }
 
 pub(super) fn write_list_sessions_json(output: &CommandOutput) -> Result<i32, ExitFailure> {
@@ -146,51 +188,6 @@ pub(super) fn write_length_prefixed_list_windows_json(
 ) -> Result<i32, ExitFailure> {
     let rows =
         parse_length_prefixed_rows(output.stdout(), LIST_WINDOWS_JSON_FIELDS, "list-windows")?;
-    write_json_value(&Value::Array(rows), "list-windows")
-}
-
-pub(super) fn filter_delimited_json_output(
-    output: &CommandOutput,
-    command_name: &'static str,
-) -> Result<CommandOutput, ExitFailure> {
-    let stdout = stdout_string(output.stdout(), command_name)?;
-    let mut filtered = String::new();
-    for record in split_delimited_records(&stdout) {
-        let Some((filter_value, rendered_record)) = record.split_once(FIELD_SEPARATOR) else {
-            return Err(ExitFailure::new(
-                1,
-                format!("{command_name} filter output missing separator"),
-            ));
-        };
-        if is_truthy(filter_value) {
-            filtered.push_str(rendered_record);
-            filtered.push(ROW_SEPARATOR);
-            filtered.push('\n');
-        }
-    }
-    Ok(CommandOutput::from_stdout(filtered.into_bytes()))
-}
-
-pub(super) fn write_list_windows_json(response: &ListWindowsResponse) -> Result<i32, ExitFailure> {
-    let rows = response
-        .windows
-        .iter()
-        .map(|window| {
-            json!({
-                "session_name": window.target.session_name().to_string(),
-                "window_index": window.target.window_index(),
-                "window_id": window.window_id,
-                "window_name": window.name.as_deref().unwrap_or(""),
-                "window_panes": window.pane_count,
-                "window_width": window.size.cols,
-                "window_height": window.size.rows,
-                "window_layout": window.layout.to_string(),
-                "window_active": window.active,
-                "window_last_flag": window.last,
-            })
-        })
-        .collect::<Vec<_>>();
-
     write_json_value(&Value::Array(rows), "list-windows")
 }
 
@@ -268,48 +265,32 @@ fn parse_length_prefixed_rows(
     fields: &[JsonField],
     command_name: &'static str,
 ) -> Result<Vec<Value>, ExitFailure> {
+    parse_length_prefixed_rows_with_filter(bytes, fields, command_name, false)
+}
+
+fn parse_length_prefixed_rows_with_filter(
+    bytes: &[u8],
+    fields: &[JsonField],
+    command_name: &'static str,
+    filtered: bool,
+) -> Result<Vec<Value>, ExitFailure> {
     let mut rows = Vec::new();
     let mut cursor = 0;
     while cursor < bytes.len() {
+        let keep = !filtered
+            || is_truthy(read_length_prefixed_value(
+                bytes,
+                &mut cursor,
+                command_name,
+                "filter",
+            )?);
         let mut object = Map::with_capacity(fields.len());
         for field in fields {
-            let relative_colon = bytes[cursor..]
-                .iter()
-                .position(|byte| *byte == b':')
-                .ok_or_else(|| length_prefix_error(command_name, field.name))?;
-            let colon = cursor + relative_colon;
-            let length = std::str::from_utf8(&bytes[cursor..colon])
-                .ok()
-                .filter(|value| !value.is_empty())
-                .and_then(|value| value.parse::<usize>().ok())
-                .ok_or_else(|| length_prefix_error(command_name, field.name))?;
-            let value_start = colon + 1;
-            let value_end = value_start.checked_add(length).ok_or_else(|| {
-                ExitFailure::new(1, format!("{command_name} --json field length overflow"))
-            })?;
-            let value = bytes.get(value_start..value_end).ok_or_else(|| {
-                ExitFailure::new(
-                    1,
-                    format!(
-                        "{command_name} --json field '{}' exceeds the captured row",
-                        field.name
-                    ),
-                )
-            })?;
-            let value = std::str::from_utf8(value).map_err(|error| {
-                ExitFailure::new(
-                    1,
-                    format!(
-                        "{command_name} --json field '{}' is not UTF-8: {error}",
-                        field.name
-                    ),
-                )
-            })?;
+            let value = read_length_prefixed_value(bytes, &mut cursor, command_name, field.name)?;
             object.insert(
                 field.name.to_owned(),
                 typed_field_value(field, value, command_name)?,
             );
-            cursor = value_end;
         }
         if bytes.get(cursor) != Some(&b'\n') {
             return Err(ExitFailure::new(
@@ -318,9 +299,47 @@ fn parse_length_prefixed_rows(
             ));
         }
         cursor += 1;
-        rows.push(Value::Object(object));
+        if keep {
+            rows.push(Value::Object(object));
+        }
     }
     Ok(rows)
+}
+
+fn read_length_prefixed_value<'a>(
+    bytes: &'a [u8],
+    cursor: &mut usize,
+    command_name: &'static str,
+    field_name: &'static str,
+) -> Result<&'a str, ExitFailure> {
+    let relative_colon = bytes[*cursor..]
+        .iter()
+        .position(|byte| *byte == b':')
+        .ok_or_else(|| length_prefix_error(command_name, field_name))?;
+    let colon = *cursor + relative_colon;
+    let length = std::str::from_utf8(&bytes[*cursor..colon])
+        .ok()
+        .filter(|value| !value.is_empty())
+        .and_then(|value| value.parse::<usize>().ok())
+        .ok_or_else(|| length_prefix_error(command_name, field_name))?;
+    let value_start = colon + 1;
+    let value_end = value_start.checked_add(length).ok_or_else(|| {
+        ExitFailure::new(1, format!("{command_name} --json field length overflow"))
+    })?;
+    let value = bytes.get(value_start..value_end).ok_or_else(|| {
+        ExitFailure::new(
+            1,
+            format!("{command_name} --json field '{field_name}' exceeds the captured row"),
+        )
+    })?;
+    let value = std::str::from_utf8(value).map_err(|error| {
+        ExitFailure::new(
+            1,
+            format!("{command_name} --json field '{field_name}' is not UTF-8: {error}"),
+        )
+    })?;
+    *cursor = value_end;
+    Ok(value)
 }
 
 fn length_prefix_error(command_name: &'static str, field_name: &'static str) -> ExitFailure {
@@ -434,6 +453,7 @@ fn write_json_value(value: &Value, command_name: &'static str) -> Result<i32, Ex
 }
 
 #[cfg(test)]
+#[path = "json_output/tests"]
 mod tests {
     use super::{
         list_sessions_json_format, list_windows_json_format, parse_delimited_rows,
@@ -513,4 +533,6 @@ mod tests {
         assert_eq!(rows[0]["window_index"], 0);
         assert_eq!(rows[0]["window_active"], true);
     }
+
+    mod framing;
 }

@@ -4,7 +4,6 @@ mod common;
 
 use std::error::Error;
 use std::fs;
-use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::{Child, ExitStatus, Output, Stdio};
 use std::time::{Duration, Instant};
@@ -186,11 +185,9 @@ fn write_resistant_helper(root: &Path) -> Result<ResistantHelper, Box<dyn Error>
 }
 
 fn write_executable_script(path: &Path, contents: &str) -> Result<(), Box<dyn Error>> {
-    fs::write(path, contents)?;
-    let mut permissions = fs::metadata(path)?.permissions();
-    permissions.set_mode(0o755);
-    fs::set_permissions(path, permissions)?;
-    Ok(())
+    Ok(common::executable_fixture::write_executable(
+        path, contents, 0o755,
+    )?)
 }
 
 fn wait_for_path(path: &Path, timeout: Duration) -> Result<(), Box<dyn Error>> {

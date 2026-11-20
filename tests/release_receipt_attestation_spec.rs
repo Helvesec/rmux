@@ -1,7 +1,10 @@
 #[cfg(unix)]
+#[path = "support/executable_fixture.rs"]
+mod executable_fixture;
+
+#[cfg(unix)]
 mod unix {
     use std::fs;
-    use std::os::unix::fs::PermissionsExt;
     use std::path::{Path, PathBuf};
     use std::process::Command;
     use std::sync::atomic::{AtomicU64, Ordering};
@@ -44,14 +47,12 @@ mod unix {
             let predicate = root.join("publication-receipt-predicate.json");
             let output = root.join("verification.json");
             let arguments = root.join("arguments.txt");
-            fs::write(
+            crate::executable_fixture::write_executable(
                 &gh,
                 "#!/bin/sh\nprintf '%s\\n' \"$@\" > \"$RMUX_ARGS_LOG\"\ncat \"$RMUX_FAKE_OUTPUT\"\n",
+                0o700,
             )
             .expect("fake gh");
-            let mut permissions = fs::metadata(&gh).expect("gh metadata").permissions();
-            permissions.set_mode(0o700);
-            fs::set_permissions(&gh, permissions).expect("gh permissions");
             fs::write(&state, b"{\"immutable\":true}\n").expect("release state");
             fs::write(&bundle, b"{}\n").expect("bundle");
             fs::write(
@@ -135,13 +136,17 @@ mod unix {
     }
 
     fn sha256(path: &Path) -> String {
-        let output = Command::new("sha256sum")
+        let output = Command::new("python3")
+            .args([
+                "-c",
+                "import hashlib, pathlib, sys; print(hashlib.sha256(pathlib.Path(sys.argv[1]).read_bytes()).hexdigest())",
+            ])
             .arg(path)
             .output()
-            .expect("sha256sum");
+            .unwrap_or_else(|error| panic!("hash receipt fixture {}: {error}", path.display()));
         assert!(output.status.success());
         String::from_utf8(output.stdout)
-            .expect("sha256 output")
+            .expect("SHA-256 output")
             .split_whitespace()
             .next()
             .expect("sha256 digest")

@@ -274,48 +274,34 @@ impl CopyModeState {
         Ok(())
     }
 
-    pub(super) fn cmd_next_prompt(&mut self, only_after: bool) -> Result<(), RmuxError> {
-        let start = if only_after {
-            self.cursor.y.saturating_add(1)
-        } else {
-            self.cursor.y
-        };
-        for y in start..self.total_lines() {
-            if self
-                .backing
-                .absolute_line_view(y)
-                .is_some_and(|line| line.start_prompt())
-            {
-                self.cursor.y = y;
-                self.cursor.x = 0;
-                self.ensure_cursor_visible();
-                self.sync_selection_with_cursor();
-                break;
-            }
-        }
+    pub(super) fn cmd_next_prompt(&mut self, output: bool) -> Result<(), RmuxError> {
+        self.move_to_shell_mark(self.cursor.y.saturating_add(1)..self.total_lines(), output);
         Ok(())
     }
 
-    pub(super) fn cmd_previous_prompt(&mut self, only_before: bool) -> Result<(), RmuxError> {
-        let start = if only_before {
-            self.cursor.y.saturating_sub(1)
-        } else {
-            self.cursor.y
-        };
-        for y in (0..=start).rev() {
-            if self
-                .backing
-                .absolute_line_view(y)
-                .is_some_and(|line| line.start_prompt())
-            {
+    pub(super) fn cmd_previous_prompt(&mut self, output: bool) -> Result<(), RmuxError> {
+        self.move_to_shell_mark((0..self.cursor.y).rev(), output);
+        Ok(())
+    }
+
+    fn move_to_shell_mark(&mut self, rows: impl Iterator<Item = usize>, output: bool) {
+        for y in rows {
+            if self.backing.absolute_line_view(y).is_some_and(|line| {
+                if output {
+                    line.start_output()
+                } else {
+                    line.start_prompt()
+                }
+            }) {
                 self.cursor.y = y;
                 self.cursor.x = 0;
-                self.ensure_cursor_visible();
+                // tmux anchors a history match at the top, and restores the
+                // live viewport when the match belongs to the visible screen.
+                self.top_line = y.min(self.bottom_top_line());
                 self.sync_selection_with_cursor();
                 break;
             }
         }
-        Ok(())
     }
 
     pub(super) fn cmd_next_matching_bracket(&mut self) -> Result<(), RmuxError> {
@@ -428,7 +414,10 @@ impl CopyModeState {
 
     pub(super) fn cmd_jump_to_mark(&mut self) -> Result<(), RmuxError> {
         if let Some(mark) = self.mark {
-            self.cursor = mark;
+            // Every backing change clamps the mark already; clamping again
+            // here keeps a later backing path from handing `line()` a row past
+            // the screen.
+            self.cursor = self.clamp_position(mark);
             self.ensure_cursor_visible();
             self.sync_selection_with_cursor();
         }

@@ -21,8 +21,8 @@ fn session_name(value: &str) -> SessionName {
 }
 
 async fn new_session(handler: &RequestHandler, session_name: &SessionName) {
-    assert!(matches!(
-        handler
+    crate::session_fixture::assert_new_session(
+        &handler
             .handle(Request::NewSession(NewSessionRequest {
                 session_name: session_name.clone(),
                 detached: true,
@@ -30,8 +30,7 @@ async fn new_session(handler: &RequestHandler, session_name: &SessionName) {
                 environment: None,
             }))
             .await,
-        Response::NewSession(_)
-    ));
+    );
 }
 
 async fn new_window(
@@ -99,6 +98,8 @@ fn drain_control_notifications(rx: &mut mpsc::Receiver<ControlServerEvent>) -> V
             Ok(
                 ControlServerEvent::SessionChanged(_)
                 | ControlServerEvent::SessionChangedAt { .. }
+                | ControlServerEvent::FormatSubscriptions(_)
+                | ControlServerEvent::PaneOutputActions(_)
                 | ControlServerEvent::Refresh,
             ) => {}
             Ok(ControlServerEvent::Exit(reason)) => {
@@ -888,7 +889,7 @@ async fn display_message_for_control_client_uses_message_notification() {
         .await
         .sessions
         .session(&session_name("alpha"))
-        .and_then(rmux_core::Session::active_pane_id)
+        .and_then(|session| session.active_pane_id())
         .expect("alpha active pane");
     let response = handler
         .handle_display_message_for_stable_pane(
@@ -971,7 +972,7 @@ async fn rejected_session_control_message_is_not_added_to_show_messages() {
         .await
         .sessions
         .session(&alpha)
-        .and_then(rmux_core::Session::active_pane_id)
+        .and_then(|session| session.active_pane_id())
         .expect("active pane");
 
     let response = handler
@@ -1114,7 +1115,7 @@ async fn startup_config_errors_do_not_block_first_regular_command() {
     )
     .await;
 
-    assert!(matches!(response, Response::NewSession(_)));
+    crate::session_fixture::assert_new_session(&response);
 
     let mut control_rx = register_control_client(&handler, 711, None).await;
     assert_eq!(

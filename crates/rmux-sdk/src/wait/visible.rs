@@ -265,7 +265,7 @@ impl VisibleTextMatcherSpec {
             }
         };
         if invalid {
-            return Err(RmuxError::protocol(ProtoError::Server(
+            return Err(RmuxError::from_proto(ProtoError::Server(
                 "visible text wait patterns must not be empty".to_owned(),
             )));
         }

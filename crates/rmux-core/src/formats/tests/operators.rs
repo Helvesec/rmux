@@ -740,3 +740,80 @@ fn recursion_limit_produces_empty() {
 // -----------------------------------------------------------------------
 // New tests — truncation and padding
 // -----------------------------------------------------------------------
+
+// -----------------------------------------------------------------------
+// FEP1 — the explicit precision of `e`, measured on the pinned tmux 3.7b
+// before this correction (fep1/native/oracle-fep1.json). Each
+// format below travelled as one argument to `display-message -p -t <pane A>`
+// against a session whose other pane was the active one; the values are that
+// run's own stdout with the trailing newline display-message adds.
+// -----------------------------------------------------------------------
+
+#[test]
+fn integer_arithmetic_keeps_its_truncation_under_an_explicit_precision() {
+    // tmux printed 2.00: 5.9 and 2.9 are truncated to 5 and 2, 5/2 is the
+    // integer 2, and the third argument only decides how it is printed.
+    assert_eq!(
+        render_template("#{e|/||2:5.9,2.9}", &StaticWindowValues),
+        "2.00"
+    );
+    // Control, tmux printed 2: no third argument at all leaves the plain
+    // integer result untouched.
+    assert_eq!(render_template("#{e|/|:5.9,2.9}", &StaticWindowValues), "2");
+    // Control, tmux printed 2.03: asking for the floating calculation keeps
+    // its own result, so an explicit precision must not be a way to turn `f`
+    // on by accident.
+    assert_eq!(
+        render_template("#{e|/|f|2:5.9,2.9}", &StaticWindowValues),
+        "2.03"
+    );
+}
+
+#[test]
+fn an_integer_comparison_takes_an_explicit_precision() {
+    // tmux printed 1.000: 2.9 and 2.1 are compared as 2 and 2, which is true,
+    // and the third argument prints that truth with three decimals.
+    assert_eq!(
+        render_template("#{e|==||3:2.9,2.1}", &StaticWindowValues),
+        "1.000"
+    );
+}
+
+#[test]
+fn a_precision_outside_the_validated_range_fails_the_expression() {
+    // tmux printed nothing but the newline display-message adds: 101 is out of
+    // the range the source validates, and it is refused with no `f` too.
+    assert_eq!(render_template("#{e|+||101:1,2}", &StaticWindowValues), "");
+}
+
+#[test]
+fn a_third_argument_that_is_present_but_empty_is_invalid_in_both_modes() {
+    // Every value is collected before anything is compared, so the case with
+    // `f` cannot be hidden behind an earlier assertion.
+    let measured: Vec<(&str, String)> = [
+        "#{e|+|||:1,2}",
+        "#{e|+|f||:1,2}",
+        "#{e|+||:1,2}",
+        "#{e|+|f|:1,2}",
+    ]
+    .into_iter()
+    .map(|format| (format, render_template(format, &StaticWindowValues)))
+    .collect();
+
+    // Measured on the pinned tmux 3.7b before this correction
+    // (fep1/r2/native/oracle-r2.json), each format sent as one
+    // argument against an explicitly non-active pane: b"\n", b"\n", b"3\n" and
+    // b"3.00\n", which is these four values plus the newline display-message
+    // adds. The trailing `|:` closes the argument list, so the first two carry
+    // a third argument that is present and empty while the last two carry none
+    // at all and keep their own defaults.
+    assert_eq!(
+        measured,
+        vec![
+            ("#{e|+|||:1,2}", String::new()),
+            ("#{e|+|f||:1,2}", String::new()),
+            ("#{e|+||:1,2}", "3".to_owned()),
+            ("#{e|+|f|:1,2}", "3.00".to_owned()),
+        ]
+    );
+}

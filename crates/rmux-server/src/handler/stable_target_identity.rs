@@ -360,6 +360,27 @@ where
         .await
 }
 
+/// Expand a validated input destination to its live synchronized recipients.
+/// The caller holds the state lock through capture and write preparation.
+pub(in crate::handler) fn with_expected_synchronized_input_targets<T>(
+    state: &mut HandlerState,
+    target: &PaneTarget,
+    targets: Vec<PaneTarget>,
+    prepare: impl FnOnce(&mut HandlerState, Vec<PaneTarget>) -> Result<T, RmuxError>,
+) -> Result<T, RmuxError> {
+    require_expected_stable_pane_identity(state, target)?;
+    let mut expected = EXPECTED_STABLE_TARGET_IDENTITIES
+        .try_with(Clone::clone)
+        .unwrap_or_default();
+    for recipient in &targets {
+        expected.identities.push(StableTargetIdentity::capture(
+            state,
+            Target::Pane(recipient.clone()),
+        )?);
+    }
+    EXPECTED_STABLE_TARGET_IDENTITIES.sync_scope(expected, || prepare(state, targets))
+}
+
 pub(in crate::handler) fn require_expected_stable_session_identity(
     state: &HandlerState,
     target: &rmux_proto::SessionName,

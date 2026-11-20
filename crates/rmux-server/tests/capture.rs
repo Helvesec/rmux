@@ -30,7 +30,7 @@ async fn capture_pane_reads_unattached_transcript() -> Result<(), Box<dyn Error>
         }),
     )
     .await?;
-    assert!(matches!(created, Response::NewSession(_)));
+    crate::common::assert_new_session(&created);
 
     let sent = send_request(
         harness.socket_path(),

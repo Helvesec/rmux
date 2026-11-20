@@ -2,38 +2,28 @@ use std::path::Path;
 use std::time::Duration;
 
 use rmux_core::{
-    formats::{FormatContext, FormatVariables},
-    style::Style,
-    text_width as tmux_text_width, truncate_to_width as tmux_truncate_to_width, OptionStore,
-    Session, Utf8Config,
+    formats::FormatContext, text_width as tmux_text_width,
+    truncate_to_width as tmux_truncate_to_width, OptionStore, Utf8Config,
 };
 use rmux_proto::OptionName;
 
-use crate::format_runtime::{
-    render_runtime_template, render_runtime_template_preserving_jobs, RuntimeFormatContext,
-};
+use crate::client_format::ClientLoopSnapshot;
+use crate::format_runtime::{render_runtime_template, RuntimeFormatContext};
 use crate::pane_terminals::HandlerState;
 
 use super::{
-    apply_runtime_style_overlay, apply_style_overlay, colour_inherits_base, cursor_position_bytes,
-    format_draw_line, parse_option_colour, parse_standalone_style, render_formatted_line,
-    FormattedLine, RenderedPrompt,
+    apply_runtime_style_overlay, apply_style_overlay, colour_inherits_base, format_draw_line,
+    parse_option_colour, parse_standalone_style, render_formatted_line, FormattedLine,
+    RenderedPrompt,
 };
 
-#[path = "status/component.rs"]
 mod component;
-#[path = "status/geometry.rs"]
 mod geometry;
-#[path = "status/jobs.rs"]
-mod jobs;
-#[path = "status/message.rs"]
 mod message;
-#[path = "status/prompt.rs"]
 mod prompt;
-#[path = "status/runs.rs"]
 mod runs;
-#[path = "status/status_format.rs"]
 mod status_format;
+mod window_list;
 
 pub(crate) use geometry::StatusGeometry;
 use geometry::StatusOverlayRow;
@@ -42,21 +32,23 @@ pub(super) use prompt::prompt_status_runs;
 pub(super) use runs::{sanitize_status_text, status_runs_width, StatusRun};
 
 use component::truncate_status_component;
-use jobs::render_template_with_status_jobs;
-use prompt::prompt_status_layout;
-use runs::{push_spaces, push_status_run, render_status_runs, truncate_status_runs, StatusStyle};
+pub(crate) use prompt::render_prompt;
+use runs::{push_spaces, push_status_run, truncate_status_runs, StatusStyle};
 use status_format::{render_explicit_status_format_line, render_status_format_line_at};
+use window_list::{status_justify, status_justify_name, status_window_format_body, StatusJustify};
 
 pub(super) struct StatusBarRenderRequest<'a> {
-    pub(super) session: &'a Session,
+    pub(super) session: rmux_core::ManagedSessionView<'a>,
     pub(super) options: &'a OptionStore,
     pub(super) geometry: StatusGeometry,
     pub(super) attached_count: usize,
     pub(super) prompt: Option<&'a RenderedPrompt>,
+    pub(super) client: Option<&'a crate::client_format::ClientFormatBindings>,
     pub(super) pane_title: Option<&'a str>,
     pub(super) state: Option<&'a HandlerState>,
     pub(super) key_table: Option<&'a str>,
     pub(super) socket_path: Option<&'a Path>,
+    pub(super) client_loop_snapshots: Option<&'a [ClientLoopSnapshot]>,
 }
 
 pub(super) fn render_status_bar(request: StatusBarRenderRequest<'_>) -> Vec<u8> {
@@ -66,16 +58,14 @@ pub(super) fn render_status_bar(request: StatusBarRenderRequest<'_>) -> Vec<u8> 
         geometry,
         attached_count,
         prompt,
+        client,
         pane_title,
         state,
         key_table,
         socket_path,
+        client_loop_snapshots,
     } = request;
-    let Some(status_y) = geometry.status_y else {
-        return Vec::new();
-    };
-    let width = usize::from(geometry.terminal_size.cols);
-    if width == 0 {
+    if geometry.terminal_size.cols == 0 || geometry.terminal_size.rows == 0 {
         return Vec::new();
     }
 
@@ -87,10 +77,12 @@ pub(super) fn render_status_bar(request: StatusBarRenderRequest<'_>) -> Vec<u8> 
         geometry.status_lines,
         StatusLineContext {
             attached_count,
+            client,
             pane_title,
             state,
             key_table,
             socket_path,
+            client_loop_snapshots,
         },
     );
     for (index, line) in lines.iter().enumerate() {
@@ -103,19 +95,14 @@ pub(super) fn render_status_bar(request: StatusBarRenderRequest<'_>) -> Vec<u8> 
     }
 
     if let Some(prompt) = prompt {
-        let message_line =
-            status_message_line_index(session.name(), options, geometry.status_lines);
-        let line_y = geometry.status_line_y(message_line).unwrap_or(status_y);
-        let layout = prompt_status_layout(session, options, geometry.terminal_size.cols, prompt);
-        frame.extend_from_slice(render_status_runs(line_y, &layout.runs).as_slice());
-        frame.extend_from_slice(cursor_position_bytes(line_y, layout.cursor_x).as_slice());
+        frame.extend_from_slice(&render_prompt(session, options, prompt));
     }
     frame
 }
 
 #[cfg_attr(not(test), allow(dead_code))]
 pub(super) fn status_bar_runs(
-    session: &Session,
+    session: rmux_core::ManagedSessionView<'_>,
     options: &OptionStore,
     columns: u16,
     attached_count: usize,
@@ -182,13 +169,111 @@ pub(super) fn status_bar_runs(
     runs
 }
 
+#[cfg_attr(not(test), allow(dead_code))]
+fn aligned_status_window_runs(
+    session: rmux_core::ManagedSessionView<'_>,
+    options: &OptionStore,
+    width: usize,
+    base_style: StatusStyle,
+    utf8_config: &Utf8Config,
+) -> Vec<StatusRun> {
+    if width == 0 {
+        return Vec::new();
+    }
+
+    let runs = truncate_status_runs(
+        &status_window_runs(session, options, base_style.clone()),
+        width,
+        utf8_config,
+    );
+    let run_width = status_runs_width(&runs, utf8_config);
+    let extra = width.saturating_sub(run_width);
+    let leading =
+        match status_justify(options.resolve(Some(session.name()), OptionName::StatusJustify)) {
+            StatusJustify::Left => 0,
+            // This helper only ever receives the room the window list may use,
+            // never the whole bar, so an absolute centre cannot be expressed
+            // here. It is not the drawing path either: the status bar goes
+            // through the format engine, which places the list itself.
+            StatusJustify::Centre | StatusJustify::AbsoluteCentre => extra / 2,
+            StatusJustify::Right => extra,
+        };
+    let trailing = extra.saturating_sub(leading);
+    let mut aligned = Vec::new();
+    push_spaces(&mut aligned, leading, base_style.clone());
+    aligned.extend(runs);
+    push_spaces(&mut aligned, trailing, base_style);
+    aligned
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
+fn status_window_runs(
+    session: rmux_core::ManagedSessionView<'_>,
+    options: &OptionStore,
+    base_style: StatusStyle,
+) -> Vec<StatusRun> {
+    let session_name = session.name();
+    let active_window = session.active_window_index();
+    let last_window = session.last_window_index();
+    let mut runs = Vec::new();
+
+    for (window_index, window) in session.windows() {
+        if !runs.is_empty() {
+            push_status_run(&mut runs, " ".to_owned(), base_style.clone());
+        }
+
+        let active = window_index == active_window;
+        let last = Some(window_index) == last_window;
+        let format_option = if active {
+            OptionName::WindowStatusCurrentFormat
+        } else {
+            OptionName::WindowStatusFormat
+        };
+        let style_option = if active {
+            OptionName::WindowStatusCurrentStyle
+        } else {
+            OptionName::WindowStatusStyle
+        };
+        let format = options
+            .resolve_for_window(session_name, window_index, format_option)
+            .unwrap_or_default();
+        let style = apply_style_overlay(
+            &base_style,
+            options.resolve_for_window(session_name, window_index, style_option),
+        );
+        let mut context = FormatContext::new()
+            .with_managed_session(session)
+            .with_window(window_index, window, active, last);
+        if let Some(pane) = window.active_pane() {
+            context = context.with_window_pane(window, pane);
+        }
+
+        let mut runtime = RuntimeFormatContext::new(context)
+            .with_options(options)
+            .with_session(session)
+            .with_window(window_index, window);
+        if let Some(pane) = window.active_pane() {
+            runtime = runtime.with_pane(pane);
+        }
+
+        push_status_run(
+            &mut runs,
+            render_runtime_template(format, &runtime, true),
+            style,
+        );
+    }
+
+    runs
+}
+
 pub(super) fn active_format_context(
-    session: &Session,
+    session: rmux_core::ManagedSessionView<'_>,
     attached_count: usize,
     key_table: Option<&str>,
     socket_path: Option<&Path>,
 ) -> FormatContext {
-    let mut context = FormatContext::from_session(session)
+    let mut context = FormatContext::new()
+        .with_managed_session(session)
         .with_session_attached(attached_count)
         .with_window(session.active_window_index(), session.window(), true, false);
     if let Some(pane) = session.window().active_pane() {
@@ -211,7 +296,7 @@ pub(super) fn active_format_context(
 }
 
 pub(super) fn status_bar_lines(
-    session: &Session,
+    session: rmux_core::ManagedSessionView<'_>,
     options: &OptionStore,
     columns: u16,
     attached_count: usize,
@@ -232,7 +317,7 @@ pub(super) fn status_bar_lines(
 }
 
 pub(super) fn status_message_y(
-    session: &Session,
+    session: rmux_core::ManagedSessionView<'_>,
     options: &OptionStore,
     geometry: StatusGeometry,
 ) -> Option<u16> {
@@ -242,15 +327,17 @@ pub(super) fn status_message_y(
 
 #[derive(Clone, Copy, Default)]
 struct StatusLineContext<'a> {
+    client: Option<&'a crate::client_format::ClientFormatBindings>,
     attached_count: usize,
     pane_title: Option<&'a str>,
     state: Option<&'a HandlerState>,
     key_table: Option<&'a str>,
     socket_path: Option<&'a Path>,
+    client_loop_snapshots: Option<&'a [ClientLoopSnapshot]>,
 }
 
 fn status_bar_lines_with_pane_title(
-    session: &Session,
+    session: rmux_core::ManagedSessionView<'_>,
     options: &OptionStore,
     columns: u16,
     status_lines: u16,
@@ -262,7 +349,7 @@ fn status_bar_lines_with_pane_title(
 }
 
 fn status_bar_line_at(
-    session: &Session,
+    session: rmux_core::ManagedSessionView<'_>,
     options: &OptionStore,
     columns: u16,
     context: StatusLineContext<'_>,
@@ -286,13 +373,19 @@ fn status_bar_line_at(
     .with_session(session)
     .with_window(session.active_window_index(), session.window());
     if let Some(state) = context.state {
-        runtime = runtime.with_state(state);
+        runtime = runtime.with_state(state).with_options(options);
     }
     if let Some(pane) = session.window().active_pane() {
         runtime = runtime.with_pane(pane);
     }
     if let Some(pane_title) = context.pane_title {
         runtime = runtime.with_named_value("pane_title", pane_title);
+    }
+    if let Some(client) = context.client {
+        runtime = client.apply(runtime);
+    }
+    if let Some(client_loop_snapshots) = context.client_loop_snapshots {
+        runtime = runtime.with_client_loop_snapshots(client_loop_snapshots);
     }
 
     render_status_format_line_at(
@@ -323,7 +416,7 @@ pub(super) fn status_message_line_index(
 }
 
 fn status_bar_line_with_pane_title(
-    session: &Session,
+    session: rmux_core::ManagedSessionView<'_>,
     options: &OptionStore,
     columns: u16,
     context: StatusLineContext<'_>,
@@ -344,13 +437,19 @@ fn status_bar_line_with_pane_title(
     // Threading the handler state in lets runtime variables such as
     // #{pane_in_mode} (the copy-mode indicator) resolve in the status bar.
     if let Some(state) = context.state {
-        runtime = runtime.with_state(state);
+        runtime = runtime.with_state(state).with_options(options);
     }
     if let Some(pane) = session.window().active_pane() {
         runtime = runtime.with_pane(pane);
     }
     if let Some(pane_title) = context.pane_title {
         runtime = runtime.with_named_value("pane_title", pane_title);
+    }
+    if let Some(client) = context.client {
+        runtime = client.apply(runtime);
+    }
+    if let Some(client_loop_snapshots) = context.client_loop_snapshots {
+        runtime = runtime.with_client_loop_snapshots(client_loop_snapshots);
     }
     if let Some(line) = render_explicit_status_format_line(
         session_name,
@@ -421,6 +520,7 @@ fn status_bar_line_with_pane_title(
         context.socket_path,
         &base_style,
         context.attached_count,
+        (context.client, context.client_loop_snapshots),
     ));
     expanded.push_str("#[nolist]");
 
@@ -435,43 +535,12 @@ fn status_bar_line_with_pane_title(
     format_draw_line(&expanded, &base_style, width, &utf8_config)
 }
 
-fn render_status_template_jobs(
+pub(super) fn render_status_template_jobs(
     template: &str,
     runtime: &RuntimeFormatContext<'_>,
     cache_ttl: Duration,
 ) -> String {
-    let profile = if template.contains("#(") {
-        runtime.status_job_profile()
-    } else {
-        None
-    };
-    render_status_template_jobs_with_profile(
-        template,
-        runtime,
-        profile.as_ref(),
-        cache_ttl,
-        runtime.status_jobs(),
-    )
-}
-
-pub(super) fn render_status_template_jobs_with_profile<V>(
-    template: &str,
-    variables: &V,
-    profile: Option<&crate::terminal::TerminalProfile>,
-    cache_ttl: Duration,
-    status_jobs: Option<&crate::status_jobs::StatusJobRuntime>,
-) -> String
-where
-    V: rmux_core::formats::FormatVariables + ?Sized,
-{
-    render_template_with_status_jobs(
-        template,
-        profile,
-        cache_ttl,
-        status_jobs,
-        |command| render_runtime_template(command, variables, true),
-        |prepared| render_runtime_template_preserving_jobs(prepared, variables, true),
-    )
+    render_runtime_template(template, &runtime.clone().with_status_jobs(cache_ttl), true)
 }
 
 pub(super) fn status_job_cache_ttl(
@@ -480,254 +549,6 @@ pub(super) fn status_job_cache_ttl(
 ) -> Duration {
     let seconds = option_usize(options, session_name, OptionName::StatusInterval).max(1);
     Duration::from_secs(u64::try_from(seconds).unwrap_or(u64::MAX))
-}
-
-fn status_window_format_body(
-    session: &Session,
-    options: &OptionStore,
-    state: Option<&HandlerState>,
-    socket_path: Option<&Path>,
-    base_style: &Style,
-    attached_count: usize,
-) -> String {
-    let session_name = session.name();
-    let active_window = session.active_window_index();
-    let last_window = session.last_window_index();
-    let status_job_ttl = status_job_cache_ttl(options, session_name);
-    let mut rendered = String::new();
-    let windows = session
-        .windows()
-        .iter()
-        .map(|(window_index, window)| (*window_index, window))
-        .collect::<Vec<_>>();
-
-    for (position, (window_index, window)) in windows.iter().enumerate() {
-        let active = *window_index == active_window;
-        let last = Some(*window_index) == last_window;
-        let format_option = if active {
-            OptionName::WindowStatusCurrentFormat
-        } else {
-            OptionName::WindowStatusFormat
-        };
-        let format = options
-            .resolve_for_window(session_name, *window_index, format_option)
-            .unwrap_or_default();
-
-        let mut context =
-            FormatContext::from_session(session).with_window(*window_index, window, active, last);
-        context = context.with_session_attached(attached_count);
-        if let Some(socket_path) = socket_path {
-            context =
-                context.with_named_value("socket_path", socket_path.to_string_lossy().into_owned());
-        }
-        if let Some(pane) = window.active_pane() {
-            context = context.with_window_pane(window, pane);
-        }
-        let mut runtime = RuntimeFormatContext::new(context)
-            .with_options(options)
-            .with_session(session)
-            .with_window(*window_index, window);
-        if let Some(state) = state {
-            runtime = runtime.with_state(state);
-        }
-        if let Some(pane) = window.active_pane() {
-            runtime = runtime.with_pane(pane);
-        }
-
-        let style = resolved_window_status_style(
-            base_style,
-            options,
-            session_name,
-            *window_index,
-            active,
-            last,
-            &runtime,
-        );
-        rendered.push_str(&format!(
-            "#[range=window|{}{} {}]",
-            window.id().as_u32(),
-            if active { " list=focus" } else { "" },
-            rmux_core::style_tostring(&style)
-        ));
-        rendered.push_str(&sanitize_status_text(render_status_template_jobs(
-            format,
-            &runtime,
-            status_job_ttl,
-        )));
-        rendered.push_str("#[norange list=on default]");
-
-        if position + 1 != windows.len() {
-            let separator = options
-                .resolve_for_window(
-                    session_name,
-                    *window_index,
-                    OptionName::WindowStatusSeparator,
-                )
-                .unwrap_or(" ");
-            let rendered_separator =
-                render_status_template_jobs(separator, &runtime, status_job_ttl);
-            if !rendered_separator.is_empty() {
-                rendered.push_str(&sanitize_status_text(rendered_separator));
-            }
-        }
-    }
-
-    rendered
-}
-
-fn resolved_window_status_style(
-    base_style: &Style,
-    options: &OptionStore,
-    session_name: &rmux_proto::SessionName,
-    window_index: u32,
-    active: bool,
-    last: bool,
-    runtime: &RuntimeFormatContext<'_>,
-) -> Style {
-    let primary = if active {
-        OptionName::WindowStatusCurrentStyle
-    } else {
-        OptionName::WindowStatusStyle
-    };
-    let mut style = apply_runtime_style_overlay(
-        base_style,
-        options.resolve_for_window(session_name, window_index, primary),
-        runtime,
-    );
-    if last {
-        style = apply_runtime_style_overlay(
-            &style,
-            options.resolve_for_window(
-                session_name,
-                window_index,
-                OptionName::WindowStatusLastStyle,
-            ),
-            runtime,
-        );
-    }
-    let has_bell = runtime.format_value_by_name("window_bell_flag").as_deref() == Some("1");
-    let has_activity = runtime
-        .format_value_by_name("window_activity_flag")
-        .as_deref()
-        == Some("1");
-    let has_silence = runtime
-        .format_value_by_name("window_silence_flag")
-        .as_deref()
-        == Some("1");
-    if has_bell {
-        style = apply_runtime_style_overlay(
-            &style,
-            options.resolve_for_window(
-                session_name,
-                window_index,
-                OptionName::WindowStatusBellStyle,
-            ),
-            runtime,
-        );
-    } else if has_activity || has_silence {
-        style = apply_runtime_style_overlay(
-            &style,
-            options.resolve_for_window(
-                session_name,
-                window_index,
-                OptionName::WindowStatusActivityStyle,
-            ),
-            runtime,
-        );
-    }
-    style
-}
-
-#[cfg_attr(not(test), allow(dead_code))]
-fn aligned_status_window_runs(
-    session: &Session,
-    options: &OptionStore,
-    width: usize,
-    base_style: StatusStyle,
-    utf8_config: &Utf8Config,
-) -> Vec<StatusRun> {
-    if width == 0 {
-        return Vec::new();
-    }
-
-    let runs = truncate_status_runs(
-        &status_window_runs(session, options, base_style.clone()),
-        width,
-        utf8_config,
-    );
-    let run_width = status_runs_width(&runs, utf8_config);
-    let extra = width.saturating_sub(run_width);
-    let leading =
-        match status_justify(options.resolve(Some(session.name()), OptionName::StatusJustify)) {
-            StatusJustify::Left => 0,
-            StatusJustify::Centre => extra / 2,
-            StatusJustify::Right => extra,
-        };
-    let trailing = extra.saturating_sub(leading);
-    let mut aligned = Vec::new();
-    push_spaces(&mut aligned, leading, base_style.clone());
-    aligned.extend(runs);
-    push_spaces(&mut aligned, trailing, base_style);
-    aligned
-}
-
-#[cfg_attr(not(test), allow(dead_code))]
-fn status_window_runs(
-    session: &Session,
-    options: &OptionStore,
-    base_style: StatusStyle,
-) -> Vec<StatusRun> {
-    let session_name = session.name();
-    let active_window = session.active_window_index();
-    let last_window = session.last_window_index();
-    let mut runs = Vec::new();
-
-    for (window_index, window) in session.windows() {
-        if !runs.is_empty() {
-            push_status_run(&mut runs, " ".to_owned(), base_style.clone());
-        }
-
-        let active = *window_index == active_window;
-        let last = Some(*window_index) == last_window;
-        let format_option = if active {
-            OptionName::WindowStatusCurrentFormat
-        } else {
-            OptionName::WindowStatusFormat
-        };
-        let style_option = if active {
-            OptionName::WindowStatusCurrentStyle
-        } else {
-            OptionName::WindowStatusStyle
-        };
-        let format = options
-            .resolve_for_window(session_name, *window_index, format_option)
-            .unwrap_or_default();
-        let style = apply_style_overlay(
-            &base_style,
-            options.resolve_for_window(session_name, *window_index, style_option),
-        );
-        let mut context =
-            FormatContext::from_session(session).with_window(*window_index, window, active, last);
-        if let Some(pane) = window.active_pane() {
-            context = context.with_window_pane(window, pane);
-        }
-
-        let mut runtime = RuntimeFormatContext::new(context)
-            .with_options(options)
-            .with_session(session)
-            .with_window(*window_index, window);
-        if let Some(pane) = window.active_pane() {
-            runtime = runtime.with_pane(pane);
-        }
-
-        push_status_run(
-            &mut runs,
-            render_runtime_template(format, &runtime, true),
-            style,
-        );
-    }
-
-    runs
 }
 
 fn resolved_status_style(
@@ -764,27 +585,4 @@ fn option_usize(
         .resolve(Some(session_name), option)
         .and_then(|value| value.parse::<usize>().ok())
         .unwrap_or(0)
-}
-
-fn status_justify(value: Option<&str>) -> StatusJustify {
-    match value {
-        Some("right") => StatusJustify::Right,
-        Some("centre" | "center" | "absolute-centre") => StatusJustify::Centre,
-        _ => StatusJustify::Left,
-    }
-}
-
-fn status_justify_name(value: StatusJustify) -> &'static str {
-    match value {
-        StatusJustify::Left => "left",
-        StatusJustify::Centre => "centre",
-        StatusJustify::Right => "right",
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum StatusJustify {
-    Left,
-    Centre,
-    Right,
 }

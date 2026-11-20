@@ -20,7 +20,7 @@ async fn create_session(handler: &RequestHandler, name: &str) {
             environment: None,
         }))
         .await;
-    assert!(matches!(response, Response::NewSession(_)));
+    crate::session_fixture::assert_new_session(&response);
 }
 
 async fn set_after_new_window_hook(handler: &RequestHandler, command: &str, append: bool) {
@@ -231,7 +231,7 @@ async fn same_after_hook_does_not_reenter_when_its_command_creates_a_window() {
             .session(&alpha)
             .expect("session survives")
             .windows()
-            .len(),
+            .count(),
         3
     );
 }
@@ -280,7 +280,7 @@ async fn lifecycle_hook_commands_cannot_enqueue_a_second_lifecycle_generation() 
     );
     let state = handler.state.lock().await;
     let beta_session = state.sessions.session(&beta).expect("beta survives");
-    assert_eq!(beta_session.windows().len(), 1);
+    assert_eq!(beta_session.windows().count(), 1);
     assert!(beta_session.window_at(0).is_some());
 }
 
@@ -407,7 +407,7 @@ async fn session_scoped_after_hook_can_run_a_distinct_session_lifecycle_hook() {
     );
     let state = handler.state.lock().await;
     let session = state.sessions.session(&beta).expect("session survives");
-    assert_eq!(session.windows().len(), 1);
+    assert_eq!(session.windows().count(), 1);
     assert!(session.window_at(0).is_some());
 }
 

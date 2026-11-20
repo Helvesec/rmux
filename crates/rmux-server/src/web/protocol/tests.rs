@@ -5,6 +5,35 @@ use super::{
 use rmux_proto::ResizePaneAdjustment;
 
 #[test]
+fn debug_redacts_auth_pins() {
+    for pin in [Some("193847"), Some("826591"), None] {
+        let wire = serde_json::from_value::<AuthWireMessage>(serde_json::json!({
+            "type": "auth",
+            "protocol_version": WEB_SHARE_PROTOCOL_VERSION,
+            "capabilities": ["e2ee-token-auth"],
+            "pin": pin,
+        }))
+        .expect("auth wire decodes");
+        let auth = super::AuthMessage {
+            pin: wire.pin.clone(),
+            supports_session_pane_frame: true,
+            supports_pane_recovery_coverage: false,
+        };
+        assert_eq!(auth.pin.as_deref(), pin);
+        for diagnostic in [
+            format!("{wire:?}"),
+            format!("{wire:#?}"),
+            format!("{auth:?}"),
+            format!("{auth:#?}"),
+        ] {
+            for canary in ["193847", "826591"] {
+                assert!(!diagnostic.contains(canary), "Debug must redact auth PINs");
+            }
+        }
+    }
+}
+
+#[test]
 fn session_logout_requires_operator_controls() {
     assert!(!session_logout_allowed(false, false));
     assert!(!session_logout_allowed(false, true));
@@ -35,6 +64,18 @@ fn auth_wire_requires_versioned_e2ee_capability_payload() {
     assert_eq!(decoded.kind, "auth");
     assert_eq!(decoded.protocol_version, WEB_SHARE_PROTOCOL_VERSION);
     assert_eq!(decoded.capabilities, ["e2ee-token-auth"]);
+}
+
+#[test]
+fn session_shift_enter_preserves_web_line_feed_and_terminal_carriage_return() {
+    use crate::input_keys::{encode_key, ExtendedKeyFormat};
+
+    let key = super::parse_key_code("S-Enter").expect("shift enter key");
+    assert_eq!(encode_session_key("S-Enter").as_deref(), Some(&b"\n"[..]));
+    assert_eq!(
+        encode_key(0, ExtendedKeyFormat::Xterm, key).as_deref(),
+        Some(&b"\r"[..])
+    );
 }
 
 #[test]

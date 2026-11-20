@@ -1,5 +1,10 @@
+#[cfg(test)]
+use crate::session_fixture::SessionSetupExt as _;
 use tokio::sync::mpsc;
 
+use super::pane_command_tests::{
+    assert_swap_layout_publication, floating_swap_fixture, FloatingSwapRoute,
+};
 use super::RequestHandler;
 use crate::control_notifications::{
     collect_control_notifications, ControlClientSnapshot, PreparedControlNotification,
@@ -15,6 +20,210 @@ use rmux_proto::{
 
 fn session_name(value: &str) -> SessionName {
     SessionName::new(value).expect("valid session name")
+}
+
+#[tokio::test]
+async fn self_swap_publishes_unzoom_but_not_unchanged_or_preserved_zoom() {
+    for route in [
+        FloatingSwapRoute::SameWindow,
+        FloatingSwapRoute::GroupedAlias,
+    ] {
+        for zoomed in [false, true] {
+            for preserve_zoom in [false, true] {
+                let mut fixture = floating_swap_fixture(route).await;
+                fixture.zoom(zoomed, zoomed).await;
+                if preserve_zoom {
+                    let state = fixture.handler.state.lock().await;
+                    for (target, expected) in &mut fixture.windows {
+                        *expected = state.sessions.window(target).unwrap().clone();
+                    }
+                }
+                let expected_events = if zoomed && !preserve_zoom {
+                    vec![fixture.windows[0].1.id()]
+                } else {
+                    Vec::new()
+                };
+                let mut events = fixture.handler.subscribe_lifecycle_events();
+                let source = fixture.source.clone();
+                let response = fixture
+                    .handler
+                    .handle(Request::SwapPane(rmux_proto::SwapPaneRequest {
+                        source,
+                        target: PaneTarget::with_window(
+                            fixture.target.session_name().clone(),
+                            0,
+                            2,
+                        ),
+                        direction: None,
+                        detached: true,
+                        preserve_zoom,
+                    }))
+                    .await;
+                assert!(matches!(response, Response::SwapPane(_)), "{response:?}");
+                assert_swap_layout_publication(&fixture.handler, &mut events, &expected_events)
+                    .await;
+                fixture.assert_state_and_runtimes().await;
+                fixture.cleanup().await;
+            }
+        }
+    }
+}
+
+#[tokio::test]
+async fn rolled_back_unzoom_failure_publishes_no_layout_or_resize() {
+    let mut fixture = floating_swap_fixture(FloatingSwapRoute::CrossWindow).await;
+    fixture.zoom(true, true).await;
+    {
+        let mut state = fixture.handler.state.lock().await;
+        for (target, expected) in &mut fixture.windows {
+            *expected = state.sessions.window(target).unwrap().clone();
+        }
+        state.fail_next_resize_for_test();
+    }
+    let mut events = fixture.handler.subscribe_lifecycle_events();
+    let response = fixture
+        .handler
+        .handle(Request::SwapPane(rmux_proto::SwapPaneRequest {
+            source: fixture.source.clone(),
+            target: fixture.target.clone(),
+            direction: None,
+            detached: true,
+            preserve_zoom: false,
+        }))
+        .await;
+    assert!(
+        matches!(&response, Response::Error(error)
+        if error.error.to_string().contains("injected pane terminal resize failure")),
+        "{response:?}"
+    );
+    assert_swap_layout_publication(&fixture.handler, &mut events, &[]).await;
+    fixture.assert_state_and_runtimes().await;
+    fixture.cleanup().await;
+}
+
+#[tokio::test]
+async fn floating_self_swap_preserves_zoom_only_with_z_through_owner_aliases() {
+    // No-Z: L1-034 self/unzoom oracle. -Z: L1-035 identical floating case.
+    for route in [
+        FloatingSwapRoute::SameWindow,
+        FloatingSwapRoute::GroupedAlias,
+    ] {
+        for preserve_zoom in [false, true] {
+            let mut fixture = floating_swap_fixture(route).await;
+            fixture.zoom(true, true).await;
+            if preserve_zoom {
+                let state = fixture.handler.state.lock().await;
+                for (target, expected) in &mut fixture.windows {
+                    *expected = state.sessions.window(target).unwrap().clone();
+                }
+            }
+            let response = fixture
+                .handler
+                .handle(Request::SwapPane(rmux_proto::SwapPaneRequest {
+                    source: fixture.source.clone(),
+                    target: PaneTarget::with_window(fixture.target.session_name().clone(), 0, 2),
+                    direction: None,
+                    detached: false,
+                    preserve_zoom,
+                }))
+                .await;
+            assert!(matches!(response, Response::SwapPane(_)), "{response:?}");
+            fixture.assert_state_and_runtimes().await;
+            for (target, expected) in &fixture.windows {
+                let actual = rendered_window_layouts(
+                    &fixture.handler,
+                    PaneTarget::with_window(
+                        target.session_name().clone(),
+                        target.window_index(),
+                        0,
+                    ),
+                )
+                .await;
+                assert_eq!(
+                    actual,
+                    (expected.layout_dump(), expected.visible_layout_dump())
+                );
+            }
+            fixture.cleanup().await;
+        }
+    }
+}
+
+#[tokio::test]
+async fn invalid_swap_endpoint_leaves_zoom_and_runtime_untouched() {
+    for invalid_source in [false, true] {
+        let mut fixture = floating_swap_fixture(FloatingSwapRoute::CrossSession).await;
+        fixture.zoom(true, true).await;
+        let before_resizes = {
+            let state = fixture.handler.state.lock().await;
+            for (target, expected) in &mut fixture.windows {
+                *expected = state.sessions.window(target).unwrap().clone();
+            }
+            state.window_runtime_resize_count_for_test()
+        };
+        let invalid = PaneTarget::new(session_name("missing-swap-session"), 99);
+        let response = fixture
+            .handler
+            .handle(Request::SwapPane(rmux_proto::SwapPaneRequest {
+                source: if invalid_source {
+                    invalid.clone()
+                } else {
+                    fixture.source.clone()
+                },
+                target: if invalid_source {
+                    fixture.source.clone()
+                } else {
+                    invalid
+                },
+                direction: None,
+                detached: false,
+                preserve_zoom: false,
+            }))
+            .await;
+        assert!(matches!(response, Response::Error(error)
+            if matches!(error.error, rmux_proto::RmuxError::SessionNotFound(_))));
+        fixture.assert_state_and_runtimes().await;
+        assert_eq!(
+            fixture
+                .handler
+                .state
+                .lock()
+                .await
+                .window_runtime_resize_count_for_test(),
+            before_resizes
+        );
+        fixture.cleanup().await;
+    }
+}
+
+#[tokio::test]
+async fn floating_refusal_does_not_swallow_unzoom_runtime_resize_failure() {
+    let mut fixture = floating_swap_fixture(FloatingSwapRoute::CrossWindow).await;
+    fixture.zoom(true, true).await;
+    {
+        let mut state = fixture.handler.state.lock().await;
+        for (target, expected) in &mut fixture.windows {
+            *expected = state.sessions.window(target).unwrap().clone();
+        }
+        state.fail_next_resize_for_test();
+    }
+    let response = fixture
+        .handler
+        .handle(Request::SwapPane(rmux_proto::SwapPaneRequest {
+            source: fixture.source.clone(),
+            target: fixture.target.clone(),
+            direction: None,
+            detached: false,
+            preserve_zoom: true,
+        }))
+        .await;
+    assert!(
+        matches!(&response, Response::Error(error)
+        if error.error.to_string().contains("injected pane terminal resize failure")),
+        "{response:?}"
+    );
+    fixture.assert_state_and_runtimes().await;
+    fixture.cleanup().await;
 }
 
 async fn rendered_window_layouts(handler: &RequestHandler, target: PaneTarget) -> (String, String) {
@@ -53,7 +262,7 @@ async fn layout_change_notification(
         pid: 73,
         session_name: Some(target.session_name().clone()),
     }];
-    let notifications = collect_control_notifications(&state, &event, None, &clients);
+    let notifications = collect_control_notifications(&state, &event, None, None, &clients);
     assert_eq!(notifications.len(), 1);
     notifications.into_iter().next().expect("one notification")
 }
@@ -63,8 +272,8 @@ async fn resize_pane_zoom_toggles_the_target_window() {
     let handler = RequestHandler::new();
     let alpha = session_name("alpha");
 
-    assert!(matches!(
-        handler
+    crate::session_fixture::assert_new_session(
+        &handler
             .handle(Request::NewSession(NewSessionRequest {
                 session_name: alpha.clone(),
                 detached: true,
@@ -72,8 +281,7 @@ async fn resize_pane_zoom_toggles_the_target_window() {
                 environment: None,
             }))
             .await,
-        Response::NewSession(_)
-    ));
+    );
     assert!(matches!(
         handler
             .handle(Request::SplitWindow(SplitWindowRequest {
@@ -120,8 +328,8 @@ async fn visible_layout_and_layout_change_follow_zoom_for_inactive_windows() {
     let window_target = WindowTarget::with_window(alpha.clone(), 0);
     let pane_target = PaneTarget::with_window(alpha.clone(), 0, 0);
 
-    assert!(matches!(
-        handler
+    crate::session_fixture::assert_new_session(
+        &handler
             .handle(Request::NewSession(NewSessionRequest {
                 session_name: alpha.clone(),
                 detached: true,
@@ -129,8 +337,7 @@ async fn visible_layout_and_layout_change_follow_zoom_for_inactive_windows() {
                 environment: None,
             }))
             .await,
-        Response::NewSession(_)
-    ));
+    );
 
     let (single_layout, single_visible_layout) =
         rendered_window_layouts(&handler, pane_target.clone()).await;
@@ -269,8 +476,8 @@ async fn display_panes_sends_overlay_to_attached_session_without_waiting_for_cle
     let alpha = session_name("alpha");
     let (control_tx, mut control_rx) = mpsc::unbounded_channel();
 
-    assert!(matches!(
-        handler
+    crate::session_fixture::assert_new_session(
+        &handler
             .handle(Request::NewSession(NewSessionRequest {
                 session_name: alpha.clone(),
                 detached: true,
@@ -278,8 +485,7 @@ async fn display_panes_sends_overlay_to_attached_session_without_waiting_for_cle
                 environment: None,
             }))
             .await,
-        Response::NewSession(_)
-    ));
+    );
     assert!(matches!(
         handler
             .handle(Request::SplitWindow(SplitWindowRequest {
@@ -323,7 +529,7 @@ async fn display_panes_sends_overlay_to_attached_session_without_waiting_for_cle
         };
         if let AttachControl::Overlay(overlay) = next {
             let frame = String::from_utf8(overlay.frame).expect("overlay is utf-8");
-            if frame.contains("\u{1b}[41m") || frame.contains("\u{1b}[44m") {
+            if frame.contains("\u{1b}[31m") || frame.contains("\u{1b}[34m") {
                 saw_display_panes_overlay = true;
                 break;
             }
@@ -349,13 +555,13 @@ async fn display_panes_counts_only_labels_that_were_rendered() {
             .expect("session create succeeds");
         state
             .sessions
-            .session_mut(&alpha)
+            .session_setup(&alpha)
             .expect("session exists")
             .split_active_pane()
             .expect("split succeeds");
         state
             .sessions
-            .session_mut(&alpha)
+            .session_setup(&alpha)
             .expect("session exists")
             .resize_terminal(TerminalSize { cols: 3, rows: 1 });
     }

@@ -1,0 +1,250 @@
+[
+  {
+    "bincode_hex": "000000000100000000000000000000000000000000000000",
+    "value": {
+      "command": {
+        "NewSession": {
+          "detached": false,
+          "group_target": null,
+          "print_format": null,
+          "print_session_info": false,
+          "process": {
+            "command": null,
+            "environment": null,
+            "process_command": null
+          },
+          "reuse": {
+            "attach_if_exists": false,
+            "detach_other_clients": false,
+            "flags": null,
+            "kill_other_clients": false,
+            "skip_environment_update": false
+          },
+          "session_name": null,
+          "size": null,
+          "window_name": null,
+          "working_directory": null
+        }
+      },
+      "endpoint": "Default"
+    }
+  },
+  {
+    "bincode_hex": "0000000002000000000000000000000000000000000000000000",
+    "value": {
+      "command": {
+        "AttachSession": {
+          "client_size": null,
+          "client_terminal": {
+            "terminal_features": [],
+            "utf8": false
+          },
+          "reuse": {
+            "detach_other_clients": false,
+            "flags": null,
+            "kill_other_clients": false,
+            "read_only": false,
+            "skip_environment_update": false
+          },
+          "target": null,
+          "target_spec": null,
+          "working_directory": null
+        }
+      },
+      "endpoint": "Default"
+    }
+  },
+  {
+    "bincode_hex": "0000000003000000000000000500000000000000616c7068610000000000000000",
+    "value": {
+      "command": {
+        "SplitWindow": {
+          "before": false,
+          "direction": "Vertical",
+          "process": {
+            "command": null,
+            "environment": null,
+            "process_command": null
+          },
+          "target": {
+            "Session": "alpha"
+          }
+        }
+      },
+      "endpoint": "Default"
+    }
+  },
+  {
+    "bincode_hex": "00000000040000000000000000000000000000000000000000000000000000000000000000",
+    "value": {
+      "command": {
+        "RefreshClient": {
+          "adjustment": null,
+          "clear_pan": false,
+          "clipboard_query": false,
+          "colour_report": null,
+          "control_size": null,
+          "flags": null,
+          "flags_alias": null,
+          "pan_down": false,
+          "pan_left": false,
+          "pan_right": false,
+          "pan_up": false,
+          "status_only": false,
+          "subscriptions": {
+            "subscriptions": [],
+            "subscriptions_format": []
+          },
+          "target_client": null
+        }
+      },
+      "endpoint": "Default"
+    }
+  },
+  {
+    "bincode_hex": "0100000010000000000000002f696e6572742fc3a920736f636b657401000000011400000000000000206e616d65202440255b5d3b3d2fc3a9e99baa200100000000000000000101ffff000001030000000000000000000000000000000500000000000000c3a9e99baa060000000000000024583b3d5c0a010000000003000000000000000c000000000000006e6f742d65786563757465640000000000000000050000000000000020612062200103000000000000000500000000000000413d423d430200000000000000413d000000000000000001050000000000000067726f75700101010101030000000000000000000000000000000300000000000000524742030000000000000052474201000000000000000001011000000000000000237b73657373696f6e5f6e616d657d0a",
+    "value": {
+      "command": {
+        "NewSession": {
+          "detached": true,
+          "group_target": "group",
+          "print_format": "#{session_name}\n",
+          "print_session_info": true,
+          "process": {
+            "command": [
+              "",
+              "é雪",
+              "$X;=\\\n"
+            ],
+            "environment": [
+              "A=B=C",
+              "A=",
+              ""
+            ],
+            "process_command": {
+              "Argv": [
+                "not-executed",
+                "",
+                " a b "
+              ]
+            }
+          },
+          "reuse": {
+            "attach_if_exists": true,
+            "detach_other_clients": true,
+            "flags": [
+              "",
+              "RGB",
+              "RGB"
+            ],
+            "kill_other_clients": true,
+            "skip_environment_update": true
+          },
+          "session_name": " name $@%[];=/é雪 ",
+          "size": {
+            "cols": 65535,
+            "rows": 0
+          },
+          "window_name": "",
+          "working_directory": ""
+        }
+      },
+      "endpoint": {
+        "UnixSocket": "/inert/é socket"
+      }
+    }
+  },
+  {
+    "bincode_hex": "020000000a00000000000000696e6572742d7069706502000000010500000000000000616c70686101140000000000000020616c7068613a343239343936373239352e30200101010101000000000000000001160000000000000020237b70616e655f63757272656e745f706174687d200400000000000000000000000000000003000000000000005247420500000000000000c3a9e99baa030000000000000052474201010000ffff",
+    "value": {
+      "command": {
+        "AttachSession": {
+          "client_size": {
+            "cols": 0,
+            "rows": 65535
+          },
+          "client_terminal": {
+            "terminal_features": [
+              "",
+              "RGB",
+              "é雪",
+              "RGB"
+            ],
+            "utf8": true
+          },
+          "reuse": {
+            "detach_other_clients": true,
+            "flags": [],
+            "kill_other_clients": true,
+            "read_only": true,
+            "skip_environment_update": true
+          },
+          "target": "alpha",
+          "target_spec": " alpha:4294967295.0 ",
+          "working_directory": " #{pane_current_path} "
+        }
+      },
+      "endpoint": {
+        "WindowsPipe": "inert-pipe"
+      }
+    }
+  },
+  {
+    "bincode_hex": "0000000003000000010000000500000000000000616c706861ffffffff00000000010000000101000000000000000001010000001100000000000000202024583b2027c3a9e99baa270a5c2020010000000000000000",
+    "value": {
+      "command": {
+        "SplitWindow": {
+          "before": true,
+          "direction": "Horizontal",
+          "process": {
+            "command": [],
+            "environment": [],
+            "process_command": {
+              "Shell": "  $X; 'é雪'\n\\  "
+            }
+          },
+          "target": {
+            "Pane": {
+              "pane_index": 0,
+              "session_name": "alpha",
+              "window_index": 4294967295
+            }
+          }
+        }
+      },
+      "endpoint": "Default"
+    }
+  },
+  {
+    "bincode_hex": "00000000040000000101000000000000003d01ffffffff01010101010101010000000000000000010d00000000000000206163746976652d70616e6520020000000000000000000000000000000e0000000000000070616e652d6f75747075743a253101000000000000001500000000000000636c69656e743a237b636c69656e745f6e616d657d0103000000000000003078300102000000000000006667",
+    "value": {
+      "command": {
+        "RefreshClient": {
+          "adjustment": 4294967295,
+          "clear_pan": true,
+          "clipboard_query": true,
+          "colour_report": "fg",
+          "control_size": "0x0",
+          "flags": "",
+          "flags_alias": " active-pane ",
+          "pan_down": true,
+          "pan_left": true,
+          "pan_right": true,
+          "pan_up": true,
+          "status_only": true,
+          "subscriptions": {
+            "subscriptions": [
+              "",
+              "pane-output:%1"
+            ],
+            "subscriptions_format": [
+              "client:#{client_name}"
+            ]
+          },
+          "target_client": "="
+        }
+      },
+      "endpoint": "Default"
+    }
+  }
+]

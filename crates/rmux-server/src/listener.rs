@@ -17,10 +17,10 @@ use crate::client_names::attached_client_name;
 use crate::control::{self, ControlLifecycle, ControlServerEvent, ControlUpgradeInput};
 use crate::daemon::ShutdownHandle;
 use crate::handler::{
-    attach_support::AttachRegistration, with_authenticated_connection_peer,
-    with_session_lease_create_addressing, ControlClientIdentity, ControlRegistration,
-    DetachedRequestGuard, NormalRequestGuard, PreparedSdkWait, RequestHandler,
-    SessionLeaseCreateAddressing,
+    attach_support::{AttachRegistration, AttachRegistrationTarget},
+    with_authenticated_connection_peer, with_session_lease_create_addressing,
+    ControlClientIdentity, ControlRegistration, DetachedRequestGuard, NormalRequestGuard,
+    PreparedSdkWait, RequestHandler, SessionLeaseCreateAddressing,
 };
 use crate::listener_options::ServeOptions;
 use crate::listener_signals::handle_server_signal;
@@ -31,8 +31,21 @@ use crate::pane_io;
 use crate::server_access::apply_access_policy;
 use crate::socket_cleanup::SocketCleanup;
 
+mod connection_dispatch;
+#[cfg(unix)]
+mod endpoint_release;
 mod legacy_shutdown;
 mod lifecycle_shutdown;
+pub(crate) mod runtime_entry;
+pub(crate) mod shutdown_answer;
+mod shutdown_refusal;
+#[cfg(unix)]
+mod startup_owner;
+
+#[cfg(test)]
+mod runtime_entry_tests;
+
+use connection_dispatch::serve_connection;
 
 use legacy_shutdown::{
     encode_legacy_kill_server_response, inspect_legacy_kill_server_frame, LegacyKillServerFrame,
@@ -41,12 +54,11 @@ use legacy_shutdown::{
 
 const CONNECTION_SHUTDOWN_GRACE: Duration = Duration::from_millis(250);
 const CONNECTION_QUIESCE_GRACE: Duration = Duration::from_secs(6);
-const FOREGROUND_SHELL_SHUTDOWN_GRACE: Duration = Duration::from_secs(5);
-const LIFECYCLE_HOOK_SHUTDOWN_GRACE: Duration = Duration::from_secs(5);
+pub(crate) const FOREGROUND_SHELL_SHUTDOWN_GRACE: Duration = Duration::from_secs(5);
 const DETACHED_RESPONSE_WRITE_TIMEOUT: Duration = Duration::from_secs(5);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum RequestQuiesceBehavior {
+pub(crate) enum RequestQuiesceBehavior {
     CancelSafe,
     BoundedDrain,
     Drain,
@@ -105,6 +117,9 @@ pub(crate) async fn serve(
         io::Error::other("Unix socket access controller is missing from serve options")
     })?)?;
     handler.install_shutdown_handle(shutdown_handle.clone());
+    handler
+        .install_pane_shell(Arc::clone(&options.pane_shell))
+        .await;
     handler.set_socket_path(&socket_path);
     let lifecycle_events = handler
         .take_lifecycle_dispatch_receiver()
@@ -117,15 +132,11 @@ pub(crate) async fn serve(
             .map_err(|error| io::Error::new(io::ErrorKind::AddrNotAvailable, error.to_string()))?;
     }
     let (connection_shutdown, connection_shutdown_rx) = watch::channel(());
-    let (hook_shutdown, hook_shutdown_rx) = oneshot::channel();
     let mut connection_tasks = JoinSet::new();
-    let hook_handler = Arc::clone(&handler);
-    let mut hook_task = tokio::spawn(async move {
-        hook_handler
-            .consume_lifecycle_hooks(lifecycle_events, hook_shutdown_rx)
-            .await;
-    });
+    let hook_consumer = lifecycle_shutdown::HookConsumer::spawn(&handler, lifecycle_events);
     let startup_guard = handler.start_config_loading();
+    #[cfg(unix)]
+    let startup_owner_task = startup_owner::watch(options.startup_owner, Arc::clone(&handler))?;
     let startup_handler = Arc::clone(&handler);
     let startup_config = options.config_load;
     let startup_task = tokio::spawn(async move {
@@ -190,6 +201,30 @@ pub(crate) async fn serve(
     // optimistic increment/post-check protocol makes this a linearization
     // point: every request is either already counted or cannot start.
     handler.close_normal_request_admission();
+    #[cfg(unix)]
+    let endpoint_reservation = endpoint_release::release_idle_endpoint(
+        &shutdown_handle,
+        &handler,
+        &socket_path,
+        &cleanup_on_drop,
+    )
+    .await;
+    #[cfg(unix)]
+    let listener = match endpoint_reservation {
+        // Connections the kernel queued before the unlink are reset now,
+        // before the drain, and their clients find the endpoint absent.
+        Some(_) => {
+            drop(listener);
+            None
+        }
+        None => Some(listener),
+    };
+    let refusing_listener = shutdown_refusal::RefusingListener::start(listener);
+    #[cfg(unix)]
+    if let Some(task) = startup_owner_task {
+        task.abort();
+        let _ = task.await;
+    }
     drop(connection_shutdown);
     startup_task.abort();
     match startup_task.await {
@@ -201,41 +236,29 @@ pub(crate) async fn serve(
     handler.shutdown_status_jobs().await;
     handler.shutdown_wait_for();
     quiesce_and_drain_connection_tasks_for_shutdown(&handler, &mut connection_tasks).await;
-    let lifecycle_shutdown_deadline = tokio::time::Instant::now() + LIFECYCLE_HOOK_SHUTDOWN_GRACE;
-    let _ = lifecycle_shutdown::drain_lifecycle_hooks_before_deadline(
-        &handler,
-        hook_shutdown,
-        &mut hook_task,
-        lifecycle_shutdown_deadline,
-    )
-    .await;
-    // Keep shell registration open while already accepted lifecycle hooks drain. Once that
-    // window closes, reject and join every background task before releasing the daemon process.
-    let unfinished_background_tasks = handler
-        .shutdown_background_tasks_and_shell_processes()
-        .await;
-    if !unfinished_background_tasks.is_empty() {
-        warn!(
-            tasks = ?unfinished_background_tasks,
-            "background tasks did not join before the shutdown deadline"
-        );
-    }
-    handler.close_and_drain_lifecycle_producers().await;
-    handler.close_and_drain_post_commit_operations().await;
-    handler.seal_and_wait_for_lifecycle_publications().await;
+    let endpoint_held = refusing_listener.is_some();
+    let progress =
+        lifecycle_shutdown::kill_server_progress(&socket_path, endpoint_held, &cleanup_on_drop);
+    let _ = hook_consumer.drain(&handler, progress).await;
+    lifecycle_shutdown::drain_background_work_and_reap_terminals(&handler).await;
 
-    // Keep the old endpoint reserved until every accepted lifecycle hook has either
-    // completed or been cancelled. Releasing it earlier lets an old hook reconnect
-    // to a new daemon generation through its inherited RMUX/TMUX environment.
+    // The refusing listener reserves the endpoint until every accepted lifecycle hook has ended.
+    // An idle shutdown that unlinked its socket holds the startup lock until here.
     #[cfg(unix)]
-    if let Err(error) = handler.restore_owner_only_unix_transport().await {
-        warn!(
-            path = %socket_path.display(),
-            "failed to restore owner-only Unix socket permissions during shutdown: {error}"
-        );
+    if refusing_listener.is_some() {
+        if let Err(error) = handler.restore_owner_only_unix_transport().await {
+            warn!(
+                path = %socket_path.display(),
+                "failed to restore owner-only Unix socket permissions during shutdown: {error}"
+            );
+        }
     }
-    drop(listener);
+    shutdown_refusal::release(refusing_listener).await;
     cleanup_on_drop.cleanup_now();
+    // Unlinking the startup lock file before unlocking it is safe: a waiting
+    // client relocks whatever file the lock path names afterwards.
+    #[cfg(unix)]
+    drop(endpoint_reservation);
 
     Ok(())
 }
@@ -263,425 +286,6 @@ async fn quiesce_and_drain_connection_tasks_for_shutdown(
 }
 
 /// Read-dispatch-write loop for a single client connection.
-async fn serve_connection(
-    stream: LocalStream,
-    requester: PeerIdentity,
-    handler: Arc<RequestHandler>,
-    connection_id: u64,
-    mut shutdown: watch::Receiver<()>,
-    shutdown_handle: ShutdownHandle,
-) -> io::Result<()> {
-    let Some(_) = handler.server_access_admission_for_peer(&requester) else {
-        let mut conn = Connection::new(stream);
-        conn.write_response(&Response::Error(ErrorResponse {
-            error: rmux_proto::RmuxError::Server("access not allowed".to_owned()),
-        }))
-        .await?;
-        return Ok(());
-    };
-    let mut conn = Connection::new(stream);
-    let detached_connection_guard = handler.begin_detached_connection(connection_id);
-    let mut sdk_wait_armed_ack_enabled = false;
-    let mut session_lease_by_id_enabled = false;
-
-    loop {
-        tokio::select! {
-            request = conn.read_request() => {
-                let Some(incoming_request) = request? else {
-                    return Ok(());
-                };
-                let legacy_kill_server_wire = incoming_request.legacy_kill_server_wire;
-                let request = incoming_request.request;
-                let Some(access_admission) =
-                    handler.server_access_admission_for_peer(&requester)
-                else {
-                    let response = match request {
-                        Request::PaneStreamCursor(request) => handler
-                            .handle_revoked_pane_stream_cursor(connection_id, request),
-                        request => handler
-                            .handle_revoked_cleanup_request(connection_id, request)
-                            .await
-                            .unwrap_or_else(|| {
-                                Response::Error(ErrorResponse {
-                                    error: rmux_proto::RmuxError::Server(
-                                        "access not allowed".to_owned(),
-                                    ),
-                                })
-                            }),
-                    };
-                    conn.write_response(&response).await?;
-                    continue;
-                };
-                let can_write = access_admission.can_write();
-                let request = match apply_access_policy(request, can_write) {
-                    Ok(request) => request,
-                    Err(error) => {
-                        conn.write_response(&Response::Error(ErrorResponse { error })).await?;
-                        continue;
-                    }
-                };
-                let attach_client_name = matches!(
-                    &request,
-                    Request::AttachSession(_)
-                        | Request::AttachSessionExt(_)
-                        | Request::AttachSessionExt2(_)
-                        | Request::AttachSessionExt3(_)
-                )
-                .then(|| attached_client_name(requester.pid));
-                let quiesce_behavior = request_quiesce_behavior(&request);
-                let mut request_shutdown = shutdown.clone();
-                let mut normal_request_guard: Option<NormalRequestGuard> =
-                    match handler.try_begin_normal_request(
-                        quiesce_behavior.requires_drain_barrier(),
-                    ) {
-                        Some(guard) => Some(guard),
-                        None => return Ok(()),
-                    };
-                // The scope carries the authenticated peer as well as its
-                // admission: an attach frame is rendered before the
-                // registration below publishes this client, and both must
-                // describe the same user (issue #182).
-                let _requester_access_guard = handler
-                    .begin_authenticated_peer_access(&requester, access_admission.clone());
-                let mut detached_request_guard = request_counts_as_detached_activity(&request)
-                    .then(|| handler.begin_detached_request());
-
-                if request_enables_sdk_wait_armed_ack(&request) {
-                    sdk_wait_armed_ack_enabled = true;
-                }
-                let enables_session_lease_by_id =
-                    request_enables_session_lease_by_id(&request);
-                let session_lease_create_addressing = if session_lease_by_id_enabled {
-                    SessionLeaseCreateAddressing::StableId
-                } else {
-                    SessionLeaseCreateAddressing::Nominal
-                };
-                debug!("dispatching {}", request.command_name());
-                #[cfg(feature = "web")]
-                let mut undelivered_web_share;
-                let mut outcome = match request {
-                    Request::SdkWaitForOutput(request) => {
-                        let prepared = handler
-                            .prepare_sdk_wait_for_output(connection_id, request)
-                            .await;
-                        if write_prepared_sdk_wait(
-                            &mut conn,
-                            prepared,
-                            &mut shutdown,
-                            &handler,
-                            connection_id,
-                            &mut detached_request_guard,
-                            sdk_wait_armed_ack_enabled,
-                        )
-                        .await?
-                        {
-                            return Ok(());
-                        }
-                        continue;
-                    }
-                    Request::SdkWaitForOutputRef(request) => {
-                        let prepared = handler
-                            .prepare_sdk_wait_for_output_ref(connection_id, request)
-                            .await;
-                        if write_prepared_sdk_wait(
-                            &mut conn,
-                            prepared,
-                            &mut shutdown,
-                            &handler,
-                            connection_id,
-                            &mut detached_request_guard,
-                            sdk_wait_armed_ack_enabled,
-                        )
-                        .await?
-                        {
-                            return Ok(());
-                        }
-                        continue;
-                    }
-                    request => {
-                        #[cfg(feature = "web")]
-                        let dispatch = handler.dispatch_for_connection_with_web_share_guard(
-                            requester.pid,
-                            connection_id,
-                            request,
-                        );
-                        #[cfg(not(feature = "web"))]
-                        let dispatch = handler.dispatch_for_connection(
-                            requester.pid,
-                            connection_id,
-                            request,
-                        );
-                        tokio::select! {
-                            outcome = with_session_lease_create_addressing(
-                                session_lease_create_addressing,
-                                dispatch,
-                            ) => {
-                                #[cfg(feature = "web")]
-                                {
-                                    undelivered_web_share = outcome.1;
-                                    outcome.0
-                                }
-                                #[cfg(not(feature = "web"))]
-                                outcome
-                            },
-                            result = wait_for_request_shutdown(
-                                &mut request_shutdown,
-                                quiesce_behavior,
-                            ),
-                                if quiesce_behavior.cancels_on_shutdown() => {
-                                if result.is_ok() {
-                                    debug!("closing client connection during shutdown");
-                                }
-                                return Ok(());
-                            }
-                            result = wait_for_peer_close(&conn.stream),
-                                if quiesce_behavior.cancels_on_peer_disconnect() => {
-                                result?;
-                                debug!("closing client connection after peer disconnect");
-                                return Ok(());
-                            }
-                        }
-                    }
-                };
-                if enables_session_lease_by_id
-                    && matches!(&outcome.response, Response::Handshake(_))
-                {
-                    session_lease_by_id_enabled = true;
-                }
-                // An attach registration is removed as soon as its last
-                // session closes, but its forwarder still has to deliver the
-                // terminal exit frame. Bridge that transition before any
-                // further await can let exit-empty shut the daemon down.
-                let attach_forwarder_guard = outcome
-                    .attach
-                    .is_some()
-                    .then(|| handler.begin_attach_forwarder());
-                let pending_control = if let Some(control_upgrade) = outcome.control.take() {
-                    let initial_command_count = control_upgrade.initial_command_count as usize;
-                    if let Err(error) =
-                        control::validate_initial_control_command_count(initial_command_count)
-                    {
-                        conn.write_response(&Response::Error(ErrorResponse { error }))
-                            .await?;
-                        drop(detached_request_guard.take());
-                        continue;
-                    }
-                    let control_mode = control_upgrade.mode;
-                    let (server_event_tx, server_event_rx) =
-                        tokio::sync::mpsc::channel::<ControlServerEvent>(
-                            control::CONTROL_SERVER_EVENT_CAPACITY,
-                        );
-                    let closing = Arc::new(std::sync::atomic::AtomicBool::new(false));
-                    let control_id = match handler
-                        .register_control_with_server_access(
-                            requester.pid,
-                            control_upgrade,
-                            ControlRegistration {
-                                event_tx: server_event_tx,
-                                closing: closing.clone(),
-                                uid: requester.uid,
-                                user: requester.user.clone(),
-                                can_write,
-                            },
-                            access_admission.clone(),
-                        )
-                        .await
-                    {
-                        Ok(control_id) => control_id,
-                        Err(error) => {
-                            conn.write_response(&Response::Error(ErrorResponse {
-                                error: error.into_rmux_error(),
-                            }))
-                            .await?;
-                            drop(detached_request_guard.take());
-                            continue;
-                        }
-                    };
-                    Some((
-                        initial_command_count,
-                        control_mode,
-                        server_event_rx,
-                        closing,
-                        control_id,
-                    ))
-                } else {
-                    None
-                };
-
-                // Tests park the loop here to make the captured admission stale
-                // between a dispatched pane-stream open and its recheck.
-                #[cfg(test)]
-                inflight_access_tests::pause_before_inflight_pane_stream_recheck(
-                    &handler,
-                    &outcome.response,
-                )
-                .await;
-
-                if matches!(
-                    outcome.response,
-                    Response::SubscribePaneStream(_) | Response::PaneStreamCursor(_)
-                ) && !handler
-                    .server_access_admission_is_current(&requester, &access_admission)
-                {
-                    outcome.response = handler.revoke_inflight_pane_stream_response(
-                        connection_id,
-                        outcome.response,
-                    );
-                }
-
-                let response_result = match (legacy_kill_server_wire, &outcome.response) {
-                    (Some(wire_version), Response::KillServer(_)) => {
-                        conn.write_legacy_kill_server_response(wire_version).await
-                    }
-                    _ => conn.write_response(&outcome.response).await,
-                };
-                if let Err(error) = response_result {
-                    if let Some((_, _, _, _, control_id)) = pending_control.as_ref() {
-                        handler.finish_control(requester.pid, *control_id).await;
-                        let _ = handler.request_shutdown_if_server_empty().await;
-                    }
-                    drop(detached_request_guard.take());
-                    #[cfg(windows)]
-                    let _ = handler
-                        .request_shutdown_if_pending_excluding_detached_connection(Some(connection_id));
-                    return Err(error);
-                }
-
-                #[cfg(feature = "web")]
-                if let Some(guard) = undelivered_web_share.as_mut() {
-                    guard.disarm();
-                }
-
-                if let Some(attach) = outcome.attach {
-                    let attach_forwarder_guard = attach_forwarder_guard
-                        .expect("attach outcome must hold an attach forwarder guard");
-                    let Response::AttachSession(response) = &outcome.response else {
-                        return Err(io::Error::other(
-                            "attach upgrade requires an attach-session response",
-                        ));
-                    };
-                    let session_name = response.session_name.clone();
-                    let terminal_context = attach.target.outer_terminal.context().clone();
-                    let client_title = attach_frame_client_title(&attach.target);
-                    let client_name = attach_client_name
-                        .expect("attach upgrade captures its client name before dispatch");
-                    let attach_identity = handler
-                        .register_attach_identity_with_server_access_and_client_name(
-                            requester.pid,
-                            client_name.clone(),
-                            session_name.clone(),
-                            Some(attach.session_id),
-                            AttachRegistration {
-                                control_tx: attach.control_tx,
-                                control_backlog: attach.control_backlog.clone(),
-                                closing: attach.closing.clone(),
-                                persistent_overlay_epoch: attach.persistent_overlay_epoch.clone(),
-                                terminal_context,
-                                client_title,
-                                flags: attach.flags,
-                                render_stream: attach.render_stream,
-                                uid: requester.uid,
-                                user: requester.user.clone(),
-                                can_write,
-                                client_size: attach.client_size,
-                            },
-                            access_admission.clone(),
-                        )
-                        .await
-                        .ok_or_else(|| {
-                            io::Error::other("attach session changed before registration")
-                        })?;
-                    drop(detached_connection_guard);
-                    drop(detached_request_guard.take());
-                    handler
-                        .emit_client_attached_identity(
-                            client_name,
-                            session_name,
-                            attach.session_id,
-                        )
-                        .await;
-                    drop(normal_request_guard.take());
-                    let (stream, buffered_bytes) = conn.into_raw_parts();
-                    if !buffered_bytes.is_empty() {
-                        warn!(
-                            buffered = buffered_bytes.len(),
-                            "preserving buffered bytes at attach upgrade boundary"
-                        );
-                    }
-                    let result = pane_io::forward_attach(
-                        stream,
-                        attach.target,
-                        buffered_bytes,
-                        shutdown,
-                        attach.control_rx,
-                        attach.control_backlog,
-                        attach.closing,
-                        attach.persistent_overlay_epoch,
-                        pane_io::LiveAttachInputContext::new(
-                            Arc::clone(&handler),
-                            attach_identity,
-                        ),
-                        attach.render_stream,
-                    )
-                    .await;
-                    handler
-                        .finish_attach(requester.pid, attach_identity.attach_id())
-                        .await;
-                    drop(attach_forwarder_guard);
-                    let _ = handler.request_shutdown_if_pending();
-                    return result;
-                }
-                if let Some((
-                    initial_command_count,
-                    control_mode,
-                    server_event_rx,
-                    closing,
-                    control_id,
-                )) = pending_control
-                {
-                    drop(detached_connection_guard);
-                    drop(detached_request_guard.take());
-                    drop(normal_request_guard.take());
-                    let (stream, buffered_bytes) = conn.into_raw_parts();
-                    let result = control::forward_control(
-                        stream,
-                        Arc::clone(&handler),
-                        ControlClientIdentity::new(requester.pid, control_id),
-                        ControlUpgradeInput::with_mode(
-                            buffered_bytes,
-                            initial_command_count,
-                            control_mode,
-                        ),
-                        shutdown,
-                        server_event_rx,
-                        ControlLifecycle {
-                            closing,
-                            shutdown_handle: shutdown_handle.clone(),
-                        },
-                    )
-                    .await;
-                    handler.finish_control(requester.pid, control_id).await;
-                    let _ = handler.request_shutdown_if_server_empty().await;
-                    return result;
-                }
-
-                drop(detached_request_guard.take());
-                if handler
-                    .request_shutdown_if_pending_excluding_detached_connection(Some(connection_id))
-                {
-                    return Ok(());
-                }
-            }
-            result = shutdown.changed() => {
-                if result.is_ok() {
-                    debug!("closing client connection during shutdown");
-                }
-                return Ok(());
-            }
-        }
-    }
-}
-
 /// The per-client outer-terminal identity a fresh registration inherits from
 /// the attach frame this listener is about to forward.
 ///
@@ -696,50 +300,6 @@ pub(crate) fn attach_frame_client_title(
         .client_title
         .as_ref()
         .map(|rendered| rendered.state().clone())
-}
-
-async fn write_prepared_sdk_wait(
-    conn: &mut Connection,
-    prepared: PreparedSdkWait,
-    shutdown: &mut watch::Receiver<()>,
-    handler: &Arc<RequestHandler>,
-    connection_id: u64,
-    detached_request_guard: &mut Option<DetachedRequestGuard>,
-    send_armed_ack: bool,
-) -> io::Result<bool> {
-    let response = match prepared {
-        PreparedSdkWait::Immediate(response) => response,
-        PreparedSdkWait::Armed(wait) => {
-            if send_armed_ack {
-                conn.write_response(&wait.armed_response()).await?;
-            }
-            tokio::select! {
-                response = wait.wait() => response,
-                result = shutdown.changed() => {
-                    if result.is_ok() {
-                        debug!("closing client connection during shutdown");
-                    }
-                    return Ok(true);
-                }
-                result = wait_for_peer_close(&conn.stream) => {
-                    result?;
-                    debug!("closing client connection after peer disconnect");
-                    return Ok(true);
-                }
-            }
-        }
-    };
-
-    if let Err(error) = conn.write_response(&response).await {
-        drop(detached_request_guard.take());
-        #[cfg(windows)]
-        let _ =
-            handler.request_shutdown_if_pending_excluding_detached_connection(Some(connection_id));
-        return Err(error);
-    }
-
-    drop(detached_request_guard.take());
-    Ok(handler.request_shutdown_if_pending_excluding_detached_connection(Some(connection_id)))
 }
 
 async fn run_connection_with_cleanup(
@@ -809,10 +369,7 @@ fn request_enables_sdk_wait_armed_ack(request: &Request) -> bool {
     matches!(
         request,
         Request::Handshake(handshake)
-            if handshake
-                .required_capabilities
-                .iter()
-                .any(|capability| capability == CAPABILITY_SDK_WAITS_ARMED)
+            if handshake.enables_connection_capability(CAPABILITY_SDK_WAITS_ARMED)
     )
 }
 
@@ -820,14 +377,11 @@ fn request_enables_session_lease_by_id(request: &Request) -> bool {
     matches!(
         request,
         Request::Handshake(handshake)
-            if handshake
-                .required_capabilities
-                .iter()
-                .any(|capability| capability == CAPABILITY_SDK_SESSION_LEASE_BY_ID_V2)
+            if handshake.enables_connection_capability(CAPABILITY_SDK_SESSION_LEASE_BY_ID_V2)
     )
 }
 
-fn request_quiesce_behavior(request: &Request) -> RequestQuiesceBehavior {
+pub(crate) fn request_quiesce_behavior(request: &Request) -> RequestQuiesceBehavior {
     match request {
         Request::LoadBuffer(_) | Request::SaveBuffer(_) | Request::SourceFile(_) => {
             RequestQuiesceBehavior::CancelSafe
@@ -1496,8 +1050,8 @@ mod tests {
         };
         let handler = Arc::new(RequestHandler::new());
         let session = SessionName::new("revoked-stream-cleanup").expect("valid session");
-        assert!(matches!(
-            handler
+        crate::session_fixture::assert_new_session(
+            &handler
                 .handle(Request::NewSession(NewSessionRequest {
                     session_name: session.clone(),
                     detached: true,
@@ -1505,8 +1059,7 @@ mod tests {
                     environment: None,
                 }))
                 .await,
-            Response::NewSession(_)
-        ));
+        );
         handler
             .set_test_access_mode_for_uid(peer_uid, AccessMode::ReadWrite)
             .expect("test peer starts read-write");
@@ -1558,8 +1111,8 @@ mod tests {
         };
         let handler = Arc::new(RequestHandler::new());
         for session_name in ["readonly-list-a", "readonly-list-b"] {
-            assert!(matches!(
-                handler
+            crate::session_fixture::assert_new_session(
+                &handler
                     .handle(Request::NewSession(NewSessionRequest {
                         session_name: SessionName::new(session_name).expect("valid session"),
                         detached: true,
@@ -1567,8 +1120,7 @@ mod tests {
                         environment: None,
                     }))
                     .await,
-                Response::NewSession(_)
-            ));
+            );
         }
         assert!(matches!(
             handler
@@ -1686,8 +1238,8 @@ mod tests {
         let handler = Arc::new(RequestHandler::new());
         let session = SessionName::new("sdkack").expect("valid session");
         let target = PaneTarget::new(session.clone(), 0);
-        assert!(matches!(
-            handler
+        crate::session_fixture::assert_new_session(
+            &handler
                 .handle(Request::NewSession(NewSessionRequest {
                     session_name: session.clone(),
                     detached: true,
@@ -1695,8 +1247,7 @@ mod tests {
                     environment: None,
                 }))
                 .await,
-            Response::NewSession(_)
-        ));
+        );
         let (mut client, _shutdown_tx, connection_task) = spawn_test_connection(&handler)?;
 
         write_test_request(
@@ -1754,8 +1305,8 @@ mod tests {
         let handler = Arc::new(RequestHandler::new());
         let original_name = SessionName::new("lease-negotiated-owner").expect("valid session");
         let renamed = SessionName::new("lease-negotiated-renamed").expect("valid session");
-        assert!(matches!(
-            handler
+        crate::session_fixture::assert_new_session(
+            &handler
                 .handle(Request::NewSession(NewSessionRequest {
                     session_name: original_name.clone(),
                     detached: true,
@@ -1763,8 +1314,7 @@ mod tests {
                     environment: None,
                 }))
                 .await,
-            Response::NewSession(_)
-        ));
+        );
         assert!(matches!(
             handler
                 .handle(Request::RenameSession(RenameSessionRequest {
@@ -1774,8 +1324,8 @@ mod tests {
                 .await,
             Response::RenameSession(_)
         ));
-        assert!(matches!(
-            handler
+        crate::session_fixture::assert_new_session(
+            &handler
                 .handle(Request::NewSession(NewSessionRequest {
                     session_name: original_name.clone(),
                     detached: true,
@@ -1783,8 +1333,7 @@ mod tests {
                     environment: None,
                 }))
                 .await,
-            Response::NewSession(_)
-        ));
+        );
 
         let (mut client, _shutdown_tx, connection_task) = spawn_test_connection(&handler)?;
         write_test_request(
@@ -1851,8 +1400,8 @@ mod tests {
         let handler = Arc::new(RequestHandler::new());
         let session = SessionName::new("sdklegacy").expect("valid session");
         let target = PaneTarget::new(session.clone(), 0);
-        assert!(matches!(
-            handler
+        crate::session_fixture::assert_new_session(
+            &handler
                 .handle(Request::NewSession(NewSessionRequest {
                     session_name: session.clone(),
                     detached: true,
@@ -1860,8 +1409,7 @@ mod tests {
                     environment: None,
                 }))
                 .await,
-            Response::NewSession(_)
-        ));
+        );
         let (mut client, _shutdown_tx, connection_task) = spawn_test_connection(&handler)?;
 
         write_test_request(
@@ -2242,7 +1790,11 @@ mod web_share_tests;
 
 #[cfg(test)]
 #[path = "listener_connection_test_support.rs"]
-mod connection_test_support;
+pub(crate) mod connection_test_support;
+
+#[cfg(test)]
+#[path = "listener_attach_geometry_test_support.rs"]
+pub(crate) mod attach_geometry_test_support;
 
 #[cfg(test)]
 #[path = "listener_inflight_access_tests.rs"]
@@ -2251,6 +1803,14 @@ mod inflight_access_tests;
 #[cfg(test)]
 #[path = "listener_attach_identity_tests.rs"]
 mod attach_identity_tests;
+
+#[cfg(test)]
+#[path = "listener_poisoned_pane_tests.rs"]
+mod poisoned_pane_tests;
+
+#[cfg(all(test, unix))]
+#[path = "listener_popup_shutdown_tests.rs"]
+mod popup_shutdown_tests;
 
 #[cfg(all(test, windows))]
 mod windows_tests {

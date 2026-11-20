@@ -90,7 +90,13 @@ pub(super) fn apply_substitution(value: &str, modifier: &FormatModifier) -> Stri
 
     match cached_regex(pattern, case_insensitive) {
         Ok(regex) => substitute_regex(value, &regex, replacement),
-        Err(_) => value.replace(pattern, replacement),
+        // A pattern that will not compile substitutes nothing: tmux's regsub
+        // returns NULL when regcomp fails (regsub.c:69-74) and the format takes
+        // the original text back (format.c:4516-4527), so the value of this
+        // step survives and the modifiers after it still run. Replacing the
+        // pattern literally would edit the text on exactly the input the
+        // expression failed to describe.
+        Err(_) => value.to_owned(),
     }
 }
 

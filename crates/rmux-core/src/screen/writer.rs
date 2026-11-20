@@ -1,15 +1,26 @@
-use crate::grid::{Grid, GridCell, GridCellFlags, GridLineFlags};
+use crate::grid::GridLineFlags;
 use crate::input::mode;
-use crate::input::{CellState, InputEndType, ScreenWriter, COLOUR_DEFAULT};
-use crate::{TerminalPaletteIndex, TerminalPassthrough};
+use crate::input::{CellState, InputEndType, ScreenWriter};
+#[cfg(feature = "kitty-keyboard")]
+use crate::kitty_keyboard::{Control, Effect};
+use crate::TerminalPassthrough;
 
-use super::{SavedGrid, Screen, TITLE_STACK_MAX};
+use super::Screen;
 
-fn cursor_backward_tab_steps(n: u32, current: u32) -> u32 {
-    n.max(1).min(current.saturating_add(1))
-}
+mod alternate;
+mod metadata;
+mod reset;
+mod tabs;
+
+#[cfg(test)]
+use tabs::cursor_backward_tab_steps;
 
 impl ScreenWriter for Screen {
+    #[cfg(feature = "kitty-keyboard")]
+    fn keyboard_control(&mut self, control: Control) -> Effect {
+        self.keyboard.apply(self.keyboard_screen(), control)
+    }
+
     fn collect_add(&mut self, ch: char, cell: &CellState) {
         self.write_char(ch, cell, false);
     }
@@ -19,6 +30,9 @@ impl ScreenWriter for Screen {
     }
 
     fn collect_add_ascii_run(&mut self, bytes: &[u8], cell: &CellState, acs: bool) {
+        if !acs && !bytes.is_empty() {
+            self.clear_combined_sequence_discard_at_cursor();
+        }
         if !self.write_plain_ascii_run(bytes, cell, acs) {
             for &byte in bytes {
                 self.write_char(char::from(byte), cell, acs);
@@ -82,10 +96,11 @@ impl ScreenWriter for Screen {
 
     fn insert_line(&mut self, n: u32, bg: i32) {
         self.clear_pending_wrap();
-        if self.cursor_y < self.rupper || self.cursor_y > self.rlower {
+        self.clear_selected_cells();
+        if self.cursor_outside_scroll_region() {
+            self.grid.insert_lines_to_bottom(self.cursor_y, n, bg);
             return;
         }
-        self.clear_selected_cells();
 
         let upper = self.cursor_y;
         let lower = self.rlower;
@@ -95,10 +110,11 @@ impl ScreenWriter for Screen {
 
     fn delete_line(&mut self, n: u32, bg: i32) {
         self.clear_pending_wrap();
-        if self.cursor_y < self.rupper || self.cursor_y > self.rlower {
+        self.clear_selected_cells();
+        if self.cursor_outside_scroll_region() {
+            self.grid.delete_lines_to_bottom(self.cursor_y, n, bg);
             return;
         }
-        self.clear_selected_cells();
 
         let upper = self.cursor_y;
         let lower = self.rlower;
@@ -184,7 +200,9 @@ impl ScreenWriter for Screen {
     }
 
     fn insert_character(&mut self, n: u32, bg: i32) {
-        self.clear_pending_wrap();
+        if self.logical_cursor_column() >= self.grid.sx() {
+            return;
+        }
         self.clear_selected_cells();
         let sx = self.grid.sx();
         let x = self.logical_insert_column();
@@ -203,10 +221,12 @@ impl ScreenWriter for Screen {
     }
 
     fn delete_character(&mut self, n: u32, bg: i32) {
-        self.clear_pending_wrap();
-        self.clear_selected_cells();
-        let x = self.cursor_column();
+        let x = self.logical_cursor_column();
         let sx = self.grid.sx();
+        if x >= sx {
+            return;
+        }
+        self.clear_selected_cells();
         let count = n.max(1).min(sx.saturating_sub(x));
         let blank = self.blank_cell(bg);
         let clears_whole_line = x == 0 && count == sx;
@@ -218,14 +238,17 @@ impl ScreenWriter for Screen {
             Self::repair_wide_cells_on_line(line, sx, bg);
             if clears_whole_line {
                 line.set_wrapped(false);
+                line.clear_shell_marks();
             }
             line.touch();
         }
     }
 
     fn clear_character(&mut self, n: u32, bg: i32) {
-        self.clear_pending_wrap();
-        let x = self.cursor_column();
+        let x = self.logical_cursor_column();
+        if x >= self.grid.sx() {
+            return;
+        }
         let end = x
             .saturating_add(n.max(1))
             .saturating_sub(1)
@@ -234,34 +257,28 @@ impl ScreenWriter for Screen {
     }
 
     fn clear_end_of_screen(&mut self, bg: i32) {
-        if self.cursor_y == 0 && self.cursor_column() == 0 {
-            self.clear_selected_cells();
-            self.grid.clear_visible_to_history(COLOUR_DEFAULT);
+        let x = self.logical_cursor_column();
+        if self.cursor_y == 0 && x == 0 {
+            self.clear_whole_screen(bg);
             return;
         }
-        let x = self.cursor_column();
-        if self.cursor_y < self.grid.sy() {
+        if self.cursor_y < self.grid.sy() && x < self.grid.sx() {
             self.clear_line_range(self.cursor_y, x, self.grid.sx().saturating_sub(1), bg);
         }
         if self.cursor_y + 1 < self.grid.sy() {
-            self.clear_screen_region(
-                self.cursor_y + 1,
-                self.grid.sy().saturating_sub(1),
-                COLOUR_DEFAULT,
-            );
+            self.clear_screen_region(self.cursor_y + 1, self.grid.sy().saturating_sub(1), bg);
         }
     }
 
     fn clear_start_of_screen(&mut self, bg: i32) {
         if self.cursor_y > 0 {
-            self.clear_screen_region(0, self.cursor_y - 1, COLOUR_DEFAULT);
+            self.clear_screen_region(0, self.cursor_y - 1, bg);
         }
         self.clear_line_range(self.cursor_y, 0, self.cursor_column(), bg);
     }
 
-    fn clear_screen(&mut self, _bg: i32) {
-        self.clear_selected_cells();
-        self.grid.clear_visible_to_history(COLOUR_DEFAULT);
+    fn clear_screen(&mut self, bg: i32) {
+        self.clear_whole_screen(bg);
     }
 
     fn clear_history(&mut self) {
@@ -270,12 +287,11 @@ impl ScreenWriter for Screen {
     }
 
     fn clear_end_of_line(&mut self, bg: i32) {
-        self.clear_line_range(
-            self.cursor_y,
-            self.cursor_column(),
-            self.grid.sx().saturating_sub(1),
-            bg,
-        );
+        let x = self.logical_cursor_column();
+        if x >= self.grid.sx() {
+            return;
+        }
+        self.clear_line_range(self.cursor_y, x, self.grid.sx().saturating_sub(1), bg);
     }
 
     fn clear_start_of_line(&mut self, bg: i32) {
@@ -286,11 +302,21 @@ impl ScreenWriter for Screen {
         self.clear_line_range(self.cursor_y, 0, self.grid.sx().saturating_sub(1), bg);
     }
 
+    fn extended_key_policy(&self) -> crate::input::ExtendedKeyPolicy {
+        self.extended_key_policy
+    }
+
     fn mode_set(&mut self, mode_bits: u32) {
+        if mode_bits & mode::MODE_SYNC != 0 {
+            self.begin_synchronized_output();
+        }
         self.mode |= mode_bits;
     }
 
     fn mode_clear(&mut self, mode_bits: u32) {
+        if mode_bits & mode::MODE_SYNC != 0 {
+            self.end_synchronized_output();
+        }
         self.mode &= !mode_bits;
         if (self.mode & mode::MODE_WRAP) == 0 {
             self.clear_pending_wrap();
@@ -312,111 +338,40 @@ impl ScreenWriter for Screen {
     }
 
     fn alternate_on(&mut self, bg: i32, save_cursor: bool) {
-        if !self.alternate_screen_enabled {
-            return;
-        }
-        if self.is_alternate() {
-            return;
-        }
-        self.clear_selected_cells();
-
-        let mut saved_grid = Grid::new(self.grid.size(), 0);
-        saved_grid.replace_visible(self.grid.visible_lines());
-        self.saved_grid = Some(SavedGrid {
-            grid: saved_grid,
-            history_enabled: self.grid.history_enabled(),
-        });
-        if save_cursor {
-            self.saved_cursor_x = Some(self.cursor_x);
-            self.saved_cursor_y = Some(self.cursor_y);
-            self.saved_cursor_pending_wrap = self.pending_wrap;
-            self.saved_state.cx = self.cursor_column();
-            self.saved_state.cy = self.cursor_y;
-        }
-
-        self.grid.clear_visible(bg);
-        self.grid.set_history_enabled(false);
-        self.pending_wrap = false;
-        if !save_cursor || !self.preserve_alternate_screen_cursor {
-            self.cursor_x = 0;
-            self.cursor_y = 0;
-        }
+        let mut rendition = CellState::default();
+        rendition.cell.bg = bg;
+        self.enter_alternate_screen(&rendition, save_cursor);
     }
 
     fn alternate_off(&mut self, _bg: i32, restore_cursor: bool) {
-        self.clear_selected_cells();
-        let saved_cursor = if restore_cursor {
-            self.saved_cursor_x
-                .zip(self.saved_cursor_y)
-                .map(|(x, y)| (x, y, self.saved_cursor_pending_wrap))
-        } else {
-            None
-        };
+        self.leave_alternate_screen(restore_cursor);
+    }
 
-        let Some(saved) = self.saved_grid.take() else {
-            if let Some((x, y, pending_wrap)) = saved_cursor {
-                self.restore_cursor_position(x, y, pending_wrap);
-            }
-            return;
-        };
+    fn alternate_on_with_rendition(&mut self, cell: &CellState, save_cursor: bool) {
+        self.enter_alternate_screen(cell, save_cursor);
+    }
 
-        let current_size = self.grid.size();
-        let saved_size = saved.grid.size();
-        let alternate_cursor = (self.cursor_x, self.cursor_y, self.pending_wrap);
-        self.grid
-            .restore_visible_at_size(saved_size, saved.grid.visible_lines(), COLOUR_DEFAULT);
-        self.grid.set_history_enabled(saved.history_enabled);
-        if let Some((x, y, pending_wrap)) = saved_cursor {
-            self.restore_cursor_position(x, y, pending_wrap);
-        } else {
-            self.restore_cursor_position(
-                alternate_cursor.0,
-                alternate_cursor.1,
-                alternate_cursor.2,
-            );
+    fn alternate_off_with_rendition(&mut self, cell: &mut CellState, restore_cursor: bool) {
+        if let Some(rendition) = self.leave_alternate_screen(restore_cursor) {
+            // tmux restores the `grid_cell` only; the character sets stay.
+            cell.cell.clone_from(&rendition.cell);
         }
-        self.resize(current_size);
     }
 
     fn tab(&mut self) {
-        self.clear_pending_wrap();
-        let start = self.cursor_column();
-        let next = ((start + 1) as usize..self.tabs.len())
-            .find(|index| self.tabs[*index])
-            .map(|index| index as u32)
-            .unwrap_or_else(|| self.grid.sx().saturating_sub(1));
-        self.cursor_x = next;
+        self.move_to_next_tab_stop();
     }
 
     fn cursor_backward_tab(&mut self, n: u32) {
-        self.clear_pending_wrap();
-        let mut current = self.cursor_column();
-        for _ in 0..cursor_backward_tab_steps(n, current) {
-            if current == 0 {
-                break;
-            }
-            let previous = (0..current as usize)
-                .rev()
-                .find(|index| self.tabs[*index])
-                .map(|index| index as u32)
-                .unwrap_or(0);
-            current = previous;
-        }
-        self.cursor_x = current;
+        self.move_back_tab_stops(n);
     }
 
     fn set_tab_stop(&mut self) {
-        let column = self.cursor_column() as usize;
-        if let Some(tab) = self.tabs.get_mut(column) {
-            *tab = true;
-        }
+        self.set_tab_stop_at_cursor();
     }
 
     fn clear_tab_stop(&mut self) {
-        let column = self.cursor_column() as usize;
-        if let Some(tab) = self.tabs.get_mut(column) {
-            *tab = false;
-        }
+        self.clear_tab_stop_at_cursor();
     }
 
     fn clear_all_tab_stops(&mut self) {
@@ -430,17 +385,11 @@ impl ScreenWriter for Screen {
     }
 
     fn set_window_name(&mut self, name: &str) {
-        if self.title_rename_enabled && self.window_name != name {
-            self.window_name = name.to_owned();
-            self.bump_metadata_revision();
-        }
+        self.accept_window_name(name);
     }
 
     fn set_path(&mut self, path: &str) {
-        if self.path != path {
-            self.path = path.to_owned();
-            self.bump_metadata_revision();
-        }
+        self.update_path(path);
     }
 
     fn save_cursor(&mut self) {
@@ -456,57 +405,25 @@ impl ScreenWriter for Screen {
     }
 
     fn alignment_test(&mut self) {
-        self.clear_selected_cells();
-        self.rupper = 0;
-        self.rlower = self.grid.sy().saturating_sub(1);
-        let sx = self.grid.sx();
-        for y in 0..self.grid.sy() {
-            if let Some(line) = self.grid.visible_line_mut(y) {
-                for x in 0..sx {
-                    if let Some(cell) = line.cell_mut(x) {
-                        *cell = GridCell::from_state(
-                            'E',
-                            1,
-                            &CellState::default(),
-                            GridCellFlags::default(),
-                        );
-                    }
-                }
-                line.set_wrapped(false);
-                line.touch();
-            }
-        }
+        self.fill_alignment_pattern();
     }
 
     fn full_reset(&mut self) {
-        self.clear_selected_cells();
-        if self.is_alternate() {
-            self.alternate_off(COLOUR_DEFAULT, false);
-        }
-        self.cursor_x = 0;
-        self.cursor_y = 0;
-        self.pending_wrap = false;
-        self.rupper = 0;
-        self.rlower = self.grid.sy().saturating_sub(1);
-        self.mode = mode::MODE_CURSOR | mode::MODE_WRAP | (self.mode & mode::MODE_CRLF);
-        self.grid.clear_visible(COLOUR_DEFAULT);
-        self.reset_tabs();
-        self.title_stack.clear();
-        self.active_hyperlink = 0;
-        self.hyperlinks.reset();
-        self.bump_metadata_revision();
+        self.reset_to_initial_state();
     }
 
     fn start_sync(&mut self) {
-        self.mode |= mode::MODE_SYNC;
+        self.begin_synchronized_output();
     }
 
     fn stop_sync(&mut self) {
-        self.mode &= !mode::MODE_SYNC;
+        self.end_synchronized_output();
     }
 
     fn set_cursor_style(&mut self, n: u32) {
-        self.cursor_style = n;
+        if crate::cursor_style_is_valid(n) {
+            self.cursor_style = n;
+        }
     }
 
     fn osc_hyperlink(&mut self, data: &str) {
@@ -544,6 +461,12 @@ impl ScreenWriter for Screen {
         ));
     }
 
+    fn restore_recovery_written_columns(&mut self, columns: u32) {
+        if let Some(line) = self.grid.visible_line_mut(self.cursor_y) {
+            line.restore_recovery_written_columns(columns);
+        }
+    }
+
     fn sixel_passthrough(&mut self, data: &[u8]) {
         self.push_terminal_passthrough(TerminalPassthrough::sixel(
             self.cursor_x,
@@ -560,6 +483,14 @@ impl ScreenWriter for Screen {
         self.grid.sy()
     }
 
+    fn resolved_cursor_state(&self) -> crate::ResolvedCursorStyle {
+        crate::resolve_cursor_style_state(
+            self.cursor_style(),
+            self.mode(),
+            self.cursor_default_style(),
+        )
+    }
+
     fn cursor_x(&self) -> u32 {
         self.cursor_x
     }
@@ -568,81 +499,58 @@ impl ScreenWriter for Screen {
         self.cursor_y
     }
 
+    fn alternate_active(&self) -> bool {
+        self.is_alternate()
+    }
+
     fn current_mode(&self) -> u32 {
         self.mode
     }
 
     fn push_title(&mut self) {
-        if !self.title_rename_enabled {
-            return;
-        }
-        if self.title_stack.len() >= TITLE_STACK_MAX {
-            let excess = self.title_stack.len() + 1 - TITLE_STACK_MAX;
-            self.title_stack.drain(0..excess);
-        }
-        self.title_stack.push(self.title.clone());
-        self.bump_metadata_revision();
+        self.push_title_stack();
     }
 
     fn pop_title(&mut self) {
-        if !self.title_rename_enabled {
-            return;
-        }
-        if let Some(title) = self.title_stack.pop() {
-            self.title = title;
-            self.bump_metadata_revision();
-        }
+        self.pop_title_stack();
     }
 
     fn osc_palette(&mut self, data: &str, _end: InputEndType) {
-        // OSC 4 is a list of index/value pairs. tmux 3.7b forwards each valid
-        // query as its own canonical ST-terminated OSC while handling palette
-        // sets internally. RMUX does not maintain an outer-terminal palette,
-        // so keep set behaviour unchanged and relay only strict, bounded
-        // queries. The dedicated event kind bypasses generic raw-passthrough
-        // policy without reflecting arbitrary OSC payloads.
-        let mut fields = data.split(';');
-        while let Some(index) = fields.next() {
-            let Some(value) = fields.next() else {
-                break;
-            };
-            if value != "?" {
-                continue;
-            }
-            let Some(index) = TerminalPaletteIndex::parse(index) else {
-                continue;
-            };
-            self.push_terminal_passthrough(TerminalPassthrough::palette_query(index));
-        }
+        self.relay_palette_queries(data);
     }
     fn osc_notification(&mut self, _data: &str) {}
     fn osc_fg_colour(&mut self, _data: &str, _end: InputEndType) {}
     fn osc_bg_colour(&mut self, _data: &str, _end: InputEndType) {}
     fn osc_cursor_colour(&mut self, _data: &str, _end: InputEndType) {}
     fn osc_clipboard(&mut self, data: &str, end: InputEndType) {
-        let mut sequence = Vec::with_capacity(data.len() + 7);
-        sequence.extend_from_slice(b"\x1b]52;");
-        sequence.extend_from_slice(data.as_bytes());
-        match end {
-            InputEndType::Bel => sequence.push(b'\x07'),
-            InputEndType::St => sequence.extend_from_slice(b"\x1b\\"),
-        }
-        if let Some((selection, payload)) = data.split_once(';') {
-            if payload == "?" {
-                self.push_terminal_passthrough(TerminalPassthrough::clipboard_query(
-                    crate::TerminalClipboardQuery::new(selection, end),
-                    sequence,
-                ));
-                return;
-            }
-        }
-        self.push_terminal_passthrough(TerminalPassthrough::clipboard(sequence));
+        self.relay_clipboard(data, end);
     }
     fn osc_reset_palette(&mut self, _data: &str) {}
     fn osc_reset_fg(&mut self) {}
     fn osc_reset_bg(&mut self) {}
     fn osc_reset_cursor(&mut self) {}
-    fn osc_shell_integration(&mut self, _data: &str) {}
+    fn osc_shell_integration(&mut self, data: &str) {
+        // tmux 3.7b consumes A/C as line marks. B/D carry no public state.
+        // Accept extension parameters, but require a complete command token.
+        let output = match crate::input::ShellMark::parse(data) {
+            Some(crate::input::ShellMark::Prompt) => {
+                // OSC 7501: a new prompt expires active and idle reports.
+                self.expire_program_status();
+                false
+            }
+            Some(crate::input::ShellMark::Output) => true,
+            _ => return,
+        };
+        if let Some(line) = self.grid.visible_line_mut(self.cursor_y) {
+            line.mark_shell_line(output);
+        }
+    }
+    fn supports_program_status(&self) -> bool {
+        true
+    }
+    fn osc_program_status(&mut self, data: &str, end: InputEndType) {
+        self.program_status.report(data, end == InputEndType::Bel);
+    }
 }
 
 #[cfg(test)]

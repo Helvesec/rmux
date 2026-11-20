@@ -27,7 +27,7 @@ async fn create_session(
             environment: None,
         }))
         .await;
-    assert!(matches!(response, Response::NewSession(_)), "{response:?}");
+    crate::session_fixture::assert_new_session(&response);
     let session_id = handler
         .state
         .lock()
@@ -140,7 +140,7 @@ async fn assert_only_first_was_killed(fixture: &DeferredTreeFixture) {
         state
             .sessions
             .session(&fixture.second_name)
-            .map(rmux_core::Session::id),
+            .map(|session| session.id()),
         Some(fixture.second_id),
         "the later mode-tree selection must survive"
     );

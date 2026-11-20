@@ -4,7 +4,9 @@ mod common;
 
 use std::error::Error;
 use std::fs;
-use std::io::Read;
+use std::io::{self, Read};
+use std::os::unix::process::CommandExt;
+use std::path::Path;
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
 
@@ -527,13 +529,15 @@ fn wait_next_text_times_out_without_history_match() -> Result<(), Box<dyn Error>
 
 #[test]
 fn wait_text_does_not_follow_reused_slot_after_kill_and_split() -> Result<(), Box<dyn Error>> {
-    let harness = CliHarness::new("automation-stable-pane-id")?;
+    let mut harness = CliHarness::new("automation-stable-pane-id")?;
     let _daemon = harness.start_hidden_daemon()?;
 
-    assert_success(&harness.run(&["new-session", "-d", "-s", "alpha", "sleep 5"])?);
-    assert_success(&harness.run(&["split-window", "-h", "-t", "alpha:0.0", "sleep 5"])?);
+    // The panes live 5 s and the wait 1 s: hold the CLI lock until the slot is reused.
+    let window = harness.command_window()?;
+    assert_success(&window.run(&["new-session", "-d", "-s", "alpha", "sleep 5"])?);
+    assert_success(&window.run(&["split-window", "-h", "-t", "alpha:0.0", "sleep 5"])?);
 
-    let mut wait_command = harness.base_command();
+    let mut wait_command = window.base_command();
     let wait_child = wait_command
         .args([
             "wait-pane",
@@ -551,14 +555,15 @@ fn wait_text_does_not_follow_reused_slot_after_kill_and_split() -> Result<(), Bo
         .spawn()?;
 
     std::thread::sleep(Duration::from_millis(150));
-    assert_success(&harness.run(&["kill-pane", "-t", "alpha:0.1"])?);
-    assert_success(&harness.run(&[
+    assert_success(&window.run(&["kill-pane", "-t", "alpha:0.1"])?);
+    assert_success(&window.run(&[
         "split-window",
         "-h",
         "-t",
         "alpha:0.0",
         "printf SLOT_REUSED_OUTPUT; sleep 1",
     ])?);
+    drop(window);
 
     let output = wait_child.wait_with_output()?;
     assert_eq!(
@@ -806,11 +811,14 @@ fn send_keys_wait_rejects_unobservable_target_client() -> Result<(), Box<dyn Err
 
 #[test]
 fn send_keys_text_wait_follows_session_identity_across_rename() -> Result<(), Box<dyn Error>> {
-    let harness = CliHarness::new("automation-wait-text-rename")?;
+    let mut harness = CliHarness::new("automation-wait-text-rename")?;
     let _daemon = harness.start_hidden_daemon()?;
 
     assert_success(&harness.run(&["new-session", "-d", "-s", "alpha"])?);
-    let mut command = harness.base_command();
+    // The wait times out after 5 s: hold the CLI lock until the release is sent.
+    let window = harness.command_window()?;
+    let wait_started_at = Instant::now();
+    let mut command = window.base_command();
     let mut wait_child = command
         .args([
             "send-keys",
@@ -821,7 +829,7 @@ fn send_keys_text_wait_follows_session_identity_across_rename() -> Result<(), Bo
             "--timeout",
             "5s",
             "--",
-            "printf WAIT_TEXT_%s STARTED; sleep 1; printf WAIT_TEXT_%s FINISHED",
+            "printf WAIT_TEXT_%s STARTED; sleep 1; read marker; printf WAIT_TEXT_%s FINISHED",
             "Enter",
         ])
         .stdin(Stdio::null())
@@ -829,7 +837,7 @@ fn send_keys_text_wait_follows_session_identity_across_rename() -> Result<(), Bo
         .stderr(Stdio::piped())
         .spawn()?;
 
-    assert_success(&harness.run(&[
+    assert_success(&window.run(&[
         "wait-pane",
         "-t",
         "alpha:0.0",
@@ -838,13 +846,31 @@ fn send_keys_text_wait_follows_session_identity_across_rename() -> Result<(), Bo
         "--timeout",
         "3s",
     ])?);
-    assert_success(&harness.run(&["rename-session", "-t", "alpha", "beta"])?);
+    let started_observed_after = wait_started_at.elapsed();
+    assert_success(&window.run(&["rename-session", "-t", "alpha", "beta"])?);
     std::thread::sleep(Duration::from_millis(150));
+    let premature_exit = wait_child.try_wait()?;
+    let mut premature_stdout = String::new();
+    let mut premature_stderr = String::new();
+    if premature_exit.is_some() {
+        if let Some(mut stdout) = wait_child.stdout.take() {
+            stdout.read_to_string(&mut premature_stdout)?;
+        }
+        if let Some(mut stderr) = wait_child.stderr.take() {
+            stderr.read_to_string(&mut premature_stderr)?;
+        }
+    }
     assert!(
-        wait_child.try_wait()?.is_none(),
-        "text wait must remain armed after the target session is renamed"
+        premature_exit.is_none(),
+        "text wait must remain armed after the target session is renamed; \
+         STARTED observed after {started_observed_after:?}, checked after {:?}, \
+         status: {premature_exit:?}\nstdout:\n{premature_stdout}\nstderr:\n{premature_stderr}",
+        wait_started_at.elapsed(),
     );
 
+    // Keep the match pending until the assertion, regardless of command scheduling.
+    assert_success(&window.run(&["send-keys", "-t", "beta:0.0", "release", "Enter"])?);
+    drop(window);
     let output = wait_child_with_timeout(wait_child, Duration::from_secs(4))?;
     assert_eq!(
         output.status.code(),
@@ -858,11 +884,13 @@ fn send_keys_text_wait_follows_session_identity_across_rename() -> Result<(), Bo
 
 #[test]
 fn send_keys_quiet_wait_follows_session_identity_across_rename() -> Result<(), Box<dyn Error>> {
-    let harness = CliHarness::new("automation-wait-quiet-rename")?;
+    let mut harness = CliHarness::new("automation-wait-quiet-rename")?;
     let _daemon = harness.start_hidden_daemon()?;
 
     assert_success(&harness.run(&["new-session", "-d", "-s", "alpha"])?);
-    let mut command = harness.base_command();
+    // The rename must land while the wait is pending: hold the CLI lock until then.
+    let window = harness.command_window()?;
+    let mut command = window.base_command();
     let mut wait_child = command
         .args([
             "send-keys",
@@ -883,7 +911,7 @@ fn send_keys_quiet_wait_follows_session_identity_across_rename() -> Result<(), B
         .stderr(Stdio::piped())
         .spawn()?;
 
-    assert_success(&harness.run(&[
+    assert_success(&window.run(&[
         "wait-pane",
         "-t",
         "alpha:0.0",
@@ -892,12 +920,25 @@ fn send_keys_quiet_wait_follows_session_identity_across_rename() -> Result<(), B
         "--timeout",
         "3s",
     ])?);
-    assert_success(&harness.run(&["rename-session", "-t", "alpha", "beta"])?);
+    assert_success(&window.run(&["rename-session", "-t", "alpha", "beta"])?);
     std::thread::sleep(Duration::from_millis(150));
+    let premature_exit = wait_child.try_wait()?;
+    let mut premature_stdout = String::new();
+    let mut premature_stderr = String::new();
+    if premature_exit.is_some() {
+        if let Some(mut stdout) = wait_child.stdout.take() {
+            stdout.read_to_string(&mut premature_stdout)?;
+        }
+        if let Some(mut stderr) = wait_child.stderr.take() {
+            stderr.read_to_string(&mut premature_stderr)?;
+        }
+    }
     assert!(
-        wait_child.try_wait()?.is_none(),
-        "quiet wait must not report false success when the target session is renamed"
+        premature_exit.is_none(),
+        "quiet wait must not report false success when the target session is renamed; \
+         status: {premature_exit:?}\nstdout:\n{premature_stdout}\nstderr:\n{premature_stderr}"
     );
+    drop(window);
 
     let output = wait_child_with_timeout(wait_child, Duration::from_secs(4))?;
     assert_eq!(
@@ -921,14 +962,18 @@ fn send_keys_quiet_wait_follows_session_identity_across_rename() -> Result<(), B
 
 #[test]
 fn send_keys_waits_fail_closed_when_observed_session_is_killed() -> Result<(), Box<dyn Error>> {
-    let harness = CliHarness::new("automation-wait-killed-session")?;
+    let mut harness = CliHarness::new("automation-wait-killed-session")?;
     let _daemon = harness.start_hidden_daemon()?;
     assert_success(&harness.run(&["new-session", "-d", "-s", "keeper", "sleep", "30"])?);
 
+    // The pane goes quiet once it has printed its marker, so a quiet wait
+    // shorter than the gap before the kill succeeds while the session is still
+    // alive. A stability window longer than the deadline makes the kill the
+    // only event that can end either wait before it times out.
     for (session, wait_args, started) in [
         (
             "quiet-target",
-            vec!["--wait", "quiet", "--stable-for", "2s"],
+            vec!["--wait", "quiet", "--stable-for", "30s"],
             "KILL_QUIET_STARTED",
         ),
         (
@@ -943,12 +988,14 @@ fn send_keys_waits_fail_closed_when_observed_session_is_killed() -> Result<(), B
         arguments.extend(wait_args);
         arguments.extend([
             "--timeout",
-            "5s",
+            "10s",
             "--",
-            "printf KILL_QUIET_%s STARTED; printf KILL_VISIBLE_%s STARTED; sleep 5",
+            "printf KILL_QUIET_%s STARTED; printf KILL_VISIBLE_%s STARTED; sleep 30",
             "Enter",
         ]);
-        let mut command = harness.base_command();
+        // The wait times out after 10 s: hold the CLI lock until the session is killed.
+        let window = harness.command_window()?;
+        let mut command = window.base_command();
         let wait_child = command
             .args(arguments)
             .stdin(Stdio::null())
@@ -956,7 +1003,7 @@ fn send_keys_waits_fail_closed_when_observed_session_is_killed() -> Result<(), B
             .stderr(Stdio::piped())
             .spawn()?;
 
-        assert_success(&harness.run(&[
+        assert_success(&window.run(&[
             "wait-pane",
             "-t",
             &target,
@@ -965,7 +1012,8 @@ fn send_keys_waits_fail_closed_when_observed_session_is_killed() -> Result<(), B
             "--timeout",
             "3s",
         ])?);
-        assert_success(&harness.run(&["kill-session", "-t", session])?);
+        assert_success(&window.run(&["kill-session", "-t", session])?);
+        drop(window);
 
         let output = wait_child_with_timeout(wait_child, Duration::from_secs(2))?;
         assert_ne!(
@@ -980,13 +1028,108 @@ fn send_keys_waits_fail_closed_when_observed_session_is_killed() -> Result<(), B
 }
 
 #[test]
+fn quiet_waits_fail_closed_when_observed_pane_is_killed() -> Result<(), Box<dyn Error>> {
+    let mut harness = CliHarness::new("automation-wait-killed-pane")?;
+    let mut daemon = harness.start_hidden_daemon()?;
+    // Each round ends with kill-session. Without another session the daemon
+    // would exit empty, and the next round's new-session would race its
+    // shutdown or autostart a different server. The keeper outlives every
+    // round, so one daemon serves the whole test.
+    assert_success(&harness.run(&["new-session", "-d", "-s", "keeper", "sleep", "300"])?);
+
+    // A second pane holds each session alive, so kill-pane removes only the
+    // observed pane and leaves no exit status behind. A stability window
+    // longer than the deadline makes the kill the only event that can end
+    // the wait before it times out.
+    for (session, wait_args, started) in [
+        (
+            "send-quiet",
+            vec!["send-keys", "--wait", "quiet", "--stable-for", "30s"],
+            Some("KILL_PANE_STARTED"),
+        ),
+        (
+            "send-exit",
+            vec!["send-keys", "--wait-pane-exit"],
+            Some("KILL_PANE_STARTED"),
+        ),
+        (
+            "wait-quiet",
+            vec!["wait-pane", "--quiet", "--stable-for", "30s"],
+            None,
+        ),
+        (
+            "wait-quiet-json",
+            vec!["wait-pane", "--quiet", "--stable-for", "30s", "--json"],
+            None,
+        ),
+    ] {
+        assert_success(&harness.run(&["new-session", "-d", "-s", session, "sleep", "30"])?);
+        assert_success(&harness.run(&["split-window", "-t", &format!("{session}:0")])?);
+        let target = pane_id(&harness, &format!("{session}:0"), 1)?;
+        let mut arguments = wait_args.clone();
+        arguments.extend(["-t", target.as_str(), "--timeout", "10s"]);
+        if started.is_some() {
+            arguments.extend(["--", "printf KILL_PANE_%s STARTED; sleep 30", "Enter"]);
+        }
+        // The wait times out after 10 s: hold the CLI lock until the pane is killed.
+        let window = harness.command_window()?;
+        let mut command = window.base_command();
+        let wait_child = command
+            .args(&arguments)
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()?;
+
+        match started {
+            Some(marker) => assert_success(&window.run(&[
+                "wait-pane",
+                "-t",
+                &target,
+                "--text",
+                marker,
+                "--timeout",
+                "3s",
+            ])?),
+            // wait-pane has no armed signal. A kill before it resolves the
+            // pane id fails the lookup instead: still closed, never green.
+            None => std::thread::sleep(Duration::from_millis(300)),
+        }
+        assert_success(&window.run(&["kill-pane", "-t", &target])?);
+        drop(window);
+
+        let output = wait_child_with_timeout(wait_child, Duration::from_secs(2))?;
+        assert_eq!(
+            output.status.code(),
+            Some(1),
+            "{arguments:?} must fail closed once its pane is killed without an exit status\nstdout:\n{}\nstderr:\n{}",
+            stdout(&output),
+            stderr(&output)
+        );
+        assert!(
+            !stdout(&output).contains("\"ok\":true"),
+            "{arguments:?} reported success for a killed pane: {}",
+            stdout(&output)
+        );
+        assert_success(&harness.run(&["kill-session", "-t", session])?);
+    }
+    assert!(
+        daemon.child_mut().try_wait()?.is_none(),
+        "the hidden daemon exited during the test, so a later round ran on another server"
+    );
+    Ok(())
+}
+
+#[test]
 fn send_keys_visible_wait_rejects_old_session_name_aba_after_rename() -> Result<(), Box<dyn Error>>
 {
-    let harness = CliHarness::new("automation-wait-rename-aba")?;
+    let mut harness = CliHarness::new("automation-wait-rename-aba")?;
     let _daemon = harness.start_hidden_daemon()?;
 
     assert_success(&harness.run(&["new-session", "-d", "-s", "alpha"])?);
-    let mut command = harness.base_command();
+    // The wait times out after 5 s: hold the CLI lock until the release is sent.
+    let window = harness.command_window()?;
+    let mut command = window.base_command();
     let mut wait_child = command
         .args([
             "send-keys",
@@ -1005,7 +1148,7 @@ fn send_keys_visible_wait_rejects_old_session_name_aba_after_rename() -> Result<
         .stderr(Stdio::piped())
         .spawn()?;
 
-    assert_success(&harness.run(&[
+    assert_success(&window.run(&[
         "wait-pane",
         "-t",
         "alpha:0.0",
@@ -1014,9 +1157,9 @@ fn send_keys_visible_wait_rejects_old_session_name_aba_after_rename() -> Result<
         "--timeout",
         "3s",
     ])?);
-    assert_success(&harness.run(&["rename-session", "-t", "alpha", "beta"])?);
-    assert_success(&harness.run(&["new-session", "-d", "-s", "alpha"])?);
-    assert_success(&harness.run(&[
+    assert_success(&window.run(&["rename-session", "-t", "alpha", "beta"])?);
+    assert_success(&window.run(&["new-session", "-d", "-s", "alpha"])?);
+    assert_success(&window.run(&[
         "send-keys",
         "-t",
         "alpha:0.0",
@@ -1029,7 +1172,8 @@ fn send_keys_visible_wait_rejects_old_session_name_aba_after_rename() -> Result<
         "wait followed a replacement session that reused the original name"
     );
 
-    assert_success(&harness.run(&["send-keys", "-t", "beta:0.0", "release", "Enter"])?);
+    assert_success(&window.run(&["send-keys", "-t", "beta:0.0", "release", "Enter"])?);
+    drop(window);
     let output = wait_child_with_timeout(wait_child, Duration::from_secs(3))?;
     assert_eq!(
         output.status.code(),
@@ -1043,11 +1187,16 @@ fn send_keys_visible_wait_rejects_old_session_name_aba_after_rename() -> Result<
 
 #[test]
 fn send_keys_quiet_wait_rejects_old_session_name_aba_after_rename() -> Result<(), Box<dyn Error>> {
-    let harness = CliHarness::new("automation-quiet-wait-rename-aba")?;
+    let mut harness = CliHarness::new("automation-quiet-wait-rename-aba")?;
     let _daemon = harness.start_hidden_daemon()?;
 
     assert_success(&harness.run(&["new-session", "-d", "-s", "alpha"])?);
-    let mut command = harness.base_command();
+    // The 5 s of quiet must outlast the gap between STARTED and the release,
+    // while the timeout only bounds a failure: a loaded host may take several
+    // seconds to deliver the release, so the timeout leaves it 25 s.
+    // Hold the CLI lock until the release is sent.
+    let window = harness.command_window()?;
+    let mut command = window.base_command();
     let mut wait_child = command
         .args([
             "send-keys",
@@ -1058,7 +1207,7 @@ fn send_keys_quiet_wait_rejects_old_session_name_aba_after_rename() -> Result<()
             "--stable-for",
             "5s",
             "--timeout",
-            "8s",
+            "30s",
             "--",
             "printf ABA_QUIET_%s STARTED; read marker; printf ABA_QUIET_%s DONE",
             "Enter",
@@ -1068,7 +1217,7 @@ fn send_keys_quiet_wait_rejects_old_session_name_aba_after_rename() -> Result<()
         .stderr(Stdio::piped())
         .spawn()?;
 
-    assert_success(&harness.run(&[
+    assert_success(&window.run(&[
         "wait-pane",
         "-t",
         "alpha:0.0",
@@ -1077,7 +1226,7 @@ fn send_keys_quiet_wait_rejects_old_session_name_aba_after_rename() -> Result<()
         "--timeout",
         "3s",
     ])?);
-    assert_success(&harness.run(&[
+    assert_success(&window.run(&[
         "rename-session",
         "-t",
         "alpha",
@@ -1094,8 +1243,9 @@ fn send_keys_quiet_wait_rejects_old_session_name_aba_after_rename() -> Result<()
         "quiet wait mistook a replacement session without the stable pane id for pane exit"
     );
 
-    assert_success(&harness.run(&["send-keys", "-t", "beta:0.0", "release", "Enter"])?);
-    let output = wait_child_with_timeout(wait_child, Duration::from_secs(6))?;
+    assert_success(&window.run(&["send-keys", "-t", "beta:0.0", "release", "Enter"])?);
+    drop(window);
+    let output = wait_child_with_timeout(wait_child, Duration::from_secs(30))?;
     assert_eq!(
         output.status.code(),
         Some(0),
@@ -1108,11 +1258,13 @@ fn send_keys_quiet_wait_rejects_old_session_name_aba_after_rename() -> Result<()
 
 #[test]
 fn wait_pane_visible_text_follows_session_identity_across_rename() -> Result<(), Box<dyn Error>> {
-    let harness = CliHarness::new("wait-pane-visible-rename")?;
+    let mut harness = CliHarness::new("wait-pane-visible-rename")?;
     let _daemon = harness.start_hidden_daemon()?;
 
     assert_success(&harness.run(&["new-session", "-d", "-s", "alpha"])?);
-    let mut command = harness.base_command();
+    // The wait times out after 5 s: hold the CLI lock until the marker is printed.
+    let window = harness.command_window()?;
+    let mut command = window.base_command();
     let mut wait_child = command
         .args([
             "wait-pane",
@@ -1133,19 +1285,20 @@ fn wait_pane_visible_text_follows_session_identity_across_rename() -> Result<(),
         "wait-pane must be armed before the rename"
     );
 
-    assert_success(&harness.run(&["rename-session", "-t", "alpha", "beta"])?);
+    assert_success(&window.run(&["rename-session", "-t", "alpha", "beta"])?);
     std::thread::sleep(Duration::from_millis(150));
     assert!(
         wait_child.try_wait()?.is_none(),
         "wait-pane must remain armed after the target session is renamed"
     );
-    assert_success(&harness.run(&[
+    assert_success(&window.run(&[
         "send-keys",
         "-t",
         "beta:0.0",
         "printf DIRECT_WAIT_%s DONE",
         "Enter",
     ])?);
+    drop(window);
 
     let output = wait_child_with_timeout(wait_child, Duration::from_secs(3))?;
     assert_eq!(
@@ -1282,26 +1435,32 @@ fn stream_pane_exits_cleanly_when_stdout_pipe_closes() -> Result<(), Box<dyn Err
 #[test]
 fn stream_pane_pipeline_emits_before_hot_live_output_lag_starves_head() -> Result<(), Box<dyn Error>>
 {
+    let steps = StepClock::start();
     let harness = CliHarness::new("automation-stream-hot-head")?;
+    steps.mark("harness");
     let _daemon = harness.start_hidden_daemon()?;
+    steps.mark("daemon");
     let output_path = harness.tmpdir().join("stream-head.out");
     let error_path = harness.tmpdir().join("stream-head.err");
 
     assert_success(&harness.run(&["new-session", "-d", "-s", "alpha", "yes BROKEN_PIPE"])?);
+    steps.mark("new-session");
 
-    let child = Command::new("sh")
-        .arg("-c")
-        .arg("\"$RMUX_BIN\" -S \"$RMUX_SOCKET\" stream-pane -t alpha:0.0 --raw 2>\"$RMUX_ERR\" | head -c 1 >\"$RMUX_OUT\"")
-        .env("RMUX_BIN", env!("CARGO_BIN_EXE_rmux"))
-        .env("RMUX_SOCKET", harness.socket_path())
-        .env("RMUX_OUT", &output_path)
-        .env("RMUX_ERR", &error_path)
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()?;
+    let child = head_pipeline_command(
+        "\"$RMUX_BIN\" -S \"$RMUX_SOCKET\" stream-pane -t alpha:0.0 --raw",
+        &error_path,
+        &output_path,
+    )
+    .env(
+        "RMUX_BIN",
+        rmux_os::build_identity::cargo_binary(env!("CARGO_BIN_EXE_rmux")),
+    )
+    .env("RMUX_SOCKET", harness.socket_path())
+    .spawn()?;
+    steps.mark(&format!("spawned pipeline group {}", child.id()));
 
-    let output = wait_child_with_timeout(child, Duration::from_secs(8))?;
+    let output =
+        wait_pipeline_group_with_timeout(child, Duration::from_secs(8), &error_path, &steps)?;
     assert_eq!(
         output.status.code(),
         Some(0),
@@ -1315,6 +1474,52 @@ fn stream_pane_pipeline_emits_before_hot_live_output_lag_starves_head() -> Resul
         1,
         "head should capture exactly one byte"
     );
+    Ok(())
+}
+
+/// A first stage that never writes stdout keeps `head` (and the shell's
+/// stderr pipe it inherits) alive. On timeout the helper must kill the whole
+/// pipeline group at once and surface the first stage's stderr, instead of
+/// killing only `sh` and then blocking on the pipe the orphans still hold.
+#[test]
+fn pipeline_group_timeout_kills_every_stage_and_reports_stage_stderr() -> Result<(), Box<dyn Error>>
+{
+    let steps = StepClock::start();
+    let harness = CliHarness::new("automation-pipeline-group-timeout")?;
+    let output_path = harness.tmpdir().join("stage-head.out");
+    let error_path = harness.tmpdir().join("stage-head.err");
+
+    let child = head_pipeline_command(
+        "{ echo STAGE_STDERR_MARKER >&2; exec sleep 30; }",
+        &error_path,
+        &output_path,
+    )
+    .spawn()?;
+    let group = libc::pid_t::try_from(child.id())?;
+
+    let started = Instant::now();
+    let error =
+        wait_pipeline_group_with_timeout(child, Duration::from_secs(1), &error_path, &steps)
+            .expect_err("a first stage that never writes stdout must time out")
+            .to_string();
+    let returned_after = started.elapsed();
+
+    assert!(
+        returned_after < Duration::from_secs(10),
+        "the timeout must not wait for orphaned stages; returned after {returned_after:?}\n{error}"
+    );
+    assert!(
+        error.contains("STAGE_STDERR_MARKER"),
+        "the timeout error must carry the first stage's stderr\n{error}"
+    );
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while process_group_alive(group) {
+        assert!(
+            Instant::now() < deadline,
+            "pipeline group {group} still has live members after the timeout\n{error}"
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
     Ok(())
 }
 
@@ -1413,6 +1618,110 @@ fn run_json(harness: &CliHarness, args: &[&str]) -> Result<Value, Box<dyn Error>
     Ok(serde_json::from_str(&stdout(&output))?)
 }
 
+/// Timestamps the steps of a test on stderr, so a slow or failing run shows
+/// where its seconds went (harness lock, daemon start, command, pipeline).
+struct StepClock {
+    started: Instant,
+}
+
+impl StepClock {
+    fn start() -> Self {
+        Self {
+            started: Instant::now(),
+        }
+    }
+
+    fn mark(&self, step: &str) {
+        eprintln!("STEP {:>8.3}s {step}", self.started.elapsed().as_secs_f64());
+    }
+}
+
+/// `sh -c '<first_stage> 2>"$STAGE_ERR" | head -c 1 >"$HEAD_OUT"'`, with the
+/// shell as leader of a new process group so a timeout can signal every stage.
+fn head_pipeline_command(first_stage: &str, stage_err: &Path, head_out: &Path) -> Command {
+    let mut command = Command::new("sh");
+    command
+        .arg("-c")
+        .arg(format!(
+            "{first_stage} 2>\"$STAGE_ERR\" | head -c 1 >\"$HEAD_OUT\""
+        ))
+        .env("STAGE_ERR", stage_err)
+        .env("HEAD_OUT", head_out)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .process_group(0);
+    command
+}
+
+/// Waits for a pipeline spawned by [`head_pipeline_command`]. On timeout it
+/// records the group's process tree, kills the whole group (the shell alone
+/// would leave the stages orphaned, still holding its stderr pipe), and
+/// returns an error carrying the first stage's stderr.
+fn wait_pipeline_group_with_timeout(
+    mut child: Child,
+    timeout: Duration,
+    stage_err: &Path,
+    steps: &StepClock,
+) -> Result<std::process::Output, Box<dyn Error>> {
+    let group = libc::pid_t::try_from(child.id())?;
+    let deadline = Instant::now() + timeout;
+    while child.try_wait()?.is_none() {
+        if Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(20));
+            continue;
+        }
+        // The shell is unreaped here, so `group` still names this pipeline.
+        let tree = process_group_tree(group);
+        // SAFETY: killpg only sends a signal; it touches no memory.
+        let killed = unsafe { libc::killpg(group, libc::SIGKILL) };
+        let kill_error = (killed != 0).then(io::Error::last_os_error);
+        steps.mark("timeout; killed pipeline group");
+        let output = child.wait_with_output()?;
+        steps.mark("pipes closed after group kill");
+        let report = format!(
+            "pipeline did not exit within {timeout:?}; killpg error: {kill_error:?}; \
+             sh status: {:?}\nsh stderr:\n{}\nstage stderr:\n{}\npipeline group {group}:\n{tree}",
+            output.status.code(),
+            String::from_utf8_lossy(&output.stderr),
+            fs::read_to_string(stage_err).unwrap_or_else(|error| format!("<{error}>")),
+        );
+        // `Result` errors print in Debug form; keep a readable copy on stderr.
+        eprintln!("{report}");
+        return Err(report.into());
+    }
+    steps.mark("sh exited; collecting pipes");
+    let output = child.wait_with_output()?;
+    steps.mark("pipes closed");
+    Ok(output)
+}
+
+fn process_group_tree(group: libc::pid_t) -> String {
+    let listing = match Command::new("ps")
+        .args(["-axo", "pid,ppid,pgid,etime,stat,time,command"])
+        .output()
+    {
+        Ok(listing) => listing,
+        Err(error) => return format!("<ps failed: {error}>"),
+    };
+    let group = group.to_string();
+    String::from_utf8_lossy(&listing.stdout)
+        .lines()
+        .enumerate()
+        .filter(|(index, line)| {
+            *index == 0 || line.split_whitespace().nth(2) == Some(group.as_str())
+        })
+        .map(|(_, line)| format!("{line}\n"))
+        .collect()
+}
+
+/// Whether any process still belongs to `group`. A zombie counts until its
+/// new parent reaps it, so callers poll.
+fn process_group_alive(group: libc::pid_t) -> bool {
+    // SAFETY: signal 0 only checks for existence and permission.
+    unsafe { libc::killpg(group, 0) == 0 }
+}
+
 fn wait_child_with_timeout(
     mut child: Child,
     timeout: Duration,
@@ -1434,4 +1743,33 @@ fn wait_child_with_timeout(
         }
         std::thread::sleep(Duration::from_millis(20));
     }
+}
+
+/// issue #62: `with-session` given no child command must fail with a message,
+/// never panic on the empty command vector.
+#[test]
+fn issue_62_with_session_without_child_command_fails_without_panic() -> Result<(), Box<dyn Error>> {
+    let harness = CliHarness::new("automation-with-session-no-command")?;
+    let _daemon = harness.start_hidden_daemon()?;
+    assert_success(&harness.run(&["new-session", "-d", "-s", "x", "sleep", "60"])?);
+
+    for args in [&["with-session", "x"][..], &["with-session", "x", "--"][..]] {
+        let output = harness.run(args)?;
+        let error = stderr(&output);
+        assert_eq!(
+            output.status.code(),
+            Some(1),
+            "{args:?} must fail with status 1\nstderr:\n{error}"
+        );
+        assert!(
+            error.contains("child command"),
+            "{args:?} must name the missing child command\nstderr:\n{error}"
+        );
+        assert!(
+            !error.contains("panicked"),
+            "{args:?} must not panic\nstderr:\n{error}"
+        );
+    }
+    assert_success(&harness.run(&["has-session", "-t", "x"])?);
+    Ok(())
 }

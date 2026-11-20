@@ -2,7 +2,7 @@ use std::error::Error as StdError;
 use std::fmt::Debug;
 use std::io;
 
-use rmux_sdk::{CollectError, RmuxError};
+use rmux_sdk::{CollectError, ProtocolError, RmuxError};
 
 fn assert_error_bounds_without_clone<T>()
 where
@@ -27,6 +27,7 @@ macro_rules! assert_not_clone {
 
 assert_not_clone!(RmuxError);
 assert_not_clone!(CollectError);
+assert_not_clone!(ProtocolError);
 
 #[test]
 fn result_alias_uses_sdk_facade_error() {
@@ -47,6 +48,7 @@ fn result_alias_uses_sdk_facade_error() {
 fn sdk_errors_have_required_bounds_without_clone() {
     assert_error_bounds_without_clone::<RmuxError>();
     assert_error_bounds_without_clone::<CollectError>();
+    assert_error_bounds_without_clone::<ProtocolError>();
 }
 
 #[test]
@@ -70,60 +72,8 @@ fn unsupported_display_is_two_visible_lines() {
 }
 
 #[test]
-fn protocol_wire_version_maps_to_sdk_guidance() {
-    let error = RmuxError::from(rmux_proto::RmuxError::UnsupportedWireVersion {
-        got: 7,
-        minimum: 1,
-        maximum: 1,
-    });
-
-    assert_eq!(
-        error.to_string(),
-        "unsupported feature `protocol.wire_version`\n\
-         hint: upgrade the rmux daemon or use an SDK that supports wire version 7 \
-         (supported range 1..=1)"
-    );
-    assert_eq!(error.feature(), Some("protocol.wire_version"));
-    assert_eq!(
-        error.hint(),
-        Some(
-            "upgrade the rmux daemon or use an SDK that supports wire version 7 \
-             (supported range 1..=1)"
-        )
-    );
-    assert!(
-        !error.to_string().contains("unsupported RMUX wire version"),
-        "SDK display should not expose raw lower-crate wire-version text"
-    );
-    assert!(StdError::source(&error).is_none());
-}
-
-#[test]
-fn unknown_command_maps_to_unsupported_capability_guidance() {
-    let error = RmuxError::from(rmux_proto::RmuxError::UnknownCommand(
-        "capture-pane".to_owned(),
-    ));
-
-    assert_eq!(
-        error.to_string(),
-        "unsupported feature `command.capture-pane`\n\
-         hint: upgrade the rmux daemon or use a command advertised by the negotiated \
-         command inventory before sending `capture-pane`"
-    );
-    assert_eq!(error.feature(), Some("command.capture-pane"));
-    assert_eq!(
-        error.hint(),
-        Some(
-            "upgrade the rmux daemon or use a command advertised by the negotiated \
-             command inventory before sending `capture-pane`"
-        )
-    );
-    assert!(StdError::source(&error).is_none());
-}
-
-#[test]
 fn protocol_error_display_wraps_source() {
-    let error = RmuxError::protocol(rmux_proto::RmuxError::SessionNotFound("demo".to_owned()));
+    let error = RmuxError::protocol(ProtocolError::new("session not found: demo"));
 
     assert_eq!(
         error.to_string(),
@@ -141,43 +91,6 @@ fn protocol_error_display_wraps_source() {
             .to_string(),
         "session not found: demo"
     );
-}
-
-#[test]
-fn typed_proto_runtime_errors_map_without_text_parsing() {
-    let pane_not_found = RmuxError::from(rmux_proto::RmuxError::PaneNotFound {
-        session_name: rmux_proto::SessionName::new("alpha").expect("valid session"),
-        pane_id: rmux_proto::PaneId::new(42),
-    });
-    assert!(matches!(
-        pane_not_found,
-        RmuxError::PaneNotFound {
-            pane_id,
-            ..
-        } if pane_id == rmux_proto::PaneId::new(42)
-    ));
-
-    let still_running = RmuxError::from(rmux_proto::RmuxError::ProcessStillRunning);
-    assert!(matches!(
-        still_running,
-        RmuxError::ProcessStillRunning { .. }
-    ));
-
-    let spawn_failed = RmuxError::from(rmux_proto::RmuxError::SpawnFailed {
-        message: "failed to spawn pane shell: denied".to_owned(),
-    });
-    assert!(matches!(
-        spawn_failed,
-        RmuxError::SpawnFailed { ref message, .. } if message.contains("denied")
-    ));
-
-    let lease_lost = RmuxError::from(rmux_proto::RmuxError::OwnedSessionLeaseLost {
-        session_name: rmux_proto::SessionName::new("owned").expect("valid session"),
-    });
-    assert!(matches!(
-        lease_lost,
-        RmuxError::OwnedSessionLeaseLost { ref message, .. } if message.contains("owned")
-    ));
 }
 
 #[test]
@@ -271,8 +184,8 @@ fn collect_error_public_constructors_preserve_individual_hints() {
             "upgrade the daemon before requesting pane snapshots",
         ),
     ]);
-    error.push(RmuxError::protocol(rmux_proto::RmuxError::SessionNotFound(
-        "demo".to_owned(),
+    error.push(RmuxError::protocol(ProtocolError::new(
+        "session not found: demo",
     )));
 
     assert_eq!(

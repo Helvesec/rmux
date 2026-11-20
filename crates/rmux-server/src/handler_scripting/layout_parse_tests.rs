@@ -4,9 +4,9 @@ fn token(value: &str) -> String {
     value.to_owned()
 }
 
-fn fixture() -> (SessionStore, TargetFindContext) {
+fn fixture() -> (ManagedSessionStore, TargetFindContext) {
     let session_name = rmux_proto::SessionName::new("alpha").expect("valid session name");
-    let mut sessions = SessionStore::new();
+    let mut sessions = ManagedSessionStore::new();
     sessions
         .create_session(session_name.clone(), TerminalSize { cols: 80, rows: 24 })
         .expect("session creation succeeds");
@@ -124,5 +124,192 @@ fn select_layout_preserves_missing_target_error() {
     assert_eq!(
         parse(&["-t"]).expect_err("-t without a target must fail"),
         RmuxError::Server("missing -t target".to_owned())
+    );
+}
+
+#[test]
+fn l1_040_resize_modes_precede_deferred_height_and_preserve_target() {
+    for width in ["10", "25%"] {
+        for (flags, mode) in [
+            (&["-Z"][..], ResizePaneAdjustment::Zoom),
+            (&["-T"][..], ResizePaneAdjustment::TrimBelow),
+            (&["-Z", "-T"][..], ResizePaneAdjustment::TrimBelow),
+            (&["-T", "-Z"][..], ResizePaneAdjustment::TrimBelow),
+        ] {
+            let (sessions, context) = fixture();
+            let mut argv = vec!["-t", "alpha:0.0", "-x", width, "-y", "bad"];
+            argv.extend_from_slice(flags);
+            let request = parse_resize_pane(
+                CommandTokens::new(argv.into_iter().map(token).collect()),
+                &sessions,
+                &context,
+            )
+            .unwrap();
+            let Request::ResizePane(request) = request else {
+                panic!("mode must precede deferred height")
+            };
+            assert_eq!(
+                request.target,
+                rmux_proto::PaneTarget::with_window(
+                    rmux_proto::SessionName::new("alpha").unwrap(),
+                    0,
+                    0
+                )
+            );
+            assert_eq!(request.adjustment, mode);
+        }
+    }
+}
+
+#[test]
+fn l1_040_no_mode_deferred_height_diagnostic_matches_native_oracle() {
+    // Keep this measured expectation even when the parser reports a divergence.
+    // Collect both numeric and percent requests before comparing diagnostics.
+    let mut errors = Vec::new();
+    for width in ["10", "25%"] {
+        let (sessions, context) = fixture();
+        let argv = ["-t", "alpha:0.0", "-x", width, "-y", "bad"];
+        let request = parse_resize_pane(
+            CommandTokens::new(argv.into_iter().map(token).collect()),
+            &sessions,
+            &context,
+        )
+        .unwrap();
+        let Request::ResizePaneAxes(request) = request else {
+            panic!("sequential width/error request")
+        };
+        assert_eq!(
+            request.target,
+            rmux_proto::PaneTarget::with_window(
+                rmux_proto::SessionName::new("alpha").unwrap(),
+                0,
+                0
+            )
+        );
+        assert_eq!(request.columns, Some(if width == "10" { 10 } else { 20 }));
+        errors.push(request.rows);
+    }
+    assert_eq!(
+        errors,
+        vec![Err(RmuxError::Server("height invalid".into())); 2]
+    );
+}
+
+#[test]
+fn l1_041_height_diagnostic_preserves_other_error_classes() {
+    for (flag, value, expected) in [
+        (
+            "-x",
+            "bad",
+            "resize-pane -x expects an integer cell count: invalid digit found in string",
+        ),
+        (
+            "-y",
+            "-1",
+            "resize-pane -y expects a non-negative cell count",
+        ),
+        ("-y", "2147483648", "resize-pane -y cell count is too large"),
+        (
+            "-y",
+            "9223372036854775808",
+            "resize-pane -y expects an integer cell count: number too large to fit in target type",
+        ),
+    ] {
+        let (sessions, context) = fixture();
+        let request = parse_resize_pane(
+            CommandTokens::new(
+                ["-t", "alpha:0.0", "-x", "10", flag, value]
+                    .into_iter()
+                    .map(token)
+                    .collect(),
+            ),
+            &sessions,
+            &context,
+        );
+        let error = if flag == "-x" {
+            request.unwrap_err()
+        } else {
+            let Request::ResizePaneAxes(request) = request.unwrap() else {
+                panic!("height error remains deferred")
+            };
+            assert_eq!(request.columns, Some(10));
+            request.rows.unwrap_err()
+        };
+        assert_eq!(error, RmuxError::Server(expected.into()));
+    }
+
+    // Percentage parsing has a separate diagnostic contract, unchanged here.
+    let (sessions, context) = fixture();
+    let expected = RmuxError::Server(
+        "resize-pane -y expects a percentage: invalid digit found in string".into(),
+    );
+    let Request::ResizePaneAxes(request) = parse_resize_pane(
+        CommandTokens::new(
+            ["-t", "alpha:0.0", "-x", "10", "-y", "bad%"]
+                .into_iter()
+                .map(token)
+                .collect(),
+        ),
+        &sessions,
+        &context,
+    )
+    .unwrap() else {
+        panic!("percentage error remains deferred")
+    };
+    assert_eq!(request.columns, Some(10));
+    assert_eq!(request.rows, Err(expected));
+}
+
+#[test]
+fn l1_041_height_error_does_not_bypass_structure_or_target_resolution() {
+    for (argv, expected) in [
+        (
+            &["-t", "alpha:0.0", "-x", "10", "-y"][..],
+            "missing -y value",
+        ),
+        (
+            &["-t", "alpha:0.0", "-x", "10", "-y", "bad", "-Q"][..],
+            "command resize-pane: unknown flag -Q",
+        ),
+        (
+            &["-t", "alpha:0.9", "-x", "25%", "-y", "bad"][..],
+            "resize-pane could not resolve dimensions for pane alpha:0.9",
+        ),
+    ] {
+        let (sessions, context) = fixture();
+        assert_eq!(
+            parse_resize_pane(
+                CommandTokens::new(argv.iter().map(|arg| token(arg)).collect()),
+                &sessions,
+                &context,
+            )
+            .unwrap_err(),
+            RmuxError::Server(expected.into()),
+        );
+    }
+}
+
+#[test]
+fn l1_041_later_valid_height_clears_deferred_error() {
+    let (sessions, context) = fixture();
+    let Request::ResizePane(request) = parse_resize_pane(
+        CommandTokens::new(
+            ["-t", "alpha:0.0", "-x", "10", "-y", "bad", "-y", "6"]
+                .into_iter()
+                .map(token)
+                .collect(),
+        ),
+        &sessions,
+        &context,
+    )
+    .unwrap() else {
+        panic!("a later valid height clears the deferred error")
+    };
+    assert_eq!(
+        request.adjustment,
+        ResizePaneAdjustment::AbsoluteSize {
+            columns: 10,
+            rows: 6
+        }
     );
 }

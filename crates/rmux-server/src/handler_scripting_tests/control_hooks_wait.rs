@@ -4,8 +4,8 @@ use super::*;
 async fn parsed_queue_accepts_display_message_format_flag() {
     let handler = RequestHandler::new();
     let alpha = session_name("alpha");
-    assert!(matches!(
-        handler
+    crate::session_fixture::assert_new_session(
+        &handler
             .handle(Request::NewSession(NewSessionRequest {
                 session_name: alpha.clone(),
                 detached: true,
@@ -13,8 +13,7 @@ async fn parsed_queue_accepts_display_message_format_flag() {
                 environment: None,
             }))
             .await,
-        Response::NewSession(_)
-    ));
+    );
 
     let parsed = CommandParser::new()
         .parse("display-message -p -F '#{session_name}' -t alpha")
@@ -109,8 +108,8 @@ async fn parsed_queue_display_message_reports_tmux_delay_errors() {
 async fn parsed_queue_display_message_accepts_compact_print_target_cluster() {
     let handler = RequestHandler::new();
     let alpha = session_name("alpha");
-    assert!(matches!(
-        handler
+    crate::session_fixture::assert_new_session(
+        &handler
             .handle(Request::NewSession(NewSessionRequest {
                 session_name: alpha.clone(),
                 detached: true,
@@ -118,8 +117,7 @@ async fn parsed_queue_display_message_accepts_compact_print_target_cluster() {
                 environment: None,
             }))
             .await,
-        Response::NewSession(_)
-    ));
+    );
 
     let parsed = CommandParser::new()
         .parse("display-message -pt alpha:0.0 'hi-#{pane_index}'")
@@ -168,8 +166,8 @@ async fn parsed_queue_display_message_targets_control_client_with_initiator_cont
     let alpha = session_name("display-control-alpha");
     let detached = session_name("display-control-detached");
     for session_name in [alpha.clone(), detached.clone()] {
-        assert!(matches!(
-            handler
+        crate::session_fixture::assert_new_session(
+            &handler
                 .handle(Request::NewSession(NewSessionRequest {
                     session_name,
                     detached: true,
@@ -177,8 +175,7 @@ async fn parsed_queue_display_message_targets_control_client_with_initiator_cont
                     environment: None,
                 }))
                 .await,
-            Response::NewSession(_)
-        ));
+        );
     }
     let requester_pid = 99_613;
     let (control_id, mut events) =
@@ -264,8 +261,8 @@ async fn parsed_queue_display_message_all_formats_uses_core_inventory() {
 async fn parsed_queue_list_panes_all_does_not_require_current_target() {
     let handler = RequestHandler::new();
     for name in ["alpha", "beta"] {
-        assert!(matches!(
-            handler
+        crate::session_fixture::assert_new_session(
+            &handler
                 .handle(Request::NewSession(NewSessionRequest {
                     session_name: session_name(name),
                     detached: true,
@@ -273,8 +270,7 @@ async fn parsed_queue_list_panes_all_does_not_require_current_target() {
                     environment: None,
                 }))
                 .await,
-            Response::NewSession(_)
-        ));
+        );
     }
 
     let parsed = CommandParser::new()
@@ -330,8 +326,8 @@ async fn parsed_queue_set_environment_requires_a_value() {
 #[tokio::test]
 async fn parsed_queue_set_environment_uses_current_session_by_default() {
     let handler = RequestHandler::new();
-    assert!(matches!(
-        handler
+    crate::session_fixture::assert_new_session(
+        &handler
             .handle(Request::NewSession(NewSessionRequest {
                 session_name: session_name("alpha"),
                 detached: true,
@@ -339,8 +335,7 @@ async fn parsed_queue_set_environment_uses_current_session_by_default() {
                 environment: None,
             }))
             .await,
-        Response::NewSession(_)
-    ));
+    );
 
     let parsed = CommandParser::new()
         .parse(

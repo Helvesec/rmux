@@ -378,7 +378,7 @@ async fn link_window_k_rejects_same_window_identity_through_group_peer_atomicall
                     .sessions
                     .session(session_name)
                     .expect("session exists before rejected replacement")
-                    .clone()
+                    .test_snapshot()
             })
             .collect::<Vec<_>>();
         let before_targets = state.window_linked_window_targets(&owner, 0);
@@ -446,7 +446,7 @@ async fn link_window_k_rejects_same_window_identity_through_group_peer_atomicall
                     .sessions
                     .session(session_name)
                     .expect("session survives rejected replacement")
-                    .clone()
+                    .test_snapshot()
             })
             .collect::<Vec<_>>();
         assert_eq!(after_sessions, before_sessions);
@@ -872,9 +872,11 @@ async fn linked_session_formats_include_session_group_peers() {
         .stdout()
         .to_vec();
 
+    // tmux 3.7b counts each session group once: two groups hold this window
+    // (measured, S2365 `linked2.sh` case 11, private sockets).
     assert_eq!(
         String::from_utf8_lossy(&linked_formats),
-        "1:4:alpha,beta,gamma,delta\n"
+        "1:2:alpha,beta,gamma,delta\n"
     );
 }
 
@@ -980,7 +982,10 @@ async fn link_window_relative_same_destination_slot_makes_room_like_tmux() {
     let state = handler.state.lock().await;
     let session = state.sessions.session(&alpha).expect("alpha should exist");
     assert_eq!(
-        session.windows().keys().copied().collect::<Vec<_>>(),
+        session
+            .windows()
+            .map(|(index, _)| index)
+            .collect::<Vec<_>>(),
         vec![0, 1, 2, 3]
     );
     assert_eq!(session.pane_id_in_window(1, 0), Some(source_pane_id));

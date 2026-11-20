@@ -7,14 +7,14 @@ use super::mode_tree_model::{
 };
 use super::mode_tree_preview::{
     preview_horizontal_offset, preview_lines_for_screen, preview_vertical_offset,
-    render_preview_segment_row, render_tree_columns_preview, tree_preview_layout,
-    tree_window_preview_label, PreviewColumn,
+    render_preview_segment_row, render_tree_columns_preview, tree_preview_layout, PreviewColumn,
+    PreviewLabel,
 };
 use super::mode_tree_render::{mode_tree_list_rows, render_mode_tree_overlay, render_visible_item};
 use super::mode_tree_selection::{
     clamp_scroll, collapse_or_parent, current_tree_kill_prompt, cycle_sort,
-    ensure_selected_visible, expand_or_child, move_selection, repeat_search, selected_items,
-    tag_all, tagged_tree_kill_prompt, toggle_tag,
+    ensure_selected_visible, expand_or_child, move_selection, move_selection_by_page,
+    repeat_search, selected_items, tag_all, tagged_tree_kill_prompt, toggle_tag,
 };
 use super::mode_tree_sort::stable_order;
 use super::*;
@@ -98,6 +98,9 @@ mod parse_and_tag;
 
 #[path = "tests/render_items.rs"]
 mod render_items;
+
+#[path = "tests/hash_render.rs"]
+mod hash_render;
 
 #[path = "tests/selection_scroll.rs"]
 mod selection_scroll;

@@ -350,7 +350,7 @@ fn assert_shutdown_joins_process_registration_race(task_kind: ProcessRaceTaskKin
         .expect("process tree starts before registration");
 
     let shutdown = registry.begin_shutdown();
-    shell_processes.close_and_terminate();
+    shell_processes.close().terminate();
     let joiner = std::thread::spawn(move || shutdown.join(Duration::from_secs(1)));
     std::thread::sleep(Duration::from_millis(50));
     let detached_before_registration_resolved = joiner.is_finished();

@@ -252,21 +252,19 @@ async fn broadcast_daemon_side(panes: &[Pane], input: Input<'_>) -> Result<Broad
     let response = match response {
         Response::PaneBroadcastInput(response) => response,
         response => {
-            return Err(RmuxError::protocol(rmux_proto::RmuxError::Server(format!(
-                "rmux daemon sent `{}` response for `pane broadcast` request",
-                response.command_name()
-            ))));
+            return Err(RmuxError::from_proto(rmux_proto::RmuxError::Server(
+                format!(
+                    "rmux daemon sent `{}` response for `pane broadcast` request",
+                    response.command_name()
+                ),
+            )));
         }
     };
 
     let mut indexed_successes = Vec::with_capacity(response.successes.len());
-    let mut seen = vec![false; requested_target_count];
+    crate::automation::validate_broadcast_response(&response, requested_target_count)?;
     for success in response.successes {
-        let (request_index, original_index) =
-            response_target_index(success.target_index, &request_to_original, "successful")?;
-        if std::mem::replace(&mut seen[request_index], true) {
-            return Err(duplicate_broadcast_outcome(success.target_index));
-        }
+        let original_index = request_to_original[success.target_index as usize];
         indexed_successes.push((
             original_index,
             BroadcastPaneSuccess {
@@ -276,25 +274,15 @@ async fn broadcast_daemon_side(panes: &[Pane], input: Input<'_>) -> Result<Broad
         ));
     }
     for failure in response.failures {
-        let (request_index, original_index) =
-            response_target_index(failure.target_index, &request_to_original, "failed")?;
-        if std::mem::replace(&mut seen[request_index], true) {
-            return Err(duplicate_broadcast_outcome(failure.target_index));
-        }
+        let original_index = request_to_original[failure.target_index as usize];
         indexed_failures.push((
             original_index,
             BroadcastPaneFailure {
                 target: panes[original_index].target().clone(),
                 pane_id: None,
-                error: RmuxError::protocol(failure.error),
+                error: RmuxError::from_proto(failure.error),
             },
         ));
-    }
-
-    if let Some(request_index) = seen.iter().position(|seen| !seen) {
-        return Err(RmuxError::protocol(rmux_proto::RmuxError::Server(format!(
-            "rmux daemon omitted pane broadcast outcome for target index {request_index}"
-        ))));
     }
 
     indexed_successes.sort_by_key(|(index, _)| *index);
@@ -315,33 +303,6 @@ async fn broadcast_daemon_side(panes: &[Pane], input: Input<'_>) -> Result<Broad
             successes, failures,
         )))
     }
-}
-
-fn response_target_index(
-    target_index: u32,
-    request_to_original: &[usize],
-    outcome: &str,
-) -> Result<(usize, usize)> {
-    let request_index = usize::try_from(target_index).map_err(|_| {
-        RmuxError::protocol(rmux_proto::RmuxError::Server(format!(
-            "rmux daemon returned out-of-range {outcome} pane broadcast target index {target_index}"
-        )))
-    })?;
-    let original_index = request_to_original
-        .get(request_index)
-        .copied()
-        .ok_or_else(|| {
-            RmuxError::protocol(rmux_proto::RmuxError::Server(format!(
-            "rmux daemon returned out-of-range {outcome} pane broadcast target index {target_index}"
-        )))
-        })?;
-    Ok((request_index, original_index))
-}
-
-fn duplicate_broadcast_outcome(target_index: u32) -> RmuxError {
-    RmuxError::protocol(rmux_proto::RmuxError::Server(format!(
-        "rmux daemon returned duplicate pane broadcast outcome for target index {target_index}"
-    )))
 }
 
 fn partial_broadcast(

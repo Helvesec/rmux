@@ -288,7 +288,9 @@ fn paste_buffer_allows_slow_continuous_pty_progress() -> Result<(), Box<dyn Erro
     }
     assert!(ready_path.exists(), "slow PTY reader did not become ready");
 
-    let payload = "x".repeat(64 * 1024);
+    // 64 KiB of distinct, ordered 8-byte records: unlike a uniform payload,
+    // any reordering of the delivered bytes changes the comparison below.
+    let payload: String = (0..8192u32).map(|index| format!("{index:08x}")).collect();
     let payload_path = harness.tmpdir().join("payload");
     fs::write(&payload_path, &payload)?;
     assert_success(
@@ -301,14 +303,18 @@ fn paste_buffer_allows_slow_continuous_pty_progress() -> Result<(), Box<dyn Erro
                 .ok_or("payload path is not valid UTF-8")?,
         ])?,
     );
+    // tmux 3.7b appends the paste to the pane's write buffer and returns at
+    // once (cmd-paste-buffer.c, bufferevent_write); the pane then receives it
+    // as fast as its program reads, however long that takes.
     let started = Instant::now();
     assert_success(&harness.run(&["paste-buffer", "-b", "slow-payload", "-t", "slow:0.0"])?);
+    let returned_after = started.elapsed();
     assert!(
-        started.elapsed() > Duration::from_secs(2),
-        "regression probe must outlive the inactivity timeout"
+        returned_after < Duration::from_secs(2),
+        "paste-buffer held its caller for {returned_after:?} while the pane read slowly"
     );
 
-    let receive_deadline = Instant::now() + Duration::from_secs(10);
+    let receive_deadline = started + Duration::from_secs(30);
     while fs::metadata(&received_path)
         .map(|metadata| metadata.len() < payload.len() as u64)
         .unwrap_or(true)
@@ -316,7 +322,13 @@ fn paste_buffer_allows_slow_continuous_pty_progress() -> Result<(), Box<dyn Erro
     {
         std::thread::sleep(Duration::from_millis(25));
     }
+    let delivered_after = started.elapsed();
     assert_eq!(fs::read(&received_path)?, payload.as_bytes());
+    assert!(
+        delivered_after > Duration::from_secs(2),
+        "regression probe must outlive the inactivity timeout: \
+         the pane read the paste in {delivered_after:?}"
+    );
 
     terminate_child(daemon.child_mut())?;
     Ok(())

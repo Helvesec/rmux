@@ -15,7 +15,14 @@ REPOSITORY_ID = 1239918790
 REPOSITORY = "Helvesec/rmux"
 RELEASE_APP_ID = 4339867
 SIGNATURE_NAMESPACE = "git"
-TAG_PATTERN = re.compile(r"^v(?P<version>[0-9]+\.[0-9]+\.[0-9]+(?P<rc>-rc\.[0-9]+)?)$")
+# Bounds each ssh-keygen call so a stalled tool is a refusal, not a hang.
+SSH_KEYGEN_TIMEOUT_SECONDS = 60
+# Match release-identity.sh and verify-release-ref.sh for every release line.
+VERSION_COMPONENT = r"(?:0|[1-9][0-9]*)"
+TAG_PATTERN = re.compile(
+    rf"v(?P<version>{VERSION_COMPONENT}\.{VERSION_COMPONENT}\.{VERSION_COMPONENT}"
+    r"(?P<rc>-rc\.[1-9][0-9]*)?)"
+)
 SHA_PATTERN = re.compile(r"^[0-9a-f]{40}$")
 HASH_PATTERN = re.compile(r"^[0-9a-f]{64}$")
 DIGEST_PATTERN = re.compile(r"^sha256:[0-9a-f]{64}$")
@@ -52,7 +59,9 @@ class ReleaseTagIdentity:
     def validate(self) -> None:
         match = TAG_PATTERN.fullmatch(self.release_ref)
         if match is None:
-            raise PolicyError("release ref must be vX.Y.Z or vX.Y.Z-rc.N")
+            raise PolicyError(
+                "release ref must be vX.Y.Z or vX.Y.Z-rc.N without leading zeros; N >= 1"
+            )
         expected_kind = "rc" if match.group("rc") else "stable"
         if self.release_kind != expected_kind:
             raise PolicyError(
@@ -230,18 +239,49 @@ def load_signer_policy(path: Path) -> SignerPolicy:
     return SignerPolicy(path, enabled, tag_policy["blocker"], tuple(signers))
 
 
-def ssh_public_key_fingerprint(public_key: str) -> str:
-    result = subprocess.run(
-        ["ssh-keygen", "-l", "-f", "-", "-E", "sha256"],
-        input=public_key + "\n",
-        text=True,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        check=False,
+def run_ssh_keygen(
+    arguments: list[str], stdin_path: Path, action: str
+) -> tuple[int, str, str]:
+    """Run ssh-keygen with file-backed stdin and stderr, bounded in time.
+
+    Win32-OpenSSH ssh-keygen never returns when stdin is an anonymous pipe
+    (-Y verify) or when it reports an error on a stderr pipe (-Y verify, -l),
+    even after the pipe is closed. Regular files work on every platform.
+    """
+    stderr_path = stdin_path.with_name(stdin_path.name + ".stderr")
+    with stdin_path.open("rb") as stdin, stderr_path.open("w+b") as stderr:
+        try:
+            result = subprocess.run(
+                ["ssh-keygen", *arguments],
+                stdin=stdin,
+                stdout=subprocess.PIPE,
+                stderr=stderr,
+                check=False,
+                timeout=SSH_KEYGEN_TIMEOUT_SECONDS,
+            )
+        except subprocess.TimeoutExpired as error:
+            raise PolicyError(
+                f"ssh-keygen {action} exceeded {SSH_KEYGEN_TIMEOUT_SECONDS}s"
+            ) from error
+        stderr.seek(0)
+        diagnostic = stderr.read()
+    return (
+        result.returncode,
+        result.stdout.decode("utf-8", "replace"),
+        diagnostic.decode("utf-8", "replace"),
     )
-    if result.returncode != 0:
-        raise PolicyError(f"invalid SSH public key: {result.stderr.strip()}")
-    fields = result.stdout.split()
+
+
+def ssh_public_key_fingerprint(public_key: str) -> str:
+    with tempfile.TemporaryDirectory(prefix="rmux-release-key-") as directory:
+        key_path = Path(directory) / "public_key"
+        key_path.write_text(public_key + "\n", encoding="utf-8")
+        returncode, stdout, stderr = run_ssh_keygen(
+            ["-l", "-f", "-", "-E", "sha256"], key_path, "public-key fingerprint"
+        )
+    if returncode != 0:
+        raise PolicyError(f"invalid SSH public key: {stderr.strip()}")
+    fields = stdout.split()
     if len(fields) < 2:
         raise PolicyError("ssh-keygen returned no public-key fingerprint")
     return fields[1]
@@ -298,13 +338,14 @@ def verify_ssh_signature(policy: SignerPolicy, payload: bytes, signature: bytes)
         root = Path(directory)
         allowed = root / "allowed_signers"
         signature_path = root / "signature"
+        payload_path = root / "payload"
         policy.write_allowed_signers(allowed)
         signature_path.write_bytes(signature)
+        payload_path.write_bytes(payload)
         verified: list[str] = []
         for signer in policy.allowed_signers:
-            result = subprocess.run(
+            returncode, _stdout, _stderr = run_ssh_keygen(
                 [
-                    "ssh-keygen",
                     "-Y",
                     "verify",
                     "-f",
@@ -316,12 +357,10 @@ def verify_ssh_signature(policy: SignerPolicy, payload: bytes, signature: bytes)
                     "-s",
                     str(signature_path),
                 ],
-                input=payload,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                check=False,
+                payload_path,
+                "signature verification",
             )
-            if result.returncode == 0:
+            if returncode == 0:
                 verified.append(signer.principal)
     if len(verified) != 1:
         raise PolicyError(

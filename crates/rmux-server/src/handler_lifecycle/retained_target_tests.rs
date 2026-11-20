@@ -1,3 +1,5 @@
+#[cfg(test)]
+use crate::session_fixture::SessionSetupExt as _;
 use rmux_core::{PaneJoinOptions, PaneSwapOptions, SessionPaneTarget};
 use rmux_proto::{
     CopyModeRequest, HookLifecycle, HookName, LinkWindowRequest, NewSessionRequest,
@@ -34,7 +36,7 @@ async fn create_handler_session(handler: &RequestHandler, name: &str) -> Session
             environment: None,
         }))
         .await;
-    assert!(matches!(response, Response::NewSession(_)), "{response:?}");
+    crate::session_fixture::assert_new_session(&response);
     name
 }
 
@@ -75,7 +77,7 @@ async fn retired_alert_target_keeps_its_deferred_hook_chain_alive() {
             },
         );
         assert!(event.retained_current_target.is_some());
-        state
+        let _ = state
             .sessions
             .remove_session(&session_name)
             .expect("remove retained alert session");
@@ -118,7 +120,7 @@ async fn live_alert_target_follows_a_surviving_window_alias_before_dispatch() {
             .expect("create source session");
         state
             .sessions
-            .session_mut(&alpha)
+            .session_setup(&alpha)
             .expect("source session exists")
             .create_window(terminal_size())
             .expect("create spare source window");
@@ -130,13 +132,13 @@ async fn live_alert_target_follows_a_surviving_window_alias_before_dispatch() {
             .sessions
             .session(&alpha)
             .and_then(|session| session.window_at(0))
-            .cloned()
+            .map(|window| window.id())
             .expect("source window exists");
         state
             .sessions
-            .session_mut(&beta)
+            .session_setup(&beta)
             .expect("alias session exists")
-            .link_window(1, source_window, false, false)
+            .link_window_id(1, source_window, false, false)
             .expect("link retained window into alias session");
     }
     set_global_activity_hook(&handler, 0, "rename-window retained-live-target").await;
@@ -151,7 +153,7 @@ async fn live_alert_target_follows_a_surviving_window_alias_before_dispatch() {
         );
         state
             .sessions
-            .session_mut(&alpha)
+            .session_setup(&alpha)
             .expect("source session exists")
             .remove_window_allowing_empty(0)
             .expect("unlink original alias");
@@ -191,9 +193,9 @@ async fn replaced_alert_target_rejects_the_deferred_hook_chain() {
                 target: WindowTarget::with_window(session_name.clone(), 0),
             },
         );
-        let session = state
+        let mut session = state
             .sessions
-            .session_mut(&session_name)
+            .session_setup(&session_name)
             .expect("session exists");
         session
             .remove_window_allowing_empty(0)

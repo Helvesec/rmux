@@ -34,7 +34,7 @@ async fn live_resize_aborts_if_the_attach_switches_after_geometry_capture() {
                 environment: None,
             }))
             .await;
-        assert!(matches!(created, Response::NewSession(_)), "{created:?}");
+        crate::session_fixture::assert_new_session(&created);
     }
     handler.wait_for_initial_panes_for_test().await;
 
@@ -106,7 +106,7 @@ async fn live_resize_never_mutates_a_recreated_same_name_session() {
             environment: None,
         }))
         .await;
-    assert!(matches!(created, Response::NewSession(_)), "{created:?}");
+    crate::session_fixture::assert_new_session(&created);
     handler.wait_for_initial_panes_for_test().await;
 
     let (control_tx, _control_rx) = mpsc::unbounded_channel::<AttachControl>();
@@ -145,10 +145,7 @@ async fn live_resize_never_mutates_a_recreated_same_name_session() {
                 environment: None,
             }))
             .await;
-        assert!(
-            matches!(recreated, Response::NewSession(_)),
-            "{recreated:?}"
-        );
+        crate::session_fixture::assert_new_session(&recreated);
         pause.release.notify_one();
     };
     let (resized, ()) = tokio::join!(resize, replace);
@@ -175,7 +172,7 @@ async fn attached_size_selection_retries_after_the_captured_window_is_killed() {
             environment: None,
         }))
         .await;
-    assert!(matches!(created, Response::NewSession(_)), "{created:?}");
+    crate::session_fixture::assert_new_session(&created);
     let created = handler
         .handle(Request::NewWindow(Box::new(NewWindowRequest {
             target: session_name.clone(),
@@ -261,7 +258,7 @@ async fn attached_size_selection_retries_after_the_candidate_epoch_changes() {
             environment: None,
         }))
         .await;
-    assert!(matches!(created, Response::NewSession(_)), "{created:?}");
+    crate::session_fixture::assert_new_session(&created);
     handler.wait_for_initial_panes_for_test().await;
 
     let (control_tx, _control_rx) = mpsc::unbounded_channel::<AttachControl>();
@@ -309,7 +306,7 @@ async fn attached_size_selection_retries_after_the_policy_changes() {
             environment: None,
         }))
         .await;
-    assert!(matches!(created, Response::NewSession(_)), "{created:?}");
+    crate::session_fixture::assert_new_session(&created);
     handler.wait_for_initial_panes_for_test().await;
 
     let (control_tx, _control_rx) = mpsc::unbounded_channel::<AttachControl>();
@@ -366,7 +363,7 @@ async fn attached_candidate_cannot_change_between_final_validation_and_apply() {
             environment: None,
         }))
         .await;
-    assert!(matches!(created, Response::NewSession(_)), "{created:?}");
+    crate::session_fixture::assert_new_session(&created);
     handler.wait_for_initial_panes_for_test().await;
 
     let (control_tx, _control_rx) = mpsc::unbounded_channel::<AttachControl>();

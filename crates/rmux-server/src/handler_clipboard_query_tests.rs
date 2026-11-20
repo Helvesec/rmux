@@ -58,11 +58,9 @@ async fn create_fixture(name: &str) -> PaneFixture {
             environment: None,
         }))
         .await;
-    assert!(matches!(response, Response::NewSession(_)), "{response:?}");
+    crate::session_fixture::assert_new_session(&response);
     let target = PaneTarget::new(session.clone(), 0);
-    handler
-        .wait_for_pane_startup_to_finish_for_test(&target)
-        .await;
+    handler.disable_pane_focus_reports_for_test(&target).await;
     let (pane_id, generation) = {
         let state = handler.state.lock().await;
         let pane_id = state
@@ -93,7 +91,7 @@ async fn create_session(handler: &RequestHandler, name: &str) -> SessionName {
             environment: None,
         }))
         .await;
-    assert!(matches!(response, Response::NewSession(_)), "{response:?}");
+    crate::session_fixture::assert_new_session(&response);
     session
 }
 
@@ -367,7 +365,7 @@ async fn pane_alert_request_round_trip_uses_fixed_outer_query_without_changing_b
     )
     .await;
 
-    fixture.handler.pane_alert_callback()(PaneAlertEvent {
+    fixture.handler.pane_alert_callback().alert(PaneAlertEvent {
         session_name: fixture.session.clone(),
         pane_id: fixture.pane_id,
         bell_count: 0,
@@ -609,6 +607,20 @@ async fn both_mode_same_pid_attach_replacement_before_commit_preserves_the_exist
 
 #[tokio::test]
 async fn both_mode_pane_respawn_before_commit_preserves_the_existing_buffer() {
+    assert_paused_both_response_dropped_after_respawn(None).await;
+}
+
+#[tokio::test]
+async fn both_mode_pane_respawn_before_commit_spares_a_focus_enabled_replacement() {
+    assert_paused_both_response_dropped_after_respawn(Some(b"\x1b[?1004h")).await;
+}
+
+/// The replacement runtime is focused for client 604, so it is owed a
+/// focus-in when its own startup output enables DEC 1004 before the respawn
+/// reconciles focus: the pinned ConPTY preamble does that natively, the seed
+/// does it on every platform. Only that attributed, generation-checked edge is
+/// excused; the stale clipboard response must add no byte at all.
+async fn assert_paused_both_response_dropped_after_respawn(replacement_startup: Option<&[u8]>) {
     let fixture = create_fixture("clipboard-both-pane-respawn").await;
     enable_get_clipboard(&fixture.handler, "both").await;
     seed_old_buffer(&fixture).await;
@@ -621,6 +633,14 @@ async fn both_mode_pane_respawn_before_commit_preserves_the_existing_buffer() {
     .await;
     let (pause, response) = begin_paused_both_response(&fixture, 604, &mut control_rx).await;
 
+    if let Some(bytes) = replacement_startup {
+        fixture
+            .handler
+            .state
+            .lock()
+            .await
+            .seed_next_respawn_startup_output_for_test(bytes);
+    }
     let respawn = fixture
         .handler
         .handle(Request::RespawnPane(Box::new(RespawnPaneRequest {
@@ -633,10 +653,44 @@ async fn both_mode_pane_respawn_before_commit_preserves_the_existing_buffer() {
         })))
         .await;
     assert!(matches!(respawn, Response::RespawnPane(_)), "{respawn:?}");
+    let replacement_generation = {
+        let state = fixture.handler.state.lock().await;
+        assert!(state
+            .resolve_pane_event_runtime_session(
+                &fixture.session,
+                fixture.pane_id,
+                Some(fixture.generation),
+            )
+            .is_none());
+        let generation = state.pane_output_generation_for_target(&fixture.target, fixture.pane_id);
+        assert_ne!(generation, fixture.generation, "respawn changes generation");
+        generation
+    };
+    let input_before_response = captured_input(&fixture).await;
     finish_paused_clipboard_response(pause, response).await;
 
     assert_old_buffer_is_unchanged(&fixture).await;
-    assert!(captured_input(&fixture).await.is_empty());
+    let state = fixture.handler.state.lock().await;
+    assert_eq!(
+        state.pane_input_capture_for_test(&fixture.target),
+        Some(input_before_response),
+        "the stale response must add no byte to the replacement runtime"
+    );
+    assert_eq!(
+        state.pane_non_focus_input_capture_for_test(&fixture.target),
+        Some(Vec::new()),
+        "only attributed focus reports may reach the replacement runtime"
+    );
+    let focus = state.pane_focus_input_capture_for_test(&fixture.target);
+    assert!(focus.len() <= 1, "one replacement focus-in edge: {focus:?}");
+    if replacement_startup.is_some() {
+        assert_eq!(focus.len(), 1, "focus-enabled replacement gets its report");
+    }
+    for report in &focus {
+        assert_eq!(report.pane_id, fixture.pane_id);
+        assert_eq!(report.generation, replacement_generation);
+        assert_eq!(report.bytes, b"\x1b[I");
+    }
 }
 
 #[tokio::test]
@@ -799,11 +853,11 @@ async fn pane_alert_callbacks_keep_clipboard_queries_in_publication_order() {
         generation: Some(fixture.generation),
     };
 
-    callback(event(TerminalClipboardQuery::new("p", InputEndType::Bel)));
+    callback.alert(event(TerminalClipboardQuery::new("p", InputEndType::Bel)));
     timeout(Duration::from_secs(1), drain_pause.wait_until_reached())
         .await
         .expect("first query worker reaches deterministic pause");
-    callback(event(TerminalClipboardQuery::new("q", InputEndType::St)));
+    callback.alert(event(TerminalClipboardQuery::new("q", InputEndType::St)));
     tokio::task::yield_now().await;
     assert!(
         control_rx.try_recv().is_err(),
@@ -846,14 +900,14 @@ async fn pane_alert_clipboard_query_queue_is_bounded_while_the_worker_is_busy() 
         generation: Some(fixture.generation),
     };
 
-    callback(event(vec![TerminalClipboardQuery::new(
+    callback.alert(event(vec![TerminalClipboardQuery::new(
         "p",
         InputEndType::Bel,
     )]));
     timeout(Duration::from_secs(1), drain_pause.wait_until_reached())
         .await
         .expect("query worker reaches deterministic pause");
-    callback(event(
+    callback.alert(event(
         (0..65)
             .map(|_| TerminalClipboardQuery::new("q", InputEndType::St))
             .collect(),
@@ -1102,6 +1156,20 @@ async fn linked_inactive_window_is_eligible_by_stable_window_identity() {
 
 #[tokio::test]
 async fn pane_generation_change_drops_late_response() {
+    assert_late_response_dropped_after_respawn(None).await;
+}
+
+#[tokio::test]
+async fn pane_generation_change_drops_late_response_to_a_focus_enabled_replacement() {
+    assert_late_response_dropped_after_respawn(Some(b"\x1b[?1004h")).await;
+}
+
+/// The replacement runtime is focused for client 302, so it is owed a
+/// focus-in when its own startup output enables DEC 1004 before the respawn
+/// reconciles focus: the pinned ConPTY preamble does that natively, the seed
+/// does it on every platform. Only that attributed, generation-checked edge is
+/// excused; the stale clipboard response must add no byte at all.
+async fn assert_late_response_dropped_after_respawn(replacement_startup: Option<&[u8]>) {
     let fixture = create_fixture("clipboard-pane-race").await;
     enable_get_clipboard(&fixture.handler, "request").await;
     let (_, mut control_rx) = register_attach(
@@ -1118,6 +1186,14 @@ async fn pane_generation_change_drops_late_response() {
     .await;
     recv_clipboard_query(&fixture.handler, 302, &mut control_rx).await;
 
+    if let Some(bytes) = replacement_startup {
+        fixture
+            .handler
+            .state
+            .lock()
+            .await
+            .seed_next_respawn_startup_output_for_test(bytes);
+    }
     let response = fixture
         .handler
         .handle(Request::RespawnPane(Box::new(RespawnPaneRequest {
@@ -1130,8 +1206,43 @@ async fn pane_generation_change_drops_late_response() {
         })))
         .await;
     assert!(matches!(response, Response::RespawnPane(_)), "{response:?}");
+    let replacement_generation = {
+        let state = fixture.handler.state.lock().await;
+        assert!(state
+            .resolve_pane_event_runtime_session(
+                &fixture.session,
+                fixture.pane_id,
+                Some(fixture.generation),
+            )
+            .is_none());
+        let generation = state.pane_output_generation_for_target(&fixture.target, fixture.pane_id);
+        assert_ne!(generation, fixture.generation, "respawn changes generation");
+        generation
+    };
+    let input_before_response = captured_input(&fixture).await;
     feed_clipboard_response(&fixture.handler, 302, b"\x1b]52;c;c3RhbGU=\x07").await;
-    assert!(captured_input(&fixture).await.is_empty());
+
+    let state = fixture.handler.state.lock().await;
+    assert_eq!(
+        state.pane_input_capture_for_test(&fixture.target),
+        Some(input_before_response),
+        "the stale response must add no byte to the replacement runtime"
+    );
+    assert_eq!(
+        state.pane_non_focus_input_capture_for_test(&fixture.target),
+        Some(Vec::new()),
+        "only attributed focus reports may reach the replacement runtime"
+    );
+    let focus = state.pane_focus_input_capture_for_test(&fixture.target);
+    assert!(focus.len() <= 1, "one replacement focus-in edge: {focus:?}");
+    if replacement_startup.is_some() {
+        assert_eq!(focus.len(), 1, "focus-enabled replacement gets its report");
+    }
+    for report in &focus {
+        assert_eq!(report.pane_id, fixture.pane_id);
+        assert_eq!(report.generation, replacement_generation);
+        assert_eq!(report.bytes, b"\x1b[I");
+    }
 }
 
 #[tokio::test]

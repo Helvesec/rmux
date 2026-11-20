@@ -32,7 +32,7 @@ async fn list_sessions_sorts_sessions_by_name() {
                 environment: None,
             }))
             .await;
-        assert!(matches!(created, Response::NewSession(_)));
+        crate::session_fixture::assert_new_session(&created);
     }
 
     let response = handler
@@ -56,6 +56,9 @@ async fn list_sessions_sorts_sessions_by_name() {
 #[tokio::test]
 async fn list_sessions_format_uses_each_sessions_active_pane_context() {
     let handler = RequestHandler::new();
+    // pane_current_path reads the pane process's live directory; a login
+    // shell may change it while it starts.
+    handler.pin_quiet_default_command_for_test().await;
     let root =
         std::env::temp_dir().join(format!("rmux-list-sessions-context-{}", std::process::id()));
     let alpha_dir = root.join("alpha");
@@ -87,7 +90,7 @@ async fn list_sessions_format_uses_each_sessions_active_pane_context() {
                 skip_environment_update: false,
             })))
             .await;
-        assert!(matches!(created, Response::NewSession(_)));
+        crate::session_fixture::assert_new_session(&created);
     }
 
     let response = handler
@@ -120,6 +123,8 @@ async fn list_sessions_format_uses_each_sessions_active_pane_context() {
 #[tokio::test]
 async fn session_path_stays_at_session_cwd_when_pane_cwds_differ() {
     let handler = RequestHandler::new();
+    // Same live-directory read as the list-sessions witness above.
+    handler.pin_quiet_default_command_for_test().await;
     let root =
         std::env::temp_dir().join(format!("rmux-session-path-context-{}", std::process::id()));
     let session_dir = root.join("session");
@@ -151,7 +156,7 @@ async fn session_path_stays_at_session_cwd_when_pane_cwds_differ() {
             skip_environment_update: false,
         })))
         .await;
-    assert!(matches!(created, Response::NewSession(_)), "{created:?}");
+    crate::session_fixture::assert_new_session(&created);
 
     let split = handler
         .handle(Request::SplitWindowExt(Box::new(

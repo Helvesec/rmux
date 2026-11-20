@@ -2,7 +2,11 @@
 
 mod common;
 
+#[path = "pane_queries/frozen_options.rs"]
+mod frozen_options;
+
 use std::error::Error;
+use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -93,9 +97,9 @@ async fn pane_id_info_and_snapshot_resolve_through_daemon_for_live_and_stale_slo
         matches!(
             &stale_events_error,
             RmuxError::Protocol {
-                source: rmux_proto::RmuxError::InvalidTarget { .. },
+                source,
                 ..
-            }
+            } if source.invalid_target().is_some()
         ),
         "a stale slot must fail closed before subscribing: {stale_events_error}"
     );
@@ -590,6 +594,10 @@ async fn read_response(stream: &mut UnixStream) -> TestResult<Response> {
 }
 
 struct Harness {
+    // `Rmux::cmd` spawns a child process resolved from "RMUX_SDK_DAEMON_BINARY",
+    // falling back to the bare name `rmux` on PATH. Held for the whole harness
+    // lifetime so commands run the same source binary as this daemon.
+    _binary_env: EnvGuard,
     _root: TestRoot,
     socket_path: PathBuf,
     child: Option<Child>,
@@ -599,7 +607,9 @@ impl Harness {
     async fn start(label: &str) -> TestResult<Self> {
         let root = TestRoot::new(label);
         let socket_path = root.path().join("daemon.sock");
-        let mut child = Command::new(rmux_binary()?)
+        let binary = rmux_binary()?;
+        let binary_env = EnvGuard::set("RMUX_SDK_DAEMON_BINARY", binary.as_os_str());
+        let mut child = Command::new(binary)
             .arg("--__internal-daemon")
             .arg(&socket_path)
             .stdin(Stdio::null())
@@ -609,6 +619,7 @@ impl Harness {
         wait_for_daemon_ready(&socket_path, &mut child).await?;
 
         Ok(Self {
+            _binary_env: binary_env,
             _root: root,
             socket_path,
             child: Some(child),
@@ -761,6 +772,28 @@ fn workspace_root() -> PathBuf {
         .and_then(Path::parent)
         .expect("rmux-sdk manifest lives under crates/rmux-sdk")
         .to_path_buf()
+}
+
+struct EnvGuard {
+    key: &'static str,
+    previous: Option<OsString>,
+}
+
+impl EnvGuard {
+    fn set(key: &'static str, value: &std::ffi::OsStr) -> Self {
+        let previous = std::env::var_os(key);
+        std::env::set_var(key, value);
+        Self { key, previous }
+    }
+}
+
+impl Drop for EnvGuard {
+    fn drop(&mut self) {
+        match &self.previous {
+            Some(value) => std::env::set_var(self.key, value),
+            None => std::env::remove_var(self.key),
+        }
+    }
 }
 
 struct TestRoot {
@@ -1004,9 +1037,9 @@ async fn issue_94_slot_handles_resolve_visible_indexes_under_base_index_one() ->
         matches!(
             &raw_events_error,
             RmuxError::Protocol {
-                source: rmux_proto::RmuxError::InvalidTarget { .. },
+                source,
                 ..
-            }
+            } if source.invalid_target().is_some()
         ),
         "an invisible raw slot must fail closed before subscribing: {raw_events_error}"
     );

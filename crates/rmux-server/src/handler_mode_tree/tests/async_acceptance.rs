@@ -77,6 +77,23 @@ async fn open_customize_mode(handler: &RequestHandler, attach_pid: u32) {
         .expect("customize-mode opens");
 }
 
+#[tokio::test]
+async fn mode_tree_modify_other_keys_printable_reaches_modal_action() {
+    let (handler, attach_pid, _control_rx) =
+        choose_buffer_action_fixture("mode-tree-mok-printable", 906).await;
+    assert!(handler.mode_tree_active(attach_pid).await);
+
+    handler
+        .handle_attached_live_input_for_test(attach_pid, b"\x1b[27;1;113~")
+        .await
+        .expect("modifyOtherKeys q is handled by mode-tree");
+
+    assert!(
+        !handler.mode_tree_active(attach_pid).await,
+        "normalized modifyOtherKeys q should dismiss mode-tree"
+    );
+}
+
 async fn zoomed_choose_tree_fixture(
     label: &str,
     attach_pid_offset: u32,
@@ -935,8 +952,8 @@ async fn choose_buffer_confirmation_uses_captured_buffer_instances() {
 async fn choose_tree_kill_pane_drains_after_kill_pane_inline_hook() {
     let handler = RequestHandler::new();
     let alpha = SessionName::new("choose-tree-after-kill").expect("valid session");
-    assert!(matches!(
-        handler
+    crate::session_fixture::assert_new_session(
+        &handler
             .handle(Request::NewSession(NewSessionRequest {
                 session_name: alpha.clone(),
                 detached: true,
@@ -944,8 +961,7 @@ async fn choose_tree_kill_pane_drains_after_kill_pane_inline_hook() {
                 environment: None,
             }))
             .await,
-        Response::NewSession(_)
-    ));
+    );
     assert!(matches!(
         handler
             .handle(Request::SplitWindow(rmux_proto::SplitWindowRequest {
@@ -1231,7 +1247,7 @@ async fn choose_tree_stale_session_action_fails_closed_after_name_reuse() {
             .await
             .sessions
             .session(&alpha)
-            .map(rmux_core::Session::id),
+            .map(|session| session.id()),
         Some(replacement_session_id)
     );
 }
@@ -1293,7 +1309,7 @@ async fn choose_tree_tagged_kill_skips_stale_identity_and_finishes_live_batch() 
         state
             .sessions
             .session(&stale_name)
-            .map(rmux_core::Session::id),
+            .map(|session| session.id()),
         Some(replacement_id),
         "the replacement behind the stale identity must survive"
     );
@@ -1381,7 +1397,7 @@ async fn choose_tree_kill_current_does_not_fall_back_after_session_aba() {
             .await
             .sessions
             .session(&alpha)
-            .map(rmux_core::Session::id),
+            .map(|session| session.id()),
         Some(replacement_session_id)
     );
 }
@@ -1455,8 +1471,8 @@ async fn choose_tree_stale_window_action_fails_closed_after_index_reuse() {
 }
 
 async fn create_mode_tree_test_session(handler: &RequestHandler, session_name: &SessionName) {
-    assert!(matches!(
-        handler
+    crate::session_fixture::assert_new_session(
+        &handler
             .handle(Request::NewSession(NewSessionRequest {
                 session_name: session_name.clone(),
                 detached: true,
@@ -1464,8 +1480,7 @@ async fn create_mode_tree_test_session(handler: &RequestHandler, session_name: &
                 environment: None,
             }))
             .await,
-        Response::NewSession(_)
-    ));
+    );
 }
 
 async fn mode_tree_test_pane_cols(handler: &RequestHandler, session_name: &SessionName) -> u16 {
@@ -2049,8 +2064,8 @@ async fn choose_tree_zw_runs_direct_command_only_on_accept() {
     let attach_pid = std::process::id();
     let alpha = SessionName::new("alpha").expect("valid session");
 
-    assert!(matches!(
-        handler
+    crate::session_fixture::assert_new_session(
+        &handler
             .handle(Request::NewSession(NewSessionRequest {
                 session_name: alpha.clone(),
                 detached: true,
@@ -2058,8 +2073,7 @@ async fn choose_tree_zw_runs_direct_command_only_on_accept() {
                 environment: None,
             }))
             .await,
-        Response::NewSession(_)
-    ));
+    );
 
     let (control_tx, _control_rx) = mpsc::unbounded_channel();
     let _ = handler
@@ -2108,8 +2122,8 @@ async fn choose_client_from_unattached_request_activates_mode_tree_on_all_attach
     let handler = RequestHandler::new();
     let alpha = SessionName::new("alpha").expect("valid session");
 
-    assert!(matches!(
-        handler
+    crate::session_fixture::assert_new_session(
+        &handler
             .handle(Request::NewSession(NewSessionRequest {
                 session_name: alpha.clone(),
                 detached: true,
@@ -2117,8 +2131,7 @@ async fn choose_client_from_unattached_request_activates_mode_tree_on_all_attach
                 environment: None,
             }))
             .await,
-        Response::NewSession(_)
-    ));
+    );
 
     let (first_tx, mut first_rx) = mpsc::unbounded_channel();
     let (second_tx, mut second_rx) = mpsc::unbounded_channel();
@@ -2202,8 +2215,8 @@ async fn mode_tree_commands_without_attached_client_mark_target_pane_mode() {
     ] {
         let handler = RequestHandler::new();
         let alpha = SessionName::new("alpha").expect("valid session");
-        assert!(matches!(
-            handler
+        crate::session_fixture::assert_new_session(
+            &handler
                 .handle(Request::NewSession(NewSessionRequest {
                     session_name: alpha.clone(),
                     detached: true,
@@ -2211,8 +2224,7 @@ async fn mode_tree_commands_without_attached_client_mark_target_pane_mode() {
                     environment: None,
                 }))
                 .await,
-            Response::NewSession(_)
-        ));
+        );
 
         if needs_buffer {
             assert!(matches!(
@@ -2249,10 +2261,7 @@ async fn mode_tree_commands_without_attached_client_mark_target_pane_mode() {
         let target = rmux_proto::PaneTarget::with_window(alpha, 0, 0);
         let state = handler.state.lock().await;
         let transcript = state.transcript_handle(&target).expect("target transcript");
-        let mode = transcript
-            .lock()
-            .expect("pane transcript mutex must not be poisoned")
-            .pane_mode_name();
+        let mode = transcript.lock().pane_mode_name();
         assert_eq!(mode, Some(expected_mode), "command should enter mode");
     }
 }
@@ -2282,8 +2291,8 @@ fn queued_mode_tree_waits_for_deferred_windows_session_terminals() {
 
         let handler = RequestHandler::new();
         let alpha = SessionName::new("alpha").expect("valid session");
-        assert!(matches!(
-            handler
+        crate::session_fixture::assert_new_session(
+            &handler
                 .handle(Request::NewSession(NewSessionRequest {
                     session_name: alpha.clone(),
                     detached: true,
@@ -2291,8 +2300,7 @@ fn queued_mode_tree_waits_for_deferred_windows_session_terminals() {
                     environment: None,
                 }))
                 .await,
-            Response::NewSession(_)
-        ));
+        );
 
         let target = PaneTarget::with_window(alpha.clone(), 0, 0);
         {
@@ -2334,13 +2342,7 @@ fn queued_mode_tree_waits_for_deferred_windows_session_terminals() {
             .await;
         let state = handler.state.lock().await;
         let transcript = state.transcript_handle(&target).expect("target transcript");
-        assert_eq!(
-            transcript
-                .lock()
-                .expect("pane transcript mutex must not be poisoned")
-                .pane_mode_name(),
-            Some("tree-mode")
-        );
+        assert_eq!(transcript.lock().pane_mode_name(), Some("tree-mode"));
     });
 }
 
@@ -2349,8 +2351,8 @@ async fn mode_tree_temporarily_hides_modal_scrollbar_and_restores_copy_mode_geom
     let handler = RequestHandler::new();
     let alpha = SessionName::new("mode-tree-modal-stack").expect("valid session");
     let target = rmux_proto::PaneTarget::with_window(alpha.clone(), 0, 0);
-    assert!(matches!(
-        handler
+    crate::session_fixture::assert_new_session(
+        &handler
             .handle(Request::NewSession(NewSessionRequest {
                 session_name: alpha.clone(),
                 detached: true,
@@ -2358,8 +2360,7 @@ async fn mode_tree_temporarily_hides_modal_scrollbar_and_restores_copy_mode_geom
                 environment: None,
             }))
             .await,
-        Response::NewSession(_)
-    ));
+    );
     for (scope, option, value) in [
         (
             ScopeSelector::Session(alpha.clone()),
@@ -2435,7 +2436,6 @@ async fn mode_tree_temporarily_hides_modal_scrollbar_and_restores_copy_mode_geom
             .transcript_handle(&target)
             .expect("target transcript")
             .lock()
-            .expect("pane transcript mutex")
             .pane_mode_name(),
         Some("tree-mode")
     );
@@ -2457,8 +2457,8 @@ async fn choose_tree_zw_defers_parse_errors_until_accept() {
     let attach_pid = std::process::id();
     let alpha = SessionName::new("alpha").expect("valid session");
 
-    assert!(matches!(
-        handler
+    crate::session_fixture::assert_new_session(
+        &handler
             .handle(Request::NewSession(NewSessionRequest {
                 session_name: alpha.clone(),
                 detached: true,
@@ -2466,8 +2466,7 @@ async fn choose_tree_zw_defers_parse_errors_until_accept() {
                 environment: None,
             }))
             .await,
-        Response::NewSession(_)
-    ));
+    );
 
     let (control_tx, _control_rx) = mpsc::unbounded_channel();
     let _ = handler.register_attach(attach_pid, alpha, control_tx).await;
@@ -2854,7 +2853,6 @@ async fn mode_tree_dismisses_after_host_respawn_and_restores_zoom() {
             .transcript_handle(&PaneTarget::with_window(session_name.clone(), 0, 1))
             .expect("respawned transcript exists")
             .lock()
-            .expect("pane transcript mutex")
             .pane_mode_name(),
         None
     );
@@ -2938,7 +2936,6 @@ async fn mode_tree_dismisses_after_host_relink_and_restores_zoom() {
             .transcript_handle(&PaneTarget::with_window(session_name.clone(), 0, 1))
             .expect("relinked host transcript exists")
             .lock()
-            .expect("pane transcript mutex")
             .pane_mode_name(),
         None
     );
@@ -3057,7 +3054,6 @@ async fn mode_tree_dismisses_after_host_window_moves_between_sessions() {
             .transcript_handle(&fixture.moved_target)
             .expect("moved host transcript exists")
             .lock()
-            .expect("pane transcript mutex")
             .pane_mode_name(),
         None
     );
@@ -3176,7 +3172,6 @@ async fn mode_tree_dismisses_after_host_pane_renumber_without_rezooming() {
             .transcript_handle(&PaneTarget::with_window(session_name.clone(), 0, 0))
             .expect("renumbered host transcript exists")
             .lock()
-            .expect("pane transcript mutex")
             .pane_mode_name(),
         None
     );
@@ -3253,3 +3248,145 @@ async fn mode_tree_activation_rejects_a_same_pid_replacement_without_zoom_leak()
     assert_eq!(replacement.id, replacement_attach_id);
     assert!(replacement.mode_tree.is_none());
 }
+
+#[cfg(unix)]
+#[tokio::test]
+async fn buffer_editor_preserves_order_and_restores_the_chooser() {
+    buffer_editor_round_trip(0).await;
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn buffer_editor_consumes_legacy_send_keys() {
+    buffer_editor_round_trip(1).await;
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn buffer_editor_consumes_extended_send_keys() {
+    buffer_editor_round_trip(2).await;
+}
+
+#[cfg(unix)]
+async fn buffer_editor_round_trip(route: u32) {
+    let label = format!("buffer-editor-consumer-{route}");
+    let (handler, pid, _rx) = choose_buffer_action_fixture(&label, 984 + route).await;
+    let release = std::env::temp_dir().join(format!(
+        "rmux-editor-test-{}-{route}.go",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_file(&release);
+    let keep_id = choose_buffer_item_id(&handler, pid, "keep").await;
+    handler
+        .active_attach
+        .lock()
+        .await
+        .by_pid
+        .get_mut(&pid)
+        .unwrap()
+        .mode_tree
+        .as_mut()
+        .unwrap()
+        .selected_id = Some(keep_id);
+    let order = handler
+        .state
+        .lock()
+        .await
+        .buffers
+        .show_with_order(Some("keep"))
+        .unwrap()
+        .2;
+    handler
+        .state
+        .lock()
+        .await
+        .options
+        .set(
+            ScopeSelector::Global,
+            OptionName::Editor,
+            format!("/bin/sh -c 'while [ ! -f \"{}\" ]; do sleep 0.01; done; printf \"EDIT\\n\" > \"$1\"' editor", release.display()),
+            SetOptionMode::Replace,
+        )
+        .unwrap();
+    if route == 0 {
+        assert!(handler
+            .handle_mode_tree_key_event(pid, PromptInputEvent::Char('e'))
+            .await
+            .unwrap());
+    } else {
+        let target = PaneTarget::new(SessionName::new(label).unwrap(), 0);
+        let request = if route == 1 {
+            Request::SendKeys(rmux_proto::SendKeysRequest {
+                target,
+                keys: vec!["e".into()],
+            })
+        } else {
+            Request::SendKeysExt(rmux_proto::SendKeysExtRequest {
+                target: Some(target),
+                keys: vec!["e".into()],
+                expand_formats: false,
+                hex: false,
+                literal: false,
+                dispatch_key_table: false,
+                copy_mode_command: false,
+                forward_mouse_event: false,
+                reset_terminal: false,
+                repeat_count: None,
+            })
+        };
+        let response = handler.handle(request).await;
+        assert!(matches!(response, Response::SendKeys(_)), "{response:?}");
+    }
+    {
+        let clients = handler.active_attach.lock().await;
+        let active = &clients.by_pid[&pid];
+        assert!(
+            active.overlay.is_some() && active.mode_tree.is_some(),
+            "buffer editor must open its popup; overlay={:?}, mode={:?}",
+            active.overlay,
+            active.mode_tree
+        );
+    }
+    let identity = handler.active_attach.lock().await.by_pid[&pid].identity(pid);
+    assert!(
+        !handler.mode_tree_active_for_identity(identity).await,
+        "the popup receives attached input while retaining the chooser for cleanup"
+    );
+    std::fs::write(&release, b"go").unwrap();
+    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        loop {
+            if handler.state.lock().await.buffers.get("keep") == Some(b"EDIT".as_slice()) {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("editor output replaces the selected buffer");
+    std::fs::remove_file(release).unwrap();
+    assert_eq!(
+        handler
+            .state
+            .lock()
+            .await
+            .buffers
+            .show_with_order(Some("keep"))
+            .unwrap()
+            .2,
+        order
+    );
+    assert!(handler.mode_tree_active(pid).await);
+    assert!(handler
+        .active_attach
+        .lock()
+        .await
+        .by_pid
+        .get(&pid)
+        .unwrap()
+        .overlay
+        .is_none());
+}
+
+#[cfg(unix)]
+#[path = "buffer_editor_current.rs"]
+mod buffer_editor_current;

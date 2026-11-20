@@ -3,12 +3,18 @@ name: Release candidate shadow sealer
 on:
   workflow_dispatch:
     inputs:
+      candidate_profile:
+        description: Canonical main or permitted premerge evidence (never publication)
+        required: false
+        default: canonical
+        type: choice
+        options: [canonical, premerge-rehearsal-v1]
       candidate_run_id:
         description: Exact completed canonical candidate run ID to seal
         required: true
         type: string
       expected_source_sha:
-        description: Exact protected main SHA shared with the candidate
+        description: Exact protected main or permitted rehearsal SHA shared with the candidate
         required: true
         type: string
       release_intent_id:
@@ -40,6 +46,7 @@ jobs:
       actions: read
       contents: read
     env:
+      RMUX_CANDIDATE_PROFILE: ${{ inputs.candidate_profile }}
       RMUX_CANDIDATE_RUN_ID: ${{ inputs.candidate_run_id }}
       RMUX_EXPECTED_SOURCE_SHA: ${{ inputs.expected_source_sha }}
       RMUX_RELEASE_INTENT_ID: ${{ inputs.release_intent_id }}
@@ -56,16 +63,22 @@ jobs:
           [[ "$RMUX_PLANNED_RELEASE_REF" =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-rc\.[0-9]+)?$ ]]
           [[ "$RMUX_RELEASE_KIND" =~ ^(shadow|rc|stable)$ ]]
           test "$GITHUB_EVENT_NAME" = workflow_dispatch
-          test "$GITHUB_REF" = refs/heads/main
+          case "$RMUX_CANDIDATE_PROFILE" in
+            canonical) test "$GITHUB_REF" = refs/heads/main ;;
+            premerge-rehearsal-v1) test "$GITHUB_REF" = refs/heads/release/0.11.0 ;;
+            *) exit 1 ;;
+          esac
           test "$GITHUB_SHA" = "$RMUX_EXPECTED_SOURCE_SHA"
           test "$GITHUB_RUN_ATTEMPT" = 1
 
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
         with:
           ref: ${{ github.sha }}
+          fetch-depth: 2
           persist-credentials: false
 
       - name: Verify the exact completed candidate run
+        if: inputs.candidate_profile == 'canonical'
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
@@ -79,6 +92,7 @@ jobs:
             > "$RUNNER_TEMP/candidate-run-proof.json"
 
       - id: artifacts
+        if: inputs.candidate_profile == 'canonical'
         name: Resolve the exact eleven candidate artifacts
         env:
           GH_TOKEN: ${{ github.token }}
@@ -110,6 +124,7 @@ jobs:
           echo "artifact_ids=$artifact_ids" >> "$GITHUB_OUTPUT"
 
       - name: Download only the resolved artifact IDs
+        if: inputs.candidate_profile == 'canonical'
         uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
         with:
           artifact-ids: ${{ steps.artifacts.outputs.artifact_ids }}
@@ -119,6 +134,7 @@ jobs:
           run-id: ${{ inputs.candidate_run_id }}
 
       - id: identity
+        if: inputs.candidate_profile == 'canonical'
         name: Recover and bind the selected fast run ID
         shell: bash
         run: |
@@ -149,6 +165,7 @@ jobs:
           echo "fast_run_id=$fast_run_id" >> "$GITHUB_OUTPUT"
 
       - name: Verify every downloaded record, binding, and byte
+        if: inputs.candidate_profile == 'canonical'
         env:
           RMUX_FAST_RUN_ID: ${{ steps.identity.outputs.fast_run_id }}
         run: |
@@ -166,6 +183,7 @@ jobs:
             --output "$RUNNER_TEMP/verified-candidate-artifacts.json"
 
       - id: gh
+        if: inputs.candidate_profile == 'canonical'
         name: Install the pinned attestation verifier
         run: |
           set -euo pipefail
@@ -175,6 +193,7 @@ jobs:
           echo "binary=$install_root/gh" >> "$GITHUB_OUTPUT"
 
       - name: Verify every build-provenance signature offline
+        if: inputs.candidate_profile == 'canonical'
         env:
           GH_TOKEN: ${{ github.token }}
           RMUX_GH_BINARY: ${{ steps.gh.outputs.binary }}
@@ -185,6 +204,7 @@ jobs:
           "$RMUX_GH_BINARY"
 
       - name: Recompute the immutable policy root
+        if: inputs.candidate_profile == 'canonical'
         run: |
           set -euo pipefail
           scripts/release/policy-root.py \
@@ -192,6 +212,7 @@ jobs:
             --output "$RUNNER_TEMP/release-policy-root.json"
 
       - name: Seal and independently reproduce the candidate manifest
+        if: inputs.candidate_profile == 'canonical'
         shell: bash
         run: |
           set -euo pipefail
@@ -215,6 +236,7 @@ jobs:
           scripts/release/candidate-manifest.py verify "${common[@]}" --manifest "$manifest"
 
       - name: Persist only the non-authoritative shadow evidence
+        if: inputs.candidate_profile == 'canonical'
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         with:
           name: rmux-candidate-manifest-${{ inputs.candidate_run_id }}
@@ -226,3 +248,11 @@ jobs:
           if-no-files-found: error
           retention-days: 7
           compression-level: 0
+
+      - name: Seal the bounded premerge rehearsal
+        if: inputs.candidate_profile == 'premerge-rehearsal-v1'
+        uses: ./.github/actions/premerge-rehearsal
+        env:
+          RMUX_REHEARSAL_STAGE: seal
+          RMUX_REHEARSAL_PERMIT: ${{ vars.RMUX_PREMERGE_REHEARSAL_PERMIT }}
+          RMUX_REHEARSAL_PERMIT_FILE: ${{ runner.temp }}/rehearsal-permit.json

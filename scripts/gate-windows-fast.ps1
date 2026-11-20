@@ -9,6 +9,7 @@ param(
 Set-StrictMode -Version Latest
 $ErrorActionPreference = "Stop"
 
+
 function Fail([string]$Message) {
     Write-Error "error: $Message"
     exit 1
@@ -50,6 +51,25 @@ if ($TestThreads -lt 1) {
 
 $repoRoot = Split-Path -Parent $PSScriptRoot
 Set-Location $repoRoot
+if (-not $env:RMUX_IDENTITY_HEAD) {
+    $python = if ($env:RMUX_PYTHON) { $env:RMUX_PYTHON } else { 'python3' }
+    $forward = @('-Target', $Target, '-TestThreads', [string]$TestThreads)
+    foreach ($name in @('SkipDoc', 'SourceGates', 'InstallNextest')) {
+        if (Get-Variable -Name $name -ValueOnly) { $forward += "-$name" }
+    }
+    & $python (Join-Path $PSScriptRoot 'candidate_identity.py') with -- (Get-Process -Id $PID).Path -NoProfile -File $PSCommandPath @forward
+    exit $LASTEXITCODE
+}
+
+$identityPython = if ($env:RMUX_PYTHON) { $env:RMUX_PYTHON } else { 'python3' }
+& $identityPython (Join-Path $PSScriptRoot 'candidate_identity.py') validate-gate
+if ($LASTEXITCODE) { exit $LASTEXITCODE }
+. (Join-Path $PSScriptRoot 'conpty/candidate-runtime.ps1') -Stage (Join-Path $env:RMUX_IDENTITY_TARGET 'conpty-runtime') -Target $Target
+Initialize-CandidateConptyRuntime $Target
+Run-Step 'candidate identity regression' { & $identityPython -m unittest discover -s scripts -p 'test_candidate*.py' }
+Run-Step 'publication identity regression' { & $identityPython -B -m unittest discover -s scripts/release -p 'test_publication*.py' }
+# Before Cargo, as in gate-unix-fast.sh, so an unlisted file fails in seconds.
+Run-Step 'release policy coverage' { & $identityPython -B -m unittest discover -s scripts -p test_release_policy_coverage.py }
 $assertCargoFilter = Join-Path $PSScriptRoot "assert-cargo-filter-nonempty.ps1"
 
 Remove-Item Env:\RUST_TEST_THREADS -ErrorAction SilentlyContinue
@@ -75,7 +95,13 @@ Write-Host "[gate] cargo_build_jobs=$env:CARGO_BUILD_JOBS"
 Write-Host "[gate] cargo_incremental=$env:CARGO_INCREMENTAL"
 
 Run-Step "cargo fmt" { cargo fmt --all --check }
+Run-Step 'feature compilation gate regression' { & $identityPython -m unittest discover -s scripts -p test_feature_powerset.py }
+Run-Step 'workspace and isolated feature powerset' { & $identityPython scripts/check_feature_powerset.py --target $Target }
 Run-Step "cargo clippy" { cargo clippy --workspace --all-targets --locked --target $Target -- -D warnings }
+Run-Step 'closed-line regression registry' {
+    & $identityPython scripts/regression_registry.py --platform windows
+    if ($LASTEXITCODE) { exit $LASTEXITCODE }
+}
 Run-Step "cargo filter nonempty rmux-client output writer" {
     & $assertCargoFilter 1 -- test -p rmux-client --locked output_writer_failure_wakes
 }
@@ -101,12 +127,20 @@ if (Has-Nextest) {
     }
 }
 
+Run-Step "queue inventory regression" {
+    & $identityPython -B -m unittest discover -s scripts/queue-inventory -p test_inventory.py
+}
+Run-Step "queue limits and referenced tests" {
+    & $identityPython -B scripts/queue-inventory/check_inventory.py --source . --execute --target $Target
+}
+
 if (-not $SkipDoc) {
     Run-Step "cargo doc tests" { cargo test --workspace --doc --locked --target $Target }
     Run-Step "cargo doc" { cargo doc --workspace --locked --no-deps --target $Target }
 }
 
 if ($SourceGates) {
+    Run-Step "release documentation allowlist" { & $identityPython scripts/release_docs_allowlist.py }
     if (-not (Has-Command "bash")) {
         Fail "-SourceGates requires bash in PATH"
     }

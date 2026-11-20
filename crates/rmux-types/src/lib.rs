@@ -3,6 +3,9 @@
 
 //! Portable semantic newtypes shared by non-adjacent RMUX crates.
 
+pub mod identity;
+pub use identity::{PaneId, SessionId, SessionName, SessionNameError, WindowId};
+
 /// A terminal geometry request.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]

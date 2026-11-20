@@ -26,8 +26,8 @@ async fn linked_occurrence_fixture(
     attach_pid_offset: u32,
 ) -> LinkedOccurrenceFixture {
     let session_name = SessionName::new(label).expect("valid session");
-    assert!(matches!(
-        handler
+    crate::session_fixture::assert_new_session(
+        &handler
             .handle(Request::NewSession(NewSessionRequest {
                 session_name: session_name.clone(),
                 detached: true,
@@ -35,8 +35,7 @@ async fn linked_occurrence_fixture(
                 environment: None,
             }))
             .await,
-        Response::NewSession(_)
-    ));
+    );
     link_replacement_occurrence(handler, &session_name).await;
 
     let (session_id, window_id, pane_id, pane_output_generation, old_occurrence_id) = {

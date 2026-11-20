@@ -23,8 +23,10 @@ use super::control::{
     apply_pending_attach_controls, coalesce_render_switches, preserves_live_output,
     PendingAttachAction, PendingAttachInputState,
 };
+use super::deferred_passthrough::{DeferredPassthroughQueue, PaneOutputGeneration};
 use super::exit_log::AttachExitReason;
 use super::pending_escape::PendingEscapeFlush;
+use super::refresh_scheduler::AttachRefreshScheduler;
 use super::wire::open_attach_target;
 use super::wire::recv_pane_output;
 use super::{
@@ -41,7 +43,11 @@ use crate::handler::RequestHandler;
 use crate::outer_terminal::{OuterTerminal, OuterTerminalContext};
 use crate::renderer::PaneRenderDeltaFrame;
 
+mod attach_eof;
 mod persistent_overlay;
+mod popup_cursor_delta;
+mod server_exit;
+mod synchronized_passthrough;
 
 async fn dispatch_live_attach_data_for_test(
     live_input: LiveAttachInputContext,
@@ -88,7 +94,7 @@ async fn forward_attach_resize_during_command_prompt_keeps_exact_identity_alive(
             environment: None,
         }))
         .await;
-    assert!(matches!(created, Response::NewSession(_)), "{created:?}");
+    crate::session_fixture::assert_new_session(&created);
     let (control_tx, control_rx) = mpsc::unbounded_channel();
     handler
         .register_attach(attach_pid, session_name.clone(), control_tx)
@@ -180,7 +186,7 @@ async fn create_attach_input_test_session(handler: &RequestHandler, name: &str) 
             environment: None,
         }))
         .await;
-    assert!(matches!(created, Response::NewSession(_)), "{created:?}");
+    crate::session_fixture::assert_new_session(&created);
     handler.start_attached_input_capture_for_test(&target).await;
     target
 }
@@ -382,7 +388,7 @@ async fn unlock_flushes_resume_output_before_following_blocking_keystroke() {
             environment: None,
         }))
         .await;
-    assert!(matches!(created, Response::NewSession(_)), "{created:?}");
+    crate::session_fixture::assert_new_session(&created);
     let bound = handler
         .handle(Request::BindKey(Box::new(BindKeyRequest {
             table_name: "unlock-output-barrier".to_owned(),
@@ -579,7 +585,7 @@ async fn pending_escape_socket_fixture(
             environment: None,
         }))
         .await;
-    assert!(matches!(created, Response::NewSession(_)));
+    crate::session_fixture::assert_new_session(&created);
     let (control_tx, control_rx) = mpsc::unbounded_channel();
     handler
         .register_attach(attach_pid, session_name, control_tx)
@@ -631,6 +637,10 @@ async fn current_attach_target(
 
 impl PendingEscapeSchedulerFixture {
     async fn start(session: &str) -> Self {
+        Self::start_with_escape_time(session, "500").await
+    }
+
+    async fn start_with_escape_time(session: &str, escape_time: &str) -> Self {
         let handler = Arc::new(RequestHandler::new());
         let attach_pid = std::process::id();
         let session_name = SessionName::new(session).expect("valid session name");
@@ -643,7 +653,7 @@ impl PendingEscapeSchedulerFixture {
                 environment: None,
             }))
             .await;
-        assert!(matches!(created, Response::NewSession(_)), "{created:?}");
+        crate::session_fixture::assert_new_session(&created);
         handler
             .wait_for_pane_startup_to_finish_for_test(&target)
             .await;
@@ -651,7 +661,7 @@ impl PendingEscapeSchedulerFixture {
             .handle(Request::SetOption(rmux_proto::SetOptionRequest {
                 scope: rmux_proto::ScopeSelector::Global,
                 option: rmux_proto::OptionName::EscapeTime,
-                value: "500".to_owned(),
+                value: escape_time.to_owned(),
                 mode: rmux_proto::SetOptionMode::Replace,
             }))
             .await;
@@ -747,6 +757,32 @@ impl PendingEscapeSchedulerFixture {
         }
     }
 
+    /// Waits on paused Tokio time, stepping the clock 1 ms per poll, so a
+    /// regression fails after two virtual seconds instead of hanging.
+    async fn wait_for_capture_on_paused_clock(
+        &self,
+        matches: impl Fn(&[u8]) -> bool,
+        label: &str,
+    ) -> Vec<u8> {
+        let started = Instant::now();
+        loop {
+            let captured = self
+                .handler
+                .attached_input_capture_for_test(&self.target)
+                .await
+                .expect("input capture remains installed");
+            if matches(&captured) {
+                return captured;
+            }
+            assert!(
+                started.elapsed() < Duration::from_secs(2),
+                "timed out waiting for {label}; capture={captured:?}, attach_finished={}",
+                self.task.is_finished()
+            );
+            step_paused_clock(Duration::from_millis(1)).await;
+        }
+    }
+
     async fn finish(self) {
         self.shutdown.send(()).expect("request attach shutdown");
         assert!(self.task.await.expect("attach task join").is_ok());
@@ -759,6 +795,19 @@ impl PendingEscapeSchedulerFixture {
             .expect("prefix-d must detach after retained input expires")
             .expect("attach task join");
         assert!(result.is_ok(), "attach exits cleanly after prefix-d");
+    }
+}
+
+/// Advances paused Tokio time in 1 ms steps. Each step yields, so attach
+/// tasks run between steps even when they never go idle: a busy regression
+/// fails on its virtual bound instead of stopping a clock that only
+/// auto-advances when every task is idle.
+async fn step_paused_clock(duration: Duration) {
+    let step = Duration::from_millis(1);
+    let mut stepped = Duration::ZERO;
+    while stepped < duration {
+        tokio::time::advance(step).await;
+        stepped += step;
     }
 }
 
@@ -828,11 +877,19 @@ async fn modal_dcs_leader_expires_and_restores_prefix_detach() {
     fixture.send(AttachMessage::Data(b"\x1bP".to_vec())).await;
 
     // ESC P is both Meta-P and the 7-bit DCS leader. It must use the
-    // configured keyboard escape-time rather than stay opaque forever.
+    // configured keyboard escape-time rather than stay opaque forever. At the
+    // escape time tmux 3.7b reads it as M-P, which the prompt ignores: nothing
+    // reaches the pane, and a later lone Escape still closes the prompt, so
+    // the text typed after it reaches the pane.
+    let past_escape_time = Duration::from_millis(1_500);
+    tokio::time::sleep(past_escape_time).await;
+    fixture.send(AttachMessage::Data(b"\x1b".to_vec())).await;
+    tokio::time::sleep(past_escape_time).await;
+    fixture.send(AttachMessage::Data(b"x".to_vec())).await;
     fixture
         .wait_for_capture(
-            |captured| captured == b"P",
-            "DCS remainder after prompt cancellation",
+            |captured| captured == b"x",
+            "text after the prompt that ESC P left open",
         )
         .await;
     fixture.detach().await;
@@ -842,6 +899,10 @@ async fn modal_dcs_leader_expires_and_restores_prefix_detach() {
 async fn modal_c1_dcs_leader_expires_and_releases_later_input() {
     let mut fixture = PendingEscapeSchedulerFixture::start("modal-c1-dcs-deadline").await;
     fixture.activate_prompt().await;
+    // Both escape-time deadlines run on paused Tokio time, stepped by the
+    // test and also read by the product, so host load cannot outlast the 2 s
+    // wait or the 750 ms margin; the detach keeps its wall-clock bound.
+    tokio::time::pause();
     fixture
         .send(AttachMessage::Keystroke(AttachedKeystroke::new(vec![0x90])))
         .await;
@@ -850,11 +911,47 @@ async fn modal_c1_dcs_leader_expires_and_releases_later_input() {
     // must be bounded. Once flushed, a later Escape can reach and close the
     // prompt instead of being absorbed into the abandoned DCS body.
     fixture
-        .wait_for_capture(|captured| captured == [0x90], "timed-out C1 DCS leader")
+        .wait_for_capture_on_paused_clock(|captured| captured == [0x90], "timed-out C1 DCS leader")
         .await;
     fixture.send(AttachMessage::Data(b"\x1b".to_vec())).await;
-    tokio::time::sleep(Duration::from_millis(750)).await;
+    step_paused_clock(Duration::from_millis(750)).await;
+    tokio::time::resume();
     fixture.detach().await;
+}
+
+#[tokio::test]
+async fn prompt_keeps_a_split_palette_response_while_its_query_is_active() {
+    // tmux 3.7b (tty-keys.c:979-985) waits max(escape-time, 500 ms) for a
+    // partial key while a pane's palette query is unanswered. A response split
+    // 300 ms apart, after ESC or after its OSC 4 opener, must reach the pane
+    // under an open prompt instead of being read as typed keys at escape-time.
+    let mut fixture =
+        PendingEscapeSchedulerFixture::start_with_escape_time("palette-query-deadline", "10").await;
+    fixture.activate_prompt().await;
+    let response = b"\x1b]4;1;rgb:1111/2222/3333\x07";
+    tokio::time::pause();
+    for (round, split) in [1, b"\x1b]4;1;rgb:".len()].into_iter().enumerate() {
+        fixture
+            .handler
+            .append_pane_output_for_test(&fixture.target, b"\x1b]4;1;?\x07")
+            .await;
+        fixture
+            .send(AttachMessage::Data(response[..split].to_vec()))
+            .await;
+        step_paused_clock(Duration::from_millis(300)).await;
+        fixture
+            .send(AttachMessage::Data(response[split..].to_vec()))
+            .await;
+        let expected = response.repeat(round + 1);
+        fixture
+            .wait_for_capture_on_paused_clock(
+                |captured| captured == expected.as_slice(),
+                "palette response split while its query is active",
+            )
+            .await;
+    }
+    tokio::time::resume();
+    fixture.finish().await;
 }
 
 async fn assert_fragmented_meta_control_promotes_to_streaming_deadline(
@@ -960,50 +1057,65 @@ async fn invalid_meta_byte_deadline_covers_data_and_windows_keystroke_frames() {
     .await;
 }
 
-async fn assert_invalid_csi_body_is_forwarded_without_retention(
+async fn assert_interrupted_csi_reaches_its_boundary(
     session: &str,
     input: AttachMessage,
+    expected: &[u8],
 ) {
     let mut fixture = PendingEscapeSchedulerFixture::start(session).await;
     fixture.send(input).await;
     let captured = fixture
-        .wait_for_capture(
-            |captured| captured == b"A\x1b[1\r",
-            "invalid CSI body forwarding",
-        )
+        .wait_for_capture(|captured| captured == expected, "interrupted CSI boundary")
         .await;
-    assert_eq!(captured, b"A\x1b[1\r");
+    assert_eq!(captured, expected);
     fixture.finish().await;
 }
 
 #[tokio::test]
 async fn invalid_csi_body_cannot_be_retained_without_a_deadline() {
-    assert_invalid_csi_body_is_forwarded_without_retention(
-        "invalid-csi-body-data",
-        AttachMessage::Data(b"A\x1b[1\r".to_vec()),
-    )
-    .await;
-    assert_invalid_csi_body_is_forwarded_without_retention(
-        "invalid-csi-body-keystroke",
-        AttachMessage::Keystroke(AttachedKeystroke::new(b"A\x1b[1\r".to_vec())),
-    )
-    .await;
+    // A-BOUNDS rejects a recognized numerical Kitty candidate at the control
+    // boundary. The private CSI namespace retains its separate legacy route.
+    for (label, input, expected) in [
+        ("numeric", b"A\x1b[1\r".as_slice(), b"A\r".as_slice()),
+        ("foreign", b"A\x1b[?1\r", b"A\x1b[?1\r"),
+    ] {
+        for (path, message) in [
+            ("data", AttachMessage::Data(input.to_vec())),
+            (
+                "keystroke",
+                AttachMessage::Keystroke(AttachedKeystroke::new(input.to_vec())),
+            ),
+        ] {
+            assert_interrupted_csi_reaches_its_boundary(
+                &format!("interrupted-csi-{label}-{path}"),
+                message,
+                expected,
+            )
+            .await;
+        }
+    }
 }
 
 #[tokio::test]
 async fn sustained_ready_socket_serves_the_initial_ambiguous_csi_deadline() {
     let mut fixture = PendingEscapeSchedulerFixture::start("sustained-ready-csi-deadline").await;
+    // Paused Tokio time, which the deadline also reads: each round below keeps
+    // the socket readable and steps the clock exactly 1 ms, so host load can
+    // no longer spend the 300 ms between `u` and the bound, while the attach
+    // loop still has to serve the deadline with input always ready.
+    tokio::time::pause();
     fixture
         .send(AttachMessage::Data(b"A\x1b[12;".to_vec()))
         .await;
     fixture
-        .wait_for_capture(|captured| captured == b"A", "ambiguous CSI retention")
+        .wait_for_capture_on_paused_clock(|captured| captured == b"A", "ambiguous CSI retention")
         .await;
 
     // Keep producing immediately readable frames for longer than escape-time.
     // The attach loop must still service the original ambiguity deadline.
     let empty = AttachMessage::Data(Vec::new());
     let started = Instant::now();
+    let mut sent_after_deadline = false;
     let captured = tokio::time::timeout(Duration::from_millis(900), async {
         loop {
             fixture
@@ -1018,21 +1130,29 @@ async fn sustained_ready_socket_serves_the_initial_ambiguous_csi_deadline() {
                     empty.clone(),
                 ])
                 .await;
-            tokio::task::yield_now().await;
+            step_paused_clock(Duration::from_millis(1)).await;
+            // Expiry discards the numerical candidate under A-BOUNDS. A
+            // single subsequent `u` must therefore be ordinary input, not its
+            // swallowed terminator, even while the socket stays readable.
+            if !sent_after_deadline && started.elapsed() >= Duration::from_millis(600) {
+                fixture.send(AttachMessage::Data(b"u".to_vec())).await;
+                sent_after_deadline = true;
+            }
             let captured = fixture
                 .handler
                 .attached_input_capture_for_test(&fixture.target)
                 .await
                 .expect("input capture remains installed");
-            if captured == b"A\x1b[12;" {
+            if captured == b"Au" {
                 break captured;
             }
         }
     })
     .await
     .expect("continuously ready socket must not starve the CSI deadline");
-    assert_eq!(captured, b"A\x1b[12;");
+    assert_eq!(captured, b"Au");
     assert!(started.elapsed() < Duration::from_millis(900));
+    tokio::time::resume();
     fixture.finish().await;
 }
 
@@ -1601,7 +1721,7 @@ async fn typed_keystroke_wire_reaches_stub_and_acknowledges() {
             environment: None,
         }))
         .await;
-    assert!(matches!(created, Response::NewSession(_)));
+    crate::session_fixture::assert_new_session(&created);
     let (control_tx, _control_rx) = mpsc::unbounded_channel();
     handler
         .register_attach(attach_pid, session_name, control_tx)
@@ -1661,7 +1781,7 @@ async fn mouse_keystroke_wire_does_not_error_or_drop_the_attach() {
             environment: None,
         }))
         .await;
-    assert!(matches!(created, Response::NewSession(_)));
+    crate::session_fixture::assert_new_session(&created);
 
     let (control_tx, _control_rx) = mpsc::unbounded_channel();
     handler
@@ -1722,7 +1842,7 @@ async fn data_payload_does_not_trust_an_unversioned_cached_pane_master() {
             environment: None,
         }))
         .await;
-    assert!(matches!(created, Response::NewSession(_)));
+    crate::session_fixture::assert_new_session(&created);
     let (control_tx, _control_rx) = mpsc::unbounded_channel();
     handler
         .register_attach(attach_pid, session_name.clone(), control_tx)
@@ -1781,7 +1901,7 @@ async fn forward_attach_emits_stop_sequence_when_processing_errors() {
         render_frame: Vec::new(),
         outer_terminal,
         client_title: None,
-        cursor_style: 0,
+        cursor_style: 0.into(),
         active_pane_geometry: PaneGeometry::new(0, 0, 80, 24),
         raw_passthrough: false,
         kitty_graphics_passthrough: false,
@@ -1850,7 +1970,7 @@ async fn detach_control_emits_stop_and_banner_in_one_data_frame() {
     let expected_stop = current_target.outer_terminal.attach_stop_sequence();
     let mut render_generation = 0_u64;
     let mut overlay_generation = 0_u64;
-    let mut persistent_overlay = None::<Vec<u8>>;
+    let mut persistent_overlay = None;
     let mut persistent_overlay_visible = false;
     let mut persistent_overlay_state_id = current_target.persistent_overlay_state_id;
     let mut locked = false;
@@ -1861,12 +1981,16 @@ async fn detach_control_emits_stop_and_banner_in_one_data_frame() {
         .expect("send detach control");
 
     let control_backlog = AtomicUsize::new(0);
+    let mut deferred_passthroughs = DeferredPassthroughQueue::default();
+    let mut pane_refresh = AttachRefreshScheduler::default();
     let action = apply_pending_attach_controls(
         &mut deferred_controls,
         Some(&mut control_rx),
         &control_backlog,
         &mut current_target,
         &stream,
+        &mut deferred_passthroughs,
+        &mut pane_refresh,
         &mut render_generation,
         &mut overlay_generation,
         &mut persistent_overlay,
@@ -1904,6 +2028,10 @@ async fn detach_control_emits_stop_and_banner_in_one_data_frame() {
             .any(|window| window == b"[detached (from session alpha)]\r\n"),
         "detach data must contain detached banner"
     );
+    assert_attach_stop_restores_cursor_before_banner(
+        &bytes,
+        b"[detached (from session alpha)]\r\n",
+    );
 }
 
 #[tokio::test]
@@ -1917,7 +2045,7 @@ async fn lock_control_emits_attach_stop_before_transferring_terminal_ownership()
     let expected_stop = current_target.outer_terminal.attach_stop_sequence();
     let mut render_generation = 0_u64;
     let mut overlay_generation = 0_u64;
-    let mut persistent_overlay = None::<Vec<u8>>;
+    let mut persistent_overlay = None;
     let mut persistent_overlay_visible = false;
     let mut persistent_overlay_state_id = current_target.persistent_overlay_state_id;
     let mut locked = false;
@@ -1932,12 +2060,16 @@ async fn lock_control_emits_attach_stop_before_transferring_terminal_ownership()
         .expect("send lock control");
 
     let control_backlog = AtomicUsize::new(0);
+    let mut deferred_passthroughs = DeferredPassthroughQueue::default();
+    let mut pane_refresh = AttachRefreshScheduler::default();
     let action = apply_pending_attach_controls(
         &mut deferred_controls,
         Some(&mut control_rx),
         &control_backlog,
         &mut current_target,
         &stream,
+        &mut deferred_passthroughs,
+        &mut pane_refresh,
         &mut render_generation,
         &mut overlay_generation,
         &mut persistent_overlay,
@@ -2035,7 +2167,7 @@ fn test_attach_target_with_protocols(
             OuterTerminalContext::default(),
         ),
         client_title: None,
-        cursor_style: 0,
+        cursor_style: 0.into(),
         active_pane_geometry: PaneGeometry::new(0, 0, 80, 24),
         raw_passthrough: kitty_graphics_passthrough || sixel_passthrough,
         kitty_graphics_passthrough,
@@ -2234,7 +2366,7 @@ async fn pending_switch_action_reports_target_change_for_status_reschedule() {
         .expect("open target");
     let mut render_generation = 0_u64;
     let mut overlay_generation = 0_u64;
-    let mut persistent_overlay = None::<Vec<u8>>;
+    let mut persistent_overlay = None;
     let mut persistent_overlay_visible = false;
     let mut persistent_overlay_state_id = current_target.persistent_overlay_state_id;
     let mut locked = false;
@@ -2247,12 +2379,16 @@ async fn pending_switch_action_reports_target_change_for_status_reschedule() {
         .expect("send switch control");
 
     let control_backlog = AtomicUsize::new(0);
+    let mut deferred_passthroughs = DeferredPassthroughQueue::default();
+    let mut pane_refresh = AttachRefreshScheduler::default();
     let action = apply_pending_attach_controls(
         &mut deferred_controls,
         Some(&mut control_rx),
         &control_backlog,
         &mut current_target,
         &stream,
+        &mut deferred_passthroughs,
+        &mut pane_refresh,
         &mut render_generation,
         &mut overlay_generation,
         &mut persistent_overlay,
@@ -2289,7 +2425,7 @@ async fn pending_refresh_after_switch_preserves_target_change() {
         .expect("open target");
     let mut render_generation = 0_u64;
     let mut overlay_generation = 0_u64;
-    let mut persistent_overlay = None::<Vec<u8>>;
+    let mut persistent_overlay = None;
     let mut persistent_overlay_visible = false;
     let mut persistent_overlay_state_id = current_target.persistent_overlay_state_id;
     let mut locked = false;
@@ -2305,12 +2441,16 @@ async fn pending_refresh_after_switch_preserves_target_change() {
         .expect("send refresh control");
 
     let control_backlog = AtomicUsize::new(0);
+    let mut deferred_passthroughs = DeferredPassthroughQueue::default();
+    let mut pane_refresh = AttachRefreshScheduler::default();
     let action = apply_pending_attach_controls(
         &mut deferred_controls,
         Some(&mut control_rx),
         &control_backlog,
         &mut current_target,
         &stream,
+        &mut deferred_passthroughs,
+        &mut pane_refresh,
         &mut render_generation,
         &mut overlay_generation,
         &mut persistent_overlay,
@@ -2325,7 +2465,8 @@ async fn pending_refresh_after_switch_preserves_target_change() {
     assert!(matches!(
         action,
         PendingAttachAction::Refresh {
-            target_changed: true
+            target_changed: true,
+            source_invalidated: true,
         }
     ));
     assert_eq!(current_target.session_name, beta);
@@ -2350,7 +2491,7 @@ async fn pending_same_pane_switch_preserves_partial_input_and_escape_deadline() 
     .expect("open target");
     let mut render_generation = 0_u64;
     let mut overlay_generation = 0_u64;
-    let mut persistent_overlay = None::<Vec<u8>>;
+    let mut persistent_overlay = None;
     let mut persistent_overlay_visible = false;
     let mut persistent_overlay_state_id = current_target.persistent_overlay_state_id;
     let mut locked = false;
@@ -2365,12 +2506,16 @@ async fn pending_same_pane_switch_preserves_partial_input_and_escape_deadline() 
     )]);
 
     let control_backlog = AtomicUsize::new(0);
+    let mut deferred_passthroughs = DeferredPassthroughQueue::default();
+    let mut pane_refresh = AttachRefreshScheduler::default();
     let action = apply_pending_attach_controls(
         &mut deferred_controls,
         Some(&mut control_rx),
         &control_backlog,
         &mut current_target,
         &stream,
+        &mut deferred_passthroughs,
+        &mut pane_refresh,
         &mut render_generation,
         &mut overlay_generation,
         &mut persistent_overlay,
@@ -2400,7 +2545,7 @@ async fn pending_different_pane_switch_clears_partial_input_and_escape_deadline(
         .expect("open target");
     let mut render_generation = 0_u64;
     let mut overlay_generation = 0_u64;
-    let mut persistent_overlay = None::<Vec<u8>>;
+    let mut persistent_overlay = None;
     let mut persistent_overlay_visible = false;
     let mut persistent_overlay_state_id = current_target.persistent_overlay_state_id;
     let mut locked = false;
@@ -2412,12 +2557,16 @@ async fn pending_different_pane_switch_clears_partial_input_and_escape_deadline(
     ))]);
 
     let control_backlog = AtomicUsize::new(0);
+    let mut deferred_passthroughs = DeferredPassthroughQueue::default();
+    let mut pane_refresh = AttachRefreshScheduler::default();
     apply_pending_attach_controls(
         &mut deferred_controls,
         Some(&mut control_rx),
         &control_backlog,
         &mut current_target,
         &stream,
+        &mut deferred_passthroughs,
+        &mut pane_refresh,
         &mut render_generation,
         &mut overlay_generation,
         &mut persistent_overlay,
@@ -2459,7 +2608,7 @@ async fn terminal_ownership_controls_clear_partial_input_and_escape_deadline() {
                 .expect("open target");
         let mut render_generation = 0_u64;
         let mut overlay_generation = 0_u64;
-        let mut persistent_overlay = None::<Vec<u8>>;
+        let mut persistent_overlay = None;
         let mut persistent_overlay_visible = false;
         let mut persistent_overlay_state_id = current_target.persistent_overlay_state_id;
         let mut locked = false;
@@ -2470,12 +2619,16 @@ async fn terminal_ownership_controls_clear_partial_input_and_escape_deadline() {
         let mut deferred_controls = VecDeque::from([control]);
 
         let control_backlog = AtomicUsize::new(0);
+        let mut deferred_passthroughs = DeferredPassthroughQueue::default();
+        let mut pane_refresh = AttachRefreshScheduler::default();
         let action = apply_pending_attach_controls(
             &mut deferred_controls,
             Some(&mut control_rx),
             &control_backlog,
             &mut current_target,
             &stream,
+            &mut deferred_passthroughs,
+            &mut pane_refresh,
             &mut render_generation,
             &mut overlay_generation,
             &mut persistent_overlay,
@@ -2515,7 +2668,7 @@ async fn stale_persistent_switches_still_advance_render_generation() {
             .expect("open target");
     let mut render_generation = 41_u64;
     let mut overlay_generation = 0_u64;
-    let mut persistent_overlay = None::<Vec<u8>>;
+    let mut persistent_overlay = None;
     let mut persistent_overlay_visible = false;
     let mut persistent_overlay_state_id = current_target.persistent_overlay_state_id;
     let mut locked = false;
@@ -2530,12 +2683,16 @@ async fn stale_persistent_switches_still_advance_render_generation() {
         .expect("send stale switch control");
 
     let control_backlog = AtomicUsize::new(0);
+    let mut deferred_passthroughs = DeferredPassthroughQueue::default();
+    let mut pane_refresh = AttachRefreshScheduler::default();
     let action = apply_pending_attach_controls(
         &mut deferred_controls,
         Some(&mut control_rx),
         &control_backlog,
         &mut current_target,
         &stream,
+        &mut deferred_passthroughs,
+        &mut pane_refresh,
         &mut render_generation,
         &mut overlay_generation,
         &mut persistent_overlay,
@@ -2568,7 +2725,7 @@ async fn render_only_switch_forwards_pending_live_passthroughs() {
     let mut current_target = open_attach_target(initial, false).expect("open target");
     let mut render_generation = 0_u64;
     let mut overlay_generation = 0_u64;
-    let mut persistent_overlay = None::<Vec<u8>>;
+    let mut persistent_overlay = None;
     let mut persistent_overlay_visible = false;
     let mut persistent_overlay_state_id = current_target.persistent_overlay_state_id;
     let mut locked = false;
@@ -2598,12 +2755,16 @@ async fn render_only_switch_forwards_pending_live_passthroughs() {
         .expect("send render-only switch");
 
     let control_backlog = AtomicUsize::new(0);
+    let mut deferred_passthroughs = DeferredPassthroughQueue::default();
+    let mut pane_refresh = AttachRefreshScheduler::default();
     let action = apply_pending_attach_controls(
         &mut deferred_controls,
         Some(&mut control_rx),
         &control_backlog,
         &mut current_target,
         &stream,
+        &mut deferred_passthroughs,
+        &mut pane_refresh,
         &mut render_generation,
         &mut overlay_generation,
         &mut persistent_overlay,
@@ -2659,6 +2820,30 @@ async fn read_attach_data_until(peer: &mut tokio::net::UnixStream, needle: &[u8]
     })
     .await
     .expect("timed out waiting for attach data")
+}
+
+fn assert_attach_stop_restores_cursor_before_banner(bytes: &[u8], banner: &[u8]) {
+    const ALTERNATE_SCREEN_EXIT: &[u8] = b"\x1b[?1049l";
+    const SHOW_CURSOR: &[u8] = b"\x1b[?25h";
+
+    let banner_start = bytes
+        .windows(banner.len())
+        .position(|window| window == banner)
+        .expect("attach stop banner must be present");
+    let stop = &bytes[..banner_start];
+    let alternate_exit_start = stop
+        .windows(ALTERNATE_SCREEN_EXIT.len())
+        .rposition(|window| window == ALTERNATE_SCREEN_EXIT)
+        .expect("attach stop must exit the alternate screen");
+
+    assert!(
+        stop.ends_with(SHOW_CURSOR),
+        "attach stop must make the outer-terminal cursor visible immediately before its banner: {stop:?}"
+    );
+    assert!(
+        alternate_exit_start + ALTERNATE_SCREEN_EXIT.len() <= stop.len() - SHOW_CURSOR.len(),
+        "attach stop must make the outer-terminal cursor visible after exiting the alternate screen: {stop:?}"
+    );
 }
 
 #[tokio::test]
@@ -2762,6 +2947,7 @@ async fn forward_attach_exited_control_wins_over_closing_shutdown() {
     shutdown_tx.send(()).expect("request attach shutdown");
 
     let exited = read_attach_data_until(&mut peer, b"[exited]\r\n").await;
+    assert_attach_stop_restores_cursor_before_banner(&exited, b"[exited]\r\n");
     assert!(
         exited
             .windows(b"[exited]\r\n".len())
@@ -2977,7 +3163,7 @@ async fn last_session_exit_waits_for_attach_wire_drain_before_daemon_shutdown() 
             environment: None,
         }))
         .await;
-    assert!(matches!(created, Response::NewSession(_)), "{created:?}");
+    crate::session_fixture::assert_new_session(&created);
     let (daemon_shutdown, mut daemon_shutdown_rx) = ShutdownHandle::new();
     handler.install_shutdown_handle(daemon_shutdown);
     let forwarder_guard = handler.begin_attach_forwarder();
@@ -3204,7 +3390,7 @@ async fn finish_attach_exit_forwards_an_already_dequeued_batch_before_banner() {
         false,
     )
     .expect("open attach target");
-    let mut deferred_passthroughs = Vec::new();
+    let mut deferred_passthroughs = DeferredPassthroughQueue::default();
 
     finish_pending_attach_exit_with_batch(
         AttachExitReason::AttachControlExited,
@@ -3212,6 +3398,7 @@ async fn finish_attach_exit_forwards_an_already_dequeued_batch_before_banner() {
         &mut current_target,
         &mut deferred_passthroughs,
         Some(AttachOutputBatch::Events {
+            generation: PaneOutputGeneration::subscribed(0),
             bytes: b"DEQUEUED_FINAL_TAIL".to_vec(),
             passthroughs: vec![TerminalPassthrough::kitty_graphics(
                 0,
@@ -3267,7 +3454,7 @@ async fn exited_after_same_source_render_switch_does_not_duplicate_dequeued_outp
     let covered_item = current_target
         .pane_output
         .as_mut()
-        .and_then(super::types::PaneOutputReceiver::try_recv)
+        .and_then(super::types::PaneOutputReceiver::try_recv_drained)
         .expect("old receiver dequeues covered output before the switch");
     let pending_batch = collect_attach_output_batch(covered_item, None);
 
@@ -3305,18 +3492,22 @@ async fn exited_after_same_source_render_switch_does_not_duplicate_dequeued_outp
         .expect("queue terminal exit");
     let mut render_generation = 0_u64;
     let mut overlay_generation = 0_u64;
-    let mut persistent_overlay = None::<Vec<u8>>;
+    let mut persistent_overlay = None;
     let mut persistent_overlay_visible = false;
     let mut persistent_overlay_state_id = current_target.persistent_overlay_state_id;
     let mut locked = false;
     let mut deferred_controls = VecDeque::new();
     let control_backlog = AtomicUsize::new(0);
+    let mut deferred_passthroughs = DeferredPassthroughQueue::default();
+    let mut pane_refresh = AttachRefreshScheduler::default();
     let exit = apply_pending_attach_controls(
         &mut deferred_controls,
         Some(&mut control_rx),
         &control_backlog,
         &mut current_target,
         &stream,
+        &mut deferred_passthroughs,
+        &mut pane_refresh,
         &mut render_generation,
         &mut overlay_generation,
         &mut persistent_overlay,
@@ -3330,7 +3521,7 @@ async fn exited_after_same_source_render_switch_does_not_duplicate_dequeued_outp
     let PendingAttachAction::Exit(exit) = exit else {
         panic!("switch followed by Exited must terminate the attach");
     };
-    let mut deferred_passthroughs = Vec::new();
+    let mut deferred_passthroughs = DeferredPassthroughQueue::default();
     finish_pending_attach_exit_with_batch(
         exit.reason,
         &stream,
@@ -3463,7 +3654,7 @@ async fn exited_after_non_coalesced_same_source_switches_forwards_passthroughs_o
     let first_item = current_target
         .pane_output
         .as_mut()
-        .and_then(super::types::PaneOutputReceiver::try_recv)
+        .and_then(super::types::PaneOutputReceiver::try_recv_drained)
         .expect("old receiver dequeues the first interval");
     let pending_batch =
         collect_attach_output_batch(first_item, current_target.pane_output.as_mut());
@@ -3486,18 +3677,22 @@ async fn exited_after_non_coalesced_same_source_switches_forwards_passthroughs_o
 
     let mut render_generation = 0_u64;
     let mut overlay_generation = 0_u64;
-    let mut persistent_overlay = None::<Vec<u8>>;
+    let mut persistent_overlay = None;
     let mut persistent_overlay_visible = false;
     let mut persistent_overlay_state_id = current_target.persistent_overlay_state_id;
     let mut locked = false;
     let mut deferred_controls = VecDeque::new();
     let control_backlog = AtomicUsize::new(0);
+    let mut deferred_passthroughs = DeferredPassthroughQueue::default();
+    let mut pane_refresh = AttachRefreshScheduler::default();
     let exit = apply_pending_attach_controls(
         &mut deferred_controls,
         Some(&mut control_rx),
         &control_backlog,
         &mut current_target,
         &stream,
+        &mut deferred_passthroughs,
+        &mut pane_refresh,
         &mut render_generation,
         &mut overlay_generation,
         &mut persistent_overlay,
@@ -3511,7 +3706,7 @@ async fn exited_after_non_coalesced_same_source_switches_forwards_passthroughs_o
     let PendingAttachAction::Exit(exit) = exit else {
         panic!("refreshes followed by Exited must terminate the attach");
     };
-    let mut deferred_passthroughs = Vec::new();
+    let mut deferred_passthroughs = DeferredPassthroughQueue::default();
     finish_pending_attach_exit_with_batch(
         exit.reason,
         &stream,
@@ -3618,7 +3813,7 @@ async fn forward_attach_select_switch_preserves_fragmented_same_pane_input() {
             environment: None,
         }))
         .await;
-    assert!(matches!(created, Response::NewSession(_)));
+    crate::session_fixture::assert_new_session(&created);
 
     let (control_tx, control_rx) = mpsc::unbounded_channel();
     handler
@@ -3712,7 +3907,7 @@ async fn forward_attach_lock_boundary_discards_fragmented_input_before_unlock() 
             environment: None,
         }))
         .await;
-    assert!(matches!(created, Response::NewSession(_)));
+    crate::session_fixture::assert_new_session(&created);
     let escape_time = handler
         .handle(Request::SetOption(rmux_proto::SetOptionRequest {
             scope: rmux_proto::ScopeSelector::Global,
@@ -3970,7 +4165,7 @@ async fn forward_attach_emits_overlay_control_frames() {
             environment: None,
         }))
         .await;
-    assert!(matches!(created, Response::NewSession(_)));
+    crate::session_fixture::assert_new_session(&created);
     let split = handler
         .handle(Request::SplitWindow(rmux_proto::SplitWindowRequest {
             target: rmux_proto::SplitWindowTarget::Session(session_name.clone()),
@@ -4011,7 +4206,7 @@ async fn forward_attach_emits_overlay_control_frames() {
             OuterTerminalContext::default(),
         ),
         client_title: None,
-        cursor_style: 0,
+        cursor_style: 0.into(),
         active_pane_geometry: PaneGeometry::new(0, 0, 80, 24),
         raw_passthrough: false,
         kitty_graphics_passthrough: false,
@@ -4110,3 +4305,5 @@ async fn forward_attach_emits_overlay_control_frames() {
         "forward_attach should stay healthy: {result:?}"
     );
 }
+#[path = "tests/kitty_quarantine.rs"]
+mod kitty_quarantine;

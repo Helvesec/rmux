@@ -2,6 +2,10 @@
 
 mod common;
 
+#[path = "tmux_compat_harness/owned_rescue.rs"]
+mod owned_rescue;
+use owned_rescue::{OwnedDaemonIdentity, OwnedDaemonRescue};
+
 use std::error::Error;
 use std::ffi::OsString;
 use std::fs;
@@ -15,6 +19,219 @@ use common::{
     TMUX_COMPAT_PREREQUISITES_NOTE, TMUX_ORACLE_ENV,
 };
 use rmux_client::{connect_or_absent, ConnectResult};
+
+#[test]
+fn owned_rescue_preserves_initial_and_replacement_foreign_daemons() -> Result<(), Box<dyn Error>> {
+    let mut failures = Vec::new();
+    for replacement in [false, true] {
+        let harness = TmuxCompatHarness::new("rescue-foreign")?;
+        let root = common::unique_tmpdir("rescue-foreign");
+        fs::create_dir_all(&root)?;
+        let socket = common::default_socket_path_in(&root)?;
+        let config = TmuxCompatRunConfig::default().with_tmpdir(root.clone());
+        let mut rescue = OwnedDaemonRescue {
+            socket: socket.clone(),
+            identity: None,
+        };
+        if replacement {
+            let start = harness
+                .run_rmux_with(&["new-session", "-d", "-s", "owned", "sleep 60"], &config)?;
+            assert_eq!(start.status_code, Some(0));
+            let pid = harness.run_rmux_with(&["display-message", "-p", "#{pid}"], &config)?;
+            let pid = pid.stdout_string().trim().parse::<u32>()?;
+            rescue.identity = Some(OwnedDaemonIdentity::capture(pid)?);
+            assert_eq!(
+                harness
+                    .run_rmux_with(&["kill-server"], &config)?
+                    .status_code,
+                Some(0)
+            );
+            wait_for_socket_absent(&socket, Duration::from_secs(5))?;
+        }
+        let binary =
+            rmux_os::build_identity::resolve(std::ffi::OsStr::new(env!("CARGO_BIN_EXE_rmux")))?;
+        let mut foreign = ForeignDaemonFixture(
+            std::process::Command::new(binary)
+                .arg(rmux_client::INTERNAL_DAEMON_FLAG)
+                .env("RMUX_TMPDIR", &root)
+                .env("HOME", harness.tmpdir().join("home"))
+                .env("XDG_CONFIG_HOME", harness.tmpdir().join("xdg"))
+                .env_remove("RMUX")
+                .env_remove("TMUX")
+                .stdin(std::process::Stdio::null())
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .spawn()?,
+        );
+        common::wait_for_socket(&socket, &mut foreign.0)?;
+        assert!(
+            harness.run_rmux_with(&["-V"], &config).is_err(),
+            "prepare must reject a foreign occupant"
+        );
+        drop(rescue);
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while foreign.0.try_wait()?.is_none() && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        if foreign.0.try_wait()?.is_some()
+            || !matches!(connect_or_absent(&socket)?, ConnectResult::Connected(_))
+        {
+            failures.push(format!(
+                "replacement={replacement}: rescue stopped the foreign daemon"
+            ));
+        }
+        drop(harness);
+        drop(foreign);
+        fs::remove_dir_all(root)?;
+    }
+    assert!(failures.is_empty(), "{}", failures.join("\n"));
+    Ok(())
+}
+
+#[test]
+fn redirected_cleanup_preserves_foreign_daemons_after_version_and_replacement(
+) -> Result<(), Box<dyn Error>> {
+    let mut failures = Vec::new();
+    for replaced in [false, true] {
+        for rerun in [false, true] {
+            let harness = TmuxCompatHarness::new("cleanup-foreign")?;
+            let root = common::unique_tmpdir("cleanup-foreign-fixture");
+            fs::create_dir_all(&root)?;
+            let socket = common::default_socket_path_in(&root)?;
+            let config = TmuxCompatRunConfig::default().with_tmpdir(root.clone());
+            if replaced {
+                let start = harness
+                    .run_rmux_with(&["new-session", "-d", "-s", "owned", "sleep 60"], &config)?;
+                assert_eq!(start.status_code, Some(0));
+                let stop = harness.run_rmux_with(&["kill-server"], &config)?;
+                assert_eq!(stop.status_code, Some(0));
+                wait_for_socket_absent(&socket, Duration::from_secs(5))?;
+            } else {
+                let version = harness.run_rmux_with(&["-V"], &config)?;
+                assert_eq!(version.status_code, Some(0));
+                assert!(matches!(connect_or_absent(&socket)?, ConnectResult::Absent));
+            }
+            let binary =
+                rmux_os::build_identity::resolve(std::ffi::OsStr::new(env!("CARGO_BIN_EXE_rmux")))?;
+            let mut foreign = ForeignDaemonFixture(
+                std::process::Command::new(binary)
+                    .arg(rmux_client::INTERNAL_DAEMON_FLAG)
+                    .env("RMUX_TMPDIR", &root)
+                    .env("HOME", harness.tmpdir().join("home"))
+                    .env("XDG_CONFIG_HOME", harness.tmpdir().join("xdg"))
+                    .env_remove("RMUX")
+                    .env_remove("TMUX")
+                    .stdin(std::process::Stdio::null())
+                    .stdout(std::process::Stdio::null())
+                    .stderr(std::process::Stdio::null())
+                    .spawn()?,
+            );
+            common::wait_for_socket(&socket, &mut foreign.0)?;
+            let identity = daemon_identity(foreign.0.id())?;
+            assert!(!identity.is_empty());
+            eprintln!("replaced={replaced} rerun={rerun} foreign={identity}");
+            if rerun && harness.run_rmux_with(&["-V"], &config).is_ok() {
+                failures.push(format!("replaced={replaced}: accepted a foreign occupant"));
+            }
+            drop(harness);
+            if daemon_identity(foreign.0.id())? != identity
+                || !matches!(connect_or_absent(&socket)?, ConnectResult::Connected(_))
+            {
+                failures.push(format!(
+                    "replaced={replaced} rerun={rerun}: stopped foreign daemon"
+                ));
+            }
+            drop(foreign);
+            fs::remove_dir_all(root)?;
+        }
+    }
+    assert!(failures.is_empty(), "{}", failures.join("\n"));
+    Ok(())
+}
+
+struct ForeignDaemonFixture(std::process::Child);
+
+impl Drop for ForeignDaemonFixture {
+    fn drop(&mut self) {
+        let _ = self.0.kill();
+        let _ = self.0.wait();
+    }
+}
+
+#[test]
+fn redirected_tmpdir_cleanup_reaps_owned_daemon_after_success_failure_and_timeout(
+) -> Result<(), Box<dyn Error>> {
+    for outcome in ["success", "failure", "timeout"] {
+        let harness = TmuxCompatHarness::new("cleanup-redirect")?;
+        let root = common::unique_tmpdir("cleanup-redirect-owned");
+        fs::create_dir_all(&root)?;
+        let socket = common::default_socket_path_in(&root)?;
+        let mut rescue = OwnedDaemonRescue {
+            socket: socket.clone(),
+            identity: None,
+        };
+        let config = TmuxCompatRunConfig::default().with_tmpdir(root.clone());
+        let start =
+            harness.run_rmux_with(&["new-session", "-d", "-s", "alpha", "sleep 60"], &config)?;
+        assert_eq!(start.status_code, Some(0));
+        let pid = harness.run_rmux_with(&["display-message", "-p", "#{pid}"], &config)?;
+        let pid = pid.stdout_string().trim().parse::<u32>()?;
+        let identity = daemon_identity(pid)?;
+        assert!(identity.contains(socket.to_str().ok_or("socket is not UTF-8")?));
+        eprintln!(
+            "outcome={outcome} socket={} identity={identity}",
+            socket.display()
+        );
+        rescue.identity = Some(OwnedDaemonIdentity::capture(pid)?);
+        assert!(
+            matches!(connect_or_absent(&socket)?, ConnectResult::Connected(_)),
+            "departing command clients must preserve the live detached session"
+        );
+        let finish = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            match outcome {
+                "failure" => {
+                    let result = harness
+                        .run_rmux_with(&["has-session", "-t", "missing"], &config)
+                        .unwrap();
+                    assert_eq!(result.status_code, Some(1));
+                    panic!("deliberate test failure");
+                }
+                "timeout" => {
+                    let result = harness
+                        .run_rmux_with(
+                            &["run-shell", "sleep 60"],
+                            &config.clone().with_timeout(Duration::from_millis(100)),
+                        )
+                        .unwrap();
+                    assert!(result.timed_out);
+                }
+                _ => {}
+            }
+            drop(harness);
+        }));
+        assert_eq!(finish.is_err(), outcome == "failure");
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while daemon_identity(pid)? == identity && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert_ne!(
+            daemon_identity(pid)?,
+            identity,
+            "{outcome}: harness left its daemon alive after teardown at {}",
+            socket.display()
+        );
+        drop(rescue);
+        fs::remove_dir_all(root)?;
+    }
+    Ok(())
+}
+
+fn daemon_identity(pid: u32) -> Result<String, Box<dyn Error>> {
+    let output = std::process::Command::new("/bin/ps")
+        .args(["-p", &pid.to_string(), "-o", "pid=,ppid=,lstart=,command="])
+        .output()?;
+    Ok(String::from_utf8(output.stdout)?.trim().to_owned())
+}
 
 #[test]
 fn tmux_compat_harness_uses_distinct_socket_paths_under_one_temp_root() -> Result<(), Box<dyn Error>>
@@ -906,19 +1123,11 @@ fn tmux_compat_link_and_unlink_window_round_trip_when_frozen_tmux_is_available(
 }
 
 fn write_fake_tmux(path: &std::path::Path) -> Result<(), Box<dyn Error>> {
-    fs::write(
+    common::executable_fixture::write_executable(
         path,
         "#!/bin/sh\nprintf 'TMPDIR=%s\\n' \"$TMPDIR\"\nprintf 'RMUX_TMPDIR=%s\\n' \"$RMUX_TMPDIR\"\nprintf 'TMUX_TMPDIR=%s\\n' \"$TMUX_TMPDIR\"\nprintf 'TMUX=%s\\n' \"${TMUX-unset}\"\nprintf 'TERM=%s\\n' \"$TERM\"\nprintf 'EXTRA=%s\\n' \"$RMUX_TEST_EXTRA\"\nprintf 'ARGV='\nfor arg in \"$@\"; do printf '[%s]' \"$arg\"; done\nprintf '\\n'\n",
+        0o755,
     )?;
-
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-
-        let mut permissions = fs::metadata(path)?.permissions();
-        permissions.set_mode(0o755);
-        fs::set_permissions(path, permissions)?;
-    }
 
     Ok(())
 }

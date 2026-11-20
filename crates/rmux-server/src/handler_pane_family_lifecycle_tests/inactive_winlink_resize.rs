@@ -42,7 +42,7 @@ pub(super) async fn create_sized_session(
             environment: None,
         }))
         .await;
-    assert!(matches!(response, Response::NewSession(_)), "{response:?}");
+    crate::session_fixture::assert_new_session(&response);
     session_name
 }
 

@@ -11,9 +11,11 @@ mod server_runtime;
 use std::env;
 use std::ffi::OsString;
 use std::io::{self, Write};
-use std::path::PathBuf;
 
-use rmux_server::{ConfigFileSelection, DaemonConfig, ServerDaemon};
+use rmux_bootstrap::hidden_daemon::{
+    ConfigSelection as ConfigFileSelection, FlagSyntax, HiddenDaemonArgs as DaemonArgs,
+};
+use rmux_server::{DaemonConfig, ServerDaemon};
 
 const INTERNAL_DAEMON_FLAG: &str = "--__internal-daemon";
 
@@ -43,18 +45,6 @@ where
     run_hidden_daemon(args)
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct DaemonArgs {
-    socket_path: Option<PathBuf>,
-    config_selection: ConfigFileSelection,
-    config_quiet: bool,
-    config_cwd: Option<PathBuf>,
-    web_frontend: Option<String>,
-    web_port: Option<u16>,
-    startup_ready_fd: Option<i32>,
-    startup_ready_event: Option<OsString>,
-}
-
 fn parse_daemon_args<I>(mut args: I) -> Result<DaemonArgs, String>
 where
     I: Iterator<Item = OsString>,
@@ -63,157 +53,20 @@ where
         return Err("rmux-daemon is internal; launch it through `rmux`, not directly".to_owned());
     }
 
-    let mut socket_path = None;
-    let mut config_selection = ConfigFileSelection::Disabled;
-    let mut config_quiet = false;
-    let mut config_cwd = None;
-    let mut web_frontend = None;
-    let mut web_port = None;
-    let mut startup_ready_fd = None;
-    let mut startup_ready_event = None;
-
-    if let Some(first) = args.next() {
-        if is_internal_flag_token(first.as_os_str()) {
-            parse_internal_flag(
-                first,
-                &mut args,
-                &mut config_selection,
-                &mut config_quiet,
-                &mut config_cwd,
-                &mut web_frontend,
-                &mut web_port,
-                &mut startup_ready_fd,
-                &mut startup_ready_event,
-            )?;
-        } else {
-            socket_path = Some(PathBuf::from(first));
-        }
-    }
-
-    while let Some(argument) = args.next() {
-        if !is_internal_flag_token(argument.as_os_str()) {
-            return Err("unexpected extra arguments for hidden daemon mode".to_owned());
-        }
-        parse_internal_flag(
-            argument,
-            &mut args,
-            &mut config_selection,
-            &mut config_quiet,
-            &mut config_cwd,
-            &mut web_frontend,
-            &mut web_port,
-            &mut startup_ready_fd,
-            &mut startup_ready_event,
-        )?;
-    }
-
-    Ok(DaemonArgs {
-        socket_path,
-        config_selection,
-        config_quiet,
-        config_cwd,
-        web_frontend,
-        web_port,
-        startup_ready_fd,
-        startup_ready_event,
-    })
-}
-
-#[allow(clippy::too_many_arguments)]
-fn parse_internal_flag<I>(
-    argument: OsString,
-    args: &mut I,
-    config_selection: &mut ConfigFileSelection,
-    config_quiet: &mut bool,
-    config_cwd: &mut Option<PathBuf>,
-    web_frontend: &mut Option<String>,
-    web_port: &mut Option<u16>,
-    startup_ready_fd: &mut Option<i32>,
-    startup_ready_event: &mut Option<OsString>,
-) -> Result<(), String>
-where
-    I: Iterator<Item = OsString>,
-{
-    match argument.to_str() {
-        Some("--config-default") => {
-            if !matches!(config_selection, ConfigFileSelection::Disabled) {
-                return Err("duplicate hidden daemon config selection".to_owned());
-            }
-            *config_selection = ConfigFileSelection::Default;
-        }
-        Some("--config-file") => {
-            let file = args
-                .next()
-                .ok_or_else(|| "--config-file requires a path".to_owned())?;
-            match config_selection {
-                ConfigFileSelection::Disabled => {
-                    *config_selection = ConfigFileSelection::Files(vec![PathBuf::from(file)]);
-                }
-                ConfigFileSelection::Files(files) => files.push(PathBuf::from(file)),
-                ConfigFileSelection::Default => {
-                    return Err("--config-file conflicts with --config-default".to_owned());
-                }
-            }
-        }
-        Some("--config-quiet") => *config_quiet = true,
-        Some("--config-cwd") => {
-            let cwd = args
-                .next()
-                .ok_or_else(|| "--config-cwd requires a path".to_owned())?;
-            *config_cwd = Some(PathBuf::from(cwd));
-        }
-        Some("--web-port") => {
-            let port = args
-                .next()
-                .ok_or_else(|| "--web-port requires a port".to_owned())?;
-            let port = port
-                .to_str()
-                .ok_or_else(|| "invalid UTF-8 in --web-port".to_owned())?
-                .parse::<u16>()
-                .map_err(|_| "--web-port requires an integer port".to_owned())?;
-            if port == 0 {
-                return Err("--web-port must be between 1 and 65535".to_owned());
-            }
-            *web_port = Some(port);
-        }
-        Some("--frontend-url" | "--web-frontend") => {
-            let frontend = args
-                .next()
-                .ok_or_else(|| "--frontend-url requires a URL".to_owned())?;
-            let frontend = frontend
-                .to_str()
-                .ok_or_else(|| "invalid UTF-8 in --frontend-url".to_owned())?;
-            *web_frontend = Some(frontend.to_owned());
-        }
-        Some("--startup-ready-fd") => {
-            let fd = args
-                .next()
-                .ok_or_else(|| "--startup-ready-fd requires a file descriptor".to_owned())?;
-            let fd = fd
-                .to_str()
-                .ok_or_else(|| "invalid UTF-8 in --startup-ready-fd".to_owned())?
-                .parse::<i32>()
-                .map_err(|_| "--startup-ready-fd requires an integer file descriptor".to_owned())?;
-            if fd < 0 {
-                return Err("--startup-ready-fd requires a non-negative file descriptor".to_owned());
-            }
-            *startup_ready_fd = Some(fd);
-        }
-        Some("--startup-ready-event") => {
-            let event = args
-                .next()
-                .ok_or_else(|| "--startup-ready-event requires an event name".to_owned())?;
-            *startup_ready_event = Some(event);
-        }
-        Some(other) => return Err(format!("unexpected hidden daemon argument '{other}'")),
-        None => return Err("invalid UTF-8 in hidden daemon flag".to_owned()),
-    }
-
-    Ok(())
+    DaemonArgs::parse(args, FlagSyntax::UnicodePrefix)
 }
 
 fn run_hidden_daemon(args: DaemonArgs) -> io::Result<()> {
     reject_unsupported_web_args(&args)?;
+    #[cfg(unix)]
+    let startup_owner = args
+        .startup_owner_fd
+        .map(|fd| {
+            // SAFETY: hidden daemon argv transfers this inherited descriptor;
+            // no runtime or other owner has been constructed yet.
+            unsafe { rmux_os::daemon::take_startup_owner(fd) }
+        })
+        .transpose()?;
 
     let mut config = match args.socket_path {
         Some(socket_path) => DaemonConfig::new(socket_path),
@@ -246,6 +99,11 @@ fn run_hidden_daemon(args: DaemonArgs) -> io::Result<()> {
     let runtime = server_runtime::build_daemon_runtime()?;
 
     runtime.block_on(async move {
+        #[cfg(unix)]
+        let server = ServerDaemon::new(config)
+            .bind_with_startup_owner(startup_owner)
+            .await?;
+        #[cfg(not(unix))]
         let server = ServerDaemon::new(config).bind().await?;
         server.wait().await
     })
@@ -268,9 +126,8 @@ fn reject_unsupported_web_args(args: &DaemonArgs) -> io::Result<()> {
     Ok(())
 }
 
-fn is_internal_flag_token(value: &std::ffi::OsStr) -> bool {
-    value.to_str().is_some_and(|value| value.starts_with("--"))
-}
+#[cfg(test)]
+mod hidden_daemon_cases;
 
 #[cfg(test)]
 mod tests {
@@ -279,6 +136,16 @@ mod tests {
     use super::{parse_daemon_args, ConfigFileSelection, INTERNAL_DAEMON_FLAG};
     use std::ffi::OsString;
     use std::path::PathBuf;
+
+    #[test]
+    fn hidden_daemon_contract() {
+        crate::hidden_daemon_cases::check(
+            |args| {
+                parse_daemon_args(std::iter::once(OsString::from(INTERNAL_DAEMON_FLAG)).chain(args))
+            },
+            true,
+        );
+    }
 
     #[test]
     fn daemon_parser_requires_internal_flag() {

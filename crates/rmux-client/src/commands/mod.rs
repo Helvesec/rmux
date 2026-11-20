@@ -2,6 +2,7 @@ pub(crate) mod buffer;
 pub(crate) mod config;
 pub(crate) mod keys;
 pub(crate) mod pane;
+pub(crate) mod runtime_execution;
 pub(crate) mod scripting;
 pub(crate) mod server;
 pub(crate) mod session;

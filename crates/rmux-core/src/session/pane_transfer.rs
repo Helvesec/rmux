@@ -1,13 +1,10 @@
 use super::pane_transfer_shared::{
-    adjusted_insert_position, adjusted_insert_position_before, apply_swap_between_windows,
-    validate_swap_destination, SwapPaneEntry,
+    apply_swap_between_windows, validate_swap_destination, SwapPaneEntry,
 };
 use super::target_error::{invalid_pane_target, invalid_window_target};
-use super::{PaneJoinOptions, PaneSwapOptions, Session, SessionPaneTarget};
-use crate::{Pane, Window};
-use rmux_proto::{PaneSplitSize, RmuxError, SplitDirection};
+use super::{PaneJoinOptions, PaneSwapOptions, Session, SessionPaneTarget, WindowSelection};
+use rmux_proto::RmuxError;
 
-#[path = "pane_transfer/break_window.rs"]
 mod break_window;
 
 impl Session {
@@ -22,25 +19,11 @@ impl Session {
         window_index: u32,
         preserve_zoom: bool,
     ) -> Result<u32, RmuxError> {
-        let last_pane = self
-            .window_at(window_index)
-            .ok_or_else(|| invalid_window_target(&self.name, window_index))?
-            .last_pane_index()
-            .ok_or_else(|| RmuxError::Server("no last pane".to_owned()))?;
-
         let window = self
-            .window_at_mut(window_index)
-            .expect("addressed session window must exist");
-        if preserve_zoom {
-            let _ = window.push_zoom(true);
-        }
-        let selected = window.select_pane(last_pane);
-        if preserve_zoom {
-            window.pop_zoom();
-        }
-        debug_assert!(selected, "validated last pane must be selectable");
-
-        Ok(last_pane)
+            .windows
+            .get_mut(&window_index)
+            .ok_or_else(|| invalid_window_target(&self.name, window_index))?;
+        WindowSelection::new(&self.name, window_index, window).select_last(preserve_zoom)
     }
 
     /// Swaps two panes within the same session without renumbering either pane.
@@ -107,7 +90,7 @@ impl Session {
             .windows
             .remove(&target.window_index)
             .expect("target window must exist for swap");
-        apply_swap_between_windows(
+        let result = apply_swap_between_windows(
             &mut source_window,
             SwapPaneEntry {
                 index: source.pane_index,
@@ -119,11 +102,12 @@ impl Session {
                 pane: target_pane,
             },
             options,
-        )?;
+        );
+        // Refusal can intentionally unzoom, but cannot drop either owner.
         self.windows.insert(source.window_index, source_window);
         self.windows.insert(target.window_index, target_window);
 
-        Ok(())
+        result
     }
 
     /// Moves one pane next to another pane in the same session.
@@ -137,127 +121,33 @@ impl Session {
             return self.join_pane_within_window(source, target, options);
         }
 
-        let source_pane = self
-            .window_at(source.window_index)
-            .ok_or_else(|| invalid_window_target(&self.name, source.window_index))?
-            .pane(source.pane_index)
-            .cloned()
-            .ok_or_else(|| {
-                invalid_pane_target(
-                    &self.name,
-                    source.window_index,
-                    source.pane_index,
-                    "pane index does not exist in session",
-                )
-            })?;
-        let target_position = self
-            .window_at(target.window_index)
-            .ok_or_else(|| invalid_window_target(&self.name, target.window_index))?
-            .pane_position(target.pane_index)
-            .ok_or_else(|| {
-                invalid_pane_target(
-                    &self.name,
-                    target.window_index,
-                    target.pane_index,
-                    "pane index does not exist in session",
-                )
-            })?;
-        let requested_size = join_requested_size(
-            self.window_at(target.window_index)
-                .expect("target window must exist"),
-            target.pane_index,
-            options.direction,
-            options.full_size,
-            options.size,
-        )?;
-        let transient_index = self
-            .window_at(target.window_index)
-            .expect("target window must exist")
-            .panes()
-            .iter()
-            .map(|pane| pane.index())
-            .max()
-            .unwrap_or(0)
-            .saturating_add(1);
-        let mut source_pane_for_validation = source_pane.clone();
-        source_pane_for_validation.set_index(transient_index);
-
+        // Remove only after both targets are validated; restore both placements on errors.
+        self.window_at(source.window_index)
+            .ok_or_else(|| invalid_window_target(&self.name, source.window_index))?;
         self.window_at(target.window_index)
-            .expect("target window must exist")
-            .ensure_accepts_pane(&source_pane_for_validation, None)?;
-        let target_active_before_id = self
-            .window_at(target.window_index)
-            .and_then(Window::active_pane)
-            .map(Pane::id)
-            .expect("validated target window must have an active pane");
-        let target_last_before_id = self.window_at(target.window_index).and_then(|window| {
-            window
-                .last_pane_index()
-                .and_then(|pane_index| window.pane(pane_index).map(Pane::id))
-        });
-
+            .ok_or_else(|| invalid_window_target(&self.name, target.window_index))?;
         let mut source_window = self
             .windows
             .remove(&source.window_index)
-            .expect("source window must exist for join");
+            .expect("validated source");
         let mut target_window = self
             .windows
             .remove(&target.window_index)
-            .expect("target window must exist for join");
-        source_window.auto_unzoom();
-        target_window.auto_unzoom();
-        let mut moved_pane = source_window
-            .extract_pane(source.pane_index)
-            .expect("validated source pane must extract");
-        let moved_pane_id = moved_pane.id();
-        moved_pane.set_index(transient_index);
-        if options.full_size {
-            target_window.insert_pane_full_size(moved_pane, options.direction, options.before)?;
-        } else {
-            let insert_position = if options.before {
-                target_position
-            } else {
-                target_position + 1
-            };
-            target_window.insert_pane_at_position(
-                insert_position,
-                moved_pane,
-                options.direction,
-            )?;
+            .expect("validated target");
+        let result = super::pane_transfer_join::join_between(
+            &mut source_window,
+            &self.name,
+            source,
+            &mut target_window,
+            &self.name,
+            target,
+            options,
+        );
+        if let Err(error) = result {
+            self.windows.insert(source.window_index, source_window);
+            self.windows.insert(target.window_index, target_window);
+            return Err(error);
         }
-        if options.detached {
-            target_window
-                .renumber_panes_by_position(target_active_before_id, target_last_before_id);
-        } else {
-            target_window.renumber_panes_by_position_stamping(
-                moved_pane_id,
-                (target_active_before_id != moved_pane_id).then_some(target_active_before_id),
-                Some(target_active_before_id),
-            );
-        }
-        let moved_pane_index = target_window
-            .panes()
-            .iter()
-            .find(|pane| pane.id() == moved_pane_id)
-            .map(|pane| pane.index())
-            .expect("moved pane must survive cross-window join");
-        if let Some(requested_size) = requested_size {
-            if options.full_size {
-                let _ = target_window.resize_pane_to(
-                    moved_pane_index,
-                    options.direction,
-                    requested_size,
-                );
-            } else {
-                let _ = target_window.resize_new_split_pane_to(
-                    moved_pane_index,
-                    options.direction,
-                    requested_size,
-                    options.before,
-                );
-            }
-        }
-
         let source_was_empty = source_window.pane_count() == 0;
         self.windows.insert(target.window_index, target_window);
         if source_was_empty {
@@ -290,80 +180,23 @@ impl Session {
     fn swap_panes_within_window(
         &mut self,
         window_index: u32,
-        source_pane_index: u32,
-        target_pane_index: u32,
+        source: u32,
+        target: u32,
         options: PaneSwapOptions,
     ) -> Result<(), RmuxError> {
-        if source_pane_index == target_pane_index {
-            let window = self
-                .window_at(window_index)
-                .ok_or_else(|| invalid_window_target(&self.name, window_index))?;
-            if window.pane(source_pane_index).is_none() {
-                return Err(invalid_pane_target(
-                    &self.name,
-                    window_index,
-                    source_pane_index,
-                    "pane index does not exist in session",
-                ));
-            }
-            return Ok(());
-        }
-
         let window = self
-            .window_at(window_index)
+            .windows
+            .get_mut(&window_index)
             .ok_or_else(|| invalid_window_target(&self.name, window_index))?;
-        if window.pane(source_pane_index).is_none() {
-            return Err(invalid_pane_target(
-                &self.name,
-                window_index,
-                source_pane_index,
-                "pane index does not exist in session",
-            ));
-        }
-        if window.pane(target_pane_index).is_none() {
-            return Err(invalid_pane_target(
-                &self.name,
-                window_index,
-                target_pane_index,
-                "pane index does not exist in session",
-            ));
-        }
-
-        let window = self
-            .window_at_mut(window_index)
-            .expect("window must exist for in-window swap");
-        window.push_zoom(options.preserve_zoom);
-        let active_before_id = window
-            .active_pane()
-            .expect("validated window must have an active pane before swap")
-            .id();
-        let source_pane_id = window
-            .pane(source_pane_index)
-            .expect("validated source pane must exist before swap")
-            .id();
-        let target_pane_id = window
-            .pane(target_pane_index)
-            .expect("validated target pane must exist before swap")
-            .id();
-        let swapped = window.swap_panes(source_pane_index, target_pane_index);
-        debug_assert!(swapped, "validated in-window swap must succeed");
-
-        if options.detached {
-            let active_after_id =
-                if active_before_id == source_pane_id || active_before_id == target_pane_id {
-                    source_pane_id
-                } else {
-                    active_before_id
-                };
-            window.select_pane_by_id(active_after_id);
-        } else {
-            window.select_pane_by_id(target_pane_id);
-        }
-        window.pop_zoom();
-
-        Ok(())
+        super::pane_transfer_borrowed::swap_within(
+            window,
+            &self.name,
+            window_index,
+            source,
+            target,
+            options,
+        )
     }
-
     fn join_pane_within_window(
         &mut self,
         source: SessionPaneTarget,
@@ -375,224 +208,10 @@ impl Session {
                 "source and target panes must be different".to_owned(),
             ));
         }
-
         let window = self
-            .window_at(source.window_index)
+            .windows
+            .get_mut(&source.window_index)
             .ok_or_else(|| invalid_window_target(&self.name, source.window_index))?;
-        let source_position = window.pane_position(source.pane_index).ok_or_else(|| {
-            invalid_pane_target(
-                &self.name,
-                source.window_index,
-                source.pane_index,
-                "pane index does not exist in session",
-            )
-        })?;
-        let target_position = window.pane_position(target.pane_index).ok_or_else(|| {
-            invalid_pane_target(
-                &self.name,
-                target.window_index,
-                target.pane_index,
-                "pane index does not exist in session",
-            )
-        })?;
-        let source_pane = window
-            .pane(source.pane_index)
-            .cloned()
-            .expect("validated source pane must exist");
-        let source_geometry = source_pane.geometry();
-        let source_pane_id = source_pane.id();
-        let target_pane = window
-            .pane(target.pane_index)
-            .expect("validated target pane must exist");
-        let target_geometry = target_pane.geometry();
-        let target_pane_id = target_pane.id();
-        window.ensure_accepts_pane(&source_pane, Some(source_position))?;
-        let source_axis_size = join_axis_for_size(
-            rmux_proto::TerminalSize {
-                cols: source_geometry.cols(),
-                rows: source_geometry.rows(),
-            },
-            options.direction,
-        );
-        let requested_size = join_requested_size(
-            window,
-            target.pane_index,
-            options.direction,
-            options.full_size,
-            options.size,
-        )?;
-        let active_before_id = window
-            .active_pane()
-            .expect("validated window must have an active pane")
-            .id();
-        let last_before_id = window
-            .last_pane_index()
-            .and_then(|pane_index| window.pane(pane_index).map(|pane| pane.id()));
-        let detached_active_after_removal_id = if active_before_id == source_pane_id {
-            last_before_id
-                .filter(|pane_id| *pane_id != source_pane_id)
-                .or_else(|| {
-                    if source_position > 0 {
-                        window.panes().get(source_position - 1).map(Pane::id)
-                    } else {
-                        window.panes().get(source_position + 1).map(Pane::id)
-                    }
-                })
-        } else {
-            Some(active_before_id)
-        };
-        let detached_last_after_removal_id = if active_before_id == source_pane_id {
-            detached_active_after_removal_id
-                .is_some_and(|pane_id| pane_id != target_pane_id)
-                .then_some(target_pane_id)
-        } else {
-            last_before_id.filter(|pane_id| *pane_id != source_pane_id)
-        };
-
-        let insert_position = if options.full_size {
-            usize::from(!options.before)
-        } else if options.before {
-            adjusted_insert_position_before(source_position, target_position)
-        } else {
-            adjusted_insert_position(source_position, target_position)
-        };
-        let window = self
-            .window_at_mut(source.window_index)
-            .expect("window must exist for in-window join");
-        let moved_pane_id = if options.full_size {
-            window.auto_unzoom();
-            let mut moved_pane = window
-                .extract_pane(source.pane_index)
-                .expect("validated source pane must extract");
-            let moved_pane_id = moved_pane.id();
-            let transient_index = window
-                .panes()
-                .iter()
-                .map(|pane| pane.index())
-                .max()
-                .unwrap_or(0)
-                .saturating_add(1);
-            moved_pane.set_index(transient_index);
-            window.insert_pane_full_size(moved_pane, options.direction, options.before)?;
-            moved_pane_id
-        } else {
-            window.move_pane_by_splitting_target(
-                source_position,
-                target_position,
-                insert_position,
-                options.direction,
-                options.before,
-            )?
-        };
-        if options.detached {
-            window.renumber_panes_by_position(
-                detached_active_after_removal_id
-                    .expect("detached pane move should leave an active pane"),
-                detached_last_after_removal_id,
-            );
-        } else {
-            let last_after_id = if active_before_id == moved_pane_id {
-                last_before_id
-            } else {
-                Some(active_before_id)
-            };
-            window.renumber_panes_by_position_stamping(
-                moved_pane_id,
-                last_after_id,
-                Some(active_before_id),
-            );
-        }
-        let moved_pane_index = window
-            .panes()
-            .iter()
-            .find(|pane| pane.id() == moved_pane_id)
-            .map(|pane| pane.index())
-            .expect("moved pane must survive in-window join");
-        if let Some(requested_size) = requested_size {
-            let size_existing_target_side = !options.full_size
-                && !options.before
-                && same_axis_source_after_target(
-                    source_geometry,
-                    target_geometry,
-                    options.direction,
-                );
-            let (sized_pane_index, size_to_apply) = if size_existing_target_side {
-                window
-                    .panes()
-                    .iter()
-                    .find(|pane| pane.id() == target_pane_id)
-                    .map(|pane| pane.index())
-                    .map(|pane_index| {
-                        (
-                            pane_index,
-                            source_axis_size.saturating_sub(requested_size).max(1),
-                        )
-                    })
-                    .expect("target pane must survive in-window join")
-            } else {
-                (moved_pane_index, requested_size)
-            };
-            let _ = window.resize_pane_to(sized_pane_index, options.direction, size_to_apply);
-        }
-
-        Ok(())
-    }
-}
-
-fn join_requested_size(
-    target_window: &Window,
-    target_pane_index: u32,
-    direction: SplitDirection,
-    full_size: bool,
-    size: Option<PaneSplitSize>,
-) -> Result<Option<u32>, RmuxError> {
-    let Some(size) = size else {
-        return Ok(None);
-    };
-    let base = if full_size {
-        join_axis_for_size(target_window.size(), direction)
-    } else {
-        let pane = target_window.pane(target_pane_index).ok_or_else(|| {
-            RmuxError::Server(format!(
-                "cannot size missing target pane index {target_pane_index}"
-            ))
-        })?;
-        join_axis_for_size(
-            rmux_proto::TerminalSize {
-                cols: pane.geometry().cols(),
-                rows: pane.geometry().rows(),
-            },
-            direction,
-        )
-    };
-
-    Ok(Some(match size {
-        PaneSplitSize::Absolute(value) => value.max(1),
-        PaneSplitSize::Percentage(value) => {
-            let scaled = (base.saturating_mul(u32::from(value))) / 100;
-            scaled.max(1)
-        }
-    }))
-}
-
-fn join_axis_for_size(size: rmux_proto::TerminalSize, direction: SplitDirection) -> u32 {
-    match direction {
-        SplitDirection::Vertical => u32::from(size.cols),
-        SplitDirection::Horizontal => u32::from(size.rows),
-    }
-}
-
-fn same_axis_source_after_target(
-    source: crate::PaneGeometry,
-    target: crate::PaneGeometry,
-    direction: SplitDirection,
-) -> bool {
-    match direction {
-        SplitDirection::Vertical => {
-            source.y() == target.y() && source.rows() == target.rows() && source.x() > target.x()
-        }
-        SplitDirection::Horizontal => {
-            source.x() == target.x() && source.cols() == target.cols() && source.y() > target.y()
-        }
+        super::pane_transfer_borrowed::join_within(window, &self.name, source, target, options)
     }
 }

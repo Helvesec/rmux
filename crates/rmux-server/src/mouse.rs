@@ -2,17 +2,19 @@
 
 use std::time::{Duration, Instant};
 
-use rmux_core::{PaneGeometry, KEYC_DRAGGING};
-use rmux_proto::{OptionName, PaneTarget, SessionId, SessionName};
+use rmux_core::KEYC_DRAGGING;
+use rmux_proto::{PaneTarget, SessionId, SessionName};
 
 use crate::copy_mode::{CopyModeLineNumberLayout, CopyModeMouseContext};
 use crate::input_keys::MouseForwardEvent;
-use crate::pane_terminals::HandlerState;
-use crate::status_lines::status_line_count;
 
 mod event_keys;
 mod hit;
+mod layout;
+mod projection;
 mod scrollbar_geometry;
+pub(crate) use projection::MouseCoordinates;
+pub(crate) use scrollbar_geometry::pane_mouse_coordinates_for_target;
 mod types;
 
 use event_keys::{
@@ -20,18 +22,18 @@ use event_keys::{
     mouse_release, mouse_wheel, synthesize_mouse_key,
 };
 use hit::{hit_to_attached_event, resolve_mouse_hit};
+pub(crate) use layout::{layout_for_session, layout_for_view};
 pub(crate) use scrollbar_geometry::pane_content_geometry_for_target;
-use scrollbar_geometry::resolve_pane_scrollbar_layout;
 #[allow(unused_imports)]
 pub(crate) use types::StatusRange;
 pub(crate) use types::{
     AttachedMouseEvent, ClassifiedMouseEvent, ClientMouseState, MouseClickTimerToken,
-    MouseEventKind, MouseLayout, MouseLocation, PaneBorderStatus, PaneMouseTarget,
-    PanePassthroughMouseEvent, PaneScrollbar,
+    MouseEventKind, MouseLayout, MouseLocation, PanePassthroughMouseEvent,
 };
 #[cfg(test)]
 pub(crate) use types::{
-    BorderControlRange, MouseDragHandler, PaneScrollbarsMode, ScrollbarPosition,
+    BorderControlRange, MouseDragHandler, PaneBorderStatus, PaneMouseTarget, PaneScrollbar,
+    PaneScrollbarsMode, ScrollbarPosition,
 };
 #[cfg_attr(windows, allow(unused_imports))]
 pub(crate) use types::{StatusLineLayout, StatusRangeType};
@@ -129,124 +131,6 @@ fn rename_mouse_pane_target(
         return;
     }
     *target = PaneTarget::with_window(new_name.clone(), target.window_index(), target.pane_index());
-}
-
-pub(crate) fn layout_for_session(
-    state: &HandlerState,
-    session_name: &SessionName,
-    attached_count: usize,
-) -> Option<MouseLayout> {
-    let session = state.sessions.session(session_name)?;
-    let window_index = session.active_window_index();
-    let window = session.window_at(window_index)?;
-    let terminal_size = session.terminal_size();
-    let status_enabled = terminal_size.cols != 0
-        && terminal_size.rows != 0
-        && !matches!(
-            state
-                .options
-                .resolve(Some(session_name), OptionName::Status),
-            Some("off")
-        );
-    let (status_at, status_lines) = if status_enabled {
-        let status_lines = status_line_count(
-            state
-                .options
-                .resolve(Some(session_name), OptionName::Status),
-            terminal_size.rows,
-        );
-        match state
-            .options
-            .resolve(Some(session_name), OptionName::StatusPosition)
-        {
-            Some("top") => (Some(0), status_lines),
-            _ => (
-                Some(terminal_size.rows.saturating_sub(status_lines)),
-                status_lines,
-            ),
-        }
-    } else {
-        (None, 0)
-    };
-    let pane_border_status = parse_pane_border_status(state.options.resolve_for_window(
-        session_name,
-        window_index,
-        OptionName::PaneBorderStatus,
-    ));
-    let content_rows = window
-        .size()
-        .rows
-        .min(terminal_size.rows.saturating_sub(status_lines));
-    let focus_follows_mouse = state
-        .options
-        .resolve(Some(session_name), OptionName::FocusFollowsMouse)
-        .is_some_and(|value| value == "on");
-    let panes = if window.is_zoomed() {
-        window.active_pane().into_iter().collect::<Vec<_>>()
-    } else {
-        window.panes().iter().collect::<Vec<_>>()
-    };
-
-    Some(MouseLayout {
-        session_id: session.id().as_u32(),
-        status_at,
-        status_lines,
-        status: crate::renderer::status_line_layout(
-            session,
-            &state.options,
-            attached_count,
-            None,
-            Some(state),
-        ),
-        pane_border_status,
-        focus_follows_mouse,
-        active_pane: window.active_pane().map(|pane| pane.id()),
-        panes: panes
-            .into_iter()
-            .map(|pane| {
-                let history_size = state
-                    .pane_history_size_stats(session_name, pane.id())
-                    .map(|stats| stats.size)
-                    .unwrap_or_default();
-                let alternate_on = state
-                    .pane_screen_state(session_name, pane.id())
-                    .map(|screen| screen.alternate_on)
-                    .unwrap_or(false);
-                let copy_mode_offset = state
-                    .pane_copy_mode_summary(session_name, pane.id())
-                    .map(|summary| summary.scroll_position);
-                let (scrollbar_config, scrollbar_layout) = resolve_pane_scrollbar_layout(
-                    state,
-                    session_name,
-                    window_index,
-                    pane,
-                    content_rows,
-                    alternate_on,
-                    copy_mode_offset.is_some(),
-                );
-                let geometry = scrollbar_layout.content;
-                let scrollbar = PaneScrollbar::from_layout(
-                    scrollbar_layout,
-                    history_size,
-                    alternate_on,
-                    &scrollbar_config,
-                    copy_mode_offset,
-                );
-                PaneMouseTarget {
-                    pane_id: pane.id(),
-                    pane_target: Some(PaneTarget::with_window(
-                        session_name.clone(),
-                        window_index,
-                        pane.index(),
-                    )),
-                    window_id: window.id().as_u32(),
-                    geometry,
-                    scrollbar,
-                    border_controls: Vec::new(),
-                }
-            })
-            .collect(),
-    })
 }
 
 pub(crate) fn classify_mouse_event(
@@ -504,12 +388,13 @@ fn apply_drag_origin_location(event: &mut AttachedMouseEvent, start: &AttachedMo
     event.window_id = start.window_id;
     event.pane_id = start.pane_id;
     event.pane_target = start.pane_target.clone();
+    event.coordinates = start.coordinates;
     event.location = start.location;
 }
 
 pub(crate) fn copy_mode_mouse_context(
     event: &AttachedMouseEvent,
-    pane: PaneGeometry,
+    pane: impl Into<MouseCoordinates> + Copy,
     slider_mpos: i32,
 ) -> Option<CopyModeMouseContext> {
     copy_mode_mouse_context_with_line_numbers(event, pane, slider_mpos, None)
@@ -517,22 +402,22 @@ pub(crate) fn copy_mode_mouse_context(
 
 pub(crate) fn copy_mode_mouse_context_with_line_numbers(
     event: &AttachedMouseEvent,
-    pane: PaneGeometry,
+    pane: impl Into<MouseCoordinates> + Copy,
     slider_mpos: i32,
     line_numbers: Option<CopyModeLineNumberLayout>,
 ) -> Option<CopyModeMouseContext> {
     event.pane_id?;
+    let pane = event.coordinates.unwrap_or_else(|| pane.into());
 
     let adjusted_y = match event.status_at {
         Some(0) if event.raw.y >= event.status_lines => event.raw.y - event.status_lines,
         _ => event.raw.y,
     };
-    if adjusted_y < pane.y() {
+    if pane.above(adjusted_y) {
         return None;
     }
 
-    let relative_x = event.raw.x.saturating_sub(pane.x());
-    let relative_y = adjusted_y.saturating_sub(pane.y());
+    let (relative_x, relative_y) = pane.clamped_offset(event.raw.x, adjusted_y);
     let content_x = line_numbers.map_or_else(
         || u32::from(relative_x.min(pane.cols().saturating_sub(1))),
         |layout| layout.mouse_content_x(pane.cols(), relative_x),
@@ -556,7 +441,7 @@ pub(crate) fn copy_mode_mouse_context_with_line_numbers(
 
 pub(crate) fn copy_mode_mouse_drag_start_context(
     event: &AttachedMouseEvent,
-    pane: PaneGeometry,
+    pane: impl Into<MouseCoordinates> + Copy,
     slider_mpos: i32,
 ) -> Option<CopyModeMouseContext> {
     copy_mode_mouse_drag_start_context_with_line_numbers(event, pane, slider_mpos, None)
@@ -564,7 +449,7 @@ pub(crate) fn copy_mode_mouse_drag_start_context(
 
 pub(crate) fn copy_mode_mouse_drag_start_context_with_line_numbers(
     event: &AttachedMouseEvent,
-    pane: PaneGeometry,
+    pane: impl Into<MouseCoordinates> + Copy,
     slider_mpos: i32,
     line_numbers: Option<CopyModeLineNumberLayout>,
 ) -> Option<CopyModeMouseContext> {
@@ -587,13 +472,8 @@ pub(crate) fn copy_mode_mouse_drag_start_context_with_line_numbers(
     Some(current)
 }
 
-fn parse_pane_border_status(value: Option<&str>) -> PaneBorderStatus {
-    match value {
-        Some("top") => PaneBorderStatus::Top,
-        Some("bottom") => PaneBorderStatus::Bottom,
-        _ => PaneBorderStatus::Off,
-    }
-}
-
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+mod scene_transform_tests;

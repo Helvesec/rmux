@@ -13,10 +13,12 @@ use ratatui_core::buffer::Buffer;
 use ratatui_core::layout::Rect;
 use ratatui_core::widgets::Widget;
 use ratatui_rmux::{PaneDriver, PaneState, PaneWidget};
-use rmux_sdk::{
-    bootstrap::discovery::SDK_DAEMON_BINARY_ENV, EnsureSession, EnsureSessionPolicy, RmuxBuilder,
-    SessionName,
-};
+use rmux_sdk::{EnsureSession, EnsureSessionPolicy, RmuxBuilder, SessionName};
+
+// ratatui-rmux must not depend on rmux-os, so the build-only selected-program
+// check is included by path, as in the Windows twin's cargo-build support.
+#[path = "../../rmux-os/src/build_identity/selected_program.rs"]
+mod build_identity;
 
 type TestResult<T = ()> = Result<T, Box<dyn Error>>;
 
@@ -29,7 +31,7 @@ async fn ratatui_real_daemon_render_smoke() -> TestResult {
     let socket_path = root.join("daemon.sock");
     let cleanup = Cleanup::new(root.clone(), socket_path.clone());
     let daemon_binary = rmux_binary()?.to_path_buf();
-    let _daemon_binary_env = EnvGuard::set(SDK_DAEMON_BINARY_ENV, daemon_binary.as_os_str());
+    let _daemon_binary_env = EnvGuard::set("RMUX_SDK_DAEMON_BINARY", daemon_binary.as_os_str());
     let _ = fs::remove_dir_all(&root);
 
     let rmux = RmuxBuilder::new()
@@ -199,7 +201,12 @@ fn is_tmp_smoke_root(root: &Path) -> bool {
 fn rmux_binary() -> TestResult<&'static Path> {
     static RMUX_BINARY: OnceLock<Result<PathBuf, String>> = OnceLock::new();
     match RMUX_BINARY.get_or_init(|| resolve_rmux_binary().map_err(|error| error.to_string())) {
-        Ok(path) => Ok(path.as_path()),
+        Ok(path) => {
+            // Select the daemon before the SDK startup budget starts, as the
+            // SDK smoke does; the SDK's own launch-time check is then warm.
+            build_identity::resolve(path.as_os_str())?;
+            Ok(path.as_path())
+        }
         Err(error) => Err(std::io::Error::other(error.clone()).into()),
     }
 }

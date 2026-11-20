@@ -1,20 +1,14 @@
-use std::ffi::OsString;
-#[cfg(unix)]
-use std::fs::File;
-#[cfg(unix)]
-use std::os::unix::process::CommandExt;
-use std::path::PathBuf;
+use std::ffi::{OsStr, OsString};
+use std::path::{Path, PathBuf};
 use std::process::ExitStatus;
 #[cfg(unix)]
-use std::process::{Child, Command, Stdio};
+use std::sync::Arc;
 
-#[cfg(all(not(unix), not(windows)))]
-use crate::unsupported_op;
-#[cfg(all(not(unix), not(windows)))]
-use crate::PtyError;
-#[cfg(any(unix, windows))]
-use crate::{backend, PtyPair};
-use crate::{ProcessId, PtyMaster, Result, Signal, TerminalSize};
+#[cfg(unix)]
+use crate::pty::SessionLeaderExit;
+use crate::{
+    ProcessId, ProcessShell, PtyMaster, Result, RmuxShell, ShellChild, Signal, TerminalSize,
+};
 
 /// A command configuration for spawning a process inside a newly allocated PTY.
 #[derive(Clone, Debug)]
@@ -123,9 +117,52 @@ impl ChildCommand {
         self
     }
 
-    /// Spawns the configured command inside a newly allocated PTY.
+    /// Returns the executable path this command runs.
+    #[must_use]
+    pub fn program(&self) -> &Path {
+        &self.program
+    }
+
+    /// Returns the `argv[0]` override, when one was configured.
+    #[must_use]
+    pub fn argv0(&self) -> Option<&OsStr> {
+        self.arg0.as_deref()
+    }
+
+    /// Returns the process arguments that follow `argv[0]`.
+    #[must_use]
+    pub fn arguments(&self) -> &[OsString] {
+        &self.args
+    }
+
+    /// Returns the explicit environment entries in application order.
+    #[must_use]
+    pub fn environment(&self) -> &[(OsString, OsString)] {
+        &self.env
+    }
+
+    /// Returns whether the inherited environment is cleared before the
+    /// entries from [`environment`](Self::environment) are applied.
+    #[must_use]
+    pub fn clears_env(&self) -> bool {
+        self.clear_env
+    }
+
+    /// Returns the child working directory, when one was configured.
+    #[must_use]
+    pub fn working_dir(&self) -> Option<&Path> {
+        self.current_dir.as_deref()
+    }
+
+    /// Returns the initial PTY size, when one was configured.
+    #[must_use]
+    pub fn initial_size(&self) -> Option<TerminalSize> {
+        self.size
+    }
+
+    /// Spawns the configured command through the default [`ProcessShell`].
     pub fn spawn(self) -> Result<SpawnedPty> {
-        spawn_child(self)
+        ProcessShell.spawn(self)
     }
 }
 
@@ -137,6 +174,20 @@ pub struct SpawnedPty {
 }
 
 impl SpawnedPty {
+    /// Pairs a PTY master with the shell running on the other endpoint.
+    ///
+    /// [`RmuxShell`] implementations outside this crate use this to return
+    /// their spawn result.
+    #[must_use]
+    pub fn new(master: PtyMaster, child: PtyChild) -> Self {
+        #[cfg(unix)]
+        let child = {
+            let exit = master.io().record_session_leader(child.pid());
+            child.with_session_leader_exit(exit)
+        };
+        Self { master, child }
+    }
+
     /// Returns the PTY master endpoint.
     #[must_use]
     pub fn master(&self) -> &PtyMaster {
@@ -162,17 +213,27 @@ impl SpawnedPty {
     }
 }
 
-/// A handle for signaling and reaping a PTY-backed child process.
+/// A handle for signaling and reaping the shell behind a PTY.
 #[derive(Debug)]
 pub struct PtyChild {
+    inner: Box<dyn ShellChild>,
+    /// The exit record of the PTY this child was paired with by
+    /// [`SpawnedPty::new`], marked when this handle reaps the process.
     #[cfg(unix)]
-    child: Child,
-    #[cfg(windows)]
-    child: backend::WindowsChild,
-    pid: ProcessId,
+    session_leader_exit: Option<Arc<SessionLeaderExit>>,
 }
 
 impl PtyChild {
+    /// Wraps a [`ShellChild`] produced by an [`RmuxShell`] backend.
+    #[must_use]
+    pub fn new(child: impl ShellChild + 'static) -> Self {
+        Self {
+            inner: Box::new(child),
+            #[cfg(unix)]
+            session_leader_exit: None,
+        }
+    }
+
     /// Returns the PTY session leader's process identifier.
     ///
     /// The spawned child creates a fresh session and foreground process group,
@@ -180,63 +241,48 @@ impl PtyChild {
     /// signal delivery.
     #[must_use]
     pub fn pid(&self) -> ProcessId {
-        self.pid
+        self.inner.pid()
     }
 
     /// Waits for the child process to exit and reaps it.
     pub fn wait(&mut self) -> Result<ExitStatus> {
-        #[cfg(unix)]
-        {
-            Ok(self.child.wait()?)
-        }
-
-        #[cfg(not(unix))]
-        {
-            #[cfg(windows)]
-            {
-                backend::wait_child(&mut self.child)
-            }
-
-            #[cfg(not(windows))]
-            {
-                Err(PtyError::Unsupported(unsupported_op::WAIT_FOR_PTY_CHILD))
-            }
-        }
+        let status = self.inner.wait()?;
+        self.note_reaped();
+        Ok(status)
     }
 
     /// Attempts to reap the child process without blocking.
     pub fn try_wait(&mut self) -> Result<Option<ExitStatus>> {
-        #[cfg(unix)]
-        {
-            Ok(self.child.try_wait()?)
+        let status = self.inner.try_wait()?;
+        if status.is_some() {
+            self.note_reaped();
         }
+        Ok(status)
+    }
 
-        #[cfg(not(unix))]
-        {
-            #[cfg(windows)]
-            {
-                backend::try_wait_child(&mut self.child)
-            }
+    #[cfg(unix)]
+    fn with_session_leader_exit(mut self, exit: Arc<SessionLeaderExit>) -> Self {
+        self.session_leader_exit = Some(exit);
+        self
+    }
 
-            #[cfg(not(windows))]
-            {
-                Err(PtyError::Unsupported(
-                    unsupported_op::TRY_WAIT_FOR_PTY_CHILD,
-                ))
-            }
+    fn note_reaped(&self) {
+        #[cfg(unix)]
+        if let Some(exit) = &self.session_leader_exit {
+            exit.mark_reaped();
         }
     }
 
     /// Waits until the Windows pane leader and every job-scoped descendant exit.
     #[cfg(windows)]
     pub fn wait_for_process_tree_exit(&mut self) -> Result<ExitStatus> {
-        backend::wait_child_process_tree(&mut self.child)
+        self.inner.wait_for_process_tree_exit()
     }
 
     /// Observes Windows process-tree exit without blocking.
     #[cfg(windows)]
     pub fn try_wait_for_process_tree_exit(&mut self) -> Result<Option<ExitStatus>> {
-        backend::try_wait_child_process_tree(&mut self.child)
+        self.inner.try_wait_for_process_tree_exit()
     }
 
     /// Clones a wait-only handle without retaining the Windows Job Object.
@@ -246,8 +292,7 @@ impl PtyChild {
     #[cfg(windows)]
     pub fn try_clone_for_wait(&self) -> Result<Self> {
         Ok(Self {
-            child: backend::try_clone_child_for_wait(&self.child)?,
-            pid: self.pid,
+            inner: self.inner.try_clone_for_wait()?,
         })
     }
 
@@ -256,8 +301,7 @@ impl PtyChild {
     #[cfg(windows)]
     pub fn try_clone_for_exit_teardown(&self) -> Result<Self> {
         Ok(Self {
-            child: backend::try_clone_child_for_exit_teardown(&self.child)?,
-            pid: self.pid,
+            inner: self.inner.try_clone_for_exit_teardown()?,
         })
     }
 
@@ -269,7 +313,7 @@ impl PtyChild {
     /// descendant that still owns the console.
     #[cfg(windows)]
     pub fn close_pseudoconsole(&self) {
-        backend::close_child_pseudoconsole(&self.child);
+        self.inner.close_pseudoconsole();
     }
 
     /// Sends an interrupt request to the PTY foreground process group.
@@ -289,24 +333,7 @@ impl PtyChild {
     /// preserves teardown correctness even when the session leader has already
     /// delegated work to descendants.
     pub fn kill(&self, signal: Signal) -> Result<()> {
-        #[cfg(unix)]
-        {
-            backend::kill_foreground_process_group(self.pid, signal)
-        }
-
-        #[cfg(not(unix))]
-        {
-            #[cfg(windows)]
-            {
-                backend::kill_child(&self.child, signal)
-            }
-
-            #[cfg(not(windows))]
-            {
-                let _ = signal;
-                Err(PtyError::Unsupported(unsupported_op::SIGNAL_PTY_FOREGROUND))
-            }
-        }
+        self.inner.kill(signal)
     }
 
     /// Sends a signal directly to the PTY session leader.
@@ -315,27 +342,7 @@ impl PtyChild {
     /// different process group while the session leader is still the child that
     /// must be reaped by RMUX.
     pub fn kill_session_leader(&self, signal: Signal) -> Result<()> {
-        #[cfg(unix)]
-        {
-            backend::kill_process(self.pid, signal)?;
-            Ok(())
-        }
-
-        #[cfg(not(unix))]
-        {
-            #[cfg(windows)]
-            {
-                backend::kill_child(&self.child, signal)
-            }
-
-            #[cfg(not(windows))]
-            {
-                let _ = signal;
-                Err(PtyError::Unsupported(
-                    unsupported_op::SIGNAL_PTY_SESSION_LEADER,
-                ))
-            }
-        }
+        self.inner.kill_session_leader(signal)
     }
 
     /// Continues the PTY foreground process group if the session leader is
@@ -346,95 +353,6 @@ impl PtyChild {
     /// normal Unix job-control rules.
     #[cfg(unix)]
     pub fn continue_if_stopped(&self) -> Result<bool> {
-        let Some(stop_signal) = backend::stopped_signal(self.pid)? else {
-            return Ok(false);
-        };
-        if stop_signal == libc::SIGTTIN || stop_signal == libc::SIGTTOU {
-            return Ok(false);
-        }
-
-        backend::kill_foreground_process_group(self.pid, Signal::CONT)
-            .or_else(|_| backend::kill_process(self.pid, Signal::CONT))?;
-        Ok(true)
-    }
-}
-
-#[cfg(unix)]
-fn spawn_child(command: ChildCommand) -> Result<SpawnedPty> {
-    let pair = match command.size {
-        Some(size) => PtyPair::open_with_size(size)?,
-        None => PtyPair::open()?,
-    };
-    let (master, slave) = pair.into_split();
-    let raw_master_fd = master.raw_fd();
-    let startup_slave = slave.try_clone()?.into_owned_fd();
-    let master = master.with_startup_slave(startup_slave);
-
-    let stdin = File::from(slave.try_clone()?.into_owned_fd());
-    let stdout = File::from(slave.try_clone()?.into_owned_fd());
-    let stderr = File::from(slave.into_owned_fd());
-
-    let mut std_command = Command::new(&command.program);
-    if let Some(arg0) = &command.arg0 {
-        std_command.arg0(arg0);
-    }
-    std_command.args(&command.args);
-    std_command.stdin(Stdio::from(stdin));
-    std_command.stdout(Stdio::from(stdout));
-    std_command.stderr(Stdio::from(stderr));
-    if command.clear_env {
-        std_command.env_clear();
-    }
-    if let Some(current_dir) = &command.current_dir {
-        std_command.current_dir(current_dir);
-    }
-
-    for (key, value) in &command.env {
-        std_command.env(key, value);
-    }
-
-    let pre_exec = move || {
-        rmux_os::signals::reset_child_signal_dispositions()?;
-        backend::setup_child_controlling_terminal(raw_master_fd)
-    };
-
-    // SAFETY: The closure only performs post-fork child setup that is required
-    // for PTY correctness: it closes the child's inherited master fd copy,
-    // creates a new session, installs the slave as the controlling terminal,
-    // and sets the child process group to the foreground process group on the
-    // PTY. The closure does not touch parent-owned Rust state after fork.
-    unsafe {
-        std_command.pre_exec(pre_exec);
-    }
-
-    let child = std_command.spawn()?;
-    let pid = ProcessId::new(child.id())?;
-
-    Ok(SpawnedPty {
-        master,
-        child: PtyChild { child, pid },
-    })
-}
-
-#[cfg(not(unix))]
-fn spawn_child(_command: ChildCommand) -> Result<SpawnedPty> {
-    #[cfg(windows)]
-    {
-        let pair = match _command.size {
-            Some(size) => PtyPair::open_with_size(size)?,
-            None => PtyPair::open()?,
-        };
-        let master = pair.into_master();
-        let child = backend::spawn_child(_command, master.windows_pty())?;
-        let pid = child.pid();
-        Ok(SpawnedPty {
-            master,
-            child: PtyChild { child, pid },
-        })
-    }
-
-    #[cfg(not(windows))]
-    {
-        Err(PtyError::Unsupported(unsupported_op::SPAWN_PTY_CHILD))
+        self.inner.continue_if_stopped()
     }
 }

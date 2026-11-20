@@ -77,6 +77,10 @@ impl OptionNode {
 }
 
 impl OptionEntry {
+    pub(super) fn is_user(&self) -> bool {
+        self.name.starts_with('@')
+    }
+
     pub(super) fn new_scalar(
         query: &OptionQuery,
         scope: OptionScopeSelector,
@@ -137,15 +141,6 @@ impl OptionEntry {
             }
             (OptionEntryValue::Array(_), None) => Some(&self.rendered),
             _ => None,
-        }
-    }
-
-    pub(super) fn array_values(&self) -> Vec<String> {
-        match &self.value {
-            OptionEntryValue::Array(items) => {
-                items.values().map(|item| item.rendered.clone()).collect()
-            }
-            OptionEntryValue::Scalar(_) => Vec::new(),
         }
     }
 

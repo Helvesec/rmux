@@ -421,3 +421,13 @@ impl Drop for TestHarness {
         let _ = std::fs::remove_dir_all(&self.root);
     }
 }
+
+/// Fails a test whose `new-session` setup did not succeed, naming the response
+/// that arrived instead so a red under load states its cause.
+#[track_caller]
+pub fn assert_new_session(response: &Response) {
+    assert!(
+        matches!(response, Response::NewSession(_)),
+        "expected Response::NewSession, got {response:?}"
+    );
+}

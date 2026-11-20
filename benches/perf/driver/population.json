@@ -1,0 +1,157 @@
+{
+  "source_commit": "b592010d0f41f8a6deba30a526c84a668ff6c6e4",
+  "operations": [
+    "new_session_warm_sh",
+    "list_sessions_default",
+    "split_window_h_detached_sh",
+    "split_window_v_detached_sh",
+    "send_keys_detached_round_trip",
+    "capture_pane_80x24",
+    "capture_pane_200x50_scrollback_10k",
+    "list_windows_20",
+    "resize_pane_right_1",
+    "kill_session",
+    "list_commands",
+    "capture_pane_5000_lines",
+    "new_window_detached_sh",
+    "resize_pane_absolute_100x30",
+    "new_session_cold_sh",
+    "split_window_h_attached_sh",
+    "split_window_v_attached_sh",
+    "resize_pane_left_1",
+    "resize_pane_right_10",
+    "resize_pane_absolute_200x50",
+    "resize_pane_storm_200",
+    "display_message_default",
+    "show_options_global",
+    "show_window_options",
+    "list_panes_80",
+    "rename_window",
+    "select_window_next",
+    "join_pane_detached",
+    "source_file_minimal",
+    "set_option_quiet",
+    "set_window_option_quiet",
+    "kill_pane",
+    "kill_server"
+  ],
+  "public_operations": [
+    "new_session_warm_sh",
+    "list_sessions_default",
+    "split_window_h_detached_sh",
+    "split_window_v_detached_sh",
+    "send_keys_detached_round_trip",
+    "capture_pane_80x24",
+    "capture_pane_200x50_scrollback_10k",
+    "list_windows_20",
+    "resize_pane_right_1",
+    "kill_session"
+  ],
+  "measured_arguments_ast": {
+    "list_commands": [
+      "List(elts=[Attribute(value=Name(id='adapter', ctx=Load()), attr='executable', ctx=Load()), Constant(value='list-commands')], ctx=Load())"
+    ],
+    "new_session_cold_sh": [
+      "Call(func=Attribute(value=Name(id='adapter', ctx=Load()), attr='command', ctx=Load()), args=[Name(id='socket', ctx=Load()), List(elts=[Constant(value='new-session'), Constant(value='-d'), Constant(value='-s'), Constant(value='bench')], ctx=Load())])"
+    ],
+    "new_session_warm_sh": [
+      "Call(func=Attribute(value=Name(id='adapter', ctx=Load()), attr='command', ctx=Load()), args=[Name(id='socket', ctx=Load()), List(elts=[Constant(value='new-session'), Constant(value='-d'), Constant(value='-s'), Constant(value='bench')], ctx=Load())])"
+    ],
+    "split_window_h_detached_sh": [
+      "List(elts=[Constant(value='split-window'), Constant(value='-h'), Constant(value='-d'), Constant(value='-t'), Constant(value='bench')], ctx=Load())"
+    ],
+    "split_window_v_detached_sh": [
+      "List(elts=[Constant(value='split-window'), Constant(value='-v'), Constant(value='-d'), Constant(value='-t'), Constant(value='bench')], ctx=Load())"
+    ],
+    "split_window_h_attached_sh": [
+      "List(elts=[Constant(value='split-window'), Constant(value='-h'), Constant(value='-t'), Constant(value='bench')], ctx=Load())"
+    ],
+    "split_window_v_attached_sh": [
+      "List(elts=[Constant(value='split-window'), Constant(value='-v'), Constant(value='-t'), Constant(value='bench')], ctx=Load())"
+    ],
+    "resize_pane_right_1": [
+      "List(elts=[Constant(value='resize-pane'), Constant(value='-t'), Constant(value='bench'), Constant(value='-R'), Constant(value='1')], ctx=Load())"
+    ],
+    "resize_pane_right_10": [
+      "List(elts=[Constant(value='resize-pane'), Constant(value='-t'), Constant(value='bench'), Constant(value='-R'), Constant(value='10')], ctx=Load())"
+    ],
+    "resize_pane_left_1": [
+      "List(elts=[Constant(value='resize-pane'), Constant(value='-t'), Constant(value='bench'), Constant(value='-L'), Constant(value='1')], ctx=Load())"
+    ],
+    "resize_pane_absolute_100x30": [
+      "List(elts=[Constant(value='resize-pane'), Constant(value='-x'), Constant(value='100'), Constant(value='-y'), Constant(value='30'), Constant(value='-t'), Constant(value='bench')], ctx=Load())"
+    ],
+    "resize_pane_absolute_200x50": [
+      "List(elts=[Constant(value='resize-pane'), Constant(value='-x'), Constant(value='200'), Constant(value='-y'), Constant(value='50'), Constant(value='-t'), Constant(value='bench')], ctx=Load())"
+    ],
+    "resize_pane_storm_200": [
+      "List(elts=[Constant(value='source-file'), Name(id='path', ctx=Load())], ctx=Load())"
+    ],
+    "list_sessions_default": [
+      "List(elts=[Constant(value='list-sessions')], ctx=Load())"
+    ],
+    "capture_pane_5000_lines": [
+      "List(elts=[Constant(value='capture-pane'), Constant(value='-p'), Constant(value='-t'), Constant(value='bench')], ctx=Load())"
+    ],
+    "capture_pane_80x24": [
+      "List(elts=[Constant(value='capture-pane'), Constant(value='-p'), Constant(value='-t'), Constant(value='bench')], ctx=Load())"
+    ],
+    "capture_pane_200x50_scrollback_10k": [
+      "List(elts=[Constant(value='capture-pane'), Constant(value='-p'), Constant(value='-S'), Constant(value='-10000'), Constant(value='-t'), Constant(value='bench')], ctx=Load())"
+    ],
+    "new_window_detached_sh": [
+      "List(elts=[Constant(value='new-window'), Constant(value='-d'), Constant(value='-t'), Constant(value='bench')], ctx=Load())"
+    ],
+    "send_keys_detached_round_trip": [
+      "List(elts=[Constant(value='send-keys'), Constant(value='-t'), Constant(value='bench:0.0'), Constant(value='printf rmux-bench'), Constant(value='Enter')], ctx=Load())"
+    ],
+    "display_message_default": [
+      "List(elts=[Constant(value='display-message'), Constant(value='-p'), Constant(value='-t'), Constant(value='bench'), Constant(value='#{session_name}')], ctx=Load())"
+    ],
+    "show_options_global": [
+      "List(elts=[Constant(value='show-options'), Constant(value='-g')], ctx=Load())"
+    ],
+    "show_window_options": [
+      "List(elts=[Constant(value='show-window-options'), Constant(value='-g')], ctx=Load())"
+    ],
+    "list_windows_20": [
+      "List(elts=[Constant(value='list-windows'), Constant(value='-t'), Constant(value='bench')], ctx=Load())"
+    ],
+    "batched_list_windows_20": [
+      "Call(func=Attribute(value=Name(id='adapter', ctx=Load()), attr='command', ctx=Load()), args=[Name(id='socket', ctx=Load()), List(elts=[Constant(value='list-windows'), Constant(value='-t'), Constant(value='bench')], ctx=Load())])"
+    ],
+    "list_panes_80": [
+      "List(elts=[Constant(value='list-panes'), Constant(value='-a')], ctx=Load())"
+    ],
+    "batched_list_panes_80": [
+      "Call(func=Attribute(value=Name(id='adapter', ctx=Load()), attr='command', ctx=Load()), args=[Name(id='socket', ctx=Load()), List(elts=[Constant(value='list-panes'), Constant(value='-a')], ctx=Load())])"
+    ],
+    "rename_window": [
+      "List(elts=[Constant(value='rename-window'), Constant(value='-t'), Constant(value='bench:0'), Constant(value='renamed')], ctx=Load())"
+    ],
+    "select_window_next": [
+      "List(elts=[Constant(value='select-window'), Constant(value='-t'), Constant(value='bench:1')], ctx=Load())"
+    ],
+    "join_pane_detached": [
+      "List(elts=[Constant(value='join-pane'), Constant(value='-d'), Constant(value='-s'), Constant(value='bench:1.0'), Constant(value='-t'), Constant(value='bench:0.0')], ctx=Load())"
+    ],
+    "source_file_minimal": [
+      "List(elts=[Constant(value='source-file'), Name(id='path', ctx=Load())], ctx=Load())"
+    ],
+    "set_option_quiet": [
+      "List(elts=[Constant(value='set-option'), Constant(value='-g'), Constant(value='status'), Constant(value='on')], ctx=Load())"
+    ],
+    "set_window_option_quiet": [
+      "List(elts=[Constant(value='set-window-option'), Constant(value='-g'), Constant(value='automatic-rename'), Constant(value='off')], ctx=Load())"
+    ],
+    "kill_pane": [
+      "List(elts=[Constant(value='kill-pane'), Constant(value='-t'), Constant(value='bench:0.1')], ctx=Load())"
+    ],
+    "kill_session": [
+      "List(elts=[Constant(value='kill-session'), Constant(value='-t'), Constant(value='bench')], ctx=Load())"
+    ],
+    "kill_server": [
+      "List(elts=[Constant(value='kill-server')], ctx=Load())"
+    ]
+  }
+}

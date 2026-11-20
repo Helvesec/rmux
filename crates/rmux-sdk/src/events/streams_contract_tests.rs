@@ -125,7 +125,7 @@ where
     let transport = TransportClient::spawn(stream);
     PaneOutputStream::open(
         transport,
-        rmux_proto::PaneTargetRef::slot(target.into()),
+        rmux_proto::PaneTargetRef::slot(target.into_proto()),
         start,
     )
     .await
@@ -351,7 +351,7 @@ async fn output_stream_does_not_retain_its_expired_open_deadline() {
     let subscribe = tokio::spawn(async move {
         PaneOutputStream::open(
             transport,
-            rmux_proto::PaneTargetRef::slot(target.into()),
+            rmux_proto::PaneTargetRef::slot(target.into_proto()),
             PaneOutputStart::Now,
         )
         .await
@@ -453,7 +453,7 @@ async fn cancelled_output_open_unsubscribes_once_and_preserves_shared_transport(
     let open = tokio::spawn(async move {
         PaneOutputStream::open(
             transport,
-            rmux_proto::PaneTargetRef::slot(target.into()),
+            rmux_proto::PaneTargetRef::slot(target.into_proto()),
             PaneOutputStart::Now,
         )
         .await

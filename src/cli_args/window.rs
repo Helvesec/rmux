@@ -80,6 +80,20 @@ pub(crate) struct WindowTargetArgs {
 }
 
 #[derive(Debug, Clone, Args)]
+pub(crate) struct ExportWindowSnapshotArgs {
+    #[arg(short = 't', value_parser = parse_target_spec, allow_hyphen_values = true)]
+    pub(crate) target: Option<TargetSpec>,
+}
+
+#[derive(Debug, Clone, Args)]
+pub(crate) struct RestoreWindowSnapshotArgs {
+    #[arg(short = 't', value_parser = parse_target_spec, allow_hyphen_values = true)]
+    pub(crate) target: Option<TargetSpec>,
+    #[arg(value_name = "snapshot-file", allow_hyphen_values = true)]
+    pub(crate) snapshot_path: PathBuf,
+}
+
+#[derive(Debug, Clone, Args)]
 #[command(group(
     ArgGroup::new("navigation")
         .required(false)

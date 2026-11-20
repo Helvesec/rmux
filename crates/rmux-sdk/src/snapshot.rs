@@ -22,10 +22,10 @@ pub use glyph::PaneGlyph;
 
 /// A captured pane grid in row-major cell order.
 ///
-/// `revision` is a daemon-derived counter that changes whenever the captured
-/// pane state mutates — output, resize, clear, exit, or any other visible
-/// change. Consumers use it as the canonical "did the pane move?" signal;
-/// there is no separate `current_revision()` getter on the SDK pane handle,
+/// `revision` is a daemon-derived counter assigned each time the daemon
+/// materialises a capture of the pane, not each time the pane mutates; see
+/// the field documentation for what equal or different revisions prove.
+/// There is no separate `current_revision()` getter on the SDK pane handle,
 /// because the only authoritative point-in-time revision value is the one
 /// carried by a freshly captured snapshot (or by a revision-carrying
 /// [`PaneEvent`](crate::PaneEvent) variant).
@@ -41,12 +41,22 @@ pub struct PaneSnapshot {
     pub cursor: PaneCursor,
     /// Daemon-derived revision counter for this captured pane state.
     ///
-    /// The producer guarantees that when any observable pane field
-    /// (`cols`, `rows`, `cells`, `cursor`, the underlying process state)
-    /// changes between two captures, the revision changes too. Equal
-    /// revisions therefore mean "nothing observable changed". A captured
-    /// snapshot for an exited or no-longer-listed pane carries a revision
-    /// distinct from any prior live revision.
+    /// The daemon assigns it whenever it materialises a capture of the pane:
+    /// a snapshot request, a surface-stream frame or a recovery snapshot.
+    /// Each capture hashes a fingerprint of `cols`, `rows`, `cells`,
+    /// `cursor`, the pane's output sequence, its history line and byte
+    /// counts, and the pane id. A capture keeps the revision for an unchanged
+    /// fingerprint unless a surface-stream floor raises it, including on reset.
+    /// Any other fingerprint, including a return to an older state, advances
+    /// it. All producers share one counter per pane, so the revision can advance
+    /// between two snapshots that are equal in every field other than `revision`.
+    ///
+    /// Equal revisions on two snapshots therefore mean that those two captures
+    /// observed the same daemon-side state. They do not prove that the pane
+    /// was unmodified between them: a change that no capture observed leaves
+    /// no trace. Live captures always carry a non-zero revision; a snapshot
+    /// for a pane that is no longer listed is the empty default with
+    /// revision `0`.
     pub revision: u64,
 }
 
@@ -341,7 +351,7 @@ fn expected_cell_count(cols: u16, rows: u16) -> usize {
     usize::from(cols) * usize::from(rows)
 }
 
-fn render_cells_lossy(cells: &[PaneCell]) -> String {
+pub(crate) fn render_cells_lossy(cells: &[PaneCell]) -> String {
     let mut rendered = String::new();
     for cell in cells {
         if cell.is_padding() {

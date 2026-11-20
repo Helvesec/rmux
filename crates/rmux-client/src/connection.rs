@@ -5,17 +5,24 @@ use std::ffi::OsStr;
 use std::ffi::OsString;
 #[cfg(all(test, unix))]
 use std::fs;
-use std::io::{self, Read, Write};
+use std::io::{self, Read};
 #[cfg(all(test, unix))]
 use std::os::unix::ffi::{OsStrExt, OsStringExt};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
+mod capabilities;
+
 use crate::ClientError;
+use rmux_bootstrap::deadline::StartupDeadline;
+
+mod deadline;
+mod frame_io;
+pub use deadline::connect_with_deadline;
 use rmux_ipc::{connect_blocking, BlockingLocalStream, LocalEndpoint};
 use rmux_proto::{
-    encode_frame, AttachSessionResponse, ControlMode, ControlModeResponse, FrameDecoder,
-    HandshakeRequest, Request, Response, RmuxError, RMUX_FRAME_MAGIC, RMUX_WIRE_VERSION,
+    encode_frame, AttachSessionResponse, ControlMode, ControlModeResponse, FrameDecoder, Request,
+    Response, RmuxError, RMUX_FRAME_MAGIC, RMUX_WIRE_VERSION,
 };
 
 /// Read buffer size for blocking socket reads.
@@ -128,6 +135,7 @@ pub struct Connection {
     stream: BlockingLocalStream,
     decoder: FrameDecoder,
     handshake_capabilities: Option<Vec<String>>,
+    operation_deadline: Option<StartupDeadline>,
 }
 
 /// The explicit result of requesting an attach-stream upgrade.
@@ -217,6 +225,7 @@ impl Connection {
             stream,
             decoder: FrameDecoder::new(),
             handshake_capabilities: None,
+            operation_deadline: None,
         })
     }
 
@@ -230,41 +239,6 @@ impl Connection {
         self.read_response()
     }
 
-    /// Returns whether the connected daemon advertises a protocol capability.
-    ///
-    /// Optional client behavior uses this as a soft gate: older daemons that do
-    /// not answer the handshake shape or report an error are treated as not
-    /// supporting the capability, leaving the connection usable for legacy
-    /// requests.
-    pub fn supports_capability(&mut self, capability: &str) -> Result<bool, ClientError> {
-        if let Some(capabilities) = &self.handshake_capabilities {
-            return Ok(capabilities.iter().any(|supported| supported == capability));
-        }
-
-        match self.roundtrip(&Request::Handshake(HandshakeRequest::current()))? {
-            Response::Handshake(response) => {
-                self.handshake_capabilities = Some(response.capabilities);
-                Ok(self
-                    .handshake_capabilities
-                    .as_ref()
-                    .expect("handshake capabilities were just cached")
-                    .iter()
-                    .any(|supported| supported == capability))
-            }
-            Response::Error(error) => {
-                if matches!(&error.error, RmuxError::UnsupportedWireVersion { .. }) {
-                    return Err(ClientError::Protocol(error.error));
-                }
-                self.handshake_capabilities = Some(Vec::new());
-                Ok(false)
-            }
-            _ => {
-                self.handshake_capabilities = Some(Vec::new());
-                Ok(false)
-            }
-        }
-    }
-
     /// Sends a request without a detached response read timeout.
     ///
     /// This is reserved for scripting requests whose server-side completion can
@@ -273,12 +247,7 @@ impl Connection {
         &mut self,
         request: &Request,
     ) -> Result<Response, ClientError> {
-        let previous_timeout = read_timeout(&self.stream).map_err(ClientError::Io)?;
-        set_read_timeout(&self.stream, None).map_err(ClientError::Io)?;
-        let result = self.roundtrip(request);
-        let restore_result =
-            set_read_timeout(&self.stream, previous_timeout).map_err(ClientError::Io);
-        finish_unbounded_roundtrip(result, restore_result)
+        self.with_read_timeout(None, |connection| connection.roundtrip(request))
     }
 
     /// Reads the next detached response without a response read timeout.
@@ -286,17 +255,7 @@ impl Connection {
     /// This is used for already-armed long-running requests where another
     /// connection may cancel the server-side wait on timeout.
     pub fn read_response_without_read_timeout(&mut self) -> Result<Response, ClientError> {
-        let previous_timeout = read_timeout(&self.stream).map_err(ClientError::Io)?;
-        set_read_timeout(&self.stream, None).map_err(ClientError::Io)?;
-        let result = self.read_response();
-        let restore_result =
-            set_read_timeout(&self.stream, previous_timeout).map_err(ClientError::Io);
-
-        match (result, restore_result) {
-            (Err(error), _) => Err(error),
-            (Ok(response), Ok(())) => Ok(response),
-            (Ok(_), Err(error)) => Err(error),
-        }
+        self.with_read_timeout(None, Self::read_response)
     }
 
     /// Reads the next detached response with a caller-provided read timeout.
@@ -304,55 +263,24 @@ impl Connection {
         &mut self,
         timeout: Duration,
     ) -> Result<Response, ClientError> {
+        self.with_read_timeout(Some(timeout), |connection| {
+            connection.read_response_with_limit(Some(timeout))
+        })
+    }
+
+    /// Runs `operation` under `timeout`, then restores the previous read
+    /// timeout. An operation error takes precedence over a restore error.
+    fn with_read_timeout<T>(
+        &mut self,
+        timeout: Option<Duration>,
+        operation: impl FnOnce(&mut Self) -> Result<T, ClientError>,
+    ) -> Result<T, ClientError> {
         let previous_timeout = read_timeout(&self.stream).map_err(ClientError::Io)?;
-        set_read_timeout(&self.stream, Some(timeout)).map_err(ClientError::Io)?;
-        let result = self.read_response();
+        set_read_timeout(&self.stream, timeout).map_err(ClientError::Io)?;
+        let result = operation(self);
         let restore_result =
             set_read_timeout(&self.stream, previous_timeout).map_err(ClientError::Io);
-
-        match (result, restore_result) {
-            (Err(error), _) => Err(error),
-            (Ok(response), Ok(())) => Ok(response),
-            (Ok(_), Err(error)) => Err(error),
-        }
-    }
-
-    pub(crate) fn write_request(&mut self, request: &Request) -> Result<(), ClientError> {
-        let frame = encode_frame(request).map_err(ClientError::Protocol)?;
-        self.stream.write_all(&frame).map_err(ClientError::Io)
-    }
-
-    pub(crate) fn write_legacy_wire_request(
-        &mut self,
-        request: &Request,
-        wire_version: u32,
-    ) -> Result<(), ClientError> {
-        let frame = encode_legacy_wire_frame(request, wire_version)?;
-        self.stream.write_all(&frame).map_err(ClientError::Io)
-    }
-
-    pub(crate) fn read_response(&mut self) -> Result<Response, ClientError> {
-        let mut buffer = [0u8; READ_BUFFER_SIZE];
-
-        loop {
-            match self.decoder.next_frame::<Response>() {
-                Ok(Some(response)) => return Ok(response),
-                Ok(None) => {}
-                Err(error) => return Err(ClientError::Protocol(error)),
-            }
-
-            let bytes_read = match self.stream.read(&mut buffer) {
-                Ok(bytes_read) => bytes_read,
-                Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
-                Err(error) => return Err(ClientError::Io(error)),
-            };
-
-            if bytes_read == 0 {
-                return Err(ClientError::UnexpectedEof);
-            }
-
-            self.decoder.push_bytes(&buffer[..bytes_read]);
-        }
+        result.and_then(|value| restore_result.map(|()| value))
     }
 
     pub(crate) fn stream_mut(&mut self) -> &mut BlockingLocalStream {
@@ -363,8 +291,7 @@ impl Connection {
         self,
         response: AttachSessionResponse,
     ) -> Result<AttachSessionUpgrade, ClientError> {
-        set_read_timeout(&self.stream, None).map_err(ClientError::Io)?;
-        set_write_timeout(&self.stream, None).map_err(ClientError::Io)?;
+        clear_upgraded_stream_timeouts(&self.stream).map_err(ClientError::Io)?;
         let initial_bytes = self.decoder.remaining_bytes().to_vec();
 
         Ok(AttachSessionUpgrade {
@@ -378,8 +305,7 @@ impl Connection {
         self,
         response: ControlModeResponse,
     ) -> Result<ControlModeUpgrade, ClientError> {
-        set_read_timeout(&self.stream, None).map_err(ClientError::Io)?;
-        set_write_timeout(&self.stream, None).map_err(ClientError::Io)?;
+        clear_upgraded_stream_timeouts(&self.stream).map_err(ClientError::Io)?;
 
         Ok(ControlModeUpgrade {
             response,
@@ -388,27 +314,11 @@ impl Connection {
     }
 }
 
-fn finish_unbounded_roundtrip(
-    result: Result<Response, ClientError>,
-    restore_result: Result<(), ClientError>,
-) -> Result<Response, ClientError> {
-    match (result, restore_result) {
-        (Err(error), _) => Err(error),
-        (Ok(response), Ok(())) => Ok(response),
-        (Ok(response), Err(ClientError::Io(error)))
-            if completed_response_survives_timeout_restore_error(&error) =>
-        {
-            Ok(response)
-        }
-        (Ok(_), Err(error)) => Err(error),
-    }
-}
-
-fn completed_response_survives_timeout_restore_error(error: &io::Error) -> bool {
-    // Darwin returns EINVAL when SO_RCVTIMEO is restored after the peer has
-    // closed. The complete framed response remains valid; the socket is not
-    // reusable and the next operation will observe the disconnect normally.
-    cfg!(target_os = "macos") && error.kind() == io::ErrorKind::InvalidInput
+/// Removes the detached RPC deadlines from a stream that becomes a long-lived
+/// attach or control-mode stream.
+fn clear_upgraded_stream_timeouts(stream: &BlockingLocalStream) -> io::Result<()> {
+    set_read_timeout(stream, None)?;
+    set_write_timeout(stream, None)
 }
 
 fn encode_legacy_wire_frame(request: &Request, wire_version: u32) -> Result<Vec<u8>, ClientError> {
@@ -446,6 +356,16 @@ fn encode_legacy_wire_frame(request: &Request, wire_version: u32) -> Result<Vec<
     }
 }
 
+/// Maps a request write failure on a detached RPC stream, naming an expired
+/// write deadline as a timeout.
+pub(crate) fn request_write_error(stream: &BlockingLocalStream, error: io::Error) -> ClientError {
+    ClientError::Io(frame_io::expired_deadline_error(
+        stream,
+        error,
+        frame_io::RpcTransfer::Request,
+    ))
+}
+
 pub(crate) fn read_response_frame_exact(
     stream: &mut BlockingLocalStream,
 ) -> Result<Response, ClientError> {
@@ -473,7 +393,11 @@ fn read_exact_or_eof(
         Err(error) if error.kind() == io::ErrorKind::UnexpectedEof => {
             Err(ClientError::UnexpectedEof)
         }
-        Err(error) => Err(ClientError::Io(error)),
+        Err(error) => Err(ClientError::Io(frame_io::expired_deadline_error(
+            stream,
+            error,
+            frame_io::RpcTransfer::Response,
+        ))),
     }
 }
 
@@ -554,12 +478,44 @@ fn read_timeout(stream: &BlockingLocalStream) -> io::Result<Option<Duration>> {
     stream.read_timeout()
 }
 
+/// Sets the read deadline of a detached RPC stream.
+///
+/// Every read and write deadline change in this module goes through
+/// [`set_read_timeout`] or [`set_write_timeout`] so the Darwin disconnect rule
+/// below holds on every path.
 fn set_read_timeout(stream: &BlockingLocalStream, timeout: Option<Duration>) -> io::Result<()> {
-    stream.set_read_timeout(timeout)
+    ignore_timeout_change_after_peer_disconnect(stream.set_read_timeout(timeout))
 }
 
+/// Sets the write deadline of a detached RPC stream; see [`set_read_timeout`].
 fn set_write_timeout(stream: &BlockingLocalStream, timeout: Option<Duration>) -> io::Result<()> {
-    stream.set_write_timeout(timeout)
+    ignore_timeout_change_after_peer_disconnect(stream.set_write_timeout(timeout))
+}
+
+/// Accepts a deadline change that Darwin refused because the peer is gone.
+///
+/// The server may send a complete response or upgrade output and close the
+/// socket before the client changes a deadline. XNU's setsockopt then fails
+/// with EINVAL, because the socket can neither send nor receive any more. Such
+/// a socket can no longer block, so the deadline is moot: buffered bytes stay
+/// readable and the next read or write reports the disconnect normally.
+fn ignore_timeout_change_after_peer_disconnect(result: io::Result<()>) -> io::Result<()> {
+    match result {
+        Err(error) if timeout_change_rejected_after_peer_disconnect(&error) => Ok(()),
+        result => result,
+    }
+}
+
+/// Matches only the kernel's EINVAL: the standard library reports invalid
+/// durations, such as zero, as `InvalidInput` without an OS error code.
+#[cfg(target_os = "macos")]
+fn timeout_change_rejected_after_peer_disconnect(error: &io::Error) -> bool {
+    error.raw_os_error() == Some(libc::EINVAL)
+}
+
+#[cfg(not(target_os = "macos"))]
+fn timeout_change_rejected_after_peer_disconnect(_error: &io::Error) -> bool {
+    false
 }
 
 /// Returns `true` for I/O errors that indicate the server is not running.

@@ -14,12 +14,16 @@ use rustix::event::{poll, PollFd, PollFlags, Timespec};
 use rustix::fs::{Mode, OFlags};
 use tokio::task::JoinHandle;
 
+use super::limit::{append_bounded, read_regular_file, MAX_BUFFER_FILE_BYTES};
+
 #[cfg(target_os = "macos")]
-#[path = "darwin_fifo_reader.rs"]
-mod fifo_reader;
+mod darwin_fifo_reader;
+#[cfg(target_os = "macos")]
+use darwin_fifo_reader as fifo_reader;
 #[cfg(not(target_os = "macos"))]
-#[path = "fifo_reader_fallback.rs"]
-mod fifo_reader;
+mod fifo_reader_fallback;
+#[cfg(not(target_os = "macos"))]
+use fifo_reader_fallback as fifo_reader;
 
 const PHASE_PENDING: u8 = 0;
 const PHASE_OPENING: u8 = 1;
@@ -170,42 +174,13 @@ pub(super) async fn read(path: PathBuf) -> io::Result<Vec<u8>> {
     }
 
     match open_read_target(&path)? {
-        ReadTarget::Ordinary(mut file) => tokio::task::spawn_blocking(move || {
-            let mut content = Vec::new();
-            file.read_to_end(&mut content)?;
-            Ok(content)
-        })
-        .await
-        .map_err(|error| io::Error::other(format!("buffer file reader failed: {error}")))?,
+        ReadTarget::Ordinary(file) => tokio::task::spawn_blocking(move || read_regular_file(file))
+            .await
+            .map_err(|error| io::Error::other(format!("buffer file reader failed: {error}")))?,
         ReadTarget::Special(file, special) => {
-            read_special_discovered_after_classification(path, file, special).await
+            fifo_reader::read_special_discovered_after_classification(path, file, special).await
         }
     }
-}
-
-#[cfg(not(target_os = "macos"))]
-async fn read_special_discovered_after_classification(
-    path: PathBuf,
-    file: File,
-    special: SpecialFile,
-) -> io::Result<Vec<u8>> {
-    start_read(path, special, Some(file)).await
-}
-
-#[cfg(target_os = "macos")]
-async fn read_special_discovered_after_classification(
-    _path: PathBuf,
-    _file: File,
-    _special: SpecialFile,
-) -> io::Result<Vec<u8>> {
-    // A nonblocking FIFO descriptor counts as a reader on macOS. Handing the
-    // path to the blocking helper after this point can lose an instantaneous
-    // writer's bytes between the two opens. Fail the raced operation instead;
-    // a path observed as a FIFO initially still uses the helper above.
-    Err(io::Error::new(
-        io::ErrorKind::InvalidInput,
-        "buffer path changed to a special file during open",
-    ))
 }
 
 pub(super) async fn write(path: PathBuf, content: Vec<u8>, append: bool) -> io::Result<()> {
@@ -292,7 +267,7 @@ fn read_special(state: Arc<CancellationState>, file: Option<File>) -> io::Result
             Ok(0) => return Ok(content),
             Ok(length) => {
                 observed_fifo_writer = true;
-                content.extend_from_slice(&buffer[..length]);
+                append_bounded(&mut content, &buffer[..length], MAX_BUFFER_FILE_BYTES)?;
             }
             Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
                 if state.special.kind == SpecialFileKind::Fifo {
@@ -538,6 +513,9 @@ fn ensure_not_cancelled(state: &CancellationState) -> io::Result<()> {
 fn errno_to_io(error: rustix::io::Errno) -> io::Error {
     io::Error::from_raw_os_error(error.raw_os_error())
 }
+
+#[cfg(test)]
+mod size_limit_tests;
 
 #[cfg(test)]
 mod tests {
@@ -792,9 +770,13 @@ mod tests {
 
         #[cfg(target_os = "macos")]
         {
-            let error = read_special_discovered_after_classification(path.clone(), file, special)
-                .await
-                .expect_err("a raced macOS FIFO read must fail without reopening the path");
+            let error = fifo_reader::read_special_discovered_after_classification(
+                path.clone(),
+                file,
+                special,
+            )
+            .await
+            .expect_err("a raced macOS FIFO read must fail without reopening the path");
             assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
             std::fs::remove_file(path).expect("remove replacement FIFO");
         }

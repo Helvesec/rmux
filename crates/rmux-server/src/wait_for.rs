@@ -222,7 +222,9 @@ impl WaitForStore {
         Ok(())
     }
 
-    pub(crate) fn shutdown(&mut self) {
+    /// Wakes every waiter for good; returns whether this call began the shutdown.
+    pub(crate) fn shutdown(&mut self) -> bool {
+        let first = !self.shutting_down;
         self.shutting_down = true;
         for state in self.channels.values_mut() {
             for waiter in state.signal_waiters.drain(..) {
@@ -236,6 +238,7 @@ impl WaitForStore {
             state.granted_lock_waiter = None;
         }
         self.channels.clear();
+        first
     }
 
     #[cfg(test)]

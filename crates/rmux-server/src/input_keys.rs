@@ -3,10 +3,9 @@
 use rmux_core::{
     input::mode, key_code_to_bytes, key_string_lookup_string, KeyCode, KEYC_BSPACE, KEYC_CTRL,
     KEYC_CURSOR, KEYC_IMPLIED_META, KEYC_KEYPAD, KEYC_MASK_KEY, KEYC_MASK_MODIFIERS,
-    KEYC_MASK_TYPE, KEYC_META, KEYC_SHIFT,
+    KEYC_MASK_TYPE, KEYC_META, KEYC_SHIFT, KEYC_USER,
 };
 
-#[path = "input_keys/mouse.rs"]
 mod mouse;
 
 #[cfg(test)]
@@ -50,6 +49,9 @@ pub(crate) fn encode_key_with_backspace(
     key: KeyCode,
     backspace: u8,
 ) -> Option<Vec<u8>> {
+    if (key & KEYC_MASK_TYPE) == KEYC_USER {
+        return Some(Vec::new());
+    }
     let format = if (pane_mode & mode::MODE_KEYS_KITTY) != 0 {
         ExtendedKeyFormat::CsiU
     } else {
@@ -61,6 +63,7 @@ pub(crate) fn encode_key_with_backspace(
             return input_key_extended(
                 (key & !KEYC_MASK_KEY) | u64::from(b'\t') | KEYC_SHIFT,
                 format,
+                backspace,
             );
         }
         return Some(b"\x1b[Z".to_vec());
@@ -74,11 +77,16 @@ pub(crate) fn encode_key_with_backspace(
         return key_code_to_bytes(key);
     }
 
+    if let Some(sequence) = input_key_escape_prefixed(pane_mode, key) {
+        return Some(sequence);
+    }
+
     if (pane_mode & mode::MODE_KEYS_EXTENDED_2) != 0 {
-        input_key_extended(key, format).or_else(|| input_key_vt10x(pane_mode, key, backspace))
+        input_key_extended(key, format, backspace)
+            .or_else(|| input_key_vt10x(pane_mode, key, backspace))
     } else if (pane_mode & mode::MODE_KEYS_EXTENDED) != 0 {
         input_key_mode1(key, backspace)
-            .or_else(|| input_key_extended(key, format))
+            .or_else(|| input_key_extended(key, format, backspace))
             .or_else(|| input_key_vt10x(pane_mode, key, backspace))
     } else {
         input_key_vt10x(pane_mode, key, backspace)
@@ -254,13 +262,19 @@ fn key_from_modified_cursor_terminator(terminator: u8) -> Option<KeyCode> {
     }
 }
 
-fn input_key_extended(key: KeyCode, format: ExtendedKeyFormat) -> Option<Vec<u8>> {
-    if let Some(sequence) = input_key_modified_cursor(key) {
+/// tmux 3.7b `input_key` replaces Backspace by the `backspace` option before
+/// the extended encoding, so a modified Backspace carries that byte (127 by
+/// default), never the internal key number.
+fn input_key_extended(key: KeyCode, format: ExtendedKeyFormat, backspace: u8) -> Option<Vec<u8>> {
+    if let Some(sequence) = input_key_embedded_modifier(key) {
         return Some(sequence);
     }
 
     let modifier = xterm_modifier_parameter(key)?;
-    let key = key & KEYC_MASK_KEY;
+    let key = match key & KEYC_MASK_KEY {
+        KEYC_BSPACE => u64::from(backspace),
+        onlykey => onlykey,
+    };
 
     Some(match format {
         ExtendedKeyFormat::Xterm => format!("\x1b[27;{modifier};{key}~").into_bytes(),
@@ -268,26 +282,73 @@ fn input_key_extended(key: KeyCode, format: ExtendedKeyFormat) -> Option<Vec<u8>
     })
 }
 
-fn input_key_modified_cursor(key: KeyCode) -> Option<Vec<u8>> {
+/// tmux 3.7b `input-keys.c` ("Keys with an embedded modifier"): with Shift,
+/// Meta or Ctrl these keys carry the xterm modifier parameter inside their own
+/// sequence, `CSI number ; modifier final`, in every extended-keys mode.
+const EMBEDDED_MODIFIER_KEYS: [(&str, u8, u8); 22] = [
+    ("F1", 1, b'P'),
+    ("F2", 1, b'Q'),
+    ("F3", 1, b'R'),
+    ("F4", 1, b'S'),
+    ("F5", 15, b'~'),
+    ("F6", 17, b'~'),
+    ("F7", 18, b'~'),
+    ("F8", 19, b'~'),
+    ("F9", 20, b'~'),
+    ("F10", 21, b'~'),
+    ("F11", 23, b'~'),
+    ("F12", 24, b'~'),
+    ("Up", 1, b'A'),
+    ("Down", 1, b'B'),
+    ("Right", 1, b'C'),
+    ("Left", 1, b'D'),
+    ("Home", 1, b'H'),
+    ("End", 1, b'F'),
+    ("PPage", 5, b'~'),
+    ("NPage", 6, b'~'),
+    ("IC", 2, b'~'),
+    ("DC", 3, b'~'),
+];
+
+fn input_key_embedded_modifier(key: KeyCode) -> Option<Vec<u8>> {
     let modifier = xterm_modifier_parameter(key)?;
     let base = key & !(KEYC_SHIFT | KEYC_META | KEYC_CTRL | KEYC_IMPLIED_META);
-    let final_byte = if base == (parse_named_key("Up") & !KEYC_IMPLIED_META) {
-        b'A'
-    } else if base == (parse_named_key("Down") & !KEYC_IMPLIED_META) {
-        b'B'
-    } else if base == (parse_named_key("Right") & !KEYC_IMPLIED_META) {
-        b'C'
-    } else if base == (parse_named_key("Left") & !KEYC_IMPLIED_META) {
-        b'D'
-    } else if base == (parse_named_key("End") & !KEYC_IMPLIED_META) {
-        b'F'
-    } else if base == (parse_named_key("Home") & !KEYC_IMPLIED_META) {
-        b'H'
-    } else {
-        return None;
-    };
+    let (_, number, final_byte) = EMBEDDED_MODIFIER_KEYS
+        .iter()
+        .find(|(name, _, _)| base == (parse_named_key(name) & !KEYC_IMPLIED_META))?;
 
-    Some(format!("\x1b[1;{}{}", modifier, char::from(final_byte)).into_bytes())
+    Some(format!("\x1b[{number};{modifier}{}", char::from(*final_byte)).into_bytes())
+}
+
+/// tmux 3.7b `input_key`: a Meta that the key's sequence does not imply (no
+/// `KEYC_IMPLIED_META`, as for an Escape typed before the key) is written as
+/// Escape followed by the builtin sequence of the key without Meta, in every
+/// key mode, before any extended form.
+fn input_key_escape_prefixed(pane_mode: u32, key: KeyCode) -> Option<Vec<u8>> {
+    if (key & KEYC_META) == 0 || (key & KEYC_IMPLIED_META) != 0 {
+        return None;
+    }
+    let sequence = input_key_builtin(pane_mode, key & !KEYC_META)?;
+    let mut output = Vec::with_capacity(sequence.len() + 1);
+    output.push(0x1b);
+    output.extend_from_slice(&sequence);
+    Some(output)
+}
+
+/// tmux 3.7b's builtin key tree (`input_key_defaults`): the keys with an
+/// embedded modifier, then the standard VT10x sequences, with the cursor and
+/// keypad forms only in their application modes.
+fn input_key_builtin(pane_mode: u32, mut key: KeyCode) -> Option<Vec<u8>> {
+    if let Some(sequence) = input_key_embedded_modifier(key) {
+        return Some(sequence);
+    }
+    if (pane_mode & mode::MODE_KKEYPAD) == 0 {
+        key &= !KEYC_KEYPAD;
+    }
+    if (pane_mode & mode::MODE_KCURSOR) == 0 {
+        key &= !KEYC_CURSOR;
+    }
+    standard_sequence(key).map(<[u8]>::to_vec)
 }
 
 fn xterm_modifier_parameter(key: KeyCode) -> Option<u8> {
@@ -304,15 +365,9 @@ fn xterm_modifier_parameter(key: KeyCode) -> Option<u8> {
     }
 }
 
-fn input_key_vt10x(pane_mode: u32, key: KeyCode, backspace: u8) -> Option<Vec<u8>> {
-    let mut key = key;
-
-    if let Some(sequence) = input_key_modified_cursor(key) {
+fn input_key_vt10x(pane_mode: u32, mut key: KeyCode, backspace: u8) -> Option<Vec<u8>> {
+    if let Some(sequence) = input_key_embedded_modifier(key) {
         return Some(sequence);
-    }
-
-    if is_shift_only_enter(key) {
-        return Some(vec![b'\n']);
     }
 
     let mut output = Vec::new();
@@ -339,18 +394,7 @@ fn input_key_vt10x(pane_mode: u32, key: KeyCode, backspace: u8) -> Option<Vec<u8
         return Some(Vec::new());
     }
 
-    if let Some(sequence) = standard_vt10x_sequence(key)
-        .or_else(|| {
-            ((key & KEYC_CURSOR) != 0)
-                .then(|| standard_vt10x_sequence(key & !KEYC_CURSOR))
-                .flatten()
-        })
-        .or_else(|| {
-            ((key & KEYC_KEYPAD) != 0)
-                .then(|| standard_vt10x_sequence(key & !KEYC_KEYPAD))
-                .flatten()
-        })
-    {
+    if let Some(sequence) = standard_sequence(key) {
         output.extend_from_slice(sequence);
         return Some(output);
     }
@@ -420,6 +464,22 @@ fn input_key_mode1(key: KeyCode, backspace: u8) -> Option<Vec<u8>> {
         return input_key_vt10x(0, key, backspace);
     }
     None
+}
+
+/// The standard sequence of a key whose cursor and keypad flags already
+/// follow the pane's application modes.
+fn standard_sequence(key: KeyCode) -> Option<&'static [u8]> {
+    standard_vt10x_sequence(key)
+        .or_else(|| {
+            ((key & KEYC_CURSOR) != 0)
+                .then(|| standard_vt10x_sequence(key & !KEYC_CURSOR))
+                .flatten()
+        })
+        .or_else(|| {
+            ((key & KEYC_KEYPAD) != 0)
+                .then(|| standard_vt10x_sequence(key & !KEYC_KEYPAD))
+                .flatten()
+        })
 }
 
 fn standard_vt10x_sequence(key: KeyCode) -> Option<&'static [u8]> {
@@ -509,9 +569,7 @@ fn is_trivial_key(key: KeyCode) -> bool {
 }
 
 fn is_backtab(key: KeyCode) -> bool {
-    key_string_lookup_string("BTab")
-        .map(|btab| (key & KEYC_MASK_KEY) == (btab & KEYC_MASK_KEY))
-        .unwrap_or(false)
+    (key & KEYC_MASK_KEY) == (parse_named_key("BTab") & KEYC_MASK_KEY)
 }
 
 fn should_strip_shift(key: KeyCode) -> bool {
@@ -522,10 +580,6 @@ fn should_strip_shift(key: KeyCode) -> bool {
 
 fn is_tab(key: KeyCode) -> bool {
     (key & KEYC_MASK_KEY) == 0x09
-}
-
-fn is_shift_only_enter(key: KeyCode) -> bool {
-    (key & KEYC_MASK_KEY) == b'\r' as u64 && (key & KEYC_MASK_MODIFIERS) == KEYC_SHIFT
 }
 
 #[cfg(test)]

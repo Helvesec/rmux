@@ -1,14 +1,18 @@
-use rmux_core::{GridRenderOptions, PaneId, Screen, ScreenCaptureRange, Utf8Config};
-use rmux_proto::{
-    OptionName, OptionScopeSelector, PaneTarget, RmuxError, ScopeSelector, SessionName,
-};
+#[cfg(test)]
+use rmux_core::Utf8Config;
+use rmux_core::{GridRenderOptions, PaneId, ScreenCaptureRange};
+use rmux_proto::{OptionName, PaneTarget, RmuxError, SessionName};
 
 use crate::pane_io::PaneInvalidationReason;
-use crate::pane_screen_state::PaneScreenState;
 use crate::pane_terminal_lookup::{missing_pane_terminal, pane_id_for_target};
 use crate::pane_transcript::SharedPaneTranscript;
 
 use super::HandlerState;
+
+mod availability;
+mod capture;
+mod screen_access;
+mod transcript_policy;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct PaneHistorySizeStats {
@@ -25,120 +29,23 @@ pub(crate) struct PaneCaptureRequest {
     pub(crate) pending_input: bool,
     pub(crate) quiet: bool,
     pub(crate) escape_pending: bool,
+    /// Whether this capture publishes the pane's link identities instead of its
+    /// text. Internal to the capture path: the request the user wrote carries
+    /// it, and every other caller of this structure leaves it false.
+    pub(crate) hyperlinks: bool,
 }
 
 impl HandlerState {
-    pub(crate) fn capture_transcript(
-        &self,
-        target: &PaneTarget,
-        request: PaneCaptureRequest,
-    ) -> Result<Vec<u8>, RmuxError> {
-        let runtime_session_name =
-            self.runtime_session_name_for_window(target.session_name(), target.window_index());
-        let pane_id = pane_id_for_target(
-            &self.sessions,
-            target.session_name(),
-            target.window_index(),
-            target.pane_index(),
-        )?;
-        let transcript = self
-            .transcripts
-            .get(&runtime_session_name)
-            .and_then(|panes| panes.get(&pane_id))
-            .ok_or_else(|| {
-                missing_pane_terminal(
-                    target.session_name(),
-                    target.window_index(),
-                    target.pane_index(),
-                )
-            })?;
-        let transcript = transcript
-            .lock()
-            .expect("pane transcript mutex must not be poisoned");
-
-        if request.pending_input {
-            let pending = transcript.pending_bytes();
-            return Ok(if request.escape_pending {
-                escape_pending_bytes(&pending)
-            } else {
-                pending
-            });
-        }
-        if request.use_mode_screen {
-            if let Some(captured) = transcript.capture_copy_mode(request.range, request.options) {
-                return Ok(captured);
+    pub(crate) fn apply_control_colour_report(&self, report: crate::control_colours::ColourReport) {
+        let pane = PaneId::from(report.pane);
+        for panes in self.transcripts.values() {
+            if let Some(transcript) = panes.get(&pane) {
+                transcript
+                    .lock()
+                    .apply_control_colour(report, &self.control_colour_clients);
+                break;
             }
         }
-        if request.alternate {
-            return transcript
-                .capture_saved(request.range, request.options)
-                .map_or_else(
-                    || {
-                        if request.quiet {
-                            Ok(Vec::new())
-                        } else {
-                            Err(RmuxError::Server("no alternate screen".to_owned()))
-                        }
-                    },
-                    Ok,
-                );
-        }
-
-        Ok(transcript.capture_main(request.range, request.options))
-    }
-
-    pub(crate) fn capture_line_format_flags(
-        &self,
-        target: &PaneTarget,
-        request: PaneCaptureRequest,
-    ) -> Result<Vec<u8>, RmuxError> {
-        let runtime_session_name =
-            self.runtime_session_name_for_window(target.session_name(), target.window_index());
-        let pane_id = pane_id_for_target(
-            &self.sessions,
-            target.session_name(),
-            target.window_index(),
-            target.pane_index(),
-        )?;
-        let transcript = self
-            .transcripts
-            .get(&runtime_session_name)
-            .and_then(|panes| panes.get(&pane_id))
-            .ok_or_else(|| {
-                missing_pane_terminal(
-                    target.session_name(),
-                    target.window_index(),
-                    target.pane_index(),
-                )
-            })?;
-        let transcript = transcript
-            .lock()
-            .expect("pane transcript mutex must not be poisoned");
-
-        if request.pending_input {
-            return Ok(Vec::new());
-        }
-        if request.use_mode_screen {
-            if let Some(flags) = transcript.capture_copy_mode_line_format_flags(request.range) {
-                return Ok(flags);
-            }
-        }
-        if request.alternate {
-            return transcript
-                .capture_saved_line_format_flags(request.range)
-                .map_or_else(
-                    || {
-                        if request.quiet {
-                            Ok(Vec::new())
-                        } else {
-                            Err(RmuxError::Server("no alternate screen".to_owned()))
-                        }
-                    },
-                    Ok,
-                );
-        }
-
-        Ok(transcript.capture_main_line_format_flags(request.range))
     }
 
     pub(crate) fn transcript_handle(
@@ -272,110 +179,13 @@ impl HandlerState {
         ))
     }
 
-    pub(crate) fn refresh_transcript_limits_for_scope(
-        &mut self,
-        scope: &ScopeSelector,
-        option: OptionName,
-    ) {
-        match option {
-            OptionName::HistoryLimit => match scope {
-                ScopeSelector::Global => {
-                    for session_name in self.transcripts.keys().cloned().collect::<Vec<_>>() {
-                        self.refresh_transcript_limits_for_session(&session_name);
-                    }
-                }
-                ScopeSelector::Session(session_name) => {
-                    self.refresh_transcript_limits_for_session(session_name);
-                }
-                ScopeSelector::Window(_) | ScopeSelector::Pane(_) => {}
-            },
-            OptionName::CodepointWidths | OptionName::VariationSelectorAlwaysWide => {
-                if matches!(scope, ScopeSelector::Global) {
-                    self.refresh_transcript_utf8_config();
-                }
-            }
-            OptionName::InputBufferSize => {
-                if matches!(scope, ScopeSelector::Global) {
-                    self.refresh_transcript_input_buffer_limits();
-                }
-            }
-            OptionName::AlternateScreen => {
-                self.refresh_transcript_alternate_screen_for_legacy_scope(scope);
-            }
-            OptionName::AllowSetTitle => {
-                self.refresh_transcript_title_rename_for_legacy_scope(scope);
-            }
-            _ => {}
-        }
-    }
-
-    pub(crate) fn refresh_transcript_alternate_screen_for_option_scope(
-        &mut self,
-        scope: &OptionScopeSelector,
-    ) {
-        let targets = match scope {
-            OptionScopeSelector::ServerGlobal
-            | OptionScopeSelector::SessionGlobal
-            | OptionScopeSelector::WindowGlobal => self.all_pane_targets(),
-            OptionScopeSelector::Session(session_name) => self.session_pane_targets(session_name),
-            OptionScopeSelector::Window(target) => {
-                self.window_pane_targets(target.session_name(), target.window_index())
-            }
-            OptionScopeSelector::Pane(target) => vec![target.clone()],
-        };
-        self.refresh_transcript_alternate_screen_for_targets(targets);
-    }
-
-    pub(crate) fn refresh_transcript_title_rename_for_option_scope(
-        &mut self,
-        scope: &OptionScopeSelector,
-    ) {
-        let targets = match scope {
-            OptionScopeSelector::ServerGlobal
-            | OptionScopeSelector::SessionGlobal
-            | OptionScopeSelector::WindowGlobal => self.all_pane_targets(),
-            OptionScopeSelector::Session(session_name) => self.session_pane_targets(session_name),
-            OptionScopeSelector::Window(target) => {
-                self.window_pane_targets(target.session_name(), target.window_index())
-            }
-            OptionScopeSelector::Pane(target) => vec![target.clone()],
-        };
-        self.refresh_transcript_title_rename_for_targets(targets);
-    }
-
-    fn refresh_transcript_alternate_screen_for_legacy_scope(&mut self, scope: &ScopeSelector) {
-        let targets = match scope {
-            ScopeSelector::Global => self.all_pane_targets(),
-            ScopeSelector::Session(session_name) => self.session_pane_targets(session_name),
-            ScopeSelector::Window(target) => {
-                self.window_pane_targets(target.session_name(), target.window_index())
-            }
-            ScopeSelector::Pane(target) => vec![target.clone()],
-        };
-        self.refresh_transcript_alternate_screen_for_targets(targets);
-    }
-
-    fn refresh_transcript_title_rename_for_legacy_scope(&mut self, scope: &ScopeSelector) {
-        let targets = match scope {
-            ScopeSelector::Global => self.all_pane_targets(),
-            ScopeSelector::Session(session_name) => self.session_pane_targets(session_name),
-            ScopeSelector::Window(target) => {
-                self.window_pane_targets(target.session_name(), target.window_index())
-            }
-            ScopeSelector::Pane(target) => vec![target.clone()],
-        };
-        self.refresh_transcript_title_rename_for_targets(targets);
-    }
-
     pub(crate) fn pane_history_size_stats(
         &self,
         session_name: &SessionName,
         pane_id: PaneId,
     ) -> Option<PaneHistorySizeStats> {
         let transcript = self.pane_transcript_for_id(session_name, pane_id)?;
-        let transcript = transcript
-            .lock()
-            .expect("pane transcript mutex must not be poisoned");
+        let transcript = transcript.lock();
 
         Some(PaneHistorySizeStats {
             limit: transcript.history_limit(),
@@ -383,357 +193,17 @@ impl HandlerState {
         })
     }
 
-    pub(crate) fn pane_history_bytes(
+    #[cfg(test)]
+    pub(crate) fn colour_query_replies_for_test(
         &self,
-        session_name: &SessionName,
-        pane_id: PaneId,
-    ) -> Option<usize> {
-        let transcript = self.pane_transcript_for_id(session_name, pane_id)?;
-        Some(
-            transcript
-                .lock()
-                .expect("pane transcript mutex must not be poisoned")
-                .tmux_history_bytes(),
-        )
-    }
-
-    pub(crate) fn pane_history_all_bytes(
-        &self,
-        session_name: &SessionName,
-        pane_id: PaneId,
-    ) -> Option<String> {
-        let transcript = self.pane_transcript_for_id(session_name, pane_id)?;
-        Some(
-            transcript
-                .lock()
-                .expect("pane transcript mutex must not be poisoned")
-                .tmux_history_all_bytes(),
-        )
-    }
-
-    fn pane_transcript_for_id(
-        &self,
-        session_name: &SessionName,
-        pane_id: PaneId,
-    ) -> Option<&SharedPaneTranscript> {
-        let window_index = self
-            .sessions
-            .session(session_name)?
-            .window_index_for_pane_id(pane_id)?;
-        let runtime_session_name = self.runtime_session_name_for_window(session_name, window_index);
-        self.transcripts.get(&runtime_session_name)?.get(&pane_id)
-    }
-
-    pub(crate) fn pane_output_sequence(
-        &self,
-        session_name: &SessionName,
-        pane_id: PaneId,
-    ) -> Option<u64> {
-        let window_index = self
-            .sessions
-            .session(session_name)?
-            .window_index_for_pane_id(pane_id)?;
-        let runtime_session_name = self.runtime_session_name_for_window(session_name, window_index);
-        let transcript = self.transcripts.get(&runtime_session_name)?.get(&pane_id)?;
-        Some(
-            transcript
-                .lock()
-                .expect("pane transcript mutex must not be poisoned")
-                .output_sequence(),
-        )
-    }
-
-    pub(crate) fn pane_screen_state(
-        &self,
-        session_name: &SessionName,
-        pane_id: PaneId,
-    ) -> Option<PaneScreenState> {
-        let window_index = self
-            .sessions
-            .session(session_name)?
-            .window_index_for_pane_id(pane_id)?;
-        let runtime_session_name = self.runtime_session_name_for_window(session_name, window_index);
-        let transcript = self.transcripts.get(&runtime_session_name)?.get(&pane_id)?;
-        let transcript = transcript
+        session: &SessionName,
+        pane: PaneId,
+    ) -> Vec<u8> {
+        self.pane_transcript_for_id(session, pane)
+            .expect("test pane transcript")
             .lock()
-            .expect("pane transcript mutex must not be poisoned");
-        Some(PaneScreenState::from_screen(transcript.screen()))
-    }
-
-    #[cfg(feature = "web")]
-    pub(crate) fn pane_recovery_screen_state(
-        &self,
-        session_name: &SessionName,
-        pane_id: PaneId,
-    ) -> Result<Option<(PaneScreenState, bool)>, RmuxError> {
-        Ok(self
-            .pane_recovery_screen(session_name, pane_id)?
-            .map(|(screen, complete)| (PaneScreenState::from_screen(&screen), complete)))
-    }
-
-    pub(crate) fn pane_copy_mode_summary(
-        &self,
-        session_name: &SessionName,
-        pane_id: PaneId,
-    ) -> Option<crate::copy_mode::CopyModeSummary> {
-        let window_index = self
-            .sessions
-            .session(session_name)?
-            .window_index_for_pane_id(pane_id)?;
-        let runtime_session_name = self.runtime_session_name_for_window(session_name, window_index);
-        let transcript = self.transcripts.get(&runtime_session_name)?.get(&pane_id)?;
-        transcript
-            .lock()
-            .expect("pane transcript mutex must not be poisoned")
-            .copy_mode_summary()
-    }
-
-    pub(crate) fn pane_copy_mode_render_screen(
-        &self,
-        session_name: &SessionName,
-        pane_id: PaneId,
-    ) -> Option<rmux_core::Screen> {
-        let window_index = self
-            .sessions
-            .session(session_name)?
-            .window_index_for_pane_id(pane_id)?;
-        let runtime_session_name = self.runtime_session_name_for_window(session_name, window_index);
-        let transcript = self.transcripts.get(&runtime_session_name)?.get(&pane_id)?;
-        transcript
-            .lock()
-            .expect("pane transcript mutex must not be poisoned")
-            .copy_mode_render_screen()
-    }
-
-    pub(crate) fn pane_copy_mode_render_snapshot(
-        &self,
-        session_name: &SessionName,
-        pane_id: PaneId,
-    ) -> Option<crate::copy_mode::CopyModeRenderSnapshot> {
-        let window_index = self
-            .sessions
-            .session(session_name)?
-            .window_index_for_pane_id(pane_id)?;
-        let runtime_session_name = self.runtime_session_name_for_window(session_name, window_index);
-        let transcript = self.transcripts.get(&runtime_session_name)?.get(&pane_id)?;
-        transcript
-            .lock()
-            .expect("pane transcript mutex must not be poisoned")
-            .copy_mode_render_snapshot()
-    }
-
-    /// Renders a copy-mode pane under the bounded Web recovery budgets.
-    ///
-    /// Metadata that does not fit the budgets (over-long titles, an oversized
-    /// hyperlink table) is dropped from the bounded clone, exactly like the
-    /// non-copy-mode [`Self::pane_recovery_screen`], and is never a reason to
-    /// fail the render: the Web session view reports the gap through
-    /// `PaneScrollbackView::metadata_complete`. Only the geometry cap, which
-    /// no bounded frame can satisfy, is an error.
-    #[cfg(feature = "web")]
-    pub(crate) fn pane_copy_mode_recovery_snapshot(
-        &self,
-        session_name: &SessionName,
-        pane_id: PaneId,
-    ) -> Result<Option<crate::copy_mode::CopyModeRenderSnapshot>, RmuxError> {
-        let Some(window_index) = self
-            .sessions
-            .session(session_name)
-            .and_then(|session| session.window_index_for_pane_id(pane_id))
-        else {
-            return Ok(None);
-        };
-        let runtime_session_name = self.runtime_session_name_for_window(session_name, window_index);
-        let Some(transcript) = self
-            .transcripts
-            .get(&runtime_session_name)
-            .and_then(|panes| panes.get(&pane_id))
-        else {
-            return Ok(None);
-        };
-        let transcript = transcript
-            .lock()
-            .expect("pane transcript mutex must not be poisoned");
-        crate::pane_recovery::validate_recovery_geometry(transcript.screen())?;
-        Ok(transcript.copy_mode_render_snapshot_bounded(
-            crate::pane_recovery::MAX_RECOVERY_STRING_BYTES,
-            crate::pane_recovery::MAX_RECOVERY_TITLE_STACK_BYTES,
-            crate::pane_recovery::MAX_RECOVERY_HYPERLINK_ENTRY_BYTES,
-            crate::pane_recovery::MAX_RECOVERY_HYPERLINK_TOTAL_BYTES,
-        ))
-    }
-
-    pub(crate) fn with_pane_screen<R>(
-        &self,
-        session_name: &SessionName,
-        pane_id: PaneId,
-        render: impl FnOnce(&Screen) -> R,
-    ) -> Option<R> {
-        let window_index = self
-            .sessions
-            .session(session_name)?
-            .window_index_for_pane_id(pane_id)?;
-        let runtime_session_name = self.runtime_session_name_for_window(session_name, window_index);
-        let transcript = self.transcripts.get(&runtime_session_name)?.get(&pane_id)?;
-        let transcript = transcript
-            .lock()
-            .expect("pane transcript mutex must not be poisoned");
-        Some(render(transcript.screen()))
-    }
-
-    pub(crate) fn pane_screen(
-        &self,
-        session_name: &SessionName,
-        pane_id: PaneId,
-    ) -> Option<Screen> {
-        let window_index = self
-            .sessions
-            .session(session_name)?
-            .window_index_for_pane_id(pane_id)?;
-        let runtime_session_name = self.runtime_session_name_for_window(session_name, window_index);
-        let transcript = self.transcripts.get(&runtime_session_name)?.get(&pane_id)?;
-        Some(
-            transcript
-                .lock()
-                .expect("pane transcript mutex must not be poisoned")
-                .screen()
-                .clone(),
-        )
-    }
-
-    #[cfg(feature = "web")]
-    pub(crate) fn pane_recovery_screen(
-        &self,
-        session_name: &SessionName,
-        pane_id: PaneId,
-    ) -> Result<Option<(Screen, bool)>, RmuxError> {
-        let Some(window_index) = self
-            .sessions
-            .session(session_name)
-            .and_then(|session| session.window_index_for_pane_id(pane_id))
-        else {
-            return Ok(None);
-        };
-        let runtime_session_name = self.runtime_session_name_for_window(session_name, window_index);
-        let Some(transcript) = self
-            .transcripts
-            .get(&runtime_session_name)
-            .and_then(|panes| panes.get(&pane_id))
-        else {
-            return Ok(None);
-        };
-        let transcript = transcript
-            .lock()
-            .expect("pane transcript mutex must not be poisoned");
-        let screen = transcript.screen();
-        crate::pane_recovery::validate_recovery_geometry(screen)?;
-        Ok(Some(screen.clone_recovery_viewport_bounded(
-            crate::pane_recovery::MAX_RECOVERY_STRING_BYTES,
-            crate::pane_recovery::MAX_RECOVERY_TITLE_STACK_BYTES,
-            crate::pane_recovery::MAX_RECOVERY_HYPERLINK_ENTRY_BYTES,
-            crate::pane_recovery::MAX_RECOVERY_HYPERLINK_TOTAL_BYTES,
-        )))
-    }
-
-    pub(crate) fn pane_in_mode(&self, session_name: &SessionName, pane_id: PaneId) -> bool {
-        let Some(window_index) = self
-            .sessions
-            .session(session_name)
-            .and_then(|session| session.window_index_for_pane_id(pane_id))
-        else {
-            return false;
-        };
-        let runtime_session_name = self.runtime_session_name_for_window(session_name, window_index);
-        self.transcripts
-            .get(&runtime_session_name)
-            .and_then(|panes| panes.get(&pane_id))
-            .is_some_and(|transcript| {
-                transcript
-                    .lock()
-                    .expect("pane transcript mutex must not be poisoned")
-                    .pane_in_mode()
-            })
-    }
-
-    pub(crate) fn pane_mode_name(
-        &self,
-        session_name: &SessionName,
-        pane_id: PaneId,
-    ) -> Option<&'static str> {
-        let window_index = self
-            .sessions
-            .session(session_name)?
-            .window_index_for_pane_id(pane_id)?;
-        let runtime_session_name = self.runtime_session_name_for_window(session_name, window_index);
-        self.transcripts
-            .get(&runtime_session_name)
-            .and_then(|panes| panes.get(&pane_id))
-            .and_then(|transcript| {
-                transcript
-                    .lock()
-                    .expect("pane transcript mutex must not be poisoned")
-                    .pane_mode_name()
-            })
-    }
-
-    pub(crate) fn pane_clock_mode_generation(
-        &self,
-        session_name: &SessionName,
-        pane_id: PaneId,
-    ) -> Option<u64> {
-        let window_index = self
-            .sessions
-            .session(session_name)?
-            .window_index_for_pane_id(pane_id)?;
-        let runtime_session_name = self.runtime_session_name_for_window(session_name, window_index);
-        self.transcripts
-            .get(&runtime_session_name)
-            .and_then(|panes| panes.get(&pane_id))
-            .and_then(|transcript| {
-                transcript
-                    .lock()
-                    .expect("pane transcript mutex must not be poisoned")
-                    .clock_mode_generation()
-            })
-    }
-
-    pub(crate) fn pane_visible_lines(&self, target: &PaneTarget) -> Result<Vec<String>, RmuxError> {
-        let transcript = self.transcript_handle(target)?;
-        let transcript = transcript
-            .lock()
-            .expect("pane transcript mutex must not be poisoned");
-        let rows = self
-            .sessions
-            .session(target.session_name())
-            .and_then(|session| session.window_at(target.window_index()))
-            .and_then(|window| window.pane(target.pane_index()))
-            .map(|pane| usize::from(pane.geometry().rows()))
-            .ok_or_else(|| {
-                missing_pane_terminal(
-                    target.session_name(),
-                    target.window_index(),
-                    target.pane_index(),
-                )
-            })?;
-
-        let render_options = GridRenderOptions {
-            with_sequences: true,
-            trim_spaces: false,
-            ..GridRenderOptions::default()
-        };
-        let mut lines = Vec::with_capacity(rows);
-        for row in 0..rows {
-            let screen = transcript.capture_main(
-                ScreenCaptureRange::new(Some(row as i64), Some(row as i64)),
-                render_options,
-            );
-            let mut line = String::from_utf8_lossy(&screen).into_owned();
-            if line.ends_with('\n') {
-                line.pop();
-            }
-            lines.push(line);
-        }
-        Ok(lines)
+            .append_bytes_and_take_replies(b"\x1b]10;?\x07\x1b]11;?\x1b\\\x1b]12;?\x07")
+            .replies
     }
 
     #[cfg(test)]
@@ -749,13 +219,7 @@ impl HandlerState {
             .get(&runtime_session_name)
             .and_then(|panes| panes.get(&pane_id))
             .ok_or_else(|| missing_pane_terminal(session_name, window_index, pane_index))
-            .map(|transcript| {
-                transcript
-                    .lock()
-                    .expect("pane transcript mutex must not be poisoned")
-                    .utf8_config()
-                    .clone()
-            })
+            .map(|transcript| transcript.lock().utf8_config().clone())
     }
 
     #[cfg(test)]
@@ -789,239 +253,43 @@ impl HandlerState {
                 },
             );
         } else {
-            transcript
-                .lock()
-                .expect("pane transcript mutex must not be poisoned")
-                .append_bytes(bytes);
+            transcript.lock().append_bytes(bytes);
         }
         Ok(())
     }
 
-    pub(in crate::pane_terminals) fn history_limit_for_session(
-        &self,
-        session_name: &SessionName,
-    ) -> usize {
-        self.options
-            .resolve(Some(session_name), OptionName::HistoryLimit)
-            .and_then(|value| value.parse::<usize>().ok())
-            .unwrap_or(2000)
-    }
-
-    pub(in crate::pane_terminals) fn refresh_transcript_limits_for_session(
-        &mut self,
-        session_name: &SessionName,
-    ) {
-        let limit = self.history_limit_for_session(session_name);
-        let runtime_session_name = self.runtime_session_name(session_name);
-        let transcripts = self
-            .transcripts
-            .get(&runtime_session_name)
-            .map(|transcripts| {
-                transcripts
-                    .iter()
-                    .map(|(pane_id, transcript)| (*pane_id, transcript.clone()))
-                    .collect::<Vec<_>>()
-            })
-            .unwrap_or_default();
-        for (pane_id, transcript) in transcripts {
-            let changed = transcript
-                .lock()
-                .expect("pane transcript mutex must not be poisoned")
-                .history_limit()
-                != limit;
-            if !changed {
-                continue;
-            }
-            if let Some(output) = self
-                .pane_outputs
-                .get(&runtime_session_name)
-                .and_then(|panes| panes.get(&pane_id))
-                .cloned()
-            {
-                output.mutate_transcript(
-                    &transcript,
-                    PaneInvalidationReason::TranscriptMutation,
-                    |transcript| {
-                        let changed = transcript.history_limit() != limit;
-                        if changed {
-                            transcript.set_limit(limit);
-                        }
-                        ((), changed)
-                    },
-                );
-            } else {
-                transcript
-                    .lock()
-                    .expect("pane transcript mutex must not be poisoned")
-                    .set_limit(limit);
-            }
-        }
-    }
-
-    fn refresh_transcript_utf8_config(&mut self) {
-        let utf8_config = Utf8Config::from_options(&self.options);
-        for transcripts in self.transcripts.values_mut() {
-            for transcript in transcripts.values() {
-                transcript
-                    .lock()
-                    .expect("pane transcript mutex must not be poisoned")
-                    .set_utf8_config(utf8_config.clone());
-            }
-        }
-    }
-
-    fn refresh_transcript_input_buffer_limits(&mut self) {
-        let limit = self.input_buffer_limit();
-        for transcripts in self.transcripts.values_mut() {
-            for transcript in transcripts.values() {
-                transcript
-                    .lock()
-                    .expect("pane transcript mutex must not be poisoned")
-                    .set_input_buffer_limit(limit);
-            }
-        }
-    }
-
-    fn refresh_transcript_alternate_screen_for_targets(&mut self, targets: Vec<PaneTarget>) {
-        for target in targets {
-            let enabled = self.alternate_screen_enabled_for_pane(
-                target.session_name(),
-                target.window_index(),
-                target.pane_index(),
-            );
-            if let Ok(transcript) = self.transcript_handle(&target) {
-                transcript
-                    .lock()
-                    .expect("pane transcript mutex must not be poisoned")
-                    .set_alternate_screen_enabled(enabled);
-            }
-        }
-    }
-
-    fn refresh_transcript_title_rename_for_targets(&mut self, targets: Vec<PaneTarget>) {
-        for target in targets {
-            let enabled = self.title_rename_enabled_for_pane(
-                target.session_name(),
-                target.window_index(),
-                target.pane_index(),
-            );
-            if let Ok(transcript) = self.transcript_handle(&target) {
-                transcript
-                    .lock()
-                    .expect("pane transcript mutex must not be poisoned")
-                    .set_title_rename_enabled(enabled);
-            }
-        }
-    }
-
-    pub(in crate::pane_terminals) fn alternate_screen_enabled_for_pane_id(
-        &self,
-        session_name: &SessionName,
-        pane_id: PaneId,
-    ) -> bool {
-        let Some(session) = self.sessions.session(session_name) else {
-            return true;
-        };
-        let Some(window_index) = session.window_index_for_pane_id(pane_id) else {
-            return true;
-        };
-        let Some(pane_index) = session
-            .window_at(window_index)
-            .and_then(|window| window.panes().iter().find(|pane| pane.id() == pane_id))
-            .map(|pane| pane.index())
-        else {
-            return true;
-        };
-        self.alternate_screen_enabled_for_pane(session_name, window_index, pane_index)
-    }
-
-    pub(in crate::pane_terminals) fn title_rename_enabled_for_pane_id(
-        &self,
-        session_name: &SessionName,
-        pane_id: PaneId,
-    ) -> bool {
-        let Some(session) = self.sessions.session(session_name) else {
-            return false;
-        };
-        let Some(window_index) = session.window_index_for_pane_id(pane_id) else {
-            return false;
-        };
-        let Some(pane_index) = session
-            .window_at(window_index)
-            .and_then(|window| window.panes().iter().find(|pane| pane.id() == pane_id))
-            .map(|pane| pane.index())
-        else {
-            return false;
-        };
-        self.title_rename_enabled_for_pane(session_name, window_index, pane_index)
-    }
-
-    fn alternate_screen_enabled_for_pane(
-        &self,
-        session_name: &SessionName,
-        window_index: u32,
-        pane_index: u32,
-    ) -> bool {
-        self.options
-            .resolve_for_pane(
-                session_name,
-                window_index,
-                pane_index,
-                OptionName::AlternateScreen,
-            )
-            .is_none_or(|value| value != "off")
-    }
-
-    fn title_rename_enabled_for_pane(
-        &self,
-        session_name: &SessionName,
-        window_index: u32,
-        pane_index: u32,
-    ) -> bool {
-        self.options.resolve_for_pane(
-            session_name,
-            window_index,
-            pane_index,
-            OptionName::AllowSetTitle,
-        ) == Some("on")
-    }
-
-    fn all_pane_targets(&self) -> Vec<PaneTarget> {
+    pub(crate) fn all_pane_targets(&self) -> Vec<PaneTarget> {
         self.sessions
             .iter()
+            .map(|session| (session.name(), session))
             .flat_map(|(session_name, session)| {
-                session
-                    .windows()
-                    .iter()
-                    .flat_map(move |(window_index, window)| {
-                        window.panes().iter().map(move |pane| {
-                            PaneTarget::with_window(
-                                session_name.clone(),
-                                *window_index,
-                                pane.index(),
-                            )
-                        })
+                session.windows().flat_map(move |(window_index, window)| {
+                    window.panes().iter().map(move |pane| {
+                        PaneTarget::with_window(session_name.clone(), window_index, pane.index())
                     })
-            })
-            .collect()
-    }
-
-    fn session_pane_targets(&self, session_name: &SessionName) -> Vec<PaneTarget> {
-        let Some(session) = self.sessions.session(session_name) else {
-            return Vec::new();
-        };
-        session
-            .windows()
-            .iter()
-            .flat_map(|(window_index, window)| {
-                window.panes().iter().map(move |pane| {
-                    PaneTarget::with_window(session_name.clone(), *window_index, pane.index())
                 })
             })
             .collect()
     }
 
-    fn window_pane_targets(
+    pub(in crate::pane_terminals) fn session_pane_targets(
+        &self,
+        session_name: &SessionName,
+    ) -> Vec<PaneTarget> {
+        let Some(session) = self.sessions.session(session_name) else {
+            return Vec::new();
+        };
+        session
+            .windows()
+            .flat_map(|(window_index, window)| {
+                window.panes().iter().map(move |pane| {
+                    PaneTarget::with_window(session_name.clone(), window_index, pane.index())
+                })
+            })
+            .collect()
+    }
+
+    pub(in crate::pane_terminals) fn window_pane_targets(
         &self,
         session_name: &SessionName,
         window_index: u32,
@@ -1070,12 +338,7 @@ impl HandlerState {
             // geometry. Reject those before taking PaneOutputState, then
             // recheck under the atomic output -> transcript critical section
             // for the actual mutation.
-            let needs_resize = transcript
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner())
-                .screen()
-                .size()
-                != size;
+            let needs_resize = transcript.needs_resize(size);
             if !needs_resize {
                 continue;
             }
@@ -1093,9 +356,7 @@ impl HandlerState {
                         },
                     )
                 } else {
-                    let mut transcript = transcript
-                        .lock()
-                        .expect("pane transcript mutex must not be poisoned");
+                    let mut transcript = transcript.lock();
                     let changed = transcript.screen().size() != size;
                     if changed {
                         transcript.resize(size);
@@ -1126,3 +387,9 @@ fn escape_pending_bytes(bytes: &[u8]) -> Vec<u8> {
     }
     output
 }
+
+#[cfg(test)]
+mod history_limit_zero_tests;
+
+#[cfg(test)]
+mod transcript_policy_tests;

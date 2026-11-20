@@ -5,6 +5,37 @@ use crate::input::InputEndType;
 /// Maximum payload size retained for one terminal graphics passthrough event.
 pub(crate) const MAX_TERMINAL_PASSTHROUGH_PAYLOAD_BYTES: usize = 8 * 1024 * 1024;
 
+/// Whether this server has SIXEL image support, as `#{sixel_support}` reports
+/// it.
+///
+/// tmux answers that token from its build-time `ENABLE_SIXEL` flag:
+/// `format_cb_sixel_support` ignores its `format_tree`, so the value describes
+/// the server binary and never the attached client, session, window, or pane.
+/// The flag does not merely compile in a parser — it compiles in an image
+/// subsystem: SIXEL is decoded ahead of the passthrough gate, images are
+/// retained in screen state, then scaled, cropped, scrolled and redrawn with
+/// the pane, a text placeholder is substituted for clients that cannot render
+/// them, and the primary device attributes gain the SIXEL parameter. Measured
+/// on the pinned 3.7b oracle pair built from one source tree: without the flag
+/// the token is `0` and primary DA is `ESC[?1;2c`; with `--enable-sixel` the
+/// token is `1` and DA is `ESC[?1;2;4c`.
+///
+/// RMUX has none of that authority. [`TerminalPassthroughKind::Sixel`] names a
+/// bare `q`-final DCS and forwards the bytes through, which is a transport
+/// courtesy rather than support: it needs `allow-passthrough`, which defaults
+/// to off, and an attached client whose outer terminal advertises `sixel`;
+/// nothing is retained, so nothing is replayed to a later subscriber or redrawn
+/// after a resize or scroll; the web transport discards every DCS; and RMUX
+/// still answers its children the non-SIXEL primary DA. Reporting `true` here
+/// would tell an application that images are supported and then refuse them at
+/// the capability handshake, so this build reports the oracle's unsupported
+/// state until equivalent server-side authority exists.
+///
+/// The separate per-client question — whether the outer terminal could render
+/// an image that was forwarded — is already reported by `sixel` in
+/// `#{client_termfeatures}`, and is not what this constant means.
+pub const SIXEL_SUPPORT: bool = false;
+
 /// Opaque terminal command that must be forwarded to a capable outer terminal.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TerminalPassthrough {

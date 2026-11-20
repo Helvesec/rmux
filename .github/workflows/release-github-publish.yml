@@ -84,9 +84,14 @@ jobs:
           test -f "$root/envelope/promotion-authorization-envelope.json"
           cp -- "$root/authorization/SHA256SUMS.sigstore.json" \
             "$root/release-assets/SHA256SUMS.sigstore.json"
-          printf '# RMUX %s\n\nExact candidate `%s` from `%s`.\n' \
+          version="${{ inputs.release_ref }}"
+          version="${version#v}"
+          cat -- "docs/release/${version%%-rc.*}.md" > "$root/release-notes.md"
+          printf '\n## Publication candidate\n\nRelease `%s`; candidate [%s](%s/%s/actions/runs/%s); source_git_sha `%s`.\n' \
             "${{ inputs.release_ref }}" "${{ inputs.candidate_run_id }}" \
-            "${{ inputs.expected_source_sha }}" > "$root/release-notes.md"
+            "${{ github.server_url }}" "${{ github.repository }}" \
+            "${{ inputs.candidate_run_id }}" "${{ inputs.expected_source_sha }}" \
+            >> "$root/release-notes.md"
           python3 scripts/release/publish-github-release.py \
             --predicate "$root/authorization/promotion-authorization-predicate.json" \
             --envelope "$root/envelope/promotion-authorization-envelope.json" \

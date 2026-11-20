@@ -4,13 +4,15 @@ use crate::pane_io::live_render::LivePaneRender;
 use crate::pane_io::types::{pane_output_channel, AttachTarget, PaneOutputSender};
 use rmux_core::PaneGeometry;
 use rmux_proto::TerminalSize;
+use std::collections::VecDeque;
+
 fn deep_coalescible_target(
     output: &PaneOutputSender,
     marker: u8,
     render_len: usize,
 ) -> AttachTarget {
     let size = TerminalSize { cols: 10, rows: 4 };
-    let session = rmux_core::Session::new(
+    let session = crate::session_fixture::SessionFixture::new(
         rmux_proto::SessionName::new(format!("switch-{marker}")).expect("valid session name"),
         size,
     );
@@ -20,14 +22,11 @@ fn deep_coalescible_target(
         .expect("session has an active pane")
         .clone();
     let transcript = crate::pane_transcript::PaneTranscript::shared(64, size);
-    transcript
-        .lock()
-        .expect("pane transcript mutex must not be poisoned")
-        .append_bytes(&[marker]);
+    transcript.lock().append_bytes(&[marker]);
     let live_pane = Some(
         LivePaneRender::new_from_transcript(
             transcript,
-            session,
+            session.view(),
             rmux_core::OptionStore::new(),
             pane,
         )
@@ -46,7 +45,7 @@ fn deep_coalescible_target(
             crate::outer_terminal::OuterTerminalContext::default(),
         ),
         client_title: None,
-        cursor_style: 0,
+        cursor_style: 0.into(),
         active_pane_geometry: PaneGeometry::new(0, 0, size.cols, size.rows),
         raw_passthrough: false,
         kitty_graphics_passthrough: false,
@@ -54,6 +53,451 @@ fn deep_coalescible_target(
         persistent_overlay_state_id: None,
         live_pane,
     }
+}
+
+fn popup_overlay(marker: u8, render_generation: u64, overlay_generation: u64) -> OverlayFrame {
+    OverlayFrame::persistent(vec![marker; 32], render_generation, overlay_generation)
+}
+
+fn receive_materialized(
+    receiver: &mut mpsc::UnboundedReceiver<AttachControl>,
+    backlog: &AtomicUsize,
+) -> AttachControl {
+    let control = receiver.try_recv().expect("attach control is queued");
+    release_attach_control_backlog(backlog, control.received_backlog_units());
+    control.materialize_received()
+}
+
+#[test]
+fn popup_repaint_backpressure_retains_only_the_latest_frame() {
+    let (inner, mut receiver) = mpsc::unbounded_channel();
+    let backlog = Arc::new(AtomicUsize::new(0));
+    let closing = Arc::new(AtomicBool::new(false));
+    let sender = AttachControlSender::new(inner, Arc::clone(&backlog), 4, Arc::clone(&closing));
+    let second_producer = sender.clone();
+
+    for generation in 0_u64..64 {
+        let producer = if generation % 2 == 0 {
+            &sender
+        } else {
+            &second_producer
+        };
+        producer
+            .send_popup_overlay(
+                7,
+                OverlayFrame::persistent(
+                    vec![generation as u8; AttachControl::BACKLOG_UNIT_BYTES],
+                    11,
+                    generation,
+                ),
+            )
+            .expect("a replacement popup repaint must fit in the existing slot");
+        assert!(
+            backlog.load(Ordering::Acquire) <= 2,
+            "replacement repaints must retain at most one weighted frame"
+        );
+    }
+
+    assert!(!closing.load(Ordering::SeqCst));
+    let control = receive_materialized(&mut receiver, &backlog);
+    let AttachControl::Overlay(frame) = control else {
+        panic!("expected a popup overlay");
+    };
+    assert_eq!(frame.overlay_generation, 63);
+    assert_eq!(frame.frame[0], 63);
+    assert!(matches!(
+        receiver.try_recv(),
+        Err(mpsc::error::TryRecvError::Empty)
+    ));
+    assert_eq!(backlog.load(Ordering::Acquire), 2);
+    drop(frame);
+    assert_eq!(backlog.load(Ordering::Acquire), 0);
+}
+
+#[test]
+fn popup_overlay_replacement_stops_at_reliable_control_boundaries() {
+    let (inner, mut receiver) = mpsc::unbounded_channel();
+    let backlog = Arc::new(AtomicUsize::new(0));
+    let sender = AttachControlSender::new(
+        inner,
+        Arc::clone(&backlog),
+        16,
+        Arc::new(AtomicBool::new(false)),
+    );
+
+    sender
+        .send_popup_overlay(7, popup_overlay(1, 3, 1))
+        .expect("first repaint fits");
+    sender
+        .send_popup_overlay(7, popup_overlay(2, 3, 2))
+        .expect("replacement repaint fits");
+    sender
+        .send_popup_overlay(7, OverlayFrame::persistent(Vec::new(), 3, 3))
+        .expect("popup clear remains reliable");
+    sender
+        .send_popup_overlay(7, popup_overlay(4, 3, 4))
+        .expect("post-clear repaint fits");
+    sender
+        .send_popup_overlay(7, popup_overlay(5, 3, 5))
+        .expect("post-clear replacement fits");
+    sender
+        .send(AttachControl::AdvancePersistentOverlayState(9))
+        .expect("state barrier fits");
+    sender
+        .send_popup_overlay(7, popup_overlay(6, 3, 6))
+        .expect("post-barrier repaint fits");
+    sender
+        .send(AttachControl::Detach)
+        .expect("explicit detach remains reliable");
+    sender
+        .send_popup_overlay(7, popup_overlay(7, 3, 7))
+        .expect("post-detach queue order remains defined");
+
+    let AttachControl::Overlay(first) = receive_materialized(&mut receiver, &backlog) else {
+        panic!("expected first popup repaint");
+    };
+    assert_eq!(first.frame[0], 2);
+    let AttachControl::Overlay(clear) = receive_materialized(&mut receiver, &backlog) else {
+        panic!("expected popup clear");
+    };
+    assert!(clear.frame.is_empty());
+    let AttachControl::Overlay(second) = receive_materialized(&mut receiver, &backlog) else {
+        panic!("expected second popup repaint");
+    };
+    assert_eq!(second.frame[0], 5);
+    assert!(matches!(
+        receive_materialized(&mut receiver, &backlog),
+        AttachControl::AdvancePersistentOverlayState(9)
+    ));
+    let AttachControl::Overlay(third) = receive_materialized(&mut receiver, &backlog) else {
+        panic!("expected third popup repaint");
+    };
+    assert_eq!(third.frame[0], 6);
+    assert!(matches!(
+        receive_materialized(&mut receiver, &backlog),
+        AttachControl::Detach
+    ));
+    let AttachControl::Overlay(fourth) = receive_materialized(&mut receiver, &backlog) else {
+        panic!("expected fourth popup repaint");
+    };
+    assert_eq!(fourth.frame[0], 7);
+    assert!(matches!(
+        receiver.try_recv(),
+        Err(mpsc::error::TryRecvError::Empty)
+    ));
+    assert_eq!(backlog.load(Ordering::Acquire), 4);
+    drop((first, second, third, fourth));
+    assert_eq!(backlog.load(Ordering::Acquire), 0);
+}
+
+#[test]
+fn sibling_overlay_controls_are_popup_replacement_boundaries() {
+    let (inner, mut receiver) = mpsc::unbounded_channel();
+    let backlog = Arc::new(AtomicUsize::new(0));
+    let sender = AttachControlSender::new(
+        inner,
+        Arc::clone(&backlog),
+        8,
+        Arc::new(AtomicBool::new(false)),
+    );
+
+    sender
+        .send_popup_overlay(7, popup_overlay(1, 3, 1))
+        .expect("popup repaint fits");
+    sender
+        .send(AttachControl::Overlay(OverlayFrame::persistent_with_state(
+            vec![2],
+            3,
+            2,
+            9,
+        )))
+        .expect("state-carrying overlay remains reliable");
+    sender
+        .send_popup_overlay(7, popup_overlay(3, 3, 3))
+        .expect("second popup repaint fits");
+    sender
+        .send(AttachControl::Overlay(OverlayFrame::new(vec![4], 3, 4)))
+        .expect("transient overlay remains reliable");
+    sender
+        .send_popup_overlay(7, popup_overlay(5, 3, 5))
+        .expect("third popup repaint fits");
+
+    for marker in [1, 2, 3, 4, 5] {
+        let AttachControl::Overlay(frame) = receive_materialized(&mut receiver, &backlog) else {
+            panic!("expected ordered overlay frame");
+        };
+        assert_eq!(frame.frame[0], marker);
+    }
+    assert_eq!(backlog.load(Ordering::Acquire), 0);
+}
+
+#[test]
+fn popup_and_switch_replacement_slots_are_mutual_ordering_boundaries() {
+    let (inner, mut receiver) = mpsc::unbounded_channel();
+    let backlog = Arc::new(AtomicUsize::new(0));
+    let sender = AttachControlSender::new(
+        inner,
+        Arc::clone(&backlog),
+        16,
+        Arc::new(AtomicBool::new(false)),
+    );
+    let output = pane_output_channel();
+
+    sender
+        .send_popup_overlay(7, popup_overlay(1, 3, 1))
+        .expect("first repaint fits");
+    sender
+        .send_popup_overlay(7, popup_overlay(2, 3, 2))
+        .expect("replacement repaint fits");
+    sender
+        .send(AttachControl::switch(deep_coalescible_target(
+            &output, 3, 32,
+        )))
+        .expect("first switch fits");
+    sender
+        .send(AttachControl::switch(deep_coalescible_target(
+            &output, 4, 32,
+        )))
+        .expect("replacement switch fits");
+    sender
+        .send_popup_overlay(7, popup_overlay(5, 3, 5))
+        .expect("second repaint run fits");
+    sender
+        .send_popup_overlay(7, popup_overlay(6, 3, 6))
+        .expect("second replacement repaint fits");
+
+    let AttachControl::Overlay(first) = receive_materialized(&mut receiver, &backlog) else {
+        panic!("expected first popup repaint");
+    };
+    assert_eq!(first.frame[0], 2);
+    let AttachControl::Switch(target) = receive_materialized(&mut receiver, &backlog) else {
+        panic!("expected switch boundary");
+    };
+    let (target, switch_count) = target.into_target_with_count();
+    assert_eq!(target.render_frame[0], 4);
+    assert_eq!(switch_count, 2);
+    let AttachControl::Overlay(second) = receive_materialized(&mut receiver, &backlog) else {
+        panic!("expected second popup repaint");
+    };
+    assert_eq!(second.frame[0], 6);
+    assert!(matches!(
+        receiver.try_recv(),
+        Err(mpsc::error::TryRecvError::Empty)
+    ));
+    assert_eq!(backlog.load(Ordering::Acquire), 2);
+    drop((first, second));
+    assert_eq!(backlog.load(Ordering::Acquire), 0);
+}
+
+#[test]
+fn an_older_popup_generation_cannot_replace_a_newer_queued_repaint() {
+    let (inner, mut receiver) = mpsc::unbounded_channel();
+    let backlog = Arc::new(AtomicUsize::new(0));
+    let sender = AttachControlSender::new(
+        inner,
+        Arc::clone(&backlog),
+        4,
+        Arc::new(AtomicBool::new(false)),
+    );
+
+    sender
+        .send_popup_overlay(7, popup_overlay(9, 3, 9))
+        .expect("newer repaint fits");
+    sender
+        .send_popup_overlay(7, popup_overlay(7, 3, 7))
+        .expect("older racing repaint is harmless");
+
+    let AttachControl::Overlay(frame) = receive_materialized(&mut receiver, &backlog) else {
+        panic!("expected popup repaint");
+    };
+    assert_eq!(frame.overlay_generation, 9);
+    assert_eq!(frame.frame[0], 9);
+    assert!(matches!(
+        receiver.try_recv(),
+        Err(mpsc::error::TryRecvError::Empty)
+    ));
+    assert_eq!(backlog.load(Ordering::Acquire), 1);
+    drop(frame);
+    assert_eq!(backlog.load(Ordering::Acquire), 0);
+}
+
+#[test]
+fn popup_identity_and_render_generation_limit_replacement_scope() {
+    let (inner, mut receiver) = mpsc::unbounded_channel();
+    let backlog = Arc::new(AtomicUsize::new(0));
+    let sender = AttachControlSender::new(
+        inner,
+        Arc::clone(&backlog),
+        4,
+        Arc::new(AtomicBool::new(false)),
+    );
+
+    sender
+        .send_popup_overlay(7, popup_overlay(1, 3, 1))
+        .expect("first popup fits");
+    sender
+        .send_popup_overlay(8, popup_overlay(2, 3, 2))
+        .expect("replacement popup keeps its own queue position");
+    sender
+        .send_popup_overlay(8, popup_overlay(3, 4, 3))
+        .expect("new base render keeps its own queue position");
+
+    for marker in [1, 2, 3] {
+        let AttachControl::Overlay(frame) = receive_materialized(&mut receiver, &backlog) else {
+            panic!("expected ordered popup repaint");
+        };
+        assert_eq!(frame.frame[0], marker);
+    }
+    assert_eq!(backlog.load(Ordering::Acquire), 0);
+}
+
+#[test]
+fn try_receive_materializes_popup_overlay_and_retains_its_reservation() {
+    let (inner, mut receiver) = mpsc::unbounded_channel();
+    let backlog = Arc::new(AtomicUsize::new(0));
+    let sender = AttachControlSender::new(
+        inner,
+        Arc::clone(&backlog),
+        4,
+        Arc::new(AtomicBool::new(false)),
+    );
+    sender
+        .send_popup_overlay(7, popup_overlay(1, 3, 1))
+        .expect("popup repaint fits");
+
+    let control = crate::pane_io::control::try_recv_attach_control(&mut receiver, &backlog)
+        .expect("popup repaint is received");
+    assert!(matches!(control, AttachControl::Overlay(_)));
+    assert_eq!(backlog.load(Ordering::Acquire), 1);
+    drop(control);
+    assert_eq!(backlog.load(Ordering::Acquire), 0);
+}
+
+#[tokio::test]
+async fn async_receive_materializes_popup_overlay_and_retains_its_reservation() {
+    let (inner, mut receiver) = mpsc::unbounded_channel();
+    let backlog = Arc::new(AtomicUsize::new(0));
+    let sender = AttachControlSender::new(
+        inner,
+        Arc::clone(&backlog),
+        4,
+        Arc::new(AtomicBool::new(false)),
+    );
+    sender
+        .send_popup_overlay(7, popup_overlay(1, 3, 1))
+        .expect("popup repaint fits");
+
+    let mut deferred = VecDeque::new();
+    let control =
+        crate::pane_io::control::recv_attach_control(&mut deferred, Some(&mut receiver), &backlog)
+            .await
+            .expect("popup repaint is received");
+    assert!(matches!(control, AttachControl::Overlay(_)));
+    assert_eq!(backlog.load(Ordering::Acquire), 1);
+    drop(control);
+    assert_eq!(backlog.load(Ordering::Acquire), 0);
+}
+
+#[test]
+fn a_dequeued_popup_slot_retains_only_one_newer_repaint() {
+    let (inner, mut receiver) = mpsc::unbounded_channel();
+    let backlog = Arc::new(AtomicUsize::new(0));
+    let sender = AttachControlSender::new(
+        inner,
+        Arc::clone(&backlog),
+        4,
+        Arc::new(AtomicBool::new(false)),
+    );
+    sender
+        .send_popup_overlay(7, popup_overlay(1, 3, 1))
+        .expect("first popup repaint fits");
+
+    let AttachControl::CoalescedPopupOverlay(in_flight) = receiver
+        .try_recv()
+        .expect("first popup repaint is dequeued")
+    else {
+        panic!("expected sender-side popup marker");
+    };
+    let first = in_flight.take().expect("dequeued repaint materializes");
+    assert_eq!(first.frame[0], 1);
+    assert_eq!(backlog.load(Ordering::Acquire), 1);
+
+    for generation in 2_u64..64 {
+        sender
+            .send_popup_overlay(7, popup_overlay(generation as u8, 3, generation))
+            .expect("one follow-up repaint slot remains bounded");
+    }
+    assert_eq!(backlog.load(Ordering::Acquire), 2);
+    let AttachControl::Overlay(latest) = receive_materialized(&mut receiver, &backlog) else {
+        panic!("expected latest follow-up repaint");
+    };
+    assert_eq!(latest.overlay_generation, 63);
+    assert_eq!(latest.frame[0], 63);
+    drop(in_flight);
+    assert_eq!(backlog.load(Ordering::Acquire), 2);
+    drop(first);
+    assert_eq!(backlog.load(Ordering::Acquire), 1);
+    drop(latest);
+    assert_eq!(backlog.load(Ordering::Acquire), 0);
+}
+
+#[test]
+fn growing_popup_repaint_still_enforces_the_weighted_backlog_limit() {
+    let (inner, mut receiver) = mpsc::unbounded_channel();
+    let backlog = Arc::new(AtomicUsize::new(0));
+    let closing = Arc::new(AtomicBool::new(false));
+    let sender = AttachControlSender::new(inner, Arc::clone(&backlog), 2, Arc::clone(&closing));
+    sender
+        .send_popup_overlay(7, popup_overlay(1, 3, 1))
+        .expect("one-unit repaint fits");
+    sender
+        .send_popup_overlay(
+            7,
+            OverlayFrame::persistent(vec![2; AttachControl::BACKLOG_UNIT_BYTES], 3, 2),
+        )
+        .expect("two-unit replacement fills the limit");
+
+    let error = sender
+        .send_popup_overlay(
+            7,
+            OverlayFrame::persistent(vec![3; 2 * AttachControl::BACKLOG_UNIT_BYTES], 3, 3),
+        )
+        .expect_err("three-unit replacement exceeds the unchanged limit");
+    assert!(error.is_full());
+    assert!(closing.load(Ordering::SeqCst));
+    assert_eq!(backlog.load(Ordering::Acquire), 3);
+
+    let AttachControl::Overlay(retained) = receive_materialized(&mut receiver, &backlog) else {
+        panic!("expected last fitting repaint");
+    };
+    assert_eq!(retained.frame[0], 2);
+    assert!(matches!(
+        receive_materialized(&mut receiver, &backlog),
+        AttachControl::Detach
+    ));
+    assert_eq!(backlog.load(Ordering::Acquire), 2);
+    drop(retained);
+    assert_eq!(backlog.load(Ordering::Acquire), 0);
+}
+
+#[test]
+fn dropping_receiver_releases_queued_popup_overlay_reservation() {
+    let (inner, receiver) = mpsc::unbounded_channel();
+    let backlog = Arc::new(AtomicUsize::new(0));
+    let sender = AttachControlSender::new(
+        inner,
+        Arc::clone(&backlog),
+        4,
+        Arc::new(AtomicBool::new(false)),
+    );
+    sender
+        .send_popup_overlay(7, popup_overlay(1, 3, 1))
+        .expect("popup repaint fits");
+    assert_eq!(backlog.load(Ordering::Acquire), 1);
+
+    drop(receiver);
+
+    assert_eq!(backlog.load(Ordering::Acquire), 0);
 }
 
 #[test]
@@ -594,6 +1038,19 @@ fn every_attach_control_variant_has_a_positive_backlog_cost() {
         );
     }
 
+    let popup_backlog = Arc::new(AtomicUsize::new(1));
+    let popup_slot = Arc::new(CoalescedPopupOverlay::new(
+        PopupOverlayKey::new(7, 3),
+        popup_overlay(1, 3, 1),
+        1,
+        Arc::clone(&popup_backlog),
+    ));
+    let popup_control = AttachControl::CoalescedPopupOverlay(popup_slot);
+    assert_eq!(popup_control.backlog_units(), 1);
+    assert_eq!(popup_control.received_backlog_units(), 0);
+    drop(popup_control);
+    assert_eq!(popup_backlog.load(Ordering::Acquire), 0);
+
     let output = pane_output_channel();
     let (pane_output_start_sequence, pane_output) = output.subscribe_live_from_now();
     let target = AttachTarget {
@@ -607,7 +1064,7 @@ fn every_attach_control_variant_has_a_positive_backlog_cost() {
             crate::outer_terminal::OuterTerminalContext::default(),
         ),
         client_title: None,
-        cursor_style: 0,
+        cursor_style: 0.into(),
         active_pane_geometry: PaneGeometry::new(0, 0, 80, 24),
         raw_passthrough: false,
         kitty_graphics_passthrough: false,
@@ -767,4 +1224,86 @@ fn a_title_carrying_refresh_keeps_the_pane_live_output() {
         crate::pane_io::control::preserves_live_output(&current, &carrying),
         "a title-carrying refresh of the same pane must keep its live output"
     );
+}
+
+#[test]
+fn popup_burst_accounts_retained_capacity_and_weighted_reservations() {
+    for drop_receiver in [false, true] {
+        let (inner, mut receiver) = mpsc::unbounded_channel();
+        let backlog = Arc::new(AtomicUsize::new(0));
+        let closing = Arc::new(AtomicBool::new(false));
+        let sender = AttachControlSender::new(inner, Arc::clone(&backlog), 4, Arc::clone(&closing));
+        let frame = |generation| {
+            let mut bytes = Vec::with_capacity(65_536);
+            bytes.resize(31_244, generation as u8);
+            OverlayFrame::persistent(bytes, 3, generation)
+        };
+        sender.send_popup_overlay(7, frame(0)).unwrap();
+        let AttachControl::Overlay(in_flight) = receive_materialized(&mut receiver, &backlog)
+        else {
+            panic!("overlay")
+        };
+        assert_eq!(backlog.load(Ordering::Acquire), 1);
+        let mut retained_high_water = 0;
+        let mut replacement_high_water = 0;
+        for generation in 1..=63 {
+            sender.send_popup_overlay(7, frame(generation)).unwrap();
+            assert_eq!(receiver.len(), 1);
+            let slot = sender
+                .send_state
+                .lock()
+                .unwrap()
+                .open_coalesced_popup_overlay
+                .as_ref()
+                .unwrap()
+                .upgrade()
+                .unwrap();
+            let (len, capacity, units, overlap) = slot.retained_allocation_for_test();
+            assert_eq!((len, capacity, units), (31_244, 65_536, 1));
+            retained_high_water = retained_high_water.max(capacity + in_flight.frame.capacity());
+            replacement_high_water =
+                replacement_high_water.max(overlap + in_flight.frame.capacity());
+            assert_eq!(backlog.load(Ordering::Acquire), 2);
+            assert!(!closing.load(Ordering::SeqCst));
+        }
+        assert_eq!(retained_high_water, 131_072);
+        assert_eq!(replacement_high_water, 196_608);
+        if drop_receiver {
+            drop(receiver);
+        } else {
+            let AttachControl::Overlay(latest) = receive_materialized(&mut receiver, &backlog)
+            else {
+                panic!("overlay")
+            };
+            assert_eq!(latest.overlay_generation, 63);
+            assert!(latest.frame.iter().all(|byte| *byte == 63));
+            assert_eq!(backlog.load(Ordering::Acquire), 2);
+            drop(latest);
+            assert!(receiver.is_empty());
+        }
+        assert_eq!(backlog.load(Ordering::Acquire), 1);
+        drop(in_flight);
+        assert_eq!(backlog.load(Ordering::Acquire), 0);
+        eprintln!("popup allocations: pending+inflight_peak={retained_high_water} replace_overlap+inflight_peak={replacement_high_water} drop_receiver={drop_receiver} final_units=0");
+    }
+    let (inner, mut receiver) = mpsc::unbounded_channel();
+    let backlog = Arc::new(AtomicUsize::new(0));
+    let sender = AttachControlSender::new(
+        inner,
+        Arc::clone(&backlog),
+        4,
+        Arc::new(AtomicBool::new(false)),
+    );
+    for (generation, bytes, units) in [
+        (1, 32, 1),
+        (2, AttachControl::BACKLOG_UNIT_BYTES, 2),
+        (3, 32, 1),
+    ] {
+        sender
+            .send_popup_overlay(7, OverlayFrame::persistent(vec![0; bytes], 3, generation))
+            .unwrap();
+        assert_eq!(backlog.load(Ordering::Acquire), units);
+    }
+    drop(receive_materialized(&mut receiver, &backlog));
+    assert_eq!(backlog.load(Ordering::Acquire), 0);
 }

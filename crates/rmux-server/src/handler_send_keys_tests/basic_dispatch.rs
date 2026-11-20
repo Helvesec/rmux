@@ -13,7 +13,7 @@ async fn send_keys_writes_resolved_bytes_to_the_correct_pane() {
             environment: None,
         }))
         .await;
-    assert!(matches!(created, Response::NewSession(_)));
+    crate::session_fixture::assert_new_session(&created);
 
     let response = handler
         .handle(Request::SendKeys(SendKeysRequest {
@@ -125,6 +125,39 @@ async fn pane_input_ref_marks_attached_session_input_as_interactive() {
 }
 
 #[tokio::test]
+async fn literal_pane_input_focus_bytes_do_not_report_outer_focus() {
+    let handler = RequestHandler::new();
+    let alpha = session_name("pane-input-is-not-focus");
+    let requester_pid = 78_u32;
+    create_send_keys_test_session(&handler, &alpha).await;
+    let (control_tx, _control_rx) = mpsc::unbounded_channel();
+    handler
+        .register_attach(requester_pid, alpha.clone(), control_tx)
+        .await;
+    handler
+        .handle_attached_live_input_for_test(requester_pid, b"\x1b[O")
+        .await
+        .expect("native focus-out succeeds");
+    let target = PaneTarget::new(alpha.clone(), 0);
+    let capture = RawPaneInputProbe::start(&handler, &alpha, "literal-focus-bytes", 3).await;
+
+    let response = handler
+        .handle(Request::PaneInput(rmux_proto::PaneInputRequest {
+            target: PaneTargetRef::slot(target),
+            keys: vec!["\x1b[I".to_owned()],
+            literal: true,
+        }))
+        .await;
+    assert_eq!(
+        response,
+        Response::SendKeys(SendKeysResponse { key_count: 1 })
+    );
+    capture.finish(&handler, &alpha).await;
+    capture.assert_contents(&handler, b"\x1b[I").await;
+    assert!(!handler.active_attach.lock().await.by_pid[&requester_pid].reported_focused);
+}
+
+#[tokio::test]
 async fn send_keys_plain_input_uses_copy_mode_until_copy_mode_exits() {
     let handler = RequestHandler::new();
     let alpha = session_name("alpha");
@@ -189,7 +222,7 @@ async fn send_keys_with_empty_keys_returns_zero_count() {
             environment: None,
         }))
         .await;
-    assert!(matches!(created, Response::NewSession(_)));
+    crate::session_fixture::assert_new_session(&created);
 
     let response = handler
         .handle(Request::SendKeys(SendKeysRequest {
@@ -418,7 +451,7 @@ async fn send_keys_reset_terminal_updates_transcript_without_writing_to_child() 
             environment: None,
         }))
         .await;
-    assert!(matches!(created, Response::NewSession(_)));
+    crate::session_fixture::assert_new_session(&created);
 
     {
         let state = handler.state.lock().await;
@@ -426,9 +459,7 @@ async fn send_keys_reset_terminal_updates_transcript_without_writing_to_child() 
         let transcript = state
             .transcript_handle(&target)
             .expect("test pane transcript must exist");
-        let mut transcript = transcript
-            .lock()
-            .expect("pane transcript mutex must not be poisoned");
+        let mut transcript = transcript.lock();
         transcript.append_bytes(b"reset-marker");
     }
 
@@ -464,6 +495,7 @@ async fn send_keys_reset_terminal_updates_transcript_without_writing_to_child() 
                 pending_input: false,
                 quiet: false,
                 escape_pending: false,
+                hyperlinks: false,
             },
         )
         .expect("capture after reset must succeed");
@@ -550,7 +582,7 @@ async fn send_keys_to_missing_pane_returns_error() {
             environment: None,
         }))
         .await;
-    assert!(matches!(created, Response::NewSession(_)));
+    crate::session_fixture::assert_new_session(&created);
 
     let response = handler
         .handle(Request::SendKeys(SendKeysRequest {
@@ -574,7 +606,7 @@ async fn pane_broadcast_input_reports_per_target_successes_and_failures() {
             environment: None,
         }))
         .await;
-    assert!(matches!(created, Response::NewSession(_)));
+    crate::session_fixture::assert_new_session(&created);
 
     let missing_target = PaneTargetRef::by_id(alpha.clone(), PaneId::new(999));
     let response = handler
@@ -661,7 +693,7 @@ async fn send_keys_k_dispatches_prefix_table_bindings() {
             environment: None,
         }))
         .await;
-    assert!(matches!(created, Response::NewSession(_)));
+    crate::session_fixture::assert_new_session(&created);
 
     let (control_tx, _control_rx) = mpsc::unbounded_channel();
     let _attach_id = handler
@@ -728,7 +760,7 @@ async fn send_keys_k_binding_task_preserves_disabled_hook_context() {
             environment: None,
         }))
         .await;
-    assert!(matches!(created, Response::NewSession(_)));
+    crate::session_fixture::assert_new_session(&created);
     let (control_tx, _control_rx) = mpsc::unbounded_channel();
     handler
         .register_attach(requester_pid, alpha.clone(), control_tx)
@@ -787,7 +819,7 @@ async fn send_keys_k_binding_task_preserves_disabled_hook_context() {
             .session(&alpha)
             .expect("session survives")
             .windows()
-            .len(),
+            .count(),
         2,
         "the attached binding still creates its requested window"
     );
@@ -817,7 +849,7 @@ async fn switch_client_t_sets_custom_key_table_for_next_k_dispatch() {
             environment: None,
         }))
         .await;
-    assert!(matches!(created, Response::NewSession(_)));
+    crate::session_fixture::assert_new_session(&created);
 
     let (control_tx, _control_rx) = mpsc::unbounded_channel();
     let _attach_id = handler
@@ -892,7 +924,7 @@ async fn send_keys_k_prefix_precedes_a_transient_key_table() {
             environment: None,
         }))
         .await;
-    assert!(matches!(created, Response::NewSession(_)));
+    crate::session_fixture::assert_new_session(&created);
 
     let (control_tx, _control_rx) = mpsc::unbounded_channel();
     handler
@@ -986,7 +1018,7 @@ async fn send_keys_k_uses_copy_mode_bindings_until_copy_mode_exits() {
             environment: None,
         }))
         .await;
-    assert!(matches!(created, Response::NewSession(_)));
+    crate::session_fixture::assert_new_session(&created);
 
     let (control_tx, _control_rx) = mpsc::unbounded_channel();
     let _attach_id = handler
@@ -1094,7 +1126,7 @@ async fn send_keys_k_uses_copy_mode_vi_bindings_when_mode_keys_is_vi() {
             environment: None,
         }))
         .await;
-    assert!(matches!(created, Response::NewSession(_)));
+    crate::session_fixture::assert_new_session(&created);
 
     let (control_tx, _control_rx) = mpsc::unbounded_channel();
     let _attach_id = handler

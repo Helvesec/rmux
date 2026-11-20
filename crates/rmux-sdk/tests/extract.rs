@@ -173,7 +173,7 @@ async fn collect_output_until_exit_caps_raw_bytes_and_records_lag() -> TestResul
         let subscription_id = PaneOutputSubscriptionId::new(11);
         peer.write_response(Response::SubscribePaneOutput(SubscribePaneOutputResponse {
             subscription_id,
-            target: target().to_proto(),
+            target: expected_target(),
             pane_id: rmux_proto::PaneId::new(1),
             cursor: PaneOutputCursor {
                 next_sequence: 1,
@@ -263,7 +263,7 @@ async fn collect_output_until_exit_observes_exit_with_empty_live_subscription() 
         let subscription_id = PaneOutputSubscriptionId::new(13);
         peer.write_response(Response::SubscribePaneOutput(SubscribePaneOutputResponse {
             subscription_id,
-            target: target().to_proto(),
+            target: expected_target(),
             pane_id: rmux_proto::PaneId::new(1),
             cursor: PaneOutputCursor {
                 next_sequence: 1,
@@ -315,7 +315,7 @@ async fn collect_output_until_exit_returns_after_post_subscribe_exit_observation
         let subscription_id = PaneOutputSubscriptionId::new(12);
         peer.write_response(Response::SubscribePaneOutput(SubscribePaneOutputResponse {
             subscription_id,
-            target: target().to_proto(),
+            target: expected_target(),
             pane_id: rmux_proto::PaneId::new(1),
             cursor: PaneOutputCursor {
                 next_sequence: 1,
@@ -362,7 +362,7 @@ async fn collect_output_until_exit_drains_final_output_after_exit_observation() 
         let subscription_id = PaneOutputSubscriptionId::new(14);
         peer.write_response(Response::SubscribePaneOutput(SubscribePaneOutputResponse {
             subscription_id,
-            target: target().to_proto(),
+            target: expected_target(),
             pane_id: rmux_proto::PaneId::new(1),
             cursor: PaneOutputCursor {
                 next_sequence: 1,
@@ -447,7 +447,7 @@ async fn collect_output_and_exit_state_stay_on_the_preflighted_pane() -> TestRes
         let subscription_id = PaneOutputSubscriptionId::new(31);
         peer.write_response(Response::SubscribePaneOutput(SubscribePaneOutputResponse {
             subscription_id,
-            target: PaneRef::new(session_name(), 0, 1).to_proto(),
+            target: rmux_proto::PaneTarget::with_window(session_name(), 0, 1),
             pane_id: PaneId::new(1),
             cursor: PaneOutputCursor {
                 next_sequence: 1,
@@ -524,7 +524,7 @@ async fn collect_output_until_exit_starting_at_oldest_uses_requested_cursor() ->
         expect_oldest_slot_subscription(&mut peer).await?;
         peer.write_response(Response::Error(ErrorResponse {
             error: ProtoError::InvalidTarget {
-                value: target().to_proto().to_string(),
+                value: expected_target().to_string(),
                 reason: "pane index does not exist in session".to_owned(),
             },
         }))
@@ -553,7 +553,7 @@ async fn collect_oldest_pins_exit_probe_to_subscribed_pane_after_slot_reuse() ->
         let subscription_id = PaneOutputSubscriptionId::new(42);
         peer.write_response(Response::SubscribePaneOutput(SubscribePaneOutputResponse {
             subscription_id,
-            target: target().to_proto(),
+            target: expected_target(),
             pane_id: PaneId::new(1),
             cursor: PaneOutputCursor {
                 next_sequence: 1,
@@ -630,12 +630,95 @@ async fn collect_output_until_exit_propagates_foreign_invalid_target() -> TestRe
     Ok(())
 }
 
+#[tokio::test]
+async fn canonical_inventory_listed_sessions_keep_lookup_identity() -> TestResult {
+    let originals = [
+        "ordinary",
+        "a\\b",
+        "a\\\\b",
+        "line\nbreak",
+        "café界",
+        "bidi\u{202e}name",
+    ]
+    .into_iter()
+    .map(|raw| SessionName::new(raw).expect("nonempty raw name"))
+    .collect::<Vec<_>>();
+    assert_ne!(originals[1], originals[2]);
+    let expected = originals.clone();
+    let socket = TestSocket::new("canonical-inventory")?;
+    let listener = UnixListener::bind(socket.path())?;
+    let server = tokio::spawn(async move {
+        let mut peer = accept_peer(&listener).await?;
+        let Request::ListSessions(request) = peer.expect_request().await? else {
+            panic!("expected session inventory");
+        };
+        assert_eq!(request.format.as_deref(), Some("#{session_name}"));
+        let output = originals
+            .iter()
+            .map(|name| format!("{name}\n"))
+            .collect::<String>();
+        peer.write_response(Response::ListSessions(ListSessionsResponse {
+            output: CommandOutput::from_stdout(output),
+        }))
+        .await?;
+        drop(peer);
+        for original in originals {
+            let mut peer = accept_peer(&listener).await?;
+            // No target names a canonical backslash exactly, because the daemon
+            // escapes the target again: such a key is looked up in the listing.
+            if original.as_str().contains('\\') {
+                let Request::ListSessions(request) = peer.expect_request().await? else {
+                    panic!("expected listing lookup of {original:?}");
+                };
+                assert_eq!(request.format.as_deref(), Some("#{session_name}"));
+                peer.write_response(Response::ListSessions(ListSessionsResponse {
+                    output: CommandOutput::from_stdout(format!("{original}\n")),
+                }))
+                .await?;
+                continue;
+            }
+            let Request::HasSession(request) = peer.expect_request().await? else {
+                panic!("expected lookup of listed session");
+            };
+            assert_eq!(
+                request.target.as_str(),
+                format!("={}", original.as_str()),
+                "inventory must address the original key exactly"
+            );
+            peer.write_response(Response::HasSession(rmux_proto::HasSessionResponse {
+                exists: true,
+            }))
+            .await?;
+        }
+        TestResult::Ok(())
+    });
+    let rmux = RmuxBuilder::new()
+        .unix_socket(socket.path())
+        .default_timeout(Duration::from_secs(1))
+        .build();
+    let listed = rmux.list_sessions().await?;
+    assert_eq!(
+        listed, expected,
+        "canonical inventory must preserve distinct keys"
+    );
+    for name in listed {
+        assert!(rmux.has_session(name).await?);
+    }
+    drop(rmux);
+    server.await??;
+    Ok(())
+}
+
 async fn pane_for(socket_path: &Path, timeout: Duration) -> TestResult<Pane> {
     let rmux = RmuxBuilder::new()
         .unix_socket(socket_path)
         .default_timeout(timeout)
         .build();
     Ok(rmux.pane(target()).await?)
+}
+
+fn expected_target() -> rmux_proto::PaneTarget {
+    rmux_proto::PaneTarget::with_window(session_name(), 0, 0)
 }
 
 fn target() -> PaneRef {
@@ -709,7 +792,7 @@ async fn expect_oldest_slot_subscription(peer: &mut Peer) -> TestResult {
     let Request::SubscribePaneOutput(request) = request else {
         panic!("oldest slot subscription must reach the daemon as a slot, got {request:?}");
     };
-    assert_eq!(request.target, target().to_proto());
+    assert_eq!(request.target, expected_target());
     assert_eq!(request.start, PaneOutputSubscriptionStart::Oldest);
     Ok(())
 }

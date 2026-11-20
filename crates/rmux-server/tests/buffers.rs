@@ -9,8 +9,9 @@ mod common;
 use common::{send_request, session_name, start_server, TestHarness};
 use rmux_proto::{
     DaemonStatusRequest, DeleteBufferRequest, KillServerRequest, ListBuffersRequest,
-    LoadBufferRequest, NewSessionRequest, PaneTarget, PasteBufferRequest, Request, Response,
-    SaveBufferRequest, SetBufferRequest, ShowBufferRequest, SourceFileRequest, TerminalSize,
+    ListSessionsRequest, LoadBufferRequest, NewSessionRequest, PaneTarget, PasteBufferRequest,
+    Request, Response, SaveBufferRequest, SetBufferRequest, ShowBufferRequest, SourceFileRequest,
+    TerminalSize,
 };
 
 const FIFO_REQUEST_CLEANUP_TIMEOUT: Duration = Duration::from_secs(2);
@@ -26,7 +27,7 @@ async fn create_session(harness: &TestHarness, name: &str) -> Result<(), Box<dyn
         }),
     )
     .await?;
-    assert!(matches!(response, Response::NewSession(_)));
+    crate::common::assert_new_session(&response);
     Ok(())
 }
 
@@ -292,6 +293,79 @@ fn create_fifo(path: &std::path::Path) -> Result<(), Box<dyn Error>> {
     } else {
         Err(format!("mkfifo failed: {}", String::from_utf8_lossy(&output.stderr)).into())
     }
+}
+
+/// One byte past the daemon's 64 MiB `load-buffer` ceiling.
+const OVERSIZED_BUFFER_FILE_BYTES: u64 = 64 * 1024 * 1024 + 1;
+
+#[tokio::test]
+async fn load_buffer_refuses_endless_and_oversized_sources_and_keeps_serving(
+) -> Result<(), Box<dyn Error>> {
+    let harness = TestHarness::new("buf-load-limit");
+    let handle = start_server(&harness).await?;
+    create_session(&harness, "alpha").await?;
+    let oversized = fifo_path(&harness, "oversized.bin");
+    // Sparse: the length costs no disk blocks.
+    std::fs::File::create(&oversized)?.set_len(OVERSIZED_BUFFER_FILE_BYTES)?;
+
+    for path in [PathBuf::from("/dev/zero"), oversized] {
+        let response = tokio::time::timeout(
+            Duration::from_secs(30),
+            send_request(
+                harness.socket_path(),
+                &Request::LoadBuffer(Box::new(LoadBufferRequest {
+                    path: path.display().to_string(),
+                    cwd: None,
+                    name: Some("huge".to_owned()),
+                    set_clipboard: false,
+                    target_client: None,
+                })),
+            ),
+        )
+        .await
+        .map_err(|_| format!("load-buffer {} did not finish", path.display()))??;
+        let Response::Error(error) = response else {
+            return Err(
+                format!("load-buffer {} must fail, got {response:?}", path.display()).into(),
+            );
+        };
+        assert!(
+            error.error.to_string().contains("limit"),
+            "load-buffer {} must name the size limit: {}",
+            path.display(),
+            error.error
+        );
+
+        let listed = send_request(
+            harness.socket_path(),
+            &Request::ListSessions(ListSessionsRequest {
+                format: Some("#{session_name}".to_owned()),
+                filter: None,
+                sort_order: None,
+                reversed: false,
+            }),
+        )
+        .await?;
+        let output = listed
+            .command_output()
+            .ok_or_else(|| format!("list-sessions after {} failed: {listed:?}", path.display()))?;
+        assert_eq!(output.stdout(), b"alpha\n");
+    }
+
+    let shown = send_request(
+        harness.socket_path(),
+        &Request::ShowBuffer(ShowBufferRequest {
+            name: Some("huge".to_owned()),
+        }),
+    )
+    .await?;
+    assert!(
+        matches!(shown, Response::Error(_)),
+        "a refused load must not store a buffer: {shown:?}"
+    );
+
+    handle.shutdown().await?;
+    Ok(())
 }
 
 #[tokio::test]

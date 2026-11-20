@@ -21,6 +21,8 @@ const TMUX_COMPAT_OVERRIDE_ENV: &str = "RMUX_INTERNAL_INVOKED_AS_TMUX";
 
 pub(super) fn exec_full_helper(args: &[OsString]) -> Result<i32, String> {
     let helper = full_helper_path()?;
+    let helper =
+        rmux_os::build_identity::resolve(helper.as_os_str()).map_err(|error| error.to_string())?;
     let mut command = Command::new(&helper);
     command.args(args.iter().skip(1));
     if let Ok(current) = env::current_exe() {

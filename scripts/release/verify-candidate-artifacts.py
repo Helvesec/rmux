@@ -11,6 +11,8 @@ import sys
 from pathlib import Path
 from typing import Any
 
+from candidate_route import CANONICAL, CandidateRoute, add_arguments, from_args
+
 from candidate_artifact_resolution import (
     DIGEST,
     PLATFORMS,
@@ -113,17 +115,21 @@ def verify_fast_directory(
     release_intent_id: str,
     planned_release_ref: str,
     release_kind: str,
+    route: CandidateRoute = CANONICAL,
 ) -> dict[str, Any]:
+    route.validate_intent(source_sha, release_intent_id, planned_release_ref, release_kind)
     exact_entries(
         directory,
         {"candidate-intent.json", "fast-nextest-artifact.json", "fast-proof.json"},
         "fast proof artifact",
     )
     intent = read_object(directory / "candidate-intent.json", "candidate intent")
+    if route.rehearsal:
+        route.validate_record(intent)
     release_version = planned_release_ref.removeprefix("v")
     package_version = release_version.split("-rc.", maxsplit=1)[0]
     expected_intent = {
-        "schema_version": 1,
+        **route.fields,
         "repository_id": REPOSITORY_ID,
         "source_git_sha": source_sha,
         "fast_run_id": fast_run_id,
@@ -137,6 +143,8 @@ def verify_fast_directory(
     }
     require_equal(intent, expected_intent, "candidate intent")
     proof = read_object(directory / "fast-proof.json", "fast run proof")
+    if route.rehearsal:
+        route.validate_record(proof)
     proof_hash = proof.get("proof_sha256")
     if (
         not isinstance(proof_hash, str)
@@ -146,7 +154,7 @@ def verify_fast_directory(
     unhashed = {key: value for key, value in proof.items() if key != "proof_sha256"}
     require_equal(canonical_sha256(unhashed), proof_hash, "fast proof digest")
     for field, expected in {
-        "schema_version": 1,
+        **route.fields,
         "kind": "fast",
         "repository_id": REPOSITORY_ID,
         "run_id": fast_run_id,
@@ -309,8 +317,11 @@ def verify_platform_download(
 
 
 def verify_downloaded(args: argparse.Namespace) -> dict[str, Any]:
+    route = from_args(args)
+    route.validate_intent(args.expected_source_sha, args.release_intent_id,
+                          args.planned_release_ref, args.release_kind)
     resolution = load_candidate_resolution(
-        args.resolution, args.candidate_run_id, args.expected_source_sha
+        args.resolution, args.candidate_run_id, args.expected_source_sha, route
     )
     root = args.downloads_dir
     expected_names = {item["name"] for item in resolution["artifacts"]}
@@ -325,6 +336,7 @@ def verify_downloaded(args: argparse.Namespace) -> dict[str, Any]:
         args.release_intent_id,
         args.planned_release_ref,
         args.release_kind,
+        route,
     )
     platforms = []
     for platform in PLATFORMS:
@@ -342,7 +354,7 @@ def verify_downloaded(args: argparse.Namespace) -> dict[str, Any]:
             )
         )
     return {
-        "schema_version": 1,
+        **route.fields,
         "status": "verified-for-shadow-sealing",
         "repository_id": REPOSITORY_ID,
         "source_git_sha": args.expected_source_sha,
@@ -395,6 +407,8 @@ def parse_args() -> argparse.Namespace:
     verify_parser.add_argument("--resolution", type=Path, required=True)
     verify_parser.add_argument("--downloads-dir", type=Path, required=True)
     verify_parser.add_argument("--output", type=Path, required=True)
+    for command in (resolve_parser, verify_parser):
+        add_arguments(command)
     return parser.parse_args()
 
 
@@ -410,6 +424,7 @@ def main() -> int:
                 repository_json=args.repository_json,
                 run_json=args.run_json,
                 artifacts_json=args.artifacts_json,
+                route=from_args(args),
             )
         )
     else:

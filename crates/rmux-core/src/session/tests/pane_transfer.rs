@@ -234,17 +234,24 @@ fn detached_move_pane_before_target_keeps_tmux_geometry_and_active_fallback() {
         .iter()
         .map(|pane| pane.geometry())
         .collect::<Vec<_>>();
+    // Re-derived from tmux 3.7b, `fmt1/oracle-linux/detached-before-tiled-sibling`:
+    // a joined or moved pane is reinserted immediately after its destination in
+    // the pane list, so `-b` changes the side of the split and nothing else.
+    // That moves which pane list index 1 and 2 name at the second transfer,
+    // which is why this vector differs from the pre-correction one.
     assert_eq!(
         geometries,
         vec![
-            PaneGeometry::new(0, 0, 80, 12),
-            PaneGeometry::new(0, 13, 80, 5),
-            PaneGeometry::new(0, 19, 80, 29),
+            PaneGeometry::new(0, 13, 80, 35),
+            PaneGeometry::new(0, 7, 80, 5),
+            PaneGeometry::new(0, 0, 80, 6),
             PaneGeometry::new(81, 0, 79, 48),
         ]
     );
+    // The detached fallback rule itself is untouched: it still keeps the same
+    // pane identity active, and only the index naming it moved.
     assert_eq!(session.active_pane_index(), 3);
-    assert_eq!(session.window().last_pane_index(), Some(2));
+    assert_eq!(session.window().last_pane_index(), Some(1));
 }
 
 #[test]
@@ -566,13 +573,25 @@ fn join_pane_before_target_honours_requested_size() {
             .collect::<Vec<_>>(),
         vec![0, 1, 2]
     );
+    // tmux reinserts the moved pane immediately after its destination, so the
+    // joined pane is index 2 and `-l` sizes it; index 1 is the destination
+    // keeping the rest of the axis. Receipt:
+    // `fmt1/oracle-linux/cross-window-before-size-nonzero-target`.
     assert_eq!(
         window
-            .pane(1)
+            .pane(2)
             .expect("joined pane exists")
             .geometry()
             .cols(),
         10
+    );
+    assert_eq!(
+        window
+            .pane(1)
+            .expect("destination pane exists")
+            .geometry()
+            .cols(),
+        38
     );
 }
 

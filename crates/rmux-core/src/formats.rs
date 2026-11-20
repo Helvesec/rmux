@@ -10,45 +10,48 @@
 //! regex substitution, `a`/`c`/`w`/`N` modifiers, and tmux single-char aliases
 //! are handled in this core expansion layer.
 
-use crate::style::parse_colour;
-use crate::utf8::Utf8Config;
-#[path = "formats/colour.rs"]
-mod colour;
-#[path = "formats/condition.rs"]
-mod condition;
-#[path = "formats/context.rs"]
-mod context;
-#[path = "formats/expand.rs"]
-mod expand;
-#[path = "formats/expression.rs"]
-mod expression;
-#[path = "formats/glob.rs"]
-mod glob;
-#[path = "formats/modifiers.rs"]
-mod modifiers;
-#[path = "formats/regex_cache.rs"]
-mod regex_cache;
-#[path = "formats/scan.rs"]
-mod scan;
-#[path = "formats/styled_text.rs"]
-mod styled_text;
-#[path = "formats/time.rs"]
-mod time;
-#[path = "formats/transforms.rs"]
-mod transforms;
+use std::rc::Rc;
 
+use crate::utf8::Utf8Config;
+mod budget;
+mod condition;
+mod context;
+mod expand;
+mod expression;
+mod glob;
+mod modifiers;
+mod path_names;
+mod regex_cache;
+mod registry;
+mod resolve;
+mod scan;
+mod styled_text;
+mod time;
+mod transforms;
+mod value_modifiers;
+mod variable;
+
+use budget::ExpandBudget;
 use condition::{format_bool_op, format_conditional};
 pub use context::{
-    is_known_format_variable_name, FormatContext, FormatVariable, FormatVariables,
-    DEFAULT_DISPLAY_MESSAGE_FORMAT, DEFAULT_LIST_PANES_ALL_FORMAT, DEFAULT_LIST_PANES_FORMAT,
-    DEFAULT_LIST_PANES_SESSION_FORMAT, DEFAULT_LIST_PANES_WINDOW_FORMAT,
+    FormatContext, FormatVariables, DEFAULT_DISPLAY_MESSAGE_FORMAT, DEFAULT_LIST_PANES_ALL_FORMAT,
+    DEFAULT_LIST_PANES_FORMAT, DEFAULT_LIST_PANES_SESSION_FORMAT, DEFAULT_LIST_PANES_WINDOW_FORMAT,
     DEFAULT_LIST_SESSIONS_FORMAT, DEFAULT_LIST_WINDOWS_ALL_FORMAT, DEFAULT_LIST_WINDOWS_FORMAT,
-    FORMAT_VARIABLES, TMUX_FORMAT_TABLE_NAMES, TMUX_TIME_FORMAT_VARIABLE_NAMES,
 };
 use expand::{format_expand1, FORMAT_LOOP_LIMIT};
 use expression::format_expression;
 use glob::format_fnmatch;
 use modifiers::{parse_modifiers, FormatModifier};
+use path_names::{format_basename, format_dirname};
+pub use registry::{
+    display_all_format_variable_descriptors, format_variable_descriptor,
+    format_variable_descriptors, is_known_format_variable_name,
+    parse_time_format_variable_descriptors, tmux_format_variable_descriptors,
+    tmux_time_format_variable_descriptors, FormatVariableContext, FormatVariableContexts,
+    FormatVariableDescriptor, FormatVariableKey, FormatVariableProvider, TMUX_FORMAT_TABLE_NAMES,
+    TMUX_TIME_FORMAT_VARIABLE_NAMES,
+};
+use resolve::{resolve_path_variable, resolve_variable};
 use scan::format_skip;
 pub use scan::format_skip_delimiter;
 pub use styled_text::{styled_text_width, truncate_styled_text_to_width};
@@ -57,8 +60,10 @@ use time::format_time_string;
 use transforms::{
     apply_substitution, format_unescape, shell_quote, style_quote, truncate_left, truncate_right,
 };
-
-const FORMAT_REPEAT_BYTES_LIMIT: usize = 5 * 1024 * 1024;
+use value_modifiers::{
+    format_ascii_character, format_colour_hex, format_display_width, format_repeat,
+};
+pub use variable::{FormatVariable, FORMAT_VARIABLES};
 
 // ---------------------------------------------------------------------------
 // Public entry points
@@ -75,6 +80,8 @@ where
         expand_time: false,
         stop_expansion: false,
         preserve_jobs: false,
+        disable_jobs: false,
+        budget: Rc::new(ExpandBudget::start()),
     };
     format_expand1(&mut state, template, variables)
 }
@@ -94,6 +101,8 @@ where
         expand_time: false,
         stop_expansion: false,
         preserve_jobs: true,
+        disable_jobs: false,
+        budget: Rc::new(ExpandBudget::start()),
     };
     format_expand1(&mut state, template, variables)
 }
@@ -142,6 +151,9 @@ struct ExpandState {
     expand_time: bool,
     stop_expansion: bool,
     preserve_jobs: bool,
+    disable_jobs: bool,
+    /// Shared by every nested state of one top-level expansion.
+    budget: Rc<ExpandBudget>,
 }
 
 // ---------------------------------------------------------------------------
@@ -197,7 +209,7 @@ where
     let mut time_string = false;
     let mut time_pretty = false;
     let mut time_format: Option<String> = None;
-    let mut deferred_loop_scope = None;
+    let mut deferred_loop = None;
     let mut ascii_char = false;
     let mut colour_hex = false;
     let mut display_width = false;
@@ -254,9 +266,7 @@ where
                         }
                     }
                 }
-                b'S' | b'W' | b'P' | b'L' => {
-                    deferred_loop_scope = Some(fm.modifier.as_bytes()[0] as char)
-                }
+                b'S' | b'W' | b'P' | b'L' => deferred_loop = Some(fm),
                 b'N' => name_exists = Some(fm),
                 b'e' => expression = Some(fm),
                 b'C' => search = Some(fm),
@@ -275,16 +285,36 @@ where
         }
     }
 
-    if let Some(scope) = deferred_loop_scope {
-        let (body, current_body) = if scope == 'S' {
+    let mut deferred_loop_value = None;
+    if let Some(loop_modifier) = deferred_loop {
+        let scope = loop_modifier.modifier.as_bytes()[0] as char;
+        let (body, current_body) = if matches!(scope, 'S' | 'L') {
             (body, None)
         } else {
             split_loop_body(body)
         };
-        if let Some(value) = variables.format_loop(scope, body, current_body, false) {
-            return value;
+        let value = {
+            let mut expand = |template: &str, variables: &dyn FormatVariables| {
+                format_expand1(state, template, variables)
+            };
+            variables.format_loop_with_args_and_expand(
+                scope,
+                &loop_modifier.argv,
+                body,
+                current_body,
+                false,
+                &mut expand,
+            )
+        };
+        if let Some(value) = value {
+            if scope == 'L' {
+                deferred_loop_value = Some(value);
+            } else {
+                return value;
+            }
         }
     }
+    let deferred_loop_present = deferred_loop_value.is_some();
     if let Some(modifier) = name_exists {
         let scope = match modifier.argv.first().map(String::as_str) {
             None | Some("") | Some("w") => None,
@@ -312,13 +342,15 @@ where
     // --- Dispatch with classified modifiers ---
 
     // Literal.
-    if flags & MOD_LITERAL != 0 {
+    if flags & MOD_LITERAL != 0 && deferred_loop_value.is_none() {
         return format_unescape(body);
     }
 
     let value;
 
-    if let Some(op) = bool_unary {
+    if let Some(loop_value) = deferred_loop_value {
+        value = loop_value;
+    } else if let Some(op) = bool_unary {
         let truthy = is_truthy(&format_expand1(state, body, variables));
         value = match op.modifier.as_str() {
             "!" => bool_value(!truthy),
@@ -359,7 +391,52 @@ where
         if body.contains("#{") {
             value = format_expand1(state, body, variables);
         } else {
-            value = resolve_variable(body, variables);
+            // A path modifier reads the lookup that keeps absence; every other
+            // body keeps the lookup it always had, whose absent value is the
+            // empty string.
+            let found = if flags & (MOD_BASENAME | MOD_DIRNAME) != 0 {
+                resolve_path_variable(body, variables)
+            } else {
+                Some(resolve_variable(body, variables))
+            };
+            // The short name is taken here, on what the lookup found, and not
+            // at the end of the pipeline. Taking it last meant a limit cut the
+            // path first, so `#{=6;b:pane_title}` answered `work` for both
+            // `/work/editor/` and `/work/logs/`. The engine this was measured
+            // against takes it during the lookup too, which is why `#{=3;b:…}`
+            // answers `edi` and a substitution, a padding or an expand all see
+            // the short name. `resolve_variable` itself is untouched: the
+            // conditions and the short aliases call it without these flags.
+            // The folder follows the short name, on the same value and in the
+            // same place: the engine measured applies both during its lookup,
+            // before the expand, the substitution, the limit and the padding.
+            // Taking the folder last meant a limit cut `/work/editor` out of
+            // `/work/editor/main.rs` first, and `#{=12;d:pane_title}` answered
+            // `/work`. Written `d;b` the two still run in this order.
+            // Both run only on a value that was really FOUND. A title that is
+            // there and holds nothing is filed under the current folder, as the
+            // engine measured files it, while a name nobody answered has no
+            // folder at all - the two were the same string before, which is why
+            // a pane with an empty title had no row of its own in a menu of
+            // parent folders.
+            value = match found {
+                Some(found) => {
+                    let short = if flags & MOD_BASENAME != 0 {
+                        format_basename(&found)
+                    } else {
+                        found
+                    };
+                    if flags & MOD_DIRNAME != 0 {
+                        format_dirname(&short)
+                    } else {
+                        short
+                    }
+                }
+                // Nothing answered to this name, so there is no value for
+                // either name to be taken from: the answer is what an absent
+                // value always gave, and never the current folder.
+                None => String::new(),
+            };
         }
     }
 
@@ -431,18 +508,6 @@ where
         }
     }
 
-    // Basename.
-    if flags & MOD_BASENAME != 0 {
-        if let Some(pos) = result.rfind('/') {
-            result = result[pos + 1..].to_owned();
-        }
-    }
-
-    // Dirname.
-    if flags & MOD_DIRNAME != 0 {
-        result = format_dirname(&result);
-    }
-
     // Length.
     if flags & MOD_LENGTH != 0 {
         result = result.len().to_string();
@@ -461,7 +526,8 @@ where
     }
 
     // Quoting.
-    if flags & MOD_QUOTE_SHELL != 0 && !is_single_nested_expansion(body) {
+    if flags & MOD_QUOTE_SHELL != 0 && (!is_single_nested_expansion(body) || deferred_loop_present)
+    {
         result = shell_quote(&result);
     } else if flags & MOD_QUOTE_STYLE != 0 {
         result = style_quote(&result);
@@ -479,33 +545,6 @@ fn bounded_format_padding_width(value: i32) -> Option<usize> {
     (width <= FORMAT_PADDING_LIMIT).then_some(width)
 }
 
-fn format_repeat<V>(state: &mut ExpandState, body: &str, variables: &V) -> String
-where
-    V: FormatVariables + ?Sized,
-{
-    let Some((unit, count)) = format_choose(state, body, variables) else {
-        state.stop_expansion = true;
-        return String::new();
-    };
-    let Ok(count) = count.parse::<usize>() else {
-        return String::new();
-    };
-    if count == 0 || count > FORMAT_PADDING_LIMIT || unit.is_empty() {
-        return String::new();
-    }
-    let Some(capacity) = unit.len().checked_mul(count) else {
-        return String::new();
-    };
-    if capacity > FORMAT_REPEAT_BYTES_LIMIT {
-        return String::new();
-    }
-    let mut repeated = String::with_capacity(capacity);
-    for _ in 0..count {
-        repeated.push_str(&unit);
-    }
-    repeated
-}
-
 fn split_loop_body(body: &str) -> (&str, Option<&str>) {
     format_skip(body.as_bytes(), b",")
         .map(|offset| (&body[..offset], Some(&body[offset + 1..])))
@@ -514,76 +553,6 @@ fn split_loop_body(body: &str) -> (&str, Option<&str>) {
 
 fn is_single_nested_expansion(body: &str) -> bool {
     body.starts_with("#{") && format_skip(body.as_bytes(), b"}") == Some(body.len() - 1)
-}
-
-fn format_ascii_character<V>(
-    _result: &str,
-    body: &str,
-    state: &mut ExpandState,
-    variables: &V,
-) -> String
-where
-    V: FormatVariables + ?Sized,
-{
-    let operand = format_expand1(state, body, variables);
-    operand
-        .parse::<u32>()
-        .ok()
-        .and_then(|value| u8::try_from(value).ok())
-        .map(char::from)
-        .map(|character| character.to_string())
-        .unwrap_or_default()
-}
-
-fn format_colour_hex<V>(_result: &str, body: &str, state: &mut ExpandState, variables: &V) -> String
-where
-    V: FormatVariables + ?Sized,
-{
-    let operand = format_expand1(state, body, variables);
-    parse_colour(&operand)
-        .ok()
-        .and_then(colour::tmux_colour_to_rgb)
-        .map(|(red, green, blue)| format!("{red:02x}{green:02x}{blue:02x}"))
-        .unwrap_or_default()
-}
-
-fn format_display_width<V>(
-    result: &str,
-    _body: &str,
-    _state: &mut ExpandState,
-    _variables: &V,
-) -> String
-where
-    V: FormatVariables + ?Sized,
-{
-    styled_text_width(result, &Utf8Config::default()).to_string()
-}
-
-fn format_dirname(value: &str) -> String {
-    if value.is_empty() {
-        return String::new();
-    }
-    if value.chars().all(|character| character == '/') {
-        return value.to_owned();
-    }
-
-    let trimmed = value.trim_end_matches('/');
-    match trimmed.rfind('/') {
-        Some(0) => "/".to_owned(),
-        Some(position) => trimmed[..position].to_owned(),
-        None => ".".to_owned(),
-    }
-}
-
-// ---------------------------------------------------------------------------
-// Variable resolution
-// ---------------------------------------------------------------------------
-
-fn resolve_variable<V>(name: &str, variables: &V) -> String
-where
-    V: FormatVariables + ?Sized,
-{
-    variables.format_value_by_name(name).unwrap_or_default()
 }
 
 fn window_raw_flags(active: bool, last: bool) -> &'static str {
@@ -607,3 +576,7 @@ fn bool_value(value: bool) -> String {
 #[cfg(test)]
 #[path = "formats/tests.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "formats/job_tests.rs"]
+mod job_tests;

@@ -531,3 +531,78 @@ fn widget_render_clips_wide_glyph_at_right_edge() {
         "clipped wide glyph must not suppress the adjacent widget update"
     );
 }
+
+mod scene_projection {
+    use ratatui_core::{buffer::Buffer, layout::Rect, widgets::Widget};
+    use ratatui_rmux::{PaneState, SceneWidget};
+    use rmux_sdk::*;
+    #[test]
+    fn resolved_spans_clip_wide_cells_and_hide_occluded_cursor() {
+        let rect = SceneRect {
+            x: -1,
+            y: 0,
+            cols: 3,
+            rows: 1,
+        };
+        let pane = ScenePane {
+            id: PaneId::new(4),
+            index: 9,
+            floating: true,
+            layer: 1,
+            focused: true,
+            visible: true,
+            content: rect.clone(),
+            frame: rect.clone(),
+            content_clip: rect.clone(),
+            frame_clip: rect,
+            hit_regions: vec![],
+            spans: vec![SceneSpan {
+                x: 0,
+                y: 0,
+                source_row: 0,
+                source_col: 1,
+                cols: 1,
+            }],
+        };
+        let scene = SceneSnapshot {
+            schema: 1,
+            session_id: SessionId::new(1),
+            window_id: WindowId::new(2),
+            window_index: 0,
+            revision: "test".into(),
+            cols: 3,
+            rows: 1,
+            content_y_offset: 0,
+            active_pane_id: Some(pane.id),
+            panes: vec![pane],
+            borders: vec![],
+        };
+        let cell = |text: &str, width| PaneCell {
+            glyph: PaneGlyph::new(text, width),
+            attributes: PaneAttributes::EMPTY,
+            foreground: PaneColor::Default,
+            background: PaneColor::Default,
+            underline: PaneColor::Default,
+        };
+        let snapshot = PaneSnapshot::new(
+            3,
+            1,
+            vec![cell("A", 1), cell("界", 2), cell("", 0)],
+            PaneCursor::new(0, 0, true, 0),
+        )
+        .unwrap();
+        let mut panes = vec![(PaneId::new(4), PaneState::from_snapshot(snapshot))];
+        let area = Rect::new(1, 1, 3, 1);
+        let mut buffer = Buffer::empty(Rect::new(0, 0, 5, 3));
+        buffer.cell_mut((4, 1)).unwrap().set_symbol("Z");
+        SceneWidget::new(&scene, &panes).render(area, &mut buffer);
+        assert_eq!(buffer.cell((1, 1)).unwrap().symbol(), " ");
+        assert_eq!(buffer.cell((4, 1)).unwrap().symbol(), "Z");
+        assert_eq!(SceneWidget::new(&scene, &panes).cursor(area), None);
+        panes[0].1.snapshot.cursor.col = 1;
+        assert_eq!(SceneWidget::new(&scene, &panes).cursor(area), Some((1, 1)));
+        // Same slot with wrong stable identity cannot contribute pixels or cursor.
+        panes[0].0 = PaneId::new(5);
+        assert_eq!(SceneWidget::new(&scene, &panes).cursor(area), None);
+    }
+}

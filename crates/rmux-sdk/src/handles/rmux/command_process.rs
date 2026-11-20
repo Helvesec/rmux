@@ -291,7 +291,13 @@ mod tests {
     }
 
     fn fixture_command(mode: &str, heartbeat: Option<&Path>) -> Command {
-        let mut command = Command::new(env::current_exe().expect("resolve test executable"));
+        let executable = rmux_os::build_identity::resolve(
+            env::current_exe()
+                .expect("resolve test executable")
+                .as_os_str(),
+        )
+        .expect("verify SDK fixture child before spawn");
+        let mut command = Command::new(executable);
         command
             .args(["--exact", FIXTURE_TEST_NAME, "--nocapture"])
             .env(FIXTURE_MODE_ENV, mode)

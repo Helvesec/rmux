@@ -197,7 +197,7 @@ pub(super) enum PendingResponseAction {
 
 fn response_to_result(response: Response) -> Result<Response> {
     match response {
-        Response::Error(error) => Err(error.into()),
+        Response::Error(error) => Err(crate::RmuxError::from_proto(error.error)),
         response => Ok(response),
     }
 }

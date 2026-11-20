@@ -93,7 +93,7 @@ fn batched_text_inserts_once_at_the_unicode_cursor() {
     let mut prompt = ClientPromptState::new_command(plan, PromptCompletion::Background);
     assert!(prompt.move_left());
 
-    assert!(prompt.insert_batched_text("é🙂"));
+    assert!(prompt.insert_batched_text("é🙂", StatusKeys::Emacs));
     assert_eq!(prompt.buffer, "a日本é🙂z");
     assert_eq!(prompt.cursor, 5);
 }
@@ -121,7 +121,10 @@ fn per_event_prompt_types_reject_batched_text() {
             format_values: Vec::new(),
         };
         let mut prompt = ClientPromptState::new_command(plan, PromptCompletion::Background);
-        assert!(!prompt.insert_batched_text("é"), "flags={flags:#x}");
+        assert!(
+            !prompt.insert_batched_text("é", StatusKeys::Emacs),
+            "flags={flags:#x}"
+        );
         assert!(prompt.buffer.is_empty());
         assert_eq!(prompt.cursor, 0);
     }
@@ -149,6 +152,7 @@ fn confirm_key_mode_accepts_correct_key() {
         &mut history,
         "",
         100,
+        StatusKeys::Emacs,
     );
     assert!(action.finalize.is_some());
     match action.finalize.unwrap() {
@@ -173,7 +177,14 @@ fn confirm_enter_without_default_yes_declines() {
     let mut prompt = ClientPromptState::new_confirm(plan, PromptCompletion::Background);
     let mut history = PromptHistoryStore::default();
 
-    let action = process_prompt_event(&mut prompt, PromptInputEvent::Enter, &mut history, "", 100);
+    let action = process_prompt_event(
+        &mut prompt,
+        PromptInputEvent::Enter,
+        &mut history,
+        "",
+        100,
+        StatusKeys::Emacs,
+    );
     assert!(action.finalize.is_some());
     match action.finalize.unwrap() {
         PromptFinalizeKind::Confirm { accepted } => assert!(!accepted),
@@ -197,7 +208,14 @@ fn confirm_enter_with_default_yes_accepts() {
     let mut prompt = ClientPromptState::new_confirm(plan, PromptCompletion::Background);
     let mut history = PromptHistoryStore::default();
 
-    let action = process_prompt_event(&mut prompt, PromptInputEvent::Enter, &mut history, "", 100);
+    let action = process_prompt_event(
+        &mut prompt,
+        PromptInputEvent::Enter,
+        &mut history,
+        "",
+        100,
+        StatusKeys::Emacs,
+    );
     assert!(action.finalize.is_some());
     match action.finalize.unwrap() {
         PromptFinalizeKind::Confirm { accepted } => assert!(accepted),
@@ -224,7 +242,14 @@ fn key_mode_captures_any_key() {
     let mut prompt = ClientPromptState::new_command(plan, PromptCompletion::Background);
     let mut history = PromptHistoryStore::default();
 
-    let action = process_prompt_event(&mut prompt, PromptInputEvent::Up, &mut history, "", 100);
+    let action = process_prompt_event(
+        &mut prompt,
+        PromptInputEvent::Up,
+        &mut history,
+        "",
+        100,
+        StatusKeys::Emacs,
+    );
     assert!(action.finalize.is_some());
 }
 
@@ -253,6 +278,7 @@ fn numeric_mode_rejects_non_digits() {
         &mut history,
         "",
         100,
+        StatusKeys::Emacs,
     );
     assert!(action.finalize.is_none());
     assert_eq!(prompt.buffer, "5");
@@ -263,6 +289,7 @@ fn numeric_mode_rejects_non_digits() {
         &mut history,
         "",
         100,
+        StatusKeys::Emacs,
     );
     assert!(action.finalize.is_some());
 }
@@ -294,12 +321,20 @@ fn incremental_mode_dispatches_on_each_char() {
         &mut history,
         "",
         100,
+        StatusKeys::Emacs,
     );
     assert!(action.dispatch.is_some());
     let dispatch = action.dispatch.unwrap();
     assert_eq!(dispatch.responses, vec!["=a"]);
 
-    let action = process_prompt_event(&mut prompt, PromptInputEvent::Enter, &mut history, "", 100);
+    let action = process_prompt_event(
+        &mut prompt,
+        PromptInputEvent::Enter,
+        &mut history,
+        "",
+        100,
+        StatusKeys::Emacs,
+    );
     assert!(matches!(action.finalize, Some(PromptFinalizeKind::Cancel)));
 }
 
@@ -328,6 +363,7 @@ fn bspace_exit_cancels_on_empty_buffer_backspace() {
         &mut history,
         "",
         100,
+        StatusKeys::Emacs,
     );
     assert!(matches!(action.finalize, Some(PromptFinalizeKind::Cancel)));
 }
@@ -383,6 +419,7 @@ fn confirm_key_y_accepts_y_char() {
         &mut history,
         "",
         100,
+        StatusKeys::Emacs,
     );
     match action.finalize.unwrap() {
         PromptFinalizeKind::Confirm { accepted } => assert!(accepted),
@@ -406,7 +443,14 @@ fn confirm_escape_cancels() {
     let mut prompt = ClientPromptState::new_confirm(plan, PromptCompletion::Background);
     let mut history = PromptHistoryStore::default();
 
-    let action = process_prompt_event(&mut prompt, PromptInputEvent::Escape, &mut history, "", 100);
+    let action = process_prompt_event(
+        &mut prompt,
+        PromptInputEvent::Escape,
+        &mut history,
+        "",
+        100,
+        StatusKeys::Emacs,
+    );
     match action.finalize.unwrap() {
         PromptFinalizeKind::Cancel => {}
         other => panic!("expected Cancel, got {other:?}"),
@@ -435,6 +479,7 @@ fn confirm_ctrl_c_cancels() {
         &mut history,
         "",
         100,
+        StatusKeys::Emacs,
     );
     match action.finalize.unwrap() {
         PromptFinalizeKind::Cancel => {}
@@ -462,7 +507,14 @@ fn numeric_mode_escape_cancels() {
     let mut history = PromptHistoryStore::default();
 
     prompt.push_char('3');
-    let action = process_prompt_event(&mut prompt, PromptInputEvent::Escape, &mut history, "", 100);
+    let action = process_prompt_event(
+        &mut prompt,
+        PromptInputEvent::Escape,
+        &mut history,
+        "",
+        100,
+        StatusKeys::Emacs,
+    );
     assert!(matches!(action.finalize, Some(PromptFinalizeKind::Cancel)));
 }
 
@@ -491,6 +543,7 @@ fn numeric_mode_backspace_on_empty_submits_empty() {
         &mut history,
         "",
         100,
+        StatusKeys::Emacs,
     );
     assert!(action.finalize.is_some());
 }
@@ -559,6 +612,7 @@ fn incremental_ctrl_r_with_empty_buffer_restores_last_input() {
         &mut history,
         "",
         100,
+        StatusKeys::Emacs,
     );
     assert_eq!(prompt.buffer, "previous");
     assert!(action.dispatch.is_some());

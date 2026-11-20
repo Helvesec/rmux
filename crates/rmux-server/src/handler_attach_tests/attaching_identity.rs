@@ -14,8 +14,15 @@ use rmux_os::identity::UserIdentity;
 
 use crate::server_access::AccessMode;
 
-const FIRST_UID: u32 = 18_300;
-const SECOND_UID: u32 = 18_301;
+fn delegated_uids() -> [u32; 2] {
+    // Advance through nonzero UIDs so neither delegated peer is the owner,
+    // and the two peers remain distinct even when the owner's UID wraps.
+    let first = crate::server_access::current_owner_uid()
+        .wrapping_add(1)
+        .max(1);
+    let second = first.wrapping_add(1).max(1);
+    [first, second]
+}
 
 fn peer(pid: u32, uid: u32) -> PeerIdentity {
     PeerIdentity {
@@ -46,8 +53,9 @@ fn admit(
 async fn conflicting_authenticated_peers_fail_closed_rather_than_becoming_the_owner() {
     let handler = RequestHandler::new();
     let shared_pid = 60_190;
-    let first = peer(shared_pid, FIRST_UID);
-    let second = peer(shared_pid, SECOND_UID);
+    let [first_uid, second_uid] = delegated_uids();
+    let first = peer(shared_pid, first_uid);
+    let second = peer(shared_pid, second_uid);
     let first_admission = admit(&handler, &first);
     let second_admission = admit(&handler, &second);
     let owner = handler.server_owner_identity();
@@ -103,7 +111,8 @@ async fn conflicting_authenticated_peers_fail_closed_rather_than_becoming_the_ow
 async fn a_pid_with_one_authenticated_peer_is_never_reported_as_conflicting() {
     let handler = RequestHandler::new();
     let shared_pid = 60_191;
-    let only = peer(shared_pid, FIRST_UID);
+    let [first_uid, _] = delegated_uids();
+    let only = peer(shared_pid, first_uid);
     let admission = admit(&handler, &only);
 
     let outer = handler.begin_authenticated_peer_access(&only, admission);
@@ -122,4 +131,73 @@ async fn a_pid_with_one_authenticated_peer_is_never_reported_as_conflicting() {
     );
     drop(inner);
     drop(outer);
+}
+
+/// Attaches a fresh, not yet registered client to `session` and returns the
+/// first frame the attach renders for it, before registration publishes it.
+async fn first_attach_frame(
+    handler: &RequestHandler,
+    requester_pid: u32,
+    session: &SessionName,
+    read_only: bool,
+    flags: Option<&str>,
+) -> String {
+    let outcome = handler
+        .dispatch(
+            requester_pid,
+            Request::AttachSessionExt3(Box::new(AttachSessionExt3Request {
+                target: Some(session.clone()),
+                target_spec: None,
+                detach_other_clients: false,
+                kill_other_clients: false,
+                read_only,
+                skip_environment_update: true,
+                flags: flags.map(|flag| vec![flag.to_owned()]),
+                working_directory: None,
+                client_terminal: rmux_proto::ClientTerminalContext::default(),
+                client_size: Some(TerminalSize { cols: 80, rows: 24 }),
+                attach_capabilities: Vec::new(),
+            })),
+        )
+        .await;
+    assert!(
+        matches!(outcome.response, Response::AttachSession(_)),
+        "the attach must succeed, got {:?}",
+        outcome.response
+    );
+    String::from_utf8(outcome.attach.expect("attach upgrade").target.render_frame)
+        .expect("render frame must be utf-8")
+}
+
+/// The attaching client's own flags drive `#{client_readonly}` in the frame it
+/// is shown before registration, as tmux 3.7b sets `CLIENT_READONLY` in
+/// `cmd_attach_session()` before that client is ever drawn. A record built
+/// without its flags would show `attach -r` a status line that says `0` while
+/// `list-clients` reports `1` for the same client.
+#[tokio::test]
+async fn the_first_attach_frame_reports_the_attaching_client_readonly_flag() {
+    let handler = RequestHandler::new();
+    let alpha = session_name("attaching-readonly");
+    create_quiet_session(&handler, &alpha).await;
+    let response = handler
+        .handle(Request::SetOption(SetOptionRequest {
+            scope: ScopeSelector::Global,
+            option: OptionName::StatusLeft,
+            value: "<RO=#{client_readonly}> ".to_owned(),
+            mode: SetOptionMode::Replace,
+        }))
+        .await;
+    assert!(matches!(response, Response::SetOption(_)), "{response:?}");
+
+    for (requester_pid, read_only, flags, expected) in [
+        (60_192, false, None, "<RO=0>"),
+        (60_193, true, None, "<RO=1>"),
+        (60_194, false, Some("read-only"), "<RO=1>"),
+    ] {
+        let frame = first_attach_frame(&handler, requester_pid, &alpha, read_only, flags).await;
+        assert!(
+            frame.contains(expected),
+            "attach read_only={read_only} flags={flags:?} must open on {expected}, got {frame:?}"
+        );
+    }
 }

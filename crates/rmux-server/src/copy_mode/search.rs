@@ -7,7 +7,8 @@ use super::text::{
     line_char, owner_positions, pattern_looks_like_regex, position_ge, position_le, LineTextMap,
 };
 use super::types::{
-    ClearPolicy, CopyModeCommandOutcome, JumpKind, JumpState, ModeKeys, SearchDirection,
+    ClearPolicy, CopyModeCommandOutcome, CopyPosition, JumpKind, JumpState, ModeKeys,
+    SearchDirection, SearchMatch,
 };
 use super::CopyModeState;
 
@@ -52,6 +53,7 @@ impl CopyModeState {
         self.perform_search(pattern, direction, plain_text)?;
         let outcome = self.finish_policy(CopyModeCommandOutcome::nothing(), ClearPolicy::Always);
         self.search_highlighted = !self.search_results.is_empty();
+        self.search_marked = self.search_current.is_some();
         Ok(outcome)
     }
 
@@ -60,7 +62,9 @@ impl CopyModeState {
             return Ok(self.finish_policy(CopyModeCommandOutcome::nothing(), ClearPolicy::Always));
         }
         self.advance_search_match(self.search_direction);
-        Ok(self.finish_policy(CopyModeCommandOutcome::nothing(), ClearPolicy::Always))
+        let outcome = self.finish_policy(CopyModeCommandOutcome::nothing(), ClearPolicy::Always);
+        self.search_marked = self.search_current.is_some();
+        Ok(outcome)
     }
 
     pub(super) fn search_reverse(&mut self) -> Result<CopyModeCommandOutcome, RmuxError> {
@@ -72,7 +76,9 @@ impl CopyModeState {
             SearchDirection::Backward => SearchDirection::Forward,
         };
         self.advance_search_match(reverse);
-        Ok(self.finish_policy(CopyModeCommandOutcome::nothing(), ClearPolicy::Always))
+        let outcome = self.finish_policy(CopyModeCommandOutcome::nothing(), ClearPolicy::Always);
+        self.search_marked = self.search_current.is_some();
+        Ok(outcome)
     }
 
     pub(super) fn incremental_search(
@@ -81,31 +87,83 @@ impl CopyModeState {
         default_direction: SearchDirection,
     ) -> Result<CopyModeCommandOutcome, RmuxError> {
         let value = parse_single_argument("incremental-search", args)?;
-        let (prefix, pattern) = match value.split_once(':') {
-            Some((prefix, pattern)) => (prefix, pattern),
-            None => ("=", value.as_str()),
-        };
-        if prefix.is_empty() {
+        // tmux takes the first byte as the prefix and searches the rest
+        // literally (window-copy.c:2690, 2747). A first character that is not
+        // ASCII is no known prefix and leaves bytes behind it, so like any
+        // unknown prefix it runs no search and keeps the marks.
+        let mut chars = value.chars();
+        let prefix = chars.next();
+        if prefix.is_some_and(|prefix| !prefix.is_ascii()) {
+            return Ok(self.finish_policy(CopyModeCommandOutcome::nothing(), ClearPolicy::Never));
+        }
+        let pattern = chars.as_str();
+        if pattern.is_empty() {
+            // The marks go; the retained search text stays (window-copy.c:2760).
             return Ok(self.finish_policy(CopyModeCommandOutcome::nothing(), ClearPolicy::Always));
         }
         let direction = match prefix {
-            "+" => SearchDirection::Forward,
-            "-" => SearchDirection::Backward,
-            "=" => self.search_direction,
-            _ => default_direction,
+            Some('=') => Some(default_direction),
+            Some('+') => Some(SearchDirection::Forward),
+            Some('-') => Some(SearchDirection::Backward),
+            _ => None,
         };
-        if pattern.is_empty() {
-            self.search_pattern.clear();
-            self.search_results.clear();
-            self.search_current = None;
-            self.search_highlighted = false;
-            return Ok(self.finish_policy(CopyModeCommandOutcome::nothing(), ClearPolicy::Always));
-        }
-        let plain = !pattern_looks_like_regex(pattern);
-        self.perform_search(pattern.to_owned(), direction, plain)?;
+        let Some(direction) = direction else {
+            return Ok(self.finish_policy(CopyModeCommandOutcome::nothing(), ClearPolicy::Never));
+        };
+        self.perform_search(pattern.to_owned(), direction, true)?;
         let outcome = self.finish_policy(CopyModeCommandOutcome::nothing(), ClearPolicy::Always);
         self.search_highlighted = !self.search_results.is_empty();
+        self.search_marked = self.search_current.is_some();
         Ok(outcome)
+    }
+
+    /// The match tmux reports at the copy cursor (window-copy.c:4629-4674): the
+    /// live match covering the cursor cell, or - only when no match covers that
+    /// cell - the one covering the cell just before it in the view. The
+    /// retained current result decides nothing.
+    pub(super) fn search_match_at_cursor(&self) -> Option<String> {
+        if !self.search_marked {
+            return None;
+        }
+        let covering = |cell: CopyPosition| {
+            self.search_results
+                .iter()
+                .find(|matched| self.match_covers_cell(matched, cell))
+        };
+        covering(self.cursor)
+            .or_else(|| self.cell_before_in_view(self.cursor).and_then(covering))
+            .map(|matched| matched.text.clone())
+    }
+
+    /// A match covers its cells from its first owner through the last cell of
+    /// its last owner, so a wide final character covers its padding too, as
+    /// tmux marks the full screen width of every match (window-copy.c:4397).
+    fn match_covers_cell(&self, matched: &SearchMatch, cell: CopyPosition) -> bool {
+        let last_owner = matched.end;
+        let last_width = self
+            .line(last_owner.y)
+            .cell(last_owner.x)
+            .map_or(1, |owner| u32::from(owner.width().max(1)));
+        let last_cell = CopyPosition {
+            x: last_owner.x + last_width - 1,
+            y: last_owner.y,
+        };
+        position_le(matched.start, cell) && position_le(cell, last_cell)
+    }
+
+    /// The cell before `cell` in reading order, while it is still in the view:
+    /// tmux indexes its marks from the first visible cell (window-copy.c:4375).
+    fn cell_before_in_view(&self, cell: CopyPosition) -> Option<CopyPosition> {
+        if cell.x > 0 {
+            return Some(CopyPosition {
+                x: cell.x - 1,
+                y: cell.y,
+            });
+        }
+        (cell.y > self.top_line).then(|| CopyPosition {
+            x: self.cols().saturating_sub(1),
+            y: cell.y - 1,
+        })
     }
 
     pub(super) fn jump_with_arg(
@@ -164,6 +222,19 @@ impl CopyModeState {
             }
         }
         Ok(())
+    }
+
+    /// Rebuilds the results after the backing changed, keeping the live marks
+    /// only where tmux's `window_copy_size_changed` marks again: marks existed,
+    /// the search had not timed out, and the pattern still has results.
+    pub(super) fn rebuild_search_keeping_marks(&mut self, marks_survive: bool) {
+        self.search_marked = false;
+        if self.search_pattern.is_empty() {
+            return;
+        }
+        let plain = !pattern_looks_like_regex(&self.search_pattern);
+        self.rebuild_search_results(plain);
+        self.search_marked = marks_survive && !self.search_results.is_empty();
     }
 
     pub(super) fn rebuild_search_results(&mut self, plain_text: bool) {

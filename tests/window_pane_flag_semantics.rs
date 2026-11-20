@@ -63,6 +63,7 @@ fn split_window_stdin_flag_feeds_the_created_pane() -> Result<(), Box<dyn Error>
     );
 
     let capture_stdout = wait_for_capture_contains(&harness, "s:0.1", "hello\nworld")?;
+    assert_empty_split(&harness, "s:0.1")?;
     let payload_count = capture_stdout.matches("hello").count();
     assert_eq!(
         payload_count, 1,
@@ -100,7 +101,7 @@ fn split_window_stdin_flag_feeds_the_created_pane() -> Result<(), Box<dyn Error>
         ],
         |stdout| {
             ["bash", "zsh", "sh"].iter().any(|shell| {
-                stdout.contains(&format!("1:dead=1:status=:time=:cmd={shell}"))
+                stdout.contains(&format!("1:dead=0:status=:time=:cmd={shell}"))
             })
         },
     )?;
@@ -108,8 +109,8 @@ fn split_window_stdin_flag_feeds_the_created_pane() -> Result<(), Box<dyn Error>
         ["bash", "zsh", "sh"]
             .iter()
             .any(|shell| dead_metadata_stdout
-                .contains(&format!("1:dead=1:status=:time=:cmd={shell}"))),
-        "split-window -I synthetic pane should not expose exit status or time: {:?}",
+                .contains(&format!("1:dead=0:status=:time=:cmd={shell}"))),
+        "split-window -I is live without a child or exit metadata: {:?}",
         dead_metadata_stdout
     );
 
@@ -192,6 +193,7 @@ fn source_file_split_window_stdin_flag_creates_empty_pane() -> Result<(), Box<dy
         panes_stdout.contains("1:%"),
         "source-file split-window -I should create pane 1: {panes_stdout:?}"
     );
+    assert_empty_split(&harness, "s:0.1")?;
 
     terminate_child(daemon.child_mut())?;
     Ok(())
@@ -222,6 +224,46 @@ fn split_window_keep_flag_retains_exited_pane() -> Result<(), Box<dyn Error>> {
     );
 
     terminate_child(daemon.child_mut())?;
+    Ok(())
+}
+
+fn assert_empty_split(harness: &CliHarness, target: &str) -> Result<(), Box<dyn Error>> {
+    let output = harness.run(&[
+        "display-message",
+        "-p",
+        "-t",
+        target,
+        "#{pane_dead}|#{pane_pid}|#{pane_dead_status}|#{pane_dead_time}|#{remain-on-exit}",
+    ])?;
+    assert_eq!(output.status.code(), Some(0), "{}", stderr(&output));
+    assert!(stderr(&output).is_empty());
+    assert_eq!(stdout(&output).trim(), "0|0|||off");
+    let local = harness.run(&["show-options", "-p", "-v", "-t", target, "remain-on-exit"])?;
+    assert_success(&local);
+    assert!(stdout(&local).trim().is_empty());
+    Ok(())
+}
+
+#[test]
+fn startup_split_window_stdin_creates_live_processless_pane() -> Result<(), Box<dyn Error>> {
+    let harness = CliHarness::new("startup-split-empty")?;
+    let _cleanup = harness.auto_start_cleanup()?;
+    let source = harness.tmpdir().join("startup-split.conf");
+    fs::write(
+        &source,
+        "new-session -d -x 80 -y 24 -s startup\nsplit-window -dI -t startup:0.0\n",
+    )?;
+    let output = harness.run(&[
+        "-f",
+        source.to_str().unwrap(),
+        "new-session",
+        "-d",
+        "-s",
+        "trigger",
+    ])?;
+    assert_success(&output);
+    assert_empty_split(&harness, "startup:0.1")?;
+    assert_success(&harness.run(&["kill-server"])?);
     Ok(())
 }
 
@@ -431,8 +473,8 @@ fn pipe_pane_stdin_flag_writes_command_output_to_pane() -> Result<(), Box<dyn Er
 }
 
 #[test]
-fn send_keys_format_flag_sends_literal_format_text() -> Result<(), Box<dyn Error>> {
-    let harness = CliHarness::new("send-keys-format-literal")?;
+fn send_keys_format_flag_expands_target_context() -> Result<(), Box<dyn Error>> {
+    let harness = CliHarness::new("send-keys-format-expansion")?;
     let mut daemon = harness.start_hidden_daemon()?;
 
     assert_success(&harness.run(&[
@@ -446,6 +488,16 @@ fn send_keys_format_flag_sends_literal_format_text() -> Result<(), Box<dyn Error
         "alpha",
         "cat",
     ])?);
+    let context = harness.run(&[
+        "display-message",
+        "-p",
+        "-t",
+        "alpha:0.0",
+        "#{session_name}",
+    ])?;
+    assert_eq!(context.status.code(), Some(0));
+    assert!(stderr(&context).is_empty());
+    assert_eq!(stdout(&context), "alpha\n");
     assert_success(&harness.run(&[
         "send-keys",
         "-t",
@@ -458,16 +510,13 @@ fn send_keys_format_flag_sends_literal_format_text() -> Result<(), Box<dyn Error
 
     let capture = harness.run(&["capture-pane", "-p", "-t", "alpha:0.0"])?;
     assert_eq!(capture.status.code(), Some(0));
+    // Measured tmux 3.7b leaves ordinary -F literal in the verified target context.
     assert!(
         stdout(&capture).contains("\n#{session_name}\n"),
-        "send-keys -F should send format text literally: {:?}",
+        "{:?}",
         stdout(&capture)
     );
-    assert!(
-        !stdout(&capture).contains("\nalpha\n"),
-        "send-keys -F should not expand the session_name format: {:?}",
-        stdout(&capture)
-    );
+    assert!(!stdout(&capture).contains("\nalpha\n"));
     assert!(stderr(&capture).is_empty());
 
     terminate_child(daemon.child_mut())?;
@@ -492,7 +541,77 @@ fn send_keys_rejects_zero_repeat_count() -> Result<(), Box<dyn Error>> {
 }
 
 #[test]
-fn last_pane_input_flags_apply_to_the_selected_last_pane() -> Result<(), Box<dyn Error>> {
+fn last_pane_input_flags_toggle_the_last_pane_without_selecting_it() -> Result<(), Box<dyn Error>> {
+    // tmux 3.7b (cmd-select-pane.c): last-pane and select-pane -l with -d or
+    // -e change the last pane's input and leave the active pane in place.
+    let harness = CliHarness::new("last-pane-input-no-select")?;
+    let mut daemon = harness.start_hidden_daemon()?;
+    let panes = |harness: &CliHarness| -> Result<String, Box<dyn Error>> {
+        let output = harness.run(&[
+            "list-panes",
+            "-t",
+            "s:0",
+            "-F",
+            "#{pane_index}:#{pane_active}:#{pane_input_off}",
+        ])?;
+        assert_eq!(output.status.code(), Some(0), "{}", stderr(&output));
+        Ok(stdout(&output))
+    };
+
+    assert_success(&harness.run(&["new-session", "-d", "-x", "80", "-y", "24", "-s", "s"])?);
+    assert_success(&harness.run(&["split-window", "-d", "-t", "s:0"])?);
+    assert_success(&harness.run(&["select-pane", "-t", "s:0.1"])?);
+
+    for (command, before, after) in [
+        (&["last-pane", "-d", "-t", "s:0"][..], "0:0:0\n", "0:0:1\n"),
+        (&["last-pane", "-e", "-t", "s:0"][..], "0:0:1\n", "0:0:0\n"),
+        (
+            &["select-pane", "-l", "-d", "-t", "s:0.1"][..],
+            "0:0:0\n",
+            "0:0:1\n",
+        ),
+        (
+            &["select-pane", "-l", "-e", "-t", "s:0.1"][..],
+            "0:0:1\n",
+            "0:0:0\n",
+        ),
+    ] {
+        assert_eq!(
+            panes(&harness)?,
+            format!("{before}1:1:0\n"),
+            "before {command:?}"
+        );
+        assert_success(&harness.run(command)?);
+        assert_eq!(
+            panes(&harness)?,
+            format!("{after}1:1:0\n"),
+            "{command:?} must toggle pane 0 and keep pane 1 active"
+        );
+    }
+
+    // -e wins over -d in either order, for the last pane and a named pane.
+    for command in [
+        &["select-pane", "-l", "-e", "-d", "-t", "s:0.1"][..],
+        &["select-pane", "-d", "-e", "-t", "s:0.0"],
+    ] {
+        assert_success(&harness.run(&["select-pane", "-d", "-t", "s:0.0"])?);
+        assert_success(&harness.run(command)?);
+        assert_eq!(panes(&harness)?, "0:0:0\n1:1:0\n", "{command:?}");
+    }
+
+    assert_success(&harness.run(&["last-pane", "-t", "s:0"])?);
+    assert_eq!(
+        panes(&harness)?,
+        "0:1:0\n1:0:0\n",
+        "plain last-pane selects"
+    );
+
+    terminate_child(daemon.child_mut())?;
+    Ok(())
+}
+
+#[test]
+fn last_pane_input_flags_apply_to_the_last_pane() -> Result<(), Box<dyn Error>> {
     let harness = CliHarness::new("last-pane-input-flags")?;
     let mut daemon = harness.start_hidden_daemon()?;
 
@@ -518,7 +637,7 @@ fn last_pane_input_flags_apply_to_the_selected_last_pane() -> Result<(), Box<dyn
     assert_eq!(disabled_capture.status.code(), Some(0));
     assert!(
         !stdout(&disabled_capture).contains("blocked"),
-        "last-pane -d should disable input to the selected last pane: {:?}",
+        "last-pane -d should disable input to the last pane: {:?}",
         stdout(&disabled_capture)
     );
 
@@ -531,7 +650,7 @@ fn last_pane_input_flags_apply_to_the_selected_last_pane() -> Result<(), Box<dyn
     assert_eq!(enabled_capture.status.code(), Some(0));
     assert!(
         stdout(&enabled_capture).contains("allowed"),
-        "last-pane -e should re-enable input to the selected last pane: {:?}",
+        "last-pane -e should re-enable input to the last pane: {:?}",
         stdout(&enabled_capture)
     );
     assert!(stderr(&enabled_capture).is_empty());
@@ -1177,9 +1296,14 @@ fn same_window_join_and_move_pane_size_matches_tmux_target_side() -> Result<(), 
             "#{pane_index}:#{pane_width}x#{pane_height}:#{pane_active}",
         ])?;
         assert_eq!(before_panes.status.code(), Some(0), "{command} -b");
+        // `-b` picks the side of the split, not the pane list index: tmux
+        // reinserts the moved pane right after its destination either way, so
+        // the destination keeps index 0 with the remaining 18 rows and the
+        // moved pane takes index 1 with the requested 5. Receipt:
+        // `fmt1/oracle-linux/size-absolute-before`.
         assert_eq!(
             stdout(&before_panes),
-            "0:100x5:1\n1:100x18:0\n",
+            "0:100x18:0\n1:100x5:1\n",
             "{command} -b"
         );
         assert!(stderr(&before_panes).is_empty(), "{command} -b");

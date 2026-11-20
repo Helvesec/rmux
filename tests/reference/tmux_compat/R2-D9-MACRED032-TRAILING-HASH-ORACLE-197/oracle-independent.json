@@ -1,0 +1,555 @@
+{
+  "started": "2026-10-15T21:59:54.245707+00:00",
+  "oracle": "$HOME/.local/tmux-3.7b/bin/tmux",
+  "oracle_sha256": "eb05f981dfc0ed55f29b7dc8e13ed838827ebca2764a9fc559ae817d9cf1acd0",
+  "host": "Darwin",
+  "target_head": "6dd1c1e6d29a3b3a4cf06188a1f543b8159f713d",
+  "isolated_socket_label": "r2-d9-197-52e614be76",
+  "env_removed": [
+    "TMUX",
+    "TMUX_PANE"
+  ],
+  "rows": [
+    {
+      "at": "2026-10-15T21:59:54.285883+00:00",
+      "argv": [
+        "$HOME/.local/tmux-3.7b/bin/tmux",
+        "-L",
+        "r2-d9-197-52e614be76",
+        "-f",
+        "/dev/null",
+        "-V"
+      ],
+      "code": 0,
+      "stdout_utf8": "tmux 3.7b\n",
+      "stdout_hex": "746d757820332e37620a",
+      "stderr_utf8": "",
+      "stderr_hex": "",
+      "free_GiB": 81.86996078491211
+    },
+    {
+      "at": "2026-10-15T21:59:54.303207+00:00",
+      "argv": [
+        "$HOME/.local/tmux-3.7b/bin/tmux",
+        "-L",
+        "r2-d9-197-52e614be76",
+        "-f",
+        "/dev/null",
+        "new-session",
+        "-d",
+        "-s",
+        "alpha"
+      ],
+      "code": 0,
+      "stdout_utf8": "",
+      "stdout_hex": "",
+      "stderr_utf8": "",
+      "stderr_hex": "",
+      "free_GiB": 81.86995697021484
+    },
+    {
+      "at": "2026-10-15T21:59:54.308181+00:00",
+      "argv": [
+        "$HOME/.local/tmux-3.7b/bin/tmux",
+        "-L",
+        "r2-d9-197-52e614be76",
+        "-f",
+        "/dev/null",
+        "display-message",
+        "-p",
+        "-t",
+        "alpha:0.0",
+        "#{session_name}|#{window_index}|#{pane_index}|#{pane_id}"
+      ],
+      "code": 0,
+      "stdout_utf8": "alpha|0|0|%0\n",
+      "stdout_hex": "616c7068617c307c307c25300a",
+      "stderr_utf8": "",
+      "stderr_hex": "",
+      "free_GiB": 81.86994934082031
+    },
+    {
+      "at": "2026-10-15T21:59:54.312491+00:00",
+      "argv": [
+        "$HOME/.local/tmux-3.7b/bin/tmux",
+        "-L",
+        "r2-d9-197-52e614be76",
+        "-f",
+        "/dev/null",
+        "display-message",
+        "-p",
+        "-t",
+        "alpha:0.0",
+        "#"
+      ],
+      "code": 0,
+      "stdout_utf8": "\n",
+      "stdout_hex": "0a",
+      "stderr_utf8": "",
+      "stderr_hex": "",
+      "free_GiB": 81.86994934082031
+    },
+    {
+      "at": "2026-10-15T21:59:54.317932+00:00",
+      "argv": [
+        "$HOME/.local/tmux-3.7b/bin/tmux",
+        "-L",
+        "r2-d9-197-52e614be76",
+        "-f",
+        "/dev/null",
+        "list-panes",
+        "-t",
+        "alpha:0.0",
+        "-F",
+        "#"
+      ],
+      "code": 0,
+      "stdout_utf8": "\n",
+      "stdout_hex": "0a",
+      "stderr_utf8": "",
+      "stderr_hex": "",
+      "free_GiB": 81.86995697021484
+    },
+    {
+      "at": "2026-10-15T21:59:54.322030+00:00",
+      "argv": [
+        "$HOME/.local/tmux-3.7b/bin/tmux",
+        "-L",
+        "r2-d9-197-52e614be76",
+        "-f",
+        "/dev/null",
+        "display-message",
+        "-p",
+        "-t",
+        "alpha:0.0",
+        "a#"
+      ],
+      "code": 0,
+      "stdout_utf8": "a\n",
+      "stdout_hex": "610a",
+      "stderr_utf8": "",
+      "stderr_hex": "",
+      "free_GiB": 81.86995697021484
+    },
+    {
+      "at": "2026-10-15T21:59:54.326416+00:00",
+      "argv": [
+        "$HOME/.local/tmux-3.7b/bin/tmux",
+        "-L",
+        "r2-d9-197-52e614be76",
+        "-f",
+        "/dev/null",
+        "list-panes",
+        "-t",
+        "alpha:0.0",
+        "-F",
+        "a#"
+      ],
+      "code": 0,
+      "stdout_utf8": "a\n",
+      "stdout_hex": "610a",
+      "stderr_utf8": "",
+      "stderr_hex": "",
+      "free_GiB": 81.86995697021484
+    },
+    {
+      "at": "2026-10-15T21:59:54.330661+00:00",
+      "argv": [
+        "$HOME/.local/tmux-3.7b/bin/tmux",
+        "-L",
+        "r2-d9-197-52e614be76",
+        "-f",
+        "/dev/null",
+        "display-message",
+        "-p",
+        "-t",
+        "alpha:0.0",
+        "#{pane_id}#"
+      ],
+      "code": 0,
+      "stdout_utf8": "%0\n",
+      "stdout_hex": "25300a",
+      "stderr_utf8": "",
+      "stderr_hex": "",
+      "free_GiB": 81.86995697021484
+    },
+    {
+      "at": "2026-10-15T21:59:54.335246+00:00",
+      "argv": [
+        "$HOME/.local/tmux-3.7b/bin/tmux",
+        "-L",
+        "r2-d9-197-52e614be76",
+        "-f",
+        "/dev/null",
+        "list-panes",
+        "-t",
+        "alpha:0.0",
+        "-F",
+        "#{pane_id}#"
+      ],
+      "code": 0,
+      "stdout_utf8": "%0\n",
+      "stdout_hex": "25300a",
+      "stderr_utf8": "",
+      "stderr_hex": "",
+      "free_GiB": 81.86995315551758
+    },
+    {
+      "at": "2026-10-15T21:59:54.339775+00:00",
+      "argv": [
+        "$HOME/.local/tmux-3.7b/bin/tmux",
+        "-L",
+        "r2-d9-197-52e614be76",
+        "-f",
+        "/dev/null",
+        "display-message",
+        "-p",
+        "-t",
+        "alpha:0.0",
+        "##"
+      ],
+      "code": 0,
+      "stdout_utf8": "#\n",
+      "stdout_hex": "230a",
+      "stderr_utf8": "",
+      "stderr_hex": "",
+      "free_GiB": 81.86995315551758
+    },
+    {
+      "at": "2026-10-15T21:59:54.344403+00:00",
+      "argv": [
+        "$HOME/.local/tmux-3.7b/bin/tmux",
+        "-L",
+        "r2-d9-197-52e614be76",
+        "-f",
+        "/dev/null",
+        "list-panes",
+        "-t",
+        "alpha:0.0",
+        "-F",
+        "##"
+      ],
+      "code": 0,
+      "stdout_utf8": "#\n",
+      "stdout_hex": "230a",
+      "stderr_utf8": "",
+      "stderr_hex": "",
+      "free_GiB": 81.86995315551758
+    },
+    {
+      "at": "2026-10-15T21:59:54.349504+00:00",
+      "argv": [
+        "$HOME/.local/tmux-3.7b/bin/tmux",
+        "-L",
+        "r2-d9-197-52e614be76",
+        "-f",
+        "/dev/null",
+        "display-message",
+        "-p",
+        "-t",
+        "alpha:0.0",
+        "###"
+      ],
+      "code": 0,
+      "stdout_utf8": "#\n",
+      "stdout_hex": "230a",
+      "stderr_utf8": "",
+      "stderr_hex": "",
+      "free_GiB": 81.86995697021484
+    },
+    {
+      "at": "2026-10-15T21:59:54.354115+00:00",
+      "argv": [
+        "$HOME/.local/tmux-3.7b/bin/tmux",
+        "-L",
+        "r2-d9-197-52e614be76",
+        "-f",
+        "/dev/null",
+        "list-panes",
+        "-t",
+        "alpha:0.0",
+        "-F",
+        "###"
+      ],
+      "code": 0,
+      "stdout_utf8": "#\n",
+      "stdout_hex": "230a",
+      "stderr_utf8": "",
+      "stderr_hex": "",
+      "free_GiB": 81.86995315551758
+    },
+    {
+      "at": "2026-10-15T21:59:54.358672+00:00",
+      "argv": [
+        "$HOME/.local/tmux-3.7b/bin/tmux",
+        "-L",
+        "r2-d9-197-52e614be76",
+        "-f",
+        "/dev/null",
+        "display-message",
+        "-p",
+        "-t",
+        "alpha:0.0",
+        "#####"
+      ],
+      "code": 0,
+      "stdout_utf8": "##\n",
+      "stdout_hex": "23230a",
+      "stderr_utf8": "",
+      "stderr_hex": "",
+      "free_GiB": 81.86994934082031
+    },
+    {
+      "at": "2026-10-15T21:59:54.363046+00:00",
+      "argv": [
+        "$HOME/.local/tmux-3.7b/bin/tmux",
+        "-L",
+        "r2-d9-197-52e614be76",
+        "-f",
+        "/dev/null",
+        "list-panes",
+        "-t",
+        "alpha:0.0",
+        "-F",
+        "#####"
+      ],
+      "code": 0,
+      "stdout_utf8": "##\n",
+      "stdout_hex": "23230a",
+      "stderr_utf8": "",
+      "stderr_hex": "",
+      "free_GiB": 81.86994552612305
+    },
+    {
+      "at": "2026-10-15T21:59:54.367734+00:00",
+      "argv": [
+        "$HOME/.local/tmux-3.7b/bin/tmux",
+        "-L",
+        "r2-d9-197-52e614be76",
+        "-f",
+        "/dev/null",
+        "display-message",
+        "-p",
+        "-t",
+        "alpha:0.0",
+        "#{"
+      ],
+      "code": 0,
+      "stdout_utf8": "\n",
+      "stdout_hex": "0a",
+      "stderr_utf8": "",
+      "stderr_hex": "",
+      "free_GiB": 81.86995697021484
+    },
+    {
+      "at": "2026-10-15T21:59:54.372310+00:00",
+      "argv": [
+        "$HOME/.local/tmux-3.7b/bin/tmux",
+        "-L",
+        "r2-d9-197-52e614be76",
+        "-f",
+        "/dev/null",
+        "list-panes",
+        "-t",
+        "alpha:0.0",
+        "-F",
+        "#{"
+      ],
+      "code": 0,
+      "stdout_utf8": "\n",
+      "stdout_hex": "0a",
+      "stderr_utf8": "",
+      "stderr_hex": "",
+      "free_GiB": 81.86995697021484
+    },
+    {
+      "at": "2026-10-15T21:59:54.376840+00:00",
+      "argv": [
+        "$HOME/.local/tmux-3.7b/bin/tmux",
+        "-L",
+        "r2-d9-197-52e614be76",
+        "-f",
+        "/dev/null",
+        "display-message",
+        "-p",
+        "-t",
+        "alpha:0.0",
+        "pre#{x"
+      ],
+      "code": 0,
+      "stdout_utf8": "pre\n",
+      "stdout_hex": "7072650a",
+      "stderr_utf8": "",
+      "stderr_hex": "",
+      "free_GiB": 81.86995315551758
+    },
+    {
+      "at": "2026-10-15T21:59:54.381082+00:00",
+      "argv": [
+        "$HOME/.local/tmux-3.7b/bin/tmux",
+        "-L",
+        "r2-d9-197-52e614be76",
+        "-f",
+        "/dev/null",
+        "list-panes",
+        "-t",
+        "alpha:0.0",
+        "-F",
+        "pre#{x"
+      ],
+      "code": 0,
+      "stdout_utf8": "pre\n",
+      "stdout_hex": "7072650a",
+      "stderr_utf8": "",
+      "stderr_hex": "",
+      "free_GiB": 81.86995315551758
+    },
+    {
+      "at": "2026-10-15T21:59:54.385431+00:00",
+      "argv": [
+        "$HOME/.local/tmux-3.7b/bin/tmux",
+        "-L",
+        "r2-d9-197-52e614be76",
+        "-f",
+        "/dev/null",
+        "display-message",
+        "-p",
+        "-t",
+        "alpha:0.0",
+        "pre#{?foo,yes}tail"
+      ],
+      "code": 0,
+      "stdout_utf8": "pretail\n",
+      "stdout_hex": "7072657461696c0a",
+      "stderr_utf8": "",
+      "stderr_hex": "",
+      "free_GiB": 81.86994934082031
+    },
+    {
+      "at": "2026-10-15T21:59:54.389471+00:00",
+      "argv": [
+        "$HOME/.local/tmux-3.7b/bin/tmux",
+        "-L",
+        "r2-d9-197-52e614be76",
+        "-f",
+        "/dev/null",
+        "list-panes",
+        "-t",
+        "alpha:0.0",
+        "-F",
+        "pre#{?foo,yes}tail"
+      ],
+      "code": 0,
+      "stdout_utf8": "pretail\n",
+      "stdout_hex": "7072657461696c0a",
+      "stderr_utf8": "",
+      "stderr_hex": "",
+      "free_GiB": 81.86994934082031
+    },
+    {
+      "at": "2026-10-15T21:59:54.393459+00:00",
+      "argv": [
+        "$HOME/.local/tmux-3.7b/bin/tmux",
+        "-L",
+        "r2-d9-197-52e614be76",
+        "-f",
+        "/dev/null",
+        "display-message",
+        "-p",
+        "-t",
+        "alpha:0.0",
+        "#{l:#}"
+      ],
+      "code": 0,
+      "stdout_utf8": "\n",
+      "stdout_hex": "0a",
+      "stderr_utf8": "",
+      "stderr_hex": "",
+      "free_GiB": 81.86994934082031
+    },
+    {
+      "at": "2026-10-15T21:59:54.402011+00:00",
+      "argv": [
+        "$HOME/.local/tmux-3.7b/bin/tmux",
+        "-L",
+        "r2-d9-197-52e614be76",
+        "-f",
+        "/dev/null",
+        "list-panes",
+        "-t",
+        "alpha:0.0",
+        "-F",
+        "#{l:#}"
+      ],
+      "code": 0,
+      "stdout_utf8": "\n",
+      "stdout_hex": "0a",
+      "stderr_utf8": "",
+      "stderr_hex": "",
+      "free_GiB": 81.86994934082031
+    },
+    {
+      "at": "2026-10-15T21:59:54.409331+00:00",
+      "argv": [
+        "$HOME/.local/tmux-3.7b/bin/tmux",
+        "-L",
+        "r2-d9-197-52e614be76",
+        "-f",
+        "/dev/null",
+        "display-message",
+        "-p",
+        "-t",
+        "alpha:0.0",
+        "#{l:##}"
+      ],
+      "code": 0,
+      "stdout_utf8": "#\n",
+      "stdout_hex": "230a",
+      "stderr_utf8": "",
+      "stderr_hex": "",
+      "free_GiB": 81.86995315551758
+    },
+    {
+      "at": "2026-10-15T21:59:54.434642+00:00",
+      "argv": [
+        "$HOME/.local/tmux-3.7b/bin/tmux",
+        "-L",
+        "r2-d9-197-52e614be76",
+        "-f",
+        "/dev/null",
+        "list-panes",
+        "-t",
+        "alpha:0.0",
+        "-F",
+        "#{l:##}"
+      ],
+      "code": 0,
+      "stdout_utf8": "#\n",
+      "stdout_hex": "230a",
+      "stderr_utf8": "",
+      "stderr_hex": "",
+      "free_GiB": 81.87000274658203
+    },
+    {
+      "at": "2026-10-15T21:59:54.456952+00:00",
+      "argv": [
+        "$HOME/.local/tmux-3.7b/bin/tmux",
+        "-L",
+        "r2-d9-197-52e614be76",
+        "-f",
+        "/dev/null",
+        "kill-server"
+      ],
+      "code": 0,
+      "stdout_utf8": "",
+      "stdout_hex": "",
+      "stderr_utf8": "",
+      "stderr_hex": "",
+      "free_GiB": 81.86999893188477
+    }
+  ],
+  "disk_free_GiB_before": 81.86996459960938,
+  "finished": "2026-10-15T21:59:54.458141+00:00",
+  "oracle_sha256_after": "eb05f981dfc0ed55f29b7dc8e13ed838827ebca2764a9fc559ae817d9cf1acd0",
+  "disk_free_GiB_after": 81.86999893188477
+}

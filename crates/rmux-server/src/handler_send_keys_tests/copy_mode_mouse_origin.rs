@@ -8,20 +8,14 @@ async fn replace_contents(handler: &RequestHandler, target: &PaneTarget) {
         let state = handler.state.lock().await;
         state.transcript_handle(target).expect("session transcript")
     };
-    let history_limit = transcript
-        .lock()
-        .expect("pane transcript mutex")
-        .history_limit();
+    let history_limit = transcript.lock().history_limit();
     let mut screen = Screen::new(SIZE, history_limit);
     let mut parser = InputParser::new();
     parser.parse(
         b"zero one two three\r\nalpha beta gamma\r\nomega sigma tau\r\n",
         &mut screen,
     );
-    transcript
-        .lock()
-        .expect("pane transcript mutex")
-        .set_screen_for_test(screen);
+    transcript.lock().set_screen_for_test(screen);
 }
 
 async fn fixture(
@@ -137,6 +131,7 @@ async fn install_cached_mouse_event(
         .get_mut(&requester_pid)
         .expect("attached client exists");
     active.mouse.current_event = Some(AttachedMouseEvent {
+        coordinates: None,
         raw: MouseForwardEvent {
             b: 0,
             lb: 0,
@@ -164,20 +159,14 @@ async fn install_scrollback(handler: &RequestHandler, target: &PaneTarget) {
         let state = handler.state.lock().await;
         state.transcript_handle(target).expect("session transcript")
     };
-    let history_limit = transcript
-        .lock()
-        .expect("pane transcript mutex")
-        .history_limit();
+    let history_limit = transcript.lock().history_limit();
     let mut screen = Screen::new(SIZE, history_limit);
     let mut parser = InputParser::new();
     let contents = (0..80)
         .map(|line| format!("line {line:02}\r\n"))
         .collect::<String>();
     parser.parse(contents.as_bytes(), &mut screen);
-    transcript
-        .lock()
-        .expect("pane transcript mutex")
-        .set_screen_for_test(screen);
+    transcript.lock().set_screen_for_test(screen);
     assert!(matches!(
         handler
             .handle(Request::CopyMode(CopyModeRequest {

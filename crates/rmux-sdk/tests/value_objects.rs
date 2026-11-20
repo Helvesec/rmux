@@ -72,28 +72,66 @@ fn process_subscription_reuse_and_terminal_specs_round_trip() {
 #[test]
 fn structured_targets_round_trip_through_proto_without_parsing() {
     let window = round_trip(WindowRef::new(session_name("alpha"), 2));
-    let window_target = rmux_proto::WindowTarget::from(window.clone());
-    assert_eq!(WindowRef::from(window_target), window);
+    let window_target =
+        rmux_proto::WindowTarget::with_window(window.session_name.clone(), window.window_index);
+    assert_eq!(
+        WindowRef::new(
+            window_target.session_name().clone(),
+            window_target.window_index()
+        ),
+        window
+    );
 
     let pane = round_trip(PaneRef::new(session_name("alpha"), 2, 3));
-    let pane_target = rmux_proto::PaneTarget::from(pane.clone());
-    assert_eq!(PaneRef::from(pane_target), pane);
+    let pane_target = rmux_proto::PaneTarget::with_window(
+        pane.session_name.clone(),
+        pane.window_index,
+        pane.pane_index,
+    );
+    assert_eq!(
+        PaneRef::new(
+            pane_target.session_name().clone(),
+            pane_target.window_index(),
+            pane_target.pane_index()
+        ),
+        pane
+    );
 
     let target = round_trip(TargetRef::Pane(PaneRef::new(session_name("alpha"), 4, 5)));
-    let proto_target = rmux_proto::Target::from(target.clone());
-    assert_eq!(TargetRef::from(proto_target), target);
+    let proto_target = rmux_proto::Target::Pane(rmux_proto::PaneTarget::with_window(
+        session_name("alpha"),
+        4,
+        5,
+    ));
+    assert_eq!(
+        bincode::serialize(&proto_target).unwrap(),
+        bincode::serialize(&target).unwrap()
+    );
+    assert_eq!(
+        serde_json::to_value(&proto_target).unwrap(),
+        serde_json::to_value(&target).unwrap()
+    );
 
     let split_target = round_trip(SplitTargetSpec::Pane(PaneRef::new(
         session_name("alpha"),
         6,
         7,
     )));
-    let proto_split_target = rmux_proto::SplitWindowTarget::from(split_target.clone());
-    assert_eq!(SplitTargetSpec::from(proto_split_target), split_target);
+    let proto_split_target = rmux_proto::SplitWindowTarget::Pane(
+        rmux_proto::PaneTarget::with_window(session_name("alpha"), 6, 7),
+    );
+    assert_eq!(
+        bincode::serialize(&proto_split_target).unwrap(),
+        bincode::serialize(&split_target).unwrap()
+    );
+    assert_eq!(
+        serde_json::to_value(&proto_split_target).unwrap(),
+        serde_json::to_value(&split_target).unwrap()
+    );
 }
 
 #[test]
-fn new_session_spec_round_trip_and_maps_reuse_flags() {
+fn new_session_spec_round_trip_preserves_reuse_flags() {
     let spec = round_trip(NewSessionSpec {
         session_name: Some(session_name("alpha")),
         working_directory: Some("#{pane_current_path}".to_owned()),
@@ -117,34 +155,34 @@ fn new_session_spec_round_trip_and_maps_reuse_flags() {
         print_format: Some("#{session_name}".to_owned()),
     });
 
-    let request = rmux_proto::NewSessionExtRequest::from(spec);
-    assert_eq!(request.session_name, Some(session_name("alpha")));
+    let value = spec;
+    assert_eq!(value.session_name, Some(session_name("alpha")));
     assert_eq!(
-        request.working_directory.as_deref(),
+        value.working_directory.as_deref(),
         Some("#{pane_current_path}")
     );
-    assert!(request.detached);
+    assert!(value.detached);
     assert_eq!(
-        request.size,
-        Some(rmux_proto::TerminalSize {
+        value.size,
+        Some(TerminalSizeSpec {
             cols: 100,
             rows: 30
         })
     );
     assert_eq!(
-        request.environment,
+        value.process.environment,
         Some(vec!["TERM=xterm-256color".to_owned()])
     );
-    assert_eq!(request.group_target, Some(session_name("group")));
-    assert!(request.attach_if_exists);
-    assert!(request.detach_other_clients);
-    assert!(!request.kill_other_clients);
-    assert_eq!(request.flags, Some(vec!["active-pane".to_owned()]));
-    assert_eq!(request.command, Some(vec!["top".to_owned()]));
+    assert_eq!(value.group_target, Some(session_name("group")));
+    assert!(value.reuse.attach_if_exists);
+    assert!(value.reuse.detach_other_clients);
+    assert!(!value.reuse.kill_other_clients);
+    assert_eq!(value.reuse.flags, Some(vec!["active-pane".to_owned()]));
+    assert_eq!(value.process.command, Some(vec!["top".to_owned()]));
 }
 
 #[test]
-fn attach_session_spec_round_trip_and_maps_reuse_flags() {
+fn attach_session_spec_round_trip_preserves_reuse_flags() {
     let spec = round_trip(AttachSessionSpec {
         target: Some(session_name("alpha")),
         target_spec: Some("alpha:1.2".to_owned()),
@@ -163,23 +201,23 @@ fn attach_session_spec_round_trip_and_maps_reuse_flags() {
         client_size: Some(TerminalSizeSpec::new(120, 40)),
     });
 
-    let request = rmux_proto::AttachSessionExt2Request::from(spec);
-    assert_eq!(request.target, Some(session_name("alpha")));
-    assert_eq!(request.target_spec.as_deref(), Some("alpha:1.2"));
-    assert!(request.detach_other_clients);
-    assert!(request.kill_other_clients);
-    assert!(request.read_only);
-    assert!(request.skip_environment_update);
-    assert_eq!(request.flags, Some(vec!["read-only".to_owned()]));
-    assert_eq!(request.working_directory.as_deref(), Some("/work"));
+    let value = spec;
+    assert_eq!(value.target, Some(session_name("alpha")));
+    assert_eq!(value.target_spec.as_deref(), Some("alpha:1.2"));
+    assert!(value.reuse.detach_other_clients);
+    assert!(value.reuse.kill_other_clients);
+    assert!(value.reuse.read_only);
+    assert!(value.reuse.skip_environment_update);
+    assert_eq!(value.reuse.flags, Some(vec!["read-only".to_owned()]));
+    assert_eq!(value.working_directory.as_deref(), Some("/work"));
     assert_eq!(
-        request.client_terminal.terminal_features,
+        value.client_terminal.terminal_features,
         vec!["RGB".to_owned()]
     );
-    assert!(request.client_terminal.utf8);
+    assert!(value.client_terminal.utf8);
     assert_eq!(
-        request.client_size,
-        Some(rmux_proto::TerminalSize {
+        value.client_size,
+        Some(TerminalSizeSpec {
             cols: 120,
             rows: 40
         })
@@ -187,7 +225,7 @@ fn attach_session_spec_round_trip_and_maps_reuse_flags() {
 }
 
 #[test]
-fn refresh_client_spec_round_trip_and_maps_subscriptions() {
+fn refresh_client_spec_round_trip_preserves_subscriptions() {
     let spec = round_trip(RefreshClientSpec {
         target_client: Some("client-1".to_owned()),
         adjustment: Some(5),
@@ -208,23 +246,26 @@ fn refresh_client_spec_round_trip_and_maps_subscriptions() {
         colour_report: Some("fg".to_owned()),
     });
 
-    let request = rmux_proto::RefreshClientRequest::from(spec);
-    assert_eq!(request.target_client.as_deref(), Some("client-1"));
-    assert_eq!(request.adjustment, Some(5));
-    assert!(request.clear_pan);
-    assert!(!request.pan_left);
-    assert!(request.pan_right);
-    assert_eq!(request.subscriptions, vec!["pane-output:%1".to_owned()]);
+    let value = spec;
+    assert_eq!(value.target_client.as_deref(), Some("client-1"));
+    assert_eq!(value.adjustment, Some(5));
+    assert!(value.clear_pan);
+    assert!(!value.pan_left);
+    assert!(value.pan_right);
     assert_eq!(
-        request.subscriptions_format,
+        value.subscriptions.subscriptions,
+        vec!["pane-output:%1".to_owned()]
+    );
+    assert_eq!(
+        value.subscriptions.subscriptions_format,
         vec!["client:#{client_name}".to_owned()]
     );
-    assert_eq!(request.control_size.as_deref(), Some("80x24"));
-    assert_eq!(request.colour_report.as_deref(), Some("fg"));
+    assert_eq!(value.control_size.as_deref(), Some("80x24"));
+    assert_eq!(value.colour_report.as_deref(), Some("fg"));
 }
 
 #[test]
-fn split_spec_round_trip_and_maps_direction_and_target() {
+fn split_spec_round_trip_preserves_direction_and_target() {
     let spec = round_trip(SplitSpec {
         target: SplitTargetSpec::Pane(PaneRef::new(session_name("alpha"), 2, 3)),
         direction: SplitDirectionSpec::Horizontal,
@@ -236,74 +277,70 @@ fn split_spec_round_trip_and_maps_direction_and_target() {
         },
     });
 
-    let request = rmux_proto::SplitWindowExtRequest::from(spec);
-    assert_eq!(request.direction, rmux_proto::SplitDirection::Horizontal);
+    let value = spec;
+    assert_eq!(value.direction, SplitDirectionSpec::Horizontal);
     assert_eq!(
-        request.target,
-        rmux_proto::SplitWindowTarget::Pane(rmux_proto::PaneTarget::with_window(
-            session_name("alpha"),
-            2,
-            3,
-        ))
+        value.target,
+        SplitTargetSpec::Pane(PaneRef::new(session_name("alpha"), 2, 3,))
     );
-    assert_eq!(request.command, Some(vec!["htop".to_owned()]));
-    assert_eq!(request.environment, Some(vec!["A=B".to_owned()]));
+    assert_eq!(value.process.command, Some(vec!["htop".to_owned()]));
+    assert_eq!(value.process.environment, Some(vec!["A=B".to_owned()]));
 }
 
 #[test]
-fn sparse_serde_payloads_preserve_proto_defaults() {
+fn sparse_serde_payloads_preserve_sdk_defaults() {
     let new_session =
         serde_json::from_value::<NewSessionSpec>(json!({})).expect("sparse new-session DTO");
     assert_eq!(new_session, NewSessionSpec::default());
-    let request = rmux_proto::NewSessionExtRequest::from(new_session);
-    assert_eq!(request.session_name, None);
-    assert_eq!(request.working_directory, None);
-    assert!(!request.detached);
-    assert_eq!(request.size, None);
-    assert_eq!(request.environment, None);
-    assert_eq!(request.group_target, None);
-    assert!(!request.attach_if_exists);
-    assert!(!request.detach_other_clients);
-    assert!(!request.kill_other_clients);
-    assert_eq!(request.flags, None);
-    assert_eq!(request.command, None);
+    let value = round_trip(new_session);
+    assert_eq!(value.session_name, None);
+    assert_eq!(value.working_directory, None);
+    assert!(!value.detached);
+    assert_eq!(value.size, None);
+    assert_eq!(value.process.environment, None);
+    assert_eq!(value.group_target, None);
+    assert!(!value.reuse.attach_if_exists);
+    assert!(!value.reuse.detach_other_clients);
+    assert!(!value.reuse.kill_other_clients);
+    assert_eq!(value.reuse.flags, None);
+    assert_eq!(value.process.command, None);
 
     let attach = serde_json::from_value::<AttachSessionSpec>(json!({})).expect("sparse attach DTO");
     assert_eq!(attach, AttachSessionSpec::default());
-    let request = rmux_proto::AttachSessionExt2Request::from(attach);
-    assert_eq!(request.target, None);
-    assert_eq!(request.target_spec, None);
-    assert!(!request.detach_other_clients);
-    assert!(!request.kill_other_clients);
-    assert!(!request.read_only);
-    assert!(!request.skip_environment_update);
-    assert_eq!(request.flags, None);
-    assert_eq!(request.working_directory, None);
-    assert_eq!(
-        request.client_terminal,
-        rmux_proto::ClientTerminalContext::default()
-    );
-    assert_eq!(request.client_size, None);
+    let value = round_trip(attach);
+    assert_eq!(value.target, None);
+    assert_eq!(value.target_spec, None);
+    assert!(!value.reuse.detach_other_clients);
+    assert!(!value.reuse.kill_other_clients);
+    assert!(!value.reuse.read_only);
+    assert!(!value.reuse.skip_environment_update);
+    assert_eq!(value.reuse.flags, None);
+    assert_eq!(value.working_directory, None);
+    assert_eq!(value.client_terminal, ClientTerminalSpec::default());
+    assert_eq!(value.client_size, None);
 
     let refresh =
         serde_json::from_value::<RefreshClientSpec>(json!({})).expect("sparse refresh DTO");
     assert_eq!(refresh, RefreshClientSpec::default());
-    let request = rmux_proto::RefreshClientRequest::from(refresh);
-    assert_eq!(request.target_client, None);
-    assert_eq!(request.adjustment, None);
-    assert!(!request.clear_pan);
-    assert!(!request.pan_left);
-    assert!(!request.pan_right);
-    assert!(!request.pan_up);
-    assert!(!request.pan_down);
-    assert!(!request.status_only);
-    assert!(!request.clipboard_query);
-    assert_eq!(request.flags, None);
-    assert_eq!(request.flags_alias, None);
-    assert_eq!(request.subscriptions, Vec::<String>::new());
-    assert_eq!(request.subscriptions_format, Vec::<String>::new());
-    assert_eq!(request.control_size, None);
-    assert_eq!(request.colour_report, None);
+    let value = round_trip(refresh);
+    assert_eq!(value.target_client, None);
+    assert_eq!(value.adjustment, None);
+    assert!(!value.clear_pan);
+    assert!(!value.pan_left);
+    assert!(!value.pan_right);
+    assert!(!value.pan_up);
+    assert!(!value.pan_down);
+    assert!(!value.status_only);
+    assert!(!value.clipboard_query);
+    assert_eq!(value.flags, None);
+    assert_eq!(value.flags_alias, None);
+    assert_eq!(value.subscriptions.subscriptions, Vec::<String>::new());
+    assert_eq!(
+        value.subscriptions.subscriptions_format,
+        Vec::<String>::new()
+    );
+    assert_eq!(value.control_size, None);
+    assert_eq!(value.colour_report, None);
 
     let split = serde_json::from_value::<SplitSpec>(json!({
         "target": { "Session": "alpha" }
@@ -311,14 +348,14 @@ fn sparse_serde_payloads_preserve_proto_defaults() {
     .expect("sparse split DTO");
     assert_eq!(split.direction, SplitDirectionSpec::Vertical);
     assert_eq!(split.process, ProcessSpec::default());
-    let request = rmux_proto::SplitWindowExtRequest::from(split);
-    assert_eq!(request.direction, rmux_proto::SplitDirection::Vertical);
+    let value = round_trip(split);
+    assert_eq!(value.direction, SplitDirectionSpec::Vertical);
     assert_eq!(
-        request.target,
-        rmux_proto::SplitWindowTarget::Session(session_name("alpha"))
+        value.target,
+        SplitTargetSpec::Session(session_name("alpha"))
     );
-    assert_eq!(request.environment, None);
-    assert_eq!(request.command, None);
+    assert_eq!(value.process.environment, None);
+    assert_eq!(value.process.command, None);
 
     let command = serde_json::from_value::<RmuxCommand>(json!({
         "command": { "RefreshClient": {} }
@@ -326,28 +363,28 @@ fn sparse_serde_payloads_preserve_proto_defaults() {
     .expect("sparse command DTO");
     assert_eq!(command.endpoint, RmuxEndpoint::Default);
     assert!(matches!(
-        command.into_request(),
-        rmux_proto::Request::RefreshClient(request)
-            if request.target_client.is_none()
-                && request.adjustment.is_none()
-                && !request.clear_pan
-                && !request.pan_left
-                && !request.pan_right
-                && !request.pan_up
-                && !request.pan_down
-                && !request.status_only
-                && !request.clipboard_query
-                && request.flags.is_none()
-                && request.flags_alias.is_none()
-                && request.subscriptions.is_empty()
-                && request.subscriptions_format.is_empty()
-                && request.control_size.is_none()
-                && request.colour_report.is_none()
+        command.command,
+        RmuxCommandKind::RefreshClient(value)
+            if value.target_client.is_none()
+                && value.adjustment.is_none()
+                && !value.clear_pan
+                && !value.pan_left
+                && !value.pan_right
+                && !value.pan_up
+                && !value.pan_down
+                && !value.status_only
+                && !value.clipboard_query
+                && value.flags.is_none()
+                && value.flags_alias.is_none()
+                && value.subscriptions.subscriptions.is_empty()
+                && value.subscriptions.subscriptions_format.is_empty()
+                && value.control_size.is_none()
+                && value.colour_report.is_none()
     ));
 }
 
 #[test]
-fn explicit_empty_options_are_not_normalized_away_in_proto_mappings() {
+fn explicit_empty_options_are_not_normalized_away_in_sdk_values() {
     let new_session = NewSessionSpec {
         process: ProcessSpec {
             command: Some(Vec::new()),
@@ -360,10 +397,10 @@ fn explicit_empty_options_are_not_normalized_away_in_proto_mappings() {
         },
         ..NewSessionSpec::default()
     };
-    let request = rmux_proto::NewSessionExtRequest::from(new_session);
-    assert_eq!(request.environment, Some(Vec::<String>::new()));
-    assert_eq!(request.flags, Some(Vec::<String>::new()));
-    assert_eq!(request.command, Some(Vec::<String>::new()));
+    let value = round_trip(new_session);
+    assert_eq!(value.process.environment, Some(Vec::<String>::new()));
+    assert_eq!(value.reuse.flags, Some(Vec::<String>::new()));
+    assert_eq!(value.process.command, Some(Vec::<String>::new()));
 
     let attach = AttachSessionSpec {
         target_spec: Some(String::new()),
@@ -374,10 +411,10 @@ fn explicit_empty_options_are_not_normalized_away_in_proto_mappings() {
         working_directory: Some(String::new()),
         ..AttachSessionSpec::default()
     };
-    let request = rmux_proto::AttachSessionExt2Request::from(attach);
-    assert_eq!(request.target_spec, Some(String::new()));
-    assert_eq!(request.flags, Some(Vec::<String>::new()));
-    assert_eq!(request.working_directory, Some(String::new()));
+    let value = round_trip(attach);
+    assert_eq!(value.target_spec, Some(String::new()));
+    assert_eq!(value.reuse.flags, Some(Vec::<String>::new()));
+    assert_eq!(value.working_directory, Some(String::new()));
 
     let refresh = RefreshClientSpec {
         flags: Some(String::new()),
@@ -386,11 +423,11 @@ fn explicit_empty_options_are_not_normalized_away_in_proto_mappings() {
         colour_report: Some(String::new()),
         ..RefreshClientSpec::default()
     };
-    let request = rmux_proto::RefreshClientRequest::from(refresh);
-    assert_eq!(request.flags, Some(String::new()));
-    assert_eq!(request.flags_alias, Some(String::new()));
-    assert_eq!(request.control_size, Some(String::new()));
-    assert_eq!(request.colour_report, Some(String::new()));
+    let value = round_trip(refresh);
+    assert_eq!(value.flags, Some(String::new()));
+    assert_eq!(value.flags_alias, Some(String::new()));
+    assert_eq!(value.control_size, Some(String::new()));
+    assert_eq!(value.colour_report, Some(String::new()));
 
     let split = SplitSpec {
         target: SplitTargetSpec::Session(session_name("alpha")),
@@ -402,13 +439,13 @@ fn explicit_empty_options_are_not_normalized_away_in_proto_mappings() {
             environment: Some(Vec::new()),
         },
     };
-    let request = rmux_proto::SplitWindowExtRequest::from(split);
-    assert_eq!(request.environment, Some(Vec::<String>::new()));
-    assert_eq!(request.command, Some(Vec::<String>::new()));
+    let value = round_trip(split);
+    assert_eq!(value.process.environment, Some(Vec::<String>::new()));
+    assert_eq!(value.process.command, Some(Vec::<String>::new()));
 }
 
 #[test]
-fn command_value_object_round_trip_and_materializes_proto_request() {
+fn command_value_object_round_trip_preserves_payload() {
     let command = round_trip(RmuxCommand::with_endpoint(
         RmuxEndpoint::UnixSocket(PathBuf::from("/tmp/rmux.sock")),
         RmuxCommandKind::SplitWindow(SplitSpec {
@@ -421,22 +458,15 @@ fn command_value_object_round_trip_and_materializes_proto_request() {
 
     assert_eq!(command.command_name(), "split-window");
 
-    let request = command.into_request();
+    let value = command.command;
     assert!(matches!(
-        request,
-        rmux_proto::Request::SplitWindowExt(request)
-            if matches!(request.target, rmux_proto::SplitWindowTarget::Session(_))
-                && request.direction == rmux_proto::SplitDirection::Vertical
-                && !request.before
-                && request.environment.is_none()
-                && request.command.is_none()
-                && request.process_command.is_none()
-                && request.start_directory.is_none()
-                && request.keep_alive_on_exit.is_none()
-                && !request.detached
-                && request.size.is_none()
-                && !request.preserve_zoom
-                && !request.full_size
-                && request.stdin_payload.is_none()
+        value,
+        RmuxCommandKind::SplitWindow(value)
+            if matches!(value.target, SplitTargetSpec::Session(_))
+                && value.direction == SplitDirectionSpec::Vertical
+                && !value.before
+                && value.process.environment.is_none()
+                && value.process.command.is_none()
+                && value.process.process_command.is_none()
     ));
 }

@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-if [[ $# -ne 3 ]]; then
-  echo "usage: $0 <download-root> <source-sha> <gh-binary>" >&2
+if [[ $# -ne 3 && $# -ne 5 ]]; then
+  echo "usage: $0 <download-root> <source-sha> <gh-binary> [<profile> <permit>]" >&2
   exit 2
 fi
 
@@ -15,6 +15,21 @@ gh_bin=$3
   exit 2
 }
 [[ -x $gh_bin && ! -L $gh_bin ]] || { echo "gh verifier must be executable" >&2; exit 2; }
+
+source_arguments=(--source-ref refs/heads/main)
+if [[ $# -eq 5 ]]; then
+  source_ref=$(python3 - "$(dirname "$0")" "$source_sha" "$4" "$5" <<'PYROUTE'
+import argparse
+import sys
+sys.path.insert(0, sys.argv[1])
+from candidate_route import from_args
+route = from_args(argparse.Namespace(candidate_profile=sys.argv[3], rehearsal_permit=sys.argv[4] or None))
+route.validate_source(sys.argv[2])
+print(route.source_ref)
+PYROUTE
+  )
+  source_arguments=(--source-ref "$source_ref")
+fi
 
 platforms=(
   linux-aarch64
@@ -66,7 +81,7 @@ PY
       --repo Helvesec/rmux \
       --signer-workflow Helvesec/rmux/.github/workflows/canonical-native-build.yml \
       --source-digest "$source_sha" \
-      --source-ref refs/heads/main \
+      "${source_arguments[@]}" \
       --deny-self-hosted-runners \
       --format json >/dev/null
   done

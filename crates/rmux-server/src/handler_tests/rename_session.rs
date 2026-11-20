@@ -17,7 +17,7 @@ async fn mutate_session_rolls_back_when_the_mutation_returns_an_error() {
             environment: None,
         }))
         .await;
-    assert!(matches!(created, Response::NewSession(_)));
+    crate::session_fixture::assert_new_session(&created);
 
     let previous_session = {
         let state = handler.state.lock().await;
@@ -25,7 +25,7 @@ async fn mutate_session_rolls_back_when_the_mutation_returns_an_error() {
             .sessions
             .session(&alpha)
             .expect("session exists")
-            .clone()
+            .test_snapshot()
     };
 
     let result = {
@@ -42,7 +42,7 @@ async fn mutate_session_rolls_back_when_the_mutation_returns_an_error() {
 
     let state = handler.state.lock().await;
     let session = state.sessions.session(&alpha).expect("session exists");
-    assert_eq!(session, &previous_session);
+    assert_eq!(session.test_snapshot(), previous_session);
     assert_eq!(
         state.ensure_panes_exist(&alpha, &[rmux_core::PaneId::new(1)]),
         Err(RmuxError::Server(format!(
@@ -84,7 +84,7 @@ async fn rename_session_to_existing_name_returns_duplicate_session() {
                 environment: None,
             }))
             .await;
-        assert!(matches!(created, Response::NewSession(_)));
+        crate::session_fixture::assert_new_session(&created);
     }
 
     let response = handler
@@ -123,7 +123,7 @@ async fn rename_session_to_same_name_returns_success_without_mutation() {
             environment: None,
         }))
         .await;
-    assert!(matches!(created, Response::NewSession(_)));
+    crate::session_fixture::assert_new_session(&created);
 
     let response = handler
         .handle(Request::RenameSession(RenameSessionRequest {
@@ -160,7 +160,7 @@ async fn rename_session_happy_path_migrates_session() {
             environment: None,
         }))
         .await;
-    assert!(matches!(created, Response::NewSession(_)));
+    crate::session_fixture::assert_new_session(&created);
 
     let renamed = handler
         .handle(Request::RenameSession(RenameSessionRequest {
@@ -205,7 +205,7 @@ async fn rename_session_resolves_unique_prefix_targets() {
             environment: None,
         }))
         .await;
-    assert!(matches!(created, Response::NewSession(_)));
+    crate::session_fixture::assert_new_session(&created);
 
     let renamed = handler
         .handle(Request::RenameSession(RenameSessionRequest {
@@ -243,7 +243,7 @@ async fn rename_session_fails_closed_when_source_name_is_recreated_after_resolut
             environment: None,
         }))
         .await;
-    assert!(matches!(created, Response::NewSession(_)), "{created:?}");
+    crate::session_fixture::assert_new_session(&created);
     let old_session_id = handler
         .state
         .lock()
@@ -284,10 +284,7 @@ async fn rename_session_fails_closed_when_source_name_is_recreated_after_resolut
             environment: None,
         }))
         .await;
-    assert!(
-        matches!(recreated, Response::NewSession(_)),
-        "{recreated:?}"
-    );
+    crate::session_fixture::assert_new_session(&recreated);
     let new_session_id = handler
         .state
         .lock()
@@ -307,7 +304,7 @@ async fn rename_session_fails_closed_when_source_name_is_recreated_after_resolut
     );
     let state = handler.state.lock().await;
     assert_eq!(
-        state.sessions.session(&alpha).map(rmux_core::Session::id),
+        state.sessions.session(&alpha).map(|session| session.id()),
         Some(new_session_id)
     );
     assert!(!state.sessions.contains_session(&beta));
@@ -335,7 +332,7 @@ async fn rename_session_serializes_timer_rekey_before_source_name_reuse() {
             environment: None,
         }))
         .await;
-    assert!(matches!(created, Response::NewSession(_)), "{created:?}");
+    crate::session_fixture::assert_new_session(&created);
     let old_target = rmux_proto::WindowTarget::with_window(alpha.clone(), 0);
     let old_snapshot = handler
         .silence_timer_snapshot_for_test(&old_target)
@@ -396,10 +393,7 @@ async fn rename_session_serializes_timer_rekey_before_source_name_reuse() {
     let renamed = rename.await.expect("rename task joins");
     assert!(matches!(renamed, Response::RenameSession(_)), "{renamed:?}");
     let recreated = recreate.await.expect("new alpha task joins");
-    assert!(
-        matches!(recreated, Response::NewSession(_)),
-        "{recreated:?}"
-    );
+    crate::session_fixture::assert_new_session(&recreated);
     assert_eq!(
         handler
             .silence_timer_snapshot_for_test(&renamed_target)
@@ -436,7 +430,7 @@ async fn stale_timer_expiry_and_cancel_fail_closed_after_session_name_reuse() {
             environment: None,
         }))
         .await;
-    assert!(matches!(created, Response::NewSession(_)), "{created:?}");
+    crate::session_fixture::assert_new_session(&created);
     let target = rmux_proto::WindowTarget::with_window(alpha.clone(), 0);
     let old_identity = handler
         .silence_timer_identity_for_test(&target)
@@ -459,10 +453,7 @@ async fn stale_timer_expiry_and_cancel_fail_closed_after_session_name_reuse() {
             environment: None,
         }))
         .await;
-    assert!(
-        matches!(recreated, Response::NewSession(_)),
-        "{recreated:?}"
-    );
+    crate::session_fixture::assert_new_session(&recreated);
     let new_identity = handler
         .silence_timer_identity_for_test(&target)
         .expect("new incarnation timer identity exists");

@@ -11,39 +11,14 @@ use std::time::{Duration, Instant};
 
 #[cfg(target_os = "linux")]
 use common::acquire_empty_socket_path_lock;
-use common::{assert_success, read_until_contains, stderr, stdout, AttachedSession, CliHarness};
+use common::{
+    assert_success, is_transient_daemon_stall, read_until_contains,
+    run_success_with_transient_retry, stderr, stdout, AttachedSession, CliHarness,
+};
 use rmux_pty::TerminalSize;
 
 const ATTACH_TIMEOUT: Duration = Duration::from_secs(5);
 const NONBLOCKING_ATTACH_TIMEOUT: Duration = Duration::from_millis(500);
-
-fn run_success_with_transient_retry(
-    harness: &CliHarness,
-    args: &[&str],
-) -> Result<(), Box<dyn Error>> {
-    let mut last_output = None;
-
-    for _ in 0..3 {
-        let output = harness.run(args)?;
-        if output.status.code() == Some(0)
-            && stdout(&output).is_empty()
-            && stderr(&output).is_empty()
-        {
-            return Ok(());
-        }
-
-        let retryable = stderr(&output).contains("Resource temporarily unavailable");
-        last_output = Some(output);
-        if !retryable {
-            break;
-        }
-
-        std::thread::sleep(Duration::from_millis(50));
-    }
-
-    assert_success(&last_output.expect("at least one command attempt for transient retry"));
-    Ok(())
-}
 
 fn assert_missing_has_session(output: &std::process::Output, session_name: &str) {
     assert_eq!(output.status.code(), Some(1));
@@ -149,6 +124,42 @@ fn new_session_print_format_uses_spawned_command_metadata() -> Result<(), Box<dy
         assert!(stderr(&created).is_empty());
         assert_success(&harness.run(&["kill-session", "-t", &session])?);
     }
+    Ok(())
+}
+
+/// Killing the last session makes an `exit-empty` daemon stop accepting while
+/// its endpoint stays bound until the shutdown drain ends. A `new-session` in
+/// that window used to fail on the queued, never-served connection; a slow
+/// `session-closed` hook widens the window load produced in `sessions.rs:147`.
+#[test]
+fn new_session_after_last_kill_session_waits_for_the_exiting_daemon() -> Result<(), Box<dyn Error>>
+{
+    const HOOK_HOLD: Duration = Duration::from_secs(3);
+
+    let harness = CliHarness::new("new-session-after-exit-empty")?;
+    let _daemon = harness.start_hidden_daemon()?;
+    let hook_started = harness.tmpdir().join("session-closed-hook-started");
+    let hook = format!(
+        "run-shell \"touch '{}'; sleep {}\"",
+        hook_started.display(),
+        HOOK_HOLD.as_secs()
+    );
+
+    assert_success(&harness.run(&["new-session", "-d", "-s", "last", "sleep 60"])?);
+    assert_success(&harness.run(&["set-hook", "-g", "session-closed", &hook])?);
+    assert_success(&harness.run(&["kill-session", "-t", "last"])?);
+
+    let deadline = Instant::now() + HOOK_HOLD;
+    while !hook_started.exists() {
+        assert!(Instant::now() < deadline, "session-closed hook never ran");
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    // The hook runs while the daemon drains; let exit-empty close admission.
+    std::thread::sleep(Duration::from_millis(300));
+
+    let created = harness.run(&["new-session", "-d", "-s", "next", "sleep 60"])?;
+    assert_success(&created);
+    assert_success(&harness.run(&["has-session", "-t", "next"])?);
     Ok(())
 }
 
@@ -752,8 +763,8 @@ fn grouped_sessions_copy_current_and_last_window_state_on_creation() -> Result<(
 
     assert_eq!(alpha_windows.status.code(), Some(0));
     assert_eq!(beta_windows.status.code(), Some(0));
-    assert_eq!(stdout(&alpha_windows), stdout(&beta_windows));
-    assert_eq!(stdout(&beta_windows), "0:0:0\n1:1:0\n2:0:1\n");
+    assert_eq!(stdout(&alpha_windows), "0:0:0\n1:1:0\n2:0:1\n");
+    assert_eq!(stdout(&beta_windows), "0:1:0\n1:0:0\n2:0:0\n");
     assert!(stderr(&alpha_windows).is_empty());
     assert!(stderr(&beta_windows).is_empty());
     Ok(())
@@ -827,6 +838,52 @@ fn kill_session_all_except_target_preserves_only_the_named_session() -> Result<(
             assert_missing_has_session(&output, target);
         }
     }
+    Ok(())
+}
+
+/// Holds a process stopped with `SIGSTOP` and resumes it when dropped.
+struct StoppedProcess {
+    pid: libc::pid_t,
+}
+
+impl StoppedProcess {
+    fn stop(pid: u32) -> Result<Self, Box<dyn Error>> {
+        let pid = libc::pid_t::try_from(pid)?;
+        // SAFETY: `pid` names a daemon child this test spawned and still owns.
+        if unsafe { libc::kill(pid, libc::SIGSTOP) } != 0 {
+            return Err(std::io::Error::last_os_error().into());
+        }
+        Ok(Self { pid })
+    }
+}
+
+impl Drop for StoppedProcess {
+    fn drop(&mut self) {
+        // SAFETY: resumes the same owned daemon child stopped in `stop`.
+        unsafe {
+            libc::kill(self.pid, libc::SIGCONT);
+        }
+    }
+}
+
+#[test]
+fn transient_retry_recognizes_a_daemon_stalled_past_the_rpc_deadline() -> Result<(), Box<dyn Error>>
+{
+    let harness = CliHarness::new("stalled-daemon-retry")?;
+    let daemon = harness.start_hidden_daemon()?;
+    run_success_with_transient_retry(&harness, &["new-session", "-d", "-s", "alpha"])?;
+
+    let stopped = StoppedProcess::stop(daemon.pid())?;
+    let stalled = harness.run(&["has-session", "-t", "alpha"])?;
+    drop(stopped);
+
+    assert_eq!(stalled.status.code(), Some(1));
+    assert!(
+        is_transient_daemon_stall(&stderr(&stalled)),
+        "an expired RPC deadline must stay retryable, got stderr: {}",
+        stderr(&stalled)
+    );
+    run_success_with_transient_retry(&harness, &["has-session", "-t", "alpha"])?;
     Ok(())
 }
 

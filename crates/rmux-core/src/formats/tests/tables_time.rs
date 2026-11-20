@@ -14,6 +14,42 @@ fn tmux_format_table_names_is_sorted_and_unique() {
 }
 
 #[test]
+fn registered_descriptors_have_unique_names_and_metadata() {
+    let mut names = Vec::new();
+    for descriptor in super::format_variable_descriptors() {
+        assert!(
+            !descriptor.contexts().is_empty(),
+            "descriptor {:?} has no context",
+            descriptor.name()
+        );
+        assert!(
+            names.iter().all(|name| *name != descriptor.name()),
+            "duplicate descriptor name {:?}",
+            descriptor.name()
+        );
+        names.push(descriptor.name());
+    }
+
+    assert!(names.contains(&"pane_created"));
+    assert!(names.contains(&"default-shell"));
+}
+
+#[test]
+fn tmux_inventory_is_derived_from_registered_descriptors() {
+    let names = super::tmux_format_variable_descriptors()
+        .map(|descriptor| {
+            assert!(descriptor.is_tmux_table_entry());
+            descriptor.name()
+        })
+        .collect::<Vec<_>>();
+
+    assert_eq!(names, super::TMUX_FORMAT_TABLE_NAMES);
+    assert_eq!(names.len(), 195);
+    assert!(!names.contains(&"command"));
+    assert!(!names.contains(&"session_width"));
+}
+
+#[test]
 fn tmux_time_format_variable_names_is_sorted_and_subset() {
     for pair in super::TMUX_TIME_FORMAT_VARIABLE_NAMES.windows(2) {
         assert!(
@@ -29,6 +65,67 @@ fn tmux_time_format_variable_names_is_sorted_and_subset() {
             "TIME variable {name:?} not in TMUX_FORMAT_TABLE_NAMES"
         );
     }
+}
+
+#[test]
+fn time_inventory_is_derived_from_registered_descriptors() {
+    let names = super::tmux_time_format_variable_descriptors()
+        .map(|descriptor| {
+            assert!(descriptor.is_time());
+            descriptor.name()
+        })
+        .collect::<Vec<_>>();
+
+    assert_eq!(names, super::TMUX_TIME_FORMAT_VARIABLE_NAMES);
+}
+
+#[test]
+fn format_variable_api_is_backed_by_registered_descriptors() {
+    for variable in super::FORMAT_VARIABLES {
+        let descriptor = super::format_variable_descriptor(variable.name())
+            .expect("enum-backed variable must have a descriptor");
+
+        assert_eq!(descriptor.format_variable(), Some(variable));
+        assert_eq!(
+            super::FormatVariable::from_name(descriptor.name()),
+            Some(variable)
+        );
+        assert!(descriptor.has_known_empty_fallback());
+    }
+}
+
+#[test]
+fn descriptor_context_and_provider_classify_real_resolution_paths() {
+    let sixel = super::format_variable_descriptor("sixel_support").expect("sixel descriptor");
+    assert_eq!(
+        sixel.provider(),
+        super::FormatVariableProvider::BuildCapability
+    );
+    assert!(sixel
+        .contexts()
+        .contains(super::FormatVariableContext::Server));
+
+    let pane_created =
+        super::format_variable_descriptor("pane_created").expect("pane_created descriptor");
+    assert_eq!(
+        pane_created.provider(),
+        super::FormatVariableProvider::Runtime
+    );
+    assert!(pane_created
+        .contexts()
+        .contains(super::FormatVariableContext::Pane));
+    assert!(!pane_created.has_known_empty_fallback());
+
+    let session_width =
+        super::format_variable_descriptor("session_width").expect("session_width descriptor");
+    assert_eq!(
+        session_width.provider(),
+        super::FormatVariableProvider::Runtime
+    );
+    assert_eq!(
+        session_width.format_variable(),
+        Some(super::FormatVariable::SessionWidth)
+    );
 }
 
 #[test]

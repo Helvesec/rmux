@@ -2,6 +2,14 @@ use std::collections::{HashMap, HashSet};
 
 use rmux_proto::{RmuxError, ScopeSelector, SessionName};
 
+mod name_keys;
+
+use name_keys::{
+    empty_environment_entries, environment_entry, environment_entry_mut,
+    environment_entry_with_name, insert_environment_entry, insert_name_into_set,
+    remove_environment_entry, remove_environment_name, remove_name_from_set,
+};
+
 /// tmux-compatible hidden environment entry flag.
 pub const ENVIRON_HIDDEN: u8 = 0x1;
 
@@ -511,109 +519,6 @@ fn remove_unset_names(values: &mut HashMap<String, String>, names: &HashSet<Stri
     for name in names {
         remove_environment_name(values, name);
     }
-}
-
-fn remove_environment_name(values: &mut HashMap<String, String>, name: &str) {
-    #[cfg(windows)]
-    if let Some(existing) = values
-        .keys()
-        .find(|key| key.eq_ignore_ascii_case(name))
-        .cloned()
-    {
-        values.remove(&existing);
-        return;
-    }
-
-    values.remove(name);
-}
-
-fn insert_environment_entry(
-    entries: &mut HashMap<String, EnvironmentEntry>,
-    name: String,
-    entry: EnvironmentEntry,
-) {
-    let _ = remove_environment_entry(entries, &name);
-    entries.insert(name, entry);
-}
-
-fn remove_environment_entry(
-    entries: &mut HashMap<String, EnvironmentEntry>,
-    name: &str,
-) -> Option<EnvironmentEntry> {
-    #[cfg(windows)]
-    if let Some(existing) = entries
-        .keys()
-        .find(|key| key.eq_ignore_ascii_case(name))
-        .cloned()
-    {
-        return entries.remove(&existing);
-    }
-
-    entries.remove(name)
-}
-
-fn environment_entry<'a>(
-    entries: &'a HashMap<String, EnvironmentEntry>,
-    name: &str,
-) -> Option<&'a EnvironmentEntry> {
-    environment_entry_with_name(entries, name).map(|(_, entry)| entry)
-}
-
-fn environment_entry_with_name<'a>(
-    entries: &'a HashMap<String, EnvironmentEntry>,
-    name: &str,
-) -> Option<(&'a str, &'a EnvironmentEntry)> {
-    #[cfg(windows)]
-    if let Some((existing, entry)) = entries
-        .iter()
-        .find(|(key, _)| key.eq_ignore_ascii_case(name))
-    {
-        return Some((existing.as_str(), entry));
-    }
-
-    entries
-        .get_key_value(name)
-        .map(|(key, entry)| (key.as_str(), entry))
-}
-
-fn environment_entry_mut<'a>(
-    entries: &'a mut HashMap<String, EnvironmentEntry>,
-    name: &str,
-) -> Option<&'a mut EnvironmentEntry> {
-    #[cfg(windows)]
-    if let Some(existing) = entries
-        .keys()
-        .find(|key| key.eq_ignore_ascii_case(name))
-        .cloned()
-    {
-        return entries.get_mut(&existing);
-    }
-
-    entries.get_mut(name)
-}
-
-fn insert_name_into_set(names: &mut HashSet<String>, name: String) {
-    remove_name_from_set(names, &name);
-    names.insert(name);
-}
-
-fn remove_name_from_set(names: &mut HashSet<String>, name: &str) -> bool {
-    #[cfg(windows)]
-    if let Some(existing) = names
-        .iter()
-        .find(|candidate| candidate.eq_ignore_ascii_case(name))
-        .cloned()
-    {
-        return names.remove(&existing);
-    }
-
-    names.remove(name)
-}
-
-fn empty_environment_entries() -> &'static HashMap<String, EnvironmentEntry> {
-    static EMPTY: std::sync::OnceLock<HashMap<String, EnvironmentEntry>> =
-        std::sync::OnceLock::new();
-    EMPTY.get_or_init(HashMap::new)
 }
 
 #[cfg(test)]

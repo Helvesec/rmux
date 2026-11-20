@@ -1,0 +1,44 @@
+{
+  "registry": "tests/reference/tmux_compat/divergences.toml",
+  "scope": "static commands; runtime expansion and includes are not evaluated",
+  "trust": "loading configuration may execute commands; diagnose never executes them",
+  "configurations": [
+    {
+      "path": "~/inspection.conf",
+      "status": "static-only",
+      "commands": [
+        "bind-key",
+        "display-message",
+        "run-shell",
+        "set-environment",
+        "source-file"
+      ]
+    },
+    {
+      "path": "~/invalid.conf",
+      "status": "parse-error",
+      "commands": []
+    },
+    {
+      "path": "~/oversized.conf",
+      "status": "too-large",
+      "commands": []
+    },
+    {
+      "path": "~/input.fifo",
+      "status": "not-regular",
+      "commands": []
+    },
+    {
+      "path": "~/inspection.conf",
+      "status": "static-only",
+      "commands": [
+        "bind-key",
+        "display-message",
+        "run-shell",
+        "set-environment",
+        "source-file"
+      ]
+    }
+  ]
+}

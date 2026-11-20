@@ -1,0 +1,108 @@
+{
+  "schema_version": 1,
+  "population": {
+    "obligations.jsonl": {
+      "sha256": "f8d2a59c894f2d19c8a7daad15799249586909c955391e48798e8197d6d04bf7",
+      "bytes": 68885
+    },
+    "vectors.jsonl": {
+      "sha256": "f7a1d17f46051d3f8b865c12f2769009f341326d35cbf074f0e7f8fbfc8d457e",
+      "bytes": 689408
+    },
+    "coverage.json": {
+      "sha256": "2a19540e48f317229a4ac96be9742c7e870707cd4f3afbb25f537acdd57fabb8",
+      "bytes": 20407
+    },
+    "policies.json": {
+      "sha256": "4481646fa4c450f315dc1e658a83eae5942f971f0a284e4eb5daa960871c49b0",
+      "bytes": 7371
+    }
+  },
+  "status": "correction/adoption candidate; distinct review and orchestrator acceptance pending",
+  "product_commit": "3d60099d0b7f2d13f91303a5e173fdee5445be21",
+  "product_tree": "2cb235f46f272b45473802dfe55fdd1cc7f65ad9",
+  "pin": {
+    "canonical_uri": "https://sw.kovidgoyal.net/kitty/keyboard-protocol/",
+    "official_repository": "https://github.com/kovidgoyal/kitty",
+    "revision": "27048839eb04833ea677c6e28c2386e7684be5fa",
+    "path": "docs/keyboard-protocol.rst",
+    "bytes": 36641,
+    "sha256": "cd452d4f1b5070752499233f8d76455c854d0ec5f2318e38309f835baf2410ce",
+    "raw_reference_policy": "audit only; no full spec import into fixtures",
+    "provenance": {
+      "immutable_blob_uri": "https://github.com/kovidgoyal/kitty/blob/27048839eb04833ea677c6e28c2386e7684be5fa/docs/keyboard-protocol.rst",
+      "immutable_raw_uri": "https://raw.githubusercontent.com/kovidgoyal/kitty/27048839eb04833ea677c6e28c2386e7684be5fa/docs/keyboard-protocol.rst",
+      "method": "preserved primary acquisition and separately reacquired exact bytes verified by original independent review; offline reuse here"
+    },
+    "lines": 789
+  },
+  "license_provenance": {
+    "reference_license_uri": "https://github.com/kovidgoyal/kitty/blob/27048839eb04833ea677c6e28c2386e7684be5fa/LICENSE",
+    "reference_license_sha256": "3972dc9744f6499f0f9b2dbf76696f2ae7ad8af9b23dde66d6af86c9dfb36986",
+    "observed_license": "GNU GPL Version3 text at repository root; file-specific later-version grant or separate documentation exception not established",
+    "copyright_source": "docs/conf.py at same revision, copyright=year/Kovid Goyal",
+    "copyright_source_sha256": "ddad5a32fddff350243e4f9cc850f003b619e957c1a13aa2f7a130a5ba5250ce",
+    "fixture_authorship": "New RMUX-authored factual fixtures and paraphrases, MIT OR Apache-2.0 under CONTRIBUTING.md; no upstream prose/code imported."
+  },
+  "authority": {
+    "owner": "tests/conformance/kitty_keyboard/pin.json",
+    "classification": "scripts/source-inventory/declarations.json files.specifications",
+    "adoption": "Distinct reviewer then orchestrator acceptance; implementer cannot approve",
+    "release_contract": ".github/release/candidate-contract.json policy_paths includes fixtures and tooling; scripts/release/validate-contracts.py invokes corpus checker"
+  },
+  "schema": {
+    "vector_required": [
+      "id",
+      "obligations",
+      "direction",
+      "authority",
+      "decision",
+      "input_hex",
+      "output_hex",
+      "initial",
+      "next",
+      "target",
+      "capability"
+    ],
+    "hex": "Lowercase contiguous octets; empty means no bytes. output_hex is normative only for pinned authority. Ambiguity rows keep null and use policy_output_hex for the selected interpretation. Policy/integration rows are design expectations, never runtime/native proof.",
+    "typed_inputs": "event/native_record/api_call represent non-byte input. Empty input_hex on these rows means no wire bytes at that boundary; not missing capture masquerading as proof. Native record memory/wire layout not invented.",
+    "event": "key is numeric Unicode scalar or functional name; modifiers is actual bitmask (wire field is+1); event_type is protocol1/2/3, not proof OS supplied physical action; key0 is text-only when provenance lacks key",
+    "state": "pane states have independent main/alternate arrays ordered oldest to active top, with absent top effective0. A-STACK representation proposed. Client states and pane states use separate row shapes; repeated timer is not protocol repeat.",
+    "event_reencode": "synthetic acquired outer bytes -> normalized event -> application bytes at initial pane flags; does not attest any real terminal capability",
+    "output_scope": "target names boundary; decoder rows output no wire bytes and event/events contain expected decoded values; route/neighbor rows may have only keyboard output expectations. Additional control side effects explicitly noted.",
+    "serialization": "one preferred valid spelling, optional omission variants covered; no assertion that all other permitted spellings fail",
+    "authority_values": [
+      "pinned",
+      "integration",
+      "policy",
+      "ambiguity",
+      "source-observation"
+    ]
+  },
+  "retained": {
+    "full_v28": true,
+    "full_kitty": true,
+    "floating": true,
+    "G": null,
+    "accepted_B0_bound": 1142,
+    "calendar": null,
+    "release_verdict": null,
+    "margin": null,
+    "remaininghumanhours": null
+  },
+  "version": "rmux-kitty-keyboard-v1",
+  "scope": "reviewed corpus integrity and selected design policies; runtime/native conformance unimplemented/unqualified",
+  "source_observations": {
+    "commit": "3d60099d0b7f2d13f91303a5e173fdee5445be21",
+    "tree": "2cb235f46f272b45473802dfe55fdd1cc7f65ad9",
+    "body_comparison_base": "533b9482e9882834d994e2624c7a46b8f4401eaf",
+    "result": "All 50 ranges/38 source bodies unchanged; inherited executions remain tied to3d60099, not rerun at533b948.",
+    "source_bindings_sha256": "c0af158d820b4c99744cd18aec6e2e7ac14147ebdb2877cbb5bf9b3558f4cc16",
+    "probe_output_sha256": "c8d54a9026b1342b017e791dc6aea3a440832f0e6bb82201d37ead101d8de0e9"
+  },
+  "lineage": {
+    "KITTY-CONFORMANCE-POPULATION.md": "1485618e1d466bd63fd3861a8ac9bb0991c03beb65e6a702d3217639e2625911",
+    "KITTY-CONFORMANCE-REVIEW.md": "d712f823203e18dff646ce2b6176011a46027c01c380a641c8bd72faaa04336c"
+  },
+  "checker_limits": "Digest/schema integrity, finite field partitions, parsed event consistency, selected C0/F3/Ctrl bytes and negotiation arithmetic only. Does not implement a general encoder, streaming decoder, runtime routing/lifecycle, native acquisition or conformance qualification. Optional offline reference verifies source anchors and factual table bindings."
+}

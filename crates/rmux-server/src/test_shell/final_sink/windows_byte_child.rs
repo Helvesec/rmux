@@ -41,7 +41,8 @@
 //! | `byte_observer.rs` | the observer bytes `rustc` was given                 |
 //! | `main.rs`          | the generated child bytes `rustc` was given          |
 //! | `rustc-program.txt`| the one resolved compiler value, displayed and exact |
-//! | `rustc-argv.txt`   | the complete compilation argv, as invoked            |
+//! | `rustc-argv.txt`   | the base compilation argv sent to the identity guard |
+//! | `rustc-observed-argv.json` | the complete instrumented compiler invocation |
 //! | `rustc-identity.txt`| `rustc -vV` from that same value                    |
 //! | `source-identity.txt`| the informational source digest and byte counts    |
 //!
@@ -53,6 +54,7 @@
 
 use std::ffi::{OsStr, OsString};
 use std::fs;
+use std::os::windows::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::OnceLock;
@@ -311,6 +313,8 @@ struct ChildBuild {
     directory: PathBuf,
     /// The published executable inside it.
     program: PathBuf,
+    /// Keep the selected executable immutable across later pane respawns.
+    _program_guard: fs::File,
     /// The single resolved compiler value.
     compiler: OsString,
     /// The complete compilation argv, program first, exactly as invoked.
@@ -325,10 +329,13 @@ struct ChildBuild {
 /// process's own build. It is never a way to adopt an executable some other
 /// process left behind.
 pub(super) fn child_program() -> Result<PathBuf, String> {
-    static PROGRAM: OnceLock<Result<PathBuf, String>> = OnceLock::new();
-    PROGRAM
-        .get_or_init(|| compile_child_program().map(|build| build.program))
-        .clone()
+    static PROGRAM: OnceLock<Result<ChildBuild, String>> = OnceLock::new();
+    let build = PROGRAM
+        .get_or_init(compile_child_program)
+        .as_ref()
+        .map_err(Clone::clone)?;
+    verify_program(&build.program)?;
+    Ok(build.program.clone())
 }
 
 /// A stable digest of the exact child sources.
@@ -364,7 +371,7 @@ fn compile_child_program() -> Result<ChildBuild, String> {
 /// safety property: an operating system reuses process ids, so the exclusive
 /// creation below is what actually keeps a build out of an occupied directory.
 fn default_build_root() -> PathBuf {
-    std::env::temp_dir().join(format!(
+    build_container().join(format!(
         "rmux-final-sink-child-{}-{:016x}",
         std::process::id(),
         source_digest()
@@ -396,40 +403,64 @@ fn build_child_program(root: &Path, compiler: OsString) -> Result<ChildBuild, St
     let argv = compilation_argv(&compiler, &directory, &partial);
     write_checked(&directory.join(COMPILER_ARGV_FILE), &describe_argv(&argv))?;
 
-    // Invoked *through* the recorded argv rather than beside it, so the record
-    // and the invocation cannot describe different commands.
-    let compiled = Command::new(&argv[0])
-        .args(&argv[1..])
-        .output()
-        .map_err(|error| {
-            format!(
-                "{} could not be run to build the final-sink child: {error}",
-                Path::new(&compiler).display()
-            )
-        })?;
-    if !compiled.status.success() {
-        return Err(format!(
-            "the pinned final-sink child source did not compile ({}):\n{}",
-            compiled.status,
-            String::from_utf8_lossy(&compiled.stderr)
-        ));
-    }
-
+    // The existing identity compiler records the real parent and these exact
+    // retained inputs before linking; it never certifies an older executable.
+    let mut arguments = vec![directory.as_os_str()];
+    arguments.extend(argv.iter().map(OsString::as_os_str));
+    identity_action("final-sink-build", &arguments)?;
     let program = directory.join(PROGRAM_FILE);
-    fs::rename(&partial, &program).map_err(|error| {
-        format!(
-            "the compiled final-sink child could not be published at {}: {error}",
-            program.display()
-        )
-    })?;
+    // Windows refuses writes/deletion while this handle is retained. The
+    // cached command can be respawned later without accepting changed bytes.
+    let program_guard = fs::OpenOptions::new()
+        .read(true)
+        .share_mode(1)
+        .open(&program)
+        .map_err(|error| format!("final-sink executable cannot be protected: {error}"))?;
+    verify_program(&program)?;
 
     Ok(ChildBuild {
         directory,
         program,
+        _program_guard: program_guard,
         compiler,
         argv,
         identity,
     })
+}
+
+fn build_container() -> PathBuf {
+    std::env::var_os("RMUX_IDENTITY_TARGET")
+        .map(|target| PathBuf::from(target).join("fixture-inputs"))
+        .unwrap_or_else(std::env::temp_dir)
+}
+
+fn identity_action(action: &str, arguments: &[&OsStr]) -> Result<(), String> {
+    let python = std::env::var_os("RMUX_IDENTITY_PYTHON")
+        .ok_or("final-sink child requires the candidate identity interpreter")?;
+    let script = std::env::var_os("RMUX_IDENTITY_SCRIPT")
+        .ok_or("final-sink child requires the candidate identity script")?;
+    let mut command = Command::new(python);
+    if std::env::var_os("RMUX_NATIVE_INPUT_MANIFEST").is_some() {
+        command.args(["-I", "-S", "-B"]);
+    }
+    let result = command
+        .arg(script)
+        .arg("fixture")
+        .arg(action)
+        .args(arguments)
+        .output()
+        .map_err(|error| format!("final-sink identity check could not run: {error}"))?;
+    if !result.status.success() {
+        return Err(format!(
+            "final-sink identity rejected before use: {}",
+            String::from_utf8_lossy(&result.stderr)
+        ));
+    }
+    Ok(())
+}
+
+fn verify_program(program: &Path) -> Result<(), String> {
+    identity_action("final-sink-check", &[program.as_os_str()])
 }
 
 /// The one site at which a build takes ownership of a directory.
@@ -476,6 +507,8 @@ fn compilation_argv(compiler: &OsStr, directory: &Path, output: &Path) -> Vec<Os
         OsString::from("2021"),
         OsString::from("--crate-name"),
         OsString::from("rmux_final_sink_child"),
+        OsString::from("--crate-type"),
+        OsString::from("bin"),
         OsString::from("-o"),
         output.as_os_str().to_owned(),
         directory.join(MAIN_FILE).into_os_string(),
@@ -498,7 +531,9 @@ fn write_checked(path: &Path, contents: &str) -> Result<(), String> {
 /// Called once per build; the value it returns is what is recorded *and* what
 /// is invoked.
 fn compiler_program() -> OsString {
-    std::env::var_os("RUSTC").unwrap_or_else(|| OsString::from("rustc"))
+    std::env::var_os("RUSTC")
+        .or_else(|| std::env::var_os("RMUX_IDENTITY_RUSTC"))
+        .unwrap_or_else(|| OsString::from("rustc"))
 }
 
 /// `rustc -vV` from the value that is about to compile the child.
@@ -584,7 +619,7 @@ mod tests {
     /// A build root no other case in this process can collide with.
     fn scratch_root(label: &str) -> PathBuf {
         static NEXT: AtomicU32 = AtomicU32::new(0);
-        let root = std::env::temp_dir().join(format!(
+        let root = build_container().join(format!(
             "rmux-final-sink-child-case-{}-{}-{label}",
             std::process::id(),
             NEXT.fetch_add(1, Ordering::Relaxed)
@@ -597,6 +632,7 @@ mod tests {
     /// file at the child's path: run with no arguments, the pinned child
     /// answers with its own usage and exit code 2.
     fn assert_is_the_pinned_child(program: &Path) {
+        verify_program(program).unwrap_or_else(|failure| panic!("{failure}"));
         let answered = Command::new(program)
             .stdin(std::process::Stdio::null())
             .output()
@@ -803,6 +839,31 @@ mod tests {
         assert!(!CHILD_MAIN_SOURCE.contains('\r'));
     }
 
+    /// A directly generated Windows executable must retain the same candidate
+    /// identity and transitive build graph as its actual Rust test producer.
+    /// Its graph is bound to the Cargo lock contexts it was built under, so the
+    /// identity harness writes the locked `V2` graph marker; `V1` is the
+    /// unlocked form and would mean the child escaped its lock binding.
+    #[test]
+    fn the_generated_final_sink_child_has_candidate_identity_before_use() {
+        let root = scratch_root("candidate-identity");
+        let build = build_child_program(&root, compiler_program())
+            .unwrap_or_else(|failure| panic!("{failure}"));
+        let bytes = fs::read(&build.program).expect("compiled Windows child");
+        for marker in [
+            b"RMUX_BUILD_IDENTITY_V1:".as_slice(),
+            b"RMUX_BUILD_GRAPH_V2:",
+        ] {
+            assert!(
+                bytes.windows(marker.len()).any(|part| part == marker),
+                "generated final-sink child lacks {} before use: {}",
+                String::from_utf8_lossy(marker),
+                build.program.display()
+            );
+        }
+        assert_is_the_pinned_child(&build.program);
+    }
+
     /// The pinned source must actually build with the workspace toolchain, and
     /// the build must be able to say what it built: these are the links the R1
     /// A/B follows from a committed source byte to an executed one.
@@ -990,7 +1051,9 @@ mod tests {
             absolute.display()
         );
 
-        let inner = Command::new(std::env::current_exe().expect("this test binary"))
+        let parent = std::env::current_exe().expect("this test binary");
+        verify_program(&parent).unwrap_or_else(|failure| panic!("{failure}"));
+        let inner = Command::new(parent)
             .args([
                 OVERRIDE_CASE_NAME,
                 "--exact",

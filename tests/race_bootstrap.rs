@@ -1,6 +1,6 @@
 #![cfg(unix)]
 
-//! Parallel bootstrap race coverage for `rmux_sdk::bootstrap::startup_unix`.
+//! Parallel bootstrap race coverage for `rmux_bootstrap::startup_unix`.
 //!
 //! These tests prove the documented contract for `connect_or_start`: under N
 //! concurrent callers per endpoint, exactly one daemon is created, and every
@@ -14,7 +14,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
-use rmux_sdk::bootstrap::startup_unix::{
+use rmux_bootstrap::startup_unix::{
     connect_or_start_with, StartupError, StartupOutcome, DEFAULT_STARTUP_DEADLINE,
     STARTUP_POLL_INTERVAL,
 };

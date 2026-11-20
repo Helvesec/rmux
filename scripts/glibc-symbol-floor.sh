@@ -32,7 +32,8 @@ command -v "$readelf_bin" >/dev/null 2>&1 || die "missing required command: $rea
 versions=""
 for binary in "$@"; do
   [ -f "$binary" ] || die "ELF binary not found: $binary"
-  binary_versions="$($readelf_bin --version-info "$binary" 2>/dev/null | sed -n 's/.*Name: GLIBC_\([0-9][0-9.]*\).*/\1/p')"
+  # readelf translates its labels (e.g. "Nom:" under fr_FR); parse the C locale.
+  binary_versions="$(LC_ALL=C "$readelf_bin" --version-info "$binary" 2>/dev/null | sed -n 's/.*Name: GLIBC_\([0-9][0-9.]*\).*/\1/p')"
   [ -n "$binary_versions" ] || die "no imported GLIBC symbol versions found in $binary"
   versions="${versions}${versions:+
 }${binary_versions}"

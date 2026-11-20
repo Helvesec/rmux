@@ -1,0 +1,91 @@
+{
+  "schema": 1,
+  "id": "web-admission-reference-v1",
+  "status": "PROSPECTIVE_NOT_MEASURED",
+  "protocol_authority": {
+    "path": "docs/specs/web-share-e2ee-protocol-v1.md",
+    "sha256": "6a72b74d0cbf9734c51b618d5220efe040c2ad908867ce2cd2dedf4b553969e9"
+  },
+  "historical_spec_source": "2ecd58a3b261977de315abd732b3ff8e58befc83",
+  "failure_classes": [
+    "token",
+    "origin",
+    "proof",
+    "pin",
+    "capability"
+  ],
+  "topologies": [
+    "direct-loopback",
+    "loopback-relay"
+  ],
+  "topology_contract": "Dedicated client/daemon loopback fixture and same-host stateless forwarding relay. Pin OS/build/CPU/tool identity, network configuration and relay binary. No external Internet. Qualify each topology separately; do not pool them.",
+  "backoff_states": [
+    "fresh",
+    "same-escalation",
+    "locked"
+  ],
+  "backoff_contract": "Before every paired block establish the same key/role failure counter, escalation level, elapsed-time bucket and capacity state for all classes. Use isolated fixture resets or witnessed state transitions; never infer equal backoff from equal sleep. Preserve operational costs and report failed setup as failure.",
+  "milestone": "first-upgrade-byte-to-observed-close",
+  "stages": [
+    "HTTP upgrade/origin",
+    "hello/token/capability",
+    "cryptographic proof",
+    "authenticated PIN/admission"
+  ],
+  "stage_rule": "From one client monotonic milestone record every external response, WSopcode/frame and closure through TCP/WSend. Pair all five failure classes within each topology/backoff stratum; do not condition away early rejections or compare only survivors. Any unsupported collection stage leaves gateFAIL.",
+  "warmup_per_stratum": 50,
+  "retain_all_attempts": true,
+  "sample_order": "Balanced blocked permutation of five classes, seed frozen before launch, identical prescribed warmup; every attempt preserved, no retry/outlier deletion, timeouts areFAIL not missing data.",
+  "clock_resolution_max_ns": 100000,
+  "statistics": {
+    "method": "two-sample-CDF-DKW-upper-bound",
+    "minimum_per_class_stratum": 50000,
+    "family_comparisons": 60,
+    "family_alpha": 0.01,
+    "beta_equal_distribution": 0.01,
+    "cdf_margin": 0.05,
+    "formula": "D=max_x|Fn(x)-Fm(x)|; U=D+sqrt(log(4/alpha_pair)/(2n))+sqrt(log(4/alpha_pair)/(2m)); accept onlyU<=0.05. alpha_pair=0.01/60.",
+    "rationale": "Distribution-wide equivalence margin onCDF, not failure to reject a zero difference. Under independent identically distributed observations within each class/stratum, DKW+union bound limits false equivalence acceptance across60pairs to0.01. With n=50000, null-distribution sampling allowances for both familyalpha0.01 and familybeta0.01 sum<0.05. Dependence or nonstationarity invalidates that calibration and leaves gateFAIL; this is a prospective design, no measured security result."
+  },
+  "ordinary_close": {
+    "code": 4000,
+    "reason": "handshake_rejected"
+  },
+  "authenticated_missing_pin_close": {
+    "code": 4008,
+    "reason": "pin_required"
+  },
+  "pin_exception": "Only after cryptographic token proof verified and PINabsent; wrongPIN is ordinaryopaque rejection. Separateexception does not excuse invalid token/origin/proof/capability.",
+  "canonical_fields": [
+    "direction",
+    "opcode",
+    "wire_bytes",
+    "deterministic_fields",
+    "close"
+  ],
+  "canonical_contract": "Ordered server-to-peer frame projection plus actual rawlength and all deterministic fields, including unknown added fields, and exact close. Client stimulus is separately hashed; never erase a leaked reason. Preserve raw bytes in evidence. Authenticated encrypted frames require decrypted fields from the trusted peer collector, separatelybound to raw frames. HTTPresponse/EOFbeforeWS is explicitfailure until the same externallyobservable rejection contract is demonstrated.",
+  "random_fields": {
+    "server_nonce": 16,
+    "server_public": 32,
+    "server_ml_kem_ct": 1088
+  },
+  "crypto_contract": "Base64url-no-pad canonical decoding and exact lengths; native crypto validators and per-exchange keygeneration/freshness attestation; no reused nonce, public ephemeral key or ML-KEMciphertext across trials. These values alone are excluded from rawequality, lengths retained. Client nonce/public/encapsulation material must independently satisfy protocol and distinct generation pertrial.",
+  "crypto_statistics": {
+    "method": "simultaneous-bit-marginal-equivalence",
+    "minimum_per_class_stratum": 100000,
+    "family_alpha": 0.01,
+    "beta_equal_distribution": 0.01,
+    "margin": 0.05,
+    "bits": 9088,
+    "comparisons": 60,
+    "rule": "Compare each decoded bit proportion acrossclasses with Hoeffding two-sample upperbound and Bonferroni overallbitspairs. Nonuniform constrained keybits are comparedbetweenclasses, not forceduniform. This finite projection is not a proof ofCSPRNGquality; native cryptographic/freshness checks remain mandatory.",
+    "overall_two_statistical_families_error_bound": 0.02
+  },
+  "canaries": [
+    "deterministic-reason",
+    "crypto-reuse",
+    "close-code",
+    "time-shift"
+  ],
+  "native_evidence": "NONE; synthetic positive/negative fixtures test the reference comparisons only."
+}

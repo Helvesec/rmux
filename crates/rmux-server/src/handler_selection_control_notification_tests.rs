@@ -15,8 +15,8 @@ fn session_name(value: &str) -> SessionName {
 }
 
 async fn new_session(handler: &RequestHandler, name: &SessionName) {
-    assert!(matches!(
-        handler
+    crate::session_fixture::assert_new_session(
+        &handler
             .handle(Request::NewSession(NewSessionRequest {
                 session_name: name.clone(),
                 detached: true,
@@ -24,8 +24,7 @@ async fn new_session(handler: &RequestHandler, name: &SessionName) {
                 environment: None,
             }))
             .await,
-        Response::NewSession(_)
-    ));
+    );
 }
 
 async fn new_window(
@@ -491,7 +490,7 @@ async fn break_pane_orders_source_selection_layout_add_and_destination_selection
             .to_string();
         let new_window = session
             .windows()
-            .values()
+            .map(|(_, window)| window)
             .find(|window| window.id().to_string() != source_window_id)
             .expect("break destination exists");
         let new_window_id = new_window.id().to_string();

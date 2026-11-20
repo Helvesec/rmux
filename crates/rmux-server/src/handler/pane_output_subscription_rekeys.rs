@@ -51,6 +51,7 @@ impl PaneOutputSubscriptionKeySnapshot {
             state
                 .sessions
                 .iter()
+                .map(|session| (session.name(), session))
                 .map(|(session_name, _)| session_name.clone()),
         )
     }
@@ -65,7 +66,7 @@ impl PaneOutputSubscriptionKeySnapshot {
             .flat_map(|session| {
                 session
                     .windows()
-                    .values()
+                    .map(|(_, window)| window)
                     .flat_map(|window| window.panes().iter().map(rmux_core::Pane::id))
             })
             .collect::<BTreeSet<_>>();
@@ -144,7 +145,12 @@ fn related_session_family(state: &HandlerState, roots: &[SessionName]) -> HashSe
         let window_indices = state
             .sessions
             .session(&session_name)
-            .map(|session| session.windows().keys().copied().collect::<Vec<_>>())
+            .map(|session| {
+                session
+                    .windows()
+                    .map(|(index, _)| index)
+                    .collect::<Vec<_>>()
+            })
             .unwrap_or_default();
         for window_index in window_indices {
             pending.extend(state.window_linked_session_family_list(&session_name, window_index));

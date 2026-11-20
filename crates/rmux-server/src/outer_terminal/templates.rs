@@ -27,10 +27,34 @@ pub(super) fn render_string_template(template: &str, arg: &str) -> String {
     template.replace("%p1%s", &sanitize_osc_payload(arg))
 }
 
-pub(super) fn render_string_string_template(template: &str, first: &str, second: &str) -> String {
-    template
-        .replace("%p1%s", &sanitize_osc_payload(first))
-        .replace("%p2%s", &sanitize_osc_payload(second))
+pub(super) fn render_clipboard_template(template: &str, encoded: &str) -> Option<String> {
+    // Ms is expanded with two string arguments: the selection and its data.
+    // tmux's checked terminfo expansion rejects a different parameter signature,
+    // even when an explicit buffer command bypasses the automatic-copy policy.
+    let mut remaining = template;
+    let mut rendered = String::with_capacity(template.len() + encoded.len());
+    let mut parameters = [false; 2];
+    while let Some(offset) = remaining.find('%') {
+        rendered.push_str(&remaining[..offset]);
+        remaining = &remaining[offset..];
+        if let Some(rest) = remaining.strip_prefix("%%") {
+            rendered.push('%');
+            remaining = rest;
+        } else if let Some(rest) = remaining.strip_prefix("%p1%s") {
+            // Buffer commands use the terminal's default selection ("").
+            parameters[0] = true;
+            remaining = rest;
+        } else if let Some(rest) = remaining.strip_prefix("%p2%s") {
+            rendered.push_str(encoded);
+            parameters[1] = true;
+            remaining = rest;
+        } else {
+            // Do not send unexpanded or mistyped terminfo expressions.
+            return None;
+        }
+    }
+    rendered.push_str(remaining);
+    parameters.into_iter().all(|used| used).then_some(rendered)
 }
 
 pub(super) fn render_int_template(template: &str, value: u32) -> String {

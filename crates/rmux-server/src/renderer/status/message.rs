@@ -1,6 +1,4 @@
-use rmux_core::{
-    format_skip_delimiter, formats::FormatVariables, OptionStore, Session, Utf8Config,
-};
+use rmux_core::{OptionStore, Utf8Config};
 use rmux_proto::OptionName;
 
 use crate::format_runtime::{render_runtime_template, RuntimeFormatContext};
@@ -9,7 +7,7 @@ use super::super::{apply_runtime_style_overlay, format_draw_line, FormattedLine}
 use super::{active_format_context, resolved_status_style, sanitize_status_text};
 
 pub(in crate::renderer) fn format_status_message_line(
-    session: &Session,
+    session: rmux_core::ManagedSessionView<'_>,
     options: &OptionStore,
     width: usize,
     message: &str,
@@ -29,7 +27,6 @@ pub(in crate::renderer) fn format_status_message_line(
         .resolve(Some(session.name()), OptionName::MessageFormat)
         .unwrap_or("#{message}");
     let expanded = render_runtime_template(template, &runtime, true);
-    let expanded = expand_format_draw_style_clauses(&expanded, &runtime);
     let style_option = if command_prompt {
         OptionName::MessageCommandStyle
     } else {
@@ -46,39 +43,4 @@ pub(in crate::renderer) fn format_status_message_line(
         width,
         &Utf8Config::from_options(options),
     )
-}
-
-fn expand_format_draw_style_clauses<V>(line: &str, variables: &V) -> String
-where
-    V: FormatVariables + ?Sized,
-{
-    let bytes = line.as_bytes();
-    let mut expanded = String::with_capacity(line.len());
-    let mut index = 0_usize;
-
-    while index < bytes.len() {
-        if bytes[index] == b'#' && bytes.get(index + 1) == Some(&b'[') {
-            if let Some(end_offset) = format_skip_delimiter(&line[index + 2..], b"]") {
-                let clause_start = index + 2;
-                let clause_end = clause_start + end_offset;
-                expanded.push_str("#[");
-                expanded.push_str(&render_runtime_template(
-                    &line[clause_start..clause_end],
-                    variables,
-                    false,
-                ));
-                expanded.push(']');
-                index = clause_end + 1;
-                continue;
-            }
-        }
-
-        let Some(ch) = line[index..].chars().next() else {
-            break;
-        };
-        expanded.push(ch);
-        index += ch.len_utf8();
-    }
-
-    expanded
 }

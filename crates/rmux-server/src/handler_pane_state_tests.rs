@@ -39,7 +39,7 @@ async fn create_session_with_pane(
             environment: None,
         }))
         .await;
-    assert!(matches!(response, Response::NewSession(_)), "{response:?}");
+    crate::session_fixture::assert_new_session(&response);
 
     let target = PaneTarget::new(session.clone(), 0);
     let pane_id = {
@@ -423,6 +423,46 @@ async fn pane_state_late_subscription_after_died_kept_receives_killed_close() {
         }
         response => panic!("late subscription should receive final killed close, got {response:?}"),
     }
+}
+
+#[tokio::test]
+async fn pane_state_subscription_after_died_kept_receives_retained_close() {
+    let handler = RequestHandler::new();
+    let (_session, target, pane_id) =
+        create_session_with_pane(&handler, "pane-state-subscribe-after-died-kept").await;
+
+    handler.record_pane_state_change(
+        pane_id,
+        Some(1),
+        PaneStateChange::Closed {
+            reason: PaneStateClosedReason::DiedKept,
+        },
+    );
+    let closed_revision = handler
+        .pane_state_journal
+        .lock()
+        .expect("pane-state journal lock should not be poisoned")
+        .current_revision();
+    let subscription_id = subscribe(&handler, 107, target, false, false).await;
+
+    match read_cursor(&handler, 107, subscription_id, closed_revision).await {
+        Response::PaneStateCursor(response) => {
+            assert_eq!(response.next_revision, closed_revision);
+            assert!(matches!(
+                response.events.as_slice(),
+                [PaneStateEventDto::Closed {
+                    revision,
+                    pane_id: event_pane_id,
+                    reason: PaneStateClosedReason::DiedKept,
+                }] if *revision == closed_revision && *event_pane_id == pane_id
+            ));
+        }
+        response => panic!("subscription after exit should receive the close, got {response:?}"),
+    }
+    assert!(matches!(
+        read_cursor(&handler, 107, subscription_id, closed_revision).await,
+        Response::Error(_)
+    ));
 }
 
 #[tokio::test]
@@ -1724,3 +1764,7 @@ async fn assert_closed_event_with_reason(
         response => panic!("pane-state cursor failed: {response:?}"),
     }
 }
+
+#[cfg(windows)]
+#[path = "handler_pane_state_tests/windows_eof.rs"]
+mod windows_eof;

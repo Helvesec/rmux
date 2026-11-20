@@ -99,6 +99,55 @@ impl SessionStore {
     }
 }
 
+impl crate::ManagedSessionStore {
+    /// Resolves an exact target by borrowing canonical managed state.
+    pub fn resolve_session(
+        &self,
+        target: &Target,
+    ) -> Result<crate::ManagedSessionView<'_>, RmuxError> {
+        self.session(target.session_name())
+            .ok_or_else(|| session_not_found(target.session_name()))
+    }
+
+    /// Resolves an exact target by borrowing canonical managed state.
+    pub fn resolve_window(&self, target: &Target) -> Result<&Window, RmuxError> {
+        let session = self.resolve_session(target)?;
+        session
+            .window_at(match target {
+                Target::Session(_) => session.active_window_index(),
+                Target::Window(t) => t.window_index(),
+                Target::Pane(t) => t.window_index(),
+            })
+            .ok_or_else(|| window_not_found(target))
+    }
+
+    /// Resolves an exact target by borrowing canonical managed state.
+    pub fn resolve_pane(&self, target: &Target) -> Result<&Pane, RmuxError> {
+        match target {
+            Target::Pane(pane_target) => self
+                .resolve_window(target)?
+                .pane(pane_target.pane_index())
+                .ok_or_else(|| pane_not_found(pane_target)),
+            _ => Err(pane_target_required(target)),
+        }
+    }
+
+    /// Resolves an exact target by borrowing canonical managed state.
+    pub fn resolve_effective_pane(&self, target: &Target) -> Result<&Pane, RmuxError> {
+        match target {
+            Target::Session(_) => self
+                .resolve_session(target)?
+                .active_pane()
+                .ok_or_else(|| active_pane_not_found(target)),
+            Target::Window(_) => self
+                .resolve_window(target)?
+                .active_pane()
+                .ok_or_else(|| active_pane_not_found(target)),
+            Target::Pane(_) => self.resolve_pane(target),
+        }
+    }
+}
+
 fn session_not_found(session_name: &SessionName) -> RmuxError {
     RmuxError::SessionNotFound(session_name.to_string())
 }

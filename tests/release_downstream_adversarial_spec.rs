@@ -151,7 +151,7 @@ from downstream_channels import read_object
 spec = importlib.util.spec_from_file_location('validate_contracts', 'scripts/release/validate-contracts.py')
 validate_contracts = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(validate_contracts)
-with tempfile.TemporaryDirectory(dir=pathlib.Path.cwd()) as root:
+with tempfile.TemporaryDirectory(dir=pathlib.Path.cwd().parent) as root:
     path = pathlib.Path(root) / 'duplicate.json'
     path.write_text('{"authority":false,"authority":true}\n', encoding='utf-8')
     for reader in (
@@ -294,7 +294,7 @@ from downstream_plan import expected_channel_entries
 spec = importlib.util.spec_from_file_location('channel_summary', 'scripts/release/channel-summary.py')
 module = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(module)
-with tempfile.TemporaryDirectory() as root:
+with tempfile.TemporaryDirectory(dir=pathlib.Path.cwd().parent) as root:
     root = pathlib.Path(root)
     plan_path = root / 'plan.json'
     plan = {

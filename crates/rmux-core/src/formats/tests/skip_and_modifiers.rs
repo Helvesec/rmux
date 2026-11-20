@@ -1,6 +1,22 @@
 use super::*;
 
 #[test]
+fn trailing_hash_survives_shared_expansion() {
+    for (template, expected) in [("#", ""), ("a#", "a"), ("#{pane_id}#", "%4")] {
+        assert_eq!(
+            render_template(template, &StaticWindowValues),
+            expected,
+            "{template}"
+        );
+        assert_eq!(
+            super::super::render_template_preserving_jobs(template, &StaticWindowValues),
+            expected,
+            "preserving jobs: {template}"
+        );
+    }
+}
+
+#[test]
 fn format_skip_basic_delimiter() {
     assert_eq!(format_skip(b"hello,world", b","), Some(5));
     // Bare `}` at depth 0 decrements brackets to -1, so it's not found.

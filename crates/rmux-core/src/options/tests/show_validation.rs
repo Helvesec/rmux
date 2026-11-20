@@ -1,6 +1,47 @@
 use super::*;
 
 #[test]
+fn command_option_show_preserves_command_list_syntax() {
+    let mut store = OptionStore::new();
+    let value = "display-message -p FIRST";
+    store
+        .set_by_name(
+            OptionScopeSelector::ServerGlobal,
+            "default-client-command",
+            Some(value.to_owned()),
+            SetOptionMode::Replace,
+            false,
+            false,
+            false,
+        )
+        .unwrap();
+    for mode in [ShowOptionsMode::Resolved, ShowOptionsMode::Explicit] {
+        assert_eq!(
+            store
+                .show_options_lines_with_mode_filtered(
+                    &OptionScopeSelector::ServerGlobal,
+                    Some("default-client-command"),
+                    false,
+                    mode
+                )
+                .unwrap(),
+            [format!("default-client-command {value}")]
+        );
+        assert_eq!(
+            store
+                .show_options_lines_with_mode_filtered(
+                    &OptionScopeSelector::ServerGlobal,
+                    Some("default-client-command"),
+                    true,
+                    mode
+                )
+                .unwrap(),
+            [value.to_owned()]
+        );
+    }
+}
+
+#[test]
 fn show_options_lines_render_names_or_values_for_the_selected_scope() {
     let mut store = OptionStore::new();
     let alpha = session_name("alpha");
@@ -571,6 +612,34 @@ fn literal_style_options_reject_invalid_styles() {
 }
 
 #[test]
+fn literal_style_options_reject_non_ascii_styles_without_panicking() {
+    // tmux 3.7b: `set -g status-style 'ab\u{e9}'` -> "invalid style: ab\u{e9}", rc=1.
+    let mut store = OptionStore::new();
+    for value in ["ab\u{e9}", "fill\u{e9}", "fg=\u{e9}"] {
+        let expected = RmuxError::InvalidSetOption(format!("invalid style: {value}"));
+        let client_error = crate::validate_option_name_mutation(
+            "status-style",
+            &OptionScopeSelector::SessionGlobal,
+            SetOptionMode::Replace,
+            Some(value),
+            false,
+        )
+        .expect_err("non-ASCII style should fail validation");
+        assert_eq!(client_error, expected, "{value:?}");
+        let error = store
+            .set(
+                ScopeSelector::Global,
+                OptionName::StatusStyle,
+                value.to_owned(),
+                SetOptionMode::Replace,
+            )
+            .expect_err("non-ASCII style should be rejected");
+        assert_eq!(error, expected, "{value:?}");
+    }
+    assert_eq!(store.global_value(OptionName::StatusStyle), None);
+}
+
+#[test]
 fn style_options_with_format_expansions_skip_eager_literal_validation() {
     let mut store = OptionStore::new();
     let alpha = session_name("alpha");
@@ -745,4 +814,134 @@ fn show_options_inheritance_markers_do_not_mark_global_defaults() {
         )
         .expect("global window option shows");
     assert_eq!(window_global, vec!["pane-border-lines single".to_owned()]);
+}
+
+#[test]
+fn unfiltered_global_listings_include_tmux37_options_in_the_observed_scope() {
+    let store = OptionStore::new();
+    let scopes = [
+        OptionScopeSelector::ServerGlobal,
+        OptionScopeSelector::SessionGlobal,
+        OptionScopeSelector::WindowGlobal,
+    ];
+    let listings: Vec<_> = scopes
+        .iter()
+        .map(|scope| store.show_options_lines(scope, false).unwrap())
+        .collect();
+
+    // tmux 3.7b's unfiltered -s, -g and -gw listings place these options in
+    // exactly one of these global scopes. Include an unchanged neighbour
+    // from each scope. These expectations do not come from registry masks.
+    for (name, expected_scope) in [
+        ("allow-set-title", 2),
+        ("codepoint-widths", 0),
+        ("copy-mode-position-format", 2),
+        ("copy-mode-position-style", 2),
+        ("copy-mode-selection-style", 2),
+        ("default-client-command", 0),
+        ("extended-keys-format", 0),
+        ("focus-follows-mouse", 1),
+        ("get-clipboard", 0),
+        ("initial-repeat-time", 1),
+        ("input-buffer-size", 0),
+        ("message-format", 1),
+        ("pane-scrollbars", 2),
+        ("pane-scrollbars-position", 2),
+        ("pane-scrollbars-style", 2),
+        ("pane-status-current-style", 2),
+        ("pane-status-style", 2),
+        ("prefix-timeout", 0),
+        ("prompt-command-cursor-style", 1),
+        ("prompt-cursor-colour", 1),
+        ("prompt-cursor-style", 1),
+        ("session-status-current-style", 2),
+        ("session-status-style", 2),
+        ("tiled-layout-max-columns", 2),
+        ("variation-selector-always-wide", 0),
+        ("buffer-limit", 0),
+        ("status", 1),
+        ("allow-rename", 2),
+    ] {
+        for (index, lines) in listings.iter().enumerate() {
+            let listed: Vec<_> = lines
+                .iter()
+                .filter(|line| {
+                    line.split_whitespace().next().unwrap().split('[').next() == Some(name)
+                })
+                .cloned()
+                .collect();
+            assert_eq!(
+                !listed.is_empty(),
+                index == expected_scope,
+                "{name} in global scope {index}"
+            );
+            if index == expected_scope {
+                let named = store
+                    .show_options_lines_filtered(&scopes[index], Some(name), false)
+                    .unwrap();
+                assert_eq!(listed, named, "{name}: named and unfiltered rendering");
+            }
+        }
+    }
+}
+
+#[test]
+fn pane_border_format_default_preserves_tmux37_mouse_controls() {
+    let store = OptionStore::new();
+    let expected = concat!(
+        "#{?pane_active,#[reverse],}#{pane_index}#[default] \"#{pane_title}\"",
+        "#{?#{mouse},#[align=right]#[range=control|8][#{?#{window_zoomed_flag},u,z}]",
+        "#[norange]#[range=control|9][x]#[norange],}",
+    );
+    assert_eq!(
+        store.resolve(None, OptionName::PaneBorderFormat),
+        Some(expected)
+    );
+    let values = store
+        .show_options_lines_filtered(
+            &OptionScopeSelector::WindowGlobal,
+            Some("pane-border-format"),
+            true,
+        )
+        .unwrap();
+    assert_eq!(values, vec![expected.to_owned()]);
+}
+
+#[test]
+fn inherited_empty_array_named_and_full_listings_follow_distinct_tmux_paths() {
+    let store = OptionStore::new();
+    for scope in [
+        OptionScopeSelector::Window(WindowTarget::with_window(session_name("alpha"), 0)),
+        OptionScopeSelector::Pane(PaneTarget::with_window(session_name("alpha"), 0, 0)),
+    ] {
+        assert_eq!(
+            store
+                .show_options_lines_with_mode_filtered(
+                    &scope,
+                    Some("pane-colours"),
+                    false,
+                    ShowOptionsMode::ResolvedWithInheritanceMarkers
+                )
+                .unwrap(),
+            vec!["pane-colours"]
+        );
+        assert!(store
+            .show_options_lines_with_mode_filtered(
+                &scope,
+                Some("pane-colours"),
+                true,
+                ShowOptionsMode::ResolvedWithInheritanceMarkers
+            )
+            .unwrap()
+            .is_empty());
+        let all = store
+            .show_options_lines_with_mode(
+                &scope,
+                false,
+                ShowOptionsMode::ResolvedWithInheritanceMarkers,
+            )
+            .unwrap();
+        assert!(all.iter().any(|line| line == "pane-colours*"));
+        assert!(!all.iter().any(|line| line == "pane-colours"));
+    }
 }

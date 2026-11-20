@@ -22,19 +22,6 @@ use std::os::windows::process::CommandExt as _;
 ))]
 use std::sync::Arc;
 
-#[cfg(unix)]
-use rustix::process::Pid;
-#[cfg(all(
-    unix,
-    not(any(
-        target_os = "cygwin",
-        target_os = "horizon",
-        target_os = "openbsd",
-        target_os = "redox",
-        target_os = "wasi"
-    ))
-))]
-use rustix::process::{waitid, WaitId, WaitIdOptions};
 #[cfg(windows)]
 use windows_sys::Win32::System::Threading::{CREATE_NO_WINDOW, CREATE_SUSPENDED};
 
@@ -45,6 +32,7 @@ use crate::process::ProcessJob;
 mod terminal;
 #[cfg(unix)]
 pub use terminal::ForegroundTerminalGuard;
+mod group_signals;
 mod termination;
 #[cfg(all(
     unix,
@@ -339,155 +327,6 @@ impl ProcessTreeChild {
         &mut self.child
     }
 
-    /// Reports whether the direct child has exited without making its Unix
-    /// process-group identifier reusable before a possible tree signal.
-    pub fn has_exited(&mut self) -> io::Result<bool> {
-        if !self.armed {
-            return Ok(true);
-        }
-
-        #[cfg(all(
-            unix,
-            not(any(
-                target_os = "cygwin",
-                target_os = "horizon",
-                target_os = "openbsd",
-                target_os = "redox",
-                target_os = "wasi"
-            ))
-        ))]
-        {
-            let pid = Pid::from_raw(self.process_group)
-                .ok_or_else(|| io::Error::other("child process id is zero"))?;
-            Ok(waitid(
-                WaitId::Pid(pid),
-                WaitIdOptions::EXITED | WaitIdOptions::NOHANG | WaitIdOptions::NOWAIT,
-            )?
-            .is_some_and(|status| status.exited() || status.killed() || status.dumped()))
-        }
-
-        #[cfg(any(
-            not(unix),
-            all(
-                unix,
-                any(
-                    target_os = "cygwin",
-                    target_os = "horizon",
-                    target_os = "openbsd",
-                    target_os = "redox",
-                    target_os = "wasi"
-                )
-            )
-        ))]
-        {
-            self.child.try_wait().map(|status| status.is_some())
-        }
-    }
-
-    /// Reports whether the direct Unix child is stopped without consuming the
-    /// status that remains owned by [`Self::wait`].
-    #[cfg(unix)]
-    pub fn has_stopped(&mut self) -> io::Result<bool> {
-        if !self.armed {
-            return Ok(false);
-        }
-
-        #[cfg(not(any(
-            target_os = "cygwin",
-            target_os = "horizon",
-            target_os = "openbsd",
-            target_os = "redox",
-            target_os = "wasi"
-        )))]
-        {
-            let pid = Pid::from_raw(self.process_group)
-                .ok_or_else(|| io::Error::other("child process id is zero"))?;
-            Ok(waitid(
-                WaitId::Pid(pid),
-                WaitIdOptions::STOPPED | WaitIdOptions::NOHANG | WaitIdOptions::NOWAIT,
-            )?
-            .is_some_and(|status| status.stopped()))
-        }
-
-        #[cfg(any(
-            target_os = "cygwin",
-            target_os = "horizon",
-            target_os = "openbsd",
-            target_os = "redox",
-            target_os = "wasi"
-        ))]
-        {
-            Ok(false)
-        }
-    }
-
-    /// Forwards a raw Unix signal to the complete child process group.
-    #[cfg(all(
-        unix,
-        not(any(
-            target_os = "cygwin",
-            target_os = "horizon",
-            target_os = "openbsd",
-            target_os = "redox",
-            target_os = "wasi"
-        ))
-    ))]
-    pub fn forward_signal(&mut self, signal: i32) -> io::Result<()> {
-        if !self.armed {
-            return Ok(());
-        }
-        let result = unsafe {
-            // SAFETY: `process_group` is the positive PID of the child group
-            // leader created by this value. A negative PID addresses exactly
-            // that process group, and the caller supplies an OS signal value.
-            libc::kill(-self.process_group, signal)
-        };
-        if result == 0 {
-            return Ok(());
-        }
-        let error = io::Error::last_os_error();
-        if error.raw_os_error() == Some(libc::ESRCH)
-            || (error.raw_os_error() == Some(libc::EPERM) && self.has_exited()?)
-        {
-            Ok(())
-        } else {
-            Err(error)
-        }
-    }
-
-    /// Forwards a raw Unix signal to the direct child on targets that cannot
-    /// inspect an exited group leader without reaping it.
-    #[cfg(all(
-        unix,
-        any(
-            target_os = "cygwin",
-            target_os = "horizon",
-            target_os = "openbsd",
-            target_os = "redox",
-            target_os = "wasi"
-        )
-    ))]
-    pub fn forward_signal(&mut self, signal: i32) -> io::Result<()> {
-        if !self.armed {
-            return Ok(());
-        }
-        let result = unsafe {
-            // SAFETY: `process_group` is also the direct child PID. Limiting
-            // the signal to that PID avoids a recycled-group race on targets
-            // without waitid(WNOWAIT).
-            libc::kill(self.process_group, signal)
-        };
-        if result == 0 {
-            return Ok(());
-        }
-        let error = io::Error::last_os_error();
-        if error.raw_os_error() == Some(libc::ESRCH) {
-            Ok(())
-        } else {
-            Err(error)
-        }
-    }
-
     /// Force-terminates the direct child and every descendant in its isolated
     /// process tree.
     pub fn terminate(&mut self) -> io::Result<()> {
@@ -550,12 +389,7 @@ impl ProcessTreeChild {
         let status = if let Some(status) = self.process_group_control.try_reap(&mut self.child)? {
             status
         } else {
-            let pid = Pid::from_raw(self.process_group)
-                .ok_or_else(|| io::Error::other("child process id is zero"))?;
-            let _ = waitid(
-                WaitId::Pid(pid),
-                WaitIdOptions::EXITED | WaitIdOptions::NOWAIT,
-            )?;
+            self.process_group_control.wait_for_leader_exit()?;
             self.process_group_control.reap_exited(&mut self.child)?
         };
 

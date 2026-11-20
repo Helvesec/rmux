@@ -1,4 +1,6 @@
-use rmux_core::command_parser::{CommandArgument, ParsedCommand, ParsedCommands};
+use rmux_core::command_parser::{
+    check_tmux_arguments, CommandArgument, ParsedCommand, ParsedCommands,
+};
 use rmux_proto::RmuxError;
 
 const CONTROL_COMMAND_MAX_ARGUMENTS: usize = 1000;
@@ -44,7 +46,9 @@ fn validate_control_command(
             validate_control_commands(nested, command_count)?;
         }
     }
-    Ok(())
+    // tmux builds nested brace blocks before the command that carries them,
+    // and rejects the whole line as a parse error before anything runs.
+    check_tmux_arguments(command).map_err(|error| RmuxError::Server(error.to_string()))
 }
 
 #[cfg(test)]
@@ -63,5 +67,32 @@ mod tests {
         let error = validate_control_command_arguments(parsed)
             .expect_err("outer and nested commands must share one aggregate limit");
         assert!(error.to_string().contains("too many commands"), "{error}");
+    }
+
+    #[test]
+    fn tmux_argument_errors_reject_the_line_nested_blocks_first() {
+        for (line, cause) in [
+            (
+                "display-message -p -:",
+                "command display-message: invalid flag -:",
+            ),
+            (
+                "display-message -p FIRST ; display-message -Q",
+                "command display-message: unknown flag -Q",
+            ),
+            (
+                "if-shell -F 1 -Z { display-message -Q }",
+                "command display-message: unknown flag -Q",
+            ),
+        ] {
+            let parsed = CommandParser::new().parse(line).expect("line parses");
+            let error = validate_control_command_arguments(parsed)
+                .expect_err("tmux rejects this line before running it");
+            assert_eq!(
+                error,
+                rmux_proto::RmuxError::Server(cause.to_owned()),
+                "{line}"
+            );
+        }
     }
 }

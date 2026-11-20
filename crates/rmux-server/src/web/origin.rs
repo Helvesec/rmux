@@ -265,7 +265,7 @@ mod tests {
             ),
             ("http://localhost:9777", "http://localhost:9777", true),
             ("http://127.0.0.1:9777", "http://127.0.0.1:9777", true),
-            ("http://192.168.1.5", "http://192.168.1.5", false),
+            ("http://192.0.2.5", "http://192.0.2.5", false),
         ];
         for (received, expected, accepted) in cases {
             assert_eq!(

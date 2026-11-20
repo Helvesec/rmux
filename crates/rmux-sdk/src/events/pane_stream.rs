@@ -227,7 +227,7 @@ impl<T> RecoverablePaneStream<T> {
                 .back()
                 .is_some_and(|event: &MappedEvent<T>| event.terminal)
             {
-                return Err(RmuxError::protocol(rmux_proto::RmuxError::Server(
+                return Err(RmuxError::from_proto(rmux_proto::RmuxError::Server(
                     "rmux daemon sent pane-stream events after a terminal end".to_owned(),
                 )));
             }
@@ -250,7 +250,7 @@ impl<T> RecoverablePaneStream<T> {
         if response_id == self.inner.subscription_id {
             return Ok(());
         }
-        Err(RmuxError::protocol(rmux_proto::RmuxError::Server(format!(
+        Err(RmuxError::from_proto(rmux_proto::RmuxError::Server(format!(
             "rmux daemon sent subscription id {} in `pane-stream-cursor` response for subscription {}",
             response_id.as_u64(),
             self.inner.subscription_id.as_u64()
@@ -294,7 +294,7 @@ fn validate_subscribed_identity(
 }
 
 fn foreign_pane_stream(detail: String) -> RmuxError {
-    RmuxError::protocol(rmux_proto::RmuxError::Server(format!(
+    RmuxError::from_proto(rmux_proto::RmuxError::Server(format!(
         "rmux daemon opened a pane stream for {detail}"
     )))
 }
@@ -325,7 +325,7 @@ pub(super) fn end_from_proto(
 }
 
 pub(super) fn unsupported_stream_variant(kind: &str) -> RmuxError {
-    RmuxError::protocol(rmux_proto::RmuxError::Server(format!(
+    RmuxError::from_proto(rmux_proto::RmuxError::Server(format!(
         "rmux daemon sent an unsupported pane-stream {kind} variant"
     )))
 }

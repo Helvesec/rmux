@@ -12,17 +12,11 @@ async fn replace_transcript_contents(
             .transcript_handle(target)
             .expect("session transcript must exist")
     };
-    let history_limit = transcript
-        .lock()
-        .expect("pane transcript mutex must not be poisoned")
-        .history_limit();
+    let history_limit = transcript.lock().history_limit();
     let mut screen = rmux_core::Screen::new(size, history_limit);
     let mut parser = rmux_core::input::InputParser::new();
     parser.parse(content, &mut screen);
-    transcript
-        .lock()
-        .expect("pane transcript mutex must not be poisoned")
-        .set_screen_for_test(screen);
+    transcript.lock().set_screen_for_test(screen);
 }
 
 #[tokio::test]

@@ -1,12 +1,11 @@
 use std::fs;
-#[cfg(unix)]
-use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use super::control_support::{with_control_queue_identity, ControlClientIdentity};
+use super::test_support::SERVER_SIGNAL_LIVENESS;
 use super::RequestHandler;
 use crate::control::{ControlModeUpgrade, ControlServerEvent, CONTROL_SERVER_EVENT_CAPACITY};
 use crate::handler::scripting_support::QueueExecutionContext;
@@ -107,13 +106,11 @@ fn write_config(path: &Path, contents: &str) {
 }
 
 fn write_executable_script(path: &Path, contents: &str) {
-    write_config(path, contents);
-    #[cfg(unix)]
-    {
-        let mut permissions = fs::metadata(path).expect("script metadata").permissions();
-        permissions.set_mode(0o755);
-        fs::set_permissions(path, permissions).expect("script permissions");
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent).expect("script parent directory");
     }
+    crate::test_env::executable_fixture::write_executable(path, contents, 0o755)
+        .expect("write script");
 }
 
 fn shell_quote(path: &Path) -> String {
@@ -155,7 +152,7 @@ async fn use_platform_test_shell(handler: &RequestHandler) {
 }
 
 async fn wait_for_named_buffer(handler: &RequestHandler, name: &str, expected: &[u8]) {
-    tokio::time::timeout(background_shell_test_timeout(), async {
+    tokio::time::timeout(SERVER_SIGNAL_LIVENESS, async {
         loop {
             if let Some(output) = handler
                 .handle(Request::ShowBuffer(ShowBufferRequest {
@@ -176,7 +173,7 @@ async fn wait_for_named_buffer(handler: &RequestHandler, name: &str, expected: &
 }
 
 async fn wait_for_detached_request_count(handler: &RequestHandler, expected: usize) {
-    tokio::time::timeout(background_shell_test_timeout(), async {
+    tokio::time::timeout(SERVER_SIGNAL_LIVENESS, async {
         loop {
             let active = handler
                 .active_detached_requests
@@ -189,23 +186,6 @@ async fn wait_for_detached_request_count(handler: &RequestHandler, expected: usi
     })
     .await
     .unwrap_or_else(|_| panic!("detached request count did not become {expected}"));
-}
-
-fn background_shell_test_timeout() -> std::time::Duration {
-    #[cfg(windows)]
-    {
-        // A cold Windows PowerShell process can start slowly when hosted CI is
-        // compiling and running several test shards. This is a liveness bound,
-        // not a process-start latency assertion.
-        std::time::Duration::from_secs(30)
-    }
-    #[cfg(not(windows))]
-    {
-        // Background shell startup competes with thousands of async tests in
-        // the full server suite. Keep this as a bounded liveness budget, not a
-        // scheduler-latency assertion.
-        std::time::Duration::from_secs(8)
-    }
 }
 
 async fn register_control_for_session(
@@ -243,7 +223,7 @@ async fn create_background_identity_session(handler: &RequestHandler, session_na
             environment: None,
         }))
         .await;
-    assert!(matches!(response, Response::NewSession(_)), "{response:?}");
+    crate::session_fixture::assert_new_session(&response);
 }
 
 async fn replace_background_identity_session(handler: &RequestHandler, session_name: SessionName) {
@@ -264,7 +244,7 @@ async fn wait_for_active_window_name(
     session_name: &SessionName,
     expected: &str,
 ) {
-    tokio::time::timeout(background_shell_test_timeout(), async {
+    tokio::time::timeout(SERVER_SIGNAL_LIVENESS, async {
         loop {
             let matches = {
                 let state = handler.state.lock().await;
@@ -286,7 +266,7 @@ async fn wait_for_active_window_name(
 }
 
 async fn wait_for_background_waiter(handler: &RequestHandler, channel: &str) {
-    tokio::time::timeout(background_shell_test_timeout(), async {
+    tokio::time::timeout(SERVER_SIGNAL_LIVENESS, async {
         loop {
             if handler.wait_for_counts(channel).0 == 1 {
                 return;
@@ -392,6 +372,9 @@ mod source_file_core;
 #[path = "handler_scripting_tests/source_file_conditions.rs"]
 mod source_file_conditions;
 
+#[path = "handler_scripting_tests/source_file_option_values.rs"]
+mod source_file_option_values;
+
 #[path = "handler_scripting_tests/if_shell.rs"]
 mod if_shell;
 
@@ -406,6 +389,9 @@ mod parsed_queue_cwd;
 
 #[path = "handler_scripting_tests/queued_inventory.rs"]
 mod queued_inventory;
+
+#[path = "handler_scripting_tests/queue_client_freshness.rs"]
+mod queue_client_freshness;
 
 #[path = "handler_scripting_tests/queue_exact_target.rs"]
 mod queue_exact_target;
@@ -455,5 +441,17 @@ mod parser_flags;
 #[path = "handler_scripting_tests/parser_option_flags.rs"]
 mod parser_option_flags;
 
+#[path = "handler_scripting_tests/quiet_only_if_unset.rs"]
+mod quiet_only_if_unset;
+
 #[path = "handler_scripting_tests/select_layout_flags.rs"]
 mod select_layout_flags;
+
+#[path = "handler_scripting_tests/session_name_validation.rs"]
+mod session_name_validation;
+
+#[path = "handler_scripting_tests/runtime_execution.rs"]
+mod runtime_execution;
+
+#[path = "handler_scripting_tests/natural_window_option.rs"]
+mod natural_window_option;

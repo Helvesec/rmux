@@ -27,7 +27,7 @@ async fn create_window_listing_fixture(handler: &RequestHandler) {
                 environment: None,
             }))
             .await;
-        assert!(matches!(response, Response::NewSession(_)), "{response:?}");
+        crate::session_fixture::assert_new_session(&response);
         let response = handler
             .handle(Request::RenameWindow(rmux_proto::RenameWindowRequest {
                 target: WindowTarget::with_window(session.clone(), 0),

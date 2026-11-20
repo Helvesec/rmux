@@ -1,4 +1,6 @@
 mod common;
+mod invocation;
+pub(super) use invocation::InvocationBudget;
 mod discovery;
 mod pane_exit;
 mod session;
@@ -13,4 +15,7 @@ pub(crate) use discovery::{
 pub(crate) use session::run_with_session;
 pub(crate) use snapshot::run_pane_snapshot;
 pub(crate) use stream::{run_collect_pane_output, run_stream_pane};
-pub(crate) use wait::{run_send_keys_with_wait, run_wait_pane};
+pub(crate) use wait::{run_send_keys_with_wait, run_wait_pane_with_deadline};
+
+#[cfg(all(test, unix))]
+mod acceptance_tests;

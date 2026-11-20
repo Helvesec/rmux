@@ -12,8 +12,9 @@ Build or reuse a real release layout and run the tiny CLI release-review smoke:
   - tmux 3.7b is used as the authority for known CLI ambiguity cases when available
 
 Options:
-  --layout DIR         Reuse an existing package layout.
-  --target-dir DIR     Cargo target dir for release builds.
+  --layout DIR         Reuse or populate a package layout (inside the private
+                       target when candidate identity is active).
+  --target-dir DIR     Cargo target dir (defaults to CARGO_TARGET_DIR if set).
   --skip-build         Do not build; requires --layout.
   --tmux PATH          tmux binary to use for authority checks.
   --no-tmux            Skip tmux authority checks.
@@ -342,6 +343,13 @@ EOF
   [ "$("$RMUX" -L "$sock" show-buffer -b tiny-send-hook)" = "seed" ] ||
     die "successful tiny send-keys prefix resolution emitted command-error"
 
+  # Session-only targets must stay on the server-owned target-resolution path.
+  run_capture send_keys_session -L "$sock" send-keys -t prefixdemo C-l
+  assert_rc send_keys_session 0
+  assert_trace send_keys_session "rmux tiny: direct: send-keys"
+  [ "$("$RMUX" -L "$sock" show-buffer -b tiny-send-hook)" = "seed" ] ||
+    die "session-target send-keys emitted command-error"
+
   run_capture send_keys_missing -L "$sock" send-keys -t absent:0.0 C-l
   [ "$(cat "$SMOKE_ROOT/send_keys_missing.rc")" != "0" ] ||
     die "missing tiny send-keys target unexpectedly succeeded"
@@ -469,11 +477,17 @@ EOF
   ! grep -Fq "split-window: invalid target" "$SMOKE_ROOT/target_error_surface.err" ||
     die "tiny target error leaked command-prefixed invalid target message"
 
+  local expected_version_line
+  expected_version_line="$("$RMUX" -V)"
   run_capture long_version --version
-  [ "$(cat "$SMOKE_ROOT/long_version.rc")" != "0" ] || die "--version unexpectedly succeeded"
-  assert_trace long_version "rmux tiny: fallback: unsupported invocation"
-  grep -Fq "usage: rmux" "$SMOKE_ROOT/long_version.err" ||
-    die "--version fallback did not print tmux-compatible usage"
+  assert_rc long_version 0
+  assert_stdout_line long_version "$expected_version_line"
+  [ ! -s "$SMOKE_ROOT/long_version.err" ] || die "--version used a helper or wrote stderr"
+
+  run_capture multi_argv_version -V -x
+  assert_rc multi_argv_version 0
+  assert_stdout_line multi_argv_version "$expected_version_line"
+  [ ! -s "$SMOKE_ROOT/multi_argv_version.err" ] || die "-V used a helper or wrote stderr"
 
   cat >"$source_file" <<EOF
 source-file $missing
@@ -529,7 +543,7 @@ EOF
 
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 layout=""
-target_dir=""
+target_dir="${CARGO_TARGET_DIR:-}"
 skip_build=0
 SKIP_TMUX=0
 TMUX_BIN=""
@@ -573,6 +587,12 @@ cd "$repo_root"
 
 resolve_tmux_authority
 
+if [ -n "${RMUX_IDENTITY_HEAD:-}" ]; then
+  # Qualify the composition before compiling or touching a requested layout.
+  layout="$("${RMUX_PYTHON:-python3}" "$repo_root/scripts/tiny_smoke_identity.py" \
+    layout "$target_dir" "$layout")"
+fi
+
 if [ -z "$layout" ]; then
   layout="$(mktemp -d "${TMPDIR:-/tmp}/rmux-review-layout.XXXXXX")"
 fi
@@ -594,6 +614,11 @@ else
     *) target_dir="$repo_root/$target_dir" ;;
   esac
   build_layout "$target_dir" "$layout"
+fi
+
+if [ -n "${RMUX_IDENTITY_HEAD:-}" ]; then
+  "${RMUX_PYTHON:-python3}" "$repo_root/scripts/tiny_smoke_identity.py" \
+    verify "$target_dir" "$layout"
 fi
 
 RMUX="$layout/bin/rmux"

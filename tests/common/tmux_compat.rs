@@ -1,3 +1,5 @@
+use std::cell::RefCell;
+use std::collections::BTreeMap;
 use std::error::Error;
 use std::ffi::OsString;
 use std::fs;
@@ -6,7 +8,8 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
-use crate::common::{assert_socket_directory_empty, CliHarness};
+use crate::common::owned_daemon::DaemonLease;
+use crate::common::{assert_socket_directory_empty, default_socket_path_in, CliHarness};
 
 pub(crate) const TMUX_ORACLE_ENV: &str = "RMUX_TMUX_ORACLE";
 pub(crate) const FROZEN_TMUX_ENV: &str = "RMUX_FROZEN_TMUX";
@@ -35,6 +38,7 @@ pub(crate) struct TmuxCompatHarness {
     rmux: CliHarness,
     tmux_socket_dir: PathBuf,
     tmux_socket_path: PathBuf,
+    redirected_rmux_sockets: RefCell<BTreeMap<PathBuf, DaemonLease>>,
 }
 
 impl TmuxCompatHarness {
@@ -48,6 +52,7 @@ impl TmuxCompatHarness {
             rmux,
             tmux_socket_dir,
             tmux_socket_path,
+            redirected_rmux_sockets: RefCell::default(),
         })
     }
 
@@ -113,18 +118,50 @@ impl TmuxCompatHarness {
         command.args(argv);
         let environment_overrides = config.environment.overrides(self.rmux.tmpdir());
         config.environment.apply(&mut command, self.rmux.tmpdir());
-        run_bounded(
+        let mut redirected_socket = None;
+        if let Some(root) = &config.environment.tmpdir {
+            let socket = default_socket_path_in(root)?;
+            if socket != self.rmux_socket_path() {
+                let mut sockets = self.redirected_rmux_sockets.borrow_mut();
+                let lease = sockets
+                    .entry(socket.clone())
+                    .or_insert_with(DaemonLease::reserve);
+                lease.prepare(&socket)?;
+                lease.configure(&mut command);
+                redirected_socket = Some(socket);
+            }
+        }
+        let result = run_bounded(
             command,
             CommandCapture {
                 program: "rmux",
-                program_path: PathBuf::from(env!("CARGO_BIN_EXE_rmux")),
+                program_path: PathBuf::from(rmux_os::build_identity::cargo_binary(env!(
+                    "CARGO_BIN_EXE_rmux"
+                ))),
                 requested_argv: requested_argv(argv),
                 effective_argv: requested_argv(argv),
                 environment_overrides,
                 socket_dir: self.rmux_socket_dir().to_path_buf(),
                 timeout: config.timeout,
             },
-        )
+            |pid| {
+                if let Some(socket) = &redirected_socket {
+                    self.redirected_rmux_sockets
+                        .borrow_mut()
+                        .get_mut(socket)
+                        .unwrap()
+                        .launched(pid);
+                }
+            },
+        );
+        if let Some(socket) = redirected_socket {
+            self.redirected_rmux_sockets
+                .borrow_mut()
+                .get_mut(&socket)
+                .unwrap()
+                .capture(&socket)?;
+        }
+        result
     }
 
     fn run_tmux_with(
@@ -160,12 +197,16 @@ impl TmuxCompatHarness {
                 socket_dir: self.tmux_socket_dir.clone(),
                 timeout: config.timeout,
             },
+            |_| {},
         )
     }
 }
 
 impl Drop for TmuxCompatHarness {
     fn drop(&mut self) {
+        for (socket, lease) in self.redirected_rmux_sockets.get_mut().iter_mut() {
+            let _ = lease.shutdown(socket);
+        }
         shutdown_tmux_server(&self.tmux_socket_path);
         let _ = fs::remove_file(&self.tmux_socket_path);
         let _ = fs::remove_dir(&self.tmux_socket_dir);
@@ -484,7 +525,15 @@ fn oracle_candidate_path() -> (PathBuf, bool) {
     if let Some(path) = std::env::var_os(FROZEN_TMUX_ENV) {
         return (PathBuf::from(path), true);
     }
-    (PathBuf::from(DEFAULT_FROZEN_TMUX_PATH), false)
+    let recorded_path = PathBuf::from(DEFAULT_FROZEN_TMUX_PATH);
+    if !recorded_path.exists() && cfg!(target_os = "linux") {
+        if let Some(home) = std::env::var_os("HOME") {
+            // The local alias still requires the frozen version and hash (or
+            // matching source metadata); never discover an oracle through PATH.
+            return (PathBuf::from(home).join(".local/bin/tmux"), true);
+        }
+    }
+    (recorded_path, false)
 }
 
 fn tmux_oracle_required() -> bool {
@@ -512,8 +561,10 @@ fn is_system_tmux_path(path: &Path) -> bool {
 fn run_bounded(
     mut command: Command,
     capture: CommandCapture,
+    mut on_spawn: impl FnMut(u32),
 ) -> Result<CapturedCommand, Box<dyn Error>> {
     let mut child = command.spawn()?;
+    on_spawn(child.id());
     let deadline = Instant::now() + capture.timeout;
     let mut timed_out = false;
 

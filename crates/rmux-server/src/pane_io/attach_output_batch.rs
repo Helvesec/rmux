@@ -4,7 +4,9 @@ use rmux_core::events::OutputCursorItem;
 use rmux_core::TerminalPassthrough;
 
 #[cfg(any(unix, windows))]
-use super::types::PaneOutputReceiver;
+use super::deferred_passthrough::PaneOutputGeneration;
+#[cfg(any(unix, windows))]
+use super::types::{DrainedPaneOutput, PaneOutputReceiver};
 #[cfg(any(unix, windows))]
 use super::wire::warn_pane_output_gap;
 
@@ -19,6 +21,7 @@ pub(super) enum AttachOutputBatch {
     Closed,
     Gap,
     Events {
+        generation: PaneOutputGeneration,
         bytes: Vec<u8>,
         passthroughs: Vec<TerminalPassthrough>,
         passthrough_sequences: Vec<u64>,
@@ -37,6 +40,7 @@ impl AttachOutputBatch {
     /// batch.
     pub(super) fn covered_by_render_snapshot(self, before_sequence: u64) -> Self {
         let Self::Events {
+            generation,
             passthroughs,
             passthrough_sequences,
             close_sequence,
@@ -52,6 +56,7 @@ impl AttachOutputBatch {
             .filter(|(_, sequence)| *sequence < before_sequence)
             .unzip();
         Self::Events {
+            generation,
             bytes: Vec::new(),
             passthroughs,
             passthrough_sequences,
@@ -64,7 +69,7 @@ impl AttachOutputBatch {
 
 #[cfg(any(unix, windows))]
 pub(super) fn collect_attach_output_batch(
-    first_item: OutputCursorItem,
+    first_item: DrainedPaneOutput,
     receiver: Option<&mut PaneOutputReceiver>,
 ) -> AttachOutputBatch {
     collect_attach_output_batch_with_mode(first_item, receiver, ByteCollection::Collect)
@@ -72,7 +77,7 @@ pub(super) fn collect_attach_output_batch(
 
 #[cfg(any(unix, windows))]
 pub(super) fn collect_attach_output_batch_metadata(
-    first_item: OutputCursorItem,
+    first_item: DrainedPaneOutput,
     receiver: Option<&mut PaneOutputReceiver>,
 ) -> AttachOutputBatch {
     collect_attach_output_batch_with_mode(first_item, receiver, ByteCollection::Skip)
@@ -80,17 +85,21 @@ pub(super) fn collect_attach_output_batch_metadata(
 
 #[cfg(any(unix, windows))]
 fn collect_attach_output_batch_with_mode(
-    first_item: OutputCursorItem,
+    first_item: DrainedPaneOutput,
     receiver: Option<&mut PaneOutputReceiver>,
     byte_collection: ByteCollection,
 ) -> AttachOutputBatch {
-    let mut batch = AttachOutputBatchBuilder::new(byte_collection);
+    let DrainedPaneOutput {
+        generation,
+        item: first_item,
+    } = first_item;
+    let mut batch = AttachOutputBatchBuilder::new(byte_collection, generation);
     if let Some(result) = batch.push_first(first_item) {
         return result;
     }
     if let Some(receiver) = receiver {
         let limit = ATTACH_OUTPUT_BATCH_LIMIT.saturating_sub(1);
-        let pending = receiver.try_recv_batch(limit);
+        let pending = receiver.try_recv_batch_for_generation(generation, limit);
         if pending.len() == limit {
             batch.mark_sustained();
         }
@@ -110,6 +119,7 @@ fn collect_attach_output_batch_with_mode(
 #[derive(Default)]
 struct AttachOutputBatchBuilder {
     byte_collection: ByteCollection,
+    generation: u64,
     saw_output_bytes: bool,
     bytes_seen: usize,
     events_seen: usize,
@@ -123,9 +133,10 @@ struct AttachOutputBatchBuilder {
 
 #[cfg(any(unix, windows))]
 impl AttachOutputBatchBuilder {
-    fn new(byte_collection: ByteCollection) -> Self {
+    fn new(byte_collection: ByteCollection, generation: u64) -> Self {
         Self {
             byte_collection,
+            generation,
             ..Self::default()
         }
     }
@@ -186,6 +197,7 @@ impl AttachOutputBatchBuilder {
     fn finish(self) -> AttachOutputBatch {
         if self.saw_output_bytes || !self.passthroughs.is_empty() {
             AttachOutputBatch::Events {
+                generation: PaneOutputGeneration::subscribed(self.generation),
                 bytes: self.bytes,
                 passthroughs: self.passthroughs,
                 passthrough_sequences: self.passthrough_sequences,
@@ -219,7 +231,6 @@ enum GapLog {
 
 #[cfg(all(test, any(unix, windows)))]
 mod tests {
-    use rmux_core::events::OutputCursorItem;
     use rmux_core::TerminalPassthrough;
 
     use super::{
@@ -246,7 +257,7 @@ mod tests {
             vec![TerminalPassthrough::sixel(1, 1, b"q#0!10~".to_vec())],
         );
 
-        let first = receiver.try_recv().expect("first output event");
+        let first = receiver.try_recv_drained().expect("first output event");
         let batch = collect_attach_output_batch(first, Some(&mut receiver));
 
         let AttachOutputBatch::Events {
@@ -285,7 +296,7 @@ mod tests {
         );
         sender.send(Vec::new());
 
-        let first = receiver.try_recv().expect("first output event");
+        let first = receiver.try_recv_drained().expect("first output event");
         let batch =
             collect_attach_output_batch(first, Some(&mut receiver)).covered_by_render_snapshot(1);
 
@@ -323,7 +334,7 @@ mod tests {
         );
         sender.send(b"two".to_vec());
 
-        let first = receiver.try_recv().expect("first output event");
+        let first = receiver.try_recv_drained().expect("first output event");
         let batch = collect_attach_output_batch_metadata(first, Some(&mut receiver));
 
         let AttachOutputBatch::Events {
@@ -352,12 +363,13 @@ mod tests {
         sender.send(b"final".to_vec());
         sender.send(Vec::new());
 
-        let first = receiver.try_recv().expect("first output event");
+        let first = receiver.try_recv_drained().expect("first output event");
         let batch = collect_attach_output_batch(first, Some(&mut receiver));
 
         assert_eq!(
             batch,
             AttachOutputBatch::Events {
+                generation: super::PaneOutputGeneration::subscribed(0),
                 bytes: b"final".to_vec(),
                 passthroughs: Vec::new(),
                 passthrough_sequences: Vec::new(),
@@ -374,7 +386,7 @@ mod tests {
         let mut receiver = sender.subscribe();
         sender.send(vec![b'x'; super::ATTACH_SUSTAINED_OUTPUT_BATCH_BYTES]);
 
-        let first = receiver.try_recv().expect("first output event");
+        let first = receiver.try_recv_drained().expect("first output event");
         let batch = collect_attach_output_batch(first, Some(&mut receiver));
 
         assert!(matches!(
@@ -394,7 +406,7 @@ mod tests {
             sender.send(b"x".to_vec());
         }
 
-        let first = receiver.try_recv().expect("first output event");
+        let first = receiver.try_recv_drained().expect("first output event");
         let batch = collect_attach_output_batch(first, Some(&mut receiver));
 
         assert!(matches!(
@@ -411,7 +423,7 @@ mod tests {
         let sender = pane_output_channel_with_limits(1, 1024);
         let mut receiver = sender.subscribe();
         sender.send(b"first".to_vec());
-        let first = receiver.try_recv().expect("first output event");
+        let first = receiver.try_recv_drained().expect("first output event");
         sender.send(b"second".to_vec());
         sender.send(b"third".to_vec());
 
@@ -424,16 +436,16 @@ mod tests {
     #[test]
     fn collect_batch_treats_first_empty_event_as_closed() {
         assert!(matches!(
-            collect_attach_output_batch(OutputCursorItem::Event(empty_event()), None),
+            collect_attach_output_batch(empty_event(), None),
             AttachOutputBatch::Closed
         ));
     }
 
-    fn empty_event() -> rmux_core::events::OutputEvent {
+    fn empty_event() -> crate::pane_io::types::DrainedPaneOutput {
         let sender = pane_output_channel_with_limits(1, 1024);
         let mut receiver = sender.subscribe();
         sender.send(Vec::new());
-        let Some(OutputCursorItem::Event(event)) = receiver.try_recv() else {
+        let Some(event) = receiver.try_recv_drained() else {
             panic!("empty event should be available");
         };
         event
@@ -448,7 +460,7 @@ mod tests {
             sender.send(b"x".to_vec());
         }
 
-        let first = receiver.try_recv().expect("first output event");
+        let first = receiver.try_recv_drained().expect("first output event");
         let batch = collect_attach_output_batch(first, Some(&mut receiver));
 
         assert!(matches!(
@@ -458,5 +470,65 @@ mod tests {
                 ..
             }
         ));
+    }
+
+    #[test]
+    fn collection_stops_when_generation_resets_after_the_first_drain() {
+        let sender = pane_output_channel_with_limits(8, 1024);
+        let mut receiver = sender.subscribe();
+        sender.send_for_generation_with_passthroughs(
+            Some(0),
+            b"old".to_vec(),
+            vec![TerminalPassthrough::kitty_graphics(
+                0,
+                0,
+                b"Gf=100;old".to_vec(),
+            )],
+        );
+        let first = receiver
+            .try_recv_drained()
+            .expect("old generation item drains first");
+
+        sender.reset_generation(1);
+        sender.send_for_generation_with_passthroughs(
+            Some(1),
+            b"new".to_vec(),
+            vec![TerminalPassthrough::kitty_graphics(
+                1,
+                1,
+                b"Gf=100;new".to_vec(),
+            )],
+        );
+
+        let old_batch = collect_attach_output_batch(first, Some(&mut receiver));
+        let AttachOutputBatch::Events {
+            generation,
+            bytes,
+            passthroughs,
+            ..
+        } = old_batch
+        else {
+            panic!("old item remains an event batch");
+        };
+        assert_eq!(generation, super::PaneOutputGeneration::subscribed(0));
+        assert_eq!(bytes, b"old");
+        assert_eq!(passthroughs.len(), 1);
+
+        let next = receiver
+            .try_recv_drained()
+            .expect("replacement generation remains available");
+        let new_batch = collect_attach_output_batch(next, Some(&mut receiver));
+        let AttachOutputBatch::Events {
+            generation,
+            bytes,
+            passthroughs,
+            ..
+        } = new_batch
+        else {
+            panic!("replacement item is an event batch");
+        };
+        assert_eq!(generation, super::PaneOutputGeneration::subscribed(1));
+        assert_eq!(bytes, b"new");
+        assert_eq!(passthroughs.len(), 1);
     }
 }

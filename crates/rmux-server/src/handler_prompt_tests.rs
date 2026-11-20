@@ -15,8 +15,8 @@ async fn create_attached_session(
     name: &str,
 ) -> mpsc::UnboundedReceiver<AttachControl> {
     let session_name = session_name(name);
-    assert!(matches!(
-        handler
+    crate::session_fixture::assert_new_session(
+        &handler
             .handle(Request::NewSession(NewSessionRequest {
                 session_name: session_name.clone(),
                 detached: true,
@@ -24,8 +24,7 @@ async fn create_attached_session(
                 environment: None,
             }))
             .await,
-        Response::NewSession(_)
-    ));
+    );
 
     let (control_tx, control_rx) = mpsc::unbounded_channel();
     handler
@@ -134,8 +133,10 @@ async fn batched_prompt_text_preserves_split_utf8_at_the_input_boundary() {
     handler.clear_prompt_for_attach(requester_pid).await;
 }
 
+/// tmux 3.7b reads an unfinished mouse report at the escape time as M-[ and
+/// then its text: the prompt keeps `<` and no input stays retained.
 #[tokio::test]
-async fn timed_out_partial_prompt_mouse_resolves_as_escape() {
+async fn timed_out_partial_prompt_mouse_resolves_as_meta_and_text() {
     let handler = RequestHandler::new();
     let requester_pid = std::process::id();
     let mut control_rx =
@@ -163,14 +164,232 @@ async fn timed_out_partial_prompt_mouse_resolves_as_escape() {
         .await
         .expect("prompt escape timeout");
 
-    assert!(pending_input.is_empty());
+    assert!(pending_input.is_empty(), "the timeout retains no input");
+    let prompt = handler.attached_prompt_render(requester_pid).await;
+    assert_eq!(
+        prompt.map(|prompt| prompt.input).as_deref(),
+        Some("<"),
+        "the timeout reads M-[ and then `<`, as tmux 3.7b"
+    );
+    handler.clear_prompt_for_attach(requester_pid).await;
+}
+
+/// R3509 M1: the command prompt ignores a key it does not bind, as tmux
+/// 3.7b's `status_prompt_key` does, so the text typed after it stays in the
+/// prompt instead of reaching the pane; only a lone Escape cancels it.
+#[tokio::test]
+async fn command_prompt_ignores_unbound_special_and_modified_keys() {
+    let handler = RequestHandler::new();
+    let requester_pid = std::process::id();
+    let mut control_rx =
+        create_attached_session(&handler, requester_pid, "prompt-unbound-keys").await;
+    for key in [
+        &b"\x1b[5~"[..],
+        b"\x1b[6~",
+        b"\x1b[2~",
+        b"\x1b[15~",
+        b"\x1b[24~",
+        b"\x1b[6;2~",
+        b"\x1b[3;5~",
+        b"\x1b[15;3~",
+        b"\x1b[1;2P",
+        b"\x1b[2J",
+        b"\x1bOP",
+        b"\x1bx",
+        b"\x1b[1;2C",
+        b"\x1b[1;5D",
+    ] {
+        handler
+            .execute_parsed_commands_for_test(
+                requester_pid,
+                parse_command("command-prompt -b -pname"),
+            )
+            .await
+            .expect("background command prompt starts");
+        let _ = recv_switch_frame_containing(&mut control_rx, "name ").await;
+        handler
+            .handle_attached_live_input_for_test(requester_pid, key)
+            .await
+            .expect("prompt key input");
+        handler
+            .handle_attached_live_input_for_test(requester_pid, b"abc")
+            .await
+            .expect("prompt text input");
+        let prompt = handler.attached_prompt_render(requester_pid).await;
+        let typed = prompt.map(|prompt| prompt.input);
+        let expected = if key == b"\x1b[2J" { "2Jabc" } else { "abc" };
+        assert_eq!(
+            typed.as_deref(),
+            Some(expected),
+            "{:?} must leave the prompt open with the text typed after it",
+            String::from_utf8_lossy(key)
+        );
+        handler.clear_prompt_for_attach(requester_pid).await;
+    }
+
+    handler
+        .execute_parsed_commands_for_test(requester_pid, parse_command("command-prompt -b -pname"))
+        .await
+        .expect("background command prompt starts");
+    let mut pending_input = Vec::new();
+    handler
+        .handle_attached_live_input(requester_pid, &mut pending_input, b"\x1b")
+        .await
+        .expect("lone Escape is retained");
+    handler
+        .flush_attached_pending_escape_input(requester_pid, &mut pending_input)
+        .await
+        .expect("escape-time flush");
     assert!(
         handler
             .attached_prompt_render(requester_pid)
             .await
             .is_none(),
-        "the timeout must cancel the prompt rather than retain input forever"
+        "a lone Escape still cancels the prompt"
     );
+}
+
+/// R3530 (1): the escape time does not make an Escape of input that only
+/// starts with one. tmux 3.7b's `tty_keys_next` reads it as Meta with the
+/// next character, whose text the prompt keeps, or as the key it completes;
+/// the prompt stays open, and the text typed afterwards stays in it.
+#[tokio::test]
+async fn timed_out_escape_prefix_is_meta_or_a_key_never_escape() {
+    let handler = RequestHandler::new();
+    let requester_pid = std::process::id();
+    let mut control_rx =
+        create_attached_session(&handler, requester_pid, "prompt-expired-escape").await;
+    for (retained, typed) in [
+        (&b"\x1b["[..], "abc"),
+        (b"\x1bO", "abc"),
+        (b"\x1b[?25", "?25abc"),
+    ] {
+        handler
+            .execute_parsed_commands_for_test(
+                requester_pid,
+                parse_command("command-prompt -b -pname"),
+            )
+            .await
+            .expect("background command prompt starts");
+        let _ = recv_switch_frame_containing(&mut control_rx, "name ").await;
+        let mut pending_input = Vec::new();
+        handler
+            .handle_attached_live_input(requester_pid, &mut pending_input, retained)
+            .await
+            .expect("unfinished key input");
+        assert_eq!(pending_input, retained, "the unfinished key waits");
+        handler
+            .flush_attached_pending_escape_input(requester_pid, &mut pending_input)
+            .await
+            .expect("escape-time flush");
+        assert!(pending_input.is_empty(), "the escape time empties it");
+        handler
+            .handle_attached_live_input(requester_pid, &mut pending_input, b"abc")
+            .await
+            .expect("prompt text input");
+        let prompt = handler.attached_prompt_render(requester_pid).await;
+        assert_eq!(
+            prompt.map(|prompt| prompt.input).as_deref(),
+            Some(typed),
+            "{:?} must leave the prompt open",
+            String::from_utf8_lossy(retained)
+        );
+        handler.clear_prompt_for_attach(requester_pid).await;
+    }
+}
+
+/// S2452: Escape typed twice in one read is M-Escape for tmux 3.7b's
+/// `tty_keys_next`, which the prompt ignores. The read waits whole until the
+/// escape time, the first Escape never parts from the second, and the text
+/// typed afterwards reaches the prompt (`ESC ESC [` leaves `[`, as in tmux).
+#[tokio::test]
+async fn escape_escape_in_one_read_is_meta_escape_and_keeps_the_prompt_open() {
+    let handler = RequestHandler::new();
+    let requester_pid = std::process::id();
+    let mut control_rx =
+        create_attached_session(&handler, requester_pid, "prompt-escape-escape").await;
+    for (read, typed) in [(&b"\x1b\x1b"[..], "abc"), (b"\x1b\x1b[", "[abc")] {
+        handler
+            .execute_parsed_commands_for_test(
+                requester_pid,
+                parse_command("command-prompt -b -pname"),
+            )
+            .await
+            .expect("background command prompt starts");
+        let _ = recv_switch_frame_containing(&mut control_rx, "name ").await;
+        let mut pending_input = Vec::new();
+        handler
+            .handle_attached_live_input(requester_pid, &mut pending_input, read)
+            .await
+            .expect("escape input");
+        assert!(
+            handler
+                .attached_prompt_render(requester_pid)
+                .await
+                .is_some(),
+            "{read:?} must not cancel the prompt before the escape time"
+        );
+        assert_eq!(pending_input, read, "the whole read waits");
+        handler
+            .flush_attached_pending_escape_input(requester_pid, &mut pending_input)
+            .await
+            .expect("escape-time flush");
+        assert!(pending_input.is_empty(), "the escape time empties it");
+        handler
+            .handle_attached_live_input(requester_pid, &mut pending_input, b"abc")
+            .await
+            .expect("prompt text input");
+        let prompt = handler.attached_prompt_render(requester_pid).await;
+        assert_eq!(
+            prompt.map(|prompt| prompt.input).as_deref(),
+            Some(typed),
+            "{read:?}"
+        );
+        handler.clear_prompt_for_attach(requester_pid).await;
+    }
+}
+
+/// S2440: the Home and End keys of an xterm (`ESC O H`, `ESC O F`) move the
+/// prompt cursor as in tmux 3.7b, in one read or with the key after the
+/// escape time; they never cancel the prompt.
+#[tokio::test]
+async fn xterm_home_and_end_move_the_prompt_cursor() {
+    let handler = RequestHandler::new();
+    let requester_pid = std::process::id();
+    let mut control_rx =
+        create_attached_session(&handler, requester_pid, "prompt-xterm-home-end").await;
+    for (input, typed) in [
+        (&b"abc\x1bOHx"[..], "xabc"),
+        (b"abc\x1b[D\x1b[D\x1bOFx", "abcx"),
+        (b"abc\x1b[Hx", "xabc"),
+        (b"abc\x1b[D\x1b[D\x1b[Fx", "abcx"),
+    ] {
+        handler
+            .execute_parsed_commands_for_test(
+                requester_pid,
+                parse_command("command-prompt -b -pname"),
+            )
+            .await
+            .expect("background command prompt starts");
+        let _ = recv_switch_frame_containing(&mut control_rx, "name ").await;
+        let mut pending_input = Vec::new();
+        handler
+            .handle_attached_live_input(requester_pid, &mut pending_input, input)
+            .await
+            .expect("prompt input");
+        handler
+            .flush_attached_pending_escape_input(requester_pid, &mut pending_input)
+            .await
+            .expect("escape-time flush");
+        let prompt = handler.attached_prompt_render(requester_pid).await;
+        assert_eq!(
+            prompt.map(|prompt| prompt.input).as_deref(),
+            Some(typed),
+            "{:?}",
+            String::from_utf8_lossy(input)
+        );
+        handler.clear_prompt_for_attach(requester_pid).await;
+    }
 }
 
 #[tokio::test]
@@ -360,8 +579,8 @@ async fn confirm_before_accepts_enter_with_default_yes_and_skips_on_decline() {
 #[tokio::test]
 async fn prompt_commands_return_tmux_style_errors_for_unknown_target_clients() {
     let handler = RequestHandler::new();
-    assert!(matches!(
-        handler
+    crate::session_fixture::assert_new_session(
+        &handler
             .handle(Request::NewSession(NewSessionRequest {
                 session_name: session_name("alpha"),
                 detached: true,
@@ -369,8 +588,7 @@ async fn prompt_commands_return_tmux_style_errors_for_unknown_target_clients() {
                 environment: None,
             }))
             .await,
-        Response::NewSession(_)
-    ));
+    );
 
     let prompt_error = handler
         .execute_parsed_commands_for_test(
