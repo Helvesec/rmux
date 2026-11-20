@@ -13,6 +13,17 @@ use super::{InputEndType, InputParser, OscColourSlot, INPUT_LAST};
 
 const XTVERSION_REPLY: &str = concat!("\x1bP>|rmux ", env!("CARGO_PKG_VERSION"), "\x1b\\");
 
+/// DISAMBIGUATE_ESCAPE_CODES, the one Kitty keyboard flag rmux implements.
+const KITTY_DISAMBIGUATE_ESCAPE_CODES: u8 = 1;
+
+fn apply_kitty_mode<W: ScreenWriter + ?Sized>(parser: &InputParser, writer: &mut W) {
+    if parser.kitty_flags() & KITTY_DISAMBIGUATE_ESCAPE_CODES != 0 {
+        writer.mode_set(mode::MODE_KEYS_KITTY);
+    } else {
+        writer.mode_clear(mode::MODE_KEYS_KITTY);
+    }
+}
+
 // ─── C0 dispatch ───────────────────────────────────────────────────
 
 pub(crate) fn dispatch_c0<W: ScreenWriter + ?Sized>(parser: &mut InputParser, writer: &mut W) {
@@ -65,6 +76,7 @@ pub(crate) fn dispatch_esc<W: ScreenWriter + ?Sized>(parser: &mut InputParser, w
     match cmd {
         EscCommand::Ris => {
             parser.cell.reset();
+            parser.kitty_reset();
             writer.full_reset();
         }
         EscCommand::Ind => {
@@ -408,15 +420,32 @@ pub(crate) fn dispatch_csi<W: ScreenWriter + ?Sized>(parser: &mut InputParser, w
                 _ => {}
             }
         }
-        // RMUX 0.9 does not implement the complete Kitty keyboard protocol.
-        // Consume every negotiation form without replying or changing the
-        // pane's key mode: accepting Set/Push while ignoring Query advertises
-        // a partial protocol that applications cannot use losslessly, and Pop
-        // must not clear an independently enabled xterm extended-key mode.
-        CsiCommand::KittyKeyboardSet
-        | CsiCommand::KittyKeyboardPush
-        | CsiCommand::KittyKeyboardPop
-        | CsiCommand::KittyKeyboardQuery => {}
+        // Kitty keyboard protocol. We support DISAMBIGUATE_ESCAPE_CODES only:
+        // that flag alone makes modified keys reportable as CSI-u, which the
+        // pane's encoder already does when MODE_KEYS_KITTY is set. Queries
+        // report exactly the flags we hold, so an app asking for event types
+        // or alternate keys learns we do not implement them.
+        CsiCommand::KittyKeyboardSet => {
+            let flags = parser.param_list.get(0, 0, 0);
+            let apply = parser.param_list.get(1, 1, 1);
+            parser.kitty_set_flags(flags as u8, apply);
+            apply_kitty_mode(parser, writer);
+        }
+        CsiCommand::KittyKeyboardPush => {
+            let flags = parser.param_list.get(0, 0, 0);
+            parser.kitty_push_flags(flags as u8);
+            apply_kitty_mode(parser, writer);
+        }
+        CsiCommand::KittyKeyboardPop => {
+            let count = parser.param_list.get(0, 1, 1);
+            parser.kitty_pop_flags(count as u32);
+            apply_kitty_mode(parser, writer);
+        }
+        CsiCommand::KittyKeyboardQuery => {
+            let flags = parser.kitty_flags();
+            let reply = format!("\x1b[?{flags}u");
+            parser.reply(&reply);
+        }
         CsiCommand::Modoff => {
             let n = parser.param_list.get(0, 0, 0);
             if n != 4 {

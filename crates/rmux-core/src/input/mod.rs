@@ -153,7 +153,16 @@ pub struct InputParser {
     /// Application-set OSC 10/11/12 colours (fg, bg, cursor). The daemon does
     /// not invent colours for an unknown attached terminal palette.
     osc_colours: [Option<String>; 3],
+
+    /// Current Kitty keyboard enhancement flags.
+    kitty_flags: u8,
+    /// Flags saved by `CSI >u` (push), bounded to avoid parser memory growth.
+    kitty_stack: Vec<u8>,
 }
+
+/// Upper bound on saved Kitty keyboard flag frames, per the protocol's advice
+/// that terminals cap this stack to avoid denial of service.
+const KITTY_STACK_MAX: usize = 8;
 
 impl InputParser {
     /// Creates a new parser in the ground state with default cell attributes.
@@ -185,6 +194,8 @@ impl InputParser {
             reply_buf: Vec::new(),
             terminal_passthrough_dropped_count: 0,
             osc_colours: [None, None, None],
+            kitty_flags: 0,
+            kitty_stack: Vec::new(),
         }
     }
 
@@ -739,6 +750,46 @@ impl InputParser {
     /// Interm buf as a string slice for table lookups.
     fn interm_str(&self) -> &[u8] {
         &self.interm_buf[..self.interm_len]
+    }
+
+    /// Current Kitty keyboard enhancement flags.
+    pub(crate) fn kitty_flags(&self) -> u8 {
+        self.kitty_flags
+    }
+
+    /// `CSI = flags ; mode u`: mode 1 replaces, 2 unions, 3 subtracts bits.
+    /// A Set clears the saved push stack, as the flags are now explicit.
+    pub(crate) fn kitty_set_flags(&mut self, flags: u8, mode: i32) {
+        self.kitty_flags = match mode {
+            2 => self.kitty_flags | flags,
+            3 => self.kitty_flags & !flags,
+            _ => flags,
+        };
+        self.kitty_stack.clear();
+    }
+
+    /// `CSI > flags u`: save the current flags, then apply the new ones.
+    /// A full stack evicts its oldest frame.
+    pub(crate) fn kitty_push_flags(&mut self, flags: u8) {
+        if self.kitty_stack.len() == KITTY_STACK_MAX {
+            self.kitty_stack.remove(0);
+        }
+        self.kitty_stack.push(self.kitty_flags);
+        self.kitty_flags = flags;
+    }
+
+    /// `CSI < count u`: pop `count` frames. A pop with an empty stack resets
+    /// all flags, so a stray Pop cannot leave stale enhancements enabled.
+    pub(crate) fn kitty_pop_flags(&mut self, count: u32) {
+        for _ in 0..count {
+            self.kitty_flags = self.kitty_stack.pop().unwrap_or(0);
+        }
+    }
+
+    /// Clear Kitty keyboard state, e.g. on a full reset.
+    pub(crate) fn kitty_reset(&mut self) {
+        self.kitty_flags = 0;
+        self.kitty_stack.clear();
     }
 
     fn note_effective_rep(&mut self) {
