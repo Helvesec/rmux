@@ -14,24 +14,35 @@ fn modoff_clears_extended_keys() {
 }
 
 #[test]
-fn kitty_keyboard_requests_are_consumed_without_negotiating_support() {
-    for request in [
-        b"\x1b[=8u".as_slice(),
-        b"\x1b[=0u".as_slice(),
-        b"\x1b[=1;3u".as_slice(),
-        b"\x1b[>1u".as_slice(),
-        b"\x1b[>0u".as_slice(),
-        b"\x1b[>1;3u".as_slice(),
-        b"\x1b[<u".as_slice(),
-        b"\x1b[<2u".as_slice(),
-        b"\x1b[?u".as_slice(),
-    ] {
+fn kitty_keyboard_negotiation_changes_only_kitty_mode() {
+    let cases: &[(&[u8], bool, &str)] = &[
+        (b"\x1b[=9u", true, ""),  // flag 1 requested among others
+        (b"\x1b[=0u", false, ""), // no flags
+        (b"\x1b[=9u", true, ""),
+        (b"\x1b[>1u", true, ""),
+        (b"\x1b[>0u", false, ""),
+        (b"\x1b[>1;3u", true, ""),
+        (b"\x1b[<u", false, ""),
+        (b"\x1b[<2u", false, ""),
+        (b"\x1b[?u", false, "\x1b[?0u"),
+    ];
+    for &(request, kitty_on, reply) in cases {
         let (parser, writer) = parse(request);
-
-        assert!(parser.reply_buf.is_empty(), "request {request:?}");
-        assert_eq!(writer.mode, MODE_CURSOR | MODE_WRAP, "request {request:?}");
-        assert!(!writer.has_call("mode_set("), "request {request:?}");
-        assert!(!writer.has_call("mode_clear("), "request {request:?}");
+        assert_eq!(
+            writer.mode & MODE_KEYS_KITTY != 0,
+            kitty_on,
+            "request {request:?}"
+        );
+        assert_eq!(
+            String::from_utf8_lossy(&parser.reply_buf),
+            reply,
+            "request {request:?}"
+        );
+        assert_eq!(
+            writer.mode & MODE_KEYS_EXTENDED_2,
+            0,
+            "kitty negotiation must not touch xterm extended keys"
+        );
     }
 }
 
@@ -45,10 +56,20 @@ fn kitty_keyboard_requests_preserve_xterm_extended_key_mode() {
         .map(String::as_str)
         .collect::<Vec<_>>();
 
-    assert_eq!(writer.mode, MODE_CURSOR | MODE_WRAP | MODE_KEYS_EXTENDED_2);
+    assert_eq!(
+        writer.mode,
+        MODE_CURSOR | MODE_WRAP | MODE_KEYS_EXTENDED_2,
+        "after pop, only xterm extended keys remain"
+    );
     assert_eq!(
         mode_transitions,
-        ["mode_clear(0x248000)", "mode_set(0x40000)"]
+        [
+            "mode_clear(0x248000)",
+            "mode_set(0x40000)",
+            "mode_clear(0x200000)",
+            "mode_set(0x200000)",
+            "mode_clear(0x200000)",
+        ]
     );
 }
 

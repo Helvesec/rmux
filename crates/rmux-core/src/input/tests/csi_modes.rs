@@ -233,3 +233,82 @@ fn rm_private_win32_console_input_mode_is_suppressed() {
 }
 
 // ─── SGR tests ─────────────────────────────────────────────────────
+
+// ─── Kitty keyboard protocol negotiation ───────────────────────────
+
+#[test]
+fn kitty_push_disambiguate_enables_csi_u_mode() {
+    let (_p, w) = parse(b"\x1b[>1u");
+    assert_ne!(w.mode & MODE_KEYS_KITTY, 0, "push must enable kitty mode");
+}
+
+#[test]
+fn kitty_set_disambiguate_enables_csi_u_mode() {
+    let (_p, w) = parse(b"\x1b[=1u");
+    assert_ne!(w.mode & MODE_KEYS_KITTY, 0, "set must enable kitty mode");
+}
+
+#[test]
+fn kitty_query_reports_current_flags() {
+    let (p, _w) = parse(b"\x1b[?u");
+    assert_eq!(String::from_utf8_lossy(&p.reply_buf), "\x1b[?0u");
+
+    let (p, _w) = parse(b"\x1b[>1u\x1b[?u");
+    assert_eq!(String::from_utf8_lossy(&p.reply_buf), "\x1b[?1u");
+}
+
+#[test]
+fn kitty_pop_restores_the_pushed_flags() {
+    // Push flag 1 over an empty set, then push flag 0, then pop twice:
+    // the first pop restores 1, the second empties the stack and resets.
+    let (p, w) = parse(b"\x1b[>1u\x1b[>0u\x1b[<u");
+    assert_ne!(w.mode & MODE_KEYS_KITTY, 0, "first pop restores flag 1");
+    assert_eq!(String::from_utf8_lossy(&p.reply_buf), "");
+
+    let (p, w) = parse(b"\x1b[>1u\x1b[>0u\x1b[<u\x1b[<u\x1b[?u");
+    assert_eq!(w.mode & MODE_KEYS_KITTY, 0, "second pop resets flags");
+    assert_eq!(String::from_utf8_lossy(&p.reply_buf), "\x1b[?0u");
+}
+
+#[test]
+fn kitty_pop_count_pops_multiple_frames() {
+    let (_p, w) = parse(b"\x1b[>1u\x1b[>0u\x1b[<2u");
+    assert_eq!(
+        w.mode & MODE_KEYS_KITTY,
+        0,
+        "pop 2 restores the initial empty set"
+    );
+}
+
+#[test]
+fn kitty_set_modes_set_union_and_subtract() {
+    let (p, w) = parse(b"\x1b[=3u\x1b[?u");
+    assert_eq!(String::from_utf8_lossy(&p.reply_buf), "\x1b[?3u");
+    assert_ne!(w.mode & MODE_KEYS_KITTY, 0);
+
+    // Mode 3 subtracts flag 1, leaving flag 2 (unsupported but still held).
+    let (p, w) = parse(b"\x1b[=3u\x1b[=1;3u\x1b[?u");
+    assert_eq!(String::from_utf8_lossy(&p.reply_buf), "\x1b[?2u");
+    assert_eq!(w.mode & MODE_KEYS_KITTY, 0, "flag 1 removed");
+
+    // Mode 2 unions a flag into the current set.
+    let (p, _w) = parse(b"\x1b[=2u\x1b[=1;2u\x1b[?u");
+    assert_eq!(String::from_utf8_lossy(&p.reply_buf), "\x1b[?3u");
+}
+
+#[test]
+fn kitty_pop_clears_only_kitty_mode() {
+    let (_p, w) = parse(b"\x1b[>4;2m\x1b[>1u\x1b[<u");
+    assert_eq!(w.mode & MODE_KEYS_KITTY, 0, "pop must clear kitty mode");
+    assert_ne!(
+        w.mode & MODE_KEYS_EXTENDED_2,
+        0,
+        "pop must not clear xterm extended keys"
+    );
+}
+
+#[test]
+fn kitty_unsupported_flag_does_not_enable_csi_u_mode() {
+    let (_p, w) = parse(b"\x1b[>2u");
+    assert_eq!(w.mode & MODE_KEYS_KITTY, 0, "event types are not supported");
+}

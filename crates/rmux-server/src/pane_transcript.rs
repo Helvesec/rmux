@@ -1077,22 +1077,35 @@ mod tests {
     }
 
     #[test]
-    fn append_bytes_ignores_kitty_keyboard_negotiation() {
+    fn append_bytes_negotiates_only_supported_kitty_flags() {
+        use rmux_core::input::mode::MODE_KEYS_KITTY;
+
         let mut transcript = transcript(40, 4, 10);
         let initial_mode = transcript.mode();
 
-        for request in [
-            b"\x1b[=8u".as_slice(),
-            b"\x1b[>1u".as_slice(),
-            b"\x1b[<u".as_slice(),
-            b"\x1b[?u".as_slice(),
-        ] {
-            assert!(transcript
-                .append_bytes_with_effects(request)
-                .replies
-                .is_empty());
-            assert_eq!(transcript.mode(), initial_mode, "request {request:?}");
-        }
+        // Unsupported flag set: no mode change, no reply.
+        let result = transcript.append_bytes_with_effects(b"\x1b[=8u");
+        assert!(result.replies.is_empty());
+        assert_eq!(transcript.mode(), initial_mode);
+
+        // Push flag 1: enables CSI-u output for this pane.
+        let result = transcript.append_bytes_with_effects(b"\x1b[>1u");
+        assert!(result.replies.is_empty());
+        assert_ne!(
+            transcript.mode() & MODE_KEYS_KITTY,
+            0,
+            "push enables kitty mode"
+        );
+
+        // Pop: restores the initial mode.
+        let result = transcript.append_bytes_with_effects(b"\x1b[<u");
+        assert!(result.replies.is_empty());
+        assert_eq!(transcript.mode(), initial_mode, "pop restores the mode");
+
+        // Query: reports the restored flags (the 8 set before the push).
+        let result = transcript.append_bytes_with_effects(b"\x1b[?u");
+        assert_eq!(result.replies, b"\x1b[?8u");
+        assert_eq!(transcript.mode(), initial_mode);
     }
 
     #[test]
