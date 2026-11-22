@@ -1,6 +1,7 @@
 mod application;
 mod bounded_write;
 mod command_line;
+mod conpty_api;
 mod dsr;
 mod flags;
 mod io;
