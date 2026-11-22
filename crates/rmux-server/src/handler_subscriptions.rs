@@ -294,7 +294,32 @@ impl RequestHandler {
                 .unwrap_or_else(|error| error.into_inner());
             subscriptions.remove_connection(connection_id);
         }
+        self.forget_pane_graphics_passthrough_connection(connection_id);
         let _ = self.request_shutdown_if_pending();
+    }
+
+    /// Marks a connection whose handshake required the pane graphics
+    /// passthrough capability. Only these connections may receive the
+    /// appended `PaneStreamEvent::GraphicsPassthrough` variant.
+    pub(crate) fn note_pane_graphics_passthrough_connection(&self, connection_id: u64) {
+        self.pane_graphics_passthrough_connections
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .insert(connection_id);
+    }
+
+    pub(crate) fn connection_requires_pane_graphics_passthrough(&self, connection_id: u64) -> bool {
+        self.pane_graphics_passthrough_connections
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .contains(&connection_id)
+    }
+
+    fn forget_pane_graphics_passthrough_connection(&self, connection_id: u64) {
+        self.pane_graphics_passthrough_connections
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .remove(&connection_id);
     }
 
     pub(crate) async fn drain_removed_pane_output_subscriptions(

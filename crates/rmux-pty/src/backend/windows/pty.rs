@@ -7,13 +7,12 @@ use std::time::Duration;
 use windows_sys::Win32::Foundation::{
     GetLastError, ERROR_BROKEN_PIPE, ERROR_INVALID_PARAMETER, E_HANDLE, HANDLE, S_OK,
 };
-use windows_sys::Win32::System::Console::{
-    ClosePseudoConsole, CreatePseudoConsole, ResizePseudoConsole, COORD, HPCON,
-};
+use windows_sys::Win32::System::Console::{COORD, HPCON};
 
 use crate::{Result, TerminalGeometry, TerminalSize};
 
 use super::bounded_write::OverlappedPipeWriter;
+use super::conpty_api::{kernel32_conpty_api, selected_conpty_api, ConptyApi};
 use super::flags::{
     conpty_flags_without_passthrough, selected_conpty_flags, standard_conpty_flags, ConptyFlags,
 };
@@ -144,7 +143,12 @@ impl WindowsPty {
             .size
             .lock()
             .map_err(|_| io::Error::other("ConPTY size mutex poisoned"))?;
-        let state = create_pty_state(size, conpty_flags_without_passthrough())?;
+        let api = self
+            .state
+            .read()
+            .map_err(|_| io::Error::other("ConPTY state lock poisoned"))?
+            .api;
+        let state = create_pty_state(size, conpty_flags_without_passthrough(), api)?;
         let mut current = self
             .state
             .write()
@@ -168,12 +172,14 @@ pub(crate) fn open_pty_pair(size: TerminalSize) -> Result<WindowsPty> {
         rows = size.rows,
         "creating ConPTY"
     );
-    let state = create_pty_state_with_fallback(size, selected_conpty_flags())?;
+    let api = selected_conpty_api();
+    let state = create_pty_state_with_fallback(size, selected_conpty_flags(), api)?;
     tracing::debug!(
         target: "rmux::conpty",
         cols = size.cols,
         rows = size.rows,
         flags = state.flags.bits(),
+        backend = state.api.source.label(),
         "ConPTY created"
     );
 
@@ -205,8 +211,9 @@ pub(crate) fn apply_size(pty: &WindowsPty, size: TerminalSize) -> Result<()> {
         .read()
         .map_err(|_| io::Error::other("ConPTY state lock poisoned"))?;
     // SAFETY: `state.hpc` is an owned live ConPTY handle while the read lock is
-    // held, and `coord` was range-checked from `TerminalSize`.
-    let hr = unsafe { ResizePseudoConsole(state.hpc.raw(), coord) };
+    // held, and `coord` was range-checked from `TerminalSize`. The resize goes
+    // through the same backend that created the handle (`state.api`).
+    let hr = unsafe { state.api.resize_pseudo_console(state.hpc.raw(), coord) };
     drop(state);
     if hr != S_OK {
         if is_benign_resize_after_exit(hr) {
@@ -240,30 +247,44 @@ pub(crate) fn apply_geometry(pty: &WindowsPty, geometry: TerminalGeometry) -> Re
 fn create_pty_state_with_fallback(
     size: TerminalSize,
     selected: ConptyFlags,
+    api: ConptyApi,
 ) -> Result<WindowsPtyState> {
-    match create_pty_state(size, selected) {
+    match create_pty_state(size, selected, api) {
         Ok(state) => Ok(state),
         Err(error) if selected.uses_passthrough() => {
             tracing::warn!(
                 target: "rmux::conpty",
+                backend = api.source.label(),
                 flags = selected.bits(),
                 "CreatePseudoConsole with passthrough failed; retrying without passthrough: {error}"
             );
-            create_pty_state_with_fallback(size, conpty_flags_without_passthrough())
+            create_pty_state_with_fallback(size, conpty_flags_without_passthrough(), api)
         }
         Err(error) if selected.bits() != 0 => {
             tracing::warn!(
                 target: "rmux::conpty",
+                backend = api.source.label(),
                 flags = selected.bits(),
                 "CreatePseudoConsole with extended flags failed; retrying standard flags: {error}"
             );
-            create_pty_state(size, standard_conpty_flags())
+            create_pty_state_with_fallback(size, standard_conpty_flags(), api)
+        }
+        Err(error) if api.source.is_dll() => {
+            tracing::warn!(
+                target: "rmux::conpty",
+                "CreatePseudoConsole failed on the conpty.dll backend even with standard flags; falling back to kernel32: {error}"
+            );
+            create_pty_state_with_fallback(size, standard_conpty_flags(), kernel32_conpty_api())
         }
         Err(error) => Err(error),
     }
 }
 
-fn create_pty_state(size: TerminalSize, flags: ConptyFlags) -> Result<WindowsPtyState> {
+fn create_pty_state(
+    size: TerminalSize,
+    flags: ConptyFlags,
+    api: ConptyApi,
+) -> Result<WindowsPtyState> {
     let (input, output) = {
         let _span = perf::span("conpty_create_pipes");
         (
@@ -273,7 +294,7 @@ fn create_pty_state(size: TerminalSize, flags: ConptyFlags) -> Result<WindowsPty
     };
     let hpc = {
         let _span = perf::span("conpty_create_pseudoconsole");
-        create_pseudo_console(size, &input, &output, flags)?
+        create_pseudo_console(size, &input, &output, flags, api)?
     };
     drop(input.read);
     drop(output.write);
@@ -283,6 +304,7 @@ fn create_pty_state(size: TerminalSize, flags: ConptyFlags) -> Result<WindowsPty
         input_writer,
         output_read: output.read,
         flags,
+        api,
     })
 }
 
@@ -291,13 +313,15 @@ fn create_pseudo_console(
     input: &PipePair,
     output: &PipePair,
     flags: ConptyFlags,
+    api: ConptyApi,
 ) -> Result<OwnedHpcon> {
     let mut hpc = 0_isize;
     // SAFETY: `input` and `output` are valid pipe handles owned by the caller,
     // `hpc` is a valid out-pointer, and `coord_from_size` range-checks the
-    // dimensions before the API call.
+    // dimensions before the API call. The call routes through the selected
+    // backend (kernel32 by default, conpty.dll via RMUX_CONPTY_DLL).
     let hr = unsafe {
-        CreatePseudoConsole(
+        api.create_pseudo_console(
             coord_from_size(size)?,
             input.read.as_raw_handle() as HANDLE,
             output.write.as_raw_handle() as HANDLE,
@@ -308,13 +332,14 @@ fn create_pseudo_console(
     if hr != S_OK {
         tracing::warn!(
             target: "rmux::conpty",
+            backend = api.source.label(),
             hresult = hr,
             flags = flags.bits(),
             "CreatePseudoConsole failed"
         );
         return Err(hresult_error(hr).into());
     }
-    Ok(OwnedHpcon(hpc))
+    Ok(OwnedHpcon { handle: hpc, api })
 }
 
 fn coord_from_size(size: TerminalSize) -> Result<COORD> {
@@ -346,23 +371,32 @@ struct WindowsPtyState {
     input_writer: Arc<OverlappedPipeWriter>,
     output_read: OwnedHandle,
     flags: ConptyFlags,
+    api: ConptyApi,
 }
 
 #[derive(Debug)]
-struct OwnedHpcon(HPCON);
+struct OwnedHpcon {
+    handle: HPCON,
+    api: ConptyApi,
+}
 
 impl OwnedHpcon {
     fn raw(&self) -> HPCON {
-        self.0
+        self.handle
     }
 
     fn close(&mut self) {
-        if self.0 != 0 {
-            tracing::trace!(target: "rmux::conpty", "closing ConPTY");
+        if self.handle != 0 {
+            tracing::trace!(
+                target: "rmux::conpty",
+                backend = self.api.source.label(),
+                "closing ConPTY"
+            );
             // SAFETY: `OwnedHpcon` owns a non-null ConPTY handle and closes it
-            // exactly once here or from `Drop`.
-            unsafe { ClosePseudoConsole(self.0) };
-            self.0 = 0;
+            // exactly once here or from `Drop`, through the same backend that
+            // created it.
+            unsafe { self.api.close_pseudo_console(self.handle) };
+            self.handle = 0;
         }
     }
 }

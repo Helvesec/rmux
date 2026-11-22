@@ -18,8 +18,8 @@ mod windows {
     };
     use rmux_sdk::{
         EnsureSession, EnsureSessionPolicy, PaneOutputChunk, PaneOutputStart, PaneOutputStream,
-        PaneProcessState, PaneRecoveryEvent, PaneRecoveryStream, PaneSurfaceEvent,
-        PaneSurfaceStream, Rmux, RmuxEndpoint,
+        PanePassthroughKind, PaneProcessState, PaneRecoveryEvent, PaneRecoveryOptions,
+        PaneRecoveryStream, PaneSurfaceEvent, PaneSurfaceStream, Rmux, RmuxEndpoint,
     };
     use tokio::time::{sleep, timeout, Instant};
 
@@ -185,6 +185,119 @@ mod windows {
 
         harness.finish().await?;
         wait_for_daemon_unavailable(&pipe_name).await?;
+        Ok(())
+    }
+
+    /// End-to-end graphics passthrough through a real daemon and a real pane.
+    ///
+    /// The pane shell emits one kitty graphics escape from ASCII-only input
+    /// (ConPTY parses pane input as keys, so typed ESC bytes never reach the
+    /// shell). Whether the escape then reaches the daemon depends on the
+    /// host's ConPTY: recent Windows builds filter pane output they cannot
+    /// render, which is exactly the gap this feature exists to bridge on
+    /// hosts whose ConPTY passes it through. The test therefore has three
+    /// honest outcomes:
+    ///
+    /// - a `Graphics` event arrives: the full chain is proven on this host;
+    /// - raw pane bytes carry the escape but no graphics event follows: a
+    ///   genuine delivery failure;
+    /// - the escape never appears in pane output: this host's ConPTY filters
+    ///   it before the daemon, and the test reports a skip instead of
+    ///   pretending to prove something it cannot observe here.
+    #[tokio::test]
+    async fn daemon_backed_graphics_passthrough_delivers_typed_escape_events() -> TestResult {
+        let _lock = LIVE_DAEMON_LOCK.lock().await;
+        let harness = Harness::start("gfxpassthrough").await?;
+        let rmux = harness.rmux();
+        let session_name = session_name("sdkwingfxpassthrough");
+
+        let session = rmux
+            .ensure_session(
+                EnsureSession::named(session_name)
+                    .policy(EnsureSessionPolicy::CreateOrReuse)
+                    .detached(true)
+                    .command(vec![
+                        "powershell.exe".to_owned(),
+                        "-NoProfile".to_owned(),
+                        "-NoLogo".to_owned(),
+                    ]),
+            )
+            .await?;
+        let pane = session.pane(0, 0);
+
+        // The per-pane opt-in is the existing `allow-passthrough` option, set
+        // through the public pane options API before the stream opens: the
+        // daemon snapshots it at subscribe time.
+        let mutation = pane.set_option("allow-passthrough", "on").await?;
+        assert_eq!(
+            mutation.new_value.as_deref(),
+            Some("on"),
+            "the pane must allow passthrough before the stream opens: {mutation:?}"
+        );
+
+        let mut recovery = pane
+            .recover_output_with(PaneRecoveryOptions::default().with_graphics_passthrough(true))
+            .await?;
+        expect_initial_recovery(&mut recovery).await?;
+
+        const KITTY_ESCAPE: &[u8] = b"\x1b_Gf=100;AAAA\x1b\\";
+        pane.send_text("echo \"$([char]27)_Gf=100;AAAA$([char]27)\\\"\r".to_owned())
+            .await?;
+
+        // The escape either reaches the daemon within moments of the echo or
+        // the host's ConPTY filtered it; nothing arrives later.
+        let deadline = Instant::now() + Duration::from_secs(15);
+        let mut escape_reached_pane_output = false;
+        let mut outcome = None;
+        while outcome.is_none() {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                if escape_reached_pane_output {
+                    return Err(
+                        "pane output carried the escape but no graphics event followed".into(),
+                    );
+                }
+                outcome = Some("skip: this host's ConPTY filters pane image escapes".to_owned());
+                break;
+            }
+            let next = match timeout(remaining, recovery.next()).await {
+                Ok(result) => result?,
+                Err(_expired) => continue,
+            };
+            match next {
+                Some(PaneRecoveryEvent::Graphics {
+                    kind,
+                    cursor_x,
+                    bytes,
+                    ..
+                }) => {
+                    assert_eq!(kind, PanePassthroughKind::KittyGraphics, "{kind:?}");
+                    assert_eq!(bytes, KITTY_ESCAPE);
+                    assert!(cursor_x > 0, "the echo prompt moves the cursor: {cursor_x}");
+                    outcome = Some("pass: graphics event delivered end to end".to_owned());
+                }
+                Some(PaneRecoveryEvent::Bytes { bytes, .. }) => {
+                    if bytes
+                        .windows(11)
+                        .any(|window| window == &KITTY_ESCAPE[..11])
+                    {
+                        escape_reached_pane_output = true;
+                    }
+                }
+                Some(PaneRecoveryEvent::Rebase(_) | PaneRecoveryEvent::Lifecycle(_)) => {}
+                Some(other) => {
+                    return Err(format!("unexpected recovery event: {other:?}").into());
+                }
+                None => return Err("graphics passthrough stream ended early".into()),
+            }
+        }
+        let outcome = outcome.expect("loop set the outcome");
+
+        drop(recovery);
+        let pipe_name = harness.pipe_name().to_owned();
+        harness.finish().await?;
+        wait_for_daemon_unavailable(&pipe_name).await?;
+        println!("{outcome}");
         Ok(())
     }
 

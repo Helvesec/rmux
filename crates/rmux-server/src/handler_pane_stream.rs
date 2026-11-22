@@ -2,7 +2,7 @@ use std::sync::{Arc, Mutex as StdMutex, Weak};
 use std::time::Instant;
 
 use rmux_proto::{
-    ErrorResponse, PaneRawRebaseReason, PaneStreamCursorRequest, PaneStreamEndReason,
+    ErrorResponse, OptionName, PaneRawRebaseReason, PaneStreamCursorRequest, PaneStreamEndReason,
     PaneStreamEvent, PaneStreamMode, Response, RmuxError, SubscribePaneStreamRequest,
     UnsubscribePaneStreamRequest, UnsubscribePaneStreamResponse,
 };
@@ -212,6 +212,9 @@ impl RequestHandler {
                 Ok(source) => source,
                 Err(error) => return Response::Error(ErrorResponse { error }),
             };
+            let graphics_passthrough = request.mode == PaneStreamMode::Raw
+                && self.connection_requires_pane_graphics_passthrough(connection_id)
+                && pane_graphics_passthrough_allowed(&state, &source.target);
             let mut subscriptions = self
                 .subscriptions
                 .lock()
@@ -227,7 +230,10 @@ impl RequestHandler {
                 };
             subscriptions.streams.insert(
                 subscription_id,
-                PaneStreamSubscription::reserved(request.mode),
+                PaneStreamSubscription::reserved_with_graphics_passthrough(
+                    request.mode,
+                    graphics_passthrough,
+                ),
             );
             let surface_route = (request.mode == PaneStreamMode::Surface)
                 .then(|| subscriptions.surface_driver_route(&source.key));
@@ -783,6 +789,26 @@ pub(in crate::handler) fn stream_source_for_target(
         transcript,
         generation,
     })
+}
+
+/// Returns whether the addressed pane allows terminal passthrough escapes.
+///
+/// Resolves the same `allow-passthrough` pane option the attach path uses,
+/// so one option governs both outer-terminal forwarding and SDK graphics
+/// passthrough delivery.
+fn pane_graphics_passthrough_allowed(
+    state: &HandlerState,
+    target: &rmux_proto::PaneTarget,
+) -> bool {
+    matches!(
+        state.options.resolve_for_pane(
+            target.session_name(),
+            target.window_index(),
+            target.pane_index(),
+            OptionName::AllowPassthrough,
+        ),
+        Some("on" | "all")
+    )
 }
 
 #[cfg(test)]

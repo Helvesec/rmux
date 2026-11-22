@@ -26,6 +26,14 @@ impl Pane {
     }
 
     /// Opens recoverable raw output with explicit cold-path options.
+    ///
+    /// With [`PaneRecoveryOptions::graphics_passthrough`], the daemon must
+    /// advertise the `sdk.pane.graphics_passthrough` capability and this
+    /// connection must require it in the same handshake, so the daemon can
+    /// recognize this connection as one that understands the appended
+    /// graphics event variant. The pane's `allow-passthrough` option must
+    /// also be `on` (or `all`) before the stream opens; the daemon snapshots
+    /// it at subscribe time.
     pub async fn recover_output_with(
         &self,
         options: PaneRecoveryOptions,
@@ -39,6 +47,14 @@ impl Pane {
             &[rmux_proto::CAPABILITY_SDK_PANE_RAW_RECOVERY],
         )
         .await?;
+        if options.graphics_passthrough {
+            crate::capabilities::require_with_handshake(
+                &pane.transport,
+                &[rmux_proto::CAPABILITY_SDK_PANE_GRAPHICS_PASSTHROUGH],
+                &[rmux_proto::CAPABILITY_SDK_PANE_GRAPHICS_PASSTHROUGH],
+            )
+            .await?;
+        }
         let target = pane.required_resolved_proto_target_ref().await?;
         match PaneRecoveryStream::open(pane.transport.clone(), target.clone(), options).await {
             Ok(stream) => Ok(stream),

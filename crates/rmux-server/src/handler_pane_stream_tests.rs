@@ -16,6 +16,8 @@ use crate::pane_transcript::SharedPaneTranscript;
 
 use super::{validate_raw_rebase_size, RequestHandler};
 
+#[path = "handler_pane_stream_tests/graphics_passthrough.rs"]
+mod graphics_passthrough;
 #[path = "handler_pane_stream_tests/subscription_kind.rs"]
 mod subscription_kind;
 #[path = "handler_pane_stream_tests/surface_budget.rs"]

@@ -15,6 +15,7 @@ pub(in crate::handler) struct RawPaneStream {
     pub(in crate::handler) receiver: PaneOutputReceiver,
     pub(in crate::handler) epoch: u64,
     pub(in crate::handler) include_snapshot: bool,
+    graphics_passthrough: bool,
     rebasing: bool,
     rebase_token: u64,
     pending_rebase: Option<PaneRawRebaseReason>,
@@ -27,18 +28,24 @@ impl RawPaneStream {
         receiver: PaneOutputReceiver,
         epoch: u64,
         include_snapshot: bool,
+        graphics_passthrough: bool,
         end_reason: Option<PaneStreamEndReason>,
     ) -> Self {
         Self {
             receiver,
             epoch,
             include_snapshot,
+            graphics_passthrough,
             rebasing: false,
             rebase_token: 0,
             pending_rebase: None,
             pending_observation: None,
             end_reason,
         }
+    }
+
+    pub(in crate::handler) const fn graphics_passthrough(&self) -> bool {
+        self.graphics_passthrough
     }
 
     pub(in crate::handler) const fn is_rebasing(&self) -> bool {
@@ -112,6 +119,7 @@ pub(in crate::handler) struct SurfacePaneStream {
 pub(in crate::handler) enum PaneStreamSubscription {
     Reserved {
         mode: PaneStreamMode,
+        graphics_passthrough: bool,
         end_reason: Option<PaneStreamEndReason>,
     },
     Raw(RawPaneStream),
@@ -120,9 +128,28 @@ pub(in crate::handler) enum PaneStreamSubscription {
 
 impl PaneStreamSubscription {
     pub(in crate::handler) const fn reserved(mode: PaneStreamMode) -> Self {
+        Self::reserved_with_graphics_passthrough(mode, false)
+    }
+
+    pub(in crate::handler) const fn reserved_with_graphics_passthrough(
+        mode: PaneStreamMode,
+        graphics_passthrough: bool,
+    ) -> Self {
         Self::Reserved {
             mode,
+            graphics_passthrough,
             end_reason: None,
+        }
+    }
+
+    pub(in crate::handler) const fn reserved_graphics_passthrough(&self) -> bool {
+        match self {
+            Self::Reserved {
+                graphics_passthrough,
+                ..
+            } => *graphics_passthrough,
+            Self::Raw(stream) => stream.graphics_passthrough(),
+            Self::Surface(_) => false,
         }
     }
 
