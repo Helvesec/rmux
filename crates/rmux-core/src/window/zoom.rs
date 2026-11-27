@@ -19,7 +19,7 @@ impl Window {
         }
 
         self.active_pane().map_or_else(String::new, |pane| {
-            LayoutTree::single(self.size).dump(std::slice::from_ref(pane))
+            LayoutTree::single(self.size, pane.id()).dump()
         })
     }
 
@@ -83,7 +83,7 @@ impl Window {
     pub(crate) fn apply_zoom_geometry(&mut self) {
         let size = self.size;
         let active_pane = self.active_pane;
-        if let Some(pane) = self.pane_mut(active_pane) {
+        if let Some(pane) = self.managed_pane_mut(active_pane) {
             pane.set_geometry(PaneGeometry::new(0, 0, size.cols, size.rows));
         }
     }

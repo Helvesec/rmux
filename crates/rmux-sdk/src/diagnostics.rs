@@ -1,7 +1,8 @@
 //! SDK diagnostics and stable unsupported-feature identifiers.
 //!
-//! This module depends only on `rmux-proto` and SDK-local types. It is safe to
-//! use from integration code without pulling in client or server crates.
+//! Public helpers consume SDK errors and require no transport types.
+
+use crate::RmuxError;
 
 /// Stable SDK feature id for unsupported detached wire versions.
 pub const FEATURE_PROTOCOL_WIRE_VERSION: &str = "protocol.wire_version";
@@ -80,51 +81,36 @@ impl Diagnostic {
     }
 }
 
-/// Returns the stable SDK unsupported-feature id for a protocol error.
+/// Returns the stable unsupported-feature id for an SDK error.
 #[must_use]
-pub fn unsupported_feature_id(error: &rmux_proto::RmuxError) -> Option<String> {
-    match error {
-        rmux_proto::RmuxError::UnsupportedWireVersion { .. } => {
-            Some(FEATURE_PROTOCOL_WIRE_VERSION.to_owned())
-        }
-        rmux_proto::RmuxError::UnsupportedCapability { feature, .. } => Some(feature.clone()),
-        rmux_proto::RmuxError::UnknownCommand(command) => Some(command_feature_id(command)),
-        _ => None,
-    }
+pub fn unsupported_feature_id(error: &RmuxError) -> Option<String> {
+    error.feature().map(str::to_owned)
 }
 
-/// Converts a protocol error into an SDK diagnostic.
+/// Converts an SDK error into a structured diagnostic.
+///
+/// Protocol diagnostics retain their message and recovery hint separately.
+/// Typed SDK outcomes retain their SDK display and optional hint. Aggregate
+/// diagnostics retain ordering; inspect their source for individual errors.
+/// Before 1.0 this helper accepted a transport error instead of an SDK error.
 #[must_use]
-pub fn protocol_diagnostic(error: &rmux_proto::RmuxError) -> Diagnostic {
+pub fn protocol_diagnostic(error: &RmuxError) -> Diagnostic {
     match error {
-        rmux_proto::RmuxError::UnsupportedWireVersion {
-            got,
-            minimum,
-            maximum,
-        } => Diagnostic::unsupported(
-            FEATURE_PROTOCOL_WIRE_VERSION,
-            format!(
-                "upgrade the rmux daemon or use an SDK that supports wire version {got} \
-                 (supported range {minimum}..={maximum})"
-            ),
+        RmuxError::Unsupported { feature, hint } => Diagnostic::unsupported(feature, hint),
+        RmuxError::Protocol { source } => Diagnostic::error(
+            format!("rmux protocol error: {source}"),
+            error.hint().expect("protocol errors have a recovery hint"),
         ),
-        rmux_proto::RmuxError::UnsupportedCapability { feature, supported } => {
-            Diagnostic::unsupported(
-                feature.clone(),
-                unsupported_capability_hint(feature, supported),
-            )
-        }
-        rmux_proto::RmuxError::UnknownCommand(command) => Diagnostic::unsupported(
-            command_feature_id(command),
-            format!(
-                "upgrade the rmux daemon or use a command advertised by the negotiated command \
-                 inventory before sending `{command}`"
-            ),
+        RmuxError::Transport { operation, source } => Diagnostic::error(
+            format!("rmux transport error while {operation}: {source}"),
+            error.hint().expect("transport errors have a recovery hint"),
         ),
-        error => Diagnostic::error(
-            format!("rmux protocol error: {error}"),
-            "check the request and daemon state, then retry after correcting the request",
-        ),
+        error => Diagnostic {
+            severity: DiagnosticSeverity::Error,
+            feature: None,
+            message: error.to_string(),
+            hint: error.hint().map(str::to_owned),
+        },
     }
 }
 
@@ -166,25 +152,29 @@ mod tests {
     #[test]
     fn protocol_unsupported_errors_map_to_stable_feature_ids() {
         assert_eq!(
-            unsupported_feature_id(&rmux_proto::RmuxError::UnsupportedWireVersion {
-                got: 2,
-                minimum: 1,
-                maximum: 1,
-            })
+            unsupported_feature_id(&RmuxError::from_proto(
+                rmux_proto::RmuxError::UnsupportedWireVersion {
+                    got: 2,
+                    minimum: 1,
+                    maximum: 1,
+                }
+            ))
             .as_deref(),
             Some(FEATURE_PROTOCOL_WIRE_VERSION)
         );
         assert_eq!(
-            unsupported_feature_id(&rmux_proto::RmuxError::UnsupportedCapability {
-                feature: "capability.future".to_owned(),
-                supported: vec![rmux_proto::CAPABILITY_DETACHED_RPC.to_owned()],
-            })
+            unsupported_feature_id(&RmuxError::from_proto(
+                rmux_proto::RmuxError::UnsupportedCapability {
+                    feature: "capability.future".to_owned(),
+                    supported: vec![rmux_proto::CAPABILITY_DETACHED_RPC.to_owned()],
+                }
+            ))
             .as_deref(),
             Some("capability.future")
         );
         assert_eq!(
-            unsupported_feature_id(&rmux_proto::RmuxError::UnknownCommand(
-                "display-menu!".to_owned()
+            unsupported_feature_id(&RmuxError::from_proto(
+                rmux_proto::RmuxError::UnknownCommand("display-menu!".to_owned())
             ))
             .as_deref(),
             Some("command.display-menu_")
@@ -193,10 +183,12 @@ mod tests {
 
     #[test]
     fn protocol_diagnostic_preserves_unsupported_capability_hint() {
-        let diagnostic = protocol_diagnostic(&rmux_proto::RmuxError::UnsupportedCapability {
-            feature: "capability.future".to_owned(),
-            supported: vec![rmux_proto::CAPABILITY_HANDSHAKE.to_owned()],
-        });
+        let diagnostic = protocol_diagnostic(&RmuxError::from_proto(
+            rmux_proto::RmuxError::UnsupportedCapability {
+                feature: "capability.future".to_owned(),
+                supported: vec![rmux_proto::CAPABILITY_HANDSHAKE.to_owned()],
+            },
+        ));
 
         assert_eq!(diagnostic.severity(), DiagnosticSeverity::Unsupported);
         assert_eq!(diagnostic.feature(), Some("capability.future"));

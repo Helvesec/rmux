@@ -1,10 +1,14 @@
 use chrono::{DateTime, Local};
-use rmux_core::{OptionStore, Pane, PaneGeometry, Session};
+use rmux_core::{OptionStore, PaneGeometry, Utf8Config};
 use rmux_proto::OptionName;
 
-use crate::pane_visible_geometry::visible_pane_content_geometry;
-
 use crate::clock_mode::format_clock_time;
+
+use super::pane_row::crop_rendered_pane_row;
+use super::projection::{
+    ProjectedPaneScrollbarContext, TerminalPaneProjection, TerminalPaneSpan,
+    TerminalSceneProjection,
+};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct ClockPaneRenderData {
@@ -134,7 +138,7 @@ const CLOCK_GLYPHS: [[[u8; 5]; 5]; 14] = [
 ];
 
 pub(crate) fn render_clock_overlay(
-    session: &Session,
+    session: rmux_core::ManagedSessionView<'_>,
     options: &OptionStore,
     panes: &[ClockPaneRenderData],
     now: DateTime<Local>,
@@ -145,27 +149,33 @@ pub(crate) fn render_clock_overlay(
 
     let mut frame = Vec::new();
     frame.extend_from_slice(b"\x1b[s\x1b[?25l");
+    let projection = TerminalSceneProjection::resolve(session, options);
     for pane_data in panes {
         let Some(pane) = session.window().pane(pane_data.pane_index) else {
             continue;
         };
-        let Some((geometry, scrollbar)) = visible_pane_geometry(
+        let Some(pane_projection) = projection.pane_projection(
             session,
             options,
             pane,
-            pane_data.history_size,
-            pane_data.alternate_on,
+            ProjectedPaneScrollbarContext {
+                history_size: pane_data.history_size,
+                alternate_on: pane_data.alternate_on,
+                copy_mode_scroll_position: None,
+            },
         ) else {
             continue;
         };
-        if geometry.cols() == 0 || geometry.rows() == 0 {
+        if pane_projection.spans().is_empty() && pane_projection.scrollbar().is_none() {
             continue;
         }
+        let geometry = pane_projection.source_geometry();
 
-        render_pane_clear(&mut frame, geometry);
+        render_pane_clear(&mut frame, &pane_projection);
         render_clock_for_pane(
             &mut frame,
             geometry,
+            pane_projection.spans(),
             options.resolve_for_pane(
                 session.name(),
                 session.active_window_index(),
@@ -180,7 +190,7 @@ pub(crate) fn render_clock_overlay(
             ),
             now,
         );
-        if let Some(scrollbar) = scrollbar {
+        if let Some(scrollbar) = pane_projection.scrollbar() {
             frame.extend_from_slice(scrollbar.frame().as_slice());
         }
     }
@@ -189,7 +199,7 @@ pub(crate) fn render_clock_overlay(
 }
 
 pub(crate) fn render_clock_restore_frame(
-    session: &Session,
+    session: rmux_core::ManagedSessionView<'_>,
     options: &OptionStore,
     panes: &[ClockPaneRestoreData],
     cursor_visible: bool,
@@ -200,36 +210,39 @@ pub(crate) fn render_clock_restore_frame(
 
     let mut frame = Vec::new();
     frame.extend_from_slice(b"\x1b[s\x1b[0m");
+    let projection = TerminalSceneProjection::resolve(session, options);
+    let utf8 = Utf8Config::from_options(options);
     for pane_data in panes {
         let Some(pane) = session.window().pane(pane_data.pane_index) else {
             continue;
         };
-        let Some((geometry, scrollbar)) = visible_pane_geometry(
+        let Some(pane_projection) = projection.pane_projection(
             session,
             options,
             pane,
-            pane_data.history_size,
-            pane_data.alternate_on,
+            ProjectedPaneScrollbarContext {
+                history_size: pane_data.history_size,
+                alternate_on: pane_data.alternate_on,
+                copy_mode_scroll_position: None,
+            },
         ) else {
             continue;
         };
-        for (row, line) in pane_data
-            .lines
-            .iter()
-            .take(usize::from(geometry.rows()))
-            .enumerate()
-        {
-            let Ok(row) = u16::try_from(row) else {
+        for span in pane_projection.spans() {
+            let Some(line) = pane_data.lines.get(span.source_row) else {
                 continue;
             };
-            frame.extend_from_slice(
-                super::cursor_position_bytes(geometry.y().saturating_add(row), geometry.x())
-                    .as_slice(),
+            let line = crop_rendered_pane_row(
+                line.as_bytes(),
+                span.source_col,
+                usize::from(span.cols),
+                &utf8,
             );
+            frame.extend_from_slice(super::cursor_position_bytes(span.y, span.x).as_slice());
             frame.extend_from_slice(b"\x1b[0m");
-            frame.extend_from_slice(line.as_bytes());
+            frame.extend_from_slice(line.bytes());
         }
-        if let Some(scrollbar) = scrollbar {
+        if let Some(scrollbar) = pane_projection.scrollbar() {
             frame.extend_from_slice(scrollbar.frame().as_slice());
         }
     }
@@ -243,27 +256,25 @@ pub(crate) fn render_clock_restore_frame(
     frame
 }
 
-fn render_pane_clear(frame: &mut Vec<u8>, geometry: PaneGeometry) {
+fn render_pane_clear(frame: &mut Vec<u8>, projection: &TerminalPaneProjection) {
     frame.extend_from_slice(b"\x1b[49m");
-    let blank_row = vec![b' '; usize::from(geometry.cols())];
-    for row in 0..geometry.rows() {
-        frame.extend_from_slice(
-            super::cursor_position_bytes(geometry.y().saturating_add(row), geometry.x()).as_slice(),
-        );
-        frame.extend_from_slice(blank_row.as_slice());
+    for span in projection.spans() {
+        frame.extend_from_slice(super::cursor_position_bytes(span.y, span.x).as_slice());
+        frame.extend(std::iter::repeat_n(b' ', usize::from(span.cols)));
     }
 }
 
 fn render_clock_for_pane(
     frame: &mut Vec<u8>,
     geometry: PaneGeometry,
+    spans: &[TerminalPaneSpan],
     colour: Option<&str>,
     style: Option<&str>,
     now: DateTime<Local>,
 ) {
     let time = format_clock_time(now, style);
     if geometry.cols() < 6 * u16::try_from(time.len()).unwrap_or(u16::MAX) || geometry.rows() < 6 {
-        render_small_clock(frame, geometry, colour, &time);
+        render_small_clock(frame, geometry, spans, colour, &time);
         return;
     }
 
@@ -293,12 +304,13 @@ fn render_clock_for_pane(
                 if CLOCK_GLYPHS[index][usize::from(row)][usize::from(col)] == 0 {
                     continue;
                 }
+                let Some((terminal_x, terminal_y)) =
+                    projected_cell(spans, x.saturating_add(col), start_y.saturating_add(row))
+                else {
+                    continue;
+                };
                 frame.extend_from_slice(
-                    super::cursor_position_bytes(
-                        start_y.saturating_add(row),
-                        x.saturating_add(col),
-                    )
-                    .as_slice(),
+                    super::cursor_position_bytes(terminal_y, terminal_x).as_slice(),
                 );
                 frame.push(b' ');
             }
@@ -310,6 +322,7 @@ fn render_clock_for_pane(
 fn render_small_clock(
     frame: &mut Vec<u8>,
     geometry: PaneGeometry,
+    spans: &[TerminalPaneSpan],
     colour: Option<&str>,
     time: &str,
 ) {
@@ -325,73 +338,56 @@ fn render_small_clock(
         .saturating_add(geometry.cols() / 2)
         .saturating_sub(width / 2);
     let y = geometry.y().saturating_add(geometry.rows() / 2);
-    frame.extend_from_slice(super::cursor_position_bytes(y, x).as_slice());
-    match super::parse_option_colour(colour) {
-        Some(colour) => {
-            if let Some(sgr) = super::foreground_sgr_parameter(colour) {
-                frame.extend_from_slice(format!("\x1b[{sgr}m").as_bytes());
+    for (x, y, text) in clipped_clock_text_runs(x, y, time, spans) {
+        frame.extend_from_slice(super::cursor_position_bytes(y, x).as_slice());
+        match super::parse_option_colour(colour) {
+            Some(colour) => {
+                if let Some(sgr) = super::foreground_sgr_parameter(colour) {
+                    frame.extend_from_slice(format!("\x1b[{sgr}m").as_bytes());
+                }
+            }
+            None => {
+                frame.extend_from_slice(b"\x1b[0m");
             }
         }
-        None => {
-            frame.extend_from_slice(b"\x1b[0m");
-        }
+        frame.extend_from_slice(text.as_bytes());
     }
-    frame.extend_from_slice(time.as_bytes());
 }
 
-fn visible_pane_geometry(
-    session: &Session,
-    options: &OptionStore,
-    pane: &Pane,
-    history_size: usize,
-    alternate_on: bool,
-) -> Option<(
-    PaneGeometry,
-    Option<super::pane_scrollbar::RenderedPaneScrollbar>,
-)> {
-    let geometry = super::StatusGeometry::for_session(session, options);
-    let raw_pane = if session.window().is_zoomed() {
-        if session.window().active_pane_index() != pane.index() {
-            return None;
-        }
-        let size = geometry.content_size();
-        visible_pane_content_geometry(
-            options,
-            session.name(),
-            session.active_window_index(),
-            PaneGeometry::new(0, 0, size.cols, size.rows),
-            geometry.content_rows,
-        )
-    } else {
-        visible_pane_content_geometry(
-            options,
-            session.name(),
-            session.active_window_index(),
-            pane.geometry(),
-            geometry.content_rows,
-        )
-    };
-    let (pane, scrollbar) = super::pane_scrollbar::resolve_pane_scrollbar(
-        session,
-        options,
-        pane,
-        super::pane_scrollbar::PaneScrollbarRenderContext {
-            geometry: raw_pane,
-            history_size,
-            alternate_on,
-            copy_mode_scroll_position: None,
-            content_y_offset: geometry.content_y_offset,
-        },
-    );
-    Some((
-        PaneGeometry::new(
-            pane.x(),
-            pane.y().saturating_add(geometry.content_y_offset),
-            pane.cols(),
-            pane.rows(),
-        ),
-        scrollbar,
-    ))
+fn projected_cell(spans: &[TerminalPaneSpan], x: u16, y: u16) -> Option<(u16, u16)> {
+    spans.iter().find_map(|span| {
+        let offset = usize::from(x).checked_sub(span.source_col)?;
+        (span.source_row == usize::from(y) && offset < usize::from(span.cols))
+            .then(|| (span.x + offset as u16, span.y))
+    })
+}
+
+fn clipped_clock_text_runs<'a>(
+    x: u16,
+    y: u16,
+    text: &'a str,
+    spans: &[TerminalPaneSpan],
+) -> Vec<(u16, u16, &'a str)> {
+    let x = usize::from(x);
+    let run_end = x.saturating_add(text.len());
+    spans
+        .iter()
+        .filter(|span| span.source_row == usize::from(y))
+        .filter_map(|span| {
+            let start = x.max(span.source_col);
+            let end = run_end.min(span.source_col.saturating_add(usize::from(span.cols)));
+            if start >= end {
+                return None;
+            }
+            let text_start = start.saturating_sub(x);
+            let text_end = end.saturating_sub(x).min(text.len());
+            Some((
+                span.x + u16::try_from(start - span.source_col).ok()?,
+                span.y,
+                &text[text_start..text_end],
+            ))
+        })
+        .collect()
 }
 
 fn glyph_index(ch: char) -> Option<usize> {
@@ -411,7 +407,7 @@ mod tests {
         render_clock_overlay, render_clock_restore_frame, ClockPaneRenderData, ClockPaneRestoreData,
     };
     use chrono::{Local, TimeZone};
-    use rmux_core::{OptionStore, Session};
+    use rmux_core::{FloatingPaneRect, OptionStore};
     use rmux_proto::{
         OptionName, ResizePaneAdjustment, ScopeSelector, SessionName, SetOptionMode, TerminalSize,
         WindowTarget,
@@ -421,9 +417,67 @@ mod tests {
         SessionName::new(value).expect("valid session name")
     }
 
+    fn float_pane(
+        session: &mut crate::session_fixture::SessionFixture,
+        pane_index: u32,
+        rect: FloatingPaneRect,
+    ) {
+        session
+            .store
+            .window_layout_context_mut(&WindowTarget::with_window(
+                session.name().clone(),
+                session.active_window_index(),
+            ))
+            .expect("window layout context")
+            .float_pane(pane_index, rect)
+            .expect("pane can float");
+    }
+
+    #[test]
+    fn clock_overlay_uses_source_threshold_and_center_before_clipping() {
+        for (x, y, cols, rows, expected) in [
+            (-3, 0, 8, 4, "\x1b[3;1H\x1b[34m3:02"),
+            (-3, -2, 8, 4, "\x1b[1;1H\x1b[34m3:02"),
+            (8, 6, 8, 4, "\x1b[9;11H\x1b[34m13"),
+            (-3, 0, 30, 6, "\x1b[44m"),
+        ] {
+            let mut session = crate::session_fixture::SessionFixture::new(
+                session_name("source"),
+                TerminalSize { cols: 12, rows: 10 },
+            );
+            session.split_active_pane().expect("split");
+            float_pane(
+                &mut session,
+                1,
+                FloatingPaneRect::new(x, y, cols, rows).expect("rect"),
+            );
+            let now = Local
+                .with_ymd_and_hms(2026, 4, 15, 13, 2, 3)
+                .single()
+                .expect("time");
+            let frame = String::from_utf8(render_clock_overlay(
+                session.view(),
+                &OptionStore::new(),
+                &[ClockPaneRenderData::new(1)],
+                now,
+            ))
+            .expect("frame");
+            assert!(frame.contains(expected), "{frame:?} lacks {expected:?}");
+            if cols == 30 {
+                assert!(
+                    !frame.contains("13:02"),
+                    "large source must retain big glyphs"
+                );
+            }
+        }
+    }
+
     #[test]
     fn clock_overlay_draws_tmux_big_digits() {
-        let session = Session::new(session_name("alpha"), TerminalSize { cols: 48, rows: 7 });
+        let session = crate::session_fixture::SessionFixture::new(
+            session_name("alpha"),
+            TerminalSize { cols: 48, rows: 7 },
+        );
         let options = OptionStore::new();
         let now = Local
             .with_ymd_and_hms(2026, 4, 15, 13, 2, 3)
@@ -431,7 +485,7 @@ mod tests {
             .expect("valid local time");
 
         let frame = String::from_utf8(render_clock_overlay(
-            &session,
+            session.view(),
             &options,
             &[ClockPaneRenderData::new(0)],
             now,
@@ -446,7 +500,10 @@ mod tests {
 
     #[test]
     fn clock_overlay_falls_back_to_plain_text_when_pane_is_small() {
-        let session = Session::new(session_name("alpha"), TerminalSize { cols: 8, rows: 5 });
+        let session = crate::session_fixture::SessionFixture::new(
+            session_name("alpha"),
+            TerminalSize { cols: 8, rows: 5 },
+        );
         let options = OptionStore::new();
         let now = Local
             .with_ymd_and_hms(2026, 4, 15, 13, 2, 3)
@@ -454,7 +511,7 @@ mod tests {
             .expect("valid local time");
 
         let frame = String::from_utf8(render_clock_overlay(
-            &session,
+            session.view(),
             &options,
             &[ClockPaneRenderData::new(0)],
             now,
@@ -466,7 +523,10 @@ mod tests {
 
     #[test]
     fn clock_overlay_obeys_always_modal_and_alternate_scrollbar_rules() {
-        let session = Session::new(session_name("alpha"), TerminalSize { cols: 20, rows: 8 });
+        let session = crate::session_fixture::SessionFixture::new(
+            session_name("alpha"),
+            TerminalSize { cols: 20, rows: 8 },
+        );
         let target = WindowTarget::with_window(session.name().clone(), 0);
         let now = Local
             .with_ymd_and_hms(2026, 4, 15, 13, 2, 3)
@@ -491,7 +551,7 @@ mod tests {
             .expect("always-on scrollbars");
 
         let always = String::from_utf8(render_clock_overlay(
-            &session,
+            session.view(),
             &options,
             &[ClockPaneRenderData::new(0)],
             now,
@@ -510,7 +570,7 @@ mod tests {
             )
             .expect("modal scrollbars");
         let modal = String::from_utf8(render_clock_overlay(
-            &session,
+            session.view(),
             &options,
             &[ClockPaneRenderData::new(0)],
             now,
@@ -529,7 +589,7 @@ mod tests {
             )
             .expect("always-on scrollbars");
         let alternate = String::from_utf8(render_clock_overlay(
-            &session,
+            session.view(),
             &options,
             &[ClockPaneRenderData {
                 pane_index: 0,
@@ -546,7 +606,10 @@ mod tests {
 
     #[test]
     fn zoomed_windows_only_render_the_active_pane_clock() {
-        let mut session = Session::new(session_name("alpha"), TerminalSize { cols: 20, rows: 8 });
+        let mut session = crate::session_fixture::SessionFixture::new(
+            session_name("alpha"),
+            TerminalSize { cols: 20, rows: 8 },
+        );
         session.split_active_pane().expect("split succeeds");
         session
             .resize_pane(1, ResizePaneAdjustment::Zoom)
@@ -558,7 +621,7 @@ mod tests {
             .expect("valid local time");
 
         let frame = String::from_utf8(render_clock_overlay(
-            &session,
+            session.view(),
             &options,
             &[ClockPaneRenderData::new(0)],
             now,
@@ -569,12 +632,46 @@ mod tests {
     }
 
     #[test]
+    fn clock_overlay_clips_text_occluded_by_front_floating_pane() {
+        let mut session = crate::session_fixture::SessionFixture::new(
+            session_name("alpha"),
+            TerminalSize { cols: 20, rows: 6 },
+        );
+        session.split_active_pane().expect("split succeeds");
+        float_pane(
+            &mut session,
+            1,
+            FloatingPaneRect::new(0, 0, 20, 3).expect("valid floating rect"),
+        );
+        let now = Local
+            .with_ymd_and_hms(2026, 4, 15, 13, 2, 3)
+            .single()
+            .expect("valid local time");
+
+        let frame = String::from_utf8(render_clock_overlay(
+            session.view(),
+            &OptionStore::new(),
+            &[ClockPaneRenderData::new(0)],
+            now,
+        ))
+        .expect("overlay is utf-8");
+
+        assert!(
+            !frame.contains("13:02"),
+            "rear clock text must be clipped by the front floating frame: {frame:?}"
+        );
+    }
+
+    #[test]
     fn restore_frame_restores_hidden_cursor_and_lines() {
-        let session = Session::new(session_name("alpha"), TerminalSize { cols: 8, rows: 4 });
+        let session = crate::session_fixture::SessionFixture::new(
+            session_name("alpha"),
+            TerminalSize { cols: 8, rows: 4 },
+        );
         let options = OptionStore::new();
 
         let frame = String::from_utf8(render_clock_restore_frame(
-            &session,
+            session.view(),
             &options,
             &[ClockPaneRestoreData {
                 pane_index: 0,
@@ -594,7 +691,10 @@ mod tests {
 
     #[test]
     fn clock_overlay_supports_rgb_clock_colours() {
-        let session = Session::new(session_name("alpha"), TerminalSize { cols: 48, rows: 7 });
+        let session = crate::session_fixture::SessionFixture::new(
+            session_name("alpha"),
+            TerminalSize { cols: 48, rows: 7 },
+        );
         let window = WindowTarget::new(session.name().clone());
         let mut options = OptionStore::new();
         options
@@ -611,7 +711,7 @@ mod tests {
             .expect("valid local time");
 
         let frame = String::from_utf8(render_clock_overlay(
-            &session,
+            session.view(),
             &options,
             &[ClockPaneRenderData::new(0)],
             now,

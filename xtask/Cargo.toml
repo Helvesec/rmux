@@ -1,4 +1,5 @@
 [package]
+rust-version.workspace = true
 name = "xtask"
 version.workspace = true
 edition.workspace = true
@@ -9,9 +10,16 @@ repository.workspace = true
 [dependencies]
 clap = { version = "=4.5.39", features = ["derive"] }
 clap_complete = "=4.5.55"
-rmux-core = { path = "../crates/rmux-core", version = "0.10.0" }
-rmux-proto = { path = "../crates/rmux-proto", version = "0.10.0" }
+rmux-core = { path = "../crates/rmux-core", version = "0.11.0" }
+rmux-proto = { path = "../crates/rmux-proto", version = "0.11.0" }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+toml = "0.8.23"
 
 [[bin]]
 name = "xtask"
 path = "src/main.rs"
+
+[[test]]
+name = "docs_acceptance"
+path = "src/docs_acceptance.rs"

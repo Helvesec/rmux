@@ -7,6 +7,36 @@ use crate::cli_response::expect_command_output;
 
 use super::{unexpected_response, ExitFailure};
 
+#[cfg(all(test, unix))]
+mod canonical_inventory_tests {
+    crate::session_inventory_tests::canonical_inventory_tests!("full");
+
+    // Full dispatcher only; registered without `tiny-cli`, as before.
+    #[test]
+    #[cfg(not(feature = "tiny-cli"))]
+    fn canonical_inventory_cli_legacy_all_windows_retains_targets() {
+        use crate::session_inventory_tests as scenario;
+
+        let result = scenario::exchange("full", scenario::inventory(), true, |path| {
+            let cli = crate::cli_args::parse(["rmux", "list-windows", "-a"]).unwrap();
+            let Some(crate::cli_args::Command::ListWindows(args)) = cli.command else {
+                panic!("list-windows");
+            };
+            super::super::window_commands::run_list_windows(args, path).unwrap()
+        });
+        assert_eq!(result, 0);
+    }
+}
+
+#[cfg(all(test, unix))]
+fn canonical_inventory_run_all_panes(path: &std::path::Path) -> i32 {
+    let cli = crate::cli_args::parse(["rmux", "list-panes", "-a"]).unwrap();
+    let Some(crate::cli_args::Command::ListPanes(args)) = cli.command else {
+        panic!("list-panes");
+    };
+    super::pane_commands::run_list_panes(args, path).unwrap()
+}
+
 pub(super) fn resolve_current_session_target(
     connection: &mut Connection,
 ) -> Result<rmux_proto::SessionName, ExitFailure> {
@@ -45,7 +75,7 @@ pub(super) fn list_session_names(
         .lines()
         .filter(|line| !line.is_empty())
         .map(|line| {
-            rmux_proto::SessionName::new(line).map_err(|error| {
+            rmux_proto::SessionName::from_canonical(line).map_err(|error| {
                 ExitFailure::new(
                     1,
                     format!("invalid session name from server '{line}': {error}"),

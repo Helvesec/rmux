@@ -5,7 +5,6 @@ use crate::terminal::SessionBaseEnvironment;
 
 use super::{session_not_found, HandlerState};
 
-#[path = "session_runtime/group_sync.rs"]
 mod group_sync;
 
 fn pane_base_environment_with_starting_fallback(
@@ -166,8 +165,8 @@ impl HandlerState {
 
         self.rename_window_link_session(session_name, new_name);
 
-        if let Some(pixels) = self.attached_terminal_pixels.remove(session_name) {
-            self.attached_terminal_pixels
+        if let Some(pixels) = self.attached_terminal_geometry.remove(session_name) {
+            self.attached_terminal_geometry
                 .insert(new_name.clone(), pixels);
         }
 
@@ -182,12 +181,12 @@ impl HandlerState {
     ) -> Result<bool, RmuxError> {
         let Some(current_runtime_owner) = current_runtime_owner else {
             self.remove_window_link_session_slots(session_name);
-            let _ = self.attached_terminal_pixels.remove(session_name);
+            let _ = self.attached_terminal_geometry.remove(session_name);
             return Ok(false);
         };
         if current_runtime_owner != session_name {
             self.remove_window_link_session_slots(session_name);
-            let _ = self.attached_terminal_pixels.remove(session_name);
+            let _ = self.attached_terminal_geometry.remove(session_name);
             return Ok(true);
         }
 
@@ -195,7 +194,7 @@ impl HandlerState {
             self.terminals
                 .rename_session(session_name, next_runtime_owner)?;
             self.rename_runtime_session_state(session_name, next_runtime_owner)?;
-            let _ = self.attached_terminal_pixels.remove(session_name);
+            let _ = self.attached_terminal_geometry.remove(session_name);
             // Group peers share the removed owner's canonical winlink slots.
             // Rekey those slots together with the runtime instead of
             // detaching them, otherwise external aliases lose the surviving
@@ -213,15 +212,16 @@ impl HandlerState {
         }
 
         #[cfg(windows)]
-        let _ = self.starting_panes.remove(session_name);
+        self.remove_session_starting_panes(session_name);
         for pipe in self.remove_session_pipes(session_name).into_values() {
             pipe.stop();
         }
         let mut removed_outputs = self.remove_session_pane_outputs(session_name);
         removed_outputs.abort_output_readers();
         let _ = self.dead_panes.remove(session_name);
+        let _ = self.kept_dead_pane_preparations.remove(session_name);
         let _ = self.attached_submitted_rows.remove(session_name);
-        let _ = self.attached_terminal_pixels.remove(session_name);
+        let _ = self.attached_terminal_geometry.remove(session_name);
         self.auto_named_windows
             .retain(|(tracked_session, _)| tracked_session != session_name);
         let mut removed_terminals = self.terminals.remove_session(session_name);
@@ -360,6 +360,11 @@ impl HandlerState {
                 "pane output generations already exist for session {new_name}"
             )));
         }
+        if self.kept_dead_pane_preparations.contains_key(new_name) {
+            return Err(RmuxError::Server(format!(
+                "kept dead pane preparations already exist for session {new_name}"
+            )));
+        }
         #[cfg(unix)]
         if self.pane_output_readers.contains_key(new_name) {
             return Err(RmuxError::Server(format!(
@@ -383,6 +388,7 @@ impl HandlerState {
         #[cfg(windows)]
         let mut starting_panes = std::mem::take(&mut self.starting_panes);
         let mut dead_panes = std::mem::take(&mut self.dead_panes);
+        let mut kept_dead_pane_preparations = std::mem::take(&mut self.kept_dead_pane_preparations);
         let mut attached_submitted_rows = std::mem::take(&mut self.attached_submitted_rows);
 
         let session_transcripts = transcripts
@@ -399,6 +405,9 @@ impl HandlerState {
         #[cfg(windows)]
         let session_starting_panes = starting_panes.remove(session_name).unwrap_or_default();
         let session_dead_panes = dead_panes.remove(session_name).unwrap_or_default();
+        let session_kept_dead_preparations = kept_dead_pane_preparations
+            .remove(session_name)
+            .unwrap_or_default();
         let session_attached_rows = attached_submitted_rows
             .remove(session_name)
             .unwrap_or_default();
@@ -429,6 +438,11 @@ impl HandlerState {
             let previous_dead_panes = dead_panes.insert(new_name.clone(), session_dead_panes);
             debug_assert!(previous_dead_panes.is_none());
         }
+        if !session_kept_dead_preparations.is_empty() {
+            let previous_preparations = kept_dead_pane_preparations
+                .insert(new_name.clone(), session_kept_dead_preparations);
+            debug_assert!(previous_preparations.is_none());
+        }
         if !session_attached_rows.is_empty() {
             let previous_attached_rows =
                 attached_submitted_rows.insert(new_name.clone(), session_attached_rows);
@@ -457,6 +471,7 @@ impl HandlerState {
             self.starting_panes = starting_panes;
         }
         self.dead_panes = dead_panes;
+        self.kept_dead_pane_preparations = kept_dead_pane_preparations;
         self.attached_submitted_rows = attached_submitted_rows;
         self.auto_named_windows = auto_named_windows;
         Ok(())

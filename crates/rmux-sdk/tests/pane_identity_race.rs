@@ -20,7 +20,7 @@ use rmux_proto::{
     WindowTarget, CAPABILITY_HANDSHAKE,
 };
 use rmux_sdk::{
-    LayoutName, Pane, PaneCloseOutcome, PaneId, PaneOutputStart, PaneRef, PaneStateEvent,
+    Pane, PaneCloseOutcome, PaneId, PaneOutputStart, PaneRef, PaneStateEvent,
     PaneStateEventsOptions, RmuxBuilder, RmuxError, SessionId, SessionName, TerminalLoadState,
     TerminalSizeSpec, WindowId,
 };
@@ -990,13 +990,13 @@ async fn render_stream_still_rejects_open_output_cursor_drift() -> TestResult {
         .await
         .expect_err("an open output cursor behind the surface boundary must remain an error");
     match error {
-        RmuxError::Protocol {
-            source: rmux_proto::RmuxError::Server(message),
-            ..
-        } => assert_eq!(
-            message,
-            "pane surface advanced beyond its correlated output cursor"
-        ),
+        RmuxError::Protocol { source, .. } if source.server_message().is_some() => {
+            let message = source.server_message().unwrap();
+            assert_eq!(
+                message,
+                "pane surface advanced beyond its correlated output cursor"
+            )
+        }
         other => return Err(format!("expected protocol drift error, got {other:?}").into()),
     }
     drop(render);
@@ -2642,7 +2642,7 @@ async fn expect_info_window_identity(
             name: Some("main".to_owned()),
             pane_count: 2,
             size: TerminalSize { cols: 80, rows: 24 },
-            layout: LayoutName::Tiled,
+            layout: rmux_proto::LayoutName::Tiled,
             active: true,
             last: false,
             rendered: String::new(),

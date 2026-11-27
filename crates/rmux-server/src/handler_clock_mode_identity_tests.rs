@@ -35,7 +35,7 @@ async fn session_id(handler: &RequestHandler, target: &PaneTarget) -> Option<Ses
     state
         .sessions
         .session(target.session_name())
-        .map(rmux_core::Session::id)
+        .map(|session| session.id())
 }
 
 async fn wait_for_session_absence(handler: &RequestHandler, target: &PaneTarget) {
@@ -384,11 +384,7 @@ async fn restore_publication_serializes_a_later_clock_reentry() {
         tokio::task::yield_now().await;
     }
     assert!(
-        transcript
-            .lock()
-            .expect("clock transcript lock")
-            .clock_mode_generation()
-            .is_none(),
+        transcript.lock().clock_mode_generation().is_none(),
         "reentry must remain behind the state-to-overlay transaction"
     );
 
@@ -485,12 +481,37 @@ async fn clock_exit_effects_ignore_recreated_same_name_session() {
     assert_ne!(replacement_session_id, old_session_id);
 
     let (replacement_tx, mut replacement_rx) = mpsc::unbounded_channel();
-    handler
-        .register_attach(requester_pid, alpha.session_name().clone(), replacement_tx)
-        .await;
+    let attach_handler = handler.clone();
+    let attach_session = alpha.session_name().clone();
+    let attach = tokio::spawn(async move {
+        attach_handler
+            .register_attach(requester_pid, attach_session, replacement_tx)
+            .await
+    });
+    // Registration publishes the new identity before waiting for ordered focus
+    // effects. Those effects follow the paused clock exit's lifecycle event, so
+    // wait for publication here and join registration only after releasing it.
+    timeout(TEST_TIMEOUT, async {
+        loop {
+            if handler
+                .active_attach_identity(requester_pid)
+                .await
+                .is_some_and(|identity| identity.session_id() == replacement_session_id)
+            {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("replacement attach identity becomes visible before clock exit resumes");
     while replacement_rx.try_recv().is_ok() {}
     pause.release();
 
+    timeout(TEST_TIMEOUT, attach)
+        .await
+        .expect("replacement attach completes")
+        .expect("replacement attach task joins");
     timeout(TEST_TIMEOUT, input)
         .await
         .expect("clock exit completes")

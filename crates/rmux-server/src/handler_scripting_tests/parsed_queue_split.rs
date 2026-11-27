@@ -1,4 +1,6 @@
 use super::*;
+#[path = "split_key_admission.rs"]
+mod split_key_admission;
 
 #[tokio::test]
 async fn parsed_queue_split_window_accepts_start_directory() {
@@ -6,8 +8,8 @@ async fn parsed_queue_split_window_accepts_start_directory() {
     let alpha = session_name("split-cwd");
     let cwd = temp_root("split-cwd");
     fs::create_dir_all(&cwd).expect("split cwd");
-    assert!(matches!(
-        handler
+    crate::session_fixture::assert_new_session(
+        &handler
             .handle(Request::NewSession(NewSessionRequest {
                 session_name: alpha.clone(),
                 detached: true,
@@ -15,8 +17,7 @@ async fn parsed_queue_split_window_accepts_start_directory() {
                 environment: None,
             }))
             .await,
-        Response::NewSession(_)
-    ));
+    );
 
     let parsed = CommandParser::new()
         .parse(&format!("split-window -c {}", shell_quote(&cwd)))
@@ -42,7 +43,7 @@ async fn parsed_queue_split_window_accepts_start_directory() {
     let lifecycle = state
         .pane_lifecycle(pane.id())
         .expect("split lifecycle exists");
-    assert_eq!(lifecycle.working_directory(), Some(cwd.as_path()));
+    assert_eq!(lifecycle.working_directory(), Some(cwd.path()));
 
     let _ = fs::remove_dir_all(cwd);
 }
@@ -51,8 +52,8 @@ async fn parsed_queue_split_window_accepts_start_directory() {
 async fn parsed_queue_split_window_applies_stateful_compat_flags() {
     let handler = RequestHandler::new();
     let alpha = session_name("alpha");
-    assert!(matches!(
-        handler
+    crate::session_fixture::assert_new_session(
+        &handler
             .handle(Request::NewSession(NewSessionRequest {
                 session_name: alpha.clone(),
                 detached: true,
@@ -60,8 +61,7 @@ async fn parsed_queue_split_window_applies_stateful_compat_flags() {
                 environment: None,
             }))
             .await,
-        Response::NewSession(_)
-    ));
+    );
 
     let parsed = CommandParser::new()
         .parse("split-window -d -Z -l 5 -t alpha:0.0")
@@ -92,7 +92,7 @@ async fn parsed_queue_split_window_applies_stateful_compat_flags() {
     handler
         .execute_parsed_commands_for_test(std::process::id(), parsed)
         .await
-        .expect("split-window -I creates an empty keep-alive pane");
+        .expect("split-window -I creates a live empty pane");
 
     let state = handler.state.lock().await;
     let session = state.sessions.session(&alpha).expect("session exists");
@@ -101,14 +101,18 @@ async fn parsed_queue_split_window_applies_stateful_compat_flags() {
         window.pane(2).is_some(),
         "split-window -I should create a third pane after the earlier split"
     );
+    let empty = window.pane(1).expect("new pane follows target zero");
+    assert_eq!(state.pane_pid_in_window(&alpha, 0, 1).unwrap(), 0);
+    assert!(!state.pane_is_dead(&alpha, empty.id()));
+    assert!(state.pane_is_empty(empty.id()));
 }
 
 #[tokio::test]
 async fn parsed_queue_split_window_keep_flag_retains_exited_pane() {
     let handler = RequestHandler::new();
     let alpha = session_name("split-keep");
-    assert!(matches!(
-        handler
+    crate::session_fixture::assert_new_session(
+        &handler
             .handle(Request::NewSession(NewSessionRequest {
                 session_name: alpha.clone(),
                 detached: true,
@@ -116,8 +120,7 @@ async fn parsed_queue_split_window_keep_flag_retains_exited_pane() {
                 environment: None,
             }))
             .await,
-        Response::NewSession(_)
-    ));
+    );
 
     let parsed = CommandParser::new()
         .parse("split-window -dk -t split-keep:0.0 'exit 7'")
@@ -127,7 +130,7 @@ async fn parsed_queue_split_window_keep_flag_retains_exited_pane() {
         .await
         .expect("split-window -k executes");
 
-    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+    let deadline = tokio::time::Instant::now() + SERVER_SIGNAL_LIVENESS;
     loop {
         let (pane_id, dead) = {
             let state = handler.state.lock().await;
@@ -152,11 +155,11 @@ async fn parsed_queue_split_window_keep_flag_retains_exited_pane() {
 }
 
 #[tokio::test]
-async fn parsed_queue_split_window_direction_flags_follow_tmux_priority() {
+async fn sc2_admission_command_key_is_distinct_from_api_boolean_keep() {
     let handler = RequestHandler::new();
-    let alpha = session_name("split-priority");
-    assert!(matches!(
-        handler
+    let alpha = session_name("sc2-admission");
+    crate::session_fixture::assert_new_session(
+        &handler
             .handle(Request::NewSession(NewSessionRequest {
                 session_name: alpha.clone(),
                 detached: true,
@@ -164,8 +167,38 @@ async fn parsed_queue_split_window_direction_flags_follow_tmux_priority() {
                 environment: None,
             }))
             .await,
-        Response::NewSession(_)
-    ));
+    );
+    let parsed = CommandParser::new()
+        .parse("split-window -Ik -t sc2-admission:0.0")
+        .unwrap();
+    handler
+        .execute_parsed_commands_for_test(std::process::id(), parsed)
+        .await
+        .unwrap();
+    let state = handler.state.lock().await;
+    assert_eq!(
+        state
+            .options
+            .resolve_for_pane(&alpha, 0, 1, OptionName::RemainOnExit),
+        Some("key"),
+        "command -k must not collapse into the public API boolean on"
+    );
+}
+
+#[tokio::test]
+async fn parsed_queue_split_window_direction_flags_follow_tmux_priority() {
+    let handler = RequestHandler::new();
+    let alpha = session_name("split-priority");
+    crate::session_fixture::assert_new_session(
+        &handler
+            .handle(Request::NewSession(NewSessionRequest {
+                session_name: alpha.clone(),
+                detached: true,
+                size: Some(TerminalSize { cols: 80, rows: 24 }),
+                environment: None,
+            }))
+            .await,
+    );
 
     let parsed = CommandParser::new()
         .parse("split-window -h -v -t split-priority:0.0")
@@ -189,8 +222,8 @@ async fn parsed_queue_split_window_direction_flags_follow_tmux_priority() {
 async fn parsed_queue_split_window_full_size_splits_the_window_root() {
     let handler = RequestHandler::new();
     let alpha = session_name("split-full");
-    assert!(matches!(
-        handler
+    crate::session_fixture::assert_new_session(
+        &handler
             .handle(Request::NewSession(NewSessionRequest {
                 session_name: alpha.clone(),
                 detached: true,
@@ -198,8 +231,7 @@ async fn parsed_queue_split_window_full_size_splits_the_window_root() {
                 environment: None,
             }))
             .await,
-        Response::NewSession(_)
-    ));
+    );
 
     let parsed = CommandParser::new()
         .parse("split-window -v -l 5 -t split-full:0.0 ; split-window -f -v -t split-full:0.1")
@@ -237,8 +269,8 @@ async fn parsed_queue_split_window_full_size_splits_the_window_root() {
 async fn parsed_queue_split_window_prints_formatted_target() {
     let handler = RequestHandler::new();
     let alpha = session_name("alpha");
-    assert!(matches!(
-        handler
+    crate::session_fixture::assert_new_session(
+        &handler
             .handle(Request::NewSession(NewSessionRequest {
                 session_name: alpha.clone(),
                 detached: true,
@@ -246,8 +278,7 @@ async fn parsed_queue_split_window_prints_formatted_target() {
                 environment: None,
             }))
             .await,
-        Response::NewSession(_)
-    ));
+    );
 
     let parsed = CommandParser::new()
         .parse("split-window -P -F '#{session_name}:#{window_index}.#{pane_index}' -t alpha:0.0")
@@ -264,8 +295,8 @@ async fn parsed_queue_split_window_prints_formatted_target() {
 async fn parsed_queue_split_window_percentage_size_uses_target_pane_axis() {
     let handler = RequestHandler::new();
     let alpha = session_name("alpha");
-    assert!(matches!(
-        handler
+    crate::session_fixture::assert_new_session(
+        &handler
             .handle(Request::NewSession(NewSessionRequest {
                 session_name: alpha.clone(),
                 detached: true,
@@ -273,8 +304,7 @@ async fn parsed_queue_split_window_percentage_size_uses_target_pane_axis() {
                 environment: None,
             }))
             .await,
-        Response::NewSession(_)
-    ));
+    );
 
     let parsed = CommandParser::new()
         .parse("split-window -v -l 5 -t alpha:0.0 ; split-window -v -l 50% -t alpha:0.1")

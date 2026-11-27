@@ -204,14 +204,12 @@ async fn surface_projection_error_is_retryable_without_closing_the_sdk_stream() 
         .await
         .expect_err("oversized Surface projection must reach the SDK as an error");
     assert!(matches!(
-        error,
-        crate::RmuxError::Protocol {
-            source: rmux_proto::RmuxError::FrameTooLarge {
+        error.protocol_source(),
+        Some(rmux_proto::RmuxError::FrameTooLarge {
                 length,
                 maximum,
-            },
-        } if length == DEFAULT_MAX_DETACHED_FRAME_LENGTH + 1
-            && maximum == DEFAULT_MAX_DETACHED_FRAME_LENGTH
+        }) if *length == DEFAULT_MAX_DETACHED_FRAME_LENGTH + 1
+            && *maximum == DEFAULT_MAX_DETACHED_FRAME_LENGTH
     ));
 
     assert!(matches!(

@@ -37,10 +37,18 @@ impl Drop for CommandConnectionCacheReset {
 }
 
 pub(super) fn with_command_connection_cache<R>(socket_path: &Path, run: impl FnOnce() -> R) -> R {
+    with_initial_command_connection(socket_path, None, run)
+}
+
+pub(super) fn with_initial_command_connection<R>(
+    socket_path: &Path,
+    connection: Option<Connection>,
+    run: impl FnOnce() -> R,
+) -> R {
     let previous = COMMAND_CONNECTION_CACHE.with(|cache| {
         cache.replace(Some(CommandConnectionCache {
             socket_path: socket_path.to_path_buf(),
-            connection: None,
+            connection,
         }))
     });
     let _reset = CommandConnectionCacheReset { previous };
@@ -226,10 +234,24 @@ fn queued_server_command_response(
         .map_err(ExitFailure::from_client)
 }
 
-fn finish_queued_server_command(
+pub(super) fn finish_queued_server_command(
     command_name: &'static str,
     response: Response,
 ) -> Result<i32, ExitFailure> {
+    if let Response::SourceFile(source) = &response {
+        if command_name == "run-shell" && !source.stderr().is_empty() {
+            if let Some(output) = source.command_output() {
+                write_command_output(output)?;
+            }
+            std::io::stderr()
+                .write_all(source.stderr())
+                .map_err(|error| {
+                    ExitFailure::new(1, format!("failed to write run-shell stderr: {error}"))
+                })?;
+            // The inserted body's error does not cancel the parent CLI group.
+            return Ok(source.exit_status().unwrap_or(0));
+        }
+    }
     if let Some(exit_status) = queued_server_command_nonzero_exit(command_name, &response)? {
         return Ok(exit_status);
     }
@@ -238,7 +260,7 @@ fn finish_queued_server_command(
 }
 
 fn queued_server_command_nonzero_exit(
-    command_name: &'static str,
+    _command_name: &'static str,
     response: &Response,
 ) -> Result<Option<i32>, ExitFailure> {
     if let Response::SourceFile(source) = &response {
@@ -253,9 +275,7 @@ fn queued_server_command_nonzero_exit(
         }
     }
     let source_stdout_may_be_diagnostic = match &response {
-        Response::SourceFile(source) if matches!(command_name, "if-shell" | "list-windows") => {
-            source.exit_status().is_some_and(|status| status != 0)
-        }
+        Response::SourceFile(source) => source.exit_status().is_some_and(|status| status != 0),
         _ => true,
     };
     if let Some(output) = response
@@ -263,7 +283,8 @@ fn queued_server_command_nonzero_exit(
         .filter(|output| source_stdout_may_be_diagnostic && !output.stdout().is_empty())
     {
         let rendered = String::from_utf8_lossy(output.stdout());
-        if let Some(message) = strip_source_file_stdin_line_prefix(&rendered) {
+        if let Some(message) = super::alias_fallback::strip_source_file_stdin_line_prefix(&rendered)
+        {
             let mut message = message.to_owned();
             while message.ends_with("\n\n") {
                 message.pop();
@@ -285,7 +306,7 @@ fn queued_server_command_nonzero_exit(
     Ok(None)
 }
 
-fn with_command_connection<F, R>(socket_path: &Path, run: F) -> Result<R, ExitFailure>
+pub(super) fn with_command_connection<F, R>(socket_path: &Path, run: F) -> Result<R, ExitFailure>
 where
     F: FnOnce(&mut Connection) -> Result<R, ExitFailure>,
 {
@@ -331,11 +352,13 @@ pub(crate) fn inherited_pane_target(
     connection: &mut Connection,
     socket_path: &Path,
 ) -> Result<Option<PaneTarget>, ExitFailure> {
-    let Some(pane_id) = inherited_pane_id(socket_path) else {
+    if inherited_pane_id(socket_path).is_none() {
         return Ok(None);
-    };
+    }
+    // Ask for implicit context; a stale environment hint is not an explicit
+    // pane operand whose failed lookup should emit a command-error hook.
     let response = connection
-        .resolve_target(Some(pane_id), ResolveTargetType::Pane, false, false)
+        .resolve_target(None, ResolveTargetType::Pane, false, false)
         .map_err(ExitFailure::from_client)?;
     match response {
         Response::ResolveTarget(response) => match response.target {
@@ -376,18 +399,7 @@ fn normalize_queued_direct_error(command_name: &str, error: ExitFailure) -> Exit
     if command_name == "source-file" {
         return error;
     }
-    let Some(message) = strip_source_file_stdin_line_prefix(error.message()) else {
-        return error;
-    };
-    ExitFailure::new(error.exit_code(), message.to_owned())
-}
-
-fn strip_source_file_stdin_line_prefix(message: &str) -> Option<&str> {
-    let rest = message.strip_prefix("-:")?;
-    let (line, message) = rest.split_once(": ")?;
-    line.bytes()
-        .all(|byte| byte.is_ascii_digit())
-        .then_some(message)
+    super::alias_fallback::normalize_alias_fallback_error(error)
 }
 
 pub(super) fn unexpected_response(command_name: &str, response: &Response) -> ExitFailure {
@@ -441,6 +453,63 @@ mod tests {
 
     use super::{capture_target_action_needs_legacy_retry, target_action_needs_legacy_retry};
 
+    #[cfg(unix)]
+    #[test]
+    fn inherited_pane_matches_missing_bare_socket_spellings() {
+        const CHILD: &str = "RMUX_SOCKET_PARENT_PANE_TEST_CHILD";
+        if std::env::var_os(CHILD).is_none() {
+            let root = std::env::temp_dir().join(format!("rmux-pane-sp-{}", std::process::id()));
+            std::fs::create_dir(&root).unwrap();
+            let status = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "cli::command_runner::tests::inherited_pane_matches_missing_bare_socket_spellings",
+                    "--nocapture",
+                ])
+                .current_dir(&root)
+                .env(CHILD, "1")
+                .env("RMUX", "review.sock,123,0")
+                .env("RMUX_PANE", "%42")
+                .status()
+                .unwrap();
+            std::fs::remove_dir_all(root).unwrap();
+            assert!(status.success());
+            return;
+        }
+        let absolute = std::env::current_dir().unwrap().join("review.sock");
+        assert!(!absolute.exists());
+        for path in [
+            std::path::Path::new("review.sock"),
+            std::path::Path::new("./review.sock"),
+            &absolute,
+        ] {
+            assert_eq!(super::inherited_pane_id(path).as_deref(), Some("%42"));
+        }
+        assert_eq!(
+            super::inherited_pane_id(&absolute.with_file_name("other.sock")),
+            None
+        );
+    }
+
+    #[test]
+    fn queued_success_stdout_is_not_reclassified_as_a_source_error() {
+        for status in [None, Some(0)] {
+            let response = Response::SourceFile(
+                rmux_proto::SourceFileResponse::from_output(
+                    rmux_proto::CommandOutput::from_stdout(b"-:1: literal output\n".to_vec()),
+                )
+                .with_exit_status(status),
+            );
+            for command in ["display-message", "list-windows", "if-shell", "run-shell"] {
+                let result = super::queued_server_command_nonzero_exit(command, &response);
+                assert!(
+                    matches!(result, Ok(None)),
+                    "{command}: {status:?}: {result:?}"
+                );
+            }
+        }
+    }
+
     #[test]
     fn target_action_retry_is_limited_to_protocol_decode_failures() {
         assert!(target_action_needs_legacy_retry(&Ok(Response::Error(
@@ -451,6 +520,9 @@ mod tests {
         assert!(!target_action_needs_legacy_retry(&Err(
             ClientError::UnexpectedEof,
         )));
+        assert!(!target_action_needs_legacy_retry(&Err(ClientError::Io(
+            std::io::Error::new(std::io::ErrorKind::TimedOut, "timed out"),
+        ))));
         assert!(capture_target_action_needs_legacy_retry(&Err(
             ClientError::UnexpectedEof,
         )));

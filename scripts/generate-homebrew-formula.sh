@@ -18,6 +18,10 @@ Options:
 USAGE
 }
 
+layout_tool() {
+  printf '%s\n' "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/packaging/layout"
+}
+
 die() {
   printf 'error: %s\n' "$*" >&2
   exit 1
@@ -75,8 +79,14 @@ asset_sha256() {
 }
 
 formula() {
-  local base_url macos_arm macos_intel
+  local base_url macos_arm macos_intel formula_install_block
   base_url="https://github.com/$repository/releases/download/$release_tag"
+
+  # The formula installs exactly what the shared layout descriptor projects
+  # for the Unix archive it unpacks; a missing file fails the install instead
+  # of being skipped.
+  formula_install_block="$("$(layout_tool)" homebrew-install |
+    sed 's/^/    /')" || die "could not project the Homebrew install block"
 
   macos_arm="rmux-$version-macos-aarch64.tar.gz"
   macos_intel="rmux-$version-macos-x86_64.tar.gz"
@@ -111,14 +121,7 @@ class Rmux < Formula
   end
 
   def install
-    bin.install "bin/rmux"
-    bin.install "bin/rmux-daemon" if File.exist?("bin/rmux-daemon")
-    libexec.install "libexec/rmux" if File.exist?("libexec/rmux")
-    man1.install "share/man/man1/rmux.1"
-    bash_completion.install "share/bash-completion/completions/rmux" if File.exist?("share/bash-completion/completions/rmux")
-    zsh_completion.install "share/zsh/site-functions/_rmux" if File.exist?("share/zsh/site-functions/_rmux")
-    fish_completion.install "share/fish/vendor_completions.d/rmux.fish" if File.exist?("share/fish/vendor_completions.d/rmux.fish")
-    pkgshare.install "share/rmux/artifact-metadata.json" if File.exist?("share/rmux/artifact-metadata.json")
+$formula_install_block
 
     license_files = Dir["LICENSE*"]
     prefix.install license_files unless license_files.empty?

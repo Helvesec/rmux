@@ -1,3 +1,4 @@
+use std::borrow::Cow;
 use std::collections::VecDeque;
 use std::sync::atomic::AtomicUsize;
 
@@ -7,6 +8,22 @@ use super::attach_control::{AttachControl, QueuedAttachTarget};
 use super::control::try_recv_attach_control;
 use super::types::{AttachTarget, OpenAttachTarget, OverlayFrame};
 use crate::outer_terminal::RenderedClientTitle;
+
+/// The already-delivered frame and its repaint policy. Queue reservations
+/// belong to the pending control, and must not survive in this display cache.
+#[derive(Debug)]
+pub(super) struct CachedPersistentOverlay {
+    frame: Vec<u8>,
+    pub(super) defer_pane_updates: bool,
+}
+
+impl std::ops::Deref for CachedPersistentOverlay {
+    type Target = [u8];
+
+    fn deref(&self) -> &Self::Target {
+        &self.frame
+    }
+}
 
 pub(super) fn discard_stale_persistent_overlays(
     attach_controls: Option<&mut mpsc::UnboundedReceiver<AttachControl>>,
@@ -262,8 +279,13 @@ fn overlay_matches_switch(
         && overlay.overlay_generation >= current_overlay_generation
 }
 
+mod popup_delta;
+pub(super) use popup_delta::popup_frame_delta;
+#[cfg(test)]
+use popup_delta::popup_rows;
+
 pub(super) fn update_persistent_overlay_cache(
-    cache: &mut Option<Vec<u8>>,
+    cache: &mut Option<CachedPersistentOverlay>,
     visible: &mut bool,
     overlay: &OverlayFrame,
 ) {
@@ -274,7 +296,10 @@ pub(super) fn update_persistent_overlay_cache(
         *cache = None;
         *visible = false;
     } else {
-        *cache = Some(overlay.frame.clone());
+        *cache = Some(CachedPersistentOverlay {
+            frame: overlay.frame.clone(),
+            defer_pane_updates: overlay.defer_pane_updates,
+        });
         *visible = true;
     }
 }
@@ -302,14 +327,14 @@ pub(super) fn clear_then_base_frame(current_target: &OpenAttachTarget) -> Vec<u8
 }
 
 pub(super) fn replacement_persistent_overlay_frame(
-    cache: &Option<Vec<u8>>,
+    cache: &Option<CachedPersistentOverlay>,
     visible: bool,
     next_target: &AttachTarget,
 ) -> Option<Vec<u8>> {
     if !visible || next_target.persistent_overlay_state_id.is_none() {
         return None;
     }
-    cache.clone()
+    cache.as_ref().map(|overlay| overlay.frame.clone())
 }
 
 pub(super) fn persistent_overlay_replacement_pending(
@@ -341,6 +366,57 @@ pub(super) fn defer_persistent_clear(
     persistent_clear && persistent_overlay_replacement_pending(controls, current_state_id)
 }
 
+/// Chooses the frame that replaces the screen on an attach switch and whether the
+/// switch clears first. Forgets the cached overlay when nothing replaces it.
+pub(super) fn switch_persistent_overlay_frame(
+    cache: &mut Option<CachedPersistentOverlay>,
+    visible: &mut bool,
+    pending_overlay: Option<&OverlayFrame>,
+    current_overlay_state_id: Option<u64>,
+    current_target_state_id: Option<u64>,
+    next_target: &AttachTarget,
+) -> (Option<Vec<u8>>, bool) {
+    let replacement_frame = pending_overlay
+        .map(|overlay| overlay.frame.clone())
+        .or_else(|| replacement_persistent_overlay_frame(cache, *visible, next_target));
+    let clear_screen = switch_requires_screen_clear(
+        *visible,
+        cache.is_some(),
+        current_overlay_state_id,
+        current_target_state_id,
+        next_target.persistent_overlay_state_id,
+    );
+    if replacement_frame.is_none() {
+        cache.take();
+        *visible = false;
+    }
+    (replacement_frame, clear_screen)
+}
+
+/// Caches a delivered overlay and chooses the bytes that paint it: a clear that
+/// restores the base frame, only the changed popup rows, or the whole overlay.
+/// Returns `None` when a pending replacement makes a persistent clear redundant.
+pub(super) fn cache_and_choose_overlay_frame<'a>(
+    cache: &mut Option<CachedPersistentOverlay>,
+    visible: &mut bool,
+    overlay: &'a OverlayFrame,
+    persistent_clear: bool,
+    deferred_controls: &VecDeque<AttachControl>,
+    current_state_id: Option<u64>,
+    current_target: &OpenAttachTarget,
+) -> Option<Cow<'a, [u8]>> {
+    let delta = popup_frame_delta(cache.as_deref(), *visible, overlay);
+    update_persistent_overlay_cache(cache, visible, overlay);
+    if defer_persistent_clear(persistent_clear, deferred_controls, current_state_id) {
+        return None;
+    }
+    let clear_frame = persistent_clear.then(|| clear_then_base_frame(current_target));
+    Some(match clear_frame.or(delta) {
+        Some(frame) => Cow::Owned(frame),
+        None => Cow::Borrowed(&overlay.frame),
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use std::collections::VecDeque;
@@ -351,7 +427,7 @@ mod tests {
     use crate::pane_io::{AttachControl, OverlayFrame};
 
     use super::{
-        advance_persistent_overlay_state, switch_requires_screen_clear,
+        advance_persistent_overlay_state, clear_then_base_frame, switch_requires_screen_clear,
         take_pending_persistent_overlay_for_state,
     };
 
@@ -483,4 +559,34 @@ mod tests {
             Some(8),
         ));
     }
+
+    #[test]
+    fn clearing_persistent_overlay_replays_the_base_cursor_state() {
+        let target = super::OpenAttachTarget {
+            session_name: rmux_proto::SessionName::new("cursor-restore")
+                .expect("valid session name"),
+            predicted_echo: VecDeque::new(),
+            predicted_echo_started_at: None,
+            pane_output: None,
+            render_frame: b"BASE\x1b[4;7H\x1b[?25h".to_vec(),
+            outer_terminal: crate::outer_terminal::OuterTerminal::default(),
+            cursor_style: 0.into(),
+            active_pane_geometry: rmux_core::PaneGeometry::new(0, 0, 80, 24),
+            raw_passthrough: false,
+            kitty_graphics_passthrough: false,
+            sixel_passthrough: false,
+            persistent_overlay_state_id: None,
+            live_pane: None,
+            render_stream: false,
+        };
+
+        assert_eq!(
+            clear_then_base_frame(&target),
+            b"\x1b[0m\x1b[H\x1b[2JBASE\x1b[4;7H\x1b[?25h"
+        );
+    }
 }
+
+#[cfg(test)]
+#[path = "popup_delta_tests.rs"]
+mod popup_delta_tests;

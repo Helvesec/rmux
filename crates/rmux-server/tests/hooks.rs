@@ -13,7 +13,8 @@ use common::{
 };
 use rmux_proto::{
     encode_frame, AttachSessionRequest, ErrorResponse, HookLifecycle, HookName, KillSessionRequest,
-    NewSessionRequest, Request, Response, RmuxError, ScopeSelector, SetHookRequest, TerminalSize,
+    ListClientsRequest, NewSessionRequest, Request, Response, RmuxError, ScopeSelector,
+    SetHookRequest, TerminalSize,
 };
 use tokio::io::AsyncWriteExt;
 use tokio::net::UnixStream;
@@ -243,7 +244,7 @@ async fn create_session(socket_path: &Path, name: &str) -> Result<(), Box<dyn Er
     )
     .await?;
 
-    assert!(matches!(response, Response::NewSession(_)));
+    crate::common::assert_new_session(&response);
     Ok(())
 }
 
@@ -324,9 +325,53 @@ async fn attach_once(socket_path: &Path, name: &str) -> Result<(), Box<dyn Error
         })
         .await?;
 
+    // The server keys an attached client by its process id, so while this
+    // client is still registered, a further attach from this test process is
+    // a move of that client (`SwitchClient`), not a new attach. Wait for the
+    // server to register the client and then to reap it after EOF, instead of
+    // assuming a fixed delay covers both under load.
+    wait_for_attached_client_count(socket_path, name, 1).await?;
     drop(attach_stream);
-    sleep(ATTACH_SETTLE_DELAY).await;
+    wait_for_attached_client_count(socket_path, name, 0).await?;
     Ok(())
+}
+
+async fn wait_for_attached_client_count(
+    socket_path: &Path,
+    name: &str,
+    expected: usize,
+) -> Result<(), Box<dyn Error>> {
+    let mut last_count = None;
+    for _ in 0..100 {
+        let response = send_request(
+            socket_path,
+            &Request::ListClients(Box::new(ListClientsRequest {
+                format: None,
+                filter: None,
+                sort_order: None,
+                reversed: false,
+                target_session: Some(session_name(name)),
+            })),
+        )
+        .await?;
+        let Response::ListClients(listing) = response else {
+            return Err(io::Error::other(format!(
+                "unexpected list-clients response: {response:?}"
+            ))
+            .into());
+        };
+        if listing.match_count == expected {
+            return Ok(());
+        }
+        last_count = Some(listing.match_count);
+        sleep(Duration::from_millis(20)).await;
+    }
+
+    Err(io::Error::other(format!(
+        "session '{name}' never reached {expected} attached client(s) within \
+         {WAIT_TIMEOUT:?}; last count {last_count:?}"
+    ))
+    .into())
 }
 
 fn hook_output_path(socket_path: &Path) -> std::path::PathBuf {

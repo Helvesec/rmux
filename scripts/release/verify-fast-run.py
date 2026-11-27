@@ -12,6 +12,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
+from candidate_route import add_arguments, from_args
+
 from github_actions import (
     get_jobs,
     get_repository,
@@ -27,6 +29,7 @@ STANDARD_RUNNER_LABELS = {
     "macos-15-intel",
     "ubuntu-22.04",
     "ubuntu-22.04-arm",
+    "ubuntu-24.04",
     "ubuntu-latest",
     "windows-latest",
 }
@@ -250,6 +253,10 @@ def verify(
     run: dict[str, Any],
     jobs: list[dict[str, Any]],
 ) -> dict[str, Any]:
+    route = from_args(args)
+    route.validate_source(args.expected_source_sha)
+    if route.rehearsal and args.kind not in {"fast", "candidate"}:
+        raise ValueError("rehearsal admits only fast and candidate runs")
     repository_contract = contract["repository"]
     require_equal(
         args.repository, repository_contract["full_name"], "requested repository"
@@ -273,7 +280,7 @@ def verify(
     require_equal(run.get("path"), run_contract["workflow_path"], "workflow path")
     require_equal(run.get("name"), run_contract["workflow_name"], "workflow name")
     require_equal(run.get("event"), run_contract["event"], "run event")
-    require_equal(run.get("head_branch"), run_contract["branch"], "head branch")
+    require_equal(run.get("head_branch"), route.branch, "head branch")
     require_equal(run.get("head_sha"), args.expected_source_sha, "source SHA")
     require_equal(
         run.get("run_attempt"), run_contract["required_run_attempt"], "run attempt"
@@ -389,7 +396,7 @@ def verify(
         key=lambda item: item["name"],
     )
     proof: dict[str, Any] = {
-        "schema_version": 1,
+        **route.fields,
         "kind": args.kind,
         "repository_id": repository["id"],
         "run_id": run["id"],
@@ -409,6 +416,7 @@ def verify(
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser()
+    add_arguments(parser)
     parser.add_argument("--repository", required=True)
     parser.add_argument("--run-id", required=True, type=int)
     parser.add_argument("--expected-source-sha", required=True)
@@ -437,6 +445,8 @@ def main() -> int:
         args.repository_root.resolve(), args.expected_source_sha
     )
     contract = json.loads(contract_bytes)
+    route = from_args(args)
+    route.validate_source(args.expected_source_sha)
     repository, run, jobs = load_inputs(args)
     proof = verify(args, contract_bytes, contract, repository, run, jobs)
     print(json.dumps(proof, indent=2, sort_keys=True))

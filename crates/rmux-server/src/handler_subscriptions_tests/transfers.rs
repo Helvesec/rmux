@@ -392,7 +392,7 @@ async fn create_session(handler: &RequestHandler, session_name: &SessionName) {
             environment: None,
         }))
         .await;
-    assert!(matches!(created, Response::NewSession(_)), "{created:?}");
+    crate::session_fixture::assert_new_session(&created);
     handler.wait_for_initial_panes_for_test().await;
 }
 
@@ -587,19 +587,19 @@ async fn pane_target_for_id(
         .sessions
         .session(session_name)
         .expect("destination session survives");
-    session
+    let result = session
         .windows()
-        .iter()
         .find_map(|(window_index, window)| {
             window
                 .panes()
                 .iter()
                 .find(|pane| pane.id() == pane_id)
                 .map(|pane| {
-                    PaneTarget::with_window(session_name.clone(), *window_index, pane.index())
+                    PaneTarget::with_window(session_name.clone(), window_index, pane.index())
                 })
         })
-        .expect("moved pane is reachable by stable id")
+        .expect("moved pane is reachable by stable id");
+    result
 }
 
 fn assert_transfer_succeeded(case: TransferCase, response: &Response) {

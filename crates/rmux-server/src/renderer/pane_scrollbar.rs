@@ -1,19 +1,34 @@
 use rmux_core::style::Style;
-use rmux_core::{OptionStore, Pane, PaneGeometry, Session};
+#[cfg(test)]
+use rmux_core::{OptionStore, Pane, PaneGeometry};
 
 use super::{cursor_position_bytes, style_sgr_bytes};
-use crate::pane_scrollbar::{PaneScrollbar, PaneScrollbarConfig, ScrollbarPosition};
+use crate::pane_scrollbar::PaneScrollbar;
+#[cfg(test)]
+use crate::pane_scrollbar::{PaneScrollbarConfig, ScrollbarPosition};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) struct RenderedPaneScrollbar {
-    track_x: u16,
-    pad_x: u16,
-    y: u16,
-    rows: u16,
+    rows: Vec<RenderedPaneScrollbarRow>,
     scrollbar: PaneScrollbar,
     track_style: Style,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) struct RenderedPaneScrollbarRow {
+    pub(super) y: u16,
+    pub(super) source_row: u16,
+    pub(super) pad: Vec<RenderedPaneScrollbarRun>,
+    pub(super) track: Vec<RenderedPaneScrollbarRun>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) struct RenderedPaneScrollbarRun {
+    pub(super) x: u16,
+    pub(super) width: u16,
+}
+
+#[cfg(test)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) struct PaneScrollbarRenderContext {
     pub(super) geometry: PaneGeometry,
@@ -23,10 +38,25 @@ pub(super) struct PaneScrollbarRenderContext {
     pub(super) content_y_offset: u16,
 }
 
+#[cfg(test)]
 pub(super) fn resolve_pane_scrollbar(
-    session: &Session,
+    session: rmux_core::ManagedSessionView<'_>,
     options: &OptionStore,
     pane: &Pane,
+    context: PaneScrollbarRenderContext,
+) -> (PaneGeometry, Option<RenderedPaneScrollbar>) {
+    let config = PaneScrollbarConfig::resolve(
+        options,
+        session.name(),
+        session.active_window_index(),
+        pane.index(),
+    );
+    resolve_pane_scrollbar_config(&config, context)
+}
+
+#[cfg(test)]
+pub(super) fn resolve_pane_scrollbar_config(
+    config: &PaneScrollbarConfig,
     context: PaneScrollbarRenderContext,
 ) -> (PaneGeometry, Option<RenderedPaneScrollbar>) {
     let PaneScrollbarRenderContext {
@@ -36,19 +66,13 @@ pub(super) fn resolve_pane_scrollbar(
         copy_mode_scroll_position,
         content_y_offset,
     } = context;
-    let config = PaneScrollbarConfig::resolve(
-        options,
-        session.name(),
-        session.active_window_index(),
-        pane.index(),
-    );
     let layout = config.layout(geometry, alternate_on, copy_mode_scroll_position.is_some());
     let content = layout.content;
     let scrollbar = PaneScrollbar::from_layout(
         layout,
         history_size,
         alternate_on,
-        &config,
+        config,
         copy_mode_scroll_position,
     );
     let rendered = scrollbar.map(|scrollbar| {
@@ -64,44 +88,55 @@ pub(super) fn resolve_pane_scrollbar(
                 (pad_x.saturating_add(scrollbar.pad), pad_x)
             }
         };
-        RenderedPaneScrollbar {
-            track_x,
-            pad_x,
-            y: content.y().saturating_add(content_y_offset),
-            rows: content.rows(),
-            scrollbar,
-            track_style: config.style,
-        }
+        let rows = (0..content.rows())
+            .map(|row| RenderedPaneScrollbarRow {
+                y: content
+                    .y()
+                    .saturating_add(content_y_offset)
+                    .saturating_add(row),
+                source_row: row,
+                pad: run_if_nonzero(pad_x, scrollbar.pad),
+                track: run_if_nonzero(track_x, scrollbar.width),
+            })
+            .collect();
+        RenderedPaneScrollbar::new(rows, scrollbar, config.style.clone())
     });
     (content, rendered)
 }
 
 impl RenderedPaneScrollbar {
+    pub(super) fn new(
+        rows: Vec<RenderedPaneScrollbarRow>,
+        scrollbar: PaneScrollbar,
+        track_style: Style,
+    ) -> Self {
+        Self {
+            rows,
+            scrollbar,
+            track_style,
+        }
+    }
+
     pub(super) fn frame(&self) -> Vec<u8> {
         let mut frame = Vec::with_capacity(
-            usize::from(self.rows)
+            self.rows
+                .len()
                 .saturating_mul(usize::from(self.scrollbar.width) + 40)
                 .saturating_add(16),
         );
         let mut slider_style = self.track_style.clone();
         std::mem::swap(&mut slider_style.cell.fg, &mut slider_style.cell.bg);
-        let track = " ".repeat(usize::from(self.scrollbar.width));
-        let pad = " ".repeat(usize::from(self.scrollbar.pad));
 
-        for row in 0..self.rows {
-            if self.scrollbar.pad != 0 {
-                frame.extend_from_slice(
-                    cursor_position_bytes(self.y.saturating_add(row), self.pad_x).as_slice(),
-                );
+        for row in &self.rows {
+            for pad in &row.pad {
+                frame.extend_from_slice(cursor_position_bytes(row.y, pad.x).as_slice());
                 frame.extend_from_slice(b"\x1b[0m");
-                frame.extend_from_slice(pad.as_bytes());
+                frame.extend(std::iter::repeat_n(b' ', usize::from(pad.width)));
             }
-            if self.scrollbar.width != 0 {
-                frame.extend_from_slice(
-                    cursor_position_bytes(self.y.saturating_add(row), self.track_x).as_slice(),
-                );
-                let in_slider = row >= self.scrollbar.slider_y
-                    && row
+            for track in &row.track {
+                frame.extend_from_slice(cursor_position_bytes(row.y, track.x).as_slice());
+                let in_slider = row.source_row >= self.scrollbar.slider_y
+                    && row.source_row
                         < self
                             .scrollbar
                             .slider_y
@@ -112,11 +147,20 @@ impl RenderedPaneScrollbar {
                     &self.track_style
                 };
                 frame.extend_from_slice(scrollbar_style_sgr_bytes(style).as_slice());
-                frame.extend_from_slice(track.as_bytes());
+                frame.extend(std::iter::repeat_n(b' ', usize::from(track.width)));
             }
         }
         frame.extend_from_slice(b"\x1b[0m");
         frame
+    }
+}
+
+#[cfg(test)]
+fn run_if_nonzero(x: u16, width: u16) -> Vec<RenderedPaneScrollbarRun> {
+    if width == 0 {
+        Vec::new()
+    } else {
+        vec![RenderedPaneScrollbarRun { x, width }]
     }
 }
 
@@ -137,16 +181,23 @@ fn scrollbar_style_sgr_bytes(style: &Style) -> Vec<u8> {
 
 #[cfg(test)]
 mod tests {
-    use rmux_core::{OptionStore, PaneGeometry, Session};
+    use rmux_core::{OptionStore, PaneGeometry};
     use rmux_proto::{
         OptionName, ScopeSelector, SessionName, SetOptionMode, TerminalSize, WindowTarget,
     };
 
     use super::*;
 
-    fn fixture(mode: &str, position: &str, style: &str) -> (Session, OptionStore) {
+    fn fixture(
+        mode: &str,
+        position: &str,
+        style: &str,
+    ) -> (crate::session_fixture::SessionFixture, OptionStore) {
         let session_name = SessionName::new("alpha").expect("valid session name");
-        let session = Session::new(session_name.clone(), TerminalSize { cols: 20, rows: 8 });
+        let session = crate::session_fixture::SessionFixture::new(
+            session_name.clone(),
+            TerminalSize { cols: 20, rows: 8 },
+        );
         let target = WindowTarget::with_window(session_name, 0);
         let mut options = OptionStore::new();
         for (option, value) in [
@@ -171,7 +222,7 @@ mod tests {
         let (session, options) = fixture("on", "right", "bg=black,fg=white,width=1,pad=0");
         let pane = session.window().pane(0).expect("pane exists");
         let (content, scrollbar) = resolve_pane_scrollbar(
-            &session,
+            session.view(),
             &options,
             pane,
             PaneScrollbarRenderContext {
@@ -198,7 +249,7 @@ mod tests {
         let (session, options) = fixture("on", "left", "fg=red,bg=blue,width=2,pad=1");
         let pane = session.window().pane(0).expect("pane exists");
         let (content, scrollbar) = resolve_pane_scrollbar(
-            &session,
+            session.view(),
             &options,
             pane,
             PaneScrollbarRenderContext {
@@ -223,7 +274,7 @@ mod tests {
             fixture("on", "right", "fill=red,fg=white,bg=default,width=1,pad=0");
         let pane = session.window().pane(0).expect("pane exists");
         let (_, scrollbar) = resolve_pane_scrollbar(
-            &session,
+            session.view(),
             &options,
             pane,
             PaneScrollbarRenderContext {
@@ -262,11 +313,11 @@ mod tests {
             content_y_offset: 0,
         };
         let (normal, normal_scrollbar) =
-            resolve_pane_scrollbar(&session, &options, pane, context(false, None));
+            resolve_pane_scrollbar(session.view(), &options, pane, context(false, None));
         let (copy, copy_scrollbar) =
-            resolve_pane_scrollbar(&session, &options, pane, context(false, Some(23)));
+            resolve_pane_scrollbar(session.view(), &options, pane, context(false, Some(23)));
         let (alternate, alternate_scrollbar) =
-            resolve_pane_scrollbar(&session, &options, pane, context(true, Some(23)));
+            resolve_pane_scrollbar(session.view(), &options, pane, context(true, Some(23)));
 
         assert_eq!(normal, raw);
         assert!(normal_scrollbar.is_none());

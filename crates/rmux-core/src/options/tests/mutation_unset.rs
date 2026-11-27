@@ -1,6 +1,186 @@
 use super::*;
 
 #[test]
+fn indexed_scalars_reject_before_set_unset_or_pane_override_mutation() {
+    let window = WindowTarget::with_window(session_name("scalar"), 0);
+    let pane = PaneTarget::with_window(session_name("scalar"), 0, 0);
+    for name in [
+        "window-pane-status-format",
+        "window-pane-current-status-format",
+        "tree-mode-preview-format",
+        "tree-mode-preview-style",
+        "window-status-format",
+        "window-status-style",
+    ] {
+        let value = if name.ends_with("style") {
+            "fg=red"
+        } else {
+            "BASE"
+        };
+        let next = if name.ends_with("style") {
+            "fg=blue"
+        } else {
+            "NEXT"
+        };
+        for scope in [
+            OptionScopeSelector::WindowGlobal,
+            OptionScopeSelector::Window(window.clone()),
+            OptionScopeSelector::Pane(pane.clone()),
+        ] {
+            let mut store = OptionStore::new();
+            for seed_scope in [scope.clone(), OptionScopeSelector::Pane(pane.clone())] {
+                store
+                    .set_by_name(
+                        seed_scope,
+                        name,
+                        Some(value.into()),
+                        SetOptionMode::Replace,
+                        false,
+                        false,
+                        false,
+                    )
+                    .unwrap();
+            }
+            let before = format!("{store:?}");
+            let indexed = format!("{name}[0]");
+            for (mode, only, unset, panes, raw) in [
+                (SetOptionMode::Replace, false, false, false, Some(next)),
+                (SetOptionMode::Append, false, false, false, Some(next)),
+                (SetOptionMode::Replace, true, false, false, Some(next)),
+                (SetOptionMode::Replace, false, true, false, None),
+                (SetOptionMode::Replace, false, true, true, None),
+                (SetOptionMode::Replace, true, true, true, None),
+                (
+                    SetOptionMode::Replace,
+                    false,
+                    false,
+                    false,
+                    Some("not-a-style"),
+                ),
+                (SetOptionMode::Replace, false, false, false, None),
+            ] {
+                assert_eq!(
+                    store
+                        .set_by_name(
+                            scope.clone(),
+                            &indexed,
+                            raw.map(str::to_owned),
+                            mode,
+                            only,
+                            unset,
+                            panes
+                        )
+                        .unwrap_err(),
+                    RmuxError::InvalidSetOption(format!("not an array: {indexed}")),
+                );
+                assert_eq!(
+                    format!("{store:?}"),
+                    before,
+                    "{indexed}: rejected mutation changed storage"
+                );
+            }
+            let outcome = store
+                .set_by_name(
+                    scope,
+                    name,
+                    Some(next.into()),
+                    SetOptionMode::Replace,
+                    false,
+                    false,
+                    false,
+                )
+                .unwrap();
+            assert!(outcome.changed);
+            assert_eq!(outcome.old_explicit.as_deref(), Some(value));
+            assert_eq!(outcome.new_explicit.as_deref(), Some(next));
+        }
+    }
+    for name in ["window-status-format[00]", "window-status-f[0]"] {
+        assert_eq!(
+            super::super::validate_option_name_mutation(
+                name,
+                &OptionScopeSelector::WindowGlobal,
+                SetOptionMode::Replace,
+                Some("value"),
+                false
+            )
+            .unwrap_err(),
+            RmuxError::InvalidSetOption(format!("not an array: {name}")),
+        );
+    }
+}
+
+#[test]
+fn scalar_index_validation_preserves_real_arrays_and_user_options() {
+    let mut store = OptionStore::new();
+    let scope = OptionScopeSelector::Session(session_name("siblings"));
+    for name in ["status-format[4]", "@scalar"] {
+        let first = store
+            .set_by_name(
+                scope.clone(),
+                name,
+                Some("BASE".into()),
+                SetOptionMode::Replace,
+                false,
+                false,
+                false,
+            )
+            .unwrap();
+        assert!(first.changed);
+        let append = store
+            .set_by_name(
+                scope.clone(),
+                name,
+                Some("NEXT".into()),
+                SetOptionMode::Append,
+                false,
+                false,
+                false,
+            )
+            .unwrap();
+        assert_eq!(append.old_explicit.as_deref(), Some("BASE"));
+        assert_eq!(append.new_explicit.as_deref(), Some("BASENEXT"));
+        assert!(store
+            .set_by_name(
+                scope.clone(),
+                name,
+                Some("BLOCK".into()),
+                SetOptionMode::Replace,
+                true,
+                false,
+                false
+            )
+            .is_err());
+        let unset = store
+            .set_by_name(
+                scope.clone(),
+                name,
+                None,
+                SetOptionMode::Replace,
+                false,
+                true,
+                false,
+            )
+            .unwrap();
+        assert_eq!(unset.old_explicit.as_deref(), Some("BASENEXT"));
+        assert_eq!(unset.new_explicit, None);
+    }
+    let before = format!("{store:?}");
+    assert!(store
+        .set_by_name(
+            scope,
+            "@scalar[0]",
+            Some("INDEX".into()),
+            SetOptionMode::Replace,
+            false,
+            false,
+            false
+        )
+        .is_err());
+    assert_eq!(format!("{store:?}"), before);
+}
+
+#[test]
 fn unset_at_global_scope_restores_default() {
     let mut store = OptionStore::new();
 

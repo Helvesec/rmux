@@ -6,7 +6,7 @@ use std::time::Duration;
 
 use tokio::time::Instant;
 
-use crate::{Pane, PaneSnapshot, Result, RmuxError, WaitTimeoutError};
+use crate::{Pane, PaneId, PaneSnapshot, Result, RmuxError, WaitTimeoutError};
 
 const DEFAULT_QUIET_FOR: Duration = Duration::from_millis(300);
 
@@ -86,6 +86,10 @@ impl Pane {
     ///
     /// `Quiet` means the rendered snapshot stays unchanged for the wait's
     /// configured quiet window; no prompt-specific heuristics are inferred.
+    /// A pane whose process exits and leaves the inventory is final: the wait
+    /// returns at once with the empty, revision-`0` snapshot of a pane that is
+    /// no longer listed. A pane closed during the wait, which leaves no exit
+    /// status, never settles and fails it with [`RmuxError::PaneNotFound`].
     pub fn wait_for_load_state(&self, state: TerminalLoadState) -> TerminalLoadStateWait {
         TerminalLoadStateWait::new(self.clone(), state)
     }
@@ -108,27 +112,24 @@ async fn wait_until_quiet(wait: TerminalLoadStateWait) -> Result<PaneSnapshot> {
     );
     let deadline = crate::wait::wait_deadline(timeout);
     let pane = wait.pane.begin_operation_handle_with_timeout(wait.timeout);
-    let (pane, _) = crate::wait::with_wait_deadline(
-        "wait for terminal load-state snapshot",
+    let (pane, pane_id) = crate::wait::with_wait_deadline(
+        LOAD_STATE_SNAPSHOT_OPERATION,
         timeout,
         deadline,
         pane.pin_to_current_identity(),
     )
     .await?;
-    let mut last = crate::wait::snapshot_with_wait_deadline(
-        &pane,
-        "wait for terminal load-state snapshot",
+    let observer = QuietObserver {
+        wait: &wait,
+        pane: &pane,
+        pane_id,
         timeout,
         deadline,
-        None,
-        || {
-            format!(
-                "terminal load state {:?} for {:?}",
-                wait.state, wait.quiet_for
-            )
-        },
-    )
-    .await?;
+    };
+    let mut last = match observer.observe(None).await? {
+        QuietObservation::Rendered(snapshot) => snapshot,
+        QuietObservation::Exited => return Ok(PaneSnapshot::default()),
+    };
     let mut stable_since = Instant::now();
 
     loop {
@@ -137,34 +138,85 @@ async fn wait_until_quiet(wait: TerminalLoadStateWait) -> Result<PaneSnapshot> {
         }
         if deadline.is_some_and(|deadline| Instant::now() >= deadline) {
             return Err(RmuxError::wait_timeout(WaitTimeoutError::new(
-                format!(
-                    "terminal load state {:?} for {:?}",
-                    wait.state, wait.quiet_for
-                ),
+                observer.description(),
                 timeout.expect("deadline implies timeout"),
                 last,
             )));
         }
         sleep_until_next_poll(deadline, wait.poll_interval).await;
-        let snapshot = crate::wait::snapshot_with_wait_deadline(
-            &pane,
-            "wait for terminal load-state snapshot",
-            timeout,
-            deadline,
-            Some(&last),
-            || {
-                format!(
-                    "terminal load state {:?} for {:?}",
-                    wait.state, wait.quiet_for
-                )
-            },
-        )
-        .await?;
+        let snapshot = match observer.observe(Some(&last)).await? {
+            QuietObservation::Rendered(snapshot) => snapshot,
+            QuietObservation::Exited => return Ok(PaneSnapshot::default()),
+        };
         if snapshot.revision == last.revision && snapshot.visible_text() == last.visible_text() {
             continue;
         }
         last = snapshot;
         stable_since = Instant::now();
+    }
+}
+
+const LOAD_STATE_SNAPSHOT_OPERATION: &str = "wait for terminal load-state snapshot";
+
+enum QuietObservation {
+    Rendered(PaneSnapshot),
+    /// The observed process exited and its pane left the inventory.
+    Exited,
+}
+
+struct QuietObserver<'a> {
+    wait: &'a TerminalLoadStateWait,
+    pane: &'a Pane,
+    /// Identity pinned when the wait began; `None` for a slot already vacant.
+    pane_id: Option<PaneId>,
+    timeout: Option<Duration>,
+    deadline: Option<Instant>,
+}
+
+impl QuietObserver<'_> {
+    fn description(&self) -> String {
+        format!(
+            "terminal load state {:?} for {:?}",
+            self.wait.state, self.wait.quiet_for
+        )
+    }
+
+    /// Captures the pane once. A pane that vanished after the wait pinned it
+    /// either exited, which ends the wait, or was closed without an exit
+    /// status, which fails it: a closed pane never settles.
+    async fn observe(&self, last: Option<&PaneSnapshot>) -> Result<QuietObservation> {
+        let listed = crate::wait::bounded_wait_snapshot(
+            LOAD_STATE_SNAPSHOT_OPERATION,
+            self.timeout,
+            self.deadline,
+            last,
+            || self.description(),
+            self.pane.listed_snapshot(),
+        )
+        .await?;
+        if let Some(snapshot) = listed {
+            return Ok(QuietObservation::Rendered(snapshot));
+        }
+        let Some(pane_id) = self.pane_id else {
+            // A slot that was already vacant keeps the documented empty snapshot.
+            return Ok(QuietObservation::Rendered(PaneSnapshot::default()));
+        };
+        let exited = crate::wait::bounded_wait_snapshot(
+            LOAD_STATE_SNAPSHOT_OPERATION,
+            self.timeout,
+            self.deadline,
+            last,
+            || self.description(),
+            self.pane.vanished_pane_exited(pane_id),
+        )
+        .await?;
+        if exited {
+            return Ok(QuietObservation::Exited);
+        }
+        Err(RmuxError::pane_not_found(
+            self.pane.target().session_name.clone(),
+            pane_id,
+        ))
     }
 }
 

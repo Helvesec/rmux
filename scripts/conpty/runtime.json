@@ -1,0 +1,34 @@
+{
+  "schema": 1,
+  "package": "Microsoft.Windows.Console.ConPTY",
+  "version": "1.24.260710001",
+  "url": "https://api.nuget.org/v3-flatcontainer/microsoft.windows.console.conpty/1.24.260710001/microsoft.windows.console.conpty.1.24.260710001.nupkg",
+  "sha256": "175640566a3b59c4b132070ee96c2c77e5ab7edd2e92732a5eb3610bbf63d90e",
+  "target": "x86_64-pc-windows-msvc",
+  "pe_machine": 34404,
+  "file_version": "1.24.2607.10001",
+  "publisher": "CN=Microsoft Corporation, O=Microsoft Corporation, L=Redmond, S=Washington, C=US",
+  "upstream_minimum_windows": "10.0.17763.0",
+  "qualification": "Windows 11 x64 only; Windows 10 pending. ARM64, x86 and emulated architectures are not qualified or packaged.",
+  "license": {
+    "spdx": "MIT",
+    "path": "share/licenses/Microsoft.Windows.Console.ConPTY/LICENSE",
+    "url": "https://raw.githubusercontent.com/microsoft/terminal/d4d59fa3395012ca37ba12665da4ec11c7dcf9cb/LICENSE",
+    "commit": "d4d59fa3395012ca37ba12665da4ec11c7dcf9cb",
+    "sha256": "5d177f23ecfeb0ea8e050b6a5a16355e1ae9a0b286436ca8f83ed08b3795be6b"
+  },
+  "files": [
+    {
+      "name": "conpty.dll",
+      "entry": "runtimes/win-x64/native/conpty.dll",
+      "sha256": "39fba2713e2495117b1591ae8c32a3b904bea7aa66069cf7815e2844c76d75d8",
+      "signer_thumbprint": "1D77A9B9E8FE2075D9AD15123257FB90DB0DA4A1"
+    },
+    {
+      "name": "OpenConsole.exe",
+      "entry": "build/native/runtimes/x64/OpenConsole.exe",
+      "sha256": "b7fd936c2668b87b9ecf7b3366dc6568afc1c6f981874cba3e955a1c35cf8160",
+      "signer_thumbprint": "AB172913A2960A224809EE8A0C371CD47A079B72"
+    }
+  ]
+}

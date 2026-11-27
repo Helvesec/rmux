@@ -1,12 +1,10 @@
-use rmux_proto::{PaneTargetRef, WebShareScope};
-
 use crate::handles::Rmux;
 use crate::transport::TransportClient;
 use crate::Result;
 
 use super::{
     list_web_shares, lookup_summary, stop_all_web_shares, stop_web_share, token_from_url,
-    web_config, WebConfigInfo, WebShareSummary,
+    web_config, WebConfigInfo, WebSharePaneTarget, WebShareScope, WebShareSummary,
 };
 
 /// A share handle returned by a create operation.
@@ -24,6 +22,8 @@ pub struct WebShareHandle {
     scope: WebShareScope,
     spectator_url: Option<String>,
     operator_url: Option<String>,
+    tunnel_provider: Option<String>,
+    tunnel_public_url: Option<String>,
     expires_at_unix: Option<u64>,
     operator_pairing_code: Option<String>,
     spectator_pairing_code: Option<String>,
@@ -31,6 +31,7 @@ pub struct WebShareHandle {
     max_spectators: Option<u16>,
     operator: bool,
     spectator: bool,
+    controls: bool,
     kill_session_on_expire: bool,
 }
 
@@ -43,9 +44,11 @@ impl WebShareHandle {
         Self {
             transport,
             id: created.share_id,
-            scope: created.scope,
+            scope: WebShareScope::from_proto(created.scope),
             spectator_url: created.spectator_url,
             operator_url: created.operator_url,
+            tunnel_provider: created.tunnel_provider,
+            tunnel_public_url: created.tunnel_public_url,
             expires_at_unix: created.expires_at_unix,
             operator_pairing_code: created.operator_pairing_code,
             spectator_pairing_code: created.spectator_pairing_code,
@@ -53,6 +56,7 @@ impl WebShareHandle {
             max_spectators: created.max_spectators,
             operator: created.operator,
             spectator: created.spectator,
+            controls: created.controls,
             kill_session_on_expire: created.kill_session_on_expire,
         }
     }
@@ -71,7 +75,7 @@ impl WebShareHandle {
 
     /// Returns the pane target when this is a single-pane share.
     #[must_use]
-    pub fn pane_target(&self) -> Option<&PaneTargetRef> {
+    pub fn pane_target(&self) -> Option<&WebSharePaneTarget> {
         match &self.scope {
             WebShareScope::Pane(target) => Some(target),
             WebShareScope::Session(_) => None,
@@ -88,6 +92,24 @@ impl WebShareHandle {
     #[must_use]
     pub const fn spectator(&self) -> bool {
         self.spectator
+    }
+
+    /// Returns whether this share can execute rmux controls, as reported by the daemon.
+    #[must_use]
+    pub const fn controls(&self) -> bool {
+        self.controls
+    }
+
+    /// Returns the named tunnel provider reported at creation, when present.
+    #[must_use]
+    pub fn tunnel_provider(&self) -> Option<&str> {
+        self.tunnel_provider.as_deref()
+    }
+
+    /// Returns the public tunnel origin reported at creation, when present.
+    #[must_use]
+    pub fn tunnel_public_url(&self) -> Option<&str> {
+        self.tunnel_public_url.as_deref()
     }
 
     /// Returns whether this share kills its target session on expiry.
@@ -202,7 +224,7 @@ impl WebShareLookup {
 
     /// Returns the pane target when this is a single-pane share.
     #[must_use]
-    pub fn pane_target(&self) -> Option<&PaneTargetRef> {
+    pub fn pane_target(&self) -> Option<&WebSharePaneTarget> {
         self.summary.pane_target()
     }
 
@@ -216,6 +238,12 @@ impl WebShareLookup {
     #[must_use]
     pub const fn spectator(&self) -> bool {
         self.summary.spectator
+    }
+
+    /// Returns whether this share can execute rmux controls, as reported by the daemon.
+    #[must_use]
+    pub const fn controls(&self) -> bool {
+        self.summary.controls
     }
 
     /// Returns the redacted spectator URL, when available.

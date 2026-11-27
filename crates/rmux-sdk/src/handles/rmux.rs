@@ -16,13 +16,11 @@ use crate::{
     Input, Pane, PaneId, PaneRef, Result, RmuxEndpoint, RmuxError, SessionName, Window, WindowRef,
 };
 use rmux_proto::{
-    HandshakeRequest, KillServerRequest, Request, Response, CAPABILITY_DAEMON_SHUTDOWN,
-    CAPABILITY_HANDSHAKE, RMUX_WIRE_VERSION,
+    HandshakeRequest, KillServerRequest, Request, Response, RmuxError as ProtoError,
+    CAPABILITY_DAEMON_SHUTDOWN, CAPABILITY_HANDSHAKE, RMUX_WIRE_VERSION,
 };
 
-#[path = "rmux/command_process.rs"]
 mod command_process;
-#[path = "rmux/connect.rs"]
 mod connect;
 
 use connect::connect_transport;
@@ -63,7 +61,7 @@ impl Rmux {
     /// Connects to the default daemon, starting it if no daemon is reachable.
     ///
     /// The hidden daemon binary is resolved from
-    /// [`crate::bootstrap::discovery::SDK_DAEMON_BINARY_ENV`] when set,
+    /// `RMUX_SDK_DAEMON_BINARY` when set,
     /// otherwise `rmux` is resolved through the host `PATH`. Startup races are
     /// serialized by the platform bootstrap layer.
     pub async fn connect_or_start() -> Result<Self> {
@@ -212,7 +210,7 @@ impl Rmux {
         session_name: impl AsRef<str>,
         pane_id: PaneId,
     ) -> Result<Pane> {
-        let session_name = SessionName::new(session_name.as_ref()).map_err(RmuxError::protocol)?;
+        let session_name = SessionName::new(session_name.as_ref()).map_err(RmuxError::from)?;
         self.pane_by_id(session_name, pane_id).await
     }
 
@@ -341,8 +339,8 @@ impl Rmux {
                 }
                 Ok(())
             }
-            Response::Error(error) => Err(error.into()),
-            response => Err(RmuxError::protocol(rmux_proto::RmuxError::Server(format!(
+            Response::Error(error) => Err(RmuxError::from_proto(error.error)),
+            response => Err(RmuxError::from_proto(ProtoError::Server(format!(
                 "rmux daemon sent `{}` response for shutdown request",
                 response.command_name()
             )))),
@@ -455,10 +453,7 @@ impl Rmux {
 }
 
 fn pane_not_found(session_name: &SessionName, pane_id: PaneId) -> RmuxError {
-    RmuxError::protocol(rmux_proto::RmuxError::pane_not_found(
-        session_name.clone(),
-        pane_id,
-    ))
+    RmuxError::from_proto(ProtoError::pane_not_found(session_name.clone(), pane_id))
 }
 
 fn run_binary_command(
@@ -533,8 +528,8 @@ async fn negotiate_shutdown_capability(client: &TransportClient) -> Result<()> {
             ensure_capability(&response.capabilities, CAPABILITY_HANDSHAKE)?;
             ensure_capability(&response.capabilities, CAPABILITY_DAEMON_SHUTDOWN)
         }
-        Response::Error(error) => Err(error.into()),
-        response => Err(RmuxError::protocol(rmux_proto::RmuxError::Server(format!(
+        Response::Error(error) => Err(RmuxError::from_proto(error.error)),
+        response => Err(RmuxError::from_proto(ProtoError::Server(format!(
             "rmux daemon sent `{}` response for capability handshake",
             response.command_name()
         )))),
@@ -542,10 +537,10 @@ async fn negotiate_shutdown_capability(client: &TransportClient) -> Result<()> {
 }
 
 fn normalize_handshake_error(error: RmuxError) -> RmuxError {
+    if let Some(ProtoError::Decode(message)) = error.protocol_source() {
+        return unsupported_handshake_error(message);
+    }
     match error {
-        RmuxError::Protocol {
-            source: rmux_proto::RmuxError::Decode(message),
-        } => unsupported_handshake_error(&message),
         RmuxError::Unsupported { feature, .. }
             if feature == crate::diagnostics::command_feature_id("handshake") =>
         {
@@ -569,13 +564,11 @@ fn ensure_selected_wire_version(wire_version: u32) -> Result<()> {
         return Ok(());
     }
 
-    Err(RmuxError::protocol(
-        rmux_proto::RmuxError::UnsupportedWireVersion {
-            got: wire_version,
-            minimum: RMUX_WIRE_VERSION,
-            maximum: RMUX_WIRE_VERSION,
-        },
-    ))
+    Err(RmuxError::from_proto(ProtoError::UnsupportedWireVersion {
+        got: wire_version,
+        minimum: RMUX_WIRE_VERSION,
+        maximum: RMUX_WIRE_VERSION,
+    }))
 }
 
 fn ensure_capability(capabilities: &[String], feature: &str) -> Result<()> {
@@ -586,12 +579,10 @@ fn ensure_capability(capabilities: &[String], feature: &str) -> Result<()> {
         return Ok(());
     }
 
-    Err(RmuxError::protocol(
-        rmux_proto::RmuxError::UnsupportedCapability {
-            feature: feature.to_owned(),
-            supported: capabilities.to_vec(),
-        },
-    ))
+    Err(RmuxError::from_proto(ProtoError::UnsupportedCapability {
+        feature: feature.to_owned(),
+        supported: capabilities.to_vec(),
+    }))
 }
 
 #[cfg(test)]

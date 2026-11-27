@@ -62,7 +62,10 @@ jobs:
         shell: bash
         run: |
           test "${{ steps.decision.outputs.execute }}" = false
-          test "${{ steps.decision.outputs.state }}" = blocked
+          case "${{ steps.decision.outputs.state }}" in
+            blocked | denied-by-policy) ;;
+            *) exit 1 ;;
+          esac
 
       - name: Seal exact manual site result evidence
         uses: ./.github/actions/release-channel-result

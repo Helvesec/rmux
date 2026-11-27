@@ -72,7 +72,7 @@ impl OuterTerminal {
         // Re-apply overrides so explicit removals (e.g. Enbp@) win over
         // capabilities that XT/Tc just re-introduced via apply_feature_name.
         // Matches tmux's second tty_term_apply_overrides() pass.
-        if terminal.xt_flag || terminal.tc_flag {
+        if terminal.vt100_like || terminal.xt_flag || terminal.tc_flag {
             terminal.apply_terminal_override_options(options);
         }
 
@@ -91,71 +91,57 @@ impl OuterTerminal {
 
     #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn features_string(&self) -> String {
-        let mut features = Vec::new();
-        if self.supports_256 {
-            features.push("256");
-        }
-        if self.enable_bpaste.is_some() && self.disable_bpaste.is_some() {
-            features.push("bpaste");
-        }
-        if self.cursor_colour_template.is_some() && self.cursor_colour_reset.is_some() {
-            features.push("ccolour");
-        }
-        if self.clipboard_template.is_some() {
-            features.push("clipboard");
-        }
-        if self.hyperlink_template.is_some() {
-            features.push("hyperlinks");
-        }
-        if self.supports_kitty_graphics {
-            features.push("kitty-graphics");
-        }
-        if self.cursor_style_template.is_some() && self.cursor_style_reset.is_some() {
-            features.push("cstyle");
-        }
-        if self.enable_extkeys.is_some() && self.disable_extkeys.is_some() {
-            features.push("extkeys");
-        }
-        if self.enable_focus.is_some() && self.disable_focus.is_some() {
-            features.push("focus");
-        }
-        if self.ignore_function_keys {
-            features.push("ignorefkeys");
-        }
-        if self.supports_margins {
-            features.push("margins");
-        }
-        if self.supports_mouse {
-            features.push("mouse");
-        }
-        if self.path_open.is_some() && self.path_close.is_some() {
-            features.push("osc7");
-        }
-        if self.supports_overline {
-            features.push("overline");
-        }
-        if self.supports_rectfill {
-            features.push("rectfill");
-        }
-        if self.supports_rgb {
-            features.push("RGB");
-        }
-        if self.supports_sixel {
-            features.push("sixel");
-        }
-        if self.supports_strikethrough {
-            features.push("strikethrough");
-        }
-        if self.sync_template.is_some() {
-            features.push("sync");
-        }
-        if self.title_open.is_some() && self.title_close.is_some() {
-            features.push("title");
-        }
-        if self.supports_usstyle {
-            features.push("usstyle");
-        }
-        features.join(",")
+        let available = [
+            ("256", self.supports_256),
+            (
+                "bpaste",
+                self.enable_bpaste.is_some() && self.disable_bpaste.is_some(),
+            ),
+            (
+                "ccolour",
+                self.cursor_colour_template.is_some() && self.cursor_colour_reset.is_some(),
+            ),
+            ("clipboard", self.clipboard_template.is_some()),
+            ("hyperlinks", self.hyperlink_template.is_some()),
+            ("kitty-graphics", self.supports_kitty_graphics),
+            (
+                "cstyle",
+                self.cursor_style_template.is_some() && self.cursor_style_reset.is_some(),
+            ),
+            (
+                "extkeys",
+                self.enable_extkeys.is_some() && self.disable_extkeys.is_some(),
+            ),
+            (
+                "focus",
+                self.enable_focus.is_some() && self.disable_focus.is_some(),
+            ),
+            ("ignorefkeys", self.ignore_function_keys),
+            ("margins", self.supports_margins),
+            ("mouse", self.supports_mouse),
+            (
+                "osc7",
+                self.path_open.is_some() && self.path_close.is_some(),
+            ),
+            ("overline", self.supports_overline),
+            ("rectfill", self.supports_rectfill),
+            ("RGB", self.supports_rgb),
+            ("sixel", self.supports_sixel),
+            ("strikethrough", self.supports_strikethrough),
+            ("sync", self.sync_template.is_some()),
+            (
+                "title",
+                self.title_open.is_some() && self.title_close.is_some(),
+            ),
+            ("usstyle", self.supports_usstyle),
+        ];
+        available
+            .into_iter()
+            .filter_map(|(name, enabled)| {
+                (enabled && self.reported_features.contains(name)).then_some(name)
+            })
+            .collect::<Vec<_>>()
+            .join(",")
     }
 
     fn apply_default_family_features(&mut self) {
@@ -192,15 +178,23 @@ impl OuterTerminal {
             self.apply_feature_name("sixel");
         }
         if term.starts_with("xterm") {
+            // Fallback capabilities remain usable; only detected or explicitly
+            // declared features belong in client_termfeatures.
+            let reported = std::mem::take(&mut self.reported_features);
             self.add_features(DEFAULT_XTERM_FEATURES);
+            self.reported_features = reported;
         }
     }
 
+    /// Applies every `terminal-features` entry whose selector matches the outer
+    /// terminal's name.
+    ///
+    /// Match the name as it stands, empty included. `fnmatch` lets selectors
+    /// made only of wildcards (`*`, `**`) match an empty name while literals,
+    /// `?`, character classes and escaped literals remain inert. The empty
+    /// selector below stays rejected as malformed rather than matching it.
     fn apply_terminal_feature_options(&mut self, options: &OptionStore) {
         let term = self.context.term_name().to_owned();
-        if term.is_empty() {
-            return;
-        }
         for entry in options.resolve_array_values(None, OptionName::TerminalFeatures) {
             let mut segments = entry.split(':');
             let Some(pattern) = segments
@@ -228,11 +222,14 @@ impl OuterTerminal {
         }
     }
 
+    /// Applies every `terminal-overrides` entry whose selector matches the outer
+    /// terminal's name.
+    ///
+    /// Empty names match exactly as in [`Self::apply_terminal_feature_options`]:
+    /// wildcard capability overrides and wildcard feature entries stay
+    /// symmetric on a client that reports no `TERM`.
     fn apply_terminal_override_options(&mut self, options: &OptionStore) {
         let term = self.context.term_name().to_owned();
-        if term.is_empty() {
-            return;
-        }
         for entry in options.resolve_array_values(None, OptionName::TerminalOverrides) {
             let segments = split_override_segments(&entry);
             let Some((pattern, overrides)) = segments.split_first() else {
@@ -331,8 +328,14 @@ impl OuterTerminal {
                     .get_or_insert_with(|| DEFAULT_FSL.to_owned());
             }
             "usstyle" => self.supports_usstyle = true,
-            _ => {}
+            _ => return,
         }
+        let canonical = match feature.to_ascii_lowercase().as_str() {
+            "rgb" => "RGB".to_owned(),
+            "kitty_graphics" | "kgp" => "kitty-graphics".to_owned(),
+            name => name.to_owned(),
+        };
+        self.reported_features.insert(canonical);
     }
 
     fn apply_capability_override(&mut self, spec: &str) {
@@ -373,6 +376,28 @@ impl OuterTerminal {
             "ms" => apply_template_override(&mut self.clipboard_template, value, remove),
             "xt" => self.xt_flag = !remove,
             _ => {}
+        }
+        if !remove {
+            let feature = match name.to_ascii_lowercase().as_str() {
+                "cs" | "cr" => Some("ccolour"),
+                "cmg" | "clmg" | "dsmg" | "enmg" => Some("margins"),
+                "dsbp" | "enbp" => Some("bpaste"),
+                "dseks" | "eneks" => Some("extkeys"),
+                "dsfcs" | "enfcs" => Some("focus"),
+                "hls" => Some("hyperlinks"),
+                "rect" => Some("rectfill"),
+                "smol" => Some("overline"),
+                "smulx" | "setulc" | "setulc1" | "ol" => Some("usstyle"),
+                "ss" | "se" => Some("cstyle"),
+                "swd" => Some("osc7"),
+                "sxl" => Some("sixel"),
+                "sync" => Some("sync"),
+                "ms" => Some("clipboard"),
+                _ => None,
+            };
+            if let Some(feature) = feature {
+                self.reported_features.insert(feature.to_owned());
+            }
         }
     }
 

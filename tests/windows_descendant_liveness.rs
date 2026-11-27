@@ -32,7 +32,9 @@ unsafe extern "system" {
 #[test]
 fn windows_pane_liveness_follows_descendant_console_job() -> Result<(), Box<dyn Error>> {
     let _serial = windows_cli_serial::acquire("windows-descendant-liveness")?;
-    let binary = PathBuf::from(env!("CARGO_BIN_EXE_rmux"));
+    let binary = PathBuf::from(rmux_os::build_identity::cargo_binary(env!(
+        "CARGO_BIN_EXE_rmux"
+    )));
     let label = unique_label();
     let case_dir = TestDirectory::new(&label)?;
     let helpers = DurableHelpers::write(case_dir.path())?;

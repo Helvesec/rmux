@@ -1,4 +1,4 @@
-use rmux_core::{BreakPaneOptions, PaneJoinOptions, SessionPaneTarget};
+use rmux_core::{BreakPaneOptions, PaneJoinOptions};
 use rmux_proto::{
     BreakPaneRequest, BreakPaneResponse, JoinPaneRequest, JoinPaneResponse, OptionScopeSelector,
     PaneTarget, RmuxError, SessionName, SetOptionMode, WindowTarget,
@@ -45,29 +45,41 @@ impl HandlerState {
             request.source.window_index(),
             &[source_pane_id],
         )?;
-        let snapshot = SessionTransferSnapshot::capture(self);
+        let mut snapshot = SessionTransferSnapshot::capture(
+            self,
+            &[
+                source_session_name.clone(),
+                destination_session_name.clone(),
+            ],
+        )?;
 
         let direction = join_pane_internal_direction(request.direction);
-        let mutation = self.sessions.with_extracted_session_pair(
-            &source_session_name,
-            &destination_session_name,
-            |source_session, destination_session| {
-                destination_session.join_pane_from_session(
-                    SessionPaneTarget::from(&request.target),
-                    source_session,
-                    SessionPaneTarget::from(&request.source),
-                    PaneJoinOptions::new(
-                        direction,
-                        request.detached,
-                        request.before,
-                        request.full_size,
-                        request.size,
-                    ),
-                )
-            },
-        )?;
+        let mutation = self
+            .sessions
+            .join_pane_for_runtime_transfer(
+                &WindowTarget::with_window(
+                    request.source.session_name().clone(),
+                    request.source.window_index(),
+                ),
+                request.source.pane_index(),
+                &WindowTarget::with_window(
+                    request.target.session_name().clone(),
+                    request.target.window_index(),
+                ),
+                request.target.pane_index(),
+                PaneJoinOptions::new(
+                    direction,
+                    request.detached,
+                    request.before,
+                    request.full_size,
+                    request.size,
+                ),
+            )
+            .map(|result| {
+                snapshot.retain_transfer(result);
+            });
         if let Err(error) = mutation {
-            snapshot.restore(self);
+            snapshot.restore(self)?;
             return Err(error);
         }
         let moved_index = self
@@ -87,12 +99,12 @@ impl HandlerState {
         let destroyed_sessions = match self.commit_linked_last_pane_transfer_removal(removal_plan) {
             Ok(destroyed_sessions) => destroyed_sessions,
             Err(error) => {
-                snapshot.restore(self);
+                snapshot.restore(self)?;
                 return Err(error);
             }
         };
         if let Err(error) = self.renumber_transfer_source_sessions(&source_family_sessions) {
-            snapshot.restore(self);
+            snapshot.restore(self)?;
             return Err(error);
         }
         let affected_sessions = match synchronize_cross_session_transfer_families(
@@ -104,12 +116,12 @@ impl HandlerState {
         ) {
             Ok(sessions) => sessions,
             Err(error) => {
-                snapshot.restore(self);
+                snapshot.restore(self)?;
                 return Err(error);
             }
         };
         if let Err(error) = restore_pane_options_after_transfer(self, &destination_family_options) {
-            snapshot.restore(self);
+            snapshot.restore(self)?;
             return Err(error);
         }
 
@@ -118,7 +130,7 @@ impl HandlerState {
             &destination_runtime,
             &[source_pane_id],
         ) {
-            snapshot.restore(self);
+            snapshot.restore(self)?;
             return Err(error);
         }
         if let Err(error) = self.move_pane_outputs_between_sessions(
@@ -131,7 +143,7 @@ impl HandlerState {
                 &source_runtime,
                 &[source_pane_id],
             );
-            snapshot.restore(self);
+            snapshot.restore(self)?;
             terminal_rollback
                 .map_err(|rollback_error| pane_transfer_rollback_error(&error, &rollback_error))?;
             return Err(error);
@@ -199,36 +211,47 @@ impl HandlerState {
                     .runtime_owner_transfer_target(&source_session_name)
             })
             .flatten();
-        let snapshot = SessionTransferSnapshot::capture(self);
-
-        let destination_index = self.sessions.with_extracted_session_pair(
-            &source_session_name,
-            &destination_session_name,
-            |source_session, destination_session| {
-                source_session.break_pane_to_session(
-                    SessionPaneTarget::from(&request.source),
-                    destination_session,
-                    BreakPaneOptions::new(
-                        request.target.as_ref().map(WindowTarget::window_index),
-                        request.name.clone(),
-                        request.detached,
-                        request.after,
-                        request.before,
-                    ),
-                )
-            },
+        let mut snapshot = SessionTransferSnapshot::capture(
+            self,
+            &[
+                source_session_name.clone(),
+                destination_session_name.clone(),
+            ],
         )?;
+
+        let destination_index = self
+            .sessions
+            .break_pane_for_runtime_transfer(
+                &WindowTarget::with_window(
+                    request.source.session_name().clone(),
+                    request.source.window_index(),
+                ),
+                request.source.pane_index(),
+                &destination_session_name,
+                BreakPaneOptions::new(
+                    request.target.as_ref().map(WindowTarget::window_index),
+                    request.name.clone(),
+                    request.detached,
+                    request.after,
+                    request.before,
+                ),
+            )
+            .map(|result| {
+                let index = result.window_index;
+                snapshot.retain_transfer(result.transfer);
+                index
+            });
         let destination_index = match destination_index {
             Ok(destination_index) => destination_index,
             Err(error) => {
-                snapshot.restore(self);
+                snapshot.restore(self)?;
                 return Err(error);
             }
         };
         let source_session_will_be_removed = self
             .sessions
             .session(&source_session_name)
-            .is_some_and(|session| session.windows().is_empty());
+            .is_none_or(|session| session.windows().next().is_none());
         let moved_target =
             PaneTarget::with_window(destination_session_name.clone(), destination_index, 0);
         let prepare_result = (|| {
@@ -264,7 +287,7 @@ impl HandlerState {
         let affected_sessions = match prepare_result {
             Ok(sessions) => sessions,
             Err(error) => {
-                snapshot.restore(self);
+                snapshot.restore(self)?;
                 return Err(error);
             }
         };
@@ -275,7 +298,7 @@ impl HandlerState {
             &destination_runtime,
             &[source_pane_id],
         ) {
-            snapshot.restore(self);
+            snapshot.restore(self)?;
             return Err(error);
         }
         if let Err(error) = self.move_pane_outputs_between_sessions(
@@ -288,7 +311,7 @@ impl HandlerState {
                 &source_runtime,
                 &[source_pane_id],
             );
-            snapshot.restore(self);
+            snapshot.restore(self)?;
             terminal_rollback
                 .map_err(|rollback_error| pane_transfer_rollback_error(&error, &rollback_error))?;
             return Err(error);
@@ -384,7 +407,7 @@ impl HandlerState {
             source_runtime,
             &[pane_id],
         );
-        snapshot.restore(self);
+        snapshot.restore(self)?;
         let model_rollback = self.resize_terminals(resize_session_name);
         output_rollback.map_err(|rollback_error| {
             pane_transfer_rollback_error(source_error, &rollback_error)

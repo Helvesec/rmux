@@ -10,6 +10,8 @@ use rmux_client::attach_terminal_with_initial_bytes_and_windows_console_key;
 use rmux_client::AttachError;
 use rmux_client::{connect, AttachSessionUpgrade, AttachTransition, ClientError, Connection};
 use rmux_proto::request::{AttachSessionExt2Request, AttachSessionExt3Request, ListClientsRequest};
+#[cfg(unix)]
+use rmux_proto::CAPABILITY_ATTACH_SERVER_EXITED;
 #[cfg(windows)]
 use rmux_proto::CAPABILITY_ATTACH_WINDOWS_CONSOLE_KEY;
 use rmux_proto::{
@@ -131,6 +133,10 @@ fn begin_attach(
     let windows_console_key = connection
         .supports_capability(CAPABILITY_ATTACH_WINDOWS_CONSOLE_KEY)
         .map_err(ExitFailure::from_client)?;
+    #[cfg(unix)]
+    let server_exited = connection
+        .supports_capability(CAPABILITY_ATTACH_SERVER_EXITED)
+        .map_err(ExitFailure::from_client)?;
     let mut advertised = Vec::new();
     if render {
         advertised.push(CAPABILITY_ATTACH_RENDER.to_owned());
@@ -138,6 +144,10 @@ fn begin_attach(
     #[cfg(windows)]
     if windows_console_key {
         advertised.push(CAPABILITY_ATTACH_WINDOWS_CONSOLE_KEY.to_owned());
+    }
+    #[cfg(unix)]
+    if server_exited {
+        advertised.push(CAPABILITY_ATTACH_SERVER_EXITED.to_owned());
     }
     let transition = if !advertised.is_empty() {
         connection
@@ -171,26 +181,30 @@ fn run_attach_upgrade(
     } = capabilities;
     let (stream, initial_bytes) = upgrade.into_parts();
     #[cfg(unix)]
-    {
-        if resize_geometry {
-            attach_terminal_with_initial_bytes_and_resize_geometry(stream, initial_bytes)
-                .map_err(attach_terminal_exit_failure)?;
-        } else {
-            attach_terminal_with_initial_bytes(stream, initial_bytes)
-                .map_err(attach_terminal_exit_failure)?;
-        }
-    }
+    let attached = if resize_geometry {
+        attach_terminal_with_initial_bytes_and_resize_geometry(stream, initial_bytes)
+    } else {
+        attach_terminal_with_initial_bytes(stream, initial_bytes)
+    };
     #[cfg(windows)]
-    {
+    let attached = {
         let _ = resize_geometry;
         attach_terminal_with_initial_bytes_and_windows_console_key(
             stream,
             initial_bytes,
             windows_console_key,
         )
-        .map_err(attach_terminal_exit_failure)?;
+    };
+    attach_terminal_exit_code(attached)
+}
+
+/// tmux exits 1 after `[server exited]`; the banner is the whole report.
+fn attach_terminal_exit_code(attached: Result<(), ClientError>) -> Result<i32, ExitFailure> {
+    match attached {
+        Ok(()) => Ok(0),
+        Err(ClientError::ServerExited) => Ok(1),
+        Err(error) => Err(attach_terminal_exit_failure(error)),
     }
-    Ok(0)
 }
 
 fn attach_terminal_exit_failure(error: ClientError) -> ExitFailure {

@@ -26,10 +26,19 @@ pub(super) fn parse_modifiers<'a, V>(
     state: &mut ExpandState,
     body: &'a str,
     variables: &V,
-) -> (Vec<FormatModifier>, &'a str)
+    status: bool,
+) -> (Vec<FormatModifier>, &'a str, bool)
 where
     V: FormatVariables + ?Sized,
 {
+    let status_limit = status && body.contains('=');
+    let mut argument = |raw: &str| {
+        if status_limit {
+            raw.to_owned()
+        } else {
+            format_expand1(state, raw, variables)
+        }
+    };
     let bytes = body.as_bytes();
     let mut modifiers = Vec::new();
     let mut i = 0;
@@ -92,7 +101,7 @@ where
             let rest = &bytes[i + 1..];
             if let Some(end_off) = format_skip(rest, b":;") {
                 let raw = &body[i + 1..i + 1 + end_off];
-                let expanded = format_expand1(state, raw, variables);
+                let expanded = argument(raw);
                 modifiers.push(FormatModifier {
                     modifier: String::from(c),
                     argv: vec![expanded],
@@ -126,7 +135,7 @@ where
                 None => break,
             };
             let raw = &body[j + 1..j + 1 + end_off];
-            let expanded = format_expand1(state, raw, variables);
+            let expanded = argument(raw);
             argv.push(expanded);
 
             j = j + 1 + end_off;
@@ -143,11 +152,26 @@ where
         continue;
     }
 
+    // For a status limit, the whole chain tells us whether the marker will be
+    // drawn. Expand each argument once in source order, including job arguments.
+    let display_marker = status_limit
+        && !modifiers
+            .iter()
+            .any(|m| matches!(m.modifier.as_str(), "q" | "n" | "w" | "a" | "c"));
+    if status_limit {
+        for m in &mut modifiers {
+            for (index, arg) in m.argv.iter_mut().enumerate() {
+                state.status = display_marker && m.modifier == "=" && index == 1;
+                *arg = format_expand1(state, arg, variables);
+            }
+        }
+        state.status = false;
+    }
     if i < bytes.len() && bytes[i] == b':' {
-        (modifiers, &body[i + 1..])
+        (modifiers, &body[i + 1..], display_marker)
     } else {
         // No `:` found — no valid modifier chain.
-        (Vec::new(), body)
+        (Vec::new(), body, false)
     }
 }
 

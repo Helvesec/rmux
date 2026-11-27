@@ -4,8 +4,8 @@ use super::pane_transfer_shared::{
 };
 use super::target_error::{invalid_pane_target, invalid_window_target};
 use super::{BreakPaneOptions, PaneJoinOptions, PaneSwapOptions, Session, SessionPaneTarget};
-use crate::{Pane, Window};
-use rmux_proto::{PaneSplitSize, RmuxError, SplitDirection};
+use crate::Window;
+use rmux_proto::RmuxError;
 
 impl Session {
     /// Swaps one pane in this session with one pane in another session.
@@ -87,133 +87,30 @@ impl Session {
         options: PaneJoinOptions,
     ) -> Result<(), RmuxError> {
         let source_window = source_session
-            .window_at(source.window_index)
+            .windows
+            .get_mut(&source.window_index)
             .ok_or_else(|| invalid_window_target(&source_session.name, source.window_index))?;
-        let source_pane = source_window
-            .pane(source.pane_index)
-            .cloned()
-            .ok_or_else(|| {
-                invalid_pane_target(
-                    &source_session.name,
-                    source.window_index,
-                    source.pane_index,
-                    "pane index does not exist in session",
-                )
-            })?;
-        let target_position = self
-            .window_at(target.window_index)
-            .ok_or_else(|| invalid_window_target(&self.name, target.window_index))?
-            .pane_position(target.pane_index)
-            .ok_or_else(|| {
-                invalid_pane_target(
-                    &self.name,
-                    target.window_index,
-                    target.pane_index,
-                    "pane index does not exist in session",
-                )
-            })?;
-        let requested_size = join_requested_size(
-            self.window_at(target.window_index)
-                .expect("target window must exist"),
-            target.pane_index,
-            options.direction,
-            options.full_size,
-            options.size,
-        )?;
-        let transient_index = self
-            .window_at(target.window_index)
-            .expect("target window must exist")
-            .panes()
-            .iter()
-            .map(Pane::index)
-            .max()
-            .unwrap_or(0)
-            .saturating_add(1);
-        let mut source_pane_for_validation = source_pane.clone();
-        source_pane_for_validation.set_index(transient_index);
-
-        self.window_at(target.window_index)
-            .expect("target window must exist")
-            .ensure_accepts_pane(&source_pane_for_validation, None)?;
-        let target_active_before_id = self
-            .window_at(target.window_index)
-            .and_then(Window::active_pane)
-            .map(Pane::id)
-            .expect("validated target window must have an active pane");
-        let target_last_before_id = self.window_at(target.window_index).and_then(|window| {
-            window
-                .last_pane_index()
-                .and_then(|pane_index| window.pane(pane_index).map(Pane::id))
-        });
-
         let target_window = self
-            .window_at_mut(target.window_index)
-            .expect("target window must exist");
-        target_window.auto_unzoom();
-        let source_window = source_session
-            .window_at_mut(source.window_index)
-            .expect("source window must exist");
-        source_window.auto_unzoom();
-        let mut moved_pane = source_window
-            .extract_pane(source.pane_index)
-            .expect("validated source pane must extract");
-        let moved_pane_id = moved_pane.id();
-        moved_pane.set_index(transient_index);
-        if options.full_size {
-            target_window.insert_pane_full_size(moved_pane, options.direction, options.before)?;
-        } else {
-            let insert_position = if options.before {
-                target_position
-            } else {
-                target_position + 1
-            };
-            target_window.insert_pane_at_position(
-                insert_position,
-                moved_pane,
-                options.direction,
-            )?;
-        }
-        if options.detached {
-            target_window
-                .renumber_panes_by_position(target_active_before_id, target_last_before_id);
-        } else {
-            target_window.renumber_panes_by_position_stamping(
-                moved_pane_id,
-                (target_active_before_id != moved_pane_id).then_some(target_active_before_id),
-                Some(target_active_before_id),
-            );
-        }
-        let moved_pane_index = target_window
-            .panes()
-            .iter()
-            .find(|pane| pane.id() == moved_pane_id)
-            .map(Pane::index)
-            .expect("moved pane must survive cross-session join");
-        if let Some(requested_size) = requested_size {
-            if options.full_size {
-                let _ = target_window.resize_pane_to(
-                    moved_pane_index,
-                    options.direction,
-                    requested_size,
-                );
-            } else {
-                let _ = target_window.resize_new_split_pane_to(
-                    moved_pane_index,
-                    options.direction,
-                    requested_size,
-                    options.before,
-                );
-            }
-        }
+            .windows
+            .get_mut(&target.window_index)
+            .ok_or_else(|| invalid_window_target(&self.name, target.window_index))?;
+        let moved_index = super::pane_transfer_join::join_between(
+            source_window,
+            &source_session.name,
+            source,
+            target_window,
+            &self.name,
+            target,
+            options,
+        )?;
+        let empty = source_window.pane_count() == 0;
         if !options.detached {
-            target_window.select_pane(moved_pane_index);
+            target_window.select_pane(moved_index);
             self.select_window(target.window_index)?;
         }
-
-        if source_window.pane_count() == 0 {
+        if empty {
             source_session.remove_window_allowing_empty(source.window_index)?;
         }
-
         Ok(())
     }
 
@@ -233,6 +130,15 @@ impl Session {
                 source.window_index,
                 source.pane_index,
                 "pane index does not exist in session",
+            ));
+        }
+        let source_pane_id = source_window
+            .pane(source.pane_index)
+            .expect("validated source")
+            .id();
+        if source_window.pane_count() > 1 && source_window.is_floating_pane_id(source_pane_id) {
+            return Err(RmuxError::Server(
+                "cannot break a floating pane out of a multi-pane window".to_owned(),
             ));
         }
         let destination_index = prepare_break_destination(
@@ -261,18 +167,18 @@ impl Session {
             return Ok(destination_index);
         }
 
-        let source_size = source_window.size();
-        let source_window = self
-            .window_at_mut(source.window_index)
-            .expect("source window must exist");
-        source_window.auto_unzoom();
-        let moved_pane = source_window
-            .extract_pane(source.pane_index)
-            .expect("validated source pane must extract");
-        let mut new_window = Window::new_with_initial_pane(
-            source_size,
-            moved_pane.id(),
-            destination_session.allocate_window_id(),
+        let size = source_window.size();
+        let pane_id = source_window
+            .pane(source.pane_index)
+            .expect("validated source")
+            .id();
+        let mut new_window =
+            Window::new_with_initial_pane(size, pane_id, destination_session.allocate_window_id());
+        super::pane_transfer_shared::apply_break_into_window(
+            self.window_at_mut(source.window_index)
+                .expect("validated source"),
+            source.pane_index,
+            &new_window,
         );
         if let Some(name) = options.name {
             new_window.set_name(name);
@@ -353,47 +259,4 @@ fn shift_windows_up_from(session: &mut Session, start_index: u32) -> Result<(), 
         session.last_window = Some(last_window.saturating_add(1));
     }
     Ok(())
-}
-
-fn join_requested_size(
-    target_window: &Window,
-    target_pane_index: u32,
-    direction: SplitDirection,
-    full_size: bool,
-    size: Option<PaneSplitSize>,
-) -> Result<Option<u32>, RmuxError> {
-    let Some(size) = size else {
-        return Ok(None);
-    };
-    let base = if full_size {
-        join_axis_for_size(target_window.size(), direction)
-    } else {
-        let pane = target_window.pane(target_pane_index).ok_or_else(|| {
-            RmuxError::Server(format!(
-                "cannot size missing target pane index {target_pane_index}"
-            ))
-        })?;
-        join_axis_for_size(
-            rmux_proto::TerminalSize {
-                cols: pane.geometry().cols(),
-                rows: pane.geometry().rows(),
-            },
-            direction,
-        )
-    };
-
-    Ok(Some(match size {
-        PaneSplitSize::Absolute(value) => value.max(1),
-        PaneSplitSize::Percentage(value) => {
-            let scaled = (base.saturating_mul(u32::from(value))) / 100;
-            scaled.max(1)
-        }
-    }))
-}
-
-fn join_axis_for_size(size: rmux_proto::TerminalSize, direction: SplitDirection) -> u32 {
-    match direction {
-        SplitDirection::Vertical => u32::from(size.cols),
-        SplitDirection::Horizontal => u32::from(size.rows),
-    }
 }

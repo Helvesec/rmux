@@ -2,6 +2,10 @@ use super::*;
 use crate::handler::with_expected_attach_and_session_identity;
 use crate::pane_io::AttachControl;
 use rmux_proto::{ErrorResponse, RmuxError};
+#[path = "run_shell/deferred_attach.rs"]
+mod deferred_attach;
+#[path = "run_shell/deferred_attach_siblings.rs"]
+mod deferred_attach_siblings;
 #[tokio::test]
 async fn run_shell_foreground_returns_stdout_like_tmux() {
     let handler = RequestHandler::new();
@@ -347,6 +351,7 @@ async fn background_run_shell_commands_survive_a_same_registration_session_switc
 async fn background_run_shell_expands_implicit_formats_after_attached_switch() {
     let handler = RequestHandler::new();
     let requester_pid = 424_306;
+    let capture = handler.install_run_shell_capture_rendezvous_for_test(requester_pid);
     let alpha = session_name("run-shell-format-switch-alpha");
     let beta = session_name("run-shell-format-switch-beta");
     create_background_identity_session(&handler, alpha.clone()).await;
@@ -371,6 +376,9 @@ async fn background_run_shell_expands_implicit_formats_after_attached_switch() {
     .await
     .expect("attached switch completes before delayed background expansion");
 
+    capture.wait_until_reached().await;
+    capture.release();
+
     wait_for_named_buffer(
         &handler,
         "bg-format",
@@ -384,6 +392,7 @@ async fn background_run_shell_builds_environment_for_followed_attached_session()
     let handler = RequestHandler::new();
     use_platform_test_shell(&handler).await;
     let requester_pid = 424_311;
+    let capture = handler.install_run_shell_capture_rendezvous_for_test(requester_pid);
     let alpha = session_name("run-shell-environment-switch-alpha");
     let beta = session_name("run-shell-environment-switch-beta");
     create_background_identity_session(&handler, alpha.clone()).await;
@@ -435,7 +444,7 @@ async fn background_run_shell_builds_environment_for_followed_attached_session()
                     as_commands: false,
                     show_stderr: true,
                     delay_seconds: Some(RunShellDelaySeconds(0.05)),
-                    start_directory: Some(root.clone()),
+                    start_directory: Some(root.to_path_buf()),
                     target: None,
                     source_depth: None,
                 },
@@ -443,6 +452,7 @@ async fn background_run_shell_builds_environment_for_followed_attached_session()
             .await;
         assert_eq!(response, Response::RunShell(RunShellResponse::background()));
 
+        capture.wait_until_reached().await;
         let switch = CommandParser::new()
             .parse(&format!("switch-client -t {beta}"))
             .expect("attached environment switch parses");
@@ -452,6 +462,8 @@ async fn background_run_shell_builds_environment_for_followed_attached_session()
             .expect("attached environment switch executes");
     })
     .await;
+
+    capture.release();
 
     wait_for_file_text(&output_path, "beta").await;
     wait_for_detached_request_count(&handler, 0).await;
@@ -534,7 +546,7 @@ async fn explicit_background_shell_target_survives_origin_attach_detach() {
                 as_commands: false,
                 show_stderr: true,
                 delay_seconds: Some(RunShellDelaySeconds(0.05)),
-                start_directory: Some(root.clone()),
+                start_directory: Some(root.to_path_buf()),
                 target: Some(PaneTarget::with_window(target, 0, 0)),
                 source_depth: None,
             },
@@ -587,7 +599,7 @@ async fn explicit_background_shell_target_survives_same_pid_attach_replacement()
                 as_commands: false,
                 show_stderr: true,
                 delay_seconds: Some(RunShellDelaySeconds(0.05)),
-                start_directory: Some(root.clone()),
+                start_directory: Some(root.to_path_buf()),
                 target: Some(PaneTarget::with_window(target, 0, 0)),
                 source_depth: None,
             },
@@ -1061,8 +1073,8 @@ async fn run_shell_expands_socket_path_without_target() {
 }
 
 async fn create_named_session(handler: &RequestHandler, name: &str) {
-    assert!(matches!(
-        handler
+    crate::session_fixture::assert_new_session(
+        &handler
             .handle(Request::NewSession(NewSessionRequest {
                 session_name: session_name(name),
                 detached: true,
@@ -1070,8 +1082,7 @@ async fn create_named_session(handler: &RequestHandler, name: &str) {
                 environment: None,
             }))
             .await,
-        Response::NewSession(_)
-    ));
+    );
 }
 
 async fn execute_test_command(handler: &RequestHandler, command: &str) {
@@ -1086,7 +1097,7 @@ async fn execute_test_command(handler: &RequestHandler, command: &str) {
 
 async fn wait_for_file_text(path: &std::path::Path, expected: &str) {
     let mut last_observed = None;
-    let result = tokio::time::timeout(background_shell_test_timeout(), async {
+    let result = tokio::time::timeout(SERVER_SIGNAL_LIVENESS, async {
         loop {
             if let Ok(text) = std::fs::read_to_string(path) {
                 if text == expected {
@@ -1296,7 +1307,7 @@ async fn parsed_new_session_start_directory_sets_session_cwd() {
         .sessions
         .session(&session_name("alpha"))
         .expect("session created");
-    assert_eq!(session.cwd(), Some(root.as_path()));
+    assert_eq!(session.cwd(), Some(root.path()));
 }
 
 #[test]

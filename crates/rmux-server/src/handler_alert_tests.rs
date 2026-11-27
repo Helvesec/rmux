@@ -7,6 +7,10 @@ use crate::format_runtime::render_runtime_template;
 use crate::outer_terminal::{OuterTerminal, OuterTerminalContext};
 use crate::pane_io::{pane_output_channel, AttachControl, AttachTarget};
 use crate::server_access::current_owner_uid;
+#[cfg(test)]
+use crate::session_fixture::SessionSetupExt as _;
+#[cfg(not(target_has_atomic = "64"))]
+use portable_atomic::AtomicU64;
 use rmux_core::{
     AlertFlags, OptionStore, PaneGeometry, PaneId, WINDOW_ACTIVITY, WINLINK_ACTIVITY, WINLINK_BELL,
     WINLINK_SILENCE,
@@ -22,10 +26,15 @@ use rmux_proto::{
     ShowMessagesRequest, SplitDirection, SplitWindowExtRequest, SplitWindowTarget,
     SubscribePaneStateRequest, Target, TerminalSize, UnlinkWindowRequest, WindowTarget,
 };
-use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+#[cfg(target_has_atomic = "64")]
+use std::sync::atomic::AtomicU64;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
 use tokio::sync::{broadcast, mpsc};
 use tokio::time::{timeout, Duration};
+
+#[path = "handler_alert_tests/terminal_capabilities.rs"]
+mod terminal_capabilities;
 
 #[cfg(windows)]
 const ALERT_TEST_EVENT_TIMEOUT: Duration = Duration::from_secs(5);
@@ -48,7 +57,7 @@ async fn create_session(handler: &RequestHandler, name: &str) -> SessionName {
             environment: None,
         }))
         .await;
-    assert!(matches!(response, Response::NewSession(_)));
+    crate::session_fixture::assert_new_session(&response);
     session
 }
 
@@ -129,7 +138,7 @@ async fn create_quiet_session(handler: &RequestHandler, name: &str) -> SessionNa
             skip_environment_update: false,
         })))
         .await;
-    assert!(matches!(response, Response::NewSession(_)));
+    crate::session_fixture::assert_new_session(&response);
     handler
         .wait_for_pane_startup_to_finish_for_test(&PaneTarget::new(session.clone(), 0))
         .await;
@@ -163,7 +172,7 @@ async fn create_grouped_session(
             skip_environment_update: false,
         })))
         .await;
-    assert!(matches!(response, Response::NewSession(_)), "{response:?}");
+    crate::session_fixture::assert_new_session(&response);
     session
 }
 
@@ -855,21 +864,23 @@ async fn pane_alert_event_sets_bell_and_activity_flags_and_emits_alert_hooks() {
     };
     let mut lifecycle = handler.subscribe_lifecycle_events();
 
-    handler.pane_alert_callback()(crate::pane_io::PaneAlertEvent {
-        session_name: session.clone(),
-        pane_id,
-        bell_count: 1,
-        title_changed: false,
-        title_change: None,
-        path_changed: false,
-        clipboard_set: false,
-        clipboard_writes: Vec::new(),
-        clipboard_queries: Vec::new(),
-        mouse_mode_changed: false,
-        alternate_mode_changed: false,
-        queue_activity_alert: true,
-        generation: None,
-    });
+    handler
+        .pane_alert_callback()
+        .alert(crate::pane_io::PaneAlertEvent {
+            session_name: session.clone(),
+            pane_id,
+            bell_count: 1,
+            title_changed: false,
+            title_change: None,
+            path_changed: false,
+            clipboard_set: false,
+            clipboard_writes: Vec::new(),
+            clipboard_queries: Vec::new(),
+            mouse_mode_changed: false,
+            alternate_mode_changed: false,
+            queue_activity_alert: true,
+            generation: None,
+        });
 
     let events = recv_lifecycle_hooks(
         &mut lifecycle,
@@ -932,7 +943,7 @@ async fn pane_alert_batch_coalesces_bell_across_two_panes_in_one_window() {
     let mut lifecycle = handler.subscribe_lifecycle_events();
     let callback = handler.pane_alert_callback();
     for pane_id in pane_ids {
-        callback(crate::pane_io::PaneAlertEvent {
+        callback.alert(crate::pane_io::PaneAlertEvent {
             session_name: session.clone(),
             pane_id,
             bell_count: 1,
@@ -999,7 +1010,7 @@ async fn pane_alert_callback_can_be_invoked_from_reader_thread() {
     let callback = handler.pane_alert_callback();
 
     std::thread::spawn(move || {
-        callback(crate::pane_io::PaneAlertEvent {
+        callback.alert(crate::pane_io::PaneAlertEvent {
             session_name: session,
             pane_id,
             bell_count: 0,
@@ -1036,21 +1047,23 @@ async fn pane_title_change_output_emits_lifecycle_hook_event() {
     };
     let mut lifecycle = handler.subscribe_lifecycle_events();
 
-    handler.pane_alert_callback()(crate::pane_io::PaneAlertEvent {
-        session_name: session,
-        pane_id,
-        bell_count: 0,
-        title_changed: true,
-        title_change: None,
-        path_changed: false,
-        clipboard_set: false,
-        clipboard_writes: Vec::new(),
-        clipboard_queries: Vec::new(),
-        mouse_mode_changed: false,
-        alternate_mode_changed: false,
-        queue_activity_alert: false,
-        generation: None,
-    });
+    handler
+        .pane_alert_callback()
+        .alert(crate::pane_io::PaneAlertEvent {
+            session_name: session,
+            pane_id,
+            bell_count: 0,
+            title_changed: true,
+            title_change: None,
+            path_changed: false,
+            clipboard_set: false,
+            clipboard_writes: Vec::new(),
+            clipboard_queries: Vec::new(),
+            mouse_mode_changed: false,
+            alternate_mode_changed: false,
+            queue_activity_alert: false,
+            generation: None,
+        });
 
     let event = recv_lifecycle(&mut lifecycle).await;
     assert_eq!(event.hook_name, HookName::PaneTitleChanged);
@@ -1088,7 +1101,7 @@ async fn pane_state_title_alert_ignores_stale_generation() {
     };
 
     let callback = handler.pane_alert_callback();
-    callback(crate::pane_io::PaneAlertEvent {
+    callback.alert(crate::pane_io::PaneAlertEvent {
         session_name: session.clone(),
         pane_id,
         bell_count: 0,
@@ -1151,7 +1164,7 @@ async fn pane_state_title_alert_ignores_stale_generation() {
     .await
     .expect("current-generation title event must arrive");
 
-    callback(crate::pane_io::PaneAlertEvent {
+    callback.alert(crate::pane_io::PaneAlertEvent {
         session_name: session,
         pane_id,
         bell_count: 0,
@@ -1749,21 +1762,23 @@ async fn inbound_osc52_before_last_pane_eof_keeps_buffer_and_hook() {
     .await
     .expect("pane exit waits for pending output before alert flush");
 
-    handler.pane_alert_callback()(crate::pane_io::PaneAlertEvent {
-        session_name: session.clone(),
-        pane_id,
-        bell_count: 0,
-        title_changed: false,
-        title_change: None,
-        path_changed: false,
-        clipboard_set: true,
-        clipboard_writes: vec![b"hello-before-eof".to_vec()],
-        clipboard_queries: Vec::new(),
-        mouse_mode_changed: false,
-        alternate_mode_changed: false,
-        queue_activity_alert: false,
-        generation: Some(generation),
-    });
+    handler
+        .pane_alert_callback()
+        .alert(crate::pane_io::PaneAlertEvent {
+            session_name: session.clone(),
+            pane_id,
+            bell_count: 0,
+            title_changed: false,
+            title_change: None,
+            path_changed: false,
+            clipboard_set: true,
+            clipboard_writes: vec![b"hello-before-eof".to_vec()],
+            clipboard_queries: Vec::new(),
+            mouse_mode_changed: false,
+            alternate_mode_changed: false,
+            queue_activity_alert: false,
+            generation: Some(generation),
+        });
     let _ = pane_output.send_for_generation(Some(generation), Vec::new());
     tokio::time::timeout(Duration::from_secs(1), pause.reached.notified())
         .await
@@ -1887,7 +1902,7 @@ async fn active_pane_osc52_does_not_enqueue_a_second_clipboard_write() {
         state
             .sessions
             .session(&session)
-            .and_then(rmux_core::Session::active_pane_id)
+            .and_then(|session| session.active_pane_id())
             .expect("active pane exists")
     };
     let mut control_rx = register_clipboard_attach(&handler, 304, &session).await;
@@ -1987,13 +2002,15 @@ async fn inactive_pane_osc52_is_enqueued_before_a_following_session_switch() {
         state
             .sessions
             .session(&destination)
-            .map(rmux_core::Session::id)
+            .map(|session| session.id())
             .expect("destination exists")
     };
     let mut control_rx = register_clipboard_attach(&handler, 308, &source).await;
     drain_attach_controls_until_idle(&mut control_rx).await;
 
-    handler.pane_alert_callback()(clipboard_alert(source, inactive_pane_id));
+    handler
+        .pane_alert_callback()
+        .alert(clipboard_alert(source, inactive_pane_id));
     let pane_output = pane_output_channel();
     let (pane_output_start_sequence, pane_output) = pane_output.subscribe_live_from_now();
     let target = AttachTarget {
@@ -2007,7 +2024,7 @@ async fn inactive_pane_osc52_is_enqueued_before_a_following_session_switch() {
             OuterTerminalContext::default(),
         ),
         client_title: None,
-        cursor_style: 0,
+        cursor_style: 0.into(),
         active_pane_geometry: PaneGeometry::new(0, 0, 80, 24),
         raw_passthrough: false,
         kitty_graphics_passthrough: false,
@@ -2058,7 +2075,9 @@ async fn busy_attach_lock_drops_osc52_relay_without_a_deferred_retry() {
     drain_attach_controls_until_idle(&mut control_rx).await;
 
     let active_attach = handler.active_attach.lock().await;
-    handler.pane_alert_callback()(clipboard_alert(session, inactive_pane_id));
+    handler
+        .pane_alert_callback()
+        .alert(clipboard_alert(session, inactive_pane_id));
     drop(active_attach);
     tokio::time::sleep(Duration::from_millis(200)).await;
 
@@ -2100,7 +2119,7 @@ async fn inactive_pane_osc52_disconnects_a_non_draining_attach_at_the_backlog_li
     let callback = handler.pane_alert_callback();
 
     for _ in 0..=ATTACH_CONTROL_BACKLOG_LIMIT {
-        callback(clipboard_alert(session.clone(), inactive_pane_id));
+        callback.alert(clipboard_alert(session.clone(), inactive_pane_id));
     }
 
     let mut writes = 0;
@@ -2305,7 +2324,7 @@ async fn inactive_pane_osc52_backlog_is_bounded_by_encoded_bytes() {
     large_alert.clipboard_writes = vec![vec![b'A'; 512 * 1024]];
 
     for _ in 0..ATTACH_CONTROL_BACKLOG_LIMIT {
-        callback(large_alert.clone());
+        callback.alert(large_alert.clone());
     }
 
     let mut writes = 0;
@@ -2443,7 +2462,7 @@ async fn pane_alert_callback_coalesces_inactive_pane_refreshes_by_session() {
         (first_callback.as_ref(), inactive_panes[0]),
         (second_callback.as_ref(), inactive_panes[1]),
     ] {
-        callback(crate::pane_io::PaneAlertEvent {
+        callback.alert(crate::pane_io::PaneAlertEvent {
             session_name: session.clone(),
             pane_id,
             bell_count: 0,
@@ -2526,21 +2545,23 @@ async fn pane_mouse_mode_alert_refreshes_the_active_attached_pane() {
         .await
         .expect("attach registration succeeds");
 
-    handler.pane_alert_callback()(crate::pane_io::PaneAlertEvent {
-        session_name: session,
-        pane_id,
-        bell_count: 0,
-        title_changed: false,
-        title_change: None,
-        path_changed: false,
-        clipboard_set: false,
-        clipboard_writes: Vec::new(),
-        clipboard_queries: Vec::new(),
-        mouse_mode_changed: true,
-        alternate_mode_changed: false,
-        queue_activity_alert: false,
-        generation: None,
-    });
+    handler
+        .pane_alert_callback()
+        .alert(crate::pane_io::PaneAlertEvent {
+            session_name: session,
+            pane_id,
+            bell_count: 0,
+            title_changed: false,
+            title_change: None,
+            path_changed: false,
+            clipboard_set: false,
+            clipboard_writes: Vec::new(),
+            clipboard_queries: Vec::new(),
+            mouse_mode_changed: true,
+            alternate_mode_changed: false,
+            queue_activity_alert: false,
+            generation: None,
+        });
 
     let control = timeout(Duration::from_secs(2), control_rx.recv())
         .await
@@ -2604,21 +2625,23 @@ async fn pane_alert_event_updates_automatic_window_name_without_disabling_auto_r
             .expect("window pane exists")
     };
 
-    handler.pane_alert_callback()(crate::pane_io::PaneAlertEvent {
-        session_name: session.clone(),
-        pane_id,
-        bell_count: 0,
-        title_changed: false,
-        title_change: None,
-        path_changed: false,
-        clipboard_set: false,
-        clipboard_writes: Vec::new(),
-        clipboard_queries: Vec::new(),
-        mouse_mode_changed: false,
-        alternate_mode_changed: false,
-        queue_activity_alert: true,
-        generation: None,
-    });
+    handler
+        .pane_alert_callback()
+        .alert(crate::pane_io::PaneAlertEvent {
+            session_name: session.clone(),
+            pane_id,
+            bell_count: 0,
+            title_changed: false,
+            title_change: None,
+            path_changed: false,
+            clipboard_set: false,
+            clipboard_writes: Vec::new(),
+            clipboard_queries: Vec::new(),
+            mouse_mode_changed: false,
+            alternate_mode_changed: false,
+            queue_activity_alert: true,
+            generation: None,
+        });
 
     let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
     loop {
@@ -2725,7 +2748,7 @@ async fn pane_alert_event_updates_grouped_session_window_names() {
             skip_environment_update: false,
         })))
         .await;
-    assert!(matches!(response, Response::NewSession(_)));
+    crate::session_fixture::assert_new_session(&response);
     set_option(
         &handler,
         ScopeSelector::Window(WindowTarget::with_window(alpha.clone(), 0)),
@@ -2796,7 +2819,7 @@ async fn pane_alert_event_updates_grouped_session_window_names() {
 #[cfg(unix)]
 #[tokio::test]
 async fn shell_input_updates_window_name_and_foreground_process_formats() {
-    let handler = RequestHandler::new();
+    let handler = RequestHandler::with_host_shell_for_test();
     let session = create_session(&handler, "alerts-foreground").await;
     let target = PaneTarget::with_window(session.clone(), 0, 0);
     let expected_path = std::fs::canonicalize("/tmp")
@@ -2962,7 +2985,7 @@ async fn grouped_window_silence_option_synchronizes_runtime_timers_for_every_ali
             skip_environment_update: false,
         })))
         .await;
-    assert!(matches!(response, Response::NewSession(_)));
+    crate::session_fixture::assert_new_session(&response);
 
     set_option(
         &handler,
@@ -3306,13 +3329,13 @@ async fn assert_grouped_mixed_renumber_preserves_silence_timers(label: &str, unl
                 .sessions
                 .session(&session_name)
                 .expect("group member survives removal");
-            session
+            let index = session
                 .windows()
-                .iter()
                 .find_map(|(window_index, window)| {
-                    (window.id() == window_id).then_some(*window_index)
+                    (window.id() == window_id).then_some(window_index)
                 })
-                .expect("surviving window identity remains in every group member")
+                .expect("surviving window identity remains in every group member");
+            index
         };
         let shifted = WindowTarget::with_window(session_name.clone(), current_index);
         let timer = handler
@@ -4228,7 +4251,7 @@ async fn window_alias_activity_resets_silence_timers_for_entire_family() {
             skip_environment_update: false,
         })))
         .await;
-    assert!(matches!(response, Response::NewSession(_)));
+    crate::session_fixture::assert_new_session(&response);
     let linked = create_quiet_session(&handler, "silence-reset-linked").await;
     let response = handler
         .handle(Request::LinkWindow(LinkWindowRequest {
@@ -4320,6 +4343,51 @@ async fn window_alias_activity_resets_silence_timers_for_entire_family() {
             "grouped aliases did not expire from the refreshed silence deadline"
         );
         tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+}
+
+#[tokio::test]
+async fn show_messages_command_logs_observer_before_eviction() {
+    let handler = RequestHandler::new();
+    let observer_pid = 73081;
+    {
+        let mut state = handler.state.lock().await;
+        state.add_message("FIRST");
+        state.add_message("LAST");
+    }
+    set_option(
+        &handler,
+        ScopeSelector::Global,
+        OptionName::MessageLimit,
+        "1",
+    )
+    .await;
+
+    for appended in [None, Some("APPEND")] {
+        if let Some(message) = appended {
+            handler.state.lock().await.add_message(message);
+        }
+        let commands = handler
+            .parse_command_string_one_group("show-messages")
+            .await
+            .expect("parse observer command");
+        let output = handler
+            .execute_parsed_commands_for_test(observer_pid, commands)
+            .await
+            .expect("execute observer command");
+        let rendered = String::from_utf8_lossy(output.stdout());
+        let lines = rendered.lines().collect::<Vec<_>>();
+        assert_eq!(lines.len(), 1, "{rendered}");
+        assert!(
+            lines[0].ends_with(&format!("client-{observer_pid} command: show-messages")),
+            "observer must evict preloaded and appended messages: {rendered}"
+        );
+        let state = handler.state.lock().await;
+        assert_eq!(state.message_log.len(), 1);
+        assert_eq!(
+            state.message_log[0].msg,
+            format!("client-{observer_pid} command: show-messages")
+        );
     }
 }
 
@@ -4443,9 +4511,9 @@ async fn format_variables_focus_clearing_and_alert_navigation_follow_winlink_fla
 
     {
         let mut state = handler.state.lock().await;
-        let session = state
+        let mut session = state
             .sessions
-            .session_mut(&session)
+            .session_setup(&session)
             .expect("session exists");
         let combined = WINLINK_ACTIVITY.union(WINLINK_BELL).union(WINLINK_SILENCE);
         assert!(session.add_winlink_alert_flags(window_one.window_index(), combined));
@@ -4730,9 +4798,9 @@ async fn kill_window_clears_alert_flags_for_removed_window() {
 
     {
         let mut state = handler.state.lock().await;
-        let session_obj = state
+        let mut session_obj = state
             .sessions
-            .session_mut(&session)
+            .session_setup(&session)
             .expect("session exists");
         session_obj.add_winlink_alert_flags(window.window_index(), WINLINK_BELL);
     }
@@ -4841,9 +4909,9 @@ async fn select_window_clears_alert_flags_on_newly_selected_window() {
 
     {
         let mut state = handler.state.lock().await;
-        let session_obj = state
+        let mut session_obj = state
             .sessions
-            .session_mut(&session)
+            .session_setup(&session)
             .expect("session exists");
         session_obj.add_winlink_alert_flags(
             window_one.window_index(),
@@ -4870,5 +4938,131 @@ async fn select_window_clears_alert_flags_on_newly_selected_window() {
     assert!(
         flags.is_empty(),
         "alert flags should be cleared when selecting a window via next-window"
+    );
+}
+
+#[tokio::test]
+async fn pane_output_refresh_preserves_popup_but_updates_other_attached_clients() {
+    let handler = RequestHandler::new();
+    let session = create_quiet_session(&handler, "popup-output-refresh").await;
+    let (popup_tx, mut popup_rx) = mpsc::unbounded_channel();
+    let (plain_tx, mut plain_rx) = mpsc::unbounded_channel();
+    handler
+        .register_attach(771, session.clone(), popup_tx)
+        .await;
+    handler
+        .register_attach(772, session.clone(), plain_tx)
+        .await;
+    let popup = rmux_core::command_parser::CommandParser::new()
+        .parse_one_group("display-popup -N -T OutputGuard -w 30 -h 8")
+        .expect("popup parses");
+    handler
+        .execute_parsed_commands_for_test(771, popup)
+        .await
+        .expect("popup opens");
+    drain_attach_controls_until_quiet(
+        &mut popup_rx,
+        Duration::from_millis(150),
+        Duration::from_secs(2),
+    )
+    .await;
+    drain_attach_controls_until_quiet(
+        &mut plain_rx,
+        Duration::from_millis(150),
+        Duration::from_secs(2),
+    )
+    .await;
+
+    handler
+        .refresh_attached_session_for_pane_output(&session)
+        .await;
+    assert!(
+        popup_rx.try_recv().is_err(),
+        "pane output must not erase/repaint a popup"
+    );
+    assert!(
+        matches!(plain_rx.try_recv(), Ok(AttachControl::Switch(_))),
+        "another client without a popup must keep seeing pane output"
+    );
+
+    // Automatic renaming is another output-driven refresh path. It must
+    // update the model and unobscured clients without repainting this popup.
+    set_option(
+        &handler,
+        ScopeSelector::Window(WindowTarget::with_window(session.clone(), 0)),
+        OptionName::AutomaticRenameFormat,
+        "popup-background-renamed",
+    )
+    .await;
+    while popup_rx.try_recv().is_ok() {}
+    while plain_rx.try_recv().is_ok() {}
+    let pane_id = {
+        let state = handler.state.lock().await;
+        state
+            .sessions
+            .session(&session)
+            .unwrap()
+            .window_at(0)
+            .unwrap()
+            .pane(0)
+            .unwrap()
+            .id()
+    };
+    handler
+        .handle_pane_alert_event(crate::pane_io::PaneAlertEvent {
+            session_name: session.clone(),
+            pane_id,
+            bell_count: 0,
+            title_changed: false,
+            title_change: None,
+            path_changed: false,
+            clipboard_set: false,
+            clipboard_writes: Vec::new(),
+            clipboard_queries: Vec::new(),
+            mouse_mode_changed: false,
+            alternate_mode_changed: false,
+            queue_activity_alert: true,
+            generation: None,
+        })
+        .await;
+    assert!(
+        popup_rx.try_recv().is_err(),
+        "automatic naming must preserve the popup"
+    );
+    {
+        let state = handler.state.lock().await;
+        assert_eq!(
+            state
+                .sessions
+                .session(&session)
+                .unwrap()
+                .window_at(0)
+                .unwrap()
+                .name(),
+            Some("popup-background-renamed")
+        );
+    }
+
+    // Layout changes and explicit refreshes still restore the full surface.
+    handler.refresh_attached_session(&session).await;
+    assert!(
+        matches!(popup_rx.try_recv(), Ok(AttachControl::Switch(_))),
+        "explicit refresh must remain available with a popup open"
+    );
+    while popup_rx.try_recv().is_ok() {}
+    let close = rmux_core::command_parser::CommandParser::new()
+        .parse_one_group("display-popup -C")
+        .expect("popup close parses");
+    handler
+        .execute_parsed_commands_for_test(771, close)
+        .await
+        .expect("popup closes");
+    while popup_rx.try_recv().is_ok() {}
+    handler
+        .refresh_attached_session_for_pane_output(&session)
+        .await;
+    assert!(
+        matches!(popup_rx.try_recv(), Ok(AttachControl::Switch(_))),
+        "pane output must resume after dismissal"
     );
 }

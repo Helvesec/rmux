@@ -2,6 +2,44 @@ use super::*;
 use crate::input::{CellState, GridAttr};
 
 #[test]
+fn unused_suffix_gap_guard_matches_materialized_explicit_space_extent() {
+    for (text, start, gap) in [
+        ("", 7, 1),
+        (" ", 7, 1),
+        ("A ", 1, 0),
+        ("A ", 2, 6),
+        ("       ", 7, 1),
+        ("        ", 7, 0),
+        ("       x", 7, 0),
+    ] {
+        for materialized in [false, true] {
+            let mut line = GridLine::new(8);
+            assert!(line.write_plain_ascii_run(0, text.as_bytes()));
+            if materialized {
+                line.materialize_for_cell_mutation();
+            }
+            let used_end_before = line.used_end();
+            let cells_before: Vec<_> = (0..8).map(|x| line.cell(x).unwrap()).collect();
+
+            line.mark_unused_suffix_as_reflow_gap(start);
+
+            assert_eq!(line.trailing_reflow_gap(), gap, "{text:?}, {materialized}");
+            assert_eq!(line.reflow_logical_width(), 8 - gap as usize);
+            for (x, before) in cells_before.iter().enumerate() {
+                let after = line.cell(u32::try_from(x).unwrap()).unwrap();
+                assert_eq!(after.text(), before.text());
+                assert_eq!(after.is_blank(), before.is_blank());
+                assert_eq!(after.is_reflow_gap(), gap > 0 && x >= start as usize);
+            }
+            if gap == 0 {
+                assert_eq!(line.used_end(), used_end_before);
+                assert_eq!(line.plain_text().is_none(), materialized);
+            }
+        }
+    }
+}
+
+#[test]
 fn render_without_trimming_preserves_explicit_trailing_spaces_but_not_cleared_cells() {
     let mut line = GridLine::new(6);
     let state = CellState::default();

@@ -1,4 +1,4 @@
-use rmux_proto::{PaneTargetRef, WebShareListener, WebShareScope};
+use super::{WebSharePaneTarget, WebShareScope};
 
 /// Redacted metadata for an active browser-visible pane or session share.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -13,6 +13,8 @@ pub struct WebShareSummary {
     pub operator: bool,
     /// Whether this share has a spectator URL.
     pub spectator: bool,
+    /// Whether this share can execute rmux controls, as reported by the daemon.
+    pub controls: bool,
     /// Active spectator client count.
     pub active_spectators: u16,
     /// Active operator client count.
@@ -30,22 +32,21 @@ pub struct WebShareSummary {
 impl WebShareSummary {
     /// Returns the pane target when this is a single-pane share.
     #[must_use]
-    pub fn pane_target(&self) -> Option<&PaneTargetRef> {
+    pub fn pane_target(&self) -> Option<&WebSharePaneTarget> {
         match &self.scope {
             WebShareScope::Pane(target) => Some(target),
             WebShareScope::Session(_) => None,
         }
     }
-}
 
-impl From<rmux_proto::WebShareSummary> for WebShareSummary {
-    fn from(value: rmux_proto::WebShareSummary) -> Self {
+    pub(super) fn from_proto(value: rmux_proto::WebShareSummary) -> Self {
         Self {
             id: value.share_id,
-            scope: value.scope,
+            scope: WebShareScope::from_proto(value.scope),
             spectator_url_redacted: value.spectator_url,
             operator: value.operator,
             spectator: value.spectator,
+            controls: value.controls,
             active_spectators: value.active_spectators,
             active_operators: value.active_operators,
             max_spectators: value.max_spectators,
@@ -67,8 +68,8 @@ pub struct WebConfigInfo {
     pub frontend_origin: String,
 }
 
-impl From<WebShareListener> for WebConfigInfo {
-    fn from(value: WebShareListener) -> Self {
+impl WebConfigInfo {
+    pub(super) fn from_proto(value: rmux_proto::WebShareListener) -> Self {
         Self {
             host: value.host,
             port: value.port,

@@ -10,7 +10,7 @@ use std::time::Duration;
 use rmux_ipc::{
     connect_blocking, resolve_endpoint, wait_for_peer_close, LocalEndpoint, LocalStream,
 };
-use tokio::io::AsyncWriteExt;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::time::timeout;
 
 static UNIQUE_ID: AtomicUsize = AtomicUsize::new(0);
@@ -31,6 +31,47 @@ async fn wait_for_peer_close_keeps_observing_after_buffered_bytes() -> std::io::
 
     wait.await.expect("peer close task")?;
     Ok(())
+}
+
+/// An exact-length read leaves Tokio's readiness set although the socket is
+/// drained. The peer-close wait must still yield, so the caller's timeout fires
+/// on a single-threaded runtime, and it must still observe the later close.
+#[test]
+fn wait_for_peer_close_yields_after_exact_length_read() {
+    let (outcome_tx, outcome_rx) = std::sync::mpsc::channel();
+    // A wait that never yields also starves this runtime's timer, so the
+    // verdict is taken from a separate OS thread.
+    std::thread::spawn(move || {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("current-thread runtime");
+        let outcome = runtime.block_on(async {
+            let (mut server, mut client) = LocalStream::pair()?;
+            client.write_all(b"ping").await?;
+            let mut frame = [0_u8; 4];
+            server.read_exact(&mut frame).await?;
+            assert_eq!(&frame, b"ping");
+
+            let silent_peer =
+                timeout(Duration::from_millis(200), wait_for_peer_close(&server)).await;
+            assert!(
+                silent_peer.is_err(),
+                "a connected silent peer must not be reported as closed"
+            );
+
+            drop(client);
+            timeout(Duration::from_secs(2), wait_for_peer_close(&server))
+                .await
+                .map_err(|_| std::io::Error::other("peer close was not observed"))?
+        });
+        let _ = outcome_tx.send(outcome);
+    });
+
+    let outcome = outcome_rx
+        .recv_timeout(Duration::from_secs(10))
+        .expect("wait_for_peer_close never yielded after an exact-length read");
+    outcome.expect("peer close after an exact-length read");
 }
 
 #[test]

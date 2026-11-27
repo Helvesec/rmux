@@ -256,7 +256,6 @@ async fn list_windows_format_uses_each_windows_active_pane_context() {
         let session = state.sessions.session(&alpha).expect("alpha exists");
         session
             .windows()
-            .iter()
             .map(|(window_index, window)| {
                 format!("{}:{}", window_index, window.active_pane_index())
             })

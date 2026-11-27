@@ -1,22 +1,60 @@
-use std::sync::{Arc, Mutex};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use crate::clock_mode::{ClockModeState, CLOCK_MODE_NAME};
-use crate::copy_mode::{CopyModeRenderSnapshot, CopyModeState, CopyModeSummary};
+use crate::clock_mode::ClockModeState;
+use crate::copy_mode::CopyModeState;
+use crate::pane_rename_queue::AcceptedWindowRename;
+#[cfg(test)]
+use rmux_core::style::Style;
+#[cfg(test)]
+use rmux_core::GridRenderOptions;
 use rmux_core::{
-    input::OscColourSlot, style::Style, GridRenderOptions, Screen, ScreenCaptureRange,
-    TerminalPaletteIndex, TerminalPassthrough, TerminalScreen, Utf8Config,
+    Screen, TerminalPaletteIndex, TerminalPassthrough, TerminalScreen, Utf8Config, WindowId,
 };
 use rmux_proto::TerminalSize;
 
-#[path = "pane_transcript/palette_queries.rs"]
 mod palette_queries;
 
 use palette_queries::PendingPaletteQueries;
 
-pub(crate) type SharedPaneTranscript = Arc<Mutex<PaneTranscript>>;
+mod dead_footer;
+
+#[cfg(test)]
+#[path = "pane_transcript/presentation_test_clock.rs"]
+pub(crate) mod presentation_test_clock;
+
+mod presentation;
+#[cfg(test)]
+use presentation::{visible_revision_reuse_map, PaneVisibleLineCapture};
+pub(crate) use presentation::{FramePresentation, PresentationCapture, PresentationRead};
+
+mod shared;
+pub(crate) use shared::{
+    with_unavailable_pane_answered, with_unavailable_pane_unanswered, PaneTranscriptReach,
+    PaneTranscriptUnavailable, SharedPaneTranscript,
+};
+
+mod capture;
+mod modes;
+mod timers;
 
 pub(crate) const PANE_INPUT_GROUND_TIMEOUT: Duration = Duration::from_secs(5);
+// A child cannot hold pane publication forever after a malformed write or
+// abrupt failure. This exceeds normal synchronized redraws (including the
+// measured 250 ms fixture) while providing deterministic fail-open progress.
+pub(crate) const PANE_SYNCHRONIZED_OUTPUT_TIMEOUT: Duration = Duration::from_secs(1);
+
+/// Which mode a pane is in, without the name a format would print.
+///
+/// `copy-mode -q` addresses a pane and has to leave whatever is on it, so it
+/// asks this rather than matching on a mode's printed name.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum PaneModeKind {
+    Copy,
+    Clock,
+    ModeTree,
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum PaneModeState {
@@ -44,13 +82,29 @@ impl PaneModeState {
 
 pub(crate) struct PaneTranscript {
     terminal: TerminalScreen,
+    pub(crate) control_colours: crate::control_colours::PaneControlColours,
+    pub(crate) theme: crate::theme::PaneTheme,
     mode: Option<PaneModeState>,
+    /// Whether this pane received input while a mode was up and nothing has
+    /// left the last mode since. The source raises it on any non-empty input
+    /// that arrives while a mode remains (`tmux-3.7b/input.c:1036-1038`) and
+    /// clears it when the last mode is left (`window.c:1275-1277`).
+    unseen_changes: bool,
     mode_revision: u64,
     output_sequence: u64,
     next_clock_generation: u64,
     ground_timer_started_at: Option<Instant>,
     ground_timer_token: u64,
+    synchronized_output_started_at: Option<Instant>,
+    synchronized_output_timer_token: u64,
+    synchronized_output_timer_job_claimed: Arc<AtomicBool>,
     pending_palette_queries: PendingPaletteQueries,
+    /// The window this pane belonged to when its policy was last resolved.
+    /// Every accepted `ESC k` request is stamped with it at acceptance.
+    rename_owner: Option<WindowId>,
+    process_exited: bool,
+    foreground_group: Option<u32>,
+    foreground_transition_pending: bool,
     #[cfg(test)]
     utf8_config: Utf8Config,
 }
@@ -61,9 +115,44 @@ pub(crate) struct PaneGroundTimer {
     token: u64,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Default)]
+/// A uniquely owned, fail-open wake for one synchronized-output interval.
+///
+/// Timer ownership is the pending-job invariant: once this value leaves a
+/// transcript, exactly one append result, scheduler error, or worker job owns
+/// its claim. Dropping it returns the claim, so a discarded hand-off cannot
+/// leave the pane permanently unable to arm another wake.
+#[derive(Debug)]
+pub(crate) struct PaneSynchronizedOutputTimer {
+    pub(crate) deadline: Instant,
+    token: u64,
+    job_ownership: PaneSynchronizedOutputTimerJobOwnership,
+}
+
+/// The sole owner of a synchronized-output timer claim.
+///
+/// This guard deliberately is neither `Clone` nor `Copy`. It moves with the
+/// timer through each hand-off: append result, scheduler send, worker queue,
+/// and stale-job replacement. Any discarded result, failed send, queue
+/// shutdown, or unwinding panic drops the guard and releases the claim.
+#[derive(Debug)]
+struct PaneSynchronizedOutputTimerJobOwnership {
+    claimed: Arc<AtomicBool>,
+}
+
+impl Drop for PaneSynchronizedOutputTimerJobOwnership {
+    fn drop(&mut self) {
+        self.claimed.store(false, Ordering::Release);
+    }
+}
+
+#[derive(Debug, Default)]
 pub(crate) struct PaneAppendResult {
     pub(crate) bell_count: u64,
+    /// Window-rename requests this batch's output accepted, in emission order,
+    /// each stamped with the window that owned the pane at that moment. They
+    /// are complete requests, not a difference of stored name: an empty or
+    /// repeated name renames the window just as a new one does.
+    pub(crate) window_rename_requests: Vec<AcceptedWindowRename>,
     pub(crate) title_changed: bool,
     pub(crate) title_change: Option<(String, String)>,
     /// The pane reported a different OSC 7 working directory. It reaches the
@@ -74,23 +163,9 @@ pub(crate) struct PaneAppendResult {
     pub(crate) dropped_passthrough_count: u64,
     pub(crate) replies: Vec<u8>,
     pub(crate) ground_timer: Option<PaneGroundTimer>,
+    pub(crate) synchronized_output_timer: Option<PaneSynchronizedOutputTimer>,
     pub(crate) alternate_mode_changed: bool,
     pub(crate) recovery_rebase_required: bool,
-}
-
-pub(crate) struct PaneTranscriptRenderState {
-    pub(crate) cursor_position: (u32, u32),
-    pub(crate) cursor_style: u32,
-    pub(crate) title: String,
-    pub(crate) path: String,
-    pub(crate) mode: u32,
-    pub(crate) has_selected_cells: bool,
-}
-
-pub(crate) struct PaneVisibleLineCapture {
-    pub(crate) revision: u64,
-    pub(crate) rendered: Option<Vec<u8>>,
-    pub(crate) previous_row: Option<usize>,
 }
 
 impl std::fmt::Debug for PaneTranscript {
@@ -103,27 +178,66 @@ impl std::fmt::Debug for PaneTranscript {
 }
 
 impl PaneTranscript {
+    pub(crate) fn keyboard_flags(&self) -> u8 {
+        self.terminal.screen().keyboard_flags()
+    }
+
     pub(crate) fn new(limit: usize, size: TerminalSize) -> Self {
+        let mut terminal = TerminalScreen::new(size, limit);
+        terminal.enable_theme_events();
         Self {
-            terminal: TerminalScreen::new(size, limit),
+            terminal,
+            control_colours: crate::control_colours::PaneControlColours::default(),
+            theme: crate::theme::PaneTheme::default(),
             mode: None,
+            // A new transcript has seen everything it holds.
+            unseen_changes: false,
             mode_revision: 0,
             output_sequence: 0,
             next_clock_generation: 1,
             ground_timer_started_at: None,
             ground_timer_token: 0,
+            synchronized_output_started_at: None,
+            synchronized_output_timer_token: 0,
+            synchronized_output_timer_job_claimed: Arc::new(AtomicBool::new(false)),
             pending_palette_queries: PendingPaletteQueries::default(),
+            rename_owner: None,
+            process_exited: false,
+            foreground_group: None,
+            foreground_transition_pending: false,
             #[cfg(test)]
             utf8_config: Utf8Config::default(),
         }
     }
 
+    pub(crate) fn shared_for_pane(
+        pane_id: rmux_core::PaneId,
+        limit: usize,
+        size: TerminalSize,
+    ) -> SharedPaneTranscript {
+        SharedPaneTranscript::new(pane_id, Self::new(limit, size))
+    }
+
+    /// Unit fixtures that never route a request to the pane use `%0`.
+    #[cfg(test)]
     pub(crate) fn shared(limit: usize, size: TerminalSize) -> SharedPaneTranscript {
-        Arc::new(Mutex::new(Self::new(limit, size)))
+        Self::shared_for_pane(rmux_core::PaneId::new(0), limit, size)
+    }
+
+    pub(crate) fn apply_control_colour(
+        &mut self,
+        report: crate::control_colours::ColourReport,
+        clients: &crate::control_colours::ControlColourClients,
+    ) {
+        self.control_colours.apply(report, clients);
     }
 
     pub(crate) fn set_limit(&mut self, limit: usize) {
         self.terminal.screen_mut().set_history_limit(limit);
+    }
+
+    pub(crate) fn set_cursor_default_style(&mut self, style: u32) -> bool {
+        self.terminal.screen_mut().set_cursor_default_style(style)
     }
 
     pub(crate) fn append_bytes(&mut self, bytes: &[u8]) -> u64 {
@@ -138,25 +252,40 @@ impl PaneTranscript {
     pub(crate) fn append_bytes_with_effects(&mut self, bytes: &[u8]) -> PaneAppendResult {
         let now = Instant::now();
         let ground_timer_expired = self.expire_ground_timer_if_due(now);
+        let synchronized_output_expired = self.expire_synchronized_output_if_due(now);
         if !bytes.is_empty() {
             self.output_sequence = self.output_sequence.saturating_add(1);
         }
         let title_before = self.terminal.screen().title().to_owned();
         let path_before = self.terminal.screen().path().to_owned();
         let alternate_before = self.terminal.screen().is_alternate();
-        self.terminal.feed(bytes);
-        let recovery_rebase_required =
-            ground_timer_expired || self.terminal.take_recovery_rebase_required();
+        let query_colours = self.control_colours.query_colours();
+        self.terminal.feed_with_query_colours(bytes, query_colours);
+        let synchronized_output_started = self.terminal.take_synchronized_output_started();
+        let recovery_rebase_required = ground_timer_expired
+            || synchronized_output_expired
+            || self.terminal.take_recovery_rebase_required();
         let title_after = self.terminal.screen().title().to_owned();
         let title_changed = title_after != title_before;
         let path_changed = self.terminal.screen().path() != path_before;
+        // Exit can be observed before the last buffered PTY bytes are drained.
+        // Preserve done/error results but never resurrect an active dead process.
+        if self.process_exited || self.foreground_transition_pending {
+            self.terminal.screen_mut().expire_program_status();
+        }
         let passthroughs = self.terminal.take_terminal_passthrough();
         self.pending_palette_queries.register(&passthroughs, now);
         let dropped_passthrough_count = self.terminal.take_terminal_passthrough_dropped_count();
         let replies = self.terminal.take_replies();
+        let replies =
+            self.theme
+                .apply(replies, self.terminal.take_theme_events(), query_colours[1]);
         let ground_timer = self.refresh_ground_timer(now);
+        let synchronized_output_timer =
+            self.refresh_synchronized_output_timer(now, synchronized_output_started);
         PaneAppendResult {
             bell_count: self.terminal.screen_mut().take_bell_count(),
+            window_rename_requests: self.accepted_window_renames(),
             title_changed,
             title_change: title_changed.then_some((title_before, title_after)),
             path_changed,
@@ -164,6 +293,7 @@ impl PaneTranscript {
             dropped_passthrough_count,
             replies,
             ground_timer,
+            synchronized_output_timer,
             alternate_mode_changed: self.terminal.screen().is_alternate() != alternate_before,
             recovery_rebase_required,
         }
@@ -176,6 +306,17 @@ impl PaneTranscript {
         self.pending_palette_queries.consume(index, Instant::now())
     }
 
+    /// A query emitted within tmux's request window and not yet answered.
+    pub(crate) fn has_active_palette_query(&self) -> bool {
+        self.pending_palette_queries
+            .has_active_query(Instant::now())
+    }
+
+    #[cfg(test)]
+    fn has_active_palette_query_at(&self, now: Instant) -> bool {
+        self.pending_palette_queries.has_active_query(now)
+    }
+
     #[cfg(test)]
     fn consume_palette_query_response_at(
         &mut self,
@@ -185,77 +326,62 @@ impl PaneTranscript {
         self.pending_palette_queries.consume(index, now)
     }
 
-    fn refresh_ground_timer(&mut self, now: Instant) -> Option<PaneGroundTimer> {
-        if self.terminal.ground_timer_active() {
-            if self.ground_timer_started_at.is_none() {
-                self.ground_timer_started_at = Some(now);
-                self.ground_timer_token = self.ground_timer_token.saturating_add(1);
-                return Some(PaneGroundTimer {
-                    deadline: now + PANE_INPUT_GROUND_TIMEOUT,
-                    token: self.ground_timer_token,
-                });
-            }
-            return None;
-        }
-
-        if self.ground_timer_started_at.take().is_some() {
-            self.ground_timer_token = self.ground_timer_token.saturating_add(1);
-        }
-        None
-    }
-
-    fn expire_ground_timer_if_due(&mut self, now: Instant) -> bool {
-        let Some(started_at) = self.ground_timer_started_at else {
-            return false;
-        };
-        if now.duration_since(started_at) < PANE_INPUT_GROUND_TIMEOUT {
-            return false;
-        }
-        self.expire_ground_timer_now()
-    }
-
-    pub(crate) fn expire_ground_timer(&mut self, timer: PaneGroundTimer) -> bool {
-        if self.ground_timer_token != timer.token || Instant::now() < timer.deadline {
-            return false;
-        }
-        self.expire_ground_timer_now()
-    }
-
-    fn expire_ground_timer_now(&mut self) -> bool {
-        if self.ground_timer_started_at.is_none() || !self.terminal.ground_timer_active() {
-            return false;
-        }
-        self.terminal.ground_timer_expired();
-        self.ground_timer_started_at = None;
-        self.ground_timer_token = self.ground_timer_token.saturating_add(1);
-        true
-    }
-
-    #[cfg(test)]
-    pub(crate) fn force_ground_timer_expired_for_test(&mut self, timer: PaneGroundTimer) -> bool {
-        if self.ground_timer_token != timer.token {
-            return false;
-        }
-        self.expire_ground_timer_now()
-    }
-
-    #[cfg(test)]
-    pub(crate) fn make_ground_timer_due_for_test(&mut self) {
-        if self.ground_timer_started_at.is_some() {
-            self.ground_timer_started_at = Some(Instant::now() - PANE_INPUT_GROUND_TIMEOUT);
-        }
-    }
-
     pub(crate) fn reset_terminal_state(&mut self) {
         self.output_sequence = self.output_sequence.saturating_add(1);
         self.terminal.feed(b"\x1bc");
         let _ = self.terminal.take_terminal_passthrough();
         let _ = self.terminal.take_terminal_passthrough_dropped_count();
         let _ = self.terminal.take_replies();
+        let _ = self.theme.apply(
+            Vec::new(),
+            self.terminal.take_theme_events(),
+            self.control_colours.query_colours()[1],
+        );
         self.ground_timer_started_at = None;
         self.ground_timer_token = self.ground_timer_token.saturating_add(1);
+        self.clear_synchronized_output_timer();
         self.pending_palette_queries.clear();
+        // This point leaves the mode without going through the revision, so it
+        // clears what leaving the last mode would have cleared.
         self.mode = None;
+        self.unseen_changes = false;
+    }
+
+    pub(crate) fn program_status(&self) -> &rmux_core::ProgramStatus {
+        self.terminal.screen().program_status()
+    }
+
+    /// Foreground process-group changes invalidate active reports even for
+    /// shells without OSC 133. This is a lifecycle heuristic, not writer identity.
+    pub(crate) fn observe_foreground_group(&mut self, group: Option<u32>) {
+        let Some(group) = group.filter(|group| *group > 0) else {
+            return;
+        };
+        if self.foreground_group.is_some_and(|old| old != group) {
+            // Bytes already queued (or read but not yet parsed) may still belong
+            // to the old group. Fail closed until that queue AND any fragmented
+            // sequence have drained; parsing them must not resurrect active state.
+            // Even an entire first report may still be in the reader's buffer.
+            // Absence of parsed records/fragments does not prove a clean drain.
+            self.foreground_transition_pending = true;
+            self.terminal.screen_mut().expire_program_status();
+        }
+        self.foreground_group = Some(group);
+    }
+
+    pub(crate) fn program_status_transition_pending(&self) -> bool {
+        self.foreground_transition_pending
+    }
+
+    pub(crate) fn finish_program_status_drain(&mut self) {
+        if self.foreground_transition_pending && self.terminal.pending_bytes().is_empty() {
+            self.foreground_transition_pending = false;
+        }
+    }
+
+    pub(crate) fn expire_program_status(&mut self) {
+        self.process_exited = true;
+        self.terminal.screen_mut().expire_program_status();
     }
 
     pub(crate) const fn output_sequence(&self) -> u64 {
@@ -281,151 +407,61 @@ impl PaneTranscript {
         self.terminal.set_title_rename_enabled(enabled);
     }
 
-    pub(crate) fn set_input_buffer_limit(&mut self, limit: usize) {
-        self.terminal.set_input_buffer_limit(limit);
+    /// Sets the pane's `allow-rename` policy together with the window that
+    /// owns it right now.
+    ///
+    /// The two travel together on purpose. A request is stamped with the owner
+    /// the pane had when its output was parsed, so a transfer that happens
+    /// afterwards cannot make an old request rename the destination window;
+    /// letting the policy and the owner be set from different places is how
+    /// they would drift apart.
+    pub(crate) fn set_rename_policy(&mut self, enabled: bool, owner: Option<WindowId>) {
+        self.terminal.set_allow_rename(enabled);
+        self.rename_owner = owner;
     }
 
-    pub(crate) fn capture_main(
-        &self,
-        range: ScreenCaptureRange,
-        options: GridRenderOptions,
-    ) -> Vec<u8> {
-        self.terminal.screen().capture_transcript(range, options)
+    #[cfg(test)]
+    pub(crate) fn rename_owner(&self) -> Option<WindowId> {
+        self.rename_owner
     }
 
-    pub(crate) fn capture_main_line_format_flags(&self, range: ScreenCaptureRange) -> Vec<u8> {
-        self.terminal.screen().capture_line_format_flags(range)
-    }
-
-    pub(crate) fn capture_main_visible_line_changes(
-        &self,
-        rows: usize,
-        options: GridRenderOptions,
-        previous_revisions: Option<&[u64]>,
-        default_style: Option<&Style>,
-    ) -> Vec<PaneVisibleLineCapture> {
-        let screen = self.terminal.screen();
-        let revisions = (0..rows)
-            .map(|row| screen.visible_line_revision(row).unwrap_or(0))
-            .collect::<Vec<_>>();
-        let previous_rows = previous_revisions.and_then(|previous| {
-            visible_revision_reuse_map(previous, &revisions).filter(|map| map.len() == rows)
-        });
-
-        (0..rows)
-            .map(|row| {
-                let previous_row = previous_rows
-                    .as_ref()
-                    .and_then(|rows| rows.get(row))
-                    .and_then(|row| *row);
-                let rendered = if previous_row.is_some() {
-                    None
-                } else {
-                    render_visible_line(screen, row, options, default_style)
-                };
-                PaneVisibleLineCapture {
-                    revision: revisions[row],
-                    rendered,
-                    previous_row,
-                }
-            })
+    /// Drains the accepted requests and stamps each with the pane's owner.
+    ///
+    /// Without a known owner a request cannot be attributed to a window at
+    /// all, so it is dropped here rather than applied to whatever window the
+    /// pane is found in later; the count is reported instead of being lost
+    /// silently. Every path that turns `allow-rename` on sets the owner in the
+    /// same call, so this is a wiring fault, not a reachable policy.
+    fn accepted_window_renames(&mut self) -> Vec<AcceptedWindowRename> {
+        let accepted = self.terminal.take_window_rename_requests();
+        if accepted.is_empty() {
+            return Vec::new();
+        }
+        let Some(owner) = self.rename_owner else {
+            tracing::warn!(
+                dropped = accepted.len(),
+                "pane accepted window-rename requests with no known owning window"
+            );
+            return Vec::new();
+        };
+        accepted
+            .into_iter()
+            .map(|name| AcceptedWindowRename { owner, name })
             .collect()
     }
 
-    pub(crate) fn render_state(&self) -> PaneTranscriptRenderState {
-        let screen = self.terminal.screen();
-        PaneTranscriptRenderState {
-            cursor_position: screen.cursor_position(),
-            cursor_style: screen.cursor_style(),
-            title: screen.title().to_owned(),
-            path: screen.path().to_owned(),
-            mode: screen.mode(),
-            has_selected_cells: screen.has_selected_cells(),
-        }
+    pub(crate) fn set_scroll_on_clear(&mut self, enabled: bool) {
+        self.terminal.set_scroll_on_clear(enabled);
     }
 
-    pub(crate) fn plain_output_forwarding_safe(&self) -> bool {
-        self.terminal.plain_output_forwarding_safe()
-    }
-
-    pub(crate) fn capture_saved(
-        &self,
-        range: ScreenCaptureRange,
-        options: GridRenderOptions,
-    ) -> Option<Vec<u8>> {
+    pub(crate) fn set_extended_key_policy(&mut self, value: Option<&str>) {
         self.terminal
-            .screen()
-            .capture_saved_transcript(range, options)
+            .screen_mut()
+            .set_extended_key_policy(rmux_core::input::ExtendedKeyPolicy::from_option(value));
     }
 
-    pub(crate) fn capture_saved_line_format_flags(
-        &self,
-        range: ScreenCaptureRange,
-    ) -> Option<Vec<u8>> {
-        self.terminal
-            .screen()
-            .capture_saved_line_format_flags(range)
-    }
-
-    pub(crate) fn capture_copy_mode(
-        &self,
-        range: ScreenCaptureRange,
-        options: GridRenderOptions,
-    ) -> Option<Vec<u8>> {
-        match &self.mode {
-            Some(PaneModeState::Copy(mode)) => {
-                Some(mode.render_screen().capture_transcript(range, options))
-            }
-            Some(PaneModeState::Clock(_) | PaneModeState::ModeTree { .. }) | None => None,
-        }
-    }
-
-    pub(crate) fn capture_copy_mode_line_format_flags(
-        &self,
-        range: ScreenCaptureRange,
-    ) -> Option<Vec<u8>> {
-        match &self.mode {
-            Some(PaneModeState::Copy(mode)) => {
-                Some(mode.render_screen().capture_line_format_flags(range))
-            }
-            Some(PaneModeState::Clock(_) | PaneModeState::ModeTree { .. }) | None => None,
-        }
-    }
-
-    pub(crate) fn pending_bytes(&self) -> Vec<u8> {
-        self.terminal.pending_bytes()
-    }
-
-    pub(crate) fn pending_bytes_ref(&self) -> &[u8] {
-        self.terminal.pending_bytes_ref()
-    }
-
-    pub(crate) fn active_cell_state_ansi_bounded(
-        &self,
-        max_hyperlink_bytes: usize,
-    ) -> (Vec<u8>, bool) {
-        self.terminal
-            .active_cell_state_ansi_bounded(max_hyperlink_bytes)
-    }
-
-    pub(crate) fn saved_cell_state_ansi_bounded(
-        &self,
-        max_hyperlink_bytes: usize,
-    ) -> (Vec<u8>, bool) {
-        self.terminal
-            .saved_cell_state_ansi_bounded(max_hyperlink_bytes)
-    }
-
-    pub(crate) fn saved_cursor_state(&self) -> (u32, u32, bool) {
-        self.terminal.saved_cursor_state()
-    }
-
-    pub(crate) fn recovery_parser_state_ansi(&self) -> Vec<u8> {
-        self.terminal.recovery_parser_state_ansi()
-    }
-
-    pub(crate) fn dynamic_colour(&self, slot: OscColourSlot) -> Option<&str> {
-        self.terminal.dynamic_colour(slot)
+    pub(crate) fn set_input_buffer_limit(&mut self, limit: usize) {
+        self.terminal.set_input_buffer_limit(limit);
     }
 
     pub(crate) fn clear_history(&mut self, reset_hyperlinks: bool) {
@@ -476,6 +512,23 @@ impl PaneTranscript {
         self.terminal.screen().tmux_history_all_bytes()
     }
 
+    pub(crate) fn set_sixel_passthrough_available(&mut self, available: bool) {
+        let available = available && !self.pane_in_mode();
+        self.terminal
+            .screen_mut()
+            .set_sixel_passthrough_available(available);
+    }
+
+    pub(crate) fn set_cell_geometry(&mut self, geometry: Option<rmux_proto::TerminalGeometry>) {
+        let pixels = geometry.and_then(|geometry| {
+            let pixels = geometry.pixels?;
+            let width = pixels.width.checked_div(geometry.size.cols)?;
+            let height = pixels.height.checked_div(geometry.size.rows)?;
+            (width > 0 && height > 0).then_some(rmux_proto::TerminalPixels::new(width, height))
+        });
+        self.terminal.screen_mut().set_cell_pixels(pixels);
+    }
+
     pub(crate) fn resize(&mut self, size: TerminalSize) {
         self.terminal.resize(size);
         if let Some(mode) = self.mode.as_mut() {
@@ -487,183 +540,47 @@ impl PaneTranscript {
         self.terminal.screen().clone()
     }
 
+    pub(crate) fn clone_presentation_screen(&self) -> Screen {
+        self.presentation_screen().clone()
+    }
+
+    /// Marks this pane's screen as the screen of a pane with no process.
+    ///
+    /// `new-pane -I` creates such a pane and then writes a finished payload
+    /// into it. The state belongs to the screen, not to the payload, so the
+    /// bytes themselves are never rewritten on their way in.
+    pub(crate) fn mark_as_empty_pane_screen(&mut self) {
+        self.terminal.screen_mut().enter_empty_pane_state();
+    }
+
+    pub(crate) fn hide_cursor(&mut self) -> bool {
+        self.terminal.screen_mut().hide_cursor()
+    }
+
     pub(crate) fn screen(&self) -> &Screen {
         self.terminal.screen()
     }
 
-    pub(crate) fn copy_mode_state(&self) -> Option<&CopyModeState> {
-        match &self.mode {
-            Some(PaneModeState::Copy(mode)) => Some(mode.as_ref()),
-            Some(PaneModeState::Clock(_) | PaneModeState::ModeTree { .. }) | None => None,
+    pub(crate) fn presentation_history_size(&self) -> usize {
+        self.presentation_screen().history_size()
+    }
+
+    pub(crate) fn presentation_is_alternate(&self) -> bool {
+        self.presentation_screen().is_alternate()
+    }
+
+    /// Appends bytes that came from this pane's own terminal.
+    ///
+    /// This is the only entry that marks them unseen, and it marks them exactly
+    /// as the source does: any non-empty input, visible or not, while a mode
+    /// remains. Everything this server writes into a transcript itself - a dead
+    /// pane's status, a diagnostic - goes through the common append and marks
+    /// nothing.
+    pub(crate) fn append_pty_bytes_with_effects(&mut self, bytes: &[u8]) -> PaneAppendResult {
+        if !bytes.is_empty() && self.mode.is_some() {
+            self.unseen_changes = true;
         }
-    }
-
-    pub(crate) fn copy_mode_state_mut(&mut self) -> Option<&mut CopyModeState> {
-        match &mut self.mode {
-            Some(PaneModeState::Copy(mode)) => Some(mode.as_mut()),
-            Some(PaneModeState::Clock(_) | PaneModeState::ModeTree { .. }) | None => None,
-        }
-    }
-
-    pub(crate) fn set_copy_mode_state(&mut self, state: Option<CopyModeState>) {
-        self.mode = state.map(Box::new).map(PaneModeState::Copy);
-        self.bump_mode_revision();
-    }
-
-    pub(crate) fn copy_mode_summary(&self) -> Option<CopyModeSummary> {
-        self.copy_mode_state().map(CopyModeState::summary)
-    }
-
-    pub(crate) fn copy_mode_render_screen(&self) -> Option<Screen> {
-        self.copy_mode_state().map(CopyModeState::render_screen)
-    }
-
-    pub(crate) fn copy_mode_render_snapshot(&self) -> Option<CopyModeRenderSnapshot> {
-        self.copy_mode_state().map(|mode| {
-            let mut snapshot = mode.render_snapshot();
-            // tmux suppresses pane scrollbars from the live base screen's
-            // alternate-screen state, even while copy-mode renders its own
-            // backing snapshot.
-            snapshot.alternate_on = self.terminal.screen().is_alternate();
-            snapshot
-        })
-    }
-
-    #[cfg(feature = "web")]
-    #[allow(clippy::too_many_arguments)]
-    pub(crate) fn copy_mode_render_snapshot_bounded(
-        &self,
-        max_string_bytes: usize,
-        max_title_stack_bytes: usize,
-        max_hyperlink_entry_bytes: usize,
-        max_hyperlink_total_bytes: usize,
-    ) -> Option<CopyModeRenderSnapshot> {
-        self.copy_mode_state().map(|mode| {
-            let mut snapshot = mode.render_snapshot_bounded(
-                max_string_bytes,
-                max_title_stack_bytes,
-                max_hyperlink_entry_bytes,
-                max_hyperlink_total_bytes,
-            );
-            snapshot.alternate_on = self.terminal.screen().is_alternate();
-            snapshot
-        })
-    }
-
-    /// Reports whether the copy-mode backing screen's metadata fits the
-    /// bounded Web recovery budgets, or `None` when the pane is not in copy
-    /// mode.
-    #[cfg(feature = "web")]
-    pub(crate) fn copy_mode_recovery_metadata_fits(
-        &self,
-        max_string_bytes: usize,
-        max_title_stack_bytes: usize,
-        max_hyperlink_entry_bytes: usize,
-        max_hyperlink_total_bytes: usize,
-    ) -> Option<bool> {
-        self.copy_mode_state().map(|mode| {
-            mode.recovery_metadata_fits(
-                max_string_bytes,
-                max_title_stack_bytes,
-                max_hyperlink_entry_bytes,
-                max_hyperlink_total_bytes,
-            )
-        })
-    }
-
-    pub(crate) fn clear_copy_mode(&mut self) -> bool {
-        match self.mode {
-            Some(PaneModeState::Copy(_)) => {
-                self.mode = None;
-                self.bump_mode_revision();
-                true
-            }
-            Some(PaneModeState::Clock(_) | PaneModeState::ModeTree { .. }) | None => false,
-        }
-    }
-
-    pub(crate) fn enter_clock_mode(&mut self) -> u64 {
-        let generation = self.next_clock_generation;
-        self.next_clock_generation = self.next_clock_generation.saturating_add(1);
-        self.mode = Some(PaneModeState::Clock(ClockModeState::new(generation)));
-        self.bump_mode_revision();
-        generation
-    }
-
-    pub(crate) fn clock_mode_generation(&self) -> Option<u64> {
-        match self.mode {
-            Some(PaneModeState::Clock(mode)) => Some(mode.generation()),
-            Some(PaneModeState::Copy(_) | PaneModeState::ModeTree { .. }) | None => None,
-        }
-    }
-
-    pub(crate) fn clear_clock_mode(&mut self) -> bool {
-        match self.mode {
-            Some(PaneModeState::Clock(_)) => {
-                self.mode = None;
-                self.bump_mode_revision();
-                true
-            }
-            Some(PaneModeState::Copy(_) | PaneModeState::ModeTree { .. }) | None => false,
-        }
-    }
-
-    pub(crate) fn enter_mode_tree(&mut self, mode_name: &'static str) -> bool {
-        if matches!(
-            self.mode.as_ref(),
-            Some(PaneModeState::ModeTree { name, .. }) if *name == mode_name
-        ) {
-            return false;
-        }
-        let previous = match self.mode.take() {
-            Some(PaneModeState::ModeTree { previous, .. }) => previous,
-            previous => previous.map(Box::new),
-        };
-        self.mode = Some(PaneModeState::ModeTree {
-            name: mode_name,
-            previous,
-        });
-        self.bump_mode_revision();
-        true
-    }
-
-    pub(crate) fn clear_mode_tree(&mut self) -> bool {
-        match self.mode.take() {
-            Some(PaneModeState::ModeTree { previous, .. }) => {
-                self.mode = previous.map(|previous| *previous);
-                self.bump_mode_revision();
-                true
-            }
-            mode @ (Some(PaneModeState::Copy(_) | PaneModeState::Clock(_)) | None) => {
-                self.mode = mode;
-                false
-            }
-        }
-    }
-
-    pub(crate) fn pane_in_mode(&self) -> bool {
-        self.mode.is_some()
-    }
-
-    pub(crate) const fn pane_mode_revision(&self) -> u64 {
-        self.mode_revision
-    }
-
-    fn bump_mode_revision(&mut self) {
-        self.mode_revision = self.mode_revision.saturating_add(1);
-    }
-
-    pub(crate) fn pane_mode_name(&self) -> Option<&'static str> {
-        match &self.mode {
-            Some(PaneModeState::Copy(mode)) => Some(if mode.view_mode() {
-                "view-mode"
-            } else {
-                "copy-mode"
-            }),
-            Some(PaneModeState::Clock(_)) => Some(CLOCK_MODE_NAME),
-            Some(PaneModeState::ModeTree { name, .. }) => Some(*name),
-            None => None,
-        }
+        self.append_bytes_with_effects(bytes)
     }
 
     pub(crate) fn mode(&self) -> u32 {
@@ -710,6 +627,7 @@ impl PaneTranscript {
     pub(crate) fn set_screen_for_test(&mut self, mut screen: Screen) {
         screen.set_utf8_config(self.utf8_config.clone());
         *self.terminal.screen_mut() = screen;
+        self.clear_synchronized_output_timer();
         self.mode = None;
     }
 
@@ -717,51 +635,26 @@ impl PaneTranscript {
     pub(crate) fn utf8_config(&self) -> &Utf8Config {
         &self.utf8_config
     }
-}
 
-fn render_visible_line(
-    screen: &Screen,
-    row: usize,
-    options: GridRenderOptions,
-    default_style: Option<&Style>,
-) -> Option<Vec<u8>> {
-    if let Some(style) = default_style {
-        screen.render_visible_line_independent_with_default_style(row, options, style)
-    } else {
-        screen.render_visible_line_independent(row, options)
+    #[cfg(test)]
+    #[allow(dead_code)]
+    pub(crate) fn capture_main_visible_line_changes(
+        &self,
+        rows: usize,
+        options: GridRenderOptions,
+        cols: u16,
+        previous_revisions: Option<&[u64]>,
+        default_style: Option<&Style>,
+    ) -> Vec<PaneVisibleLineCapture> {
+        self.read_presentation().capture_projected_line_changes(
+            0,
+            rows,
+            options,
+            cols,
+            previous_revisions,
+            default_style,
+        )
     }
-}
-
-fn visible_revision_reuse_map(previous: &[u64], next: &[u64]) -> Option<Vec<Option<usize>>> {
-    if previous.len() != next.len() {
-        return None;
-    }
-    let rows = next.len();
-    let mut map = vec![None; rows];
-    for (row, entry) in map.iter_mut().enumerate() {
-        if previous[row] == next[row] {
-            *entry = Some(row);
-        }
-    }
-
-    if let Some(scroll_rows) =
-        (1..rows).find(|scroll_rows| previous[*scroll_rows..] == next[..rows - *scroll_rows])
-    {
-        for (row, entry) in map.iter_mut().enumerate().take(rows - scroll_rows) {
-            *entry = Some(row + scroll_rows);
-        }
-        return Some(map);
-    }
-
-    if let Some(scroll_rows) =
-        (1..rows).find(|scroll_rows| previous[..rows - *scroll_rows] == next[*scroll_rows..])
-    {
-        for (row, entry) in map.iter_mut().enumerate().skip(scroll_rows) {
-            *entry = Some(row - scroll_rows);
-        }
-    }
-
-    Some(map)
 }
 
 #[cfg(test)]
@@ -783,6 +676,28 @@ mod tests {
         assert_eq!(
             transcript.capture_main(ScreenCaptureRange::default(), GridRenderOptions::default()),
             b"three\n\n"
+        );
+    }
+
+    #[test]
+    fn dead_pane_footer_joins_the_row_above_like_tmux() {
+        let mut transcript = transcript(20, 3, 10);
+        transcript.append_bytes(b"\x1b[1;2H\x1b7\x1b[1;2rerror");
+        let saved_cursor = transcript.saved_cursor_state();
+        transcript.append_dead_pane_footer(b"Pane is dead");
+        assert_eq!(transcript.saved_cursor_state(), saved_cursor);
+        let joined = GridRenderOptions {
+            join_wrapped: true,
+            ..GridRenderOptions::default()
+        };
+
+        assert_eq!(
+            transcript.capture_main(ScreenCaptureRange::default(), GridRenderOptions::default()),
+            b"\n\nPane is dead\n"
+        );
+        assert_eq!(
+            transcript.capture_main(ScreenCaptureRange::default(), joined),
+            b"\nPane is dead\n"
         );
     }
 
@@ -889,18 +804,63 @@ mod tests {
     }
 
     #[test]
-    fn append_bytes_recovers_after_tmux_wrapped_osc_bel_without_outer_st() {
-        let mut transcript = transcript(40, 4, 10);
-        let result = transcript.append_bytes_with_effects(b"\x1bPtmux;\x1b\x1b]4;0;?\x07OpenCode");
+    fn synchronized_output_reentry_rearms_timeout_at_the_exact_parser_transition() {
+        let mut transcript = transcript(48, 4, 100);
+        transcript.append_bytes(b"\x1b[2J\x1b[HSTABLE_BEFORE_SYNC");
+        let mut first_timer = transcript
+            .append_bytes_with_effects(b"\x1b[?2026h\x1b[2J\x1b[HFIRST_PARTIAL")
+            .synchronized_output_timer
+            .expect("first mode admission arms a timer");
+        let first_timer_token = first_timer.token;
 
-        assert_eq!(result.passthroughs.len(), 1);
-        assert_eq!(result.passthroughs[0].payload(), b"\x1b]4;0;?\x07");
-        let capture = String::from_utf8(
-            transcript.capture_main(ScreenCaptureRange::default(), GridRenderOptions::default()),
-        )
-        .expect("capture is utf8");
-        assert!(capture.contains("OpenCode"));
-        assert!(!capture.contains("4;0;?"));
+        let second_timer = transcript
+            .append_bytes_with_effects(
+                b"\x1b[2J\x1b[HFIRST_FINAL\x1b[?2026l\x1b[?2026h\x1b[2J\x1b[HSECOND_PARTIAL",
+            )
+            .synchronized_output_timer;
+        assert!(
+            second_timer.is_none(),
+            "one owned timer job must cover rapid synchronized-output reentry"
+        );
+
+        let presented = transcript
+            .presentation_screen()
+            .capture_transcript(ScreenCaptureRange::default(), GridRenderOptions::default());
+        assert!(presented
+            .windows(b"FIRST_FINAL".len())
+            .any(|window| window == b"FIRST_FINAL"));
+        assert!(!presented
+            .windows(b"SECOND_PARTIAL".len())
+            .any(|window| window == b"SECOND_PARTIAL"));
+
+        first_timer.deadline = Instant::now() - Duration::from_millis(1);
+        let (expired, replacement) = transcript.handle_synchronized_output_timer(first_timer);
+        assert!(
+            !expired,
+            "the first interval must not release its successor"
+        );
+        let replacement = replacement.expect("the stale job rearms the current interval");
+        assert_ne!(first_timer_token, replacement.token);
+    }
+
+    #[test]
+    fn split_window_stdin_timer_discard_does_not_latch_later_synchronized_admission() {
+        let mut transcript = transcript(48, 4, 100);
+        {
+            let discarded_timer = transcript
+                .append_bytes_with_effects(b"\x1b[?2026h\x1b[2J\x1b[HSPLIT_WINDOW_STDIN_PARTIAL")
+                .synchronized_output_timer
+                .expect("split-window stdin admission produces a timer job");
+            assert!(discarded_timer.deadline > Instant::now());
+        }
+
+        let rearmed_timer = transcript
+            .append_bytes_with_effects(b"\x1b[?2026l\x1b[?2026h\x1b[2J\x1b[HLATER_CHILD_PARTIAL")
+            .synchronized_output_timer;
+        assert!(
+            rearmed_timer.is_some(),
+            "discarding the split-window timer must not poison a later admission"
+        );
     }
 
     #[test]
@@ -1021,6 +981,30 @@ mod tests {
     }
 
     #[test]
+    fn osc4_query_is_active_only_until_answered_or_past_the_tmux_window() {
+        let mut transcript = transcript(40, 4, 10);
+        let index = TerminalPaletteIndex::from(1);
+        assert!(!transcript.has_active_palette_query());
+
+        transcript.append_bytes_with_effects(b"\x1b]4;1;?\x07");
+        let asked = Instant::now();
+        assert!(transcript.has_active_palette_query());
+        assert!(
+            !transcript.has_active_palette_query_at(asked + Duration::from_millis(600)),
+            "tmux 3.7b drops a request after 500 ms; it no longer slows partial keys"
+        );
+        assert!(transcript.consume_palette_query_response(index));
+        assert!(
+            !transcript.has_active_palette_query(),
+            "an answered query no longer slows partial keys"
+        );
+
+        transcript.append_bytes_with_effects(b"\x1b]4;1;?\x07");
+        transcript.reset_terminal_state();
+        assert!(!transcript.has_active_palette_query());
+    }
+
+    #[test]
     fn osc4_invalid_indices_and_sets_never_open_a_response_slot() {
         let mut transcript = transcript(40, 4, 10);
 
@@ -1077,22 +1061,14 @@ mod tests {
     }
 
     #[test]
-    fn append_bytes_ignores_kitty_keyboard_negotiation() {
+    fn append_bytes_negotiates_kitty_without_outer_mode_bits() {
         let mut transcript = transcript(40, 4, 10);
         let initial_mode = transcript.mode();
-
-        for request in [
-            b"\x1b[=8u".as_slice(),
-            b"\x1b[>1u".as_slice(),
-            b"\x1b[<u".as_slice(),
-            b"\x1b[?u".as_slice(),
-        ] {
-            assert!(transcript
-                .append_bytes_with_effects(request)
-                .replies
-                .is_empty());
-            assert_eq!(transcript.mode(), initial_mode, "request {request:?}");
-        }
+        let result = transcript.append_bytes_with_effects(b"\x1b[=8u\x1b[>1u\x1b[?u\x1b[<u\x1b[?u");
+        assert_eq!(result.replies, b"\x1b[?1u\x1b[?8u");
+        assert_eq!(transcript.keyboard_flags(), 8);
+        assert_eq!(transcript.mode(), initial_mode);
+        assert!(result.passthroughs.is_empty());
     }
 
     #[test]
@@ -1230,3 +1206,11 @@ mod tests {
         );
     }
 }
+
+#[cfg(test)]
+#[path = "pane_transcript/theme_tests.rs"]
+mod theme_tests;
+
+#[cfg(test)]
+#[path = "pane_transcript/dcs_passthrough_tests.rs"]
+mod dcs_passthrough_tests;

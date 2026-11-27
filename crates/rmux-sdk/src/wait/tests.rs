@@ -92,11 +92,13 @@ fn sdk_wait_response_rejects_mismatched_wait_id() {
         SdkWaitId::new(9),
     );
 
-    match result.expect_err("mismatched wait id must fail") {
-        RmuxError::Protocol {
-            source: ProtoError::Server(message),
-            ..
-        } => assert!(message.contains("did not match request id 9")),
+    match result
+        .expect_err("mismatched wait id must fail")
+        .protocol_source()
+    {
+        Some(ProtoError::Server(message)) => {
+            assert!(message.contains("did not match request id 9"))
+        }
         error => panic!("expected protocol mismatch, got {error:?}"),
     }
 }

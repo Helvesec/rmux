@@ -48,6 +48,10 @@ const WINDOWS_BATCH_ARGV_SPECIALS: [&str; 10] = [
     "",
 ];
 
+#[path = "support/windows_job_bound.rs"]
+mod windows_job_bound;
+use windows_job_bound::run_rmux_job_bound;
+
 static WINDOWS_CONSOLE_TEST_LOCK: Mutex<()> = Mutex::new(());
 static NEXT_LABEL_ID: AtomicUsize = AtomicUsize::new(0);
 
@@ -154,7 +158,9 @@ impl ControlKeyOutcome {
 #[test]
 fn windows_attach_exit_emits_exited_banner() -> Result<(), Box<dyn Error>> {
     let _serial = lock_windows_console_test();
-    let binary = PathBuf::from(env!("CARGO_BIN_EXE_rmux"));
+    let binary = PathBuf::from(rmux_os::build_identity::cargo_binary(env!(
+        "CARGO_BIN_EXE_rmux"
+    )));
     let label = unique_label("win-exit");
     let _guard = RmuxServerGuard::new(&binary, label.clone());
 
@@ -210,7 +216,9 @@ fn windows_full_helper_client_shell_handoff_starts_power_shell_pane_when_availab
         return Ok(());
     }
 
-    let binary = PathBuf::from(env!("CARGO_BIN_EXE_rmux"));
+    let binary = PathBuf::from(rmux_os::build_identity::cargo_binary(env!(
+        "CARGO_BIN_EXE_rmux"
+    )));
     let label = unique_label("win-helper-shell-handoff");
     let _guard = RmuxServerGuard::new(&binary, label.clone());
 
@@ -218,7 +226,7 @@ fn windows_full_helper_client_shell_handoff_starts_power_shell_pane_when_availab
         .arg("-L")
         .arg(&label)
         .args(["new-session", "-d", "-s", "handoff"])
-        .env("RMUX_INTERNAL_PUBLIC_BINARY_PATH", &binary)
+        .env("RMUX_INTERNAL_PUBLIC_BINARY_PATH", std::env::current_exe()?)
         .env("RMUX_INTERNAL_CLIENT_SHELL", &powershell)
         .output()?;
     assert!(
@@ -254,7 +262,9 @@ fn windows_full_helper_client_shell_handoff_starts_power_shell_pane_when_availab
 #[test]
 fn windows_batch_argv_is_rejected_before_session_creation() -> Result<(), Box<dyn Error>> {
     let _serial = lock_windows_console_test();
-    let binary = PathBuf::from(env!("CARGO_BIN_EXE_rmux"));
+    let binary = PathBuf::from(rmux_os::build_identity::cargo_binary(env!(
+        "CARGO_BIN_EXE_rmux"
+    )));
     let label = unique_label("win-batch-argv-rejected");
     let case_dir = std::env::temp_dir().join(&label);
     let bin = case_dir.join("bin");
@@ -328,7 +338,9 @@ fn windows_batch_argv_is_rejected_before_session_creation() -> Result<(), Box<dy
 fn windows_batch_argv_rejection_covers_window_split_and_respawn_entries(
 ) -> Result<(), Box<dyn Error>> {
     let _serial = lock_windows_console_test();
-    let binary = PathBuf::from(env!("CARGO_BIN_EXE_rmux"));
+    let binary = PathBuf::from(rmux_os::build_identity::cargo_binary(env!(
+        "CARGO_BIN_EXE_rmux"
+    )));
     let label = unique_label("win-batch-argv-lifecycle");
     let case_dir = std::env::temp_dir().join(&label);
     let bin = case_dir.join("bin");
@@ -480,7 +492,9 @@ fn windows_batch_argv_rejection_covers_window_split_and_respawn_entries(
 #[test]
 fn windows_cmd_default_shell_script_runs_through_cmd_wrapper() -> Result<(), Box<dyn Error>> {
     let _serial = lock_windows_console_test();
-    let binary = PathBuf::from(env!("CARGO_BIN_EXE_rmux"));
+    let binary = PathBuf::from(rmux_os::build_identity::cargo_binary(env!(
+        "CARGO_BIN_EXE_rmux"
+    )));
     let label = unique_label("win-cmd-default-shell");
     let case_dir = std::env::temp_dir().join(&label).join("shell dir");
     fs::create_dir_all(&case_dir)?;
@@ -532,7 +546,9 @@ fn windows_cmd_default_shell_script_runs_through_cmd_wrapper() -> Result<(), Box
 #[ignore = "timing-sensitive Windows attach latency probe"]
 fn windows_attach_exit_command_returns_under_latency_budget() -> Result<(), Box<dyn Error>> {
     let _serial = lock_windows_console_test();
-    let binary = PathBuf::from(env!("CARGO_BIN_EXE_rmux"));
+    let binary = PathBuf::from(rmux_os::build_identity::cargo_binary(env!(
+        "CARGO_BIN_EXE_rmux"
+    )));
     let label = unique_label("win-exit-latency");
     let _guard = RmuxServerGuard::new(&binary, label.clone());
 
@@ -583,7 +599,9 @@ fn windows_attach_ctrl_d_returns_under_latency_budget_when_pwsh_available(
         return Ok(());
     }
 
-    let binary = PathBuf::from(env!("CARGO_BIN_EXE_rmux"));
+    let binary = PathBuf::from(rmux_os::build_identity::cargo_binary(env!(
+        "CARGO_BIN_EXE_rmux"
+    )));
     let label = unique_label("win-ctrl-d-latency");
     let _guard = RmuxServerGuard::new(&binary, label.clone());
 
@@ -629,7 +647,9 @@ fn windows_attach_ctrl_d_returns_under_latency_budget_when_pwsh_available(
 fn windows_attach_exit_latency_regression_stays_bounded_across_repeats(
 ) -> Result<(), Box<dyn Error>> {
     let _serial = lock_windows_console_test();
-    let binary = PathBuf::from(env!("CARGO_BIN_EXE_rmux"));
+    let binary = PathBuf::from(rmux_os::build_identity::cargo_binary(env!(
+        "CARGO_BIN_EXE_rmux"
+    )));
     let label = unique_label("win-exit-latency-regression");
     let _guard = RmuxServerGuard::new(&binary, label.clone());
     let mut samples = Vec::new();
@@ -681,7 +701,9 @@ fn windows_attach_exit_latency_regression_stays_bounded_across_repeats(
 fn windows_deferred_initial_pane_accepts_immediate_control_actions_and_mutations(
 ) -> Result<(), Box<dyn Error>> {
     let _serial = lock_windows_console_test();
-    let binary = PathBuf::from(env!("CARGO_BIN_EXE_rmux"));
+    let binary = PathBuf::from(rmux_os::build_identity::cargo_binary(env!(
+        "CARGO_BIN_EXE_rmux"
+    )));
     let label = unique_label("win-deferred-controls");
     let _guard = RmuxServerGuard::new(&binary, label.clone());
 
@@ -786,13 +808,16 @@ fn windows_conpty_stress_survives_large_output_resize_mouse_toggles_and_detach(
         return Ok(());
     }
 
-    let binary = PathBuf::from(env!("CARGO_BIN_EXE_rmux"));
+    let binary = PathBuf::from(rmux_os::build_identity::cargo_binary(env!(
+        "CARGO_BIN_EXE_rmux"
+    )));
     let label = unique_label("win-conpty-stress");
     let _guard = RmuxServerGuard::new(&binary, label.clone());
 
-    run_rmux(
+    run_rmux_job_bound(
         &binary,
         &label,
+        true,
         [
             "new-session",
             "-d",
@@ -867,13 +892,16 @@ fn windows_attach_ctrl_c_interrupts_pwsh_foreground_python_when_available(
         return Ok(());
     }
 
-    let binary = PathBuf::from(env!("CARGO_BIN_EXE_rmux"));
+    let binary = PathBuf::from(rmux_os::build_identity::cargo_binary(env!(
+        "CARGO_BIN_EXE_rmux"
+    )));
     let label = unique_label("win-ctrl-c-interrupt");
     let _guard = RmuxServerGuard::new(&binary, label.clone());
 
-    run_rmux(
+    run_rmux_job_bound(
         &binary,
         &label,
+        true,
         [
             "new-session",
             "-d",
@@ -892,7 +920,7 @@ fn windows_attach_ctrl_c_interrupts_pwsh_foreground_python_when_available(
 
     wait_for_needle_or_error(&mut attach, b"PS ", SETUP_TIMEOUT)?;
     io.write_all(
-        b"python -c \"import time; print('RMUX_CTRL_C_READY', flush=True); time.sleep(10**6)\"\r\n",
+        b"python -c \"import time; print('RMUX_CTRL_C_' 'READY', flush=True); time.sleep(10**6)\"\r\n",
     )?;
     wait_for_needle_or_error(
         &mut attach,
@@ -929,14 +957,17 @@ fn windows_attach_ctrl_c_interrupts_foreground_python_descendant_when_available(
         return Ok(());
     }
 
-    let binary = PathBuf::from(env!("CARGO_BIN_EXE_rmux"));
+    let binary = PathBuf::from(rmux_os::build_identity::cargo_binary(env!(
+        "CARGO_BIN_EXE_rmux"
+    )));
     let label = unique_label("win-ctrl-c-descendant");
     let _guard = RmuxServerGuard::new(&binary, label.clone());
     let script = write_python_descendant_sleep_script(&label)?;
 
-    run_rmux(
+    run_rmux_job_bound(
         &binary,
         &label,
+        true,
         [
             "new-session",
             "-d",
@@ -988,13 +1019,16 @@ fn windows_send_keys_ctrl_c_interrupts_pwsh_foreground_python_when_available(
         return Ok(());
     }
 
-    let binary = PathBuf::from(env!("CARGO_BIN_EXE_rmux"));
+    let binary = PathBuf::from(rmux_os::build_identity::cargo_binary(env!(
+        "CARGO_BIN_EXE_rmux"
+    )));
     let label = unique_label("win-send-ctrl-c");
     let _guard = RmuxServerGuard::new(&binary, label.clone());
 
-    run_rmux(
+    run_rmux_job_bound(
         &binary,
         &label,
+        true,
         [
             "new-session",
             "-d",
@@ -1013,7 +1047,7 @@ fn windows_send_keys_ctrl_c_interrupts_pwsh_foreground_python_when_available(
             "send-keys",
             "-t",
             "sendctrlc:0.0",
-            "python -c \"import time; print('RMUX_PY_READY', flush=True); time.sleep(10**6)\"",
+            "python -c \"import time; print('RMUX_PY_' 'READY', flush=True); time.sleep(10**6)\"",
             "Enter",
         ],
     )?;
@@ -1043,7 +1077,9 @@ fn windows_send_keys_ctrl_c_interrupts_pwsh_foreground_python_when_available(
 #[test]
 fn windows_send_keys_ctrl_d_releases_cmd_timeout() -> Result<(), Box<dyn Error>> {
     let _serial = lock_windows_console_test();
-    let binary = PathBuf::from(env!("CARGO_BIN_EXE_rmux"));
+    let binary = PathBuf::from(rmux_os::build_identity::cargo_binary(env!(
+        "CARGO_BIN_EXE_rmux"
+    )));
     let label = unique_label("win-send-ctrl-d-timeout");
     let _guard = RmuxServerGuard::new(&binary, label.clone());
     let target = "ctrldtimeout:0.0";
@@ -1099,7 +1135,9 @@ fn windows_send_keys_ctrl_d_releases_cmd_timeout() -> Result<(), Box<dyn Error>>
 #[test]
 fn windows_send_keys_ctrl_d_releases_cmd_wrapped_shell_command() -> Result<(), Box<dyn Error>> {
     let _serial = lock_windows_console_test();
-    let binary = PathBuf::from(env!("CARGO_BIN_EXE_rmux"));
+    let binary = PathBuf::from(rmux_os::build_identity::cargo_binary(env!(
+        "CARGO_BIN_EXE_rmux"
+    )));
     let label = unique_label("win-send-ctrl-d-shell-timeout");
     let _guard = RmuxServerGuard::new(&binary, label.clone());
 
@@ -1151,15 +1189,18 @@ fn windows_send_keys_ctrl_d_does_not_release_pwsh_timeout() -> Result<(), Box<dy
         return Ok(());
     }
 
-    let binary = PathBuf::from(env!("CARGO_BIN_EXE_rmux"));
+    let binary = PathBuf::from(rmux_os::build_identity::cargo_binary(env!(
+        "CARGO_BIN_EXE_rmux"
+    )));
     let label = unique_label("win-send-ctrl-d-pwsh-timeout");
     let _guard = RmuxServerGuard::new(&binary, label.clone());
     let target = "ctrldpwshtimeout:0.0";
     let prompt = b"RMUX_TIMEOUT_READY>";
 
-    run_rmux(
+    run_rmux_job_bound(
         &binary,
         &label,
+        true,
         [
             "new-session",
             "-d",
@@ -1213,7 +1254,9 @@ fn windows_send_keys_ctrl_d_releases_wsl_python_stdin_under_pwsh_when_available(
         return Ok(());
     }
 
-    let binary = PathBuf::from(env!("CARGO_BIN_EXE_rmux"));
+    let binary = PathBuf::from(rmux_os::build_identity::cargo_binary(env!(
+        "CARGO_BIN_EXE_rmux"
+    )));
     let label = unique_label("win-send-ctrl-d-pwsh-wsl");
     let case_dir = std::env::temp_dir().join(&label);
     fs::create_dir_all(&case_dir)?;
@@ -1287,15 +1330,18 @@ fn windows_send_keys_ctrl_d_multi_token_does_not_leak_following_key_after_pwsh_t
         return Ok(());
     }
 
-    let binary = PathBuf::from(env!("CARGO_BIN_EXE_rmux"));
+    let binary = PathBuf::from(rmux_os::build_identity::cargo_binary(env!(
+        "CARGO_BIN_EXE_rmux"
+    )));
     let label = unique_label("win-send-ctrl-d-pwsh-multi");
     let _guard = RmuxServerGuard::new(&binary, label.clone());
     let target = "ctrldpwshmulti:0.0";
     let prompt = b"RMUX_TIMEOUT_READY>";
 
-    run_rmux(
+    run_rmux_job_bound(
         &binary,
         &label,
+        true,
         [
             "new-session",
             "-d",
@@ -1347,12 +1393,20 @@ fn windows_send_keys_ctrl_d_recomputes_shell_policy_for_each_synchronized_pane(
         return Ok(());
     }
 
-    let binary = PathBuf::from(env!("CARGO_BIN_EXE_rmux"));
+    let binary = PathBuf::from(rmux_os::build_identity::cargo_binary(env!(
+        "CARGO_BIN_EXE_rmux"
+    )));
     let label = unique_label("win-sync-mixed-ctrl-d");
     let _guard = RmuxServerGuard::new(&binary, label.clone());
 
-    assert_mixed_shell_synchronized_ctrl_d(&binary, &label, "syncmixpwsh", "syncmixpwsh:0.1")?;
-    assert_mixed_shell_synchronized_ctrl_d(&binary, &label, "syncmixcmd", "syncmixcmd:0.0")?;
+    assert_mixed_shell_synchronized_ctrl_d(
+        &binary,
+        &label,
+        "syncmixpwsh",
+        "syncmixpwsh:0.1",
+        true,
+    )?;
+    assert_mixed_shell_synchronized_ctrl_d(&binary, &label, "syncmixcmd", "syncmixcmd:0.0", false)?;
 
     Ok(())
 }
@@ -1362,15 +1416,17 @@ fn assert_mixed_shell_synchronized_ctrl_d(
     label: &str,
     session: &str,
     control_target: &str,
+    expect_launch: bool,
 ) -> Result<(), Box<dyn Error>> {
     let cmd_target = format!("{session}:0.0");
     let pwsh_target = format!("{session}:0.1");
     let cmd_prompt = b"CMD_TIMEOUT_READY>";
     let pwsh_prompt = b"PWSH_TIMEOUT_READY>";
 
-    run_rmux(
+    run_rmux_job_bound(
         binary,
         label,
+        expect_launch,
         [
             "new-session",
             "-d",
@@ -1551,13 +1607,16 @@ fn windows_send_keys_ctrl_c_targets_only_selected_pane_and_preserves_sibling_and
         return Ok(());
     }
 
-    let binary = PathBuf::from(env!("CARGO_BIN_EXE_rmux"));
+    let binary = PathBuf::from(rmux_os::build_identity::cargo_binary(env!(
+        "CARGO_BIN_EXE_rmux"
+    )));
     let label = unique_label("win-ctrl-c-target-only");
     let _guard = RmuxServerGuard::new(&binary, label.clone());
 
-    run_rmux(
+    run_rmux_job_bound(
         &binary,
         &label,
+        true,
         [
             "new-session",
             "-d",
@@ -1643,13 +1702,16 @@ fn windows_attach_ctrl_c_stops_ping_when_available() -> Result<(), Box<dyn Error
         return Ok(());
     }
 
-    let binary = PathBuf::from(env!("CARGO_BIN_EXE_rmux"));
+    let binary = PathBuf::from(rmux_os::build_identity::cargo_binary(env!(
+        "CARGO_BIN_EXE_rmux"
+    )));
     let label = unique_label("win-attach-ping-ctrl-c");
     let _guard = RmuxServerGuard::new(&binary, label.clone());
 
-    run_rmux(
+    run_rmux_job_bound(
         &binary,
         &label,
+        true,
         [
             "new-session",
             "-d",
@@ -1705,13 +1767,16 @@ fn windows_send_keys_ctrl_c_multi_token_stops_ping_when_available() -> Result<()
         return Ok(());
     }
 
-    let binary = PathBuf::from(env!("CARGO_BIN_EXE_rmux"));
+    let binary = PathBuf::from(rmux_os::build_identity::cargo_binary(env!(
+        "CARGO_BIN_EXE_rmux"
+    )));
     let label = unique_label("win-send-ping-ctrl-c");
     let _guard = RmuxServerGuard::new(&binary, label.clone());
 
-    run_rmux(
+    run_rmux_job_bound(
         &binary,
         &label,
+        true,
         [
             "new-session",
             "-d",
@@ -1792,13 +1857,16 @@ fn windows_send_keys_ctrl_c_double_token_interrupts_synchronized_panes_when_avai
         return Ok(());
     }
 
-    let binary = PathBuf::from(env!("CARGO_BIN_EXE_rmux"));
+    let binary = PathBuf::from(rmux_os::build_identity::cargo_binary(env!(
+        "CARGO_BIN_EXE_rmux"
+    )));
     let label = unique_label("win-sync-ping-ctrl-c");
     let _guard = RmuxServerGuard::new(&binary, label.clone());
 
-    run_rmux(
+    run_rmux_job_bound(
         &binary,
         &label,
+        true,
         [
             "new-session",
             "-d",
@@ -1911,15 +1979,18 @@ fn windows_attach_ctrl_c_preserves_raw_console_character_when_processed_input_is
         return Ok(());
     }
 
-    let binary = PathBuf::from(env!("CARGO_BIN_EXE_rmux"));
+    let binary = PathBuf::from(rmux_os::build_identity::cargo_binary(env!(
+        "CARGO_BIN_EXE_rmux"
+    )));
     let label = unique_label("win-attach-raw-ctrl-c");
     let _guard = RmuxServerGuard::new(&binary, label.clone());
     let script = write_raw_console_probe_script(&label)?;
     let command = format!("pwsh.exe -NoLogo -NoProfile -File {}", script.display());
 
-    run_rmux(
+    run_rmux_job_bound(
         &binary,
         &label,
+        true,
         ["new-session", "-d", "-s", "rawattach", command.as_str()],
     )?;
     run_rmux(&binary, &label, ["set-option", "-g", "status", "off"])?;
@@ -1971,12 +2042,15 @@ fn windows_attach_ctrl_d_preserves_raw_console_character_when_processed_input_is
         escaped_output(&direct_output)
     );
 
-    let binary = PathBuf::from(env!("CARGO_BIN_EXE_rmux"));
+    let binary = PathBuf::from(rmux_os::build_identity::cargo_binary(env!(
+        "CARGO_BIN_EXE_rmux"
+    )));
     let _guard = RmuxServerGuard::new(&binary, label.clone());
     let command = format!("pwsh.exe -NoLogo -NoProfile -File {}", script.display());
-    run_rmux(
+    run_rmux_job_bound(
         &binary,
         &label,
+        true,
         ["new-session", "-d", "-s", "rawctrld", command.as_str()],
     )?;
     run_rmux(&binary, &label, ["set-option", "-g", "status", "off"])?;
@@ -2024,15 +2098,18 @@ fn windows_send_keys_ctrl_d_preserves_raw_console_character_when_processed_input
         return Ok(());
     }
 
-    let binary = PathBuf::from(env!("CARGO_BIN_EXE_rmux"));
+    let binary = PathBuf::from(rmux_os::build_identity::cargo_binary(env!(
+        "CARGO_BIN_EXE_rmux"
+    )));
     let label = unique_label("win-send-raw-ctrl-d");
     let _guard = RmuxServerGuard::new(&binary, label.clone());
     let script = write_raw_console_probe_script(&label)?;
     let command = format!("pwsh.exe -NoLogo -NoProfile -File {}", script.display());
 
-    run_rmux(
+    run_rmux_job_bound(
         &binary,
         &label,
+        true,
         ["new-session", "-d", "-s", "rawsendd", command.as_str()],
     )?;
     run_rmux(&binary, &label, ["set-option", "-g", "status", "off"])?;
@@ -2082,15 +2159,18 @@ fn windows_send_keys_ctrl_c_preserves_raw_console_character_when_processed_input
         return Ok(());
     }
 
-    let binary = PathBuf::from(env!("CARGO_BIN_EXE_rmux"));
+    let binary = PathBuf::from(rmux_os::build_identity::cargo_binary(env!(
+        "CARGO_BIN_EXE_rmux"
+    )));
     let label = unique_label("win-send-raw-ctrl-c");
     let _guard = RmuxServerGuard::new(&binary, label.clone());
     let script = write_raw_console_probe_script(&label)?;
     let command = format!("pwsh.exe -NoLogo -NoProfile -File {}", script.display());
 
-    run_rmux(
+    run_rmux_job_bound(
         &binary,
         &label,
+        true,
         ["new-session", "-d", "-s", "rawsend", command.as_str()],
     )?;
     run_rmux(&binary, &label, ["set-option", "-g", "status", "off"])?;
@@ -2137,7 +2217,9 @@ fn windows_attach_ctrl_d_matches_direct_pwsh_foreground_python_behavior_when_ava
     }
     let native = direct_python_stdin_ctrl_d_outcome()?;
 
-    let binary = PathBuf::from(env!("CARGO_BIN_EXE_rmux"));
+    let binary = PathBuf::from(rmux_os::build_identity::cargo_binary(env!(
+        "CARGO_BIN_EXE_rmux"
+    )));
     let label = unique_label("win-ctrl-d-python-eof");
     let _guard = RmuxServerGuard::new(&binary, label.clone());
 
@@ -2162,7 +2244,7 @@ fn windows_attach_ctrl_d_matches_direct_pwsh_foreground_python_behavior_when_ava
 
     wait_for_needle_or_error(&mut attach, b"PS ", SETUP_TIMEOUT)?;
     io.write_all(
-        b"python -c \"import sys; print('RMUX_EOF_READY', flush=True); sys.stdin.read(); print('EOF_DONE', flush=True)\"\r\n",
+        b"python -c \"import sys; print('RMUX_EOF_' 'READY', flush=True); sys.stdin.read(); print('EOF_' 'DONE', flush=True)\"\r\n",
     )?;
     wait_for_needle_or_error(&mut attach, b"RMUX_EOF_READY", SETUP_TIMEOUT)?;
     write_windows_console_key(attach.child().pid(), WindowsConsoleKeyEvent::ctrl_d())?;
@@ -2377,6 +2459,38 @@ fn timeout_countdown_detection_accepts_localized_countdown_text() {
 #[test]
 fn timeout_countdown_detection_does_not_match_only_the_command_line() {
     assert!(!timeout_countdown_started(b"timeout.exe /T 10000\r\n"));
+}
+
+/// The Ctrl-C and Ctrl-D probes type a `python -c` line into pwsh and then
+/// wait for a readiness marker before injecting the key. The pane echoes the
+/// typed line first, so a marker spelled out in that line satisfies the wait
+/// before python runs, and the key reaches pwsh while it is still starting
+/// python. Python must assemble each marker from adjacent literals.
+#[test]
+fn typed_python_probe_lines_do_not_echo_their_own_markers() {
+    let source = include_str!("windows_attach_exit.rs");
+    let typed_lines = source
+        .lines()
+        .filter(|line| line.contains("python -c") && line.contains("print("));
+    let mut checked = 0;
+    for line in typed_lines {
+        checked += 1;
+        for marker in [
+            "RMUX_CTRL_C_READY",
+            "RMUX_PY_READY",
+            "RMUX_EOF_READY",
+            "EOF_DONE",
+        ] {
+            assert!(
+                !line.contains(&format!("'{marker}'")),
+                "a typed probe line spells out its marker {marker}: {line}"
+            );
+        }
+    }
+    assert!(
+        checked >= 4,
+        "expected the typed python probe lines, found {checked}"
+    );
 }
 
 #[test]
@@ -2619,7 +2733,7 @@ fn direct_python_stdin_ctrl_d_outcome() -> Result<ControlKeyOutcome, Box<dyn Err
 
     wait_for_needle_or_error(&mut spawned, b"PS ", SETUP_TIMEOUT)?;
     io.write_all(
-        b"python -c \"import sys; print('RMUX_EOF_READY', flush=True); sys.stdin.read(); print('EOF_DONE', flush=True)\"\r\n",
+        b"python -c \"import sys; print('RMUX_EOF_' 'READY', flush=True); sys.stdin.read(); print('EOF_' 'DONE', flush=True)\"\r\n",
     )?;
     wait_for_needle_or_error(&mut spawned, b"RMUX_EOF_READY", SETUP_TIMEOUT)?;
     write_windows_console_key(spawned.child().pid(), WindowsConsoleKeyEvent::ctrl_d())?;

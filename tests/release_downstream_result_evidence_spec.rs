@@ -365,7 +365,7 @@ fn exact_reference_binds_artifacts_and_rejects_forged_metadata() {
     assert_fixture(&format!(
         "{FIXTURE}\n{}",
         r#"
-with tempfile.TemporaryDirectory(dir=pathlib.Path.cwd()) as root:
+with tempfile.TemporaryDirectory(dir=pathlib.Path.cwd().parent) as root:
     paths = write_fixture(root)
     reference = create(paths)
     if reference['predicate_bundle']['artifact_id'] != 53:
@@ -391,7 +391,7 @@ fn result_envelope_normalizes_exact_github_artifact_metadata() {
     assert_fixture(&format!(
         "{FIXTURE}\n{}",
         r#"
-with tempfile.TemporaryDirectory(dir=pathlib.Path.cwd()) as root:
+with tempfile.TemporaryDirectory(dir=pathlib.Path.cwd().parent) as root:
     root = pathlib.Path(root)
     paths = write_fixture(root)
     control_sha = '9' * 40
@@ -430,7 +430,7 @@ fn exact_reference_rejects_changed_envelope_and_symlinked_request() {
     assert_fixture(&format!(
         "{FIXTURE}\n{}",
         r#"
-with tempfile.TemporaryDirectory(dir=pathlib.Path.cwd()) as root:
+with tempfile.TemporaryDirectory(dir=pathlib.Path.cwd().parent) as root:
     paths = write_fixture(root)
     envelope = json.loads(paths['envelope'].read_text(encoding='utf-8'))
     envelope['request_sha256'] = '0' * 64
@@ -463,7 +463,7 @@ fn sigstore_verifier_binds_exact_statement_signer_and_timestamp() {
     assert_fixture(&format!(
         "{FIXTURE}\n{}",
         r#"
-with tempfile.TemporaryDirectory(dir=pathlib.Path.cwd()) as root:
+with tempfile.TemporaryDirectory(dir=pathlib.Path.cwd().parent) as root:
     root = pathlib.Path(root)
     paths = write_fixture(root)
     bundle = root / 'downstream-channel-result.sigstore.json'

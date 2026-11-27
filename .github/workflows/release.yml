@@ -57,6 +57,7 @@ jobs:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
         with:
           ref: ${{ github.sha }}
+          fetch-depth: 0
           persist-credentials: false
 
       - name: Resolve release identity
@@ -350,19 +351,7 @@ jobs:
           $testRustFlags = $env:RUSTFLAGS
           try {
             Remove-Item Env:\RUSTFLAGS -ErrorAction SilentlyContinue
-            Run "cargo" @(
-              "build", "--package", "rmux", "--locked",
-              "--profile", $env:BUILD_PROFILE,
-              "--target", $env:TARGET,
-              "--bin", "rmux-daemon"
-            )
-            Run "cargo" @(
-              "build", "--package", "rmux", "--locked",
-              "--profile", $env:BUILD_PROFILE,
-              "--target", $env:TARGET,
-              "--features", "tiny-cli",
-              "--bin", "rmux"
-            )
+            & "./scripts/release/build-windows-package-binaries.ps1" -Target $env:TARGET -Profile $env:BUILD_PROFILE -ProfileDir $env:PROFILE_DIR -TinyCargoArgs @("--features", "tiny-cli")
           } finally {
             $env:RUSTFLAGS = $testRustFlags
           }
@@ -491,6 +480,7 @@ jobs:
             dist/*.zip
             dist/*.deb
             dist/*.rpm
+            dist/*.NOTICE.txt
           if-no-files-found: error
 
   platform-gates:
@@ -759,7 +749,7 @@ jobs:
         run: |
           cd release-assets
           shopt -s nullglob
-          assets=( *.tar.gz *.zip *.deb *.rpm *.snap )
+          assets=( *.tar.gz *.zip *.deb *.rpm *.snap *.NOTICE.txt )
           if (( ${#assets[@]} == 0 )); then
             echo "No release archives found" >&2
             exit 1
@@ -806,6 +796,7 @@ jobs:
             release-assets/*.deb
             release-assets/*.rpm
             release-assets/*.snap
+            release-assets/*.NOTICE.txt
             release-assets/SHA256SUMS
             release-assets/SHA256SUMS.sigstore.json
 
@@ -1061,6 +1052,7 @@ jobs:
             release-assets/*.deb
             release-assets/*.rpm
             release-assets/*.snap
+            release-assets/*.NOTICE.txt
             release-assets/SHA256SUMS
             release-assets/SHA256SUMS.sigstore.json
           )
@@ -1415,7 +1407,19 @@ jobs:
 
           work="$(mktemp -d)"
           trap 'rm -rf "$work"' EXIT
-          package_repo_url="https://x-access-token:${RMUX_PACKAGE_REPO_TOKEN}@github.com/${RMUX_PACKAGE_REPO}.git"
+          package_repo_url="https://github.com/${RMUX_PACKAGE_REPO}.git"
+          askpass="$RUNNER_TEMP/rmux-package-askpass"
+          cat > "$askpass" <<'EOF'
+          #!/bin/sh
+          case "$1" in
+            *Username*) printf '%s\n' x-access-token ;;
+            *Password*) printf '%s\n' "$RMUX_PACKAGE_REPO_TOKEN" ;;
+            *) exit 1 ;;
+          esac
+          EOF
+          chmod 700 "$askpass"
+          export GIT_ASKPASS="$askpass" GIT_TERMINAL_PROMPT=0
+          trap 'rm -rf "$work"; rm -f "$askpass"' EXIT
           git clone --depth 1 --branch "$RMUX_PACKAGE_REPO_BRANCH" "$package_repo_url" "$work"
           expected_base="$(tr -d '\r\n' < package-repositories/PACKAGE_REPOSITORY_BASE)"
           scripts/verify-package-repository-base.sh "$work" "$expected_base"

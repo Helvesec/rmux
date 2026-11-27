@@ -105,7 +105,7 @@ async fn fixture(name: &str) -> (RequestHandler, SessionName, PaneTarget) {
             skip_environment_update: false,
         })))
         .await;
-    assert!(matches!(response, Response::NewSession(_)), "{response:?}");
+    crate::session_fixture::assert_new_session(&response);
     handler
         .wait_for_pane_startup_to_finish_for_test(&target)
         .await;
@@ -114,6 +114,7 @@ async fn fixture(name: &str) -> (RequestHandler, SessionName, PaneTarget) {
 
 fn mouse_event(target: &PaneTarget) -> AttachedMouseEvent {
     AttachedMouseEvent {
+        coordinates: None,
         raw: MouseForwardEvent {
             b: 0,
             lb: 0,
@@ -164,7 +165,7 @@ async fn start_prompt(
             .map(|_| ())
     });
 
-    tokio::time::timeout(background_shell_test_timeout(), async {
+    tokio::time::timeout(SERVER_SIGNAL_LIVENESS, async {
         loop {
             if handler
                 .attached_prompt_render(std::process::id())
@@ -209,7 +210,7 @@ async fn finish_prompt(
 
 async fn wait_for_prompt_task(handler: &RequestHandler, name: &'static str) {
     tokio::task::yield_now().await;
-    tokio::time::timeout(background_shell_test_timeout(), async {
+    tokio::time::timeout(SERVER_SIGNAL_LIVENESS, async {
         while handler.background_task_running_for_test(name) {
             tokio::time::sleep(std::time::Duration::from_millis(5)).await;
         }
@@ -223,20 +224,14 @@ async fn prepare_copy_cursor(handler: &RequestHandler, target: &PaneTarget) {
         let state = handler.state.lock().await;
         state.transcript_handle(target).expect("pane transcript")
     };
-    let history_limit = transcript
-        .lock()
-        .expect("pane transcript mutex")
-        .history_limit();
+    let history_limit = transcript.lock().history_limit();
     let mut screen = Screen::new(TerminalSize { cols: 20, rows: 6 }, history_limit);
     let mut parser = InputParser::new();
     parser.parse(
         b"zero one two three\r\nalpha beta gamma\r\nomega sigma tau\r\n",
         &mut screen,
     );
-    transcript
-        .lock()
-        .expect("pane transcript mutex")
-        .set_screen_for_test(screen);
+    transcript.lock().set_screen_for_test(screen);
     let command = format!(
         "copy-mode -t {target}; send-keys -Xt {target} history-top; \
          send-keys -Xt {target} start-of-line; send-keys -N6 -Xt {target} cursor-right"

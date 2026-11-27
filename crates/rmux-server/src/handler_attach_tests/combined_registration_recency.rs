@@ -11,6 +11,8 @@
 //! mint tokens too; nothing below compares an absolute value or a global delta.
 
 use super::*;
+#[cfg(test)]
+use crate::session_fixture::SessionSetupExt as _;
 
 use super::switch_frame_geometry::{
     register_declared_attach, set_window_size_policy, window_content_size,
@@ -93,7 +95,7 @@ async fn create_detached_session(handler: &RequestHandler, session: &SessionName
             environment: None,
         }))
         .await;
-    assert!(matches!(created, Response::NewSession(_)), "{created:?}");
+    crate::session_fixture::assert_new_session(&created);
 }
 
 async fn set_session_status(handler: &RequestHandler, session: &SessionName, value: &str) {
@@ -113,7 +115,7 @@ async fn pin_public_times(handler: &RequestHandler, sessions: &[&SessionName]) {
     for session in sessions {
         state
             .sessions
-            .session_mut(session)
+            .session_setup(session)
             .expect("session exists")
             .pin_public_times_for_tests(PINNED_SECOND);
     }
@@ -312,9 +314,8 @@ async fn destroy_rehome_orders_clients_by_captured_size_sequence_and_sessions_by
         for session in [&older, &newer] {
             state
                 .sessions
-                .session_mut(session)
-                .expect("survivor exists")
-                .touch_attached();
+                .touch_attached(session)
+                .expect("survivor exists");
         }
     }
     pin_public_times(&handler, &[&doomed, &older, &newer]).await;

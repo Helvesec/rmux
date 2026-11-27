@@ -16,8 +16,8 @@ use std::time::{Duration, Instant};
 #[cfg(target_os = "linux")]
 use common::acquire_empty_socket_path_lock;
 use common::{
-    assert_clap_failure, assert_socket_directory_empty, assert_success, read_until_contains,
-    stderr, stdout, terminate_child, wait_for_socket, AttachedSession, CliHarness,
+    assert_clap_failure, assert_success, read_until_contains, stderr, stdout, terminate_child,
+    unique_tmpdir, wait_for_socket, wait_for_socket_directory_empty, AttachedSession, CliHarness,
     BINARY_OVERRIDE_ENV, BINARY_OVERRIDE_TEST_OPT_IN_ENV,
 };
 use rmux_client::{connect, INTERNAL_DAEMON_FLAG};
@@ -36,13 +36,16 @@ use rmux_pty::TerminalSize;
 
 const ATTACH_TIMEOUT: Duration = Duration::from_secs(5);
 const NONBLOCKING_ATTACH_TIMEOUT: Duration = Duration::from_millis(500);
+/// Bounds a client that must start the daemon and spawn the first pane before
+/// it sees any reply: on a loaded host that chain alone can outlast
+/// [`ATTACH_TIMEOUT`], so only a stalled chain should reach this bound.
+const AUTOSTART_SESSION_TIMEOUT: Duration = Duration::from_secs(30);
 const WORKFLOW_TRUECOLOR_FEATURES: &str =
     ",xterm-256color:RGB,tmux-256color:RGB,screen-256color:RGB,screen:RGB";
 type SharedPipeBuffer = Arc<Mutex<Vec<u8>>>;
 type PipeCollector = JoinHandle<io::Result<Vec<u8>>>;
 const TOP_LEVEL_USAGE: &str = "usage: rmux [-2CDhlNuVv] [-c shell-command] [-f file] [-L socket-name]\n            [-S socket-path] [-T features] [command [flags]]\n";
 const LONG_OPTION_USAGE: &str = "usage: rmux [-2CDlNuVv] [-c shell-command] [-f file] [-L socket-name]\n            [-S socket-path] [-T features] [command [flags]]\n";
-const LONG_OPTION_HELP: &str = "usage: rmux [-2CDlNuVv] [-c shell-command] [-f file] [-L socket-name]\n            [-S socket-path] [-T features] [command [flags]]\n\nRMUX extensions:\n  capabilities [--human|--json]\n  claude [install-skill|claude-args...]\n  diagnose [--human|--json]\n  doctor tmux-dropin\n  setup tmux-shim\n  wait-pane [flags]\n  pane-snapshot [flags]\n  stream-pane [--raw|--lines]\n  collect-pane-output --until-pane-exit --max-bytes bytes\n  locator|expect-pane [flags]\n  find-panes|find-sessions [flags]\n  broadcast-keys -t target... -- key ...\n  with-session session-name -- command ...\n  web-share [flags]\n  web-share list|lookup|stop|disconnect|off|config\n\nUse `rmux list-commands` for the tmux-compatible command surface.\n";
 
 fn assert_nested_switch_client_error(output: &Output) {
     let stderr = stderr(output);
@@ -485,9 +488,13 @@ fn incompatible_wire_error_uses_simple_default_kill_server_command() -> Result<(
 
     assert_eq!(output.status.code(), Some(1));
     let stderr = stderr(&output);
-    assert!(
-        stderr.contains("uses an incompatible protocol"),
-        "stderr should explain protocol incompatibility, got: {stderr}"
+    assert_eq!(
+        stderr,
+        format!(
+            "rmux: running daemon from an older release uses incompatible protocol 1; this client supports protocol {RMUX_WIRE_VERSION} on '{}'.\nrmux: stopping this daemon ends its sessions and running processes. Save your work with the matching client first.\nrmux: run `rmux kill-server` to stop it, then retry.\n",
+            harness.socket_path().display()
+        ),
+        "stderr should explain the known older protocol exactly"
     );
     assert!(
         stderr.contains("rmux: run `rmux kill-server` to stop it, then retry."),
@@ -679,9 +686,13 @@ fn incompatible_wire_error_targets_explicit_socket_command() -> Result<(), Box<d
 
     assert_eq!(output.status.code(), Some(1));
     let stderr = stderr(&output);
-    assert!(
-        stderr.contains("uses an incompatible protocol"),
-        "stderr should explain protocol incompatibility, got: {stderr}"
+    assert_eq!(
+        stderr,
+        format!(
+            "rmux: running daemon from an older release uses incompatible protocol 1; this client supports protocol {RMUX_WIRE_VERSION} on '{}'.\nrmux: stopping this daemon ends its sessions and running processes. Save your work with the matching client first.\nrmux: run `rmux -S {socket_arg} kill-server` to stop it, then retry.\n",
+            socket_path.display()
+        ),
+        "stderr should explain the known older protocol exactly"
     );
     assert!(
         stderr.contains(&format!("rmux -S {socket_arg} kill-server")),
@@ -702,9 +713,13 @@ fn alias_fallback_incompatible_wire_error_keeps_socket_context() -> Result<(), B
 
     assert_eq!(output.status.code(), Some(1));
     let stderr = stderr(&output);
-    assert!(
-        stderr.contains("uses an incompatible protocol"),
-        "stderr should explain protocol incompatibility, got: {stderr}"
+    assert_eq!(
+        stderr,
+        format!(
+            "rmux: running daemon from an older release uses incompatible protocol 1; this client supports protocol {RMUX_WIRE_VERSION} on '{}'.\nrmux: stopping this daemon ends its sessions and running processes. Save your work with the matching client first.\nrmux: run `rmux kill-server` to stop it, then retry.\n",
+            harness.socket_path().display()
+        ),
+        "stderr should explain the known older protocol exactly"
     );
     assert!(
         stderr.contains("rmux: run `rmux kill-server` to stop it, then retry."),
@@ -793,17 +808,182 @@ fn version_flag_reports_rmux_version_without_server_contact() -> Result<(), Box<
     Ok(())
 }
 
+// C-D85: native --version is an RMUX extension, not tmux parity.
 #[test]
-fn top_level_long_options_match_tmux_usage_errors() -> Result<(), Box<dyn Error>> {
+fn native_long_version_product_divergence_matches_short_version() -> Result<(), Box<dyn Error>> {
+    let harness = CliHarness::new("native-long-version")?;
+    let short = harness.run(&["-V"])?;
+    assert_eq!(
+        stdout(&short),
+        format!("rmux {}\n", env!("CARGO_PKG_VERSION"))
+    );
+    assert!(stderr(&short).is_empty());
+    assert_eq!(short.status.code(), Some(0));
+    let check = |args: &[&str]| -> Result<(), Box<dyn Error>> {
+        let long = harness.run(args)?;
+        assert_eq!(long.status, short.status, "{args:?}");
+        assert_eq!(long.stdout, short.stdout, "{args:?}");
+        assert_eq!(long.stderr, short.stderr, "{args:?}");
+        assert!(!harness.socket_path().exists(), "{args:?}");
+        Ok(())
+    };
+    check(&["--version"])?;
+    check(&["-u", "--version"])?;
+    for later in [
+        "-V",
+        "-x",
+        "-h",
+        "--help",
+        "--nope",
+        "--",
+        "list-sessions",
+        "",
+    ] {
+        check(&["--version", later])?;
+    }
+    for earlier in ["-h", "--help", "-x", "--nope"] {
+        let expected = harness.run(&[earlier, "-V"])?;
+        let actual = harness.run(&[earlier, "--version"])?;
+        assert_eq!(actual.status, expected.status, "{earlier}");
+        assert_eq!(actual.stdout, expected.stdout, "{earlier}");
+        assert_eq!(actual.stderr, expected.stderr, "{earlier}");
+    }
+    for flag in ['L', 'S', 'f', 'T', 'c'] {
+        for prefix in [format!("-{flag}"), format!("-v{flag}")] {
+            check(&[&prefix, "--version", "-V"])?;
+            check(&[&prefix, "value", "--version"])?;
+            let consumed = harness.run(&[&prefix, "--version", "-x"])?;
+            assert_eq!(consumed.status.code(), Some(1));
+            assert_eq!(
+                stderr(&consumed),
+                format!("rmux: unknown option -- x\n{TOP_LEVEL_USAGE}")
+            );
+            assert!(stdout(&consumed).is_empty());
+            check(&[&format!("{prefix}--version"), "--version"])?;
+        }
+    }
+    assert!(!harness.socket_path().exists());
+    Ok(())
+}
+
+#[test]
+fn earlier_version_is_the_first_decisive_top_level_option() -> Result<(), Box<dyn Error>> {
+    let harness = CliHarness::new("version-first-decisive")?;
+    let expected_stdout = format!("rmux {}\n", env!("CARGO_PKG_VERSION"));
+
+    for args in [
+        &["-V", "-x"][..],
+        &["-V", "-h"][..],
+        &["-V", "-x", "-x"][..],
+        &["-u", "-V", "-x"][..],
+        &["-Vh"][..],
+        &["-uVx"][..],
+        &["-LsockA", "-V"][..],
+        &["-vLsockA", "-V"][..],
+        &["-cechoV", "-V"][..],
+        &["-fconfigV", "-V"][..],
+        &["-SrelativeV.sock", "-V"][..],
+        &["-TfeatureV", "-V"][..],
+        &["-V", ""][..],
+        &["-V", "-L"][..],
+        &["-V", "--help"][..],
+        &["-V", "--version"][..],
+    ] {
+        let output = harness.run(args)?;
+        assert_eq!(output.status.code(), Some(0), "args={args:?}");
+        assert_eq!(stdout(&output), expected_stdout, "args={args:?}");
+        assert!(stderr(&output).is_empty(), "args={args:?}");
+        assert!(!harness.socket_path().exists(), "args={args:?}");
+    }
+
+    Ok(())
+}
+
+#[test]
+fn earlier_top_level_decisions_still_win_over_later_version() -> Result<(), Box<dyn Error>> {
+    let harness = CliHarness::new("decision-before-version")?;
+
+    for args in [&["-h", "-V"][..], &["-hV"][..]] {
+        let output = harness.run(args)?;
+        assert_eq!(output.status.code(), Some(0), "args={args:?}");
+        assert_eq!(stdout(&output), TOP_LEVEL_USAGE, "args={args:?}");
+        assert!(stderr(&output).is_empty(), "args={args:?}");
+        assert!(!harness.socket_path().exists(), "args={args:?}");
+    }
+
+    for args in [&["-x", "-V"][..], &["-uxV"][..], &["-xuV"][..]] {
+        let output = harness.run(args)?;
+        assert_eq!(output.status.code(), Some(1), "args={args:?}");
+        assert!(stdout(&output).is_empty(), "args={args:?}");
+        assert_eq!(
+            stderr(&output),
+            format!("rmux: unknown option -- x\n{TOP_LEVEL_USAGE}"),
+            "args={args:?}"
+        );
+        assert!(!harness.socket_path().exists(), "args={args:?}");
+    }
+
+    let long = harness.run(&["--nope", "-V"])?;
+    assert_eq!(long.status.code(), Some(1));
+    assert!(stdout(&long).is_empty());
+    assert_eq!(stderr(&long), LONG_OPTION_USAGE);
+    assert!(!harness.socket_path().exists());
+    Ok(())
+}
+
+#[test]
+fn cluster_tail_values_are_not_scanned_as_version_flags() -> Result<(), Box<dyn Error>> {
+    let harness = CliHarness::new("cluster-tail-values")?;
+
+    for (args, option) in [
+        (&["-vf", "-V"][..], "-f <file>"),
+        (&["-vc", "-V"][..], "-c <shell-command>"),
+    ] {
+        let output = harness.run(args)?;
+        assert_eq!(output.status.code(), Some(1), "args={args:?}");
+        assert!(stdout(&output).is_empty(), "args={args:?}");
+        assert_eq!(
+            stderr(&output),
+            format!(
+                "error: a value is required for '{option}' but none was supplied\n\nFor more information, try '--help'.\n"
+            ),
+            "args={args:?}"
+        );
+        assert!(!harness.socket_path().exists(), "args={args:?}");
+    }
+
+    let later_version = harness.run(&["-vL", "sockA", "-V"])?;
+    assert_eq!(later_version.status.code(), Some(0));
+    assert_eq!(
+        stdout(&later_version),
+        format!("rmux {}\n", env!("CARGO_PKG_VERSION"))
+    );
+    assert!(stderr(&later_version).is_empty());
+    assert!(!harness.socket_path().exists());
+    Ok(())
+}
+
+#[test]
+fn native_long_help_succeeds_and_unknown_long_options_keep_usage_errors(
+) -> Result<(), Box<dyn Error>> {
     let harness = CliHarness::new("top-level-long-usage-errors")?;
 
     let help = harness.run(&["--help"])?;
-    assert_eq!(help.status.code(), Some(1));
-    assert!(stdout(&help).is_empty());
-    assert_eq!(stderr(&help), LONG_OPTION_HELP);
+    assert_eq!(help.status.code(), Some(0));
+    assert!(stderr(&help).is_empty());
     assert!(!harness.socket_path().exists());
 
-    for args in [&["--version"][..], &["--vesion"][..]] {
+    let inventory = harness.run(&["list-commands"])?;
+    assert_eq!(inventory.status.code(), Some(0));
+    assert!(stderr(&inventory).is_empty());
+    assert!(stdout(&inventory).lines().count() > 50);
+    assert_eq!(
+        stdout(&help).split_once("\nCommands:\n").unwrap().1,
+        stdout(&inventory)
+    );
+    assert!(!harness.socket_path().exists());
+
+    for args in [&["--version=x"][..], &["--vesion"][..], &["--vers"][..]] {
         let output = harness.run(args)?;
         assert_eq!(output.status.code(), Some(1));
         assert!(stdout(&output).is_empty());
@@ -1098,7 +1278,7 @@ fn list_keys_uses_default_table_without_server() -> Result<(), Box<dyn Error>> {
         .contains("bind-key    -T prefix M-7     select-layout main-vertical-mirrored"));
     assert!(
         !stdout(&output).contains("new-pane"),
-        "new-pane is deferred in the tmux-3.7 ledger and must not be advertised"
+        "FNP1 requires explicit geometry and does not add a default new-pane binding"
     );
     assert!(stdout(&output).contains("bind-key    -T prefix \\\"      split-window"));
     assert!(stdout(&output).contains("bind-key    -T prefix \\~      show-messages"));
@@ -1315,6 +1495,8 @@ fn help_and_list_commands_cover_the_full_tmux_command_table() -> Result<(), Box<
         "setup",
         "wait-pane",
         "pane-snapshot",
+        "export-window-snapshot",
+        "restore-window-snapshot",
         "stream-pane",
         "collect-pane-output",
         "locator",
@@ -1608,7 +1790,7 @@ fn start_server_exits_the_default_empty_daemon_after_reply() -> Result<(), Box<d
         harness.pid_path().exists(),
         "the successful command must have launched a daemon before it exited"
     );
-    wait_for_socket_cleanup(harness.socket_path())?;
+    wait_for_socket_directory_empty(harness.socket_path(), ATTACH_TIMEOUT)?;
     let list = harness.run(&["list-sessions"])?;
     assert_eq!(list.status.code(), Some(1));
     assert_absent_server_error(&list, &harness, "list-sessions");
@@ -1634,7 +1816,7 @@ fn control_start_server_exits_the_default_empty_daemon_after_protocol_exit(
         harness.pid_path().exists(),
         "control-mode must have launched the daemon before reporting %exit"
     );
-    wait_for_socket_cleanup(harness.socket_path())?;
+    wait_for_socket_directory_empty(harness.socket_path(), ATTACH_TIMEOUT)?;
     Ok(())
 }
 
@@ -1658,7 +1840,7 @@ fn queued_start_server_with_observational_tail_exits_the_empty_daemon() -> Resul
         "the tail response must expose the daemon PID: {:?}",
         stdout(&output)
     );
-    wait_for_socket_cleanup(harness.socket_path())?;
+    wait_for_socket_directory_empty(harness.socket_path(), ATTACH_TIMEOUT)?;
     Ok(())
 }
 
@@ -1684,7 +1866,7 @@ fn control_start_server_with_observational_tail_exits_after_protocol_exit(
         rendered.lines().any(|line| line.parse::<u32>().is_ok()),
         "the tail response must expose the daemon PID: {rendered:?}"
     );
-    wait_for_socket_cleanup(harness.socket_path())?;
+    wait_for_socket_directory_empty(harness.socket_path(), ATTACH_TIMEOUT)?;
     Ok(())
 }
 
@@ -1715,7 +1897,7 @@ fn control_start_server_keeps_a_session_created_by_the_initial_queue() -> Result
     assert!(harness.socket_path().exists());
     assert_success(&harness.run(&["has-session", "-t", "alpha"])?);
     assert_success(&harness.run(&["kill-session", "-t", "alpha"])?);
-    wait_for_socket_cleanup(harness.socket_path())?;
+    wait_for_socket_directory_empty(harness.socket_path(), ATTACH_TIMEOUT)?;
     Ok(())
 }
 
@@ -1738,7 +1920,7 @@ fn start_server_preserves_explicit_exit_empty_off() -> Result<(), Box<dyn Error>
     assert_eq!(stdout(&policy), "off\n");
     assert!(stderr(&policy).is_empty());
     assert_success(&harness.run(&["kill-server"])?);
-    wait_for_socket_cleanup(harness.socket_path())?;
+    wait_for_socket_directory_empty(harness.socket_path(), ATTACH_TIMEOUT)?;
     Ok(())
 }
 
@@ -1753,7 +1935,7 @@ fn start_server_preserves_a_preexisting_empty_daemon() -> Result<(), Box<dyn Err
     assert!(harness.socket_path().exists());
     assert_eq!(daemon.child_mut().try_wait()?, None);
     assert_success(&harness.run(&["kill-server"])?);
-    wait_for_socket_cleanup(harness.socket_path())?;
+    wait_for_socket_directory_empty(harness.socket_path(), ATTACH_TIMEOUT)?;
     let _ = daemon.child_mut().wait();
     Ok(())
 }
@@ -1774,7 +1956,48 @@ fn queued_start_server_keeps_the_daemon_for_a_following_session() -> Result<(), 
     assert!(harness.socket_path().exists());
     assert_success(&harness.run(&["has-session", "-t", "alpha"])?);
     assert_success(&harness.run(&["kill-session", "-t", "alpha"])?);
-    wait_for_socket_cleanup(harness.socket_path())?;
+    wait_for_socket_directory_empty(harness.socket_path(), ATTACH_TIMEOUT)?;
+    Ok(())
+}
+
+#[test]
+fn socket_cleanup_wait_outlasts_a_startup_lock_removed_after_the_socket(
+) -> Result<(), Box<dyn Error>> {
+    // Daemon shutdown unlinks the socket before its startup lock; replay that
+    // order with the lock removal deliberately late.
+    let socket_dir = unique_tmpdir("socket-cleanup-order");
+    fs::create_dir_all(&socket_dir)?;
+    let socket_path = socket_dir.join("default");
+    let lock_path = socket_dir.join("default.startup-lock");
+    fs::write(&lock_path, b"")?;
+    let remover = thread::spawn(move || {
+        thread::sleep(Duration::from_millis(200));
+        fs::remove_file(lock_path)
+    });
+
+    let waited = wait_for_socket_directory_empty(&socket_path, ATTACH_TIMEOUT);
+    let removed = remover.join().expect("startup lock remover thread");
+    fs::remove_dir(&socket_dir)?;
+    waited?;
+    removed?;
+    Ok(())
+}
+
+#[test]
+fn socket_cleanup_wait_reports_a_startup_lock_left_after_the_socket() -> Result<(), Box<dyn Error>>
+{
+    let socket_dir = unique_tmpdir("socket-cleanup-leak");
+    fs::create_dir_all(&socket_dir)?;
+    let socket_path = socket_dir.join("default");
+    fs::write(socket_dir.join("default.startup-lock"), b"")?;
+
+    let waited = wait_for_socket_directory_empty(&socket_path, Duration::from_millis(100));
+    fs::remove_dir_all(&socket_dir)?;
+    let error = waited.expect_err("a startup lock left behind must fail the cleanup wait");
+    assert!(
+        error.to_string().contains("[\"default.startup-lock\"]"),
+        "error={error}"
+    );
     Ok(())
 }
 
@@ -1818,7 +2041,7 @@ fn queued_start_server_preserves_deferred_session_creation() -> Result<(), Box<d
         std::thread::sleep(Duration::from_millis(20));
     }
     assert_success(&harness.run(&["kill-session", "-t", "late"])?);
-    wait_for_socket_cleanup(harness.socket_path())?;
+    wait_for_socket_directory_empty(harness.socket_path(), ATTACH_TIMEOUT)?;
     Ok(())
 }
 
@@ -1839,7 +2062,7 @@ fn hidden_daemon_binary_override_is_ignored_without_test_opt_in() -> Result<(), 
         !marker_path.exists(),
         "the undocumented override must be ignored without the test-only opt-in"
     );
-    wait_for_socket_cleanup(harness.socket_path())?;
+    wait_for_socket_directory_empty(harness.socket_path(), ATTACH_TIMEOUT)?;
     Ok(())
 }
 
@@ -1850,7 +2073,7 @@ fn kill_server_shuts_down_daemon_and_cleans_socket() -> Result<(), Box<dyn Error
 
     let output = harness.run(&["kill-server"])?;
     assert_success(&output);
-    wait_for_socket_cleanup(harness.socket_path())?;
+    wait_for_socket_directory_empty(harness.socket_path(), ATTACH_TIMEOUT)?;
 
     let _ = daemon.child_mut().wait();
     Ok(())
@@ -1917,6 +2140,29 @@ fn server_access_list_succeeds_against_running_server() -> Result<(), Box<dyn Er
 #[test]
 fn server_access_updates_unix_transport_and_preserves_it_across_rebind(
 ) -> Result<(), Box<dyn Error>> {
+    // Delegation requires traversable ancestors. A run-wide fixture root may
+    // live under a private home, so use the default short /tmp root in an
+    // isolated process without changing other tests' environment or permissions.
+    if std::env::var_os("RMUX_TEST_TMPDIR").is_some() {
+        let executable = rmux_os::build_identity::resolve(std::env::current_exe()?.as_os_str())?;
+        let output = Command::new(executable)
+            .args([
+                "--exact",
+                "server_access_updates_unix_transport_and_preserves_it_across_rebind",
+                "--test-threads=1",
+                "--nocapture",
+            ])
+            .env_remove("RMUX_TEST_TMPDIR")
+            .output()?;
+        assert!(
+            output.status.success(),
+            "isolated server-access test failed: {:?}\nstdout:\n{}\nstderr:\n{}",
+            output.status,
+            stdout(&output),
+            stderr(&output)
+        );
+        return Ok(());
+    }
     let Some(user) = delegated_unix_account() else {
         return Ok(());
     };
@@ -1925,6 +2171,8 @@ fn server_access_updates_unix_transport_and_preserves_it_across_rebind(
     let socket_path = harness.socket_path();
     let socket_parent = socket_path.parent().expect("socket parent");
     assert_unix_transport_modes(socket_parent, socket_path, 0o700, 0o600)?;
+    let fixture_root_mode = fs::metadata(harness.tmpdir())?.permissions().mode() & 0o777;
+    assert_eq!(fixture_root_mode, 0o711);
 
     let read_only = harness.run(&["server-access", "-r", &user])?;
     assert_success(&read_only);
@@ -1960,6 +2208,11 @@ fn server_access_updates_unix_transport_and_preserves_it_across_rebind(
     let deny = harness.run(&["server-access", "-d", &user])?;
     assert_success(&deny);
     assert_unix_transport_modes(socket_parent, socket_path, 0o700, 0o600)?;
+    assert_eq!(
+        fs::metadata(harness.tmpdir())?.permissions().mode() & 0o777,
+        fixture_root_mode,
+        "server-access must preserve ancestors outside its managed socket directory"
+    );
     Ok(())
 }
 
@@ -2040,10 +2293,11 @@ fn invalid_listing_flags_are_rejected_by_cli_parser() -> Result<(), Box<dyn Erro
         let output = harness.run(args)?;
         assert_eq!(output.status.code(), Some(1), "args={args:?}");
         assert!(stdout(&output).is_empty(), "args={args:?}");
-        assert!(
-            stderr(&output).contains("unexpected argument '-Q'"),
-            "args={args:?}, stderr={}",
-            stderr(&output)
+        // tmux 3.7b names the command and the flag on one line.
+        assert_eq!(
+            stderr(&output),
+            format!("command {}: unknown flag -Q\n", args[0]),
+            "args={args:?}"
         );
     }
     Ok(())
@@ -2251,7 +2505,7 @@ fn direct_new_window_k_preserves_payload_output_and_error_contract() -> Result<(
 }
 
 #[test]
-fn capture_pane_invalid_bounds_are_rejected() -> Result<(), Box<dyn Error>> {
+fn capture_pane_invalid_bounds_select_the_default_bound() -> Result<(), Box<dyn Error>> {
     let harness = CliHarness::new("capture-pane-invalid-bounds")?;
     let _daemon = harness.start_hidden_daemon()?;
 
@@ -2267,13 +2521,12 @@ fn capture_pane_invalid_bounds_are_rejected() -> Result<(), Box<dyn Error>> {
         "sleep 30",
     ])?);
 
+    // tmux 3.7b falls back to the default bound instead of failing (R3510 M11).
+    let default = harness.run(&["capture-pane", "-p", "-t", "alpha:0.0"])?;
     let output = harness.run(&["capture-pane", "-p", "-t", "alpha:0.0", "-E", "abc"])?;
-    assert_eq!(output.status.code(), Some(1));
-    assert!(stdout(&output).is_empty());
-    assert_eq!(
-        stderr(&output),
-        "command capture-pane: -E expects a number\n"
-    );
+    assert_eq!(output.status.code(), Some(0));
+    assert_eq!(stdout(&output), stdout(&default));
+    assert!(stderr(&output).is_empty());
     Ok(())
 }
 
@@ -2289,7 +2542,7 @@ fn attach_session_is_a_start_server_command() -> Result<(), Box<dyn Error>> {
     assert_eq!(output.status.code(), Some(1));
     assert_eq!(stderr(&output).trim(), "no sessions");
     assert!(harness.pid_path().exists());
-    wait_for_socket_cleanup(harness.socket_path())?;
+    wait_for_socket_directory_empty(harness.socket_path(), ATTACH_TIMEOUT)?;
     Ok(())
 }
 
@@ -2308,7 +2561,7 @@ fn queued_attach_session_cleans_up_daemon_started_by_command() -> Result<(), Box
     assert_eq!(output.status.code(), Some(1));
     assert_eq!(stderr(&output).trim(), "no sessions");
     assert!(harness.pid_path().exists());
-    wait_for_socket_cleanup(harness.socket_path())?;
+    wait_for_socket_directory_empty(harness.socket_path(), ATTACH_TIMEOUT)?;
     Ok(())
 }
 
@@ -2330,7 +2583,7 @@ fn queued_command_before_attach_still_cleans_up_the_started_daemon() -> Result<(
     assert_eq!(output.status.code(), Some(1));
     assert_eq!(stderr(&output).trim(), "no sessions");
     assert!(harness.pid_path().exists());
-    wait_for_socket_cleanup(harness.socket_path())?;
+    wait_for_socket_directory_empty(harness.socket_path(), ATTACH_TIMEOUT)?;
     Ok(())
 }
 
@@ -2360,7 +2613,7 @@ fn queued_session_teardown_lets_the_started_daemon_exit_empty() -> Result<(), Bo
     // The startup connection must not outlive the command that consumed it:
     // a second idle client connection cancels the daemon's exit-empty
     // shutdown for good. tmux 3.7b stops its server here.
-    wait_for_socket_cleanup(harness.socket_path())?;
+    wait_for_socket_directory_empty(harness.socket_path(), ATTACH_TIMEOUT)?;
 
     let listed = harness.run(&["list-sessions"])?;
     assert_eq!(listed.status.code(), Some(1));
@@ -2492,10 +2745,120 @@ fn shell_command_starts_the_server_and_returns_the_shell_exit_status() -> Result
         harness.pid_path().exists(),
         "-c shell-command startup must launch the hidden daemon when the server is absent"
     );
-    assert!(
-        harness.socket_path().exists(),
-        "-c shell-command startup must leave the auto-started server socket behind"
+    // tmux 3.7b answers MSG_SHELL and drops the client: under the default
+    // exit-empty, the server it started for `-c` leaves nothing behind.
+    wait_for_socket_directory_empty(harness.socket_path(), ATTACH_TIMEOUT)?;
+    let list = harness.run(&["list-sessions"])?;
+    assert_eq!(list.status.code(), Some(1));
+    assert_absent_server_error(&list, &harness, "list-sessions");
+    Ok(())
+}
+
+/// A shell that names itself, so the test sees which shell `-c` ran.
+fn write_marker_shell(harness: &CliHarness) -> Result<PathBuf, Box<dyn Error>> {
+    let shell_path = harness.tmpdir().join("marker-shell");
+    common::executable_fixture::write_executable(
+        &shell_path,
+        "#!/bin/sh\nprintf 'marker-shell %s|%s|%s\\n' \"$1\" \"$2\" \"$SHELL\"\n",
+        0o755,
+    )?;
+    Ok(shell_path)
+}
+
+#[test]
+fn shell_command_runs_the_default_shell_of_its_startup_config() -> Result<(), Box<dyn Error>> {
+    let harness = CliHarness::new("shell-command-config-default-shell")?;
+    let _cleanup = harness.auto_start_cleanup()?;
+    let shell_path = write_marker_shell(&harness)?;
+    let config_path = harness.tmpdir().join("rmux.conf");
+    fs::write(
+        &config_path,
+        format!("set-option -g default-shell '{}'\n", shell_path.display()),
+    )?;
+    let config_path = config_path.to_string_lossy().into_owned();
+
+    let output = harness.run_with(&["-f", &config_path, "-c", "echo client"], |command| {
+        command
+            .env(BINARY_OVERRIDE_ENV, harness.launcher_path())
+            .env("SHELL", "/bin/sh");
+    })?;
+
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "stderr={:?}",
+        stderr(&output)
     );
+    assert_eq!(
+        stdout(&output),
+        format!("marker-shell -c|echo client|{}\n", shell_path.display())
+    );
+    wait_for_socket_directory_empty(harness.socket_path(), ATTACH_TIMEOUT)?;
+    Ok(())
+}
+
+#[test]
+fn shell_command_runs_the_default_shell_of_a_running_server() -> Result<(), Box<dyn Error>> {
+    let harness = CliHarness::new("shell-command-server-default-shell")?;
+    let mut daemon = harness.start_hidden_daemon()?;
+    let shell_path = write_marker_shell(&harness)?;
+    let shell_text = shell_path.to_string_lossy().into_owned();
+    assert_success(&harness.run(&["set-option", "-g", "default-shell", &shell_text])?);
+
+    let output = harness.run_with(&["-c", "echo client"], |command| {
+        command.env("SHELL", "/bin/sh");
+    })?;
+
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "stderr={:?}",
+        stderr(&output)
+    );
+    assert_eq!(
+        stdout(&output),
+        format!("marker-shell -c|echo client|{shell_text}\n")
+    );
+    assert_eq!(daemon.child_mut().try_wait()?, None);
+    assert_success(&harness.run(&["kill-server"])?);
+    wait_for_socket_directory_empty(harness.socket_path(), ATTACH_TIMEOUT)?;
+    let _ = daemon.child_mut().wait();
+    Ok(())
+}
+
+#[test]
+fn shell_command_preserves_explicit_exit_empty_off() -> Result<(), Box<dyn Error>> {
+    let harness = CliHarness::new("shell-command-exit-empty-off")?;
+    let _cleanup = harness.auto_start_cleanup()?;
+    let config_path = harness.tmpdir().join("rmux.conf");
+    fs::write(&config_path, "set-option -g exit-empty off\n")?;
+    let config_path = config_path.to_string_lossy().into_owned();
+
+    let output = harness.run_with(&["-f", &config_path, "-c", "true"], |command| {
+        command.env(BINARY_OVERRIDE_ENV, harness.launcher_path());
+    })?;
+
+    assert_success(&output);
+    let policy = harness.run(&["show-options", "-gv", "exit-empty"])?;
+    assert_eq!(policy.status.code(), Some(0));
+    assert_eq!(stdout(&policy), "off\n");
+    assert_success(&harness.run(&["kill-server"])?);
+    wait_for_socket_directory_empty(harness.socket_path(), ATTACH_TIMEOUT)?;
+    Ok(())
+}
+
+#[test]
+fn shell_command_preserves_a_preexisting_empty_daemon() -> Result<(), Box<dyn Error>> {
+    let harness = CliHarness::new("shell-command-existing-empty")?;
+    let mut daemon = harness.start_hidden_daemon()?;
+
+    assert_success(&harness.run(&["-c", "true"])?);
+
+    assert!(harness.socket_path().exists());
+    assert_eq!(daemon.child_mut().try_wait()?, None);
+    assert_success(&harness.run(&["kill-server"])?);
+    wait_for_socket_directory_empty(harness.socket_path(), ATTACH_TIMEOUT)?;
+    let _ = daemon.child_mut().wait();
     Ok(())
 }
 
@@ -2613,6 +2976,83 @@ fn control_mode_argv_command_uses_initial_flags_zero_frame() -> Result<(), Box<d
     Ok(())
 }
 
+#[test]
+fn control_mode_argv_command_list_stops_at_its_first_error_like_tmux() -> Result<(), Box<dyn Error>>
+{
+    // tmux 3.7b oracle, measured 2026-11-19 (R3511 M1): the control-mode argv
+    // is one command list, so an error stops the rest of it and the guard
+    // `has-session -t nope \; kill-session -t keep` leaves `keep` alive.
+    // The exit status of a failed control command is R3511 M2, not asserted.
+    let harness = CliHarness::new("control-mode-argv-list-error")?;
+    let _daemon = harness.start_hidden_daemon()?;
+    assert_success(&harness.run(&["new-session", "-d", "-s", "keep"])?);
+    assert_success(&harness.run(&["new-window", "-d", "-t", "keep"])?);
+
+    for (argv, frames_before_error) in [
+        (
+            &[
+                "has-session",
+                "-t",
+                "nope",
+                ";",
+                "kill-session",
+                "-t",
+                "keep",
+            ][..],
+            0,
+        ),
+        (
+            &[
+                "select-window",
+                "-t",
+                "keep:7",
+                ";",
+                "kill-window",
+                "-t",
+                "keep",
+            ][..],
+            0,
+        ),
+        (
+            &[
+                "display-message",
+                "-p",
+                "first",
+                ";",
+                "has-session",
+                "-t",
+                "nope",
+                ";",
+                "kill-session",
+                "-t",
+                "keep",
+            ][..],
+            1,
+        ),
+    ] {
+        let output = harness.run(&[&["-C"][..], argv].concat())?;
+        let rendered = stdout(&output);
+        let context = format!("argv={argv:?} stdout={rendered:?}");
+        assert!(stderr(&output).is_empty(), "{context}");
+        let records = rendered.lines().collect::<Vec<_>>();
+        let begins = records
+            .iter()
+            .filter(|record| record.starts_with("%begin "))
+            .count();
+        assert_eq!(begins, frames_before_error + 1, "{context}");
+        let error = records
+            .iter()
+            .position(|record| record.starts_with("%error "))
+            .unwrap_or_else(|| panic!("the failing command has an error guard: {context}"));
+        assert_eq!(records[error + 1..], ["%exit"], "{context}");
+
+        let windows = harness.run(&["list-windows", "-t", "keep", "-F", "#{window_index}"])?;
+        assert_eq!(windows.status.code(), Some(0), "{context}");
+        assert_eq!(stdout(&windows).lines().count(), 2, "{context}");
+    }
+    Ok(())
+}
+
 fn assert_control_attach_records(records: &[&str], offset: usize, session: &str, flags: &str) {
     let begin = records
         .get(offset)
@@ -2726,24 +3166,35 @@ fn control_attach_eof_cannot_overtake_session_change() -> Result<(), Box<dyn Err
     );
     assert!(rendered.ends_with("%exit\n"), "{rendered:?}");
 
-    let failed = harness.run(&["-C", "attach-session", "-t", "missing"])?;
-    let rendered = stdout(&failed);
-    let records = rendered.lines().collect::<Vec<_>>();
-    let begin = records
-        .iter()
-        .position(|record| record.starts_with("%begin "))
-        .expect("failed attach has a begin guard");
-    let error = records
-        .iter()
-        .position(|record| record.starts_with("%error "))
-        .expect("failed attach has an error guard");
-    let exit = records
-        .iter()
-        .position(|record| *record == "%exit")
-        .expect("failed attach has an exit record");
-    assert!(begin < error && error < exit, "{rendered:?}");
-    assert!(!rendered.contains("%session-changed "), "{rendered:?}");
-    assert_eq!(rendered.matches("%exit").count(), 1, "{rendered:?}");
+    // The server ends a control client whose initial attach fails, so it can
+    // close the socket before the client finishes its upgrade; repeat the
+    // failure so that race is exercised, as the successful attach is above.
+    for iteration in 0..EOF_ITERATIONS {
+        let failed = harness.run(&["-C", "attach-session", "-t", "missing"])?;
+        let rendered = stdout(&failed);
+        let failed_stderr = String::from_utf8_lossy(&failed.stderr);
+        let context = format!(
+            "iteration {iteration}: status={:?} stdout={rendered:?} stderr={failed_stderr:?}",
+            failed.status.code()
+        );
+        assert!(failed_stderr.is_empty(), "{context}");
+        let records = rendered.lines().collect::<Vec<_>>();
+        let begin = records
+            .iter()
+            .position(|record| record.starts_with("%begin "))
+            .unwrap_or_else(|| panic!("failed attach has a begin guard: {context}"));
+        let error = records
+            .iter()
+            .position(|record| record.starts_with("%error "))
+            .unwrap_or_else(|| panic!("failed attach has an error guard: {context}"));
+        let exit = records
+            .iter()
+            .position(|record| *record == "%exit")
+            .unwrap_or_else(|| panic!("failed attach has an exit record: {context}"));
+        assert!(begin < error && error < exit, "{context}");
+        assert!(!rendered.contains("%session-changed "), "{context}");
+        assert_eq!(rendered.matches("%exit").count(), 1, "{context}");
+    }
     Ok(())
 }
 
@@ -2819,7 +3270,7 @@ fn command_free_control_mode_creates_attached_default_session_on_tty() -> Result
     let transcript = read_until_contains(
         control.master_mut(),
         "%session-changed $0 0",
-        ATTACH_TIMEOUT,
+        AUTOSTART_SESSION_TIMEOUT,
     )?;
     assert!(
         transcript.contains("%begin ") && transcript.contains(" 0\r\n"),
@@ -2879,11 +3330,14 @@ fn control_attach_existing_starts_at_current_pane_output_cursor() -> Result<(), 
     let harness = CliHarness::new("control-existing-output-cursor")?;
     let _daemon = harness.start_hidden_daemon()?;
     assert_success(&harness.run(&["new-session", "-d", "-s", "alpha"])?);
+    // The typed command line never contains the marker it prints: a loaded
+    // shell can leave the pane's echo of the keys on screen long before it
+    // runs them, and that echo must not count as backlog already read.
     assert_success(&harness.run(&[
         "send-keys",
         "-t",
         "alpha:0.0",
-        "printf EXISTING-BACKLOG",
+        "printf 'EXISTING-%s' BACKLOG",
         "Enter",
     ])?);
 
@@ -2954,7 +3408,7 @@ fn control_attach_existing_starts_at_current_pane_output_cursor() -> Result<(), 
         "send-keys",
         "-t",
         "alpha:0.0",
-        "printf LIVE-AFTER-ATTACH",
+        "printf 'LIVE-%s' AFTER-ATTACH",
         "Enter",
     ])?);
     wait_for_output_condition(
@@ -3152,15 +3606,22 @@ fn new_session_auto_start_waits_for_old_generation_hook_before_restart(
     let hook_started = harness.tmpdir().join("old-generation-hook.started");
     let hook_release = harness.tmpdir().join("old-generation-hook.release");
     let hook_finished = harness.tmpdir().join("old-generation-hook.finished");
+    let hook_trace = harness.tmpdir().join("old-generation-hook.trace");
+    // Retained daemon images may have a different basename, so their shell
+    // environment need not contain the public tmux shim. Exercise this candidate
+    // directly instead of whichever tmux happens to be on the inherited PATH.
+    let nested_client = shell_quote(Path::new(harness.base_command().get_program()));
     // Bound the nested client so this test exercises the generation handoff
     // without waiting for the daemon's five-second hook cancellation deadline.
-    fs::write(
+    common::executable_fixture::write_executable(
         &hook_path,
         format!(
             "#!/bin/sh\n\
+             exec 2> {trace}\n\
+             set -x\n\
              printf 'started\\n' > {started}\n\
              while [ ! -f {release} ]; do sleep 0.01; done\n\
-             tmux kill-server >/dev/null 2>&1 &\n\
+             {nested_client} kill-server >/dev/null 2>&1 &\n\
              child=$!\n\
              sleep 0.2\n\
              kill \"$child\" >/dev/null 2>&1 || true\n\
@@ -3169,15 +3630,10 @@ fn new_session_auto_start_waits_for_old_generation_hook_before_restart(
             started = shell_quote(&hook_started),
             release = shell_quote(&hook_release),
             finished = shell_quote(&hook_finished),
+            trace = shell_quote(&hook_trace),
         ),
+        0o700,
     )?;
-    {
-        use std::os::unix::fs::PermissionsExt;
-
-        let mut permissions = fs::metadata(&hook_path)?.permissions();
-        permissions.set_mode(0o700);
-        fs::set_permissions(&hook_path, permissions)?;
-    }
 
     let first = harness.run_with(&["new-session", "-d", "-s", "alpha"], |command| {
         command.env(BINARY_OVERRIDE_ENV, harness.launcher_path());
@@ -3200,6 +3656,10 @@ fn new_session_auto_start_waits_for_old_generation_hook_before_restart(
     wait_for_file_contents(&hook_started, "started\n", ATTACH_TIMEOUT)?;
 
     let endpoint_reserved = harness.socket_path().exists();
+    assert!(
+        !hook_finished.exists(),
+        "the hook must still be held at release"
+    );
     fs::write(&hook_release, b"release\n")?;
 
     let kill = kill_child.wait_with_output()?;
@@ -3208,7 +3668,13 @@ fn new_session_auto_start_waits_for_old_generation_hook_before_restart(
         endpoint_reserved,
         "the old endpoint must remain reserved while an accepted shutdown hook is pending"
     );
-    assert_eq!(fs::read_to_string(&hook_finished)?, "finished\n");
+    let finished = fs::read_to_string(&hook_finished).unwrap_or_else(|error| {
+        panic!(
+            "old-generation endpoint released before hook completion: {error}; trace={:?}",
+            fs::read_to_string(&hook_trace)
+        )
+    });
+    assert_eq!(finished, "finished\n");
 
     let second = harness.run_with(&["new-session", "-d", "-s", "beta"], |command| {
         command.env(BINARY_OVERRIDE_ENV, harness.launcher_path());
@@ -3295,10 +3761,7 @@ fn tmux_environment_does_not_route_client_to_explicit_socket_path() -> Result<()
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .spawn()?;
-    if let Err(error) = wait_for_socket(&socket_path, &mut daemon) {
-        let _ = terminate_child(&mut daemon);
-        return Err(error);
-    }
+    wait_for_socket(&socket_path, &mut daemon)?;
 
     let socket_arg = socket_path.to_string_lossy().to_string();
     assert_success(&harness.run(&["-S", &socket_arg, "new-session", "-d", "-s", "alpha"])?);
@@ -3502,21 +3965,32 @@ fn nested_cli_commands_inherit_calling_pane_target() -> Result<(), Box<dyn Error
     let _daemon = harness.start_hidden_daemon()?;
     let display_path = harness.tmpdir().join("nested-display.txt");
     let split_marker = harness.tmpdir().join("nested-split.txt");
-    let binary = shell_quote_str(env!("CARGO_BIN_EXE_rmux"));
+    // Every pane lives until the test has listed them: the test removes this
+    // file after list-panes, and the harness removes it on drop.
+    let keep_alive = harness.tmpdir().join("nested-cli-keep-alive");
+    fs::write(&keep_alive, "")?;
+    let hold = format!(
+        "while [ -f {} ]; do sleep 0.05; done",
+        shell_quote(&keep_alive)
+    );
+    let binary = shell_quote_str(rmux_os::build_identity::cargo_binary(env!(
+        "CARGO_BIN_EXE_rmux"
+    )));
     let command = format!(
         "sleep 1; {binary} display-message -p '#{{session_name}}:#{{pane_id}}' > {} 2>/dev/null; \
-         {binary} split-window -d \"sh -c 'printf nested > {}; sleep 30'\"; sleep 30",
+         {binary} split-window -d \"sh -c 'printf nested > {}; {hold}'\"; {hold}",
         shell_quote(&display_path),
         shell_quote(&split_marker)
     );
 
     assert_success(&harness.run(&["new-session", "-d", "-s", "alpha", "sh", "-c", &command])?);
-    assert_success(&harness.run(&["new-session", "-d", "-s", "beta", "sleep 30"])?);
+    assert_success(&harness.run(&["new-session", "-d", "-s", "beta", &hold])?);
 
     wait_for_file_contents(&display_path, "alpha:%0\n", ATTACH_TIMEOUT)?;
     wait_for_file_contents(&split_marker, "nested", ATTACH_TIMEOUT)?;
 
     let panes = harness.run(&["list-panes", "-a", "-F", "#{session_name}:#{pane_index}"])?;
+    fs::remove_file(&keep_alive)?;
     assert_eq!(
         panes.status.code(),
         Some(0),
@@ -3525,6 +3999,10 @@ fn nested_cli_commands_inherit_calling_pane_target() -> Result<(), Box<dyn Error
     );
     assert!(stderr(&panes).is_empty());
     let panes = stdout(&panes);
+    assert!(
+        panes.lines().any(|line| line == "beta:0"),
+        "detached beta must still be running, got:\n{panes}"
+    );
     assert!(
         panes.lines().any(|line| line == "alpha:1"),
         "nested split should create the new pane in alpha, got:\n{panes}"
@@ -3540,25 +4018,35 @@ fn nested_cli_commands_inherit_calling_pane_target() -> Result<(), Box<dyn Error
 fn foreign_socket_pane_hint_is_ignored_for_nested_targets() -> Result<(), Box<dyn Error>> {
     let harness = CliHarness::new("foreign-socket-pane-hint")?;
     let _daemon = harness.start_hidden_daemon()?;
-    assert_success(&harness.run(&["new-session", "-d", "-s", "alpha", "sleep 30"])?);
-    assert_success(&harness.run(&["new-session", "-d", "-s", "beta", "sleep 30"])?);
+    // Every pane lives until the test has listed them: the test removes this
+    // file after list-panes, and the harness removes it on drop.
+    let keep_alive = harness.tmpdir().join("foreign-socket-keep-alive");
+    fs::write(&keep_alive, "")?;
+    let hold = format!(
+        "while [ -f {} ]; do sleep 0.05; done",
+        shell_quote(&keep_alive)
+    );
+    assert_success(&harness.run(&["new-session", "-d", "-s", "alpha", &hold])?);
+    assert_success(&harness.run(&["new-session", "-d", "-s", "beta", &hold])?);
     let socket = harness.socket_path().to_string_lossy().to_string();
     let foreign_rmux = format!("{}/foreign.sock,123,0", harness.tmpdir().display());
 
-    let output = harness.run_with(
-        &["-S", &socket, "split-window", "-d", "sleep 30"],
-        |command| {
-            command.env("RMUX", &foreign_rmux);
-            command.env("RMUX_PANE", "%0");
-            command.env("TMUX_PANE", "%0");
-        },
-    )?;
+    let output = harness.run_with(&["-S", &socket, "split-window", "-d", &hold], |command| {
+        command.env("RMUX", &foreign_rmux);
+        command.env("RMUX_PANE", "%0");
+        command.env("TMUX_PANE", "%0");
+    })?;
     assert_success(&output);
 
     let panes = harness.run(&["list-panes", "-a", "-F", "#{session_name}:#{pane_index}"])?;
+    fs::remove_file(&keep_alive)?;
     assert_eq!(panes.status.code(), Some(0), "stderr={}", stderr(&panes));
     assert!(stderr(&panes).is_empty());
     let panes = stdout(&panes);
+    assert!(
+        panes.lines().any(|line| line == "alpha:0"),
+        "alpha must still be running, got:\n{panes}"
+    );
     assert!(
         panes.lines().any(|line| line == "beta:1"),
         "foreign hint must be ignored and the fallback should split beta, got:\n{panes}"
@@ -3578,12 +4066,22 @@ fn queued_run_shell_children_inherit_calling_pane_target() -> Result<(), Box<dyn
     let marker = harness.tmpdir().join("queued-run-shell-marker.txt");
     let command_file = harness.tmpdir().join("queued-run-shell.rmux");
     let child_script = harness.tmpdir().join("queued-run-shell-child.sh");
-    let binary = shell_quote_str(env!("CARGO_BIN_EXE_rmux"));
+    // Every pane lives until the test has listed them: the test removes this
+    // file after list-panes, and the harness removes it on drop.
+    let keep_alive = harness.tmpdir().join("queued-run-shell-keep-alive");
+    fs::write(&keep_alive, "")?;
+    let hold = format!(
+        "while [ -f {} ]; do sleep 0.05; done",
+        shell_quote(&keep_alive)
+    );
+    let binary = shell_quote_str(rmux_os::build_identity::cargo_binary(env!(
+        "CARGO_BIN_EXE_rmux"
+    )));
 
     fs::write(
         &child_script,
         format!(
-            "{binary} split-window -d \"sh -c 'printf queued > {}; sleep 30'\"\n",
+            "{binary} split-window -d \"sh -c 'printf queued > {}; {hold}'\"\n",
             shell_quote(&marker)
         ),
     )?;
@@ -3592,7 +4090,7 @@ fn queued_run_shell_children_inherit_calling_pane_target() -> Result<(), Box<dyn
         format!("run-shell \"sh {}\"\n", shell_quote(&child_script)),
     )?;
     let pane_command = format!(
-        "while [ ! -f {} ]; do sleep 0.05; done; {binary} source-file {}; sleep 30",
+        "while [ ! -f {} ]; do sleep 0.05; done; {binary} source-file {}; {hold}",
         shell_quote(&gate),
         shell_quote(&command_file)
     );
@@ -3606,14 +4104,19 @@ fn queued_run_shell_children_inherit_calling_pane_target() -> Result<(), Box<dyn
         "-c",
         &pane_command,
     ])?);
-    assert_success(&harness.run(&["new-session", "-d", "-s", "beta", "sleep 30"])?);
+    assert_success(&harness.run(&["new-session", "-d", "-s", "beta", &hold])?);
     fs::write(&gate, "go")?;
 
     wait_for_file_contents(&marker, "queued", ATTACH_TIMEOUT)?;
     let panes = harness.run(&["list-panes", "-a", "-F", "#{session_name}:#{pane_index}"])?;
+    fs::remove_file(&keep_alive)?;
     assert_eq!(panes.status.code(), Some(0), "stderr={}", stderr(&panes));
     assert!(stderr(&panes).is_empty());
     let panes = stdout(&panes);
+    assert!(
+        panes.lines().any(|line| line == "beta:0"),
+        "detached beta must still be running, got:\n{panes}"
+    );
     assert!(
         panes.lines().any(|line| line == "alpha:1"),
         "queued run-shell child should split alpha, got:\n{panes}"
@@ -3631,13 +4134,23 @@ fn nested_run_shell_commands_inherit_calling_pane_target() -> Result<(), Box<dyn
     let _daemon = harness.start_hidden_daemon()?;
     let gate = harness.tmpdir().join("go");
     let marker = harness.tmpdir().join("run-shell-c-marker.txt");
-    let binary = shell_quote_str(env!("CARGO_BIN_EXE_rmux"));
+    // Every pane lives until the test has listed them: the test removes this
+    // file after list-panes, and the harness removes it on drop.
+    let keep_alive = harness.tmpdir().join("run-shell-c-keep-alive");
+    fs::write(&keep_alive, "")?;
+    let hold = format!(
+        "while [ -f {} ]; do sleep 0.05; done",
+        shell_quote(&keep_alive)
+    );
+    let binary = shell_quote_str(rmux_os::build_identity::cargo_binary(env!(
+        "CARGO_BIN_EXE_rmux"
+    )));
     let nested_command = format!(
-        "split-window -d \"sh -c 'printf commands > {}; sleep 2'\"",
+        "split-window -d \"sh -c 'printf commands > {}; {hold}'\"",
         shell_quote(&marker)
     );
     let pane_command = format!(
-        "while [ ! -f {} ]; do sleep 0.05; done; {binary} run-shell -C {}; sleep 2",
+        "while [ ! -f {} ]; do sleep 0.05; done; {binary} run-shell -C {}; {hold}",
         shell_quote(&gate),
         shell_quote_str(&nested_command)
     );
@@ -3651,14 +4164,19 @@ fn nested_run_shell_commands_inherit_calling_pane_target() -> Result<(), Box<dyn
         "-c",
         &pane_command,
     ])?);
-    assert_success(&harness.run(&["new-session", "-d", "-s", "beta", "sleep 30"])?);
+    assert_success(&harness.run(&["new-session", "-d", "-s", "beta", &hold])?);
     fs::write(&gate, "go")?;
 
     wait_for_file_contents(&marker, "commands", ATTACH_TIMEOUT)?;
     let panes = harness.run(&["list-panes", "-a", "-F", "#{session_name}:#{pane_index}"])?;
+    fs::remove_file(&keep_alive)?;
     assert_eq!(panes.status.code(), Some(0), "stderr={}", stderr(&panes));
     assert!(stderr(&panes).is_empty());
     let panes = stdout(&panes);
+    assert!(
+        panes.lines().any(|line| line == "beta:0"),
+        "detached beta must still be running, got:\n{panes}"
+    );
     assert!(
         panes.lines().any(|line| line == "alpha:1"),
         "run-shell -C should split alpha, got:\n{panes}"
@@ -3681,7 +4199,9 @@ fn nested_new_session_expands_start_directory_against_calling_pane() -> Result<(
     let nested_stderr = harness.tmpdir().join("nested-new-session.stderr");
     fs::create_dir_all(&start_dir)?;
     let start_dir_text = start_dir.to_string_lossy().to_string();
-    let binary = shell_quote_str(env!("CARGO_BIN_EXE_rmux"));
+    let binary = shell_quote_str(rmux_os::build_identity::cargo_binary(env!(
+        "CARGO_BIN_EXE_rmux"
+    )));
     fs::write(
         &nested_script,
         format!(
@@ -3728,8 +4248,12 @@ fn new_session_trailing_shell_command_spawns_initial_pane_command() -> Result<()
     let harness = CliHarness::new("new-session-shell-command")?;
     let _cleanup = harness.auto_start_cleanup()?;
 
+    // pane_current_command names the pane's foreground process-group leader,
+    // so `sleep` itself must hold the pane: a holding shell would be reported
+    // instead. macOS sleep rejects `infinity`, and INT32_MAX seconds is out of
+    // reach of any stall; `_cleanup` kills the server, which ends the pane.
     let create = harness.run_with(
-        &["new-session", "-d", "-s", "alpha", "sleep 30"],
+        &["new-session", "-d", "-s", "alpha", "sleep 2147483647"],
         |command| {
             command.env(BINARY_OVERRIDE_ENV, harness.launcher_path());
         },
@@ -4101,7 +4625,9 @@ fn socket_path_flag_overrides_socket_name_and_rmux_environment() -> Result<(), B
 fn socket_path_flag_can_start_directly_under_tmp() -> Result<(), Box<dyn Error>> {
     let harness = CliHarness::new("socket-path-under-tmp")?;
     let _cleanup = harness.auto_start_cleanup()?;
-    let socket_path = std::env::temp_dir().join(format!(
+    // The contract is the system's shared sticky /tmp, not $TMPDIR: a private
+    // TMPDIR owned by the caller with mode 1777 is deliberately refused.
+    let socket_path = Path::new("/tmp").join(format!(
         "rmux-direct-socket-{}-{}.sock",
         std::process::id(),
         "cli-surface"
@@ -4438,7 +4964,7 @@ fn exit_empty_retries_after_a_replied_detached_client_drains_an_attached_exit(
     );
 
     drop(killer);
-    wait_for_socket_cleanup(harness.socket_path())?;
+    wait_for_socket_directory_empty(harness.socket_path(), ATTACH_TIMEOUT)?;
     Ok(())
 }
 
@@ -5266,7 +5792,10 @@ fn detach_client_rejects_unexpected_arguments() -> Result<(), Box<dyn Error>> {
     let output = harness.run(&["detach-client", "something"])?;
 
     assert_clap_failure(&output);
-    assert!(stderr(&output).contains("unexpected"));
+    assert_eq!(
+        stderr(&output),
+        "command detach-client: too many arguments (need at most 0)\n"
+    );
     Ok(())
 }
 
@@ -5289,10 +5818,18 @@ fn has_session_is_silent_for_nonexistent_session_on_running_server() -> Result<(
     let harness = CliHarness::new("has-nonexistent")?;
     let mut daemon = harness.start_hidden_daemon()?;
 
+    // Measured with tmux 3.7b: a running server without sessions reports the
+    // missing current target before it looks up the explicit target.
     let output = harness.run(&["has-session", "-t", "never-created"])?;
     assert_eq!(output.status.code(), Some(1));
     assert!(stdout(&output).is_empty());
-    assert!(stderr(&output).contains("can't find session: never-created"));
+    assert_eq!(stderr(&output), "no current target\n");
+
+    assert_success(&harness.run(&["new-session", "-d", "-s", "alpha"])?);
+    let output = harness.run(&["has-session", "-t", "never-created"])?;
+    assert_eq!(output.status.code(), Some(1));
+    assert!(stdout(&output).is_empty());
+    assert_eq!(stderr(&output), "can't find session: never-created\n");
 
     terminate_child(daemon.child_mut())?;
     Ok(())
@@ -5316,13 +5853,19 @@ fn new_session_with_partial_terminal_size() -> Result<(), Box<dyn Error>> {
 }
 
 #[test]
-fn help_exits_one_with_tmux_usage() -> Result<(), Box<dyn Error>> {
-    let harness = CliHarness::new("help-exit-code")?;
-    let output = harness.run(&["--help"])?;
+fn tmux_long_help_retains_stderr_and_exit_one() -> Result<(), Box<dyn Error>> {
+    use std::os::unix::process::CommandExt;
 
+    let harness = CliHarness::new("help-exit-code")?;
+    let native = harness.run(&["--help"])?;
+    let output = harness.run_with(&["--help"], |command| {
+        command.arg0("tmux");
+    })?;
+
+    assert_eq!(native.status.code(), Some(0));
     assert_eq!(output.status.code(), Some(1));
     assert!(stdout(&output).is_empty());
-    assert_eq!(stderr(&output), LONG_OPTION_HELP);
+    assert_eq!(stderr(&output), stdout(&native));
     Ok(())
 }
 
@@ -5334,24 +5877,6 @@ fn attach_then_detach(harness: &CliHarness, session: &str) -> Result<(), Box<dyn
     assert_eq!(status.code(), Some(0));
     attach.assert_restored()?;
     Ok(())
-}
-
-fn wait_for_socket_cleanup(socket_path: &Path) -> Result<(), Box<dyn Error>> {
-    let deadline = Instant::now() + ATTACH_TIMEOUT;
-
-    while Instant::now() < deadline {
-        if !socket_path.exists() {
-            assert_socket_directory_empty(socket_path)?;
-            return Ok(());
-        }
-        thread::sleep(Duration::from_millis(25));
-    }
-
-    Err(format!(
-        "timed out waiting for '{}' to be removed",
-        socket_path.display()
-    )
-    .into())
 }
 
 fn wait_for_child_status(
@@ -5481,22 +6006,34 @@ fn shell_quote_str(value: &str) -> String {
 }
 
 fn write_marker_script(path: &Path, marker_path: &Path) -> Result<(), Box<dyn Error>> {
-    fs::write(
+    common::executable_fixture::write_executable(
         path,
         format!(
             "#!/bin/sh\nprintf redirected > '{}'\nexit 0\n",
             marker_path.display()
         ),
+        0o755,
     )?;
-
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-
-        let mut permissions = fs::metadata(path)?.permissions();
-        permissions.set_mode(0o755);
-        fs::set_permissions(path, permissions)?;
-    }
 
     Ok(())
 }
+
+#[path = "cli_surface/new_window_selection.rs"]
+mod new_window_selection;
+
+#[path = "cli_surface/legacy_alias_admission.rs"]
+mod legacy_alias_admission;
+
+#[path = "cli_surface/source_file_lifetime.rs"]
+mod source_file_lifetime;
+#[path = "cli_surface/source_file_queue.rs"]
+mod source_file_queue;
+
+#[path = "cli_surface/control_error_message.rs"]
+mod control_error_message;
+
+#[path = "cli_surface/queue_dimensions.rs"]
+mod queue_dimensions;
+
+#[path = "cli_surface/run_shell_output.rs"]
+mod run_shell_output;

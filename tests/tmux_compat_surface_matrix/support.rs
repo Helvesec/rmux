@@ -95,7 +95,9 @@ pub(super) fn assert_run_metadata(
     assert_command_metadata(
         &run.rmux,
         "rmux",
-        Path::new(env!("CARGO_BIN_EXE_rmux")),
+        Path::new(rmux_os::build_identity::cargo_binary(env!(
+            "CARGO_BIN_EXE_rmux"
+        ))),
         harness.rmux_socket_dir(),
         argv,
         &argv_os(argv),
@@ -121,7 +123,9 @@ pub(super) fn assert_rmux_metadata(
     assert_command_metadata(
         command,
         "rmux",
-        Path::new(env!("CARGO_BIN_EXE_rmux")),
+        Path::new(rmux_os::build_identity::cargo_binary(env!(
+            "CARGO_BIN_EXE_rmux"
+        ))),
         harness.rmux_socket_dir(),
         argv,
         &argv_os(argv),
@@ -209,14 +213,7 @@ pub(super) fn assert_exact_tmux_compat(run: &TmuxCompatRun) {
 }
 
 pub(super) fn drop_deferred_prefix_bindings(output: &[u8]) -> Vec<u8> {
-    const DEFERRED_BINDINGS: &[&[u8]] = &[
-        b"prefix:*:0\n",
-        b"prefix:DC:1\n",
-        b"prefix:S-Up:1\n",
-        b"prefix:S-Down:1\n",
-        b"prefix:S-Left:1\n",
-        b"prefix:S-Right:1\n",
-    ];
+    const DEFERRED_BINDINGS: &[&[u8]] = &[b"prefix:*:0\n"];
 
     output
         .split_inclusive(|byte| *byte == b'\n')
@@ -347,7 +344,9 @@ pub(super) fn spawn_rmux_attached_client_with(
     fs::create_dir_all(&home)?;
     fs::create_dir_all(&xdg)?;
 
-    let mut command = Command::new(env!("CARGO_BIN_EXE_rmux"));
+    let mut command = Command::new(rmux_os::build_identity::cargo_binary(env!(
+        "CARGO_BIN_EXE_rmux"
+    )));
     command
         .env("TMPDIR", harness.tmpdir())
         .env("RMUX_TMPDIR", harness.tmpdir())
@@ -417,7 +416,9 @@ pub(super) fn spawn_rmux_attached_input_client_at_size(
     fs::create_dir_all(&home)?;
     fs::create_dir_all(&xdg)?;
 
-    let mut command = Command::new(env!("CARGO_BIN_EXE_rmux"));
+    let mut command = Command::new(rmux_os::build_identity::cargo_binary(env!(
+        "CARGO_BIN_EXE_rmux"
+    )));
     command
         .env("TMPDIR", harness.tmpdir())
         .env("RMUX_TMPDIR", harness.tmpdir())
@@ -518,6 +519,19 @@ pub(super) fn attached_client_new_session(
         config.clone(),
     )?;
     assert_quiet_success(&create);
+    // Keys sent before the line editor starts are echoed by the tty and stay in
+    // scrollback, so each shell must have drawn its prompt first.
+    let _ = wait_for_attached_pair(
+        harness,
+        tmux_binary,
+        &["capture-pane", "-p", "-t", "alpha:0.0"],
+        config.clone(),
+        deadline,
+        |run| {
+            run.rmux.stdout_string().contains("tester@RMUXHOST")
+                && run.tmux.stdout_string().contains("tester@RMUXHOST")
+        },
+    )?;
     let populate = harness.run_pair_with(
         tmux_binary,
         &[
@@ -915,7 +929,9 @@ pub(super) fn rmux_control_mode_command(
     fs::create_dir_all(&home)?;
     fs::create_dir_all(&xdg)?;
 
-    let mut command = Command::new(env!("CARGO_BIN_EXE_rmux"));
+    let mut command = Command::new(rmux_os::build_identity::cargo_binary(env!(
+        "CARGO_BIN_EXE_rmux"
+    )));
     command
         .env("TMPDIR", harness.tmpdir())
         .env("RMUX_TMPDIR", harness.tmpdir())

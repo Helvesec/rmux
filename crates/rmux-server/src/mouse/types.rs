@@ -59,13 +59,25 @@ pub(crate) struct PaneMouseTarget {
     pub(crate) pane_id: PaneId,
     pub(crate) pane_target: Option<PaneTarget>,
     pub(crate) window_id: u32,
+    pub(crate) layer: u32,
     pub(crate) geometry: PaneGeometry,
+    // Session layouts always carry a projection; legacy unit fixtures may omit it.
+    pub(super) projection: Option<super::projection::MouseProjection>,
     pub(crate) scrollbar: Option<PaneScrollbar>,
     pub(crate) border_controls: Vec<BorderControlRange>,
 }
 
+impl PaneMouseTarget {
+    pub(crate) fn coordinates(&self) -> super::projection::MouseCoordinates {
+        self.projection
+            .as_ref()
+            .map_or_else(|| self.geometry.into(), |projection| projection.coordinates)
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct MouseLayout {
+    pub(crate) client_viewport: bool,
     pub(crate) session_id: u32,
     pub(crate) status_at: Option<u16>,
     pub(crate) status_lines: u16,
@@ -84,6 +96,8 @@ pub(crate) enum MouseDragHandler {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct AttachedMouseEvent {
+    /// Projection captured for the pane hit by this terminal event.
+    pub(crate) coordinates: Option<super::projection::MouseCoordinates>,
     pub(crate) raw: MouseForwardEvent,
     pub(crate) session_id: u32,
     pub(crate) window_id: Option<u32>,

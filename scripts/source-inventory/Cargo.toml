@@ -1,0 +1,16 @@
+[package]
+name = "rmux-source-syntax"
+version = "1.0.0"
+edition = "2021"
+rust-version = "1.88"
+publish = false
+
+# Standalone internal tool: never unify parser features with runtime packages.
+[workspace]
+
+[dependencies]
+proc-macro2 = { version = "=1.0.106", features = ["span-locations"] }
+quote = "=1.0.45"
+serde = { version = "=1.0.228", features = ["derive"] }
+serde_json = "=1.0.150"
+syn = { version = "=2.0.118", features = ["full", "visit"] }

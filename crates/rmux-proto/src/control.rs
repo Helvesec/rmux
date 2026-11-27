@@ -203,18 +203,16 @@ pub fn octal_escape(bytes: &[u8]) -> String {
 }
 
 fn push_escaped_text(output: &mut String, text: &str) {
-    for character in text.chars() {
-        if character.is_ascii() {
-            let byte = character as u8;
-            if needs_octal_escape(byte) {
-                push_octal_escape(output, byte);
-            } else {
-                output.push(character);
-            }
-        } else {
-            output.push(character);
+    let mut start = 0;
+    for (offset, byte) in text.bytes().enumerate() {
+        if needs_octal_escape(byte) {
+            // ASCII escape positions are always UTF-8 boundaries.
+            output.push_str(&text[start..offset]);
+            push_octal_escape(output, byte);
+            start = offset + 1;
         }
     }
+    output.push_str(&text[start..]);
 }
 
 const fn needs_octal_escape(byte: u8) -> bool {

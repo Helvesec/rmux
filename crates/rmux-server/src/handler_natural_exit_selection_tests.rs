@@ -124,7 +124,7 @@ async fn new_session(handler: &RequestHandler, name: &SessionName) {
             environment: None,
         }))
         .await;
-    assert!(matches!(response, Response::NewSession(_)), "{response:?}");
+    crate::session_fixture::assert_new_session(&response);
 }
 
 async fn add_panes(handler: &RequestHandler, session: &SessionName, pane_count: usize) {
@@ -177,8 +177,7 @@ async fn set_window_size_mode(handler: &RequestHandler, session_name: &SessionNa
             .session(session_name)
             .expect("target session exists")
             .windows()
-            .keys()
-            .copied()
+            .map(|(index, _)| index)
             .collect::<Vec<_>>()
     };
     for window_index in window_indexes {
@@ -324,12 +323,11 @@ async fn inactive_window_pane_target(
     let active_window_index = session.active_window_index();
     let (window_index, window) = session
         .windows()
-        .iter()
-        .find(|(index, _)| **index != active_window_index)
+        .find(|(index, _)| *index != active_window_index)
         .expect("inactive window exists");
     let pane = window.active_pane().expect("inactive window has a pane");
     (
-        PaneTarget::with_window(session_name.clone(), *window_index, pane.index()),
+        PaneTarget::with_window(session_name.clone(), window_index, pane.index()),
         window.id().to_string(),
     )
 }
@@ -371,12 +369,16 @@ async fn exit_and_wait_removed(handler: &RequestHandler, target: PaneTarget) {
     loop {
         let present = {
             let state = handler.state.lock().await;
-            let present = state.sessions.iter().any(|(_, session)| {
-                session
-                    .windows()
-                    .values()
-                    .any(|window| window.panes().iter().any(|pane| pane.id() == pane_id))
-            });
+            let present = state
+                .sessions
+                .iter()
+                .map(|session| (session.name(), session))
+                .any(|(_, session)| {
+                    session
+                        .windows()
+                        .map(|(_, window)| window)
+                        .any(|window| window.panes().iter().any(|pane| pane.id() == pane_id))
+                });
             present
         };
         if !present {

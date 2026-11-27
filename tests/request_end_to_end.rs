@@ -12,7 +12,7 @@ use std::time::Duration;
 
 use common::{assert_success, stderr, stdout, CliHarness};
 
-const COMMAND_SURFACE: [&str; 101] = [
+const COMMAND_SURFACE: [&str; 107] = [
     "new-session",
     "start-server",
     "kill-server",
@@ -36,6 +36,8 @@ const COMMAND_SURFACE: [&str; 101] = [
     "resize-window",
     "respawn-window",
     "split-window",
+    "new-pane",
+    "set-pane-placement",
     "swap-pane",
     "last-pane",
     "join-pane",
@@ -60,6 +62,10 @@ const COMMAND_SURFACE: [&str; 101] = [
     "clock-mode",
     "wait-pane",
     "pane-snapshot",
+    "export-window-snapshot",
+    "export-window-snapshot-v2",
+    "restore-window-snapshot",
+    "restore-window-snapshot-v2",
     "stream-pane",
     "collect-pane-output",
     "locator",
@@ -135,30 +141,52 @@ fn cli_command_surface_matches_public_help_enum_and_dispatch() -> Result<(), Box
     let list_output = harness.run(&["list-commands"])?;
     let listed_commands = extract_list_commands(&stdout(&list_output));
     let enum_commands = extract_enum_variant_commands(
-        &repo_root.join("src/cli_args.rs"),
-        "pub(crate) enum Command",
+        &repo_root.join("crates/rmux-core/src/command_schema.rs"),
+        "commands {",
     )?;
     let dispatch_commands = extract_match_variant_commands(
-        &repo_root.join("src/cli/dispatch.rs"),
+        &repo_root.join("src/cli/dispatch/command.rs"),
         "match command",
         "Command::",
     )?;
 
-    // The bare `list-commands` listing is byte-compared against tmux, so it omits
-    // RMUX server extensions. Top-level-only extensions such as capabilities,
-    // doctor and setup are tested separately.
+    // Negotiated pane commands use named Unsupported dispatch arms rather than
+    // dedicated enum variants. They remain part of the public command surface.
+    let negotiated_commands =
+        BTreeSet::from(["new-pane".to_owned(), "set-pane-placement".to_owned()]);
+    let enum_expected = expected.difference(&negotiated_commands).cloned().collect();
+    let help_output = harness.run(&["--help"])?;
+    assert_eq!(help_output.status.code(), Some(0));
+    assert!(stderr(&help_output).is_empty());
+    let help_commands = extract_list_commands(&stdout(&help_output));
+    assert!(expected.is_subset(&help_commands));
+    for command in &negotiated_commands {
+        let help = harness.run(&[command, "--help"])?;
+        assert_eq!(help.status.code(), Some(0), "{command}: {}", stderr(&help));
+        assert!(stdout(&help).contains(command));
+    }
+
+    // Bare `list-commands` names match the tmux 3.7b inventory (including
+    // new-pane), so this name-only comparison omits RMUX server extensions.
+    // Top-level-only extensions such as capabilities, doctor and setup are
+    // tested separately.
     let rmux_extensions: BTreeSet<String> = [
         "broadcast-keys",
         "collect-pane-output",
         "expect-pane",
         "find-panes",
         "find-sessions",
+        "export-window-snapshot",
+        "export-window-snapshot-v2",
+        "restore-window-snapshot",
+        "restore-window-snapshot-v2",
         "locator",
         "pane-snapshot",
         "stream-pane",
         "wait-pane",
         "web-share",
         "with-session",
+        "set-pane-placement",
     ]
     .iter()
     .map(|name| (*name).to_owned())
@@ -169,7 +197,7 @@ fn cli_command_surface_matches_public_help_enum_and_dispatch() -> Result<(), Box
     assert_eq!(expected.len(), COMMAND_SURFACE.len());
     assert_eq!(list_output.status.code(), Some(0));
     assert_eq!(listed_commands, listed_expected);
-    assert_eq!(enum_commands, expected);
+    assert_eq!(enum_commands, enum_expected);
     assert_eq!(dispatch_commands, expected);
     Ok(())
 }
@@ -449,7 +477,15 @@ fn extract_match_variant_commands(
     prefix: &str,
 ) -> Result<BTreeSet<String>, Box<dyn Error>> {
     let contents = fs::read_to_string(path)?;
-    let block = extract_braced_block(&contents, anchor)?;
+    extract_match_variant_commands_from_contents(&contents, anchor, prefix)
+}
+
+fn extract_match_variant_commands_from_contents(
+    contents: &str,
+    anchor: &str,
+    prefix: &str,
+) -> Result<BTreeSet<String>, Box<dyn Error>> {
+    let block = extract_braced_block(contents, anchor)?;
     let mut commands = BTreeSet::new();
 
     for line in block.lines() {
@@ -459,6 +495,13 @@ fn extract_match_variant_commands(
         }
 
         if let Some(variant) = extract_prefixed_variant_name(trimmed, prefix) {
+            if variant == "Unsupported" {
+                if let Some((_, guard)) = trimmed.split_once(" if args.name == \"") {
+                    if let Some((name, _)) = guard.split_once('"') {
+                        commands.insert(name.to_owned());
+                    }
+                }
+            }
             if is_internal_command_variant(&variant) {
                 continue;
             }
@@ -470,10 +513,43 @@ fn extract_match_variant_commands(
     Ok(commands)
 }
 
+#[test]
+fn command_surface_detects_missing_negotiated_dispatch() -> Result<(), Box<dyn Error>> {
+    let dispatch = r#"
+        match command {
+            Command::NewSession(args) => run(args),
+            Command::Unsupported(args) if args.name == "new-pane" => create(args),
+            Command::Unsupported(args) => reject(args),
+        }
+    "#;
+    let expected = BTreeSet::from(["new-session".to_owned(), "new-pane".to_owned()]);
+    assert_eq!(
+        extract_match_variant_commands_from_contents(dispatch, "match command", "Command::")?,
+        expected,
+    );
+    let missing_dispatch = dispatch.replace(
+        "Command::Unsupported(args) if args.name == \"new-pane\" => create(args),",
+        "",
+    );
+    let actual = extract_match_variant_commands_from_contents(
+        &missing_dispatch,
+        "match command",
+        "Command::",
+    )?;
+    assert_eq!(
+        expected
+            .difference(&actual)
+            .cloned()
+            .collect::<BTreeSet<_>>(),
+        BTreeSet::from(["new-pane".to_owned()]),
+    );
+    Ok(())
+}
+
 fn is_internal_command_variant(variant: &str) -> bool {
     matches!(
         variant,
-        "Noop" | "Unsupported" | "ApplyParseTimeAssignments"
+        "Noop" | "Unsupported" | "ApplyParseTimeAssignments" | "DeferredDimensionError"
     )
 }
 
@@ -510,9 +586,22 @@ fn extract_braced_block<'a>(contents: &'a str, anchor: &str) -> Result<&'a str, 
 fn extract_variant_name(line: &str) -> Option<String> {
     let variant: String = line
         .chars()
-        .take_while(|character| character.is_ascii_alphabetic())
+        .take_while(|character| character.is_ascii_alphanumeric())
         .collect();
     (!variant.is_empty()).then_some(variant)
+}
+
+#[test]
+fn command_surface_preserves_numeric_variant_suffixes() {
+    for (variant, name) in [
+        ("ExportWindowSnapshotV2", "export-window-snapshot-v2"),
+        ("RestoreWindowSnapshotV2", "restore-window-snapshot-v2"),
+    ] {
+        let line = format!("Command::{variant}(args) => run(args),");
+        let extracted = extract_prefixed_variant_name(&line, "Command::").unwrap();
+        assert_eq!(extracted, variant);
+        assert_eq!(public_command_name(&extracted), name);
+    }
 }
 
 fn extract_prefixed_variant_name(line: &str, prefix: &str) -> Option<String> {

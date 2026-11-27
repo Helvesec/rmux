@@ -519,6 +519,8 @@ async fn control_queue_new_session_rejects_same_name_replacement_before_attach()
                 );
             }
             ControlServerEvent::SessionChanged(None)
+            | ControlServerEvent::FormatSubscriptions(_)
+            | ControlServerEvent::PaneOutputActions(_)
             | ControlServerEvent::Refresh
             | ControlServerEvent::Exit(_) => {}
         }
@@ -581,7 +583,7 @@ async fn control_queue_new_session_attach_existing_rejects_same_name_replacement
             .await
             .sessions
             .session(&session_name)
-            .map(rmux_core::Session::id),
+            .map(|session| session.id()),
         Some(replacement_session_id),
         "replacement session survives"
     );
@@ -636,6 +638,8 @@ async fn control_queue_new_session_attach_existing_rejects_same_name_replacement
                 );
             }
             ControlServerEvent::SessionChanged(None)
+            | ControlServerEvent::FormatSubscriptions(_)
+            | ControlServerEvent::PaneOutputActions(_)
             | ControlServerEvent::Refresh
             | ControlServerEvent::Exit(_) => {}
         }
@@ -744,6 +748,8 @@ async fn control_queue_new_session_attach_existing_binds_captured_identity() {
                 saw_window_add |= line == format!("%window-add @{expected_window_id}");
             }
             ControlServerEvent::SessionChanged(None)
+            | ControlServerEvent::FormatSubscriptions(_)
+            | ControlServerEvent::PaneOutputActions(_)
             | ControlServerEvent::Refresh
             | ControlServerEvent::Exit(_) => {}
         }
@@ -767,7 +773,7 @@ async fn create_session(handler: &RequestHandler, session_name: SessionName) {
             environment: None,
         }))
         .await;
-    assert!(matches!(response, Response::NewSession(_)), "{response:?}");
+    crate::session_fixture::assert_new_session(&response);
 }
 
 async fn session_id(handler: &RequestHandler, session_name: &SessionName) -> rmux_proto::SessionId {

@@ -42,7 +42,7 @@ function Assert-RmuxHelperFallback {
     $result = Invoke-NativeCapture $Rmux @("--help")
     $output = $result.Output
     $status = $result.Status
-    if ($status -ne 0 -and $status -ne 1) {
+    if ($status -ne 0) {
         Fail "rmux --help failed with unexpected exit code $status`n$output"
     }
     if (($output -join "`n") -notmatch 'usage: rmux') {
@@ -53,6 +53,13 @@ function Assert-RmuxHelperFallback {
 # `--help` is intentionally outside the tiny direct path. It proves that the
 # installed public CLI can reach the complete command surface: directly for full
 # CLIs, or through the private helper for tiny dispatchers.
+if ($env:RMUX_FINAL_SMOKE_MANIFEST) {
+    if (-not $env:RMUX_FINAL_SMOKE_ROOT) { Fail "final smoke package root is required" }
+    $python = if ($env:RMUX_PYTHON) { $env:RMUX_PYTHON } else { "python3" }
+    & $python (Join-Path $PSScriptRoot "release/final_artifact_smoke.py") guard `
+        --manifest $env:RMUX_FINAL_SMOKE_MANIFEST --package-root $env:RMUX_FINAL_SMOKE_ROOT --binary $Rmux
+    if ($LASTEXITCODE -ne 0) { Fail "final artifact identity refused" }
+}
 Assert-RmuxHelperFallback
 $diagnoseJson = Invoke-RmuxSuccess @("diagnose", "--json")
 try {

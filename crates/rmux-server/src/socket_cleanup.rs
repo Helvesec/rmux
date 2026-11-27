@@ -34,6 +34,18 @@ impl SocketCleanup {
         self.armed = true;
     }
 
+    /// Unlinks the socket file of this generation now and leaves the lock
+    /// and shim cleanup armed for [`Self::cleanup_now`].
+    pub(crate) fn unlink_socket_now(&self) -> std::io::Result<bool> {
+        let Some(socket_identity) = self.socket_identity else {
+            return Ok(false);
+        };
+        crate::unix_socket::remove_socket_file_if_identity_matches(
+            &self.socket_path,
+            socket_identity,
+        )
+    }
+
     pub(crate) fn cleanup_now(&mut self) {
         if !self.armed {
             return;

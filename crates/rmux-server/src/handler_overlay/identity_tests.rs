@@ -23,7 +23,7 @@ async fn create_session(handler: &RequestHandler, name: &SessionName) {
             environment: None,
         }))
         .await;
-    assert!(matches!(response, Response::NewSession(_)), "{response:?}");
+    crate::session_fixture::assert_new_session(&response);
 }
 
 async fn attach(
@@ -48,6 +48,32 @@ async fn execute_overlay(
         .execute_parsed_commands_for_test(requester_pid, parsed)
         .await
         .map(|_| ())
+}
+
+// Keep popup command completion separate from inspecting its selected client.
+async fn open_popup_for_inspection(
+    handler: &RequestHandler,
+    requester_pid: u32,
+    selected_pid: u32,
+    command: String,
+) -> tokio::task::JoinHandle<Result<(), rmux_proto::RmuxError>> {
+    let task_handler = handler.clone();
+    let command =
+        tokio::spawn(async move { execute_overlay(&task_handler, requester_pid, &command).await });
+    loop {
+        let installed = {
+            let active_attach = handler.active_attach.lock().await;
+            matches!(
+                active_attach.by_pid[&selected_pid].overlay,
+                Some(ClientOverlayState::Popup(_))
+            )
+        };
+        if installed {
+            break;
+        }
+        tokio::task::yield_now().await;
+    }
+    command
 }
 
 async fn link_window(
@@ -102,22 +128,59 @@ async fn client_selector_and_explicit_pane_target_keep_distinct_identities() {
         .await
         .expect("menu cleanup");
 
-    execute_overlay(
-        &handler,
-        alpha_pid,
-        &format!("display-popup -N -c {beta_pid} -t {alpha}:0.0 -T Popup"),
+    let opened = timeout(
+        Duration::from_secs(2),
+        open_popup_for_inspection(
+            &handler,
+            alpha_pid,
+            beta_pid,
+            format!("display-popup -N -c {beta_pid} -t {alpha}:0.0 -T Popup"),
+        ),
     )
-    .await
-    .expect("popup opens on selected client");
-    let active_attach = handler.active_attach.lock().await;
-    let Some(ClientOverlayState::Popup(popup)) = active_attach.by_pid[&beta_pid].overlay.as_ref()
-    else {
-        panic!("selected client owns the popup");
-    };
-    assert_eq!(
-        popup.current_target,
-        rmux_proto::Target::Pane(PaneTarget::with_window(alpha, 0, 0))
+    .await;
+    if opened.is_err() {
+        let active_attach = handler.active_attach.lock().await;
+        eprintln!(
+            "POPUP_HELPER_STALL: beta_installed={} alpha_installed={}",
+            matches!(
+                active_attach.by_pid[&beta_pid].overlay,
+                Some(ClientOverlayState::Popup(_))
+            ),
+            active_attach.by_pid[&alpha_pid].overlay.is_some(),
+        );
+        drop(active_attach);
+        handler
+            .clear_interactive_overlay(beta_pid, true)
+            .await
+            .expect("popup cleanup after stall");
+    }
+    let popup_command =
+        opened.expect("popup helper must return after installation, before command completion");
+    assert!(
+        !popup_command.is_finished(),
+        "cross-client popup command waits for closure"
     );
+    {
+        let active_attach = handler.active_attach.lock().await;
+        let Some(ClientOverlayState::Popup(popup)) =
+            active_attach.by_pid[&beta_pid].overlay.as_ref()
+        else {
+            panic!("selected client owns the popup");
+        };
+        assert_eq!(
+            popup.current_target,
+            rmux_proto::Target::Pane(PaneTarget::with_window(alpha, 0, 0))
+        );
+    }
+    handler
+        .clear_interactive_overlay(beta_pid, true)
+        .await
+        .expect("popup cleanup");
+    timeout(Duration::from_secs(2), popup_command)
+        .await
+        .expect("popup command finishes after cleanup")
+        .expect("popup task does not panic")
+        .expect("popup opens on selected client");
 }
 
 #[tokio::test]

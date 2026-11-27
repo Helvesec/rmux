@@ -159,7 +159,7 @@ pub(super) fn strict_locator_error(
     query: String,
     snapshot: &PaneSnapshot,
 ) -> RmuxError {
-    RmuxError::protocol(rmux_proto::RmuxError::Server(format!(
+    RmuxError::from_proto(rmux_proto::RmuxError::Server(format!(
         "strict locator violation: expected 1 match, found {count}; locator: {query}; last visible screen:\n{}",
         snapshot.visible_text()
     )))

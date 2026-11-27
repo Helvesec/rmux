@@ -1,4 +1,6 @@
 use std::fs;
+#[path = "../../crates/rmux-os/src/build_identity/selected_program.rs"]
+mod build_identity;
 use std::io;
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -15,6 +17,11 @@ const LOCK_POLL_INTERVAL: Duration = Duration::from_millis(50);
 const LNK1104_RETRY_LIMIT: usize = 3;
 const PROCESS_BINARY_STALE_AFTER: Duration = Duration::from_secs(24 * 60 * 60);
 pub(crate) const PREBUILT_RMUX_BINARY_ENV: &str = "RMUX_WINDOWS_SMOKE_RMUX_BIN";
+
+#[allow(dead_code)]
+pub(crate) fn verify_binary(path: &Path) -> io::Result<PathBuf> {
+    build_identity::resolve(path.as_os_str())
+}
 #[allow(dead_code)]
 const PRIVATE_TARGET_DIR: &str = "rmux-windows-smoke-build";
 #[allow(dead_code)]
@@ -91,6 +98,7 @@ pub(crate) fn prebuilt_rmux_binary() -> io::Result<Option<PathBuf>> {
     };
     let path = PathBuf::from(value);
     if path.is_file() {
+        verify_binary(&path)?;
         return Ok(Some(path));
     }
     Err(io::Error::new(
@@ -107,6 +115,7 @@ pub(crate) fn copy_binary_for_current_process(
     source: &Path,
     parent_target_dir: &Path,
 ) -> io::Result<PathBuf> {
+    verify_binary(source)?;
     let destination_dir = parent_target_dir.join("debug").join(PROCESS_BINARY_DIR);
     fs::create_dir_all(&destination_dir)?;
     cleanup_stale_process_binaries(&destination_dir);
@@ -117,6 +126,7 @@ pub(crate) fn copy_binary_for_current_process(
         .as_nanos();
     let destination = destination_dir.join(format!("rmux-{}-{suffix}.exe", process::id()));
     fs::copy(source, &destination)?;
+    verify_binary(&destination)?;
     Ok(destination)
 }
 
@@ -128,7 +138,8 @@ where
     F: FnMut() -> process::Command,
 {
     for attempt in 0..=LNK1104_RETRY_LIMIT {
-        let output = make_command().output()?;
+        // The test's build output belongs to the parent crate, not this build.
+        let output = make_command().env_remove("OUT_DIR").output()?;
         if output.status.success()
             || !output_contains_lnk1104(&output)
             || attempt == LNK1104_RETRY_LIMIT
@@ -196,6 +207,47 @@ fn cleanup_stale_process_binaries(destination_dir: &Path) {
 fn output_contains_lnk1104(output: &process::Output) -> bool {
     String::from_utf8_lossy(&output.stdout).contains("LNK1104")
         || String::from_utf8_lossy(&output.stderr).contains("LNK1104")
+}
+
+#[cfg(all(test, windows))]
+#[test]
+fn nested_cargo_does_not_inherit_parent_output_on_retry() {
+    const CHILD: &str = "RMUX_TEST_WINDOWS_CARGO_OUTPUT_CHILD";
+    if std::env::var_os(CHILD).is_some() {
+        let shell = PathBuf::from(std::env::var_os("SystemRoot").unwrap())
+            .join("System32")
+            .join("cmd.exe");
+        let mut attempts = 0;
+        let output = run_cargo_build_with_lnk1104_retry(|| {
+            attempts += 1;
+            let mut command = process::Command::new(&shell);
+            command.args(["/D", "/C"]);
+            command.arg(if attempts == 1 {
+                "if defined OUT_DIR (exit /b 86) else (echo LNK1104 & exit /b 1)"
+            } else {
+                "if defined OUT_DIR (exit /b 86) else (exit /b 0)"
+            });
+            command
+        })
+        .unwrap();
+        assert!(output.status.success(), "{output:?}");
+        assert_eq!(
+            attempts, 2,
+            "the environment must be isolated on every retry"
+        );
+        return;
+    }
+
+    let thread = thread::current();
+    let executable = std::env::current_exe().unwrap();
+    let executable = build_identity::resolve(executable.as_os_str()).unwrap();
+    let output = process::Command::new(executable)
+        .args(["--exact", thread.name().unwrap(), "--nocapture"])
+        .env(CHILD, "1")
+        .env("OUT_DIR", "parent-build-output")
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "{output:?}");
 }
 
 impl Drop for WindowsCargoBuildGuard {

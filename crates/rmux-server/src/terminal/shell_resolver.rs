@@ -5,6 +5,8 @@ use std::env;
 use std::ffi::{OsStr, OsString};
 #[cfg(unix)]
 use std::fs;
+#[cfg(windows)]
+use std::os::windows::ffi::{OsStrExt, OsStringExt};
 use std::path::{Path, PathBuf};
 
 use rmux_core::OptionStore;
@@ -55,18 +57,49 @@ pub(crate) fn is_suitable_shell(path: &Path) -> bool {
     metadata.is_file() && access(path, Access::EXEC_OK).is_ok()
 }
 
+#[cfg(unix)]
+pub(super) fn resolve_profile_shell(
+    options: &OptionStore,
+    session_name: Option<&SessionName>,
+    environment: &HashMap<String, String>,
+    _current_dir: &Path,
+) -> PathBuf {
+    resolve_shell_path(options, session_name, environment)
+}
+
+#[cfg(windows)]
+pub(super) fn resolve_profile_shell(
+    options: &OptionStore,
+    session_name: Option<&SessionName>,
+    environment: &HashMap<String, String>,
+    current_dir: &Path,
+) -> PathBuf {
+    resolve_windows_shell_path(options, session_name, environment, Some(current_dir))
+}
+
 #[cfg(windows)]
 pub(super) fn resolve_shell_path(
     options: &OptionStore,
     session_name: Option<&SessionName>,
     environment: &HashMap<String, String>,
 ) -> PathBuf {
-    explicit_default_shell(options, session_name)
+    resolve_windows_shell_path(options, session_name, environment, None)
+}
+
+#[cfg(windows)]
+fn resolve_windows_shell_path(
+    options: &OptionStore,
+    session_name: Option<&SessionName>,
+    environment: &HashMap<String, String>,
+    current_dir: Option<&Path>,
+) -> PathBuf {
+    let shell = explicit_default_shell(options, session_name)
         .map(PathBuf::from)
-        .map(|path| resolve_program_path(&path, environment))
+        .map(|path| resolve_program_path_with_base(&path, environment, current_dir))
         .filter(|path| path.is_file())
         .or_else(|| inherited_client_shell(environment))
-        .unwrap_or_else(|| default_shell_path(environment))
+        .unwrap_or_else(|| default_shell_path(environment));
+    normalize_windows_shell_execution_path(shell)
 }
 
 #[cfg(windows)]
@@ -98,6 +131,33 @@ pub(super) fn resolve_program_path_from(
 pub(super) fn normalize_shell_path(path: PathBuf) -> PathBuf {
     let environment = env::vars().collect::<HashMap<_, _>>();
     resolve_program_path(&path, &environment)
+}
+
+#[cfg(windows)]
+fn normalize_windows_shell_execution_path(path: PathBuf) -> PathBuf {
+    const FORWARD_SLASH: u16 = b'/' as u16;
+    const BACKSLASH: u16 = b'\\' as u16;
+
+    if !path
+        .as_os_str()
+        .encode_wide()
+        .any(|unit| unit == FORWARD_SLASH)
+    {
+        return path;
+    }
+
+    let units = path
+        .as_os_str()
+        .encode_wide()
+        .map(|unit| {
+            if unit == FORWARD_SLASH {
+                BACKSLASH
+            } else {
+                unit
+            }
+        })
+        .collect::<Vec<_>>();
+    PathBuf::from(OsString::from_wide(&units))
 }
 
 #[cfg(windows)]
@@ -271,24 +331,9 @@ fn append_extension(path: &Path, extension: &OsStr) -> PathBuf {
 
 #[cfg(unix)]
 fn current_user_login_shell() -> Option<PathBuf> {
-    let uid = getuid().as_raw();
-    fs::read_to_string("/etc/passwd")
-        .ok()?
-        .lines()
-        .find_map(|line| passwd_shell_for_uid(line, uid))
-}
-
-#[cfg(unix)]
-fn passwd_shell_for_uid(line: &str, uid: u32) -> Option<PathBuf> {
-    let mut fields = line.split(':');
-    let _name = fields.next()?;
-    let _password = fields.next()?;
-    let parsed_uid = fields.next()?.parse::<u32>().ok()?;
-    let _gid = fields.next()?;
-    let _gecos = fields.next()?;
-    let _home = fields.next()?;
-    let shell = fields.next()?;
-    (parsed_uid == uid && !shell.is_empty()).then(|| PathBuf::from(shell))
+    rmux_os::identity::IdentityResolver::unix_login_shell_by_uid(getuid().as_raw())
+        .ok()
+        .flatten()
 }
 
 #[cfg(unix)]
@@ -374,6 +419,45 @@ mod unix_tests {
     }
 
     #[test]
+    fn absent_shell_environment_uses_the_account_database_login_shell() {
+        let expected = account_database_login_shell();
+        assert!(is_suitable_shell(&expected), "{expected:?}");
+
+        let resolved = resolve_shell_path(&OptionStore::new(), None, &HashMap::new());
+
+        assert_eq!(resolved, normalize_shell_path(expected));
+    }
+
+    /// Reads the current account's login shell through the platform account
+    /// database tool, independently of RMUX's own lookup. macOS accounts live
+    /// in Directory Services rather than `/etc/passwd`.
+    fn account_database_login_shell() -> PathBuf {
+        let uid = getuid().as_raw().to_string();
+        let record = [
+            ("/usr/bin/getent", vec!["passwd", uid.as_str()]),
+            ("/usr/bin/id", vec!["-P", uid.as_str()]),
+        ]
+        .into_iter()
+        .filter(|(program, _)| Path::new(program).is_file())
+        .find_map(|(program, arguments)| {
+            let output = std::process::Command::new(program)
+                .args(arguments)
+                .output()
+                .ok()?;
+            output
+                .status
+                .success()
+                .then(|| String::from_utf8_lossy(&output.stdout).trim().to_owned())
+        })
+        .expect("getent or id reports the current account record");
+        let shell = record
+            .rsplit(':')
+            .next()
+            .expect("account record has a shell field");
+        PathBuf::from(shell)
+    }
+
+    #[test]
     fn invalid_stored_default_shell_falls_back_to_the_session_environment() {
         let mut options = OptionStore::new();
         options
@@ -394,255 +478,5 @@ mod unix_tests {
 }
 
 #[cfg(all(test, windows))]
-mod tests {
-    use super::*;
-    use std::ffi::OsStr;
-    use std::fs;
-
-    #[test]
-    fn search_path_skips_windowsapps_alias_candidates() {
-        let root = unique_test_dir("windowsapps-alias");
-        let windows_apps = root.join("Microsoft").join("WindowsApps");
-        let regular_bin = root.join("regular-bin");
-        fs::create_dir_all(&windows_apps).expect("windowsapps test directory");
-        fs::create_dir_all(&regular_bin).expect("regular test directory");
-        fs::write(windows_apps.join("pwsh.exe"), b"").expect("windowsapps pwsh fixture");
-        fs::write(regular_bin.join("pwsh.exe"), b"").expect("regular pwsh fixture");
-        let path = env::join_paths([windows_apps.as_os_str(), regular_bin.as_os_str()])
-            .expect("joined PATH");
-
-        let resolved = search_path_in(
-            Path::new("pwsh.exe"),
-            path.as_os_str(),
-            Some(OsStr::new(".EXE")),
-        )
-        .expect("regular pwsh should resolve");
-
-        assert_eq!(resolved, regular_bin.join("pwsh.exe"));
-        let _ = fs::remove_dir_all(root);
-    }
-
-    #[test]
-    fn search_path_rejects_only_windowsapps_alias_candidates() {
-        let root = unique_test_dir("only-windowsapps");
-        let windows_apps = root.join("Microsoft").join("WindowsApps");
-        fs::create_dir_all(&windows_apps).expect("windowsapps test directory");
-        fs::write(windows_apps.join("pwsh.exe"), b"").expect("windowsapps pwsh fixture");
-        let path = env::join_paths([windows_apps.as_os_str()]).expect("joined PATH");
-
-        let resolved = search_path_in(
-            Path::new("pwsh.exe"),
-            path.as_os_str(),
-            Some(OsStr::new(".EXE")),
-        );
-
-        assert_eq!(resolved, None);
-        let _ = fs::remove_dir_all(root);
-    }
-
-    #[test]
-    fn search_path_allows_packaged_windowsapps_executables() {
-        let root = unique_test_dir("packaged-windowsapps");
-        let packaged = root
-            .join("Program Files")
-            .join("WindowsApps")
-            .join("Microsoft.PowerShell_7.6.1.0_x64__8wekyb3d8bbwe");
-        fs::create_dir_all(&packaged).expect("packaged windowsapps test directory");
-        fs::write(packaged.join("pwsh.exe"), b"").expect("packaged pwsh fixture");
-        let path = env::join_paths([packaged.as_os_str()]).expect("joined PATH");
-
-        let resolved = search_path_in(
-            Path::new("pwsh.exe"),
-            path.as_os_str(),
-            Some(OsStr::new(".EXE")),
-        )
-        .expect("packaged pwsh should resolve");
-
-        assert_eq!(resolved, packaged.join("pwsh.exe"));
-        let _ = fs::remove_dir_all(root);
-    }
-
-    #[test]
-    fn resolve_program_path_uses_effective_environment_path_case_insensitively() {
-        let root = unique_test_dir("effective-path");
-        let bin = root.join("bin");
-        fs::create_dir_all(&bin).expect("bin test directory");
-        fs::write(bin.join("rmux-probe.exe"), b"").expect("probe fixture");
-        let path = env::join_paths([bin.as_os_str()]).expect("joined PATH");
-        let environment = HashMap::from([
-            ("Path".to_owned(), path.to_string_lossy().into_owned()),
-            ("PATHEXT".to_owned(), ".EXE".to_owned()),
-        ]);
-
-        let resolved = resolve_program_path(Path::new("rmux-probe"), &environment);
-
-        assert_eq!(resolved, bin.join("rmux-probe.EXE"));
-        let _ = fs::remove_dir_all(root);
-    }
-
-    #[test]
-    fn resolve_program_path_uses_child_cwd_for_relative_path_entries() {
-        let root = unique_test_dir("relative-effective-path");
-        let bin = root.join("bin");
-        fs::create_dir_all(&bin).expect("bin test directory");
-        fs::write(bin.join("rmux-probe.exe"), b"").expect("probe fixture");
-        let environment = HashMap::from([
-            ("PATH".to_owned(), "bin".to_owned()),
-            ("PATHEXT".to_owned(), ".EXE".to_owned()),
-        ]);
-
-        let resolved = resolve_program_path_from(Path::new("rmux-probe"), &environment, &root);
-
-        assert_eq!(resolved, bin.join("rmux-probe.EXE"));
-        let _ = fs::remove_dir_all(root);
-    }
-
-    #[test]
-    fn resolve_program_path_completes_explicit_paths_from_child_cwd_and_pathext() {
-        let root = unique_test_dir("explicit-pathext");
-        let bin = root.join("bin");
-        fs::create_dir_all(&bin).expect("bin test directory");
-        let absolute = bin.join("absolute-shim.CMD");
-        let relative = bin.join("relative-shim.BAT");
-        fs::write(&absolute, b"").expect("absolute batch fixture");
-        fs::write(&relative, b"").expect("relative batch fixture");
-        let environment = HashMap::from([("PATHEXT".to_owned(), "CMD;.BAT".to_owned())]);
-
-        let resolved_absolute = resolve_program_path_from(
-            &bin.join("absolute-shim"),
-            &environment,
-            Path::new(r"C:\ignored-for-absolute-path"),
-        );
-        let resolved_relative = resolve_program_path_from(
-            &PathBuf::from("bin").join("relative-shim"),
-            &environment,
-            &root,
-        );
-
-        assert_eq!(resolved_absolute, absolute);
-        assert_eq!(resolved_relative, relative);
-        let _ = fs::remove_dir_all(root);
-    }
-
-    #[test]
-    fn explicit_default_shell_uses_effective_environment_path() {
-        let root = unique_test_dir("default-shell-path");
-        let bin = root.join("bin");
-        fs::create_dir_all(&bin).expect("bin test directory");
-        fs::write(bin.join("custom-shell.exe"), b"").expect("custom shell fixture");
-        let path = env::join_paths([bin.as_os_str()]).expect("joined PATH");
-        let environment = HashMap::from([
-            ("PATH".to_owned(), path.to_string_lossy().into_owned()),
-            ("PATHEXT".to_owned(), ".EXE".to_owned()),
-        ]);
-        let mut options = OptionStore::new();
-        options
-            .set(
-                rmux_proto::ScopeSelector::Global,
-                OptionName::DefaultShell,
-                "custom-shell".to_owned(),
-                rmux_proto::SetOptionMode::Replace,
-            )
-            .expect("default-shell set succeeds");
-
-        let resolved = resolve_shell_path(&options, None, &environment);
-
-        assert_eq!(resolved, bin.join("custom-shell.EXE"));
-        let _ = fs::remove_dir_all(root);
-    }
-
-    #[test]
-    fn inherited_client_shell_hint_is_used_when_default_shell_is_unset() {
-        let environment = HashMap::from([(CLIENT_SHELL_ENV.to_owned(), "cmd.exe".to_owned())]);
-        let options = OptionStore::new();
-
-        let resolved = resolve_shell_path(&options, None, &environment);
-        let leaf = resolved
-            .file_name()
-            .expect("resolved shell has a leaf")
-            .to_string_lossy()
-            .to_ascii_lowercase();
-
-        assert_eq!(leaf, "cmd.exe");
-    }
-
-    #[test]
-    fn alias_only_client_shell_hint_falls_back_instead_of_retaining_bare_name() {
-        let root = unique_test_dir("client-shell-alias");
-        let windows_apps = root.join("Microsoft").join("WindowsApps");
-        let cmd = root.join("cmd.exe");
-        fs::create_dir_all(&windows_apps).expect("WindowsApps test directory");
-        fs::write(windows_apps.join("pwsh.exe"), b"").expect("alias pwsh fixture");
-        fs::write(&cmd, b"").expect("cmd fixture");
-        let path = env::join_paths([windows_apps.as_os_str()]).expect("alias-only PATH");
-        let environment = HashMap::from([
-            (CLIENT_SHELL_ENV.to_owned(), "pwsh.exe".to_owned()),
-            ("PATH".to_owned(), path.to_string_lossy().into_owned()),
-            ("PATHEXT".to_owned(), ".EXE".to_owned()),
-            ("COMSPEC".to_owned(), cmd.to_string_lossy().into_owned()),
-        ]);
-
-        let resolved = resolve_shell_path(&OptionStore::new(), None, &environment);
-
-        assert_eq!(resolved, cmd);
-        let _ = fs::remove_dir_all(root);
-    }
-
-    #[test]
-    fn explicit_default_shell_overrides_inherited_client_shell_hint() {
-        let environment =
-            HashMap::from([(CLIENT_SHELL_ENV.to_owned(), "powershell.exe".to_owned())]);
-        let mut options = OptionStore::new();
-        options
-            .set(
-                rmux_proto::ScopeSelector::Global,
-                OptionName::DefaultShell,
-                "cmd.exe".to_owned(),
-                rmux_proto::SetOptionMode::Replace,
-            )
-            .expect("default-shell set succeeds");
-
-        let resolved = resolve_shell_path(&options, None, &environment);
-        let leaf = resolved
-            .file_name()
-            .expect("resolved shell has a leaf")
-            .to_string_lossy()
-            .to_ascii_lowercase();
-
-        assert_eq!(leaf, "cmd.exe");
-    }
-
-    #[test]
-    fn invalid_explicit_default_shell_falls_back_to_inherited_client_shell() {
-        let environment = HashMap::from([(CLIENT_SHELL_ENV.to_owned(), "cmd.exe".to_owned())]);
-        let mut options = OptionStore::new();
-        options
-            .set(
-                rmux_proto::ScopeSelector::Global,
-                OptionName::DefaultShell,
-                r"C:\definitely\missing\rmux-shell.exe".to_owned(),
-                rmux_proto::SetOptionMode::Replace,
-            )
-            .expect("default-shell set succeeds");
-
-        let resolved = resolve_shell_path(&options, None, &environment);
-
-        assert_eq!(
-            resolved
-                .file_name()
-                .expect("fallback shell has a leaf")
-                .to_string_lossy()
-                .to_ascii_lowercase(),
-            "cmd.exe"
-        );
-    }
-
-    fn unique_test_dir(label: &str) -> PathBuf {
-        let path = env::temp_dir().join(format!(
-            "rmux-shell-resolver-{label}-{}",
-            std::process::id()
-        ));
-        let _ = fs::remove_dir_all(&path);
-        path
-    }
-}
+#[path = "shell_resolver/windows_tests.rs"]
+mod tests;

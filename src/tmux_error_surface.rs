@@ -42,9 +42,6 @@ pub(crate) fn tmux_cli_error_message(command_name: &str, error: &RmuxError) -> S
                 .map(|index| format!("index in use: {index}"))
                 .unwrap_or_else(|| error.to_string())
         }
-        RmuxError::InvalidTarget { reason, .. } if reason.starts_with("can't find ") => {
-            reason.clone()
-        }
         RmuxError::SessionNotFound(session_name) if command_name == "kill-session" => {
             format!("can't find session: {session_name}")
         }
@@ -54,7 +51,9 @@ pub(crate) fn tmux_cli_error_message(command_name: &str, error: &RmuxError) -> S
             message.clone()
         }
         RmuxError::InvalidSetOption(message)
-            if message.starts_with("value is ") || message.starts_with("invalid style: ") =>
+            if message.starts_with("value is ")
+                || message.starts_with("invalid style: ")
+                || message.starts_with("not an array: ") =>
         {
             message.clone()
         }
@@ -62,7 +61,9 @@ pub(crate) fn tmux_cli_error_message(command_name: &str, error: &RmuxError) -> S
             if message
                 .strip_prefix("invalid set-option request: ")
                 .is_some_and(|message| {
-                    message.starts_with("value is ") || message.starts_with("invalid style: ")
+                    message.starts_with("value is ")
+                        || message.starts_with("invalid style: ")
+                        || message.starts_with("not an array: ")
                 }) =>
         {
             message
@@ -84,7 +85,9 @@ pub(crate) fn tmux_cli_error_message(command_name: &str, error: &RmuxError) -> S
             if message
                 .strip_prefix("invalid set-option request: ")
                 .is_some_and(|message| {
-                    message.starts_with("value is ") || message.starts_with("invalid style: ")
+                    message.starts_with("value is ")
+                        || message.starts_with("invalid style: ")
+                        || message.starts_with("not an array: ")
                 }) =>
         {
             message
@@ -99,8 +102,7 @@ pub(crate) fn tmux_cli_error_message(command_name: &str, error: &RmuxError) -> S
                 message.clone()
             }
         }
-        RmuxError::Server(message) => message.clone(),
-        _ => error.to_string(),
+        _ => error.tmux_message(),
     }
 }
 
@@ -161,6 +163,21 @@ fn io_error_message_without_code(error: &std::io::Error) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn indexed_scalar_error_preserves_the_original_name_on_all_option_surfaces() {
+        let message = "not an array: window-status-f[00]";
+        for command in ["set-option", "set-window-option"] {
+            for error in [
+                RmuxError::InvalidSetOption(message.into()),
+                RmuxError::InvalidSetOption(format!("invalid set-option request: {message}")),
+                RmuxError::Server(format!("invalid set-option request: {message}")),
+                RmuxError::Message(format!("invalid set-option request: {message}")),
+            ] {
+                assert_eq!(tmux_cli_error_message(command, &error), message);
+            }
+        }
+    }
 
     #[test]
     fn source_file_line_prefix_accepts_windows_drive_paths() {

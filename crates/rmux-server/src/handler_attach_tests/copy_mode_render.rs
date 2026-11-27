@@ -153,9 +153,11 @@ async fn attached_copy_mode_u_attach_render_matches_mode_capture_source() {
         frame.contains("mode-render-03"),
         "attached refresh should include the same copy-mode backing content, got {frame:?}"
     );
-    assert!(
-        mode_capture.contains("mode-render-03"),
-        "mode capture should include the copy-mode backing content, got {mode_capture:?}"
+    // tmux 3.7b captures the bottom of the copy-mode backing, not the
+    // scrolled rows the attached frame shows.
+    assert_eq!(
+        mode_capture,
+        "mode-render-04\nmode-render-05\nmode-render-06\nmode-render-07\nmode-render-08\n\n"
     );
 }
 
@@ -307,6 +309,7 @@ async fn attached_mouse_drag_copy_mode_refresh_keeps_prompt_visible() {
         .get_mut(&requester_pid)
         .expect("attached client exists");
     active.mouse.current_event = Some(AttachedMouseEvent {
+        coordinates: None,
         raw: MouseForwardEvent {
             b: 32,
             lb: 0,

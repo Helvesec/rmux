@@ -33,8 +33,13 @@ hash_file() {
   algo="$1"
   file="$2"
   case "$algo" in
-    md5) md5sum "$file" | awk '{print $1}' ;;
-    sha256) sha256sum "$file" | awk '{print $1}' ;;
+    md5|sha256)
+      if command -v "${algo}sum" >/dev/null 2>&1; then
+        "${algo}sum" < "$file" | awk '{print $1}'
+      else
+        openssl dgst "-$algo" < "$file" | awk '{print $NF}'
+      fi
+      ;;
     *) die "unsupported hash: $algo" ;;
   esac
 }
@@ -484,8 +489,11 @@ for architecture in "${architectures[@]}"; do
   case "$architecture" in *[!A-Za-z0-9_-]*|"") die "invalid architecture: $architecture" ;; esac
 done
 
-for command in awk basename cat cmp cp date dirname dpkg-deb find gzip md5sum mkdir readlink rm sha256sum sort tr wc; do
+for command in awk basename cat cmp cp date dirname dpkg-deb find gzip mkdir readlink rm sort tr wc; do
   need "$command"
+done
+for algorithm in md5 sha256; do
+  command -v "${algorithm}sum" >/dev/null 2>&1 || need openssl
 done
 if [ -n "$signing_key" ]; then
   need gpg

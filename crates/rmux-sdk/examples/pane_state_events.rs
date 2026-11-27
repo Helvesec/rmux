@@ -1,11 +1,11 @@
-use rmux_sdk::{EnsureSession, PaneStateEvent, PaneStateEventsOptions, Rmux, SessionName};
+use rmux_sdk::{EnsureSession, PaneStateEvent, PaneStateEventsOptions, Rmux};
 
 #[tokio::main]
 async fn main() -> rmux_sdk::Result<()> {
     let rmux = Rmux::builder().connect_or_start().await?;
     let session = rmux
         .ensure_session(
-            EnsureSession::try_named(SessionName::new("pane-state-events")?)?
+            EnsureSession::try_named("pane-state-events")?
                 .create_or_reuse()
                 .detached(true),
         )

@@ -15,7 +15,7 @@ pub(crate) struct ChooseTreeArgs {
     #[arg(short = 'w', action = ArgAction::SetTrue)]
     pub(crate) windows_collapsed: bool,
     #[arg(short = 'y', action = ArgAction::SetTrue, hide = true)]
-    unsupported_auto_accept: bool,
+    pub(crate) auto_accept: bool,
     #[arg(short = 'Z', action = ArgAction::SetTrue)]
     pub(crate) zoom: bool,
     #[arg(short = 'F', allow_hyphen_values = true)]
@@ -36,9 +36,6 @@ pub(crate) struct ChooseTreeArgs {
 
 impl ChooseTreeArgs {
     pub(crate) fn validate(self) -> Result<Self, clap::Error> {
-        if self.unsupported_auto_accept {
-            return Err(unknown_flag_error("choose-tree", "-y"));
-        }
         Ok(self)
     }
 }
@@ -50,7 +47,7 @@ pub(crate) struct ChooseBufferArgs {
     #[arg(short = 'r', action = ArgAction::SetTrue)]
     pub(crate) reversed: bool,
     #[arg(short = 'y', action = ArgAction::SetTrue, hide = true)]
-    unsupported_auto_accept: bool,
+    pub(crate) auto_accept: bool,
     #[arg(short = 'Z', action = ArgAction::SetTrue)]
     pub(crate) zoom: bool,
     #[arg(short = 'F', allow_hyphen_values = true)]
@@ -71,9 +68,6 @@ pub(crate) struct ChooseBufferArgs {
 
 impl ChooseBufferArgs {
     pub(crate) fn validate(self) -> Result<Self, clap::Error> {
-        if self.unsupported_auto_accept {
-            return Err(unknown_flag_error("choose-buffer", "-y"));
-        }
         Ok(self)
     }
 }
@@ -85,7 +79,7 @@ pub(crate) struct ChooseClientArgs {
     #[arg(short = 'r', action = ArgAction::SetTrue)]
     pub(crate) reversed: bool,
     #[arg(short = 'y', action = ArgAction::SetTrue, hide = true)]
-    unsupported_auto_accept: bool,
+    pub(crate) auto_accept: bool,
     #[arg(short = 'Z', action = ArgAction::SetTrue)]
     pub(crate) zoom: bool,
     #[arg(short = 'F', allow_hyphen_values = true)]
@@ -106,9 +100,6 @@ pub(crate) struct ChooseClientArgs {
 
 impl ChooseClientArgs {
     pub(crate) fn validate(self) -> Result<Self, clap::Error> {
-        if self.unsupported_auto_accept {
-            return Err(unknown_flag_error("choose-client", "-y"));
-        }
         Ok(self)
     }
 }
@@ -151,11 +142,4 @@ impl QueuedCommand for CustomizeModeArgs {
     fn set_queue_command(&mut self, queue_command: String) {
         self.queue_command = queue_command;
     }
-}
-
-fn unknown_flag_error(command_name: &str, flag: &str) -> clap::Error {
-    clap::Error::raw(
-        clap::error::ErrorKind::UnknownArgument,
-        format!("command {command_name}: unknown flag {flag}"),
-    )
 }

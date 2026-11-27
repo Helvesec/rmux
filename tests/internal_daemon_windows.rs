@@ -13,6 +13,10 @@ use rmux_client::{
 };
 use rmux_proto::{KillServerRequest, ListSessionsRequest, Request, Response};
 
+#[path = "support/startup_stderr.rs"]
+mod startup_stderr;
+use startup_stderr::assert_startup_output;
+
 const BINARY_OVERRIDE_ENV: &str = "RMUX_INTERNAL_BINARY_PATH";
 const BINARY_OVERRIDE_TEST_OPT_IN_ENV: &str = "RMUX_ALLOW_INTERNAL_BINARY_OVERRIDE";
 const CLIENT_VERSION_OVERRIDE_ENV: &str = "RMUX_INTERNAL_CLIENT_VERSION";
@@ -25,13 +29,15 @@ const WINDOWS_DAEMON_EXIT_TIMEOUT: Duration = Duration::from_secs(20);
 fn hidden_daemon_mode_serves_windows_ipc_requests() -> Result<(), Box<dyn Error>> {
     let socket_path =
         socket_path_for_label(format!("hidden-daemon-windows-{}", std::process::id()))?;
-    let mut child = Command::new(env!("CARGO_BIN_EXE_rmux"))
-        .arg(INTERNAL_DAEMON_FLAG)
-        .arg(&socket_path)
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()?;
+    let mut child = Command::new(rmux_os::build_identity::cargo_binary(env!(
+        "CARGO_BIN_EXE_rmux"
+    )))
+    .arg(INTERNAL_DAEMON_FLAG)
+    .arg(&socket_path)
+    .stdin(Stdio::null())
+    .stdout(Stdio::null())
+    .stderr(Stdio::null())
+    .spawn()?;
 
     let mut connection = match wait_for_connection(&socket_path, &mut child) {
         Ok(connection) => connection,
@@ -68,7 +74,10 @@ fn ensure_server_running_auto_starts_windows_hidden_daemon() -> Result<(), Box<d
     let previous_opt_in = std::env::var_os(BINARY_OVERRIDE_TEST_OPT_IN_ENV);
     let _binary_restore = EnvVarGuard::new(BINARY_OVERRIDE_ENV, previous_binary);
     let _opt_in_restore = EnvVarGuard::new(BINARY_OVERRIDE_TEST_OPT_IN_ENV, previous_opt_in);
-    std::env::set_var(BINARY_OVERRIDE_ENV, env!("CARGO_BIN_EXE_rmux"));
+    std::env::set_var(
+        BINARY_OVERRIDE_ENV,
+        rmux_os::build_identity::cargo_binary(env!("CARGO_BIN_EXE_rmux")),
+    );
     std::env::set_var(BINARY_OVERRIDE_TEST_OPT_IN_ENV, "1");
     let socket_path = socket_path_for_label(format!("auto-start-windows-{}", std::process::id()))?;
 
@@ -97,15 +106,12 @@ fn attach_session_cleans_up_only_daemon_started_by_command_windows() -> Result<(
             std::process::id()
         ))?;
         let output = run_rmux_command_with_auto_start_binary(&socket_path, args)?;
+        assert_startup_output(&output, 1, b"no sessions\n", true);
         assert_eq!(
             output.status.code(),
             Some(1),
             "attach-session should reject an empty daemon: stderr={}",
             String::from_utf8_lossy(&output.stderr)
-        );
-        assert_eq!(
-            String::from_utf8_lossy(&output.stderr).trim(),
-            "no sessions"
         );
         wait_for_daemon_process_absent(&socket_path)?;
     }
@@ -143,15 +149,12 @@ fn attach_session_preserves_preexisting_empty_windows_daemon_and_state(
         &["attach-session", ";", "list-sessions"][..],
     ] {
         let output = run_rmux_command(&socket_path, args)?;
+        assert_startup_output(&output, 1, b"no sessions\n", false);
         assert_eq!(
             output.status.code(),
             Some(1),
             "attach-session should reject an empty daemon: stderr={}",
             String::from_utf8_lossy(&output.stderr)
-        );
-        assert_eq!(
-            String::from_utf8_lossy(&output.stderr).trim(),
-            "no sessions"
         );
         assert!(
             daemon.try_wait()?.is_none(),
@@ -185,7 +188,10 @@ fn start_server_with_captured_output_returns_after_empty_windows_daemon_exits(
     let previous_opt_in = std::env::var_os(BINARY_OVERRIDE_TEST_OPT_IN_ENV);
     let _binary_restore = EnvVarGuard::new(BINARY_OVERRIDE_ENV, previous_binary);
     let _opt_in_restore = EnvVarGuard::new(BINARY_OVERRIDE_TEST_OPT_IN_ENV, previous_opt_in);
-    std::env::set_var(BINARY_OVERRIDE_ENV, env!("CARGO_BIN_EXE_rmux"));
+    std::env::set_var(
+        BINARY_OVERRIDE_ENV,
+        rmux_os::build_identity::cargo_binary(env!("CARGO_BIN_EXE_rmux")),
+    );
     std::env::set_var(BINARY_OVERRIDE_TEST_OPT_IN_ENV, "1");
 
     let socket_path = socket_path_for_label(format!(
@@ -196,6 +202,7 @@ fn start_server_with_captured_output_returns_after_empty_windows_daemon_exits(
         &socket_path,
         &["start-server", ";", "display-message", "-p", "#{pid}"],
     )?;
+    assert_startup_output(&output, 0, b"", true);
     assert!(
         output.status.success(),
         "captured start-server failed: status={:?}\nstdout={}\nstderr={}",
@@ -203,7 +210,6 @@ fn start_server_with_captured_output_returns_after_empty_windows_daemon_exits(
         String::from_utf8_lossy(&output.stdout),
         String::from_utf8_lossy(&output.stderr)
     );
-    assert!(output.stderr.is_empty());
     let daemon_pid = String::from_utf8_lossy(&output.stdout)
         .trim()
         .parse::<u32>()
@@ -373,25 +379,32 @@ fn seamless_upgrade_preserves_active_stale_windows_daemon() -> Result<(), Box<dy
 }
 
 fn spawn_hidden_daemon(socket_path: &Path) -> Result<Child, Box<dyn Error>> {
-    Ok(Command::new(env!("CARGO_BIN_EXE_rmux"))
-        .arg(INTERNAL_DAEMON_FLAG)
-        .arg(socket_path)
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()?)
+    Ok(Command::new(rmux_os::build_identity::cargo_binary(env!(
+        "CARGO_BIN_EXE_rmux"
+    )))
+    .arg(INTERNAL_DAEMON_FLAG)
+    .arg(socket_path)
+    .stdin(Stdio::null())
+    .stdout(Stdio::null())
+    .stderr(Stdio::null())
+    .spawn()?)
 }
 
 fn run_client_as_newer_version(
     socket_path: &Path,
     args: &[&str],
 ) -> Result<ExitStatus, Box<dyn Error>> {
-    let mut command = Command::new(env!("CARGO_BIN_EXE_rmux"));
+    let mut command = Command::new(rmux_os::build_identity::cargo_binary(env!(
+        "CARGO_BIN_EXE_rmux"
+    )));
     command
         .arg("-S")
         .arg(socket_path)
         .args(args)
-        .env(BINARY_OVERRIDE_ENV, env!("CARGO_BIN_EXE_rmux"))
+        .env(
+            BINARY_OVERRIDE_ENV,
+            rmux_os::build_identity::cargo_binary(env!("CARGO_BIN_EXE_rmux")),
+        )
         .env(BINARY_OVERRIDE_TEST_OPT_IN_ENV, "1")
         .env(CLIENT_VERSION_OVERRIDE_ENV, "999.0.0-test")
         .env(CALLER_JOB_TEST_OPT_IN_ENV, "1");
@@ -399,7 +412,9 @@ fn run_client_as_newer_version(
 }
 
 fn run_rmux_command(socket_path: &Path, args: &[&str]) -> Result<Output, Box<dyn Error>> {
-    let mut command = Command::new(env!("CARGO_BIN_EXE_rmux"));
+    let mut command = Command::new(rmux_os::build_identity::cargo_binary(env!(
+        "CARGO_BIN_EXE_rmux"
+    )));
     command.arg("-S").arg(socket_path).args(args);
     run_command_output(command)
 }
@@ -408,12 +423,17 @@ fn run_rmux_command_with_auto_start_binary(
     socket_path: &Path,
     args: &[&str],
 ) -> Result<Output, Box<dyn Error>> {
-    let mut command = Command::new(env!("CARGO_BIN_EXE_rmux"));
+    let mut command = Command::new(rmux_os::build_identity::cargo_binary(env!(
+        "CARGO_BIN_EXE_rmux"
+    )));
     command
         .arg("-S")
         .arg(socket_path)
         .args(args)
-        .env(BINARY_OVERRIDE_ENV, env!("CARGO_BIN_EXE_rmux"))
+        .env(
+            BINARY_OVERRIDE_ENV,
+            rmux_os::build_identity::cargo_binary(env!("CARGO_BIN_EXE_rmux")),
+        )
         .env(BINARY_OVERRIDE_TEST_OPT_IN_ENV, "1");
     run_command_output(command)
 }

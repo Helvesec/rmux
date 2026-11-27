@@ -181,7 +181,8 @@ fn apply_cell_overlay_style(cell: &mut GridCell, style: &Style) {
     // (2026-07-11): explicit fg/bg replace the cell's colours. A complete
     // style drops the cell's attributes, while a partial style preserves
     // them and unions attributes supplied by the overlay. `noattr` always
-    // drops inherited attributes.
+    // drops inherited attributes. Every painted cell retains `NOATTR` as an
+    // internal nonempty marker; grid rendering does not map it to an SGR.
     let fg_set = !matches!(style.cell.fg, COLOUR_DEFAULT | COLOUR_TERMINAL);
     let bg_set = !matches!(style.cell.bg, COLOUR_DEFAULT | COLOUR_TERMINAL);
     let style_attr = style.cell.attr & !GridAttr::NOATTR;
@@ -190,7 +191,7 @@ fn apply_cell_overlay_style(cell: &mut GridCell, style: &Style) {
     } else {
         style_attr | cell.attr()
     };
-    cell.set_attr(attr);
+    cell.set_attr(attr | GridAttr::NOATTR);
     if fg_set {
         cell.set_fg(style.cell.fg);
     }

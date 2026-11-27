@@ -14,6 +14,11 @@ Options:
   --platform-label <label>        Artifact label override (default: inferred)
   --skip-build                    Repackage an existing binary
   --allow-stale-binary            Allow --skip-build for local-only packaging
+  --payload-provenance <file>     Declare where the packaged binaries were
+                                  built, for a payload this repository did not
+                                  build; every declared digest must be the
+                                  digest of the file really staged
+  SOURCE_DATE_EPOCH=<seconds>     Archive mtime override (default: commit time)
   RMUX_PACKAGE_CODESIGN_ADHOC=1   Ad-hoc sign the binary before hashing (macOS)
   -h, --help                      Show this help
 USAGE
@@ -46,7 +51,8 @@ commit_time_iso() {
 
 commit_touch_timestamp() {
   local epoch
-  epoch="$(git show -s --format=%ct HEAD)"
+  epoch="${SOURCE_DATE_EPOCH:-$(git show -s --format=%ct HEAD)}"
+  case "$epoch" in ''|*[!0-9]*) die "SOURCE_DATE_EPOCH must be a non-negative integer" ;; esac
   if date -u -r "$epoch" +%Y%m%d%H%M.%S >/dev/null 2>&1; then
     date -u -r "$epoch" +%Y%m%d%H%M.%S
   else
@@ -85,6 +91,69 @@ strip_linux_tiny_binary() {
   esac
   command -v strip >/dev/null 2>&1 || return 0
   strip -s "$binary_path" || die "failed to strip package binary: $binary_path"
+}
+
+layout_tool() {
+  printf '%s\n' "$repo_root/scripts/packaging/layout-current"
+}
+
+# Preparing sources and staging them are the same operations for every shell
+# builder; they live beside the descriptor and are called from here. The path
+# comes from this script, which is known before any option is read.
+. "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/packaging/prepare-sources.sh"
+
+# Copy what the shared package layout descriptor projects for one variant.
+# Refuse a staged package that omits a declared file, carries an extra one or
+# uses another mode, before anything is archived.
+# A builder writes its generated files - the metadata, the manifest, the
+# checksums, the Debian copyright - through its own umask, which differs
+# between hosts. Their declared mode is applied here, so one payload does not
+# reach two modes on two machines.
+apply_generated_modes() {
+  local variant stage path mode
+  variant="$1"
+  stage="$2"
+  while IFS="$(printf '\t')" read -r path mode; do
+    [ -n "$path" ] || continue
+    [ -e "$stage/$path" ] || continue
+    chmod "$mode" "$stage/$path"
+  done <<EOF
+$("$(layout_tool)" generated-modes --variant "$variant" --package-root "$stage")
+EOF
+}
+
+check_package_layout() {
+  "$(layout_tool)" check-tree --variant "$1" --root "$2" ||
+    die "staged package does not match the layout descriptor"
+}
+
+unix_payload_provenance() {
+  python3 - "$repo_root" "$stage_dir" "$configuration" "$1" <<'PYTHON'
+import json
+from pathlib import Path
+import sys
+
+repo, stage, configuration, declaration_path = sys.argv[1:]
+sys.path.insert(0, str(Path(repo) / "scripts/packaging"))
+import layout
+
+try:
+    declaration = json.loads(Path(declaration_path).read_text())
+    if not isinstance(declaration, dict) or declaration.get("configuration") != configuration:
+        raise layout.LayoutError("payload provenance configuration differs")
+    from layout_profiles import with_notices
+    descriptor = with_notices(layout.load(Path(repo) / "scripts/packaging/rmux-package-layout.json"))
+    result = layout.payload_provenance(descriptor, "unix-archive", stage, declaration)
+    roles = layout.payload_binary_roles(descriptor, "unix-archive")
+    for item in declaration["files"]:
+        if "bytes" in item and (type(item["bytes"]) is not int
+                                or item["bytes"] != (Path(stage) / roles[item["role"]]).stat().st_size):
+            raise layout.LayoutError("payload provenance size differs: " + item["role"])
+    print(layout.embeddable_field("payload_provenance", result))
+except (OSError, ValueError, layout.LayoutError) as error:
+    print("payload provenance: " + str(error), file=sys.stderr)
+    sys.exit(1)
+PYTHON
 }
 
 workspace_version() {
@@ -137,6 +206,7 @@ output_dir="target/dist"
 platform_label=""
 skip_build=0
 allow_stale_binary=0
+payload_provenance_file=""
 
 while [ "$#" -gt 0 ]; do
   case "$1" in
@@ -167,6 +237,11 @@ while [ "$#" -gt 0 ]; do
     --allow-stale-binary)
       allow_stale_binary=1
       shift
+      ;;
+    --payload-provenance)
+      [ "$#" -ge 2 ] || die "--payload-provenance requires a value"
+      payload_provenance_file="$2"
+      shift 2
       ;;
     -h|--help)
       usage
@@ -207,10 +282,8 @@ daemon_binary="$target_dir/$target/$profile_dir/rmux-daemon"
 completion_cache="${RMUX_COMPLETIONS_DIR:-$target_dir/$target/$profile_dir/completions}"
 
 if [ "$skip_build" -eq 0 ]; then
-  "${compatible_build[@]}" "${cargo_args[@]}" --package rmux --bin rmux
-  cp "$binary" "$helper_binary"
-  "${compatible_build[@]}" "${cargo_args[@]}" --package rmux --features tiny-cli --bin rmux
-  "${compatible_build[@]}" "${cargo_args[@]}" --package rmux --bin rmux-daemon
+  "${RMUX_PYTHON:-python3}" "$repo_root/scripts/packaging/notices.py" build \
+    --binary-dir "$(dirname "$binary")" -- "${compatible_build[@]}" "${cargo_args[@]}" --package rmux
 elif [ "$allow_stale_binary" -eq 0 ]; then
   die "--skip-build is local-only packaging; pass --allow-stale-binary to acknowledge that"
 fi
@@ -221,15 +294,6 @@ fi
 [ -x "$helper_binary" ] || die "expected private helper binary is not executable: $helper_binary"
 [ -f "$daemon_binary" ] || die "expected daemon binary was not found: $daemon_binary"
 [ -x "$daemon_binary" ] || die "expected daemon binary is not executable: $daemon_binary"
-if [ "${RMUX_PACKAGE_CODESIGN_ADHOC:-0}" = "1" ]; then
-  command -v codesign >/dev/null 2>&1 || die "RMUX_PACKAGE_CODESIGN_ADHOC=1 requires codesign"
-  codesign --force --sign - "$binary"
-  codesign --force --sign - "$helper_binary"
-  codesign --force --sign - "$daemon_binary"
-  codesign --verify --verbose=2 "$binary"
-  codesign --verify --verbose=2 "$helper_binary"
-  codesign --verify --verbose=2 "$daemon_binary"
-fi
 
 dist_dir="$(mkdir -p "$output_dir" && cd "$output_dir" && pwd)"
 package_name="rmux-$version-$platform_label"
@@ -249,47 +313,53 @@ case "$stage_dir" in "$dist_dir"/*) ;; *) die "stage path escapes output dir" ;;
 rm -rf "$stage_dir"
 mkdir -p "$stage_dir/bin" "$stage_dir/libexec/rmux" "$stage_dir/share/man/man1" "$stage_dir/share/rmux"
 
-cp "$binary" "$stage_dir/bin/rmux"
-cp "$helper_binary" "$stage_dir/libexec/rmux/rmux"
-cp "$daemon_binary" "$stage_dir/bin/rmux-daemon"
+install -m 0755 "$binary" "$stage_dir/bin/rmux"
+install -m 0755 "$helper_binary" "$stage_dir/libexec/rmux/rmux"
+install -m 0755 "$daemon_binary" "$stage_dir/bin/rmux-daemon"
 strip_linux_tiny_binary "$stage_dir/bin/rmux"
-install -m 0755 scripts/install-unix-archive.sh "$stage_dir/install.sh"
-cp docs/man/rmux.1 "$stage_dir/share/man/man1/rmux.1"
 completion_tmp="$(mktemp -d "${TMPDIR:-/tmp}/rmux-completions.XXXXXX")"
 if [ "$skip_build" -eq 0 ]; then
-  cargo run --quiet --package xtask -- generate-completions --output-dir "$completion_tmp" >/dev/null
+  # The generator writes under its own names and says what it wrote; those
+  # files are then prepared under the names the descriptor gives them, so a
+  # source renamed there is served by the generator's real output.
+  completion_generated="$completion_tmp/generated"
+  mkdir -p "$completion_generated"
+  cargo run --quiet --package xtask -- generate-completions \
+    --output-dir "$completion_generated" > "$completion_tmp/generated.tsv"
+  prepare_generated_sources "unix-archive" completion \
+    "$completion_tmp/generated.tsv" "$completion_tmp"
   rm -rf "$completion_cache"
   mkdir -p "$completion_cache"
-  cp "$completion_tmp/rmux.bash" "$completion_tmp/_rmux" "$completion_tmp/rmux.fish" \
-    "$completion_tmp/_rmux.ps1" "$completion_tmp/rmux.elv" "$completion_cache/"
+  prepare_cached_sources "unix-archive" completion "$completion_tmp" "$completion_cache" \
+    "generated completion is missing"
 else
-  for completion_file in rmux.bash _rmux rmux.fish _rmux.ps1 rmux.elv; do
-    [ -f "$completion_cache/$completion_file" ] || die "--skip-build requires prebuilt completions in $completion_cache; rerun without --skip-build or set RMUX_COMPLETIONS_DIR"
-    cp "$completion_cache/$completion_file" "$completion_tmp/$completion_file"
-  done
+  prepare_cached_sources "unix-archive" completion "$completion_cache" "$completion_tmp" \
+    "--skip-build requires prebuilt completions in $completion_cache; rerun without --skip-build or set RMUX_COMPLETIONS_DIR"
 fi
-mkdir -p \
-  "$stage_dir/share/bash-completion/completions" \
-  "$stage_dir/share/zsh/site-functions" \
-  "$stage_dir/share/fish/vendor_completions.d" \
-  "$stage_dir/share/powershell/Completions" \
-  "$stage_dir/share/elvish/lib"
-install -m 0644 "$completion_tmp/rmux.bash" "$stage_dir/share/bash-completion/completions/rmux"
-install -m 0644 "$completion_tmp/_rmux" "$stage_dir/share/zsh/site-functions/_rmux"
-install -m 0644 "$completion_tmp/rmux.fish" "$stage_dir/share/fish/vendor_completions.d/rmux.fish"
-install -m 0644 "$completion_tmp/_rmux.ps1" "$stage_dir/share/powershell/Completions/_rmux.ps1"
-install -m 0644 "$completion_tmp/rmux.elv" "$stage_dir/share/elvish/lib/rmux.elv"
-license_copied=false
-for license_file in LICENSE LICENSE.* LICENSE-*; do
-  [ -f "$license_file" ] || continue
-  cp "$license_file" "$stage_dir/"
-  license_copied=true
-done
-[ "$license_copied" = true ] || die "license files are missing"
+# Every packaged file that is not a built binary or generated here - the
+# installer, the man page, the five completions and the licenses - is staged
+# from the shared layout descriptor, with the destination and mode it declares.
+stage_from_descriptor "unix-archive" "$stage_dir" \
+  --repo "$repo_root" --completions "$completion_tmp" --only-sources repo,completion
+
+notice_required=(--optional)
+[ "$skip_build" -ne 0 ] || notice_required=(--required)
+"${RMUX_PYTHON:-python3}" "$repo_root/scripts/packaging/notices.py" stage \
+  --binary-dir "$(dirname "$binary")" --root "$stage_dir" --variant unix-archive "${notice_required[@]}"
 
 packaged_binary="$stage_dir/bin/rmux"
 packaged_helper="$stage_dir/libexec/rmux/rmux"
 packaged_daemon="$stage_dir/bin/rmux-daemon"
+# Sign staged copies before package hashes. Cargo inputs stay bound to their notices.
+if [ "${RMUX_PACKAGE_CODESIGN_ADHOC:-0}" = "1" ]; then
+  command -v codesign >/dev/null 2>&1 || die "RMUX_PACKAGE_CODESIGN_ADHOC=1 requires codesign"
+  codesign --force --sign - "$packaged_binary"
+  codesign --force --sign - "$packaged_helper"
+  codesign --force --sign - "$packaged_daemon"
+  codesign --verify --verbose=2 "$packaged_binary"
+  codesign --verify --verbose=2 "$packaged_helper"
+  codesign --verify --verbose=2 "$packaged_daemon"
+fi
 binary_abs="$(cd "$(dirname "$packaged_binary")" && pwd)/$(basename "$packaged_binary")"
 helper_binary_abs="$(cd "$(dirname "$packaged_helper")" && pwd)/$(basename "$packaged_helper")"
 daemon_binary_abs="$(cd "$(dirname "$packaged_daemon")" && pwd)/$(basename "$packaged_daemon")"
@@ -299,15 +369,33 @@ daemon_binary_sha256="$(sha256_file "$packaged_daemon")"
 binary_bytes="$(wc -c < "$packaged_binary" | tr -d ' ')"
 helper_binary_bytes="$(wc -c < "$packaged_helper" | tr -d ' ')"
 daemon_binary_bytes="$(wc -c < "$packaged_daemon" | tr -d ' ')"
+# Two file slots may legitimately carry the same image in a local package: the
+# descriptor requires three paths, not three different builds. Saying so here
+# keeps the package honest without asserting a tiny dispatcher or a delegation
+# to the helper that this payload does not implement.
+full_cli_reused_in_two_slots=false
+if [ "$binary_sha256" = "$helper_binary_sha256" ]; then
+  full_cli_reused_in_two_slots=true
+fi
+
+# A payload this repository did not build is declared, bound to the staged
+# files by the projection, and refused unless every digest matches.
+payload_provenance_field=""
+if [ -n "$payload_provenance_file" ]; then
+  [ -f "$payload_provenance_file" ] || die "payload provenance file not found: $payload_provenance_file"
+  payload_provenance_field="$(unix_payload_provenance "$payload_provenance_file")" ||
+    die "declared payload provenance does not match the staged payload"
+fi
+
 glibc_metadata_fields=""
 package_glibc_min=""
 case "$target" in
   *-unknown-linux-gnu)
     glibc_floor_script="$repo_root/scripts/glibc-symbol-floor.sh"
-    binary_glibc_min="$($glibc_floor_script "$packaged_binary")"
-    helper_binary_glibc_min="$($glibc_floor_script "$packaged_helper")"
-    daemon_binary_glibc_min="$($glibc_floor_script "$packaged_daemon")"
-    package_glibc_min="$($glibc_floor_script "$packaged_binary" "$packaged_helper" "$packaged_daemon")"
+    binary_glibc_min="$("$glibc_floor_script" "$packaged_binary")"
+    helper_binary_glibc_min="$("$glibc_floor_script" "$packaged_helper")"
+    daemon_binary_glibc_min="$("$glibc_floor_script" "$packaged_daemon")"
+    package_glibc_min="$("$glibc_floor_script" "$packaged_binary" "$packaged_helper" "$packaged_daemon")"
     max_supported_glibc="${RMUX_MAX_SUPPORTED_GLIBC:-2.31}"
     case "$max_supported_glibc" in ''|*[!0-9.]*|.*|*.|*..*) die "invalid RMUX_MAX_SUPPORTED_GLIBC: $max_supported_glibc" ;; esac
     if [ "$(printf '%s\n%s\n' "$package_glibc_min" "$max_supported_glibc" | LC_ALL=C sort -V | tail -n 1)" != "$max_supported_glibc" ]; then
@@ -331,6 +419,12 @@ if [ "$configuration" != "release" ] || [ "$skip_build" -eq 1 ] || [ "$git_dirty
   release_artifact=false
 fi
 generated_at_utc="$(commit_time_iso)"
+
+# The format identity the package declares is the descriptor's, so a change of
+# package contract moves it in one place for builders, validators and
+# installers at once.
+package_layout_id="$("$(layout_tool)" layout-id --variant unix-archive)" ||
+  die "could not project the package layout identity"
 
 cat > "$stage_dir/share/rmux/artifact-metadata.json" <<EOF
 {
@@ -356,7 +450,9 @@ $glibc_metadata_fields
   "package_name": "$package_name",
   "package_target": "$target",
   "package_target_label": "$platform_label",
-  "package_layout": "rmux-package-v2",
+  "package_layout": "$package_layout_id",
+  "full_cli_reused_in_two_slots": $full_cli_reused_in_two_slots,
+$payload_provenance_field
   "archive_format": "tar.gz",
   "archive_reproducibility": "normalized-mtime-gzip-no-name",
   "skip_build": $([ "$skip_build" -eq 1 ] && printf true || printf false),
@@ -365,15 +461,35 @@ $glibc_metadata_fields
 }
 EOF
 
+# The installer inside the package installs what the descriptor projects, so
+# the projection travels with the package instead of being repeated there.
+"$(layout_tool)" manifest --variant unix-archive > "$stage_dir/share/rmux/package-layout.tsv" ||
+  die "could not project the package manifest"
+chmod 0644 "$stage_dir/share/rmux/package-layout.tsv"
+
 write_package_checksums "$stage_dir" "$stage_dir/SHA256SUMS.txt"
+apply_generated_modes "unix-archive" "$stage_dir"
+check_package_layout "unix-archive" "$stage_dir"
 touch_stamp="$(commit_touch_timestamp)"
-find "$stage_dir" -exec touch -t "$touch_stamp" {} +
+# Directory permissions must not depend on the staging process umask.
+find "$stage_dir" -type d -exec chmod 0755 {} +
+# commit_touch_timestamp formats UTC; touch otherwise interprets the local TZ.
+TZ=UTC find "$stage_dir" -exec touch -t "$touch_stamp" {} +
 
 rm -f "$archive_path"
 if command -v gzip >/dev/null 2>&1; then
   tmp_tar="$archive_path.tmp.tar"
   rm -f "$tmp_tar"
-  COPYFILE_DISABLE=1 tar -cf "$tmp_tar" -C "$dist_dir" "$package_name"
+  case "$(tar --version 2>/dev/null)" in
+    *"GNU tar"*)
+      # Fix Linux headers and traversal independently of the host user,
+      # filesystem insertion order and tar's default extended format.
+      COPYFILE_DISABLE=1 LC_ALL=C tar --sort=name --format=ustar \
+        --owner=0 --group=0 --numeric-owner \
+        -cf "$tmp_tar" -C "$dist_dir" "$package_name"
+      ;;
+    *) COPYFILE_DISABLE=1 tar -cf "$tmp_tar" -C "$dist_dir" "$package_name" ;;
+  esac
   gzip -n -c "$tmp_tar" > "$archive_path"
   rm -f "$tmp_tar"
 else
@@ -381,6 +497,8 @@ else
 fi
 archive_sha256="$(sha256_file "$archive_path")"
 printf '%s  %s\n' "$archive_sha256" "$(basename "$archive_path")" > "$checksums_path"
+"${RMUX_PYTHON:-python3}" "$repo_root/scripts/packaging/notices.py" publish \
+  --binary-dir "$(dirname "$binary")" --archive "$archive_path" "${notice_required[@]}"
 
 printf 'package=%s\n' "$archive_path"
 printf 'sha256=%s\n' "$archive_sha256"
@@ -389,3 +507,4 @@ printf 'helper_binary_sha256=%s\n' "$helper_binary_sha256"
 printf 'daemon_binary_sha256=%s\n' "$daemon_binary_sha256"
 [ -z "$package_glibc_min" ] || printf 'glibc_min=%s\n' "$package_glibc_min"
 printf 'release_artifact=%s\n' "$release_artifact"
+printf 'full_cli_reused_in_two_slots=%s\n' "$full_cli_reused_in_two_slots"

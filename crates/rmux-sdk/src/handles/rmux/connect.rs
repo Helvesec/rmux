@@ -6,8 +6,6 @@ use std::io;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-#[cfg(windows)]
-use crate::bootstrap::deadline::StartupDeadline;
 use crate::bootstrap::discovery;
 #[cfg(windows)]
 use crate::diagnostics::FEATURE_TRANSPORT_UNIX_SOCKET;
@@ -16,14 +14,19 @@ use crate::diagnostics::FEATURE_TRANSPORT_WINDOWS_PIPE;
 use crate::transport::{OperationDeadline, TransportClient};
 use crate::{Result, RmuxEndpoint, RmuxError};
 #[cfg(windows)]
+use rmux_bootstrap::deadline::StartupDeadline;
+#[cfg(windows)]
 use windows_sys::Win32::Foundation::{
     ERROR_FILE_NOT_FOUND, ERROR_NO_DATA, ERROR_PIPE_BUSY, ERROR_PIPE_NOT_CONNECTED,
 };
 
 const INTERNAL_DAEMON_FLAG: &str = "--__internal-daemon";
+#[cfg(unix)]
+mod startup_child;
 #[cfg(any(unix, windows))]
-#[path = "connect/startup_config.rs"]
 mod startup_config;
+#[cfg(unix)]
+mod unix_startup;
 #[cfg(windows)]
 const WINDOWS_CONNECT_RETRY_INTERVAL: Duration = Duration::from_millis(10);
 
@@ -88,27 +91,10 @@ async fn connect_or_start_transport_for_platform(
             transport,
         });
     };
-    let socket_path = socket_path.clone();
-    let launcher_cwd = caller_cwd.clone();
-    let outcome = crate::bootstrap::startup_unix::connect_or_start_with_timeout(
-        &socket_path,
-        || {
-            let socket_path = socket_path.clone();
-            async move {
-                startup_config::spawn_hidden_daemon(
-                    socket_path.as_os_str(),
-                    launcher_cwd.as_deref(),
-                    deadline,
-                )
-            }
-        },
-        deadline.remaining_timeout(),
-        crate::bootstrap::startup_unix::STARTUP_POLL_INTERVAL,
-    )
-    .await
-    .map_err(startup_error)?;
-    let transport = TransportClient::spawn(outcome.into_stream()).with_operation_deadline(deadline);
-    startup_config::wait_until_loaded(&transport, deadline).await?;
+    let transport = unix_startup::connect_ready(deadline, || {
+        unix_startup::join_or_start(socket_path, deadline, caller_cwd.as_deref())
+    })
+    .await?;
     Ok(ConnectedTransport {
         endpoint: endpoint.clone(),
         transport: transport.reusable(),
@@ -131,7 +117,7 @@ async fn connect_or_start_transport_for_platform(
     let pipe_path = std::path::PathBuf::from(pipe);
     let launcher_cwd = caller_cwd.clone();
     let (outcome, selected_endpoint) =
-        crate::bootstrap::startup_windows::connect_or_start_selected_with_timeout(
+        rmux_bootstrap::startup_windows::connect_or_start_selected_with_timeout(
             &pipe_path,
             |reserved_pipe| {
                 let reserved_pipe = reserved_pipe.as_os_str().to_owned();
@@ -144,7 +130,7 @@ async fn connect_or_start_transport_for_platform(
                 }
             },
             startup_deadline.remaining_timeout(),
-            crate::bootstrap::startup_windows::STARTUP_POLL_INTERVAL,
+            rmux_bootstrap::startup_windows::STARTUP_POLL_INTERVAL,
         )
         .await
         .map_err(startup_error)?;
@@ -181,7 +167,7 @@ async fn connect_or_start_transport_for_platform(
 
 #[cfg(windows)]
 async fn drop_windows_startup_probe_stream(
-    outcome: crate::bootstrap::startup_windows::StartupOutcome,
+    outcome: rmux_bootstrap::startup_windows::StartupOutcome,
 ) -> Result<()> {
     tokio::task::spawn_blocking(move || drop(outcome))
         .await

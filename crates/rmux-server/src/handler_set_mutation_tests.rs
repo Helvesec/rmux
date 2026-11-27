@@ -21,7 +21,7 @@ async fn create_session(handler: &RequestHandler, name: &str) {
         }))
         .await;
 
-    assert!(matches!(response, Response::NewSession(_)));
+    crate::session_fixture::assert_new_session(&response);
 }
 
 #[tokio::test]
@@ -80,7 +80,7 @@ async fn set_option_updates_the_store_and_session_values_override_global() {
 #[cfg(unix)]
 #[tokio::test]
 async fn typed_and_named_default_shell_mutations_reject_unsuitable_paths() {
-    let handler = RequestHandler::new();
+    let handler = RequestHandler::with_host_shell_for_test();
     let invalid = "/definitely/missing/rmux-shell";
     let expected = Response::Error(ErrorResponse {
         error: RmuxError::Message(format!("not a suitable shell: {invalid}")),
@@ -278,6 +278,97 @@ async fn set_option_by_name_refreshes_existing_transcripts_for_server_utf8_optio
 
     assert_ne!(before, after);
     assert_eq!(after, expected);
+}
+
+#[tokio::test]
+async fn cursor_style_options_synchronize_existing_pane_defaults() {
+    let handler = RequestHandler::new();
+    create_session(&handler, "cursor-default").await;
+    let session = session_name("cursor-default");
+    let target = PaneTarget::with_window(session.clone(), 0, 0);
+
+    let initial = {
+        let state = handler.state.lock().await;
+        let transcript = state.transcript_handle(&target).expect("pane transcript");
+        let style = transcript.lock().screen().cursor_default_style();
+        style
+    };
+    assert_eq!(initial, 0);
+
+    let (output, cached_boundary, mut recovery_observer) = {
+        let state = handler.state.lock().await;
+        let output = state
+            .pane_output_for_target(&session, 0, 0)
+            .expect("pane output");
+        let (boundary, (), observer) = output.capture_with_observer(|| ());
+        (output, boundary, observer)
+    };
+
+    let global = handler
+        .handle(Request::SetOptionByName(Box::new(SetOptionByNameRequest {
+            scope: OptionScopeSelector::WindowGlobal,
+            name: "cursor-style".to_owned(),
+            value: Some("bar".to_owned()),
+            mode: SetOptionMode::Replace,
+            only_if_unset: false,
+            unset: false,
+            unset_pane_overrides: false,
+            format: false,
+            format_target: None,
+        })))
+        .await;
+    assert!(matches!(global, Response::SetOptionByName(_)));
+    assert!(
+        output.subscribe_at_boundary(cached_boundary).is_none(),
+        "cursor-default mutation must stale cached recovery boundaries"
+    );
+    let Some(crate::pane_io::PaneObservationItem::Invalidated(invalidation)) =
+        recovery_observer.try_recv_observed()
+    else {
+        panic!("cursor-default mutation must invalidate recovery observers");
+    };
+    assert_eq!(
+        invalidation.reason,
+        crate::pane_io::PaneInvalidationReason::TranscriptMutation
+    );
+
+    let inherited = {
+        let state = handler.state.lock().await;
+        let transcript = state.transcript_handle(&target).expect("pane transcript");
+        let style = transcript.lock().screen().cursor_default_style();
+        style
+    };
+    assert_eq!(inherited, 6);
+
+    create_session(&handler, "cursor-default-new").await;
+    let new_target = PaneTarget::with_window(session_name("cursor-default-new"), 0, 0);
+    let inherited_at_spawn = {
+        let state = handler.state.lock().await;
+        let transcript = state
+            .transcript_handle(&new_target)
+            .expect("new pane transcript");
+        let style = transcript.lock().screen().cursor_default_style();
+        style
+    };
+    assert_eq!(inherited_at_spawn, 6);
+
+    let pane = handler
+        .handle(Request::SetOption(SetOptionRequest {
+            scope: ScopeSelector::Pane(target.clone()),
+            option: OptionName::CursorStyle,
+            value: "underline".to_owned(),
+            mode: SetOptionMode::Replace,
+        }))
+        .await;
+    assert!(matches!(pane, Response::SetOption(_)));
+
+    let overridden = {
+        let state = handler.state.lock().await;
+        let transcript = state.transcript_handle(&target).expect("pane transcript");
+        let style = transcript.lock().screen().cursor_default_style();
+        style
+    };
+    assert_eq!(overridden, 4);
 }
 
 #[tokio::test]

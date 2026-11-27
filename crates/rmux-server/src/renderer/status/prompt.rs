@@ -1,14 +1,40 @@
+mod completion;
+
 use rmux_core::{
     text_width as tmux_text_width, truncate_right_to_width as tmux_truncate_right_to_width,
-    truncate_to_width as tmux_truncate_to_width, OptionStore, Session, Utf8Config,
+    truncate_to_width as tmux_truncate_to_width, OptionStore, Utf8Config,
 };
 use rmux_proto::OptionName;
 
+use super::super::cursor_position_bytes;
 use super::super::{apply_style_overlay, RenderedPrompt};
-use super::resolved_status_style;
+use super::runs::render_status_runs;
 use super::runs::{
     push_spaces, push_status_run, sanitize_status_text, status_runs_width, StatusRun, StatusStyle,
 };
+use super::{resolved_status_style, status_message_line_index, StatusGeometry};
+
+pub(crate) fn render_prompt(
+    session: rmux_core::ManagedSessionView<'_>,
+    options: &OptionStore,
+    prompt: &RenderedPrompt,
+) -> Vec<u8> {
+    let geometry = StatusGeometry::for_session(session, options);
+    let mut frame = Vec::new();
+    let message_line =
+        status_message_line_index(session.name(), options, geometry.status_lines.max(1));
+    let Some(row) = geometry.message_overlay_row(message_line) else {
+        return frame;
+    };
+    let line_y = row.y();
+    let layout = prompt_status_layout(session, options, geometry.terminal_size.cols, prompt);
+    frame.extend_from_slice(render_status_runs(line_y, &layout.runs).as_slice());
+    frame.extend_from_slice(&completion::render_completion_menu(
+        session, options, prompt, geometry, line_y,
+    ));
+    frame.extend_from_slice(cursor_position_bytes(line_y, layout.cursor_x).as_slice());
+    frame
+}
 
 pub(super) struct PromptStatusLayout {
     pub(super) runs: Vec<StatusRun>,
@@ -16,7 +42,7 @@ pub(super) struct PromptStatusLayout {
 }
 
 pub(in crate::renderer) fn prompt_status_runs(
-    session: &Session,
+    session: rmux_core::ManagedSessionView<'_>,
     options: &OptionStore,
     columns: u16,
     prompt: &RenderedPrompt,
@@ -25,7 +51,7 @@ pub(in crate::renderer) fn prompt_status_runs(
 }
 
 pub(super) fn prompt_status_layout(
-    session: &Session,
+    session: rmux_core::ManagedSessionView<'_>,
     options: &OptionStore,
     columns: u16,
     prompt: &RenderedPrompt,
@@ -53,7 +79,11 @@ pub(super) fn prompt_status_layout(
     }
 }
 
-fn prompt_style(session: &Session, options: &OptionStore, command_prompt: bool) -> StatusStyle {
+fn prompt_style(
+    session: rmux_core::ManagedSessionView<'_>,
+    options: &OptionStore,
+    command_prompt: bool,
+) -> StatusStyle {
     let style_option = if command_prompt {
         OptionName::MessageCommandStyle
     } else {
@@ -136,5 +166,14 @@ mod tests {
 
         assert_eq!(visible.text, "👨\u{200D}👩B");
         assert_eq!(visible.cursor_x, 3);
+    }
+
+    #[test]
+    fn gh219_prompt_visible_input_keeps_the_overlong_zwj_source_suffix() {
+        let input = "AB👩\u{200D}❤\u{FE0F}\u{200D}💋\u{200D}👨X";
+        let visible = prompt_visible_input(input, input.chars().count(), 5, &Utf8Config::default());
+
+        assert_eq!(visible.text, input[1..]);
+        assert_eq!(visible.cursor_x, 4);
     }
 }

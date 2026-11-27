@@ -1,0 +1,139 @@
+{
+  "schema_version": 1,
+  "scope": "workspace-package-feature-library-binary-declarations",
+  "metadata_format": 1,
+  "source_base": {
+    "commit": "8a95f5492eae411792a68eb39b54b844035d9ad0",
+    "tree": "76d6df7bbe7f75a8f751485609532a8da16791f9"
+  },
+  "packages": [
+    {
+      "id": "package:helper-pkg",
+      "name": "helper-pkg",
+      "version": "1.0.0",
+      "edition": "2021",
+      "rust_version": null,
+      "publish": null,
+      "targets": [
+        {
+          "id": "package:helper-pkg/lib:helper_pkg",
+          "name": "helper_pkg",
+          "kind": [
+            "lib"
+          ],
+          "crate_types": [
+            "lib"
+          ],
+          "required_features": []
+        }
+      ],
+      "features": {
+        "default": [
+          "std"
+        ],
+        "std": []
+      }
+    },
+    {
+      "id": "package:internal-pkg",
+      "name": "internal-pkg",
+      "version": "1.2.3",
+      "edition": "2021",
+      "rust_version": null,
+      "publish": [],
+      "targets": [
+        {
+          "id": "package:internal-pkg/lib:internal_pkg",
+          "name": "internal_pkg",
+          "kind": [
+            "proc-macro"
+          ],
+          "crate_types": [
+            "proc-macro"
+          ],
+          "required_features": []
+        }
+      ],
+      "features": {}
+    },
+    {
+      "id": "package:registry-pkg",
+      "name": "registry-pkg",
+      "version": "1.0.0",
+      "edition": "2021",
+      "rust_version": null,
+      "publish": [
+        "private-a",
+        "private-b"
+      ],
+      "targets": [
+        {
+          "id": "package:registry-pkg/bin:registry-pkg",
+          "name": "registry-pkg",
+          "kind": [
+            "bin"
+          ],
+          "crate_types": [
+            "bin"
+          ],
+          "required_features": []
+        }
+      ],
+      "features": {
+        "default": []
+      }
+    },
+    {
+      "id": "package:surface-a",
+      "name": "surface-a",
+      "version": "1.2.3",
+      "edition": "2021",
+      "rust_version": "1.70",
+      "publish": null,
+      "targets": [
+        {
+          "id": "package:surface-a/bin:alpha-tool",
+          "name": "alpha-tool",
+          "kind": [
+            "bin"
+          ],
+          "crate_types": [
+            "bin"
+          ],
+          "required_features": [
+            "alpha",
+            "zeta"
+          ]
+        },
+        {
+          "id": "package:surface-a/lib:renamed_core",
+          "name": "renamed_core",
+          "kind": [
+            "cdylib",
+            "rlib"
+          ],
+          "crate_types": [
+            "cdylib",
+            "rlib"
+          ],
+          "required_features": []
+        }
+      ],
+      "features": {
+        "alpha": [
+          "alias?/std",
+          "dep:alias"
+        ],
+        "default": [
+          "alpha",
+          "zeta"
+        ],
+        "implicit": [
+          "dep:implicit"
+        ],
+        "spare": [],
+        "zeta": []
+      }
+    }
+  ]
+}

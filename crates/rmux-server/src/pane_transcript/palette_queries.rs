@@ -7,12 +7,17 @@ use rmux_core::{TerminalPaletteIndex, TerminalPassthrough};
 // for a loaded ConPTY/SSH path while retaining a short, explicit correlation
 // window.
 const RESPONSE_TIMEOUT: Duration = Duration::from_secs(8);
+/// tmux 3.7b `INPUT_REQUEST_TIMEOUT` (input.c:75): a forwarded query is
+/// active, and slows the client's partial keys, only this long after it was
+/// sent. The correlation window above stays deliberately longer.
+const ACTIVE_QUERY_WINDOW: Duration = Duration::from_millis(500);
 const MAX_RESPONSES_PER_INDEX: u8 = 8;
 
 #[derive(Debug, Clone, Copy)]
 struct PendingPaletteQuery {
     index: TerminalPaletteIndex,
     responses: u8,
+    registered_at: Instant,
     expires_at: Instant,
 }
 
@@ -41,11 +46,13 @@ impl PendingPaletteQueries {
                     1
                 }
                 .min(MAX_RESPONSES_PER_INDEX);
+                pending.registered_at = now;
                 pending.expires_at = now + RESPONSE_TIMEOUT;
             } else {
                 self.entries.push(PendingPaletteQuery {
                     index,
                     responses: 1,
+                    registered_at: now,
                     expires_at: now + RESPONSE_TIMEOUT,
                 });
             }
@@ -66,6 +73,14 @@ impl PendingPaletteQueries {
             self.entries[position].responses -= 1;
         }
         true
+    }
+
+    /// Whether an unanswered query is still active in tmux's sense, so a
+    /// response split across reads must not expire at the keyboard escape-time.
+    pub(super) fn has_active_query(&self, now: Instant) -> bool {
+        self.entries
+            .iter()
+            .any(|entry| now.saturating_duration_since(entry.registered_at) <= ACTIVE_QUERY_WINDOW)
     }
 
     pub(super) fn clear(&mut self) {

@@ -27,7 +27,7 @@ async fn create_window_listing_fixture(handler: &RequestHandler) {
                 environment: None,
             }))
             .await;
-        assert!(matches!(response, Response::NewSession(_)), "{response:?}");
+        crate::session_fixture::assert_new_session(&response);
         let response = handler
             .handle(Request::RenameWindow(rmux_proto::RenameWindowRequest {
                 target: WindowTarget::with_window(session.clone(), 0),
@@ -165,7 +165,7 @@ async fn source_file_and_control_queue_share_list_windows_all_execution() {
     let response = handler
         .handle(source_file_request(
             vec!["all.conf".to_owned()],
-            Some(root.clone()),
+            Some(root.to_path_buf()),
         ))
         .await;
     let Response::SourceFile(response) = response else {
@@ -371,7 +371,7 @@ async fn startup_config_entry_executes_list_windows_all_and_continues() {
     let config = crate::DaemonConfig::new(root.join("rmux.sock")).with_config_files(
         vec![std::path::PathBuf::from("startup.conf")],
         false,
-        Some(root.clone()),
+        Some(root.to_path_buf()),
     );
 
     handler

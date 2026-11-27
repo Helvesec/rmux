@@ -156,6 +156,8 @@ tmp_root="target/release-automation-logs/$platform-$short_sha"
 artifact_root="target/release-artifacts/release-automation-$platform-$short_sha"
 manifest_path="target/release-artifacts/release_automation_${platform}-$short_sha.txt"
 
+# Retire the old verdict before replacing the bundle it describes.
+rm -f "$manifest_path"
 rm -rf "$tmp_root" "$artifact_root"
 mkdir -p "$tmp_root/logs"
 
@@ -181,11 +183,16 @@ package_sha="$(kv_value sha256 "$package_log")"
 [ -n "$package_sha" ] || die "package script did not emit sha256=<hash>"
 
 verify_log="$tmp_root/logs/verify-package.log"
+verify_args=(--expected-commit "$head_sha")
+[ "$configuration" != "release" ] || verify_args+=(--require-release-artifact)
 run_logged "$verify_log" \
   "$repo_root/scripts/verify-package.sh" \
   "$package_path" \
   --checksums "$dist_dir/SHA256SUMS.txt" \
-  --run-binary
+  --run-binary "${verify_args[@]}"
+
+[ "$(git rev-parse HEAD)" = "$head_sha" ] && [ -z "$(git status --porcelain)" ] ||
+  die "source changed during local release verification"
 
 mkdir -p "$artifact_root/logs"
 cp "$tmp_root/logs/"*.log "$artifact_root/logs/"
@@ -195,6 +202,9 @@ cat > "$artifact_root/summary.json" <<EOF
   "schema": 1,
   "platform": "$platform",
   "pipeline": "release-local-v1",
+  "authority": "local-only",
+  "signature": "unsigned",
+  "source_verification": "package-metadata-commit",
   "git_commit": "$head_sha",
   "configuration": "$configuration",
   "package_path": "$(printf '%s' "$(display_path "$package_path")" | json_escape)",
@@ -217,6 +227,8 @@ PASS
 
 This local-first wrapper packages RMUX and verifies the package on $platform.
 It does not publish releases, create tags, or contact CI.
+The package is unsigned. Metadata is bound to HEAD; hosted provenance and
+independent binary build reproducibility are not established by this wrapper.
 
 ## Inputs
 
@@ -240,7 +252,7 @@ It does not publish releases, create tags, or contact CI.
 ## Commands
 
 - \`scripts/package-unix.sh --configuration $configuration --output-dir $dist_dir\`
-- \`scripts/verify-package.sh <package> --checksums $dist_dir/SHA256SUMS.txt --run-binary\`
+- \`scripts/verify-package.sh <package> --checksums $dist_dir/SHA256SUMS.txt --run-binary ${verify_args[*]}\`
 EOF
 
 printf 'verdict=PASS\n'

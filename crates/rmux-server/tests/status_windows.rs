@@ -131,7 +131,11 @@ impl CliHarness {
     }
 
     fn kill_server(&self) {
-        let _ = Command::new(rmux_binary().unwrap_or_else(|_| Path::new("rmux")))
+        let selected = rmux_binary().unwrap_or_else(|_| Path::new("rmux"));
+        let Ok(binary) = windows_cargo_build::verify_binary(selected) else {
+            return;
+        };
+        let _ = Command::new(binary)
             .arg("-L")
             .arg(&self.label)
             .arg("kill-server")
@@ -259,7 +263,10 @@ fn unique_id(label: &str) -> String {
 fn rmux_binary() -> TestResult<&'static Path> {
     static RMUX_BINARY: OnceLock<Result<PathBuf, String>> = OnceLock::new();
     match RMUX_BINARY.get_or_init(|| resolve_rmux_binary().map_err(|error| error.to_string())) {
-        Ok(path) => Ok(path.as_path()),
+        Ok(path) => {
+            windows_cargo_build::verify_binary(path)?;
+            Ok(path.as_path())
+        }
         Err(error) => Err(std::io::Error::other(error.clone()).into()),
     }
 }

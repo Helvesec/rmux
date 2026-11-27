@@ -43,16 +43,13 @@ pub(crate) struct PtyTestGuard {
 impl PtyTestLock {
     pub(crate) async fn lock(&'static self) -> PtyTestGuard {
         let in_process = IN_PROCESS_PTY_TEST_LOCK.lock().await;
-        let path = std::env::temp_dir().join("rmux-server-pty-tests.lock");
-        let file = OpenOptions::new()
-            .create(true)
-            .truncate(false)
-            .read(true)
-            .write(true)
-            .open(&path)
-            .unwrap_or_else(|error| {
-                panic!("failed to open PTY test lock '{}': {error}", path.display())
-            });
+        // The lock is the temp directory itself: the same scope a lock file
+        // inside it had, shared by every test binary of the run, and nothing is
+        // left behind once the run ends.
+        let path = std::env::temp_dir();
+        let file = File::open(&path).unwrap_or_else(|error| {
+            panic!("failed to open PTY test lock '{}': {error}", path.display())
+        });
         flock(file.as_fd(), FlockOperation::LockExclusive).unwrap_or_else(|error| {
             panic!(
                 "failed to acquire PTY test lock '{}': {error}",
@@ -420,4 +417,14 @@ impl Drop for TestHarness {
         let _ = std::fs::remove_file(&self.socket_path);
         let _ = std::fs::remove_dir_all(&self.root);
     }
+}
+
+/// Fails a test whose `new-session` setup did not succeed, naming the response
+/// that arrived instead so a red under load states its cause.
+#[track_caller]
+pub fn assert_new_session(response: &Response) {
+    assert!(
+        matches!(response, Response::NewSession(_)),
+        "expected Response::NewSession, got {response:?}"
+    );
 }

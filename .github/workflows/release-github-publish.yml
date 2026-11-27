@@ -77,6 +77,7 @@ jobs:
         shell: bash
         env:
           GH_TOKEN: ${{ github.token }}
+          NOTES_SOURCE_SHA: ${{ inputs.expected_source_sha }}
         run: |
           set -euo pipefail
           root="$RUNNER_TEMP/rmux-publication"
@@ -84,9 +85,17 @@ jobs:
           test -f "$root/envelope/promotion-authorization-envelope.json"
           cp -- "$root/authorization/SHA256SUMS.sigstore.json" \
             "$root/release-assets/SHA256SUMS.sigstore.json"
-          printf '# RMUX %s\n\nExact candidate `%s` from `%s`.\n' \
+          version="${{ inputs.release_ref }}"
+          version="${version#v}"
+          [[ "$NOTES_SOURCE_SHA" =~ ^[0-9a-f]{40}$ ]]
+          # Source notes resolve in their Git tree; a Release body has no directory.
+          source_url="https://github.com/Helvesec/rmux/blob/$NOTES_SOURCE_SHA"
+          sed "s|](\\.\\./\\.\\./|]($source_url/|g" "docs/release/${version%%-rc.*}.md" > "$root/release-notes.md"
+          printf '\n## Publication candidate\n\nRelease `%s`; candidate [%s](%s/%s/actions/runs/%s); source_git_sha `%s`.\n' \
             "${{ inputs.release_ref }}" "${{ inputs.candidate_run_id }}" \
-            "${{ inputs.expected_source_sha }}" > "$root/release-notes.md"
+            "${{ github.server_url }}" "${{ github.repository }}" \
+            "${{ inputs.candidate_run_id }}" "${{ inputs.expected_source_sha }}" \
+            >> "$root/release-notes.md"
           python3 scripts/release/publish-github-release.py \
             --predicate "$root/authorization/promotion-authorization-predicate.json" \
             --envelope "$root/envelope/promotion-authorization-envelope.json" \

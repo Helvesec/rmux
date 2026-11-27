@@ -1,0 +1,1668 @@
+{
+  "schema": 1,
+  "name": "formats-rest-linux-v1",
+  "independent_expectation": "Exact tmux3.7b raw outputs frozen before candidate, selected from pinned format.c/window-copy.c semantics. No candidate values as oracle.",
+  "startup": "set-option -s exit-empty off\nset-option -g status off\nset-option -g automatic-rename off\nset-option -g mode-keys vi\nnew-session -d -s alpha -n zeta -x 40 -y 16 /bin/bash --noprofile --norc -c 'printf '\"'\"'%s\\n'\"'\"' \"$$\" > @ROOT@/main.pid; IFS= read -r first; printf '\"'\"'\\033[H\\033[2J'\"'\"'; printf '\"'\"'%b'\"'\"' '\"'\"'T\\tTAB tail\\r\\nababa tail\\r\\nxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxEND\\r\\nNEXT tail\\r\\nwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwWRAPEND tail\\r\\nREADY038\\r\\n'\"'\"'; printf '\"'\"'RX:%s\\n'\"'\"' \"$first\"; while IFS= read -r line; do printf '\"'\"'RX:%s\\n'\"'\"' \"$line\"; done'\nsend-keys -F -t alpha:0.0 'startup:#{session_name}:#{pane_index}' Enter\n",
+  "startup_helpers": [
+    "main"
+  ],
+  "steps": [
+    {
+      "kind": "delivery",
+      "id": "route-startup",
+      "line": "RX:startup:alpha:0",
+      "target": "alpha:0.0",
+      "prefix": "RX:startup:",
+      "success": {
+        "exit": 0,
+        "stderr": ""
+      }
+    },
+    {
+      "kind": "command",
+      "argv": [
+        "new-session",
+        "-d",
+        "-s",
+        "beta",
+        "-n",
+        "beta",
+        "-x",
+        "40",
+        "-y",
+        "16",
+        "/bin/bash",
+        "--noprofile",
+        "--norc",
+        "-c",
+        "printf '%s\\n' \"$$\" > @ROOT@/other.pid; printf '%b' 'READY038\\r\\n'; while IFS= read -r line; do printf 'RX:%s\\n' \"$line\"; done"
+      ],
+      "helper": "other"
+    },
+    {
+      "kind": "command",
+      "argv": [
+        "set-option",
+        "-g",
+        "@text",
+        "a b$c#d%\\'|&;()[]"
+      ]
+    },
+    {
+      "kind": "command",
+      "argv": [
+        "set-option",
+        "-g",
+        "@tab",
+        "A\tB"
+      ]
+    },
+    {
+      "kind": "command",
+      "argv": [
+        "set-option",
+        "-g",
+        "@newline",
+        "A\nB"
+      ]
+    },
+    {
+      "kind": "command",
+      "argv": [
+        "set-option",
+        "-g",
+        "@unicode",
+        "é中x"
+      ]
+    },
+    {
+      "kind": "command",
+      "argv": [
+        "set-option",
+        "-g",
+        "@path",
+        "/a/b/c/"
+      ]
+    },
+    {
+      "kind": "command",
+      "argv": [
+        "set-option",
+        "-g",
+        "@double",
+        "//host/a//"
+      ]
+    },
+    {
+      "kind": "command",
+      "argv": [
+        "set-option",
+        "-g",
+        "@overlap",
+        "ababa"
+      ]
+    },
+    {
+      "kind": "observe",
+      "id": "registry-missing-xyz",
+      "argv": [
+        "display-message",
+        "-p",
+        "-t",
+        "alpha:0.0",
+        "#{pane_x}|#{pane_y}|#{pane_z}"
+      ],
+      "success": {
+        "exit": 0,
+        "stderr": ""
+      }
+    },
+    {
+      "kind": "command",
+      "id": "discovery-raw",
+      "argv": [
+        "display-message",
+        "-a",
+        "-t",
+        "alpha:0.0"
+      ]
+    },
+    {
+      "kind": "command",
+      "id": "default-list-panes-raw",
+      "argv": [
+        "list-panes",
+        "-t",
+        "alpha:0"
+      ]
+    },
+    {
+      "kind": "observe",
+      "id": "vars-present",
+      "argv": [
+        "display-message",
+        "-p",
+        "-t",
+        "alpha:0.0",
+        "#{session_name}|#{window_name}|#{pane_index}|#{pane_width}|#{pane_height}"
+      ],
+      "success": {
+        "exit": 0,
+        "stderr": ""
+      }
+    },
+    {
+      "kind": "observe",
+      "id": "vars-absent",
+      "argv": [
+        "display-message",
+        "-p",
+        "-t",
+        "alpha:0.0",
+        "#{search_present}|#{search_match}|#{selection_present}|#{client_name}"
+      ],
+      "success": {
+        "exit": 0,
+        "stderr": ""
+      }
+    },
+    {
+      "kind": "observe",
+      "id": "conditional",
+      "argv": [
+        "display-message",
+        "-p",
+        "-t",
+        "alpha:0.0",
+        "#{?#{==:#{session_name},alpha},yes,no}"
+      ],
+      "success": {
+        "exit": 0,
+        "stderr": ""
+      }
+    },
+    {
+      "kind": "observe",
+      "id": "nested",
+      "argv": [
+        "display-message",
+        "-p",
+        "-t",
+        "alpha:0.0",
+        "#{?#{&&:#{==:#{pane_index},0},#{>:5,2}},#{e|+:7,8},no}"
+      ],
+      "success": {
+        "exit": 0,
+        "stderr": ""
+      }
+    },
+    {
+      "kind": "observe",
+      "id": "quote-shell",
+      "argv": [
+        "display-message",
+        "-p",
+        "-t",
+        "alpha:0.0",
+        "#{q:@text}"
+      ],
+      "success": {
+        "exit": 0,
+        "stderr": ""
+      }
+    },
+    {
+      "kind": "observe",
+      "id": "quote-style",
+      "argv": [
+        "display-message",
+        "-p",
+        "-t",
+        "alpha:0.0",
+        "#{q/e/:@text}"
+      ],
+      "success": {
+        "exit": 0,
+        "stderr": ""
+      }
+    },
+    {
+      "kind": "observe",
+      "id": "quote-nested",
+      "argv": [
+        "display-message",
+        "-p",
+        "-t",
+        "alpha:0.0",
+        "#{q:#{@text}}"
+      ],
+      "success": {
+        "exit": 0,
+        "stderr": ""
+      }
+    },
+    {
+      "kind": "observe",
+      "id": "quote-tab",
+      "argv": [
+        "display-message",
+        "-p",
+        "-t",
+        "alpha:0.0",
+        "#{q:@tab}"
+      ],
+      "success": {
+        "exit": 0,
+        "stderr": ""
+      }
+    },
+    {
+      "kind": "observe",
+      "id": "quote-newline",
+      "argv": [
+        "display-message",
+        "-p",
+        "-t",
+        "alpha:0.0",
+        "#{q:@newline}"
+      ],
+      "success": {
+        "exit": 0,
+        "stderr": ""
+      }
+    },
+    {
+      "kind": "observe",
+      "id": "quote-unicode",
+      "argv": [
+        "display-message",
+        "-p",
+        "-t",
+        "alpha:0.0",
+        "#{q:@unicode}"
+      ],
+      "success": {
+        "exit": 0,
+        "stderr": ""
+      }
+    },
+    {
+      "kind": "observe",
+      "id": "literal-escapes",
+      "argv": [
+        "display-message",
+        "-p",
+        "-t",
+        "alpha:0.0",
+        "#{l:a#,b#:c##d}"
+      ],
+      "success": {
+        "exit": 0,
+        "stderr": ""
+      }
+    },
+    {
+      "kind": "observe",
+      "id": "hash-trailing",
+      "argv": [
+        "display-message",
+        "-p",
+        "-t",
+        "alpha:0.0",
+        "before#"
+      ],
+      "success": {
+        "exit": 0,
+        "stderr": ""
+      }
+    },
+    {
+      "kind": "observe",
+      "id": "hash-existing-0",
+      "argv": [
+        "display-message",
+        "-p",
+        "-t",
+        "alpha:0.0",
+        "##"
+      ],
+      "success": {
+        "exit": 0,
+        "stderr": ""
+      }
+    },
+    {
+      "kind": "observe",
+      "id": "hash-existing-1",
+      "argv": [
+        "display-message",
+        "-p",
+        "-t",
+        "alpha:0.0",
+        "###"
+      ],
+      "success": {
+        "exit": 0,
+        "stderr": ""
+      }
+    },
+    {
+      "kind": "observe",
+      "id": "hash-existing-2",
+      "argv": [
+        "display-message",
+        "-p",
+        "-t",
+        "alpha:0.0",
+        "####"
+      ],
+      "success": {
+        "exit": 0,
+        "stderr": ""
+      }
+    },
+    {
+      "kind": "observe",
+      "id": "hash-existing-3",
+      "argv": [
+        "display-message",
+        "-p",
+        "-t",
+        "alpha:0.0",
+        "#####"
+      ],
+      "success": {
+        "exit": 0,
+        "stderr": ""
+      }
+    },
+    {
+      "kind": "observe",
+      "id": "hash-existing-4",
+      "argv": [
+        "display-message",
+        "-p",
+        "-t",
+        "alpha:0.0",
+        "text#"
+      ],
+      "success": {
+        "exit": 0,
+        "stderr": ""
+      }
+    },
+    {
+      "kind": "observe",
+      "id": "hash-existing-5",
+      "argv": [
+        "display-message",
+        "-p",
+        "-t",
+        "alpha:0.0",
+        "abc#"
+      ],
+      "success": {
+        "exit": 0,
+        "stderr": ""
+      }
+    },
+    {
+      "kind": "observe",
+      "id": "hash-neighbor-0",
+      "argv": [
+        "display-message",
+        "-p",
+        "-t",
+        "alpha:0.0",
+        "#"
+      ],
+      "success": {
+        "exit": 0,
+        "stderr": ""
+      }
+    },
+    {
+      "kind": "observe",
+      "id": "hash-neighbor-1",
+      "argv": [
+        "display-message",
+        "-p",
+        "-t",
+        "alpha:0.0",
+        "é#"
+      ],
+      "success": {
+        "exit": 0,
+        "stderr": ""
+      }
+    },
+    {
+      "kind": "observe",
+      "id": "hash-neighbor-2",
+      "argv": [
+        "display-message",
+        "-p",
+        "-t",
+        "alpha:0.0",
+        "prefix##"
+      ],
+      "success": {
+        "exit": 0,
+        "stderr": ""
+      }
+    },
+    {
+      "kind": "observe",
+      "id": "hash-neighbor-3",
+      "argv": [
+        "display-message",
+        "-p",
+        "-t",
+        "alpha:0.0",
+        "prefix###"
+      ],
+      "success": {
+        "exit": 0,
+        "stderr": ""
+      }
+    },
+    {
+      "kind": "observe",
+      "id": "hash-neighbor-4",
+      "argv": [
+        "display-message",
+        "-p",
+        "-t",
+        "alpha:0.0",
+        "#{l:#}"
+      ],
+      "success": {
+        "exit": 0,
+        "stderr": ""
+      }
+    },
+    {
+      "kind": "observe",
+      "id": "hash-neighbor-5",
+      "argv": [
+        "display-message",
+        "-p",
+        "-t",
+        "alpha:0.0",
+        "#{l:##}"
+      ],
+      "success": {
+        "exit": 0,
+        "stderr": ""
+      }
+    },
+    {
+      "kind": "observe",
+      "id": "hash-neighbor-6",
+      "argv": [
+        "display-message",
+        "-p",
+        "-t",
+        "alpha:0.0",
+        "#{session_name}#"
+      ],
+      "success": {
+        "exit": 0,
+        "stderr": ""
+      }
+    },
+    {
+      "kind": "observe",
+      "id": "hash-escapes",
+      "argv": [
+        "display-message",
+        "-p",
+        "-t",
+        "alpha:0.0",
+        "## #{l:##} ##{session_name}"
+      ],
+      "success": {
+        "exit": 0,
+        "stderr": ""
+      }
+    },
+    {
+      "kind": "observe",
+      "id": "length-unicode",
+      "argv": [
+        "display-message",
+        "-p",
+        "-t",
+        "alpha:0.0",
+        "#{n:@unicode}|#{w:@unicode}"
+      ],
+      "success": {
+        "exit": 0,
+        "stderr": ""
+      }
+    },
+    {
+      "kind": "observe",
+      "id": "truncate-unicode",
+      "argv": [
+        "display-message",
+        "-p",
+        "-t",
+        "alpha:0.0",
+        "#{=3:@unicode}|#{=-3:@unicode}|#{p8:@unicode}"
+      ],
+      "success": {
+        "exit": 0,
+        "stderr": ""
+      }
+    },
+    {
+      "kind": "observe",
+      "id": "basename",
+      "argv": [
+        "display-message",
+        "-p",
+        "-t",
+        "alpha:0.0",
+        "#{b:@path}|#{d:@path}"
+      ],
+      "success": {
+        "exit": 0,
+        "stderr": ""
+      }
+    },
+    {
+      "kind": "observe",
+      "id": "dirname-double",
+      "argv": [
+        "display-message",
+        "-p",
+        "-t",
+        "alpha:0.0",
+        "#{d:@double}|#{b:@double}"
+      ],
+      "success": {
+        "exit": 0,
+        "stderr": ""
+      }
+    },
+    {
+      "kind": "observe",
+      "id": "number-add",
+      "argv": [
+        "display-message",
+        "-p",
+        "-t",
+        "alpha:0.0",
+        "#{e|+:12,7}"
+      ],
+      "success": {
+        "exit": 0,
+        "stderr": ""
+      }
+    },
+    {
+      "kind": "observe",
+      "id": "number-subtract",
+      "argv": [
+        "display-message",
+        "-p",
+        "-t",
+        "alpha:0.0",
+        "#{e|-:12,7}"
+      ],
+      "success": {
+        "exit": 0,
+        "stderr": ""
+      }
+    },
+    {
+      "kind": "observe",
+      "id": "number-divide",
+      "argv": [
+        "display-message",
+        "-p",
+        "-t",
+        "alpha:0.0",
+        "#{e|/:12,5}"
+      ],
+      "success": {
+        "exit": 0,
+        "stderr": ""
+      }
+    },
+    {
+      "kind": "observe",
+      "id": "number-float",
+      "argv": [
+        "display-message",
+        "-p",
+        "-t",
+        "alpha:0.0",
+        "#{e|/|f|3:12,5}"
+      ],
+      "success": {
+        "exit": 0,
+        "stderr": ""
+      }
+    },
+    {
+      "kind": "observe",
+      "id": "number-modulus",
+      "argv": [
+        "display-message",
+        "-p",
+        "-t",
+        "alpha:0.0",
+        "#{e|%:12,5}"
+      ],
+      "success": {
+        "exit": 0,
+        "stderr": ""
+      }
+    },
+    {
+      "kind": "observe",
+      "id": "number-zero",
+      "argv": [
+        "display-message",
+        "-p",
+        "-t",
+        "alpha:0.0",
+        "#{e|/:2,0}"
+      ],
+      "success": {
+        "exit": 0,
+        "stderr": ""
+      }
+    },
+    {
+      "kind": "observe",
+      "id": "number-hex",
+      "argv": [
+        "display-message",
+        "-p",
+        "-t",
+        "alpha:0.0",
+        "#{e|+:0x10,2}|#{==:0x10,16}"
+      ],
+      "success": {
+        "exit": 0,
+        "stderr": ""
+      }
+    },
+    {
+      "kind": "observe",
+      "id": "number-invalid",
+      "argv": [
+        "display-message",
+        "-p",
+        "-t",
+        "alpha:0.0",
+        "#{e|+:bad,2}"
+      ],
+      "success": {
+        "exit": 0,
+        "stderr": ""
+      }
+    },
+    {
+      "kind": "observe",
+      "id": "compare-case",
+      "argv": [
+        "display-message",
+        "-p",
+        "-t",
+        "alpha:0.0",
+        "#{m/i:AL*,alpha}|#{m:AL*,alpha}"
+      ],
+      "success": {
+        "exit": 0,
+        "stderr": ""
+      }
+    },
+    {
+      "kind": "observe",
+      "id": "regex-posix",
+      "argv": [
+        "display-message",
+        "-p",
+        "-t",
+        "alpha:0.0",
+        "#{m/r:^[[:alpha:]]+$,abCD}|#{m/r:^[[:digit:]]+$,12}"
+      ],
+      "success": {
+        "exit": 0,
+        "stderr": ""
+      }
+    },
+    {
+      "kind": "observe",
+      "id": "regex-substitute",
+      "argv": [
+        "display-message",
+        "-p",
+        "-t",
+        "alpha:0.0",
+        "#{s/(ab)/<\\1>/:@overlap}"
+      ],
+      "success": {
+        "exit": 0,
+        "stderr": ""
+      }
+    },
+    {
+      "kind": "observe",
+      "id": "regex-invalid",
+      "argv": [
+        "display-message",
+        "-p",
+        "-t",
+        "alpha:0.0",
+        "#{s/[/X/:@text}"
+      ],
+      "success": {
+        "exit": 0,
+        "stderr": ""
+      }
+    },
+    {
+      "kind": "observe",
+      "id": "regex-start",
+      "argv": [
+        "display-message",
+        "-p",
+        "-t",
+        "alpha:0.0",
+        "#{s/^/X/:@unicode}"
+      ],
+      "success": {
+        "exit": 0,
+        "stderr": ""
+      }
+    },
+    {
+      "kind": "observe",
+      "id": "regex-empty",
+      "argv": [
+        "display-message",
+        "-p",
+        "-t",
+        "alpha:0.0",
+        "#{s/[0-9]*/X/:@unicode}"
+      ],
+      "success": {
+        "exit": 0,
+        "stderr": ""
+      }
+    },
+    {
+      "kind": "observe",
+      "id": "conditional-errors",
+      "argv": [
+        "display-message",
+        "-p",
+        "-t",
+        "alpha:0.0",
+        "#{?missing,yes,no}|#{?0,yes,no}|#{!missing}|#{!!session_name}"
+      ],
+      "success": {
+        "exit": 0,
+        "stderr": ""
+      }
+    },
+    {
+      "kind": "observe",
+      "id": "loop-S",
+      "argv": [
+        "display-message",
+        "-p",
+        "-t",
+        "alpha:0.0",
+        "#{S:#{session_name};}"
+      ],
+      "success": {
+        "exit": 0,
+        "stderr": ""
+      }
+    },
+    {
+      "kind": "observe",
+      "id": "loop-W",
+      "argv": [
+        "display-message",
+        "-p",
+        "-t",
+        "alpha:0.0",
+        "#{W:#{window_index}/#{window_name};}"
+      ],
+      "success": {
+        "exit": 0,
+        "stderr": ""
+      }
+    },
+    {
+      "kind": "observe",
+      "id": "loop-W-sort",
+      "argv": [
+        "display-message",
+        "-p",
+        "-t",
+        "alpha:0.0",
+        "#{W/n:#{window_index}/#{window_name};}"
+      ],
+      "success": {
+        "exit": 0,
+        "stderr": ""
+      }
+    },
+    {
+      "kind": "observe",
+      "id": "loop-W-reverse",
+      "argv": [
+        "display-message",
+        "-p",
+        "-t",
+        "alpha:0.0",
+        "#{W/r:#{window_index};}"
+      ],
+      "success": {
+        "exit": 0,
+        "stderr": ""
+      }
+    },
+    {
+      "kind": "observe",
+      "id": "loop-nested",
+      "argv": [
+        "display-message",
+        "-p",
+        "-t",
+        "alpha:0.0",
+        "#{S:#{session_name}=[#{W:#{window_name};}]|}"
+      ],
+      "success": {
+        "exit": 0,
+        "stderr": ""
+      }
+    },
+    {
+      "kind": "observe",
+      "id": "loop-P",
+      "argv": [
+        "display-message",
+        "-p",
+        "-t",
+        "alpha:0.0",
+        "#{P:#{pane_index};}"
+      ],
+      "success": {
+        "exit": 0,
+        "stderr": ""
+      }
+    },
+    {
+      "kind": "observe",
+      "id": "loop-local-restored",
+      "argv": [
+        "display-message",
+        "-p",
+        "-t",
+        "alpha:0.0",
+        "#{S:#{session_name};}#{session_name}|#{W:#{window_index};}#{window_index}"
+      ],
+      "success": {
+        "exit": 0,
+        "stderr": ""
+      }
+    },
+    {
+      "kind": "observe",
+      "id": "loop-selected",
+      "argv": [
+        "display-message",
+        "-p",
+        "-t",
+        "alpha:0.0",
+        "#{W:other#{window_index};,active#{window_index};}"
+      ],
+      "success": {
+        "exit": 0,
+        "stderr": ""
+      }
+    },
+    {
+      "kind": "observe",
+      "id": "count-loop",
+      "argv": [
+        "display-message",
+        "-p",
+        "-t",
+        "alpha:0.0",
+        "#{S/n:#{session_name};}|#{W/n:#{window_name};}"
+      ],
+      "success": {
+        "exit": 0,
+        "stderr": ""
+      }
+    },
+    {
+      "kind": "observe",
+      "id": "literal-unicode",
+      "argv": [
+        "display-message",
+        "-p",
+        "-t",
+        "alpha:0.0",
+        "#{l:é中,#{}"
+      ],
+      "success": {
+        "exit": 0,
+        "stderr": ""
+      }
+    },
+    {
+      "kind": "observe",
+      "id": "missing-variable",
+      "argv": [
+        "display-message",
+        "-p",
+        "-t",
+        "alpha:0.0",
+        "#{missing038}|#{?missing038,Y,N}"
+      ],
+      "success": {
+        "exit": 0,
+        "stderr": ""
+      }
+    },
+    {
+      "kind": "command",
+      "argv": [
+        "send-keys",
+        "-F",
+        "-t",
+        "alpha:0.0",
+        "cli:#{session_name}:#{pane_index}",
+        "Enter"
+      ]
+    },
+    {
+      "kind": "delivery",
+      "id": "route-cli",
+      "line": "RX:cli:alpha:0",
+      "target": "alpha:0.0",
+      "prefix": "RX:cli:",
+      "success": {
+        "exit": 0,
+        "stderr": ""
+      }
+    },
+    {
+      "kind": "file",
+      "name": "source.conf",
+      "text": "rename-window -t alpha:0 fromsource\nsend-keys -F -t alpha:0.0 'source:#{window_name}:#{pane_index}' Enter\n"
+    },
+    {
+      "kind": "command",
+      "argv": [
+        "source-file",
+        "@ROOT@/source.conf"
+      ]
+    },
+    {
+      "kind": "delivery",
+      "id": "route-source",
+      "line": "RX:source:fromsource:0",
+      "target": "alpha:0.0",
+      "prefix": "RX:source:",
+      "success": {
+        "exit": 0,
+        "stderr": ""
+      }
+    },
+    {
+      "kind": "command",
+      "argv": [
+        "rename-window",
+        "-t",
+        "alpha:0",
+        "fromqueue",
+        ";",
+        "send-keys",
+        "-F",
+        "-t",
+        "alpha:0.0",
+        "queue:#{window_name}:#{pane_index}",
+        "Enter"
+      ]
+    },
+    {
+      "kind": "delivery",
+      "id": "route-queue",
+      "line": "RX:queue:fromqueue:0",
+      "target": "alpha:0.0",
+      "prefix": "RX:queue:",
+      "success": {
+        "exit": 0,
+        "stderr": ""
+      }
+    },
+    {
+      "kind": "attach",
+      "session": "alpha"
+    },
+    {
+      "kind": "command",
+      "argv": [
+        "bind-key",
+        "x",
+        "send-keys",
+        "-F",
+        "-t",
+        "alpha:0.0",
+        "binding:#{session_name}:#{pane_index}",
+        "Enter"
+      ]
+    },
+    {
+      "kind": "key",
+      "id": "binding-key",
+      "hex": "0278"
+    },
+    {
+      "kind": "delivery",
+      "id": "route-binding",
+      "line": "RX:binding:alpha:0",
+      "prefix": "RX:binding:",
+      "target": "alpha:0.0",
+      "success": {
+        "exit": 0,
+        "stderr": ""
+      }
+    },
+    {
+      "kind": "command",
+      "argv": [
+        "copy-mode",
+        "-t",
+        "alpha:0.0"
+      ]
+    },
+    {
+      "kind": "command",
+      "argv": [
+        "send-keys",
+        "-t",
+        "alpha:0.0",
+        "-X",
+        "search-forward-text",
+        "TAB"
+      ]
+    },
+    {
+      "kind": "observe",
+      "id": "copy-tab-owner-start",
+      "argv": [
+        "display-message",
+        "-p",
+        "-t",
+        "alpha:0.0",
+        "#{search_present}|#{search_count}|#{search_match}|#{copy_cursor_x}|#{copy_cursor_y}"
+      ],
+      "success": {
+        "exit": 0,
+        "stderr": ""
+      }
+    },
+    {
+      "kind": "command",
+      "argv": [
+        "send-keys",
+        "-t",
+        "alpha:0.0",
+        "-X",
+        "-N",
+        "1",
+        "cursor-left"
+      ]
+    },
+    {
+      "kind": "observe",
+      "id": "copy-tab-owner-0",
+      "argv": [
+        "display-message",
+        "-p",
+        "-t",
+        "alpha:0.0",
+        "#{search_present}|#{search_count}|#{search_match}|#{copy_cursor_x}|#{copy_cursor_y}"
+      ],
+      "success": {
+        "exit": 0,
+        "stderr": ""
+      }
+    },
+    {
+      "kind": "command",
+      "argv": [
+        "send-keys",
+        "-t",
+        "alpha:0.0",
+        "-X",
+        "-N",
+        "1",
+        "cursor-right"
+      ]
+    },
+    {
+      "kind": "observe",
+      "id": "copy-tab-owner-1",
+      "argv": [
+        "display-message",
+        "-p",
+        "-t",
+        "alpha:0.0",
+        "#{search_present}|#{search_count}|#{search_match}|#{copy_cursor_x}|#{copy_cursor_y}"
+      ],
+      "success": {
+        "exit": 0,
+        "stderr": ""
+      }
+    },
+    {
+      "kind": "command",
+      "argv": [
+        "send-keys",
+        "-t",
+        "alpha:0.0",
+        "-X",
+        "-N",
+        "3",
+        "cursor-right"
+      ]
+    },
+    {
+      "kind": "observe",
+      "id": "copy-tab-owner-2",
+      "argv": [
+        "display-message",
+        "-p",
+        "-t",
+        "alpha:0.0",
+        "#{search_present}|#{search_count}|#{search_match}|#{copy_cursor_x}|#{copy_cursor_y}"
+      ],
+      "success": {
+        "exit": 0,
+        "stderr": ""
+      }
+    },
+    {
+      "kind": "command",
+      "argv": [
+        "send-keys",
+        "-t",
+        "alpha:0.0",
+        "-X",
+        "search-forward-text",
+        "aba"
+      ]
+    },
+    {
+      "kind": "observe",
+      "id": "copy-overlap-start",
+      "argv": [
+        "display-message",
+        "-p",
+        "-t",
+        "alpha:0.0",
+        "#{search_present}|#{search_count}|#{search_match}|#{copy_cursor_x}|#{copy_cursor_y}"
+      ],
+      "success": {
+        "exit": 0,
+        "stderr": ""
+      }
+    },
+    {
+      "kind": "command",
+      "argv": [
+        "send-keys",
+        "-t",
+        "alpha:0.0",
+        "-X",
+        "-N",
+        "1",
+        "cursor-right"
+      ]
+    },
+    {
+      "kind": "observe",
+      "id": "copy-overlap-0",
+      "argv": [
+        "display-message",
+        "-p",
+        "-t",
+        "alpha:0.0",
+        "#{search_present}|#{search_count}|#{search_match}|#{copy_cursor_x}|#{copy_cursor_y}"
+      ],
+      "success": {
+        "exit": 0,
+        "stderr": ""
+      }
+    },
+    {
+      "kind": "command",
+      "argv": [
+        "send-keys",
+        "-t",
+        "alpha:0.0",
+        "-X",
+        "-N",
+        "1",
+        "cursor-right"
+      ]
+    },
+    {
+      "kind": "observe",
+      "id": "copy-overlap-1",
+      "argv": [
+        "display-message",
+        "-p",
+        "-t",
+        "alpha:0.0",
+        "#{search_present}|#{search_count}|#{search_match}|#{copy_cursor_x}|#{copy_cursor_y}"
+      ],
+      "success": {
+        "exit": 0,
+        "stderr": ""
+      }
+    },
+    {
+      "kind": "command",
+      "argv": [
+        "send-keys",
+        "-t",
+        "alpha:0.0",
+        "-X",
+        "-N",
+        "1",
+        "cursor-right"
+      ]
+    },
+    {
+      "kind": "observe",
+      "id": "copy-overlap-2",
+      "argv": [
+        "display-message",
+        "-p",
+        "-t",
+        "alpha:0.0",
+        "#{search_present}|#{search_count}|#{search_match}|#{copy_cursor_x}|#{copy_cursor_y}"
+      ],
+      "success": {
+        "exit": 0,
+        "stderr": ""
+      }
+    },
+    {
+      "kind": "command",
+      "argv": [
+        "send-keys",
+        "-t",
+        "alpha:0.0",
+        "-X",
+        "-N",
+        "1",
+        "cursor-right"
+      ]
+    },
+    {
+      "kind": "observe",
+      "id": "copy-overlap-3",
+      "argv": [
+        "display-message",
+        "-p",
+        "-t",
+        "alpha:0.0",
+        "#{search_present}|#{search_count}|#{search_match}|#{copy_cursor_x}|#{copy_cursor_y}"
+      ],
+      "success": {
+        "exit": 0,
+        "stderr": ""
+      }
+    },
+    {
+      "kind": "command",
+      "argv": [
+        "send-keys",
+        "-t",
+        "alpha:0.0",
+        "-X",
+        "-N",
+        "1",
+        "cursor-right"
+      ]
+    },
+    {
+      "kind": "observe",
+      "id": "copy-overlap-4",
+      "argv": [
+        "display-message",
+        "-p",
+        "-t",
+        "alpha:0.0",
+        "#{search_present}|#{search_count}|#{search_match}|#{copy_cursor_x}|#{copy_cursor_y}"
+      ],
+      "success": {
+        "exit": 0,
+        "stderr": ""
+      }
+    },
+    {
+      "kind": "command",
+      "argv": [
+        "send-keys",
+        "-t",
+        "alpha:0.0",
+        "-X",
+        "search-forward",
+        "ab(a|aba)"
+      ]
+    },
+    {
+      "kind": "observe",
+      "id": "copy-regex-overlap-start",
+      "argv": [
+        "display-message",
+        "-p",
+        "-t",
+        "alpha:0.0",
+        "#{search_present}|#{search_count}|#{search_match}|#{copy_cursor_x}|#{copy_cursor_y}"
+      ],
+      "success": {
+        "exit": 0,
+        "stderr": ""
+      }
+    },
+    {
+      "kind": "command",
+      "argv": [
+        "send-keys",
+        "-t",
+        "alpha:0.0",
+        "-X",
+        "-N",
+        "2",
+        "cursor-right"
+      ]
+    },
+    {
+      "kind": "observe",
+      "id": "copy-regex-overlap-0",
+      "argv": [
+        "display-message",
+        "-p",
+        "-t",
+        "alpha:0.0",
+        "#{search_present}|#{search_count}|#{search_match}|#{copy_cursor_x}|#{copy_cursor_y}"
+      ],
+      "success": {
+        "exit": 0,
+        "stderr": ""
+      }
+    },
+    {
+      "kind": "command",
+      "argv": [
+        "send-keys",
+        "-t",
+        "alpha:0.0",
+        "-X",
+        "-N",
+        "2",
+        "cursor-right"
+      ]
+    },
+    {
+      "kind": "observe",
+      "id": "copy-regex-overlap-1",
+      "argv": [
+        "display-message",
+        "-p",
+        "-t",
+        "alpha:0.0",
+        "#{search_present}|#{search_count}|#{search_match}|#{copy_cursor_x}|#{copy_cursor_y}"
+      ],
+      "success": {
+        "exit": 0,
+        "stderr": ""
+      }
+    },
+    {
+      "kind": "command",
+      "argv": [
+        "send-keys",
+        "-t",
+        "alpha:0.0",
+        "-X",
+        "search-forward-text",
+        "END"
+      ]
+    },
+    {
+      "kind": "observe",
+      "id": "copy-physical-end-start",
+      "argv": [
+        "display-message",
+        "-p",
+        "-t",
+        "alpha:0.0",
+        "#{search_present}|#{search_count}|#{search_match}|#{copy_cursor_x}|#{copy_cursor_y}"
+      ],
+      "success": {
+        "exit": 0,
+        "stderr": ""
+      }
+    },
+    {
+      "kind": "command",
+      "argv": [
+        "send-keys",
+        "-t",
+        "alpha:0.0",
+        "-X",
+        "-N",
+        "3",
+        "cursor-right"
+      ]
+    },
+    {
+      "kind": "observe",
+      "id": "copy-physical-end-0",
+      "argv": [
+        "display-message",
+        "-p",
+        "-t",
+        "alpha:0.0",
+        "#{search_present}|#{search_count}|#{search_match}|#{copy_cursor_x}|#{copy_cursor_y}"
+      ],
+      "success": {
+        "exit": 0,
+        "stderr": ""
+      }
+    },
+    {
+      "kind": "command",
+      "argv": [
+        "send-keys",
+        "-t",
+        "alpha:0.0",
+        "-X",
+        "-N",
+        "1",
+        "cursor-down"
+      ]
+    },
+    {
+      "kind": "observe",
+      "id": "copy-physical-end-1",
+      "argv": [
+        "display-message",
+        "-p",
+        "-t",
+        "alpha:0.0",
+        "#{search_present}|#{search_count}|#{search_match}|#{copy_cursor_x}|#{copy_cursor_y}"
+      ],
+      "success": {
+        "exit": 0,
+        "stderr": ""
+      }
+    },
+    {
+      "kind": "command",
+      "argv": [
+        "send-keys",
+        "-t",
+        "alpha:0.0",
+        "-X",
+        "-N",
+        "1",
+        "start-of-line"
+      ]
+    },
+    {
+      "kind": "observe",
+      "id": "copy-physical-end-2",
+      "argv": [
+        "display-message",
+        "-p",
+        "-t",
+        "alpha:0.0",
+        "#{search_present}|#{search_count}|#{search_match}|#{copy_cursor_x}|#{copy_cursor_y}"
+      ],
+      "success": {
+        "exit": 0,
+        "stderr": ""
+      }
+    },
+    {
+      "kind": "command",
+      "argv": [
+        "send-keys",
+        "-t",
+        "alpha:0.0",
+        "-X",
+        "search-forward-text",
+        "WRAPEND"
+      ]
+    },
+    {
+      "kind": "observe",
+      "id": "copy-soft-wrap-start",
+      "argv": [
+        "display-message",
+        "-p",
+        "-t",
+        "alpha:0.0",
+        "#{search_present}|#{search_count}|#{search_match}|#{copy_cursor_x}|#{copy_cursor_y}"
+      ],
+      "success": {
+        "exit": 0,
+        "stderr": ""
+      }
+    },
+    {
+      "kind": "command",
+      "argv": [
+        "send-keys",
+        "-t",
+        "alpha:0.0",
+        "-X",
+        "-N",
+        "2",
+        "cursor-right"
+      ]
+    },
+    {
+      "kind": "observe",
+      "id": "copy-soft-wrap-0",
+      "argv": [
+        "display-message",
+        "-p",
+        "-t",
+        "alpha:0.0",
+        "#{search_present}|#{search_count}|#{search_match}|#{copy_cursor_x}|#{copy_cursor_y}"
+      ],
+      "success": {
+        "exit": 0,
+        "stderr": ""
+      }
+    },
+    {
+      "kind": "command",
+      "argv": [
+        "send-keys",
+        "-t",
+        "alpha:0.0",
+        "-X",
+        "-N",
+        "4",
+        "cursor-right"
+      ]
+    },
+    {
+      "kind": "observe",
+      "id": "copy-soft-wrap-1",
+      "argv": [
+        "display-message",
+        "-p",
+        "-t",
+        "alpha:0.0",
+        "#{search_present}|#{search_count}|#{search_match}|#{copy_cursor_x}|#{copy_cursor_y}"
+      ],
+      "success": {
+        "exit": 0,
+        "stderr": ""
+      }
+    },
+    {
+      "kind": "command",
+      "argv": [
+        "send-keys",
+        "-t",
+        "alpha:0.0",
+        "-X",
+        "-N",
+        "1",
+        "cursor-right"
+      ]
+    },
+    {
+      "kind": "observe",
+      "id": "copy-soft-wrap-2",
+      "argv": [
+        "display-message",
+        "-p",
+        "-t",
+        "alpha:0.0",
+        "#{search_present}|#{search_count}|#{search_match}|#{copy_cursor_x}|#{copy_cursor_y}"
+      ],
+      "success": {
+        "exit": 0,
+        "stderr": ""
+      }
+    },
+    {
+      "kind": "command",
+      "argv": [
+        "send-keys",
+        "-t",
+        "alpha:0.0",
+        "-X",
+        "cancel"
+      ]
+    }
+  ],
+  "observations": 83,
+  "fixture": "Two sessions with one pane each plus one owned attached client:3helpers perphase. Earlier731native2 hadtwo alpha windows andretains originalsource/context attribution. No loop normalization.",
+  "prospective_semantics": "Ordinary send-keys -F must deliver literal arguments; copy-mode -F -X expands search context. Existing case lines are historical expansion witnesses, never rewritten or recredited; product and future route coverage remain pending."
+}

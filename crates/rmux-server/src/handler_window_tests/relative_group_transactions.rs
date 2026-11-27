@@ -94,8 +94,7 @@ pub(super) fn window_ids(
         .session(session_name)
         .expect("session exists")
         .windows()
-        .iter()
-        .map(|(index, window)| (*index, window.id().as_u32()))
+        .map(|(index, window)| (index, window.id().as_u32()))
         .collect()
 }
 
@@ -322,7 +321,10 @@ async fn grouped_relative_link_after_sparse_last_window_via_peer_succeeds() {
             .session(session_name)
             .expect("group member exists");
         assert_eq!(
-            session.windows().keys().copied().collect::<Vec<_>>(),
+            session
+                .windows()
+                .map(|(index, _)| index)
+                .collect::<Vec<_>>(),
             vec![0, 10, 11]
         );
         assert_eq!(

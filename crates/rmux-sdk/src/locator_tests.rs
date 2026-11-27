@@ -56,6 +56,85 @@ async fn locator_click_shares_resolution_and_action_deadline() {
     server.abort();
 }
 
+#[cfg(feature = "regex")]
+#[tokio::test(start_paused = true)]
+async fn get_by_text_searches_with_the_callers_regex_builder_options() {
+    let (client_stream, mut server_stream) = tokio::io::duplex(4096);
+    let transport = TransportClient::spawn(client_stream);
+    transport
+        .cache_capabilities(vec![
+            CAPABILITY_HANDSHAKE.to_owned(),
+            CAPABILITY_SDK_PANE_BY_ID.to_owned(),
+        ])
+        .await;
+    let pane = Pane::new(
+        PaneRef::new(session_name(), 0, 0),
+        RmuxEndpoint::Default,
+        Some(Duration::from_secs(1)),
+        transport,
+    );
+    let server = tokio::spawn(async move {
+        loop {
+            match read_request(&mut server_stream).await {
+                Request::ListPanes(_) => {
+                    write_response(
+                        &mut server_stream,
+                        Response::ListPanes(ListPanesResponse {
+                            output: CommandOutput::from_stdout("0:0:%1\n"),
+                        }),
+                    )
+                    .await;
+                }
+                Request::PaneSnapshotRef(_) => {
+                    write_response(
+                        &mut server_stream,
+                        Response::PaneSnapshot(snapshot_response("READY")),
+                    )
+                    .await;
+                }
+                other => panic!("unexpected locator request {other:?}"),
+            }
+        }
+    });
+    let case_insensitive = regex::RegexBuilder::new("ready")
+        .case_insensitive(true)
+        .build()
+        .expect("caller regex compiles");
+    assert!(case_insensitive.is_match("READY"));
+
+    let waited = pane
+        .get_by_text(case_insensitive.clone())
+        .wait_for()
+        .timeout(Duration::from_secs(1))
+        .await;
+    let asserted = pane
+        .get_by_text(case_insensitive)
+        .expect()
+        .to_have_text("READY")
+        .timeout(Duration::from_secs(1))
+        .await;
+    server.abort();
+
+    let waited = waited.expect("case-insensitive regex locator finds READY");
+    assert_eq!(waited.visible_text(), "READY");
+    asserted.expect("case-insensitive regex locator matches the READY text");
+}
+
+#[cfg(feature = "regex")]
+#[test]
+fn compiled_regex_locator_text_is_equal_only_to_the_same_compiled_regex() {
+    let caller = regex::Regex::new("ready").expect("caller regex compiles");
+    let text = crate::LocatorText::from(caller);
+    let recompiled = crate::LocatorText::from(regex::Regex::new("ready").expect("regex"));
+
+    assert_eq!(text, text.clone());
+    assert_ne!(text, recompiled);
+    assert_eq!(
+        format!("{text:?}"),
+        r#"CompiledRegex(LocatorRegex("ready"))"#
+    );
+}
+
 async fn serve_pane_lookup(stream: &mut tokio::io::DuplexStream) {
     assert!(matches!(read_request(stream).await, Request::ListPanes(_)));
     write_response(

@@ -72,7 +72,7 @@ impl<'a> GrammarParser<'a> {
                 LexToken::CloseBrace => {
                     return Err(CommandParseError::structural(
                         self.peek_line()?,
-                        "unmatched }",
+                        "syntax error",
                     ));
                 }
                 LexToken::Else if stop_directives.contains(&ConditionStop::Else) => break,
@@ -115,7 +115,7 @@ impl<'a> GrammarParser<'a> {
                 LexToken::OpenBrace => {
                     return Err(CommandParseError::structural(
                         self.peek_line()?,
-                        "unexpected {",
+                        "syntax error",
                     ));
                 }
                 LexToken::Format(_) => {

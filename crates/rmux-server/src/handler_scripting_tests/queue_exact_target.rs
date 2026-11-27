@@ -20,7 +20,7 @@ async fn create_session(handler: &RequestHandler, name: &str) -> SessionName {
             environment: None,
         }))
         .await;
-    assert!(matches!(response, Response::NewSession(_)), "{response:?}");
+    crate::session_fixture::assert_new_session(&response);
     name
 }
 
@@ -506,3 +506,8 @@ async fn hook_command_path_uses_the_same_exact_target_guard() {
     assert_eq!(replacement.id(), replacement_id);
     assert_ne!(replacement.name(), Some("stale-hook"));
 }
+
+mod valid_move;
+
+#[path = "queue_exact_target_send_keys.rs"]
+mod send_keys_regressions;

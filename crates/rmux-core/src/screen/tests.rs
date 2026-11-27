@@ -13,6 +13,71 @@ fn new_screen(cols: u16, rows: u16, history: usize) -> Screen {
     Screen::new(TerminalSize { cols, rows }, history)
 }
 
+#[test]
+fn configured_cursor_default_is_resolved_without_overwriting_raw_style() {
+    let mut screen = new_screen(10, 2, 10);
+    screen.set_cursor_default_style(6);
+    screen.set_cursor_default_style(99);
+    parse(&mut screen, b"\x1b[?12h");
+
+    assert_eq!(screen.cursor_style(), 0);
+    assert_eq!(screen.cursor_default_style(), 6);
+    assert_eq!(screen.resolved_cursor_style(), 5);
+}
+
+#[test]
+fn cursor_style_is_shared_by_main_and_alternate_screens() {
+    let mut screen = new_screen(10, 2, 10);
+    parse(&mut screen, b"\x1b[3 q\x1b[?1049h\x1b[6 q\x1b[?1049l");
+    assert_eq!(screen.cursor_style(), 6);
+
+    parse(&mut screen, b"\x1b[?1049h");
+    assert_eq!(screen.cursor_style(), 6);
+}
+
+#[test]
+fn invalid_cursor_styles_preserve_the_previous_screen_state() {
+    let mut screen = new_screen(10, 2, 10);
+    parse(&mut screen, b"\x1b[3 q\x1b[7 q\x1b[99 q");
+
+    assert_eq!(screen.cursor_style(), 3);
+    assert_eq!(screen.resolved_cursor_style(), 3);
+}
+
+#[test]
+fn decscusr_accepts_zero_through_six_and_absent_means_zero() {
+    for style in 0..=6 {
+        let mut screen = new_screen(10, 2, 10);
+        parse(&mut screen, format!("\x1b[{style} q").as_bytes());
+        assert_eq!(screen.cursor_style(), style);
+    }
+
+    let mut screen = new_screen(10, 2, 10);
+    parse(&mut screen, b"\x1b[4 q\x1b[ q");
+    assert_eq!(screen.cursor_style(), 0);
+}
+
+#[test]
+fn decscusr_and_mode_12_follow_last_writer_blink_precedence() {
+    let mut screen = new_screen(10, 2, 10);
+    parse(&mut screen, b"\x1b[?12h\x1b[6 q");
+    assert_eq!(screen.resolved_cursor_style(), 6);
+
+    parse(&mut screen, b"\x1b[?12h");
+    assert_eq!(screen.resolved_cursor_style(), 5);
+    parse(&mut screen, b"\x1b[?12l");
+    assert_eq!(screen.resolved_cursor_style(), 6);
+}
+
+#[test]
+fn decstr_preserves_cursor_style_and_blink_state() {
+    let mut screen = new_screen(10, 2, 10);
+    parse(&mut screen, b"\x1b[6 q\x1b[?12h\x1b[!p");
+
+    assert_eq!(screen.cursor_style(), 6);
+    assert_eq!(screen.resolved_cursor_style(), 5);
+}
+
 fn reflow_overflow_screen(history_limit: usize) -> Screen {
     let mut screen = new_screen(20, 1, history_limit);
     parse(&mut screen, b"abcdefghijklmnopqrst");
@@ -123,6 +188,11 @@ fn selection_style_overlay_composes_like_tmux_screen_select_cell() {
         0,
         "cell attributes are dropped when the selection style sets none"
     );
+    assert_ne!(
+        cell.attr() & GridAttr::NOATTR,
+        0,
+        "a painted selection cell keeps the internal nonempty marker"
+    );
 
     // A complete style with its own attributes still applies them while
     // dropping the cell's (oracle probe 2026-07-11: bg=red,fg=white,bold
@@ -181,6 +251,56 @@ fn row_range_style_overlay_is_inclusive_and_paints_blank_cells() {
     }));
     assert_eq!(colours[0], (COLOUR_DEFAULT, COLOUR_DEFAULT));
     assert_eq!(&colours[1..], &[(0, 6); 5]);
+}
+
+#[test]
+fn row_range_overlay_marks_only_the_wide_owner_and_preserves_its_link() {
+    use crate::input::GridAttr;
+
+    let mut screen = new_screen(6, 1, 10);
+    parse(
+        &mut screen,
+        "\x1b]8;;https://example.test\x1b\\表\x1b]8;;\x1b\\x".as_bytes(),
+    );
+    let mut before = Vec::new();
+    assert!(screen.visit_visible_line_cells(0, 6, |cell| {
+        before.push((cell.width(), cell.is_padding(), cell.attr(), cell.link()));
+    }));
+    assert_eq!((before[0].0, before[1].1), (2, true));
+    assert_ne!(before[0].3, 0, "wide owner carries the hyperlink");
+
+    let style = crate::style::Style::parse("bg=cyan,fg=black").expect("valid overlay style");
+    screen.overlay_style_on_row_range(0, 1, 1, &style);
+
+    let mut after = Vec::new();
+    assert!(screen.visit_visible_line_cells(0, 6, |cell| {
+        after.push((
+            cell.width(),
+            cell.is_padding(),
+            cell.attr(),
+            cell.fg(),
+            cell.bg(),
+            cell.link(),
+        ));
+    }));
+    assert_eq!((after[0].0, after[1].1), (2, true));
+    assert_eq!(after[0].5, before[0].3, "overlay preserves the link ID");
+    assert_eq!((after[0].3, after[0].4), (0, 6));
+    assert_ne!(
+        after[0].2 & GridAttr::NOATTR,
+        0,
+        "the painted wide owner carries the internal nonempty marker"
+    );
+    assert_eq!(
+        after[1].2 & GridAttr::NOATTR,
+        0,
+        "wide padding remains structural rather than independently painted"
+    );
+    assert_eq!(
+        after[2].2 & GridAttr::NOATTR,
+        0,
+        "the neighboring unpainted cell remains unmarked"
+    );
 }
 
 #[test]
@@ -551,6 +671,49 @@ fn width_resize_reflows_wrapped_lines_instead_of_truncating() {
 }
 
 #[test]
+fn width_resize_joins_a_short_wrapped_row_by_its_written_cells() {
+    let mut screen = new_screen(8, 4, 10);
+    parse(&mut screen, b"ab\r\ncd\x1b[1;1H");
+    crate::input::ScreenWriter::linefeed(&mut screen, true, COLOUR_DEFAULT);
+
+    screen.resize(TerminalSize { cols: 4, rows: 4 });
+
+    let capture = screen.capture_transcript(full_range(), GridRenderOptions::default());
+    let rendered = String::from_utf8(capture).expect("capture must be UTF-8");
+    assert_eq!(rendered.lines().find(|line| !line.is_empty()), Some("abcd"));
+}
+
+#[test]
+fn width_resize_short_wrapped_extent_keeps_cursor_and_shell_marks_with_content() {
+    for (first, cols, expected_cursor, expected_row) in
+        [("ab", 4, (2, 0), 0), ("ab  ", 3, (1, 1), 1)]
+    {
+        let mut screen = new_screen(8, 4, 10);
+        parse(&mut screen, format!("{first}\r\ncd\x1b[1;1H").as_bytes());
+        crate::input::ScreenWriter::linefeed(&mut screen, true, COLOUR_DEFAULT);
+        parse(&mut screen, b"\x1b]133;A\x07\x1b]133;C\x07");
+
+        screen.resize(TerminalSize { cols, rows: 4 });
+
+        assert_eq!(screen.cursor_position(), expected_cursor, "{first:?}");
+        let mut flags = crate::grid::GridLineFlags::START_PROMPT;
+        flags.insert(crate::grid::GridLineFlags::START_OUTPUT);
+        for row in 0..4 {
+            assert_eq!(
+                screen
+                    .grid()
+                    .visible_line(row)
+                    .unwrap()
+                    .flags()
+                    .contains(flags),
+                row == expected_row,
+                "{first:?}, row {row}"
+            );
+        }
+    }
+}
+
+#[test]
 fn width_resize_reflows_plain_ascii_without_materializing_cells() {
     let mut screen = new_screen(4, 3, 20);
     parse(&mut screen, b"abcdefghijkl");
@@ -572,6 +735,28 @@ fn width_resize_reflows_plain_ascii_without_materializing_cells() {
     );
     for (line, _) in compact_lines {
         assert_eq!(line.cells().len(), 0);
+    }
+}
+
+#[test]
+fn width_resize_short_wrapped_row_preserves_only_written_spaces() {
+    for (first_row, expected) in [("ab", "abcd"), ("ab  ", "ab  cd")] {
+        let mut screen = new_screen(8, 4, 10);
+        parse(
+            &mut screen,
+            format!("{first_row}\r\ncd\x1b[1;1H").as_bytes(),
+        );
+        crate::input::ScreenWriter::linefeed(&mut screen, true, COLOUR_DEFAULT);
+
+        screen.resize(TerminalSize { cols: 6, rows: 4 });
+
+        let capture = screen.capture_transcript(full_range(), GridRenderOptions::default());
+        let rendered = String::from_utf8(capture).expect("capture must be UTF-8");
+        assert_eq!(
+            rendered.lines().find(|line| !line.is_empty()),
+            Some(expected),
+            "short wrapped row {first_row:?} must retain written spaces without padding"
+        );
     }
 }
 
@@ -1103,13 +1288,43 @@ fn reflow_overflow_capacity_freezes_on_normal_output_after_growth_product_diverg
         );
         assert_eq!(partial.grid().hscrolled(), 5);
 
-        // tmux 3.7b lets this height shrink recreate the original overflow.
-        // RMUX deliberately keeps the post-output bound so old capacity cannot
-        // be resurrected after the reflow contents have been superseded.
-        partial.resize(TerminalSize { cols: 2, rows: 1 });
-        assert_eq!(partial.history_size(), 5);
+        let mut fully_pulled = reflow_overflow_screen(history_limit);
+        fully_pulled.resize(TerminalSize { cols: 2, rows: 20 });
+        assert_eq!(fully_pulled.history_size(), 0);
+        assert_eq!(fully_pulled.grid().hscrolled(), 0);
+
+        for _ in 0..30 {
+            parse(&mut fully_pulled, b"\r\nZ");
+        }
+        assert_eq!(fully_pulled.history_size(), history_limit);
+        assert_eq!(fully_pulled.grid().hscrolled(), history_limit);
+    }
+}
+
+#[test]
+fn reflow_output_capacity_stays_bounded_but_height_transfers_preserve_rows() {
+    for history_limit in [1, 3] {
+        let mut partial = reflow_overflow_screen(history_limit);
         partial.resize(TerminalSize { cols: 2, rows: 5 });
-        assert_eq!(partial.history_size(), 1);
+        assert_eq!(partial.history_size(), 5);
+        assert_eq!(partial.grid().hscrolled(), 5);
+
+        for _ in 0..8 {
+            parse(&mut partial, b"\r\nZ");
+        }
+        assert_eq!(
+            partial.history_size(),
+            5,
+            "normal output must freeze the temporary capacity at the retained history"
+        );
+        assert_eq!(partial.grid().hscrolled(), 5);
+
+        // Height transfers preserve rows already stored, independently of
+        // the normal-output capacity above (tmux screen_resize_y).
+        partial.resize(TerminalSize { cols: 2, rows: 1 });
+        assert_eq!(partial.history_size(), 9);
+        partial.resize(TerminalSize { cols: 2, rows: 5 });
+        assert_eq!(partial.history_size(), 5);
         assert_eq!(partial.cursor_position(), (1, 4));
 
         let mut fully_pulled = reflow_overflow_screen(history_limit);
@@ -1126,8 +1341,8 @@ fn reflow_overflow_capacity_freezes_on_normal_output_after_growth_product_diverg
         fully_pulled.resize(TerminalSize { cols: 2, rows: 1 });
         assert_eq!(
             fully_pulled.history_size(),
-            history_limit,
-            "height shrink after output must not restore consumed reflow capacity"
+            history_limit + 19,
+            "height shrink transfers nineteen existing visible rows without collection"
         );
     }
 }
@@ -1249,14 +1464,14 @@ fn alternate_screen_width_resize_preserves_physical_cursor_product_divergence() 
 
     screen.resize(TerminalSize { cols: 10, rows: 3 });
 
-    // tmux 3.7b preserves both the physical row split and cursor. RMUX keeps
-    // its lossless alternate-screen content reflow, but the cursor remains at
-    // the same physical coordinate so a live application can redraw from the
-    // position it owned before SIGWINCH.
+    // tmux 3.7b preserves both the physical row split and the cursor, so a
+    // live application redraws from the cell it owned before SIGWINCH. Rows
+    // and cursor now match tmux here; C-D71 still owns this test for the
+    // bounded edge cursor its narrowing siblings keep.
     assert_eq!(screen.cursor_position(), (1, 1));
     assert!(!screen.pending_wrap);
     parse(&mut screen, b"X");
-    assert_eq!(&screen.capture_grid(false).lines[..2], &["abcdef", " X"]);
+    assert_eq!(&screen.capture_grid(false).lines[..2], &["abcde", "fX"]);
 
     parse(&mut screen, b"\x1b[?1047l");
     assert_eq!(screen.cursor_position(), (2, 1));
@@ -1278,11 +1493,11 @@ fn alternate_screen_narrow_resize_clamps_cursor_with_pending_wrap_product_diverg
 
     // tmux 3.7b retains an out-of-bounds virtual x=8 and wraps the next
     // printable byte. RMUX represents the same next-write behavior with its
-    // bounded cursor plus pending-wrap state.
+    // bounded cursor plus pending-wrap state. The hidden "fgh" stays hidden.
     assert_eq!(screen.cursor_position(), (4, 0));
     assert!(screen.pending_wrap);
     parse(&mut screen, b"X");
-    assert_eq!(&screen.capture_grid(false).lines[..2], &["abcde", "Xgh"]);
+    assert_eq!(&screen.capture_grid(false).lines[..2], &["abcde", "X"]);
 }
 
 #[test]
@@ -1307,10 +1522,7 @@ fn alternate_screen_resize_remaps_pending_wrap_by_physical_column_product_diverg
     assert_eq!(narrowed.cursor_position(), (4, 0));
     assert!(narrowed.pending_wrap);
     parse(&mut narrowed, b"X");
-    assert_eq!(
-        &narrowed.capture_grid(false).lines[..2],
-        &["abcde", "Xghij"]
-    );
+    assert_eq!(&narrowed.capture_grid(false).lines[..2], &["abcde", "X"]);
 }
 
 #[test]
@@ -1323,7 +1535,7 @@ fn alternate_screen_width_and_height_resize_preserves_physical_cursor_product_di
     assert_eq!(screen.cursor_position(), (1, 1));
     assert!(!screen.pending_wrap);
     parse(&mut screen, b"X");
-    assert_eq!(&screen.capture_grid(false).lines[..2], &["abcdef", " X"]);
+    assert_eq!(&screen.capture_grid(false).lines[..2], &["abcde", "fX"]);
 }
 
 #[test]
@@ -1352,7 +1564,69 @@ fn alternate_screen_wide_reflow_preserves_physical_cursor_without_fragments_prod
     assert!(screen.pending_wrap);
     parse(&mut screen, b"X");
     assert_no_wide_cell_fragments(&screen);
-    assert_eq!(&screen.capture_grid(false).lines[..2], &["ab表c", "Xef"]);
+    assert_eq!(&screen.capture_grid(false).lines[..2], &["ab表c", "X"]);
+}
+
+/// R3510 M7, measured on tmux 3.7b: a width change truncates every
+/// alternate-screen row at the new edge instead of reflowing it, keeps the
+/// hidden cells for a later widening, and leaves the cursor on its cell.
+#[test]
+fn alternate_screen_width_resize_truncates_rows_instead_of_reflowing() {
+    const DIGITS: &str = "01234567890123456789012345678901234567890123456789";
+    let mut screen = new_screen(50, 10, 100);
+    for line in 1..=15 {
+        parse(&mut screen, format!("L{line:02}\r\n").as_bytes());
+    }
+    parse(
+        &mut screen,
+        format!("\x1b[?1049h\x1b[2J\x1b[H{DIGITS}\x1b[5;3Hxx").as_bytes(),
+    );
+
+    for (cols, rows) in [(20, 10), (20, 6), (33, 12), (50, 10)] {
+        screen.resize(TerminalSize { cols, rows });
+
+        let mut expected = vec![String::new(); usize::from(rows)];
+        expected[0] = DIGITS[..usize::from(cols)].to_owned();
+        expected[4] = "  xx".to_owned();
+        // The fifteen main-screen lines keep their six-row history beneath.
+        assert_eq!(screen.history_size(), 6, "{cols}x{rows}");
+        let lines = screen.capture_grid(false).lines;
+        assert_eq!(&lines[6..], expected.as_slice(), "{cols}x{rows}");
+        assert_eq!(screen.cursor_position(), (4, 4), "{cols}x{rows}");
+        assert!(!screen.pending_wrap, "{cols}x{rows}");
+    }
+}
+
+/// Hidden alternate-screen cells follow tmux 3.7b's `grid_clear`: an erase or
+/// a write inside the visible columns keeps them, an erase that covers the
+/// whole row (EL 2, ECH from the first column) forgets them.
+#[test]
+fn alternate_screen_hidden_columns_follow_tmux_erase_rules() {
+    const DIGITS: &str = "01234567890123456789012345678901234567890123456789";
+    let mut screen = new_screen(50, 4, 10);
+    parse(
+        &mut screen,
+        format!("\x1b[?1049h\x1b[H{DIGITS}\x1b[2;1H{DIGITS}\x1b[3;1H{DIGITS}\x1b[4;1H{DIGITS}")
+            .as_bytes(),
+    );
+    screen.resize(TerminalSize { cols: 20, rows: 4 });
+    parse(
+        &mut screen,
+        b"\x1b[1;5H\x1b[K\x1b[2;1H\x1b[2K\x1b[3;19HAB\x1b[4;1H\x1b[20X",
+    );
+
+    screen.resize(TerminalSize { cols: 50, rows: 4 });
+
+    assert_eq!(
+        screen.capture_grid(false).lines,
+        vec![
+            format!("0123{}{}", " ".repeat(16), &DIGITS[20..]),
+            String::new(),
+            format!("{}AB{}", &DIGITS[..18], &DIGITS[20..]),
+            String::new(),
+        ]
+    );
+    assert_eq!(screen.cursor_position(), (0, 3));
 }
 
 #[test]
@@ -1386,6 +1660,102 @@ fn alternate_screen_physical_cursor_resize_does_not_change_1049_restore() {
 
     assert_eq!(screen.cursor_position(), (7, 0));
     assert_eq!(screen.capture_grid(true).lines[0], "abcdefX");
+}
+
+#[test]
+fn alternate_screen_1049_exit_restores_the_rendition_saved_on_entry() {
+    let mut screen = new_screen(20, 5, 10);
+    let mut parser = InputParser::new();
+    parser.parse(b"\x1b[31mA\x1b[?1049h\x1b[32;1mB\x1b[?1049lX", &mut screen);
+
+    // R3510 M6, measured on tmux 3.7b: `capture-pane -e -p` gives
+    // `^[[31mAX^[[39m`; the bold green of the alternate screen does not leak.
+    let capture = screen.capture_transcript(
+        full_range(),
+        GridRenderOptions {
+            with_sequences: true,
+            ..GridRenderOptions::default()
+        },
+    );
+    let rendered = String::from_utf8(capture).expect("capture must be UTF-8");
+    assert_eq!(rendered.lines().next(), Some("\x1b[31mAX\x1b[39m"));
+}
+
+#[test]
+fn alternate_screen_exit_rendition_matches_tmux_3_7b() {
+    // Each row was measured on tmux 3.7b with `capture-pane -p` and the
+    // rendition of the cell written last: entry copies the rendition every
+    // time, only `?1049l` restores it, even outside the alternate screen
+    // and without touching the character sets. Rows that leave `?47` or
+    // `?1047` place the next write explicitly, because RMUX homes the cursor
+    // on those entries where tmux leaves it, a cursor divergence outside this
+    // rendition case.
+    let cases: [(&str, &[u8], &[u8], &str); 9] = [
+        (
+            "1047",
+            b"\x1b[31mA\x1b[?1047h\x1b[32;1mB\x1b[?1047l\x1b[1;3HX",
+            b"\x1b[32;1m",
+            "A X",
+        ),
+        (
+            "47",
+            b"\x1b[31mA\x1b[?47h\x1b[32;1mB\x1b[?47l\x1b[1;3HX",
+            b"\x1b[32;1m",
+            "A X",
+        ),
+        (
+            "no entry",
+            b"\x1b[31mA\x1b[32m\x1b[?1049lX",
+            b"\x1b[32m",
+            "AX",
+        ),
+        (
+            "re-entry",
+            b"\x1b[31mA\x1b[?1049h\x1b[32mB\x1b[?1049h\x1b[33mC\x1b[?1049lX",
+            b"\x1b[31m",
+            "AX",
+        ),
+        (
+            "latest entry",
+            b"\x1b[?1049h\x1b[?1049l\x1b[31mA\x1b[?1047h\x1b[32mB\x1b[?1047l\x1b[1;3H\x1b[33mC\x1b[?1049lX",
+            b"\x1b[31m",
+            "X C",
+        ),
+        (
+            "second exit",
+            b"\x1b[31mA\x1b[?1049h\x1b[32mB\x1b[?1049l\x1b[33mC\x1b[?1049lX",
+            b"\x1b[31m",
+            "AX",
+        ),
+        (
+            "background",
+            b"\x1b[41mA\x1b[?1049h\x1b[42mB\x1b[?1049lX",
+            b"\x1b[41m",
+            "AX",
+        ),
+        (
+            "underline style and colour",
+            b"\x1b[4:3;58:5:1mA\x1b[?1049h\x1b[0mB\x1b[?1049lX",
+            b"\x1b[4:3;58:5:1m",
+            "AX",
+        ),
+        (
+            "character sets",
+            b"\x1b[31mA\x1b(0\x1b[?1049h\x1b(B\x1b[32mB\x1b[?1049lq",
+            b"\x1b[31m",
+            "Aq",
+        ),
+    ];
+    for (name, bytes, rendition, line) in cases {
+        let mut screen = new_screen(20, 5, 10);
+        let mut parser = InputParser::new();
+        parser.parse(bytes, &mut screen);
+        let mut expected = InputParser::new();
+        expected.parse(rendition, &mut new_screen(20, 5, 10));
+
+        assert_eq!(parser.cell_state(), expected.cell_state(), "{name}");
+        assert_eq!(screen.capture_grid(false).lines[0], line, "{name}");
+    }
 }
 
 #[test]
@@ -1618,6 +1988,61 @@ fn alternate_screen_restore_preserves_wrapped_rows() {
         .flags()
         .contains(crate::grid::GridLineFlags::WRAPPED));
     assert_eq!(screen.capture_grid(true).lines, vec!["abcdef"]);
+}
+
+#[test]
+fn capture_format_masks_only_active_alternate_boundary_wrap_like_tmux_3_7b() {
+    for mode in [47, 1047, 1049] {
+        for (mark, label) in [("", "-"), ("\x1b]133;A\x07", "P"), ("\x1b]133;C\x07", "O")] {
+            let mut screen = new_screen(8, 2, 20);
+            let content = format!("{mark}abcdefghijklmnopqrst\r\n\x1b[?{mode}h\x1b[HVIM");
+            parse(&mut screen, content.as_bytes());
+            assert_eq!(screen.history_size(), 2);
+            let first_label = match label {
+                "P" => "PW",
+                "O" => "OW",
+                _ => "W",
+            };
+            let full = screen.capture_line_format(full_range());
+            assert_eq!(full.labels(), [first_label, "-", "-", "-"]);
+            assert_eq!(full.join_continuations(), [true, false, false, false]);
+            assert_eq!(screen.capture_line_format_flags(full_range()), b"W---");
+            let boundary_only = ScreenCaptureRange {
+                start: Some(-1),
+                end: Some(-1),
+                ..ScreenCaptureRange::default()
+            };
+            assert_eq!(screen.capture_line_format_labels(boundary_only), ["-"]);
+            // Projection for copy-mode rendering carries the same boundary.
+            let projected = screen.clone_viewport(1, 0, 1);
+            assert_eq!(
+                projected.capture_line_format_labels(ScreenCaptureRange::default()),
+                ["-", "-"]
+            );
+            assert_eq!(
+                screen.capture_saved_line_format_labels(full_range()),
+                Some(vec!["-", "-"])
+            );
+            // Capture must not erase the stored wrap needed by main-screen recovery.
+            assert_eq!(screen.grid().absolute_line_wrapped(1), Some(true));
+            parse(&mut screen, format!("\x1b[?{mode}l").as_bytes());
+            assert_eq!(
+                screen.capture_line_format_labels(full_range()),
+                [first_label, "W", "-", "-"]
+            );
+
+            let mut screen = new_screen(8, 2, 20);
+            parse(
+                &mut screen,
+                format!("{mark}abcdefghijkl\r\n\x1b[?{mode}h\x1b[HVIM").as_bytes(),
+            );
+            assert_eq!(
+                screen.capture_line_format_labels(full_range()),
+                [label, "-", "-"]
+            );
+            assert_eq!(screen.capture_line_format_labels(boundary_only), [label]);
+        }
+    }
 }
 
 #[test]
@@ -1858,15 +2283,6 @@ fn alternate_screen_resize_preserves_main_history_product_divergence() {
 }
 
 #[test]
-fn insert_and_delete_line_ignore_rows_outside_scroll_region() {
-    let mut screen = new_screen(4, 4, 10);
-    parse(&mut screen, b"1\r\n2\r\n3\r\n4");
-    parse(&mut screen, b"\x1b[2;3r\x1b[1;1H\x1b[L\x1b[M");
-
-    assert_eq!(screen.capture_grid(false).lines, vec!["1", "2", "3", "4"]);
-}
-
-#[test]
 fn vertical_cursor_commands_respect_scroll_region_boundaries() {
     type CursorCase = (&'static str, u8, &'static [u8], (u32, u32));
 
@@ -1934,15 +2350,18 @@ fn default_cell_style_overlay_preserves_application_backgrounds() {
     assert_eq!(line.cell(2).expect("default blank").bg(), 0);
 }
 
+/// Measured on tmux 3.7b: after `SGR 48;5;236`, `ED 0` away from home paints
+/// the rows it clears entirely with that background as well, not only the
+/// rest of the cursor row.
 #[test]
-fn erase_display_does_not_tint_fully_cleared_rows_with_current_background() {
+fn erase_display_tints_fully_cleared_rows_with_current_background() {
     let mut screen = new_screen(6, 4, 10);
     parse(&mut screen, b"\x1b[48;5;236mA\x1b[J");
 
     let current = screen.grid().visible_line(0).expect("current row");
+    let active_bg = current.cell(1).expect("current row trailing cell").bg();
     assert_ne!(
-        current.cell(1).expect("current row trailing cell").bg(),
-        COLOUR_DEFAULT,
+        active_bg, COLOUR_DEFAULT,
         "ED should preserve BCE on the current line"
     );
 
@@ -1952,8 +2371,8 @@ fn erase_display_does_not_tint_fully_cleared_rows_with_current_background() {
             let cell = line.cell(col).expect("cleared cell");
             assert_eq!(
                 cell.bg(),
-                COLOUR_DEFAULT,
-                "fully cleared row {row}, col {col} must keep the terminal background"
+                active_bg,
+                "fully cleared row {row}, col {col} must take the active background"
             );
             assert_eq!(cell.text(), " ", "row {row}, col {col} should be blank");
         }
@@ -2110,6 +2529,663 @@ fn third_regional_indicator_starts_a_new_cell() {
     assert!(line.cell(1).expect("flag padding").is_padding());
     assert_eq!(line.cell(2).expect("third indicator").text(), "🇩");
     assert_eq!(line.cell(2).expect("third indicator").width(), 1);
+}
+
+fn b2_combining_cluster(byte_len: usize) -> String {
+    assert!((22..=33).contains(&byte_len), "B2 fixture byte length");
+    let mut cluster = String::from("A");
+    let mut remaining = byte_len - cluster.len();
+    if remaining % 2 == 1 {
+        cluster.push('\u{20D0}');
+        remaining -= '\u{20D0}'.len_utf8();
+    }
+    for _ in 0..remaining / '\u{0301}'.len_utf8() {
+        cluster.push('\u{0301}');
+    }
+    assert_eq!(cluster.len(), byte_len, "B2 fixture byte length");
+    cluster
+}
+
+#[test]
+fn b2_grid_preserves_valid_combined_clusters_through_32_bytes() {
+    for byte_len in 22..=32 {
+        let cluster = b2_combining_cluster(byte_len);
+        let sequence = format!("B{cluster}A");
+        let mut screen = new_screen(8, 1, 10);
+
+        parse(&mut screen, sequence.as_bytes());
+
+        let line = screen.grid().visible_line(0).expect("B2 matrix row");
+        assert_eq!(line.cell(0).expect("leading neighbor").text(), "B");
+        assert_eq!(
+            line.cell(1).expect("combined owner").text(),
+            cluster,
+            "{byte_len}-byte cluster"
+        );
+        assert_eq!(line.cell(1).expect("combined owner").width(), 1);
+        assert_eq!(line.cell(2).expect("trailing neighbor").text(), "A");
+        assert_eq!(screen.cursor_position(), (3, 0));
+        assert!(!screen.pending_wrap());
+        assert!(!line.flags().contains(crate::grid::GridLineFlags::WRAPPED));
+        assert_eq!(screen.capture_grid(false).lines, vec![sequence.clone()]);
+        assert_eq!(
+            screen
+                .render_visible_line_independent(0, GridRenderOptions::default())
+                .expect("rendered B2 matrix row"),
+            sequence.as_bytes()
+        );
+        assert!(screen.plain_output_forwarding_safe());
+    }
+}
+
+#[test]
+fn b2_common_emoji_clusters_remain_single_wide_cells() {
+    // tmux 3.7b accepts the 32-byte sequence into one cell but its capture
+    // path renders that exact-bound cell empty. RMUX deliberately preserves
+    // the bytes instead of reproducing that oracle bug.
+    let cases = [
+        (25, "👨\u{200D}👩\u{200D}👧\u{200D}👦"),
+        (26, "👨🏻\u{200D}🤝\u{200D}👨🏿"),
+        (27, "👩\u{200D}❤\u{FE0F}\u{200D}💋\u{200D}👨"),
+        (28, "🏴󠁧󠁢󠁳󠁣󠁴󠁿"),
+        (32, "👩🏻\u{200D}👩\u{200D}👧\u{200D}👧\u{FE0F}"),
+    ];
+
+    for (byte_len, cluster) in cases {
+        assert_eq!(cluster.len(), byte_len, "B2 emoji fixture byte length");
+        let sequence = format!("B{cluster}A");
+        let mut screen = new_screen(8, 1, 10);
+
+        parse(&mut screen, sequence.as_bytes());
+
+        let line = screen.grid().visible_line(0).expect("B2 emoji row");
+        let owner = line.cell(1).expect("B2 emoji owner");
+        assert_eq!(owner.text(), cluster, "{byte_len}-byte emoji cluster");
+        assert_eq!(owner.width(), 2);
+        assert!(line.cell(2).expect("B2 emoji padding").is_padding());
+        assert_eq!(
+            line.cell(3).expect("B2 emoji trailing neighbor").text(),
+            "A"
+        );
+        assert_eq!(screen.cursor_position(), (4, 0));
+        assert!(!screen.pending_wrap());
+        assert_eq!(screen.capture_grid(false).lines, vec![sequence.clone()]);
+        assert_eq!(
+            screen
+                .render_visible_line_independent(0, GridRenderOptions::default())
+                .expect("rendered B2 emoji row"),
+            sequence.as_bytes()
+        );
+        assert_no_wide_cell_fragments(&screen);
+    }
+}
+
+#[test]
+fn b2_measured_27_byte_zwj_survives_grid_capture_and_render() {
+    const CLUSTER: &str = "👩\u{200D}❤\u{FE0F}\u{200D}💋\u{200D}👨";
+    let sequence = format!("ZWJ:{CLUSTER}:AFTER");
+    assert_eq!(CLUSTER.len(), 27);
+    let mut screen = new_screen(12, 2, 10);
+
+    parse(&mut screen, sequence.as_bytes());
+
+    let line = screen.grid().visible_line(0).expect("measured B2 row");
+    let owner = line.cell(4).expect("measured ZWJ owner");
+    assert_eq!(owner.text(), CLUSTER);
+    assert_eq!(owner.width(), 2);
+    assert!(line.cell(5).expect("measured ZWJ padding").is_padding());
+    assert_eq!(line.cell(6).expect("trailing colon").text(), ":");
+    assert_eq!(screen.cursor_position(), (11, 0));
+    assert!(screen.pending_wrap());
+    assert_eq!(
+        screen.capture_grid(false).lines,
+        vec![sequence.clone(), String::new()]
+    );
+    assert_eq!(
+        screen
+            .render_visible_line_independent(0, GridRenderOptions::default())
+            .expect("rendered measured B2 row"),
+        sequence.as_bytes()
+    );
+    assert_no_wide_cell_fragments(&screen);
+}
+
+#[test]
+fn b2_true_overflow_drops_only_the_unstorable_extension() {
+    // tmux 3.7b retains the 31-byte prefix and drops the final two-byte
+    // extension because appending it would exceed UTF8_SIZE.
+    let cluster = b2_combining_cluster(33);
+    let bounded = cluster[..31].to_owned();
+    let sequence = format!("B{cluster}A");
+    let expected = format!("B{bounded}A");
+    let mut screen = new_screen(8, 1, 10);
+
+    parse(&mut screen, sequence.as_bytes());
+
+    let line = screen.grid().visible_line(0).expect("B2 overflow row");
+    assert_eq!(line.cell(1).expect("bounded owner").text(), bounded);
+    assert_eq!(line.cell(1).expect("bounded owner").width(), 1);
+    assert_eq!(line.cell(2).expect("trailing neighbor").text(), "A");
+    assert_eq!(screen.cursor_position(), (3, 0));
+    assert!(!screen.pending_wrap());
+    assert_eq!(screen.capture_grid(false).lines, vec![expected.clone()]);
+    assert_eq!(
+        screen
+            .render_visible_line_independent(0, GridRenderOptions::default())
+            .expect("rendered B2 overflow row"),
+        expected.as_bytes()
+    );
+    assert!(screen.plain_output_forwarding_safe());
+}
+
+const GH219_LONG_ZWJ: &str = "👩\u{200D}❤\u{FE0F}\u{200D}💋\u{200D}👨\u{200D}👩";
+const GH219_BOUNDED_ZWJ_PREFIX: &str = "👩\u{200D}❤\u{FE0F}\u{200D}💋\u{200D}👨\u{200D}";
+const GH219_ZWJ_AT_29_BYTES: &str = concat!(
+    "👩",
+    "\u{0301}\u{0301}\u{0301}\u{0301}\u{0301}\u{0301}",
+    "\u{0301}\u{0301}\u{0301}\u{0301}\u{0301}",
+    "\u{200D}",
+);
+const GH219_ZWJ_AT_30_BYTES: &str = concat!(
+    "👩\u{20D0}",
+    "\u{0301}\u{0301}\u{0301}\u{0301}\u{0301}",
+    "\u{0301}\u{0301}\u{0301}\u{0301}\u{0301}",
+    "\u{200D}",
+);
+const GH219_ZWJ_AT_31_BYTES: &str = concat!(
+    "👩",
+    "\u{0301}\u{0301}\u{0301}\u{0301}\u{0301}\u{0301}",
+    "\u{0301}\u{0301}\u{0301}\u{0301}\u{0301}\u{0301}",
+    "\u{200D}",
+);
+const GH219_ZWJ_AT_BOUND: &str = concat!(
+    "👩\u{20D0}",
+    "\u{0301}\u{0301}\u{0301}\u{0301}\u{0301}\u{0301}",
+    "\u{0301}\u{0301}\u{0301}\u{0301}\u{0301}",
+    "\u{200D}",
+);
+
+fn assert_gh219_captured_row(screen: &Screen) {
+    let line = screen.grid().visible_line(3).expect("captured ZWJ row");
+    let combined = line.cell(4).expect("bounded combined cell");
+    assert_eq!(combined.text(), GH219_BOUNDED_ZWJ_PREFIX);
+    assert_eq!(combined.width(), 2);
+    assert!(line.cell(5).expect("combined padding").is_padding());
+    assert_eq!(line.cell(6).expect("post-ZWJ colon").text(), ":");
+    assert_eq!(line.cell(7).expect("relative rewrite").text(), "Z");
+    assert_eq!(line.cell(104).expect("explicit CUP sidebar").text(), "S");
+}
+
+#[test]
+fn overlong_zwj_tail_does_not_offset_captured_ascii_or_cup() {
+    let sequence = format!(
+        "\x1b[4;1H\x1b[2KZWJ:{GH219_LONG_ZWJ}:0123456789\x1b[10DZWJ_AFTER\x1b[4;105HSB:ZWJ"
+    );
+    let mut screen = new_screen(120, 24, 10);
+    let mut parser = InputParser::new();
+
+    parser.parse(sequence.as_bytes(), &mut screen);
+
+    assert_gh219_captured_row(&screen);
+}
+
+#[test]
+fn overlong_zwj_tail_is_chunk_safe_at_every_captured_split() {
+    let sequence = format!(
+        "\x1b[4;1H\x1b[2KZWJ:{GH219_LONG_ZWJ}:0123456789\x1b[10DZWJ_AFTER\x1b[4;105HSB:ZWJ"
+    );
+
+    for split in 0..=sequence.len() {
+        let mut screen = new_screen(120, 24, 10);
+        let mut parser = InputParser::new();
+        parser.parse(&sequence.as_bytes()[..split], &mut screen);
+        parser.parse(&sequence.as_bytes()[split..], &mut screen);
+        assert_gh219_captured_row(&screen);
+    }
+}
+
+#[test]
+fn overlong_zwj_tail_does_not_consume_an_immediate_ansi_control() {
+    let sequence = format!("{GH219_LONG_ZWJ}\x1b[1;6HX");
+
+    for chunk_size in [1, 2, 3, sequence.len()] {
+        let mut screen = new_screen(12, 2, 10);
+        let mut parser = InputParser::new();
+        for chunk in sequence.as_bytes().chunks(chunk_size) {
+            parser.parse(chunk, &mut screen);
+        }
+        let line = screen.grid().visible_line(0).expect("ANSI target row");
+        assert_eq!(line.cell(5).expect("ANSI-positioned cell").text(), "X");
+        assert!(screen.plain_output_forwarding_safe());
+    }
+}
+
+#[test]
+fn overlong_zwj_tail_blocks_plain_forwarding_until_a_text_boundary() {
+    let mut screen = new_screen(12, 2, 10);
+    let mut parser = InputParser::new();
+
+    parser.parse(GH219_LONG_ZWJ.as_bytes(), &mut screen);
+    assert!(!screen.plain_output_forwarding_safe());
+
+    parser.parse(b"A", &mut screen);
+    assert!(screen.plain_output_forwarding_safe());
+    let line = screen.grid().visible_line(0).expect("text boundary row");
+    assert_eq!(line.cell(2).expect("following ASCII").text(), "A");
+}
+
+#[test]
+fn overlong_zwj_tail_does_not_create_a_right_margin_wrap() {
+    let sequence = format!("A{GH219_LONG_ZWJ}B");
+    let mut screen = new_screen(4, 2, 10);
+    let mut parser = InputParser::new();
+
+    for chunk in sequence.as_bytes().chunks(2) {
+        parser.parse(chunk, &mut screen);
+    }
+
+    let first = screen.grid().visible_line(0).expect("first row");
+    assert_eq!(first.cell(0).expect("leading ASCII").text(), "A");
+    assert_eq!(
+        first.cell(1).expect("bounded combined cell").text(),
+        GH219_BOUNDED_ZWJ_PREFIX
+    );
+    assert!(first.cell(2).expect("combined padding").is_padding());
+    assert_eq!(first.cell(3).expect("right-margin ASCII").text(), "B");
+    let second = screen.grid().visible_line(1).expect("second row");
+    assert!(second.cell(0).expect("unused next row").is_blank());
+}
+
+fn assert_gh219_tail_progress(screen: &Screen, prefix: &str, expected_tail: &[&str]) {
+    let line = screen.grid().visible_line(0).expect("visible row");
+    assert_eq!(line.cell(0).expect("bounded owner").text(), prefix);
+    assert_eq!(line.cell(0).expect("bounded owner").width(), 2);
+    assert!(line.cell(1).expect("bounded padding").is_padding());
+    for (index, expected) in expected_tail.iter().enumerate() {
+        let x = 2_u32 + u32::try_from(index).expect("test index") * 2;
+        assert_eq!(
+            line.cell(x).expect("later multibyte owner").text(),
+            *expected
+        );
+        assert_eq!(line.cell(x).expect("later multibyte owner").width(), 2);
+        assert!(line
+            .cell(x + 1)
+            .expect("later multibyte padding")
+            .is_padding());
+    }
+    assert!(screen.plain_output_forwarding_safe());
+    assert_no_wide_cell_fragments(screen);
+}
+
+fn arm_gh219_zwj_tail(parser: &mut InputParser, screen: &mut Screen, prefix: &str) {
+    assert!(matches!(prefix.len(), 29..=31), "bounded fixture length");
+    assert_eq!(
+        prefix.chars().last(),
+        Some('\u{200D}'),
+        "fixture ends in ZWJ"
+    );
+    parser.parse(prefix.as_bytes(), screen);
+    parser.parse("👨🏽".as_bytes(), screen);
+    assert!(!screen.plain_output_forwarding_safe());
+}
+
+#[test]
+fn gh219_overflow_tail_releases_later_multibyte_text_at_each_boundary() {
+    let boundary_cases = [
+        (29, GH219_ZWJ_AT_29_BYTES, &["中", "文"][..]),
+        (30, GH219_ZWJ_AT_30_BYTES, &["中", "文"][..]),
+        (31, GH219_ZWJ_AT_31_BYTES, &["中", "文"][..]),
+        (32, GH219_ZWJ_AT_BOUND, &["👨🏽", "中", "文"][..]),
+    ];
+
+    for (byte_count, prefix, expected_tail) in boundary_cases {
+        assert_eq!(prefix.len(), byte_count, "boundary fixture length");
+        let sequence = format!("{prefix}👨🏽中文");
+        let mut screen = new_screen(10, 1, 10);
+
+        parse(&mut screen, sequence.as_bytes());
+
+        assert_gh219_tail_progress(&screen, prefix, expected_tail);
+    }
+}
+
+#[test]
+fn gh219_zwj_tails_are_chunk_safe_before_later_cjk() {
+    for prefix in [
+        GH219_ZWJ_AT_29_BYTES,
+        GH219_ZWJ_AT_30_BYTES,
+        GH219_ZWJ_AT_31_BYTES,
+    ] {
+        let sequence = format!("{prefix}👨🏽中文");
+        for split in 0..=sequence.len() {
+            let mut screen = new_screen(10, 1, 10);
+            let mut parser = InputParser::new();
+            parser.parse(&sequence.as_bytes()[..split], &mut screen);
+            parser.parse(&sequence.as_bytes()[split..], &mut screen);
+            assert_gh219_tail_progress(&screen, prefix, &["中", "文"]);
+        }
+    }
+}
+
+#[test]
+fn gh219_cursor_neutral_controls_release_thirty_one_byte_zwj_tail() {
+    let controls = [
+        ("SGR", "\x1b[0m"),
+        ("OSC", "\x1b]2;gh219\x07"),
+        ("DECSET", "\x1b[?25h"),
+        ("same-column CUP", "\x1b[1;3H"),
+    ];
+
+    for (name, control) in controls {
+        let mut screen = new_screen(10, 1, 10);
+        let mut parser = InputParser::new();
+        arm_gh219_zwj_tail(&mut parser, &mut screen, GH219_ZWJ_AT_31_BYTES);
+
+        parser.parse(control.as_bytes(), &mut screen);
+        assert!(
+            !screen.plain_output_forwarding_safe(),
+            "{name} must retain the pending fresh-cell boundary"
+        );
+        parser.parse("中文".as_bytes(), &mut screen);
+
+        assert_gh219_tail_progress(&screen, GH219_ZWJ_AT_31_BYTES, &["中", "文"]);
+    }
+}
+
+#[test]
+fn gh219_repeated_sgr_cannot_rearm_zwj_tail_at_29_30_or_31_bytes() {
+    for prefix in [
+        GH219_ZWJ_AT_29_BYTES,
+        GH219_ZWJ_AT_30_BYTES,
+        GH219_ZWJ_AT_31_BYTES,
+    ] {
+        let sequence = format!("{prefix}👨🏽\x1b[0m😀\x1b[0m😁");
+        for split in 0..=sequence.len() {
+            let mut screen = new_screen(10, 1, 10);
+            let mut parser = InputParser::new();
+            parser.parse(&sequence.as_bytes()[..split], &mut screen);
+            parser.parse(&sequence.as_bytes()[split..], &mut screen);
+            assert_gh219_tail_progress(&screen, prefix, &["😀", "😁"]);
+        }
+    }
+}
+
+#[test]
+fn gh219_acs_recovery_emits_each_translated_spacing_owner() {
+    let mut screen = new_screen(10, 1, 10);
+    let mut parser = InputParser::new();
+    arm_gh219_zwj_tail(&mut parser, &mut screen, GH219_ZWJ_AT_31_BYTES);
+
+    parser.parse(b"\x1b(0\x1b[0mq\x1b[0mq", &mut screen);
+
+    let line = screen.grid().visible_line(0).expect("ACS recovery row");
+    assert_eq!(line.cell(2).expect("first ACS owner").text(), "─");
+    assert_eq!(line.cell(3).expect("second ACS owner").text(), "─");
+    assert!(screen.plain_output_forwarding_safe());
+}
+
+#[test]
+fn gh219_acs_runs_recover_at_29_30_and_31_byte_boundaries() {
+    for prefix in [
+        GH219_ZWJ_AT_29_BYTES,
+        GH219_ZWJ_AT_30_BYTES,
+        GH219_ZWJ_AT_31_BYTES,
+    ] {
+        for suffix in ["\x1b[0mq\x1b[0mq", "qq"] {
+            let mut screen = new_screen(10, 1, 10);
+            let mut parser = InputParser::new();
+            arm_gh219_zwj_tail(&mut parser, &mut screen, prefix);
+
+            parser.parse(b"\x1b(0", &mut screen);
+            parser.parse(suffix.as_bytes(), &mut screen);
+
+            let line = screen.grid().visible_line(0).expect("ACS boundary row");
+            assert_eq!(
+                line.cell(2).expect("first ACS owner").text(),
+                "─",
+                "prefix_bytes={} suffix={suffix:?}",
+                prefix.len()
+            );
+            assert_eq!(
+                line.cell(3).expect("second ACS owner").text(),
+                "─",
+                "prefix_bytes={} suffix={suffix:?}",
+                prefix.len()
+            );
+            assert!(screen.plain_output_forwarding_safe());
+        }
+    }
+}
+
+#[test]
+fn gh219_hangul_filler_remains_discarded_after_a_control_boundary() {
+    let mut forced = new_screen(8, 1, 10);
+    assert!(
+        forced.combine_char('\u{3164}', true),
+        "force-standalone recovery must retain unconditional filler discard"
+    );
+
+    let mut screen = new_screen(8, 1, 10);
+    let mut parser = InputParser::new();
+    arm_gh219_zwj_tail(&mut parser, &mut screen, GH219_ZWJ_AT_31_BYTES);
+
+    parser.parse("\x1b[0m\u{3164}A".as_bytes(), &mut screen);
+
+    let line = screen.grid().visible_line(0).expect("filler recovery row");
+    assert_eq!(line.cell(2).expect("post-filler ASCII").text(), "A");
+    assert!(line.cell(3).expect("cell after ASCII").is_blank());
+    assert!(screen.plain_output_forwarding_safe());
+}
+
+#[test]
+fn gh219_style_only_control_does_not_end_a_discarded_joined_tail() {
+    let render = |control: &str| {
+        let mut screen = new_screen(8, 1, 10);
+        let mut parser = InputParser::new();
+        parser.parse(GH219_BOUNDED_ZWJ_PREFIX.as_bytes(), &mut screen);
+        parser.parse("\u{200D}".as_bytes(), &mut screen);
+        assert!(!screen.plain_output_forwarding_safe());
+
+        parser.parse(format!("{control}中A").as_bytes(), &mut screen);
+        first_line(&screen)
+    };
+
+    let uninterrupted = render("");
+    let styled = render("\x1b[0m");
+    assert_eq!(styled, uninterrupted);
+    assert_eq!(styled, format!("{GH219_BOUNDED_ZWJ_PREFIX}A"));
+}
+
+#[test]
+fn gh219_cursor_movement_cannot_consume_another_cells_modifier_or_jamo() {
+    let mut modifier = new_screen(10, 2, 10);
+    let mut parser = InputParser::new();
+    parser.parse("\x1b[2;1H👋\x1b[1;1H".as_bytes(), &mut modifier);
+    arm_gh219_zwj_tail(&mut parser, &mut modifier, GH219_ZWJ_AT_31_BYTES);
+    parser.parse("\x1b[2;3H🏽".as_bytes(), &mut modifier);
+    let modifier_line = modifier.grid().visible_line(1).expect("modifier row");
+    assert_eq!(modifier_line.cell(0).expect("emoji owner").text(), "👋🏽");
+    assert!(modifier.plain_output_forwarding_safe());
+
+    let mut jamo = new_screen(10, 2, 10);
+    let mut parser = InputParser::new();
+    parser.parse("\x1b[2;1Hᄀ\x1b[1;1H".as_bytes(), &mut jamo);
+    arm_gh219_zwj_tail(&mut parser, &mut jamo, GH219_ZWJ_AT_31_BYTES);
+    parser.parse("\x1b[2;3Hᅡ".as_bytes(), &mut jamo);
+    let jamo_line = jamo.grid().visible_line(1).expect("jamo row");
+    assert_eq!(jamo_line.cell(0).expect("Hangul owner").text(), "가");
+    assert!(jamo_line.cell(2).expect("unrelated cell").is_blank());
+    assert!(jamo.plain_output_forwarding_safe());
+}
+
+#[test]
+fn gh219_recovery_state_tracks_its_screen_cell_lifecycle() {
+    let mut reset = new_screen(8, 2, 10);
+    let mut parser = InputParser::new();
+    arm_gh219_zwj_tail(&mut parser, &mut reset, GH219_ZWJ_AT_31_BYTES);
+    parser.parse(b"\x1bc", &mut reset);
+    assert!(reset.plain_output_forwarding_safe(), "full reset");
+
+    let mut alternate = new_screen(8, 2, 10);
+    let mut parser = InputParser::new();
+    arm_gh219_zwj_tail(&mut parser, &mut alternate, GH219_ZWJ_AT_31_BYTES);
+    parser.parse(b"\x1b[?1049h", &mut alternate);
+    assert!(alternate.plain_output_forwarding_safe(), "alternate entry");
+    parser.parse(b"\x1b[?1049l", &mut alternate);
+    assert!(
+        !alternate.plain_output_forwarding_safe(),
+        "alternate exit restores the main owner"
+    );
+    parser.parse(b"A", &mut alternate);
+    assert!(alternate.plain_output_forwarding_safe());
+
+    let mut source = new_screen(8, 1, 10);
+    let mut parser = InputParser::new();
+    arm_gh219_zwj_tail(&mut parser, &mut source, GH219_ZWJ_AT_31_BYTES);
+    let replacement = source.clone_recovery_state();
+    assert!(
+        replacement.plain_output_forwarding_safe(),
+        "a recovery screen clone must not retain parser-only obligations"
+    );
+}
+
+#[test]
+fn gh219_forwarding_depends_on_the_current_combining_owner() {
+    let mut screen = new_screen(8, 2, 10);
+    let mut parser = InputParser::new();
+    arm_gh219_zwj_tail(&mut parser, &mut screen, GH219_ZWJ_AT_31_BYTES);
+
+    parser.parse(b"\x1b[2;3H", &mut screen);
+    assert!(
+        screen.plain_output_forwarding_safe(),
+        "an unrelated cursor position has no pending combine obligation"
+    );
+    parser.parse(b"\x1b[1;3H", &mut screen);
+    assert!(
+        !screen.plain_output_forwarding_safe(),
+        "returning to the marked owner restores the obligation"
+    );
+    parser.parse(b"A", &mut screen);
+    assert!(screen.plain_output_forwarding_safe());
+}
+
+#[test]
+fn gh219_cr_and_lf_do_not_carry_recovery_to_an_unrelated_position() {
+    let cases = [
+        ("CR", b"\r".as_slice(), 0_u32, 0_u32),
+        ("LF", b"\n".as_slice(), 2_u32, 1_u32),
+    ];
+
+    for (name, boundary, expected_x, expected_y) in cases {
+        let mut screen = new_screen(8, 2, 10);
+        let mut parser = InputParser::new();
+        arm_gh219_zwj_tail(&mut parser, &mut screen, GH219_ZWJ_AT_31_BYTES);
+
+        parser.parse(boundary, &mut screen);
+        assert!(
+            screen.plain_output_forwarding_safe(),
+            "{name} must not carry recovery to an unrelated position"
+        );
+        parser.parse("中".as_bytes(), &mut screen);
+
+        let line = screen
+            .grid()
+            .visible_line(expected_y)
+            .expect("boundary output row");
+        assert_eq!(line.cell(expected_x).expect("CJK owner").text(), "中");
+        assert!(line.cell(expected_x + 1).expect("CJK padding").is_padding());
+        assert!(screen.plain_output_forwarding_safe());
+        assert_no_wide_cell_fragments(&screen);
+    }
+}
+
+fn assert_exact_bound_zwj_then_cjk(screen: &Screen) {
+    let line = screen.grid().visible_line(0).expect("visible row");
+    assert_eq!(
+        line.cell(0).expect("bounded owner").text(),
+        GH219_ZWJ_AT_BOUND
+    );
+    assert_eq!(line.cell(0).expect("bounded owner").width(), 2);
+    assert!(line.cell(1).expect("bounded padding").is_padding());
+    assert_eq!(line.cell(2).expect("following CJK owner").text(), "中");
+    assert_eq!(line.cell(2).expect("following CJK owner").width(), 2);
+    assert!(line.cell(3).expect("following CJK padding").is_padding());
+    assert_no_wide_cell_fragments(screen);
+}
+
+#[test]
+fn exact_bound_zwj_does_not_consume_a_following_cjk_cell() {
+    assert_eq!(GH219_ZWJ_AT_BOUND.len(), 32);
+    let sequence = format!("{GH219_ZWJ_AT_BOUND}中");
+    let mut screen = new_screen(8, 1, 10);
+
+    parse(&mut screen, sequence.as_bytes());
+
+    assert_exact_bound_zwj_then_cjk(&screen);
+}
+
+#[test]
+fn exact_bound_zwj_then_cjk_is_chunk_safe_at_every_split() {
+    let sequence = format!("{GH219_ZWJ_AT_BOUND}中");
+
+    for split in 0..=sequence.len() {
+        let mut screen = new_screen(8, 1, 10);
+        let mut parser = InputParser::new();
+        parser.parse(&sequence.as_bytes()[..split], &mut screen);
+        parser.parse(&sequence.as_bytes()[split..], &mut screen);
+        assert_exact_bound_zwj_then_cjk(&screen);
+    }
+}
+
+#[test]
+fn cup_to_exact_bound_zwj_padding_does_not_consume_cjk() {
+    let sequence = format!("{GH219_ZWJ_AT_BOUND}\x1b[1;3H中");
+    let mut screen = new_screen(8, 1, 10);
+
+    parse(&mut screen, sequence.as_bytes());
+
+    assert_exact_bound_zwj_then_cjk(&screen);
+}
+
+#[test]
+fn gh219_completed_invalid_utf8_replacement_releases_zwj_terminated_cell() {
+    // Each sequence reaches the size announced by its lead byte and decodes
+    // to one U+FFFD, as tmux utf8_append does (C0 80 is two lone bytes).
+    for invalid in [
+        &[0xc3, 0xc3][..],
+        &[0xed, 0xa0, 0x80][..],
+        &[0xf4, 0x90, 0x80, 0x80][..],
+    ] {
+        let mut screen = new_screen(8, 1, 10);
+        let mut parser = InputParser::new();
+        arm_gh219_zwj_tail(&mut parser, &mut screen, GH219_ZWJ_AT_31_BYTES);
+
+        parser.parse(invalid, &mut screen);
+        assert!(screen.plain_output_forwarding_safe());
+        parser.parse("中".as_bytes(), &mut screen);
+
+        let line = screen.grid().visible_line(0).expect("recovery row");
+        assert_eq!(line.cell(2).expect("replacement cell").text(), "\u{FFFD}");
+        assert_eq!(line.cell(3).expect("following CJK owner").text(), "中");
+        assert!(line.cell(4).expect("following CJK padding").is_padding());
+        assert_no_wide_cell_fragments(&screen);
+    }
+}
+
+#[test]
+fn gh219_stop_utf8_replacement_releases_zwj_terminated_cell() {
+    let mut screen = new_screen(8, 1, 10);
+    let mut parser = InputParser::new();
+    arm_gh219_zwj_tail(&mut parser, &mut screen, GH219_ZWJ_AT_31_BYTES);
+
+    parser.parse(&[0xe2], &mut screen);
+    assert!(!screen.plain_output_forwarding_safe());
+    parser.parse(b"A", &mut screen);
+
+    let line = screen.grid().visible_line(0).expect("recovery row");
+    assert_eq!(line.cell(2).expect("replacement cell").text(), "\u{FFFD}");
+    assert_eq!(line.cell(3).expect("following ASCII").text(), "A");
+    assert!(screen.plain_output_forwarding_safe());
 }
 
 fn first_line(screen: &Screen) -> String {

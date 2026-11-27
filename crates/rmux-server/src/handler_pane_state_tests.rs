@@ -39,7 +39,7 @@ async fn create_session_with_pane(
             environment: None,
         }))
         .await;
-    assert!(matches!(response, Response::NewSession(_)), "{response:?}");
+    crate::session_fixture::assert_new_session(&response);
 
     let target = PaneTarget::new(session.clone(), 0);
     let pane_id = {
@@ -282,7 +282,15 @@ async fn pane_state_closed_reason_variants_are_delivered_before_end_of_stream() 
         let (_session, target, pane_id) =
             create_session_with_pane(&handler, &format!("pane-state-closed-{index}")).await;
         let subscription_id = subscribe(&handler, 93, target, false, false).await;
-        handler.record_pane_state_change(pane_id, Some(1), PaneStateChange::Closed { reason });
+        handler.record_pane_state_change(
+            pane_id,
+            Some(1),
+            PaneStateChange::Closed {
+                reason,
+                exit_status: None,
+                exit_signal: None,
+            },
+        );
 
         match read_cursor(&handler, 93, subscription_id, 0).await {
             Response::PaneStateCursor(response) => {
@@ -320,6 +328,8 @@ async fn duplicate_closed_for_same_pane_is_suppressed_until_reopened() {
         Some(1),
         PaneStateChange::Closed {
             reason: PaneStateClosedReason::DiedKept,
+            exit_status: None,
+            exit_signal: None,
         },
     );
     handler.record_pane_state_change(
@@ -327,6 +337,8 @@ async fn duplicate_closed_for_same_pane_is_suppressed_until_reopened() {
         None,
         PaneStateChange::Closed {
             reason: PaneStateClosedReason::Killed,
+            exit_status: None,
+            exit_signal: None,
         },
     );
 
@@ -356,6 +368,8 @@ async fn duplicate_closed_for_same_pane_is_suppressed_until_reopened() {
         Some(2),
         PaneStateChange::Closed {
             reason: PaneStateClosedReason::Killed,
+            exit_status: None,
+            exit_signal: None,
         },
     );
 
@@ -393,6 +407,8 @@ async fn pane_state_late_subscription_after_died_kept_receives_killed_close() {
         Some(1),
         PaneStateChange::Closed {
             reason: PaneStateClosedReason::DiedKept,
+            exit_status: None,
+            exit_signal: None,
         },
     );
     let first_closed_revision = handler
@@ -406,6 +422,8 @@ async fn pane_state_late_subscription_after_died_kept_receives_killed_close() {
         None,
         PaneStateChange::Closed {
             reason: PaneStateClosedReason::Killed,
+            exit_status: None,
+            exit_signal: None,
         },
     );
 
@@ -426,6 +444,48 @@ async fn pane_state_late_subscription_after_died_kept_receives_killed_close() {
 }
 
 #[tokio::test]
+async fn pane_state_subscription_after_died_kept_receives_retained_close() {
+    let handler = RequestHandler::new();
+    let (_session, target, pane_id) =
+        create_session_with_pane(&handler, "pane-state-subscribe-after-died-kept").await;
+
+    handler.record_pane_state_change(
+        pane_id,
+        Some(1),
+        PaneStateChange::Closed {
+            reason: PaneStateClosedReason::DiedKept,
+            exit_status: None,
+            exit_signal: None,
+        },
+    );
+    let closed_revision = handler
+        .pane_state_journal
+        .lock()
+        .expect("pane-state journal lock should not be poisoned")
+        .current_revision();
+    let subscription_id = subscribe(&handler, 107, target, false, false).await;
+
+    match read_cursor(&handler, 107, subscription_id, closed_revision).await {
+        Response::PaneStateCursor(response) => {
+            assert_eq!(response.next_revision, closed_revision);
+            assert!(matches!(
+                response.events.as_slice(),
+                [PaneStateEventDto::Closed {
+                    revision,
+                    pane_id: event_pane_id,
+                    reason: PaneStateClosedReason::DiedKept,
+                }] if *revision == closed_revision && *event_pane_id == pane_id
+            ));
+        }
+        response => panic!("subscription after exit should receive the close, got {response:?}"),
+    }
+    assert!(matches!(
+        read_cursor(&handler, 107, subscription_id, closed_revision).await,
+        Response::Error(_)
+    ));
+}
+
+#[tokio::test]
 async fn respawn_pane_reopens_pane_state_before_future_close() {
     let handler = RequestHandler::new();
     let (_session, target, pane_id) =
@@ -436,6 +496,8 @@ async fn respawn_pane_reopens_pane_state_before_future_close() {
         Some(1),
         PaneStateChange::Closed {
             reason: PaneStateClosedReason::DiedKept,
+            exit_status: None,
+            exit_signal: None,
         },
     );
 
@@ -462,6 +524,8 @@ async fn respawn_pane_reopens_pane_state_before_future_close() {
         Some(2),
         PaneStateChange::Closed {
             reason: PaneStateClosedReason::Killed,
+            exit_status: None,
+            exit_signal: None,
         },
     );
 
@@ -569,6 +633,8 @@ async fn respawn_window_reopens_retained_pane_state_before_future_close() {
         Some(1),
         PaneStateChange::Closed {
             reason: PaneStateClosedReason::DiedKept,
+            exit_status: None,
+            exit_signal: None,
         },
     );
 
@@ -597,6 +663,8 @@ async fn respawn_window_reopens_retained_pane_state_before_future_close() {
         Some(2),
         PaneStateChange::Closed {
             reason: PaneStateClosedReason::Killed,
+            exit_status: None,
+            exit_signal: None,
         },
     );
 
@@ -1724,3 +1792,7 @@ async fn assert_closed_event_with_reason(
         response => panic!("pane-state cursor failed: {response:?}"),
     }
 }
+
+#[cfg(windows)]
+#[path = "handler_pane_state_tests/windows_eof.rs"]
+mod windows_eof;

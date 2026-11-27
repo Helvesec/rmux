@@ -37,6 +37,35 @@ impl TerminalScreen {
         self.parser.screen()
     }
 
+    /// Returns the last screen state eligible for presentation.
+    ///
+    /// While DEC synchronized output is active, parsing continues in
+    /// [`Self::screen`] but presentation remains at the state captured when
+    /// mode 2026 was entered.
+    #[must_use]
+    pub fn presentation_screen(&self) -> &Screen {
+        self.parser.screen().presentation_screen()
+    }
+
+    /// Returns and clears whether the latest feed admitted synchronized output.
+    pub fn take_synchronized_output_started(&mut self) -> bool {
+        self.parser.screen_mut().take_synchronized_output_started()
+    }
+
+    /// Returns whether DEC synchronized output currently owns publication.
+    #[must_use]
+    pub fn synchronized_output_active(&self) -> bool {
+        self.parser.screen().synchronized_output_active()
+    }
+
+    /// Releases synchronized output without discarding the converged screen.
+    ///
+    /// This is the fail-open path used when a child exits or leaves mode 2026
+    /// unclosed.
+    pub fn finish_synchronized_output(&mut self) -> bool {
+        self.parser.screen_mut().finish_synchronized_output()
+    }
+
     /// Returns a mutable borrow of the structured screen grid.
     pub fn screen_mut(&mut self) -> &mut Screen {
         self.parser.screen_mut()
@@ -64,6 +93,28 @@ impl TerminalScreen {
         self.parser.set_title_rename_enabled(enabled);
     }
 
+    /// Enables or disables window renames requested by pane output.
+    pub fn set_allow_rename(&mut self, enabled: bool) {
+        self.parser.set_allow_rename(enabled);
+    }
+
+    /// Drains the window-rename requests this pane's output accepted, in the
+    /// order it emitted them.
+    ///
+    /// This is the pane owner's only view of `ESC k`: the stored screen
+    /// metadata cannot stand in for it, because an empty request and a
+    /// repeated identical one leave that metadata unchanged while still
+    /// renaming the window. The owner drains after every feed, like the
+    /// replies and the theme operations.
+    pub fn take_window_rename_requests(&mut self) -> Vec<String> {
+        self.parser.take_window_rename_requests()
+    }
+
+    /// Sets whether a whole-screen erase scrolls the visible rows into history.
+    pub fn set_scroll_on_clear(&mut self, enabled: bool) {
+        self.parser.set_scroll_on_clear(enabled);
+    }
+
     /// Updates the tmux `input-buffer-size` parser limit.
     pub fn set_input_buffer_limit(&mut self, limit: usize) {
         self.parser.set_input_buffer_limit(limit);
@@ -74,9 +125,26 @@ impl TerminalScreen {
         self.parser.resize(size);
     }
 
+    /// Feeds pane output with known foreground/background query overrides.
+    /// These affect OSC 10/11 replies only, never application colours, cursor
+    /// state or recovery serialisation. Unknown slots retain normal behavior.
+    pub fn feed_with_query_colours(&mut self, bytes: &[u8], colours: [Option<[u8; 3]>; 2]) {
+        self.parser.feed_with_query_colours(bytes, colours);
+    }
+
     /// Feeds raw PTY output bytes through the private parser into the screen.
     pub fn feed(&mut self, bytes: &[u8]) {
         self.parser.feed(bytes);
+    }
+
+    /// Drain server-owned theme operations alongside the ordinary reply bytes.
+    pub fn take_theme_events(&mut self) -> Vec<crate::input::ThemeEvent> {
+        self.parser.take_theme_events()
+    }
+
+    /// Opt into server effects; the owner must drain them after every feed.
+    pub fn enable_theme_events(&mut self) {
+        self.parser.enable_theme_events();
     }
 
     /// Returns and clears whether the latest feeds used terminal-parser state
@@ -186,3 +254,7 @@ impl TerminalScreen {
         self.parser.reset_parser();
     }
 }
+
+#[cfg(test)]
+#[path = "terminal_screen/tests.rs"]
+mod tests;

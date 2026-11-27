@@ -3,11 +3,11 @@ use std::collections::BTreeMap;
 use rmux_proto::{RmuxError, RotateWindowDirection, TerminalSize};
 
 use super::target_error::{invalid_window_target, invalid_window_target_with_reason};
-use super::{cyclic_previous_window_index, Session};
+use super::Session;
 use crate::{Pane, PaneId, Window};
 
-#[path = "window_ops/navigation.rs"]
-mod navigation;
+pub(super) mod navigation;
+mod slot_moves;
 
 impl Session {
     /// Creates a new window at the lowest available index and returns its window index together with the initial pane ID.
@@ -119,7 +119,7 @@ impl Session {
                     self.name
                 ))
             })?;
-            let _ = self.move_window(source_index, destination_index, false, false)?;
+            self.shift_window_slot(source_index, destination_index)?;
             index_map.insert(source_index, destination_index);
         }
 
@@ -224,6 +224,11 @@ impl Session {
         if self.last_window == Some(window_index) {
             self.last_window = None;
         }
+        crate::session::visit_history::forget_occurrence(&mut self.window_stack, window_index);
+        if self.last_window.is_none() {
+            self.last_window =
+                crate::session::visit_history::live_head(&self.window_stack, self.active_window);
+        }
 
         Ok(removed)
     }
@@ -302,104 +307,16 @@ impl Session {
         self.last_window = self
             .last_window
             .and_then(|window_index| index_map.get(&window_index).copied());
-
-        Ok(index_map)
-    }
-
-    /// Moves one window to another slot within the same session, optionally removing an occupied destination.
-    ///
-    /// When `select_destination` is `true`, the destination slot becomes active
-    /// using tmux's winlink-based selection semantics instead of following the
-    /// moved window by identity.
-    pub fn move_window(
-        &mut self,
-        source_index: u32,
-        destination_index: u32,
-        kill_destination: bool,
-        select_destination: bool,
-    ) -> Result<Option<Window>, RmuxError> {
-        if !self.windows.contains_key(&source_index) {
-            return Err(invalid_window_target(&self.name, source_index));
-        }
-        if source_index == destination_index {
-            return Ok(None);
-        }
-        if self.windows.contains_key(&destination_index) && !kill_destination {
-            return Err(invalid_window_target_with_reason(
-                &self.name,
-                destination_index,
-                "window index already exists in session",
-            ));
-        }
-
-        let previous_active = self.active_window;
-        let previous_last = self.last_window;
-        let moved_window = self.extract_window_for_move(source_index)?;
-        let moved_alert_flags = self
-            .winlink_alert_flags
-            .remove(&source_index)
-            .unwrap_or_else(crate::AlertFlags::empty);
-        let removed_window = if kill_destination {
-            let _ = self.winlink_alert_flags.remove(&destination_index);
-            self.windows.remove(&destination_index)
-        } else {
-            None
-        };
-
-        self.windows.insert(destination_index, moved_window);
-        self.winlink_alert_flags
-            .insert(destination_index, moved_alert_flags);
-        self.apply_move_tracking(
-            source_index,
-            destination_index,
-            previous_active,
-            previous_last,
-            select_destination,
+        // A renumber keeps the occurrences and only moves their indices
+        // (`session.c:724-731`), so the history follows them by the same map.
+        self.window_stack = crate::session::visit_history::carry_occurrences(
+            &self.window_stack,
+            &index_map,
+            self.active_window,
+            |slot| self.windows.contains_key(&slot),
         );
 
-        Ok(removed_window)
-    }
-
-    /// Swaps two window slots within the same session while preserving the underlying windows.
-    pub fn swap_windows(
-        &mut self,
-        source_index: u32,
-        destination_index: u32,
-    ) -> Result<(), RmuxError> {
-        if !self.windows.contains_key(&source_index) {
-            return Err(invalid_window_target(&self.name, source_index));
-        }
-        if !self.windows.contains_key(&destination_index) {
-            return Err(invalid_window_target(&self.name, destination_index));
-        }
-        if source_index == destination_index {
-            return Ok(());
-        }
-
-        let source_window = self
-            .windows
-            .remove(&source_index)
-            .expect("source window must exist for swap");
-        let destination_window = self
-            .windows
-            .remove(&destination_index)
-            .expect("destination window must exist for swap");
-        let source_flags = self
-            .winlink_alert_flags
-            .remove(&source_index)
-            .unwrap_or_else(crate::AlertFlags::empty);
-        let destination_flags = self
-            .winlink_alert_flags
-            .remove(&destination_index)
-            .unwrap_or_else(crate::AlertFlags::empty);
-
-        self.windows.insert(source_index, destination_window);
-        self.windows.insert(destination_index, source_window);
-        self.winlink_alert_flags
-            .insert(source_index, destination_flags);
-        self.winlink_alert_flags
-            .insert(destination_index, source_flags);
-        Ok(())
+        Ok(index_map)
     }
 
     /// Rotates pane positions in the addressed window without renumbering the panes themselves.
@@ -408,8 +325,8 @@ impl Session {
         window_index: u32,
         direction: RotateWindowDirection,
     ) -> Result<(), RmuxError> {
-        self.resolve_window_target_mut(window_index)?
-            .rotate_panes(direction);
+        self.window_layout_context_mut(window_index)?
+            .rotate(direction, false);
         Ok(())
     }
 
@@ -420,8 +337,8 @@ impl Session {
         direction: RotateWindowDirection,
         restore_zoom: bool,
     ) -> Result<(), RmuxError> {
-        self.resolve_window_target_mut(window_index)?
-            .rotate_panes_with_zoom(direction, restore_zoom);
+        self.window_layout_context_mut(window_index)?
+            .rotate(direction, restore_zoom);
         Ok(())
     }
 
@@ -431,7 +348,7 @@ impl Session {
         window_index: u32,
         size: TerminalSize,
     ) -> Result<(), RmuxError> {
-        self.resolve_window_target_mut(window_index)?.set_size(size);
+        self.window_layout_context_mut(window_index)?.set_size(size);
         Ok(())
     }
 
@@ -457,94 +374,6 @@ impl Session {
         let window = self.resolve_window_target_mut(window_index)?;
         window.respawn(pane_id);
         Ok(pane_id)
-    }
-
-    fn extract_window_for_move(&mut self, window_index: u32) -> Result<Window, RmuxError> {
-        self.windows
-            .remove(&window_index)
-            .ok_or_else(|| invalid_window_target(&self.name, window_index))
-    }
-
-    fn apply_move_tracking(
-        &mut self,
-        source_index: u32,
-        destination_index: u32,
-        previous_active: u32,
-        previous_last: Option<u32>,
-        select_destination: bool,
-    ) {
-        let source_was_active = previous_active == source_index;
-        let destination_was_active = previous_active == destination_index;
-
-        self.active_window = if source_was_active {
-            if select_destination {
-                destination_index
-            } else {
-                self.next_active_window_after_detach(source_index, previous_last)
-            }
-        } else if select_destination {
-            destination_index
-        } else {
-            previous_active
-        };
-
-        self.last_window = if source_was_active {
-            if select_destination {
-                self.preserved_last_after_selecting_destination(
-                    source_index,
-                    destination_index,
-                    previous_last,
-                )
-            } else {
-                None
-            }
-        } else if select_destination {
-            if destination_was_active {
-                self.preserved_last_after_selecting_destination(
-                    source_index,
-                    destination_index,
-                    previous_last,
-                )
-            } else {
-                Some(previous_active)
-            }
-        } else if previous_last == Some(source_index) {
-            None
-        } else {
-            previous_last.filter(|window_index| self.windows.contains_key(window_index))
-        };
-
-        if self.last_window == Some(self.active_window) {
-            self.last_window = None;
-        }
-    }
-
-    fn next_active_window_after_detach(
-        &self,
-        removed_index: u32,
-        previous_last: Option<u32>,
-    ) -> u32 {
-        if let Some(last_window) = previous_last {
-            if last_window != removed_index && self.windows.contains_key(&last_window) {
-                return last_window;
-            }
-        }
-
-        cyclic_previous_window_index(&self.windows, removed_index)
-            .expect("a non-empty session must have a replacement window")
-    }
-
-    fn preserved_last_after_selecting_destination(
-        &self,
-        source_index: u32,
-        destination_index: u32,
-        previous_last: Option<u32>,
-    ) -> Option<u32> {
-        previous_last.filter(|window_index| {
-            *window_index != source_index
-                && *window_index != destination_index
-                && self.windows.contains_key(window_index)
-        })
     }
 
     fn bump_allocators_for_window(&mut self, window: &Window) {

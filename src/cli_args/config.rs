@@ -3,6 +3,7 @@ use rmux_proto::HookName;
 #[cfg(test)]
 use rmux_proto::{ScopeSelector, SessionName};
 
+use super::schema::{self, CommandSpec};
 use super::{parse_target_spec, TargetSpec};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -14,8 +15,8 @@ pub(crate) enum SetOptionCommandKind {
 impl SetOptionCommandKind {
     pub(crate) const fn command_name(self) -> &'static str {
         match self {
-            Self::SetOption => "set-option",
-            Self::SetWindowOption => "set-window-option",
+            Self::SetOption => schema::SetOption::NAME,
+            Self::SetWindowOption => schema::SetWindowOption::NAME,
         }
     }
 }
@@ -118,8 +119,8 @@ pub(crate) enum ShowOptionsCommandKind {
 impl ShowOptionsCommandKind {
     pub(crate) const fn command_name(self) -> &'static str {
         match self {
-            Self::ShowOptions => "show-options",
-            Self::ShowWindowOptions => "show-window-options",
+            Self::ShowOptions => schema::ShowOptions::NAME,
+            Self::ShowWindowOptions => schema::ShowWindowOptions::NAME,
         }
     }
 }

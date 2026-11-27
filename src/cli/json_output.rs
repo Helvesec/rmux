@@ -1,8 +1,7 @@
 use std::io::{self, ErrorKind, Write};
 
-use rmux_core::formats::is_truthy;
-use rmux_proto::{CommandOutput, ListClientsResponse, ListWindowsResponse};
-use serde_json::{json, Map, Value};
+use rmux_proto::{CommandOutput, ListClientsResponse};
+use serde_json::{Map, Value};
 
 use super::ExitFailure;
 
@@ -10,6 +9,12 @@ const FIELD_SEPARATOR: char = '\x1f';
 const FIELD_SEPARATOR_STR: &str = "\x1f";
 const ROW_SEPARATOR: char = '\x1e';
 const ROW_SEPARATOR_STR: &str = "\x1e";
+
+// In pane/window rows every literal US is escaped before the two delimiters
+// are inserted. Each format variable is therefore read exactly once.
+const ESCAPED_US: &str = "\x1fe";
+const FIELD_END: &str = "\x1ff";
+const ROW_TERMINATOR: &str = "\x1f\n";
 
 const LIST_CLIENTS_FIELDS: &[JsonField] = &[
     JsonField::string("client_name"),
@@ -64,7 +69,7 @@ pub(super) fn list_clients_json_format() -> String {
 }
 
 pub(super) fn list_panes_json_format() -> String {
-    json_format(LIST_PANES_FIELDS)
+    escaped_row_format(LIST_PANES_FIELDS)
 }
 
 pub(super) fn list_sessions_json_format() -> String {
@@ -72,11 +77,17 @@ pub(super) fn list_sessions_json_format() -> String {
 }
 
 pub(super) fn list_windows_json_format() -> String {
-    LIST_WINDOWS_JSON_FIELDS
+    escaped_row_format(LIST_WINDOWS_JSON_FIELDS)
+}
+
+fn escaped_row_format(fields: &[JsonField]) -> String {
+    let fields = fields
         .iter()
-        .map(|field| format!("#{{n:{0}}}:#{{{0}}}", field.name))
+        .map(|field| format!("#{{s/{FIELD_SEPARATOR}/{ESCAPED_US}/:{}}}", field.name))
         .collect::<Vec<_>>()
-        .join("")
+        .join(FIELD_END);
+    // The list renderer supplies the newline after each row.
+    format!("{fields}{FIELD_SEPARATOR}")
 }
 
 fn json_format(fields: &[JsonField]) -> String {
@@ -134,63 +145,16 @@ pub(super) fn write_list_clients_json(response: &ListClientsResponse) -> Result<
 }
 
 pub(super) fn write_list_panes_json(output: &CommandOutput) -> Result<i32, ExitFailure> {
-    write_delimited_output_as_json(output, LIST_PANES_FIELDS, "list-panes")
+    let rows = parse_escaped_rows(output.stdout(), LIST_PANES_FIELDS, "list-panes")?;
+    write_json_value(&Value::Array(rows), "list-panes")
 }
 
 pub(super) fn write_list_sessions_json(output: &CommandOutput) -> Result<i32, ExitFailure> {
     write_delimited_output_as_json(output, LIST_SESSIONS_FIELDS, "list-sessions")
 }
 
-pub(super) fn write_length_prefixed_list_windows_json(
-    output: &CommandOutput,
-) -> Result<i32, ExitFailure> {
-    let rows =
-        parse_length_prefixed_rows(output.stdout(), LIST_WINDOWS_JSON_FIELDS, "list-windows")?;
-    write_json_value(&Value::Array(rows), "list-windows")
-}
-
-pub(super) fn filter_delimited_json_output(
-    output: &CommandOutput,
-    command_name: &'static str,
-) -> Result<CommandOutput, ExitFailure> {
-    let stdout = stdout_string(output.stdout(), command_name)?;
-    let mut filtered = String::new();
-    for record in split_delimited_records(&stdout) {
-        let Some((filter_value, rendered_record)) = record.split_once(FIELD_SEPARATOR) else {
-            return Err(ExitFailure::new(
-                1,
-                format!("{command_name} filter output missing separator"),
-            ));
-        };
-        if is_truthy(filter_value) {
-            filtered.push_str(rendered_record);
-            filtered.push(ROW_SEPARATOR);
-            filtered.push('\n');
-        }
-    }
-    Ok(CommandOutput::from_stdout(filtered.into_bytes()))
-}
-
-pub(super) fn write_list_windows_json(response: &ListWindowsResponse) -> Result<i32, ExitFailure> {
-    let rows = response
-        .windows
-        .iter()
-        .map(|window| {
-            json!({
-                "session_name": window.target.session_name().to_string(),
-                "window_index": window.target.window_index(),
-                "window_id": window.window_id,
-                "window_name": window.name.as_deref().unwrap_or(""),
-                "window_panes": window.pane_count,
-                "window_width": window.size.cols,
-                "window_height": window.size.rows,
-                "window_layout": window.layout.to_string(),
-                "window_active": window.active,
-                "window_last_flag": window.last,
-            })
-        })
-        .collect::<Vec<_>>();
-
+pub(super) fn write_list_windows_json(output: &CommandOutput) -> Result<i32, ExitFailure> {
+    let rows = parse_escaped_rows(output.stdout(), LIST_WINDOWS_JSON_FIELDS, "list-windows")?;
     write_json_value(&Value::Array(rows), "list-windows")
 }
 
@@ -263,71 +227,50 @@ fn parse_delimited_row(
     Ok(Value::Object(object))
 }
 
-fn parse_length_prefixed_rows(
+fn parse_escaped_rows(
     bytes: &[u8],
     fields: &[JsonField],
     command_name: &'static str,
 ) -> Result<Vec<Value>, ExitFailure> {
-    let mut rows = Vec::new();
-    let mut cursor = 0;
-    while cursor < bytes.len() {
-        let mut object = Map::with_capacity(fields.len());
-        for field in fields {
-            let relative_colon = bytes[cursor..]
-                .iter()
-                .position(|byte| *byte == b':')
-                .ok_or_else(|| length_prefix_error(command_name, field.name))?;
-            let colon = cursor + relative_colon;
-            let length = std::str::from_utf8(&bytes[cursor..colon])
-                .ok()
-                .filter(|value| !value.is_empty())
-                .and_then(|value| value.parse::<usize>().ok())
-                .ok_or_else(|| length_prefix_error(command_name, field.name))?;
-            let value_start = colon + 1;
-            let value_end = value_start.checked_add(length).ok_or_else(|| {
-                ExitFailure::new(1, format!("{command_name} --json field length overflow"))
-            })?;
-            let value = bytes.get(value_start..value_end).ok_or_else(|| {
-                ExitFailure::new(
-                    1,
-                    format!(
-                        "{command_name} --json field '{}' exceeds the captured row",
-                        field.name
-                    ),
-                )
-            })?;
-            let value = std::str::from_utf8(value).map_err(|error| {
-                ExitFailure::new(
-                    1,
-                    format!(
-                        "{command_name} --json field '{}' is not UTF-8: {error}",
-                        field.name
-                    ),
-                )
-            })?;
-            object.insert(
-                field.name.to_owned(),
-                typed_field_value(field, value, command_name)?,
-            );
-            cursor = value_end;
-        }
-        if bytes.get(cursor) != Some(&b'\n') {
-            return Err(ExitFailure::new(
-                1,
-                format!("{command_name} --json row is missing its terminator"),
-            ));
-        }
-        cursor += 1;
-        rows.push(Value::Object(object));
+    let text = std::str::from_utf8(bytes).map_err(|error| {
+        ExitFailure::new(
+            1,
+            format!("{command_name} --json received non-UTF-8 output: {error}"),
+        )
+    })?;
+    if text.is_empty() {
+        return Ok(Vec::new());
     }
-    Ok(rows)
-}
-
-fn length_prefix_error(command_name: &'static str, field_name: &'static str) -> ExitFailure {
-    ExitFailure::new(
-        1,
-        format!("{command_name} --json field '{field_name}' has an invalid length prefix"),
-    )
+    let rows = text.strip_suffix(ROW_TERMINATOR).ok_or_else(|| {
+        ExitFailure::new(
+            1,
+            format!("{command_name} --json row is missing its terminator"),
+        )
+    })?;
+    rows.split(ROW_TERMINATOR)
+        .map(|row| {
+            let mut values = row.split(FIELD_END);
+            let mut object = Map::with_capacity(fields.len());
+            let wrong_field_count = || {
+                ExitFailure::new(
+                    1,
+                    format!("{command_name} --json expected {} fields", fields.len()),
+                )
+            };
+            for field in fields {
+                let raw = values.next().ok_or_else(wrong_field_count)?;
+                let value = raw.replace(ESCAPED_US, FIELD_SEPARATOR_STR);
+                object.insert(
+                    field.name.to_owned(),
+                    typed_field_value(field, &value, command_name)?,
+                );
+            }
+            if values.next().is_some() {
+                return Err(wrong_field_count());
+            }
+            Ok(Value::Object(object))
+        })
+        .collect()
 }
 
 fn field_value(
@@ -434,11 +377,10 @@ fn write_json_value(value: &Value, command_name: &'static str) -> Result<i32, Ex
 }
 
 #[cfg(test)]
+#[path = "json_output/tests"]
 mod tests {
     use super::{
-        list_sessions_json_format, list_windows_json_format, parse_delimited_rows,
-        parse_length_prefixed_rows, LIST_PANES_FIELDS, LIST_SESSIONS_FIELDS,
-        LIST_WINDOWS_JSON_FIELDS,
+        list_sessions_json_format, parse_delimited_rows, LIST_PANES_FIELDS, LIST_SESSIONS_FIELDS,
     };
 
     #[test]
@@ -484,33 +426,5 @@ mod tests {
         assert!(error.message().contains("expected 10 fields"));
     }
 
-    #[test]
-    fn list_windows_length_prefix_preserves_all_user_control_characters() {
-        assert!(list_windows_json_format()
-            .starts_with("#{n:session_name}:#{session_name}#{n:window_index}:#{window_index}"));
-        let values = [
-            "alpha",
-            "0",
-            "@1",
-            "unit\x1frow\x1e\n雪",
-            "1",
-            "80",
-            "24",
-            "tiled",
-            "1",
-            "0",
-        ];
-        let mut payload = Vec::new();
-        for value in values {
-            payload.extend_from_slice(format!("{}:", value.len()).as_bytes());
-            payload.extend_from_slice(value.as_bytes());
-        }
-        payload.push(b'\n');
-
-        let rows = parse_length_prefixed_rows(&payload, LIST_WINDOWS_JSON_FIELDS, "list-windows")
-            .expect("length-prefixed row parses");
-        assert_eq!(rows[0]["window_name"], "unit\x1frow\x1e\n雪");
-        assert_eq!(rows[0]["window_index"], 0);
-        assert_eq!(rows[0]["window_active"], true);
-    }
+    mod framing;
 }

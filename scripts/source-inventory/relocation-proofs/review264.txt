@@ -1,0 +1,22 @@
+R2-264 — PASS borné C2, D161(1b).
+HEAD 330141c0eb1eeb3f709dc12172795a040dd21f05.
+28/28 deltas attribués ; 23 compteurs égaux rehachés.
+28 fichiers : 38 038 → 37 934 lignes ; production −105, tests +1.
+27 cas : retrait de 99 lignes path de production.
+Attach Unix : −6 path, −2 déclarations transférées,
++1 import +1 blanc ; +1 path de test, soit −6 production/+1 test.
+Façade : 13 production ; parent Windows 557→542, lib 111→108.
+Chaque ligne et jeton retiré/transféré est justifié dans le JSON.
+Rejeu scellé PASS : 2300 Rust, 2495 consommateurs/cfg,
+321 racines Cargo, 370 déplacements ; façade incluse.
+4 littéraux de tests : mêmes corps ; 9 adresses vérifiées.
+Aucune croissance des 51 ni nouveau gros fichier ; crédit zéro.
+C1/C3/C4 acquis conservés ; aucune adoption/activation.
+Transport prescrit : seuls chemins/hashes/comptes prouvés.
+Avant historique inchangé ; 12 identités, BASELINE/BOUNDS/CORE,
+seuil 599, 150 allow et 4 path tooling conservés.
+Canaris ajout/retrait/substitution/collision/borne relâchée requis.
+Chaîne ajout seul, époque/activation explicites et R1 du diff dus.
+HEAD et 33 entrées stables début/fin ; venv privée <0,2 Gio.
+Produit/gardes/pins/attendus intacts ; aucun autre rôle piloté.
+Cargo/build/PTY/natif/FF/train/clôture : non exécutés.

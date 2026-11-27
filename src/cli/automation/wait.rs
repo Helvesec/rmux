@@ -1,37 +1,61 @@
 use std::path::Path;
 use std::time::{Duration, Instant};
 
+use rmux_bootstrap::deadline::StartupDeadline;
 use rmux_client::Connection;
-use rmux_proto::{
-    ErrorResponse, ListClientsRequest, PaneOutputSubscriptionId, PaneOutputSubscriptionStart,
-    PaneTarget, ResolveTargetType, Response, SendKeysExt2Request, SendKeysExtRequest, Target,
-};
+use rmux_proto::{PaneOutputSubscriptionId, PaneOutputSubscriptionStart};
 use serde_json::{json, Value};
 
 use crate::cli_args::{SendKeysArgs, SendKeysWaitMode, WaitPaneArgs};
-use crate::cli_response::{expect_command_success, tmux_cli_error_message};
+use crate::cli_response::expect_command_success;
 
 use super::super::ExitFailure;
 use super::common::{
-    check_disabled, connect_cli, duration_millis, elapsed_millis, find_visible_text,
-    sleep_poll_interval, timeout_deadline, visible_text, write_json, DEFAULT_STABLE_FOR,
+    check_disabled, connect_wait, duration_millis, elapsed_millis, find_visible_text,
+    timeout_deadline, visible_text, write_json, DEFAULT_STABLE_FOR,
 };
 use super::pane_exit::PaneExitStatus;
 use super::stream;
 use super::wait_target::{self, StableWaitProcessState, StableWaitTarget};
 
-const CLIENT_FIELD_SEPARATOR: char = '\u{1f}';
-const CLIENT_ROW_SEPARATOR: char = '\u{1e}';
-const CLIENT_TARGET_FORMAT: &str =
-    "#{client_name}\u{1f}#{client_tty}\u{1f}#{client_pid}\u{1f}#{client_session}\u{1f}#{client_control_mode}\u{1e}";
+mod send_keys;
+use send_keys::{
+    send_keys_target_plan, send_keys_through_command_path, unresolved_wait_target_error,
+};
+
 const PANE_EXIT_TOMBSTONE_HANDOFF_GRACE: Duration = Duration::from_millis(100);
 
+#[cfg(all(test, unix))]
 pub(crate) fn run_wait_pane(args: WaitPaneArgs, socket_path: &Path) -> Result<i32, ExitFailure> {
+    run_wait_pane_with_deadline(args, socket_path, None)
+}
+
+pub(crate) fn run_wait_pane_with_deadline(
+    args: WaitPaneArgs,
+    socket_path: &Path,
+    deadline: Option<StartupDeadline>,
+) -> Result<i32, ExitFailure> {
+    match run_wait_pane_inner(args.clone(), socket_path, deadline) {
+        Err(error) if error.is_timeout() => write_timeout_result(
+            args.json,
+            WaitCondition::from_wait_pane(&args).name(),
+            args.target.as_ref().map_or("", |target| target.raw()),
+            args.timeout.unwrap_or(super::common::DEFAULT_TIMEOUT),
+        ),
+        result => result,
+    }
+}
+
+fn run_wait_pane_inner(
+    args: WaitPaneArgs,
+    socket_path: &Path,
+    deadline: Option<StartupDeadline>,
+) -> Result<i32, ExitFailure> {
     check_disabled("RMUX_DISABLE_WAIT_PANE", "wait-pane")?;
     let started_at = Instant::now();
-    let deadline = timeout_deadline(args.timeout);
+    let deadline = deadline.unwrap_or_else(|| timeout_deadline(args.timeout));
     let condition = WaitCondition::from_wait_pane(&args);
-    let mut connection = connect_cli(socket_path)?;
+    let mut connection = connect_wait(socket_path, deadline)?;
     let target = wait_target::resolve(&mut connection, args.target.as_ref(), "wait-pane")?;
 
     match wait_condition(&mut connection, target.clone(), &condition, deadline, None)? {
@@ -67,12 +91,28 @@ pub(crate) fn run_wait_pane(args: WaitPaneArgs, socket_path: &Path) -> Result<i3
 pub(crate) fn run_send_keys_with_wait(
     args: SendKeysArgs,
     socket_path: &Path,
+    deadline: Option<StartupDeadline>,
+) -> Result<i32, ExitFailure> {
+    let started_at = Instant::now();
+    match run_send_keys_with_wait_inner(args.clone(), socket_path, started_at, deadline) {
+        Err(error) if error.is_timeout() => Err(timeout_error(
+            WaitCondition::from_send_keys(&args)?.name(),
+            started_at,
+        )),
+        result => result,
+    }
+}
+
+fn run_send_keys_with_wait_inner(
+    args: SendKeysArgs,
+    socket_path: &Path,
+    started_at: Instant,
+    deadline: Option<StartupDeadline>,
 ) -> Result<i32, ExitFailure> {
     check_disabled("RMUX_DISABLE_SEND_KEYS_WAIT", "send-keys --wait")?;
-    let started_at = Instant::now();
-    let deadline = timeout_deadline(args.timeout);
+    let deadline = deadline.unwrap_or_else(|| timeout_deadline(args.timeout));
     let condition = WaitCondition::from_send_keys(&args)?;
-    let mut send_connection = connect_cli(socket_path)?;
+    let mut send_connection = connect_wait(socket_path, deadline)?;
     let mut target_plan = send_keys_target_plan(&mut send_connection, &args)?;
     if target_plan.wait_target.is_none() {
         return Err(unresolved_wait_target_error(&args));
@@ -83,7 +123,7 @@ pub(crate) fn run_send_keys_with_wait(
             .wait_target
             .clone()
             .expect("send-keys --wait target was preflighted");
-        let mut wait_connection = connect_cli(socket_path)?;
+        let mut wait_connection = connect_wait(socket_path, deadline)?;
         let wait_target_ref =
             wait_target.refreshed_target_ref(&mut wait_connection, "send-keys")?;
         let subscription_id = stream::subscribe(
@@ -162,69 +202,28 @@ fn send_keys_wait_exit_code(
     PaneExitStatus::send_keys_exit_code(pane_exit)
 }
 
-fn write_timeout_result(
-    json_output: bool,
-    condition: &'static str,
-    target: &str,
-    timeout: Duration,
+mod outcome;
+#[cfg(test)]
+use outcome::lag_json_value;
+use outcome::{next_text_lag_error, timeout_error, write_lag_result, write_timeout_result};
+
+pub(super) fn invocation_timeout(
+    command: &crate::cli_args::Command,
+    started_at: Instant,
 ) -> Result<i32, ExitFailure> {
-    if json_output {
-        return write_json(&json!({
-            "schema_version": 1,
-            "ok": false,
-            "error": "timeout",
-            "condition": condition,
-            "target": target,
-            "timeout_ms": duration_millis(timeout),
-        }))
-        .map(|_| 1);
-    }
-    Err(ExitFailure::new(
-        1,
-        format!("wait-pane timed out waiting for {condition}"),
-    ))
-}
-
-fn timeout_error(condition: &'static str, started_at: Instant) -> ExitFailure {
-    ExitFailure::new(
-        1,
-        format!(
-            "send-keys timed out waiting for {condition} after {} ms",
-            elapsed_millis(started_at)
+    match command {
+        crate::cli_args::Command::WaitPane(args) => write_timeout_result(
+            args.json,
+            WaitCondition::from_wait_pane(args).name(),
+            args.target.as_ref().map_or("", |target| target.raw()),
+            args.timeout.unwrap_or(super::common::DEFAULT_TIMEOUT),
         ),
-    )
-}
-
-fn next_text_lag_error(missed_events: u64) -> ExitFailure {
-    ExitFailure::new(
-        1,
-        format!(
-            "wait-pane --next-text lost pane output due to lag before matching; missed {missed_events} events"
-        ),
-    )
-}
-
-fn write_lag_result(
-    json_output: bool,
-    condition: &'static str,
-    target: &str,
-    missed_events: u64,
-) -> Result<i32, ExitFailure> {
-    if json_output {
-        return write_json(&lag_json_value(condition, target, missed_events)).map(|_| 1);
+        crate::cli_args::Command::SendKeys(args) => Err(timeout_error(
+            WaitCondition::from_send_keys(args)?.name(),
+            started_at,
+        )),
+        _ => unreachable!("only wait commands have an invocation budget"),
     }
-    Err(next_text_lag_error(missed_events))
-}
-
-fn lag_json_value(condition: &'static str, target: &str, missed_events: u64) -> Value {
-    json!({
-        "schema_version": 1,
-        "ok": false,
-        "error": "pane-output-lag",
-        "condition": condition,
-        "target": target,
-        "missed_events": missed_events,
-    })
 }
 
 #[derive(Debug, Clone)]
@@ -301,7 +300,7 @@ fn wait_condition(
     connection: &mut Connection,
     target: StableWaitTarget,
     condition: &WaitCondition,
-    deadline: Instant,
+    deadline: StartupDeadline,
     require_revision_change_from: Option<u64>,
 ) -> Result<WaitCompletion, ExitFailure> {
     match condition {
@@ -324,7 +323,7 @@ fn wait_visible_text(
     connection: &mut Connection,
     mut target: StableWaitTarget,
     text: &str,
-    deadline: Instant,
+    deadline: StartupDeadline,
 ) -> Result<WaitCompletion, ExitFailure> {
     loop {
         let snapshot = wait_target::snapshot(connection, &mut target)?;
@@ -332,17 +331,20 @@ fn wait_visible_text(
         {
             return Ok(WaitCompletion::Matched { pane_exit: None });
         }
-        if Instant::now() >= deadline {
+        if deadline
+            .remaining_timeout()
+            .is_some_and(|remaining| remaining.is_zero())
+        {
             return Ok(WaitCompletion::TimedOut);
         }
-        sleep_poll_interval();
+        std::thread::sleep(deadline.sleep_for(super::common::POLL_INTERVAL));
     }
 }
 
 fn wait_quiet(
     connection: &mut Connection,
     mut target: StableWaitTarget,
-    deadline: Instant,
+    deadline: StartupDeadline,
     stable_for: Duration,
     require_revision_change_from: Option<u64>,
 ) -> Result<WaitCompletion, ExitFailure> {
@@ -351,20 +353,18 @@ fn wait_quiet(
     let mut observed_required_change = require_revision_change_from.is_none();
 
     loop {
-        match wait_target::process_state(connection, &mut target)? {
-            StableWaitProcessState::Alive => {}
-            StableWaitProcessState::Exited {
-                status: pane_exit, ..
-            } => {
-                return Ok(WaitCompletion::Matched {
-                    pane_exit: Some(pane_exit),
-                });
-            }
-            StableWaitProcessState::TargetGone => {
-                return Err(ExitFailure::new(1, "wait target session no longer exists"));
-            }
+        if let Some(completion) = quiet_completion_after_process_end(connection, &mut target)? {
+            return Ok(completion);
         }
-        let snapshot = wait_target::snapshot(connection, &mut target)?;
+        let snapshot = match wait_target::snapshot(connection, &mut target) {
+            Ok(snapshot) => snapshot,
+            // The pane may end between the probe and the snapshot: probe again
+            // so the wait ends on what happened to the pane, not on the race.
+            Err(snapshot_error) => {
+                return quiet_completion_after_process_end(connection, &mut target)?
+                    .ok_or(snapshot_error);
+            }
+        };
         if require_revision_change_from.is_some_and(|baseline| snapshot.revision != baseline) {
             observed_required_change = true;
         }
@@ -375,17 +375,43 @@ fn wait_quiet(
         if observed_required_change && stable_since.elapsed() >= stable_for {
             return Ok(WaitCompletion::Matched { pane_exit: None });
         }
-        if Instant::now() >= deadline {
+        if deadline
+            .remaining_timeout()
+            .is_some_and(|remaining| remaining.is_zero())
+        {
             return Ok(WaitCompletion::TimedOut);
         }
-        sleep_poll_interval();
+        std::thread::sleep(deadline.sleep_for(super::common::POLL_INTERVAL));
+    }
+}
+
+/// Ends a quiet wait once the pane process has ended; `None` while it runs.
+fn quiet_completion_after_process_end(
+    connection: &mut Connection,
+    target: &mut StableWaitTarget,
+) -> Result<Option<WaitCompletion>, ExitFailure> {
+    match wait_target::process_state(connection, target)? {
+        StableWaitProcessState::Alive => Ok(None),
+        // A pane removed without exit metadata (kill-pane) never settled:
+        // only an observed process exit may end a quiet wait early.
+        StableWaitProcessState::Exited {
+            status: pane_exit, ..
+        } if pane_exit.is_stale() => Err(ExitFailure::new(1, "wait target pane no longer exists")),
+        StableWaitProcessState::Exited {
+            status: pane_exit, ..
+        } => Ok(Some(WaitCompletion::Matched {
+            pane_exit: Some(pane_exit),
+        })),
+        StableWaitProcessState::TargetGone => {
+            Err(ExitFailure::new(1, "wait target session no longer exists"))
+        }
     }
 }
 
 fn wait_pane_exit(
     connection: &mut Connection,
     mut target: StableWaitTarget,
-    deadline: Instant,
+    deadline: StartupDeadline,
 ) -> Result<WaitCompletion, ExitFailure> {
     let mut target_gone_since = None;
     loop {
@@ -417,10 +443,13 @@ fn wait_pane_exit(
                 }
             }
         }
-        if Instant::now() >= deadline {
+        if deadline
+            .remaining_timeout()
+            .is_some_and(|remaining| remaining.is_zero())
+        {
             return Ok(WaitCompletion::TimedOut);
         }
-        sleep_poll_interval();
+        std::thread::sleep(deadline.sleep_for(super::common::POLL_INTERVAL));
     }
 }
 
@@ -435,17 +464,15 @@ enum PaneOutputEofWait {
 fn wait_pane_output_eof(
     connection: &mut Connection,
     mut target: StableWaitTarget,
-    deadline: Instant,
+    deadline: StartupDeadline,
 ) -> Result<PaneOutputEofWait, ExitFailure> {
     let target_ref = target.refreshed_target_ref(connection, "wait-pane")?;
-    let subscription_id =
-        match stream::subscribe(connection, target_ref, PaneOutputSubscriptionStart::Oldest) {
-            Ok(subscription_id) => subscription_id,
-            Err(error) if pane_output_subscription_unavailable(error.message()) => {
-                return Ok(PaneOutputEofWait::Unavailable);
-            }
-            Err(error) => return Err(error),
-        };
+    let start = PaneOutputSubscriptionStart::Oldest;
+    let subscription_id = match stream::try_subscribe(connection, target_ref, start)? {
+        Ok(subscription_id) => subscription_id,
+        Err(error) if target.is_gone_error(&error) => return Ok(PaneOutputEofWait::Unavailable),
+        Err(error) => return Err(stream::subscription_refused(&error)),
+    };
 
     loop {
         let batch = stream::poll_output_silent_lag(connection, subscription_id, "wait-pane")?;
@@ -459,25 +486,22 @@ fn wait_pane_output_eof(
             let _ = connection.unsubscribe_pane_output(subscription_id);
             return Ok(PaneOutputEofWait::Reached);
         }
-        if Instant::now() >= deadline {
+        if deadline
+            .remaining_timeout()
+            .is_some_and(|remaining| remaining.is_zero())
+        {
             let _ = connection.unsubscribe_pane_output(subscription_id);
             return Ok(PaneOutputEofWait::TimedOut);
         }
-        sleep_poll_interval();
+        std::thread::sleep(deadline.sleep_for(super::common::POLL_INTERVAL));
     }
-}
-
-fn pane_output_subscription_unavailable(message: &str) -> bool {
-    message.contains("pane not found")
-        || message.contains("session not found")
-        || message.contains("window index does not exist")
 }
 
 fn wait_next_text(
     connection: &mut Connection,
     mut target: StableWaitTarget,
     text: &str,
-    deadline: Instant,
+    deadline: StartupDeadline,
 ) -> Result<WaitCompletion, ExitFailure> {
     let target_ref = target.refreshed_target_ref(connection, "wait-pane")?;
     let subscription_id =
@@ -492,7 +516,7 @@ fn wait_next_text_subscription(
     connection: &mut Connection,
     subscription_id: PaneOutputSubscriptionId,
     needle: &[u8],
-    deadline: Instant,
+    deadline: StartupDeadline,
 ) -> Result<WaitCompletion, ExitFailure> {
     let mut tail = Vec::new();
     loop {
@@ -510,10 +534,13 @@ fn wait_next_text_subscription(
         if batch.saw_eof {
             return Ok(WaitCompletion::TimedOut);
         }
-        if Instant::now() >= deadline {
+        if deadline
+            .remaining_timeout()
+            .is_some_and(|remaining| remaining.is_zero())
+        {
             return Ok(WaitCompletion::TimedOut);
         }
-        sleep_poll_interval();
+        std::thread::sleep(deadline.sleep_for(super::common::POLL_INTERVAL));
     }
 }
 
@@ -536,288 +563,12 @@ fn observe_needle(tail: &mut Vec<u8>, bytes: &[u8], needle: &[u8]) -> bool {
     false
 }
 
-struct SendKeysTargetPlan {
-    send_target: Option<PaneTarget>,
-    wait_target: Option<StableWaitTarget>,
-}
-
-fn send_keys_target_plan(
-    connection: &mut Connection,
-    args: &SendKeysArgs,
-) -> Result<SendKeysTargetPlan, ExitFailure> {
-    let send_target = if args.target.is_some() {
-        Some(super::common::resolve_pane_slot(
-            connection,
-            args.target.as_ref(),
-            "send-keys",
-        )?)
-    } else {
-        None
-    };
-    let wait_target = if let Some(target) = send_target.as_ref() {
-        Some(wait_target::for_slot(connection, target, "send-keys")?)
-    } else if let Some(target_client) = args.client_target.as_deref() {
-        attached_target_client_pane_ref(connection, target_client)?
-    } else {
-        let current = super::common::resolve_pane_slot(connection, None, "send-keys")?;
-        Some(wait_target::for_slot(connection, &current, "send-keys")?)
-    };
-
-    Ok(SendKeysTargetPlan {
-        send_target,
-        wait_target,
-    })
-}
-
-fn attached_target_client_pane_ref(
-    connection: &mut Connection,
-    target_client: &str,
-) -> Result<Option<StableWaitTarget>, ExitFailure> {
-    let Some(session_name) = attached_target_client_session(connection, target_client)? else {
-        return Ok(None);
-    };
-    let response = connection
-        .resolve_target(Some(session_name), ResolveTargetType::Pane, false, false)
-        .map_err(ExitFailure::from_client)?;
-    let target = match response {
-        Response::ResolveTarget(response) => match response.target {
-            Target::Pane(target) => target,
-            other => {
-                return Err(ExitFailure::new(
-                    1,
-                    format!(
-                        "resolve-target produced {} where a pane target was required",
-                        target_kind_name(&other)
-                    ),
-                ));
-            }
-        },
-        Response::Error(ErrorResponse { error }) => {
-            return Err(ExitFailure::new(
-                1,
-                tmux_cli_error_message("send-keys", &error),
-            ));
-        }
-        other => {
-            return Err(ExitFailure::new(
-                1,
-                format!(
-                    "protocol error: unexpected '{}' response for send-keys",
-                    other.command_name()
-                ),
-            ));
-        }
-    };
-
-    wait_target::for_slot(connection, &target, "send-keys").map(Some)
-}
-
-fn unresolved_wait_target_error(args: &SendKeysArgs) -> ExitFailure {
-    if let Some(target_client) = args.client_target.as_deref() {
-        return ExitFailure::new(
-            1,
-            format!("send-keys --wait cannot observe a pane for target client {target_client:?}"),
-        );
-    }
-    ExitFailure::new(1, "send-keys --wait cannot resolve a pane to observe")
-}
-
-fn attached_target_client_session(
-    connection: &mut Connection,
-    target_client: &str,
-) -> Result<Option<String>, ExitFailure> {
-    let response = connection
-        .list_clients(ListClientsRequest {
-            format: Some(CLIENT_TARGET_FORMAT.to_owned()),
-            filter: None,
-            sort_order: None,
-            reversed: false,
-            target_session: None,
-        })
-        .map_err(ExitFailure::from_client)?;
-    let output = match response {
-        Response::ListClients(response) => response.output,
-        Response::Error(ErrorResponse { error }) => {
-            return Err(ExitFailure::new(
-                1,
-                tmux_cli_error_message("send-keys", &error),
-            ));
-        }
-        other => {
-            return Err(ExitFailure::new(
-                1,
-                format!(
-                    "protocol error: unexpected '{}' response for send-keys",
-                    other.command_name()
-                ),
-            ));
-        }
-    };
-    let target_client = normalize_target_client(target_client);
-    if target_client == "=" {
-        return Ok(None);
-    }
-    let rendered = String::from_utf8_lossy(output.stdout());
-    for row in rendered.split(CLIENT_ROW_SEPARATOR) {
-        let Some(client) = ParsedClientRow::parse(row) else {
-            continue;
-        };
-        if client.control || !client.matches(target_client) {
-            continue;
-        }
-        if client.session.is_empty() {
-            return Ok(None);
-        }
-        return Ok(Some(client.session.to_owned()));
-    }
-    Ok(None)
-}
-
-struct ParsedClientRow<'a> {
-    name: &'a str,
-    tty: &'a str,
-    pid: &'a str,
-    session: &'a str,
-    control: bool,
-}
-
-impl<'a> ParsedClientRow<'a> {
-    fn parse(row: &'a str) -> Option<Self> {
-        if row.is_empty() {
-            return None;
-        }
-        let mut fields = row.split(CLIENT_FIELD_SEPARATOR);
-        let name = fields.next()?;
-        let tty = fields.next()?;
-        let pid = fields.next()?;
-        let session = fields.next()?;
-        let control = fields.next()? == "1";
-        if fields.next().is_some() {
-            return None;
-        }
-        Some(Self {
-            name,
-            tty,
-            pid,
-            session,
-            control,
-        })
-    }
-
-    fn matches(&self, target_client: &str) -> bool {
-        self.pid == target_client
-            || client_path_matches(self.name, target_client)
-            || client_path_matches(self.tty, target_client)
-    }
-}
-
-fn client_path_matches(path: &str, target_client: &str) -> bool {
-    path == target_client
-        || path
-            .strip_prefix("/dev/")
-            .is_some_and(|stripped| stripped == target_client)
-}
-
-fn normalize_target_client(target_client: &str) -> &str {
-    target_client.strip_suffix(':').unwrap_or(target_client)
-}
-
-fn target_kind_name(target: &Target) -> &'static str {
-    match target {
-        Target::Session(_) => "session",
-        Target::Window(_) => "window",
-        Target::Pane(_) => "pane",
-    }
-}
-
-fn send_keys_through_command_path(
-    connection: &mut Connection,
-    args: SendKeysArgs,
-    target: Option<PaneTarget>,
-) -> Result<Response, ExitFailure> {
-    if let Some(target_client) = args.client_target {
-        return connection
-            .send_keys_extended_target_client(SendKeysExt2Request {
-                target,
-                keys: args.keys,
-                expand_formats: args.expand_formats,
-                hex: args.hex,
-                literal: args.literal,
-                dispatch_key_table: args.key_table,
-                copy_mode_command: args.copy_mode,
-                forward_mouse_event: args.mouse,
-                reset_terminal: args.reset_terminal,
-                repeat_count: args.repeat_count,
-                target_client: Some(target_client),
-            })
-            .map_err(ExitFailure::from_client);
-    }
-
-    connection
-        .send_keys_extended(SendKeysExtRequest {
-            target,
-            keys: args.keys,
-            expand_formats: args.expand_formats,
-            hex: args.hex,
-            literal: args.literal,
-            dispatch_key_table: args.key_table,
-            copy_mode_command: args.copy_mode,
-            forward_mouse_event: args.mouse,
-            reset_terminal: args.reset_terminal,
-            repeat_count: args.repeat_count,
-        })
-        .map_err(ExitFailure::from_client)
-}
-
 fn target_name(target: &StableWaitTarget) -> String {
     target.target_ref().to_string()
 }
 
 #[cfg(test)]
-mod tests {
-    use std::time::Duration;
+mod tests;
 
-    use super::{
-        lag_json_value, observe_needle, send_keys_wait_exit_code, PaneExitStatus, WaitCondition,
-    };
-
-    #[test]
-    fn next_text_observer_matches_across_output_chunks() {
-        let mut tail = Vec::new();
-
-        assert!(!observe_needle(&mut tail, b"abc", b"cde"));
-        assert!(observe_needle(&mut tail, b"def", b"cde"));
-    }
-
-    #[test]
-    fn next_text_observer_keeps_only_required_tail() {
-        let mut tail = Vec::new();
-
-        assert!(!observe_needle(&mut tail, b"abcdef", b"defgh"));
-
-        assert_eq!(tail, b"cdef");
-    }
-
-    #[test]
-    fn next_text_lag_json_is_machine_readable() {
-        let value = lag_json_value("next-text", "%1", 7);
-
-        assert_eq!(value["schema_version"], 1);
-        assert_eq!(value["ok"], false);
-        assert_eq!(value["error"], "pane-output-lag");
-        assert_eq!(value["condition"], "next-text");
-        assert_eq!(value["target"], "%1");
-        assert_eq!(value["missed_events"], 7);
-    }
-
-    #[test]
-    fn quiet_completion_does_not_claim_the_observed_process_status() {
-        let condition = WaitCondition::Quiet(Duration::from_millis(100));
-
-        assert_eq!(
-            send_keys_wait_exit_code(&condition, Some(PaneExitStatus::known(Some(7), None)),)
-                .expect("quiet reports completion rather than process success"),
-            0
-        );
-    }
-}
+#[cfg(all(test, unix))]
+mod quiet_race_tests;

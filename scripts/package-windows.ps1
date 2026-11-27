@@ -7,16 +7,29 @@ param(
     [switch]$SkipBuild,
     [switch]$AllowStaleBinary,
     [switch]$ReuseReleaseBinaries,
-    [string]$ReleaseBinaryManifest = ""
+    [string]$ReleaseBinaryManifest = "",
+    [string]$ConptyPackage = ""
 )
 
 Set-StrictMode -Version Latest
 $ErrorActionPreference = "Stop"
+. (Join-Path $PSScriptRoot "conpty/runtime.ps1")
+. (Join-Path $PSScriptRoot "packaging/layout-tool.ps1")
+. (Join-Path $PSScriptRoot "packaging/stage-layout.ps1")
+. (Join-Path $PSScriptRoot "package-windows-archive.ps1")
+
+function Invoke-Notices([string[]]$Arguments) {
+    $python = Resolve-LayoutPython
+    & $python (Join-Path $PSScriptRoot "packaging/notices.py") @Arguments
+    if ($LASTEXITCODE -ne 0) { Fail "third-party notice generation or payload binding failed" }
+}
 
 function Fail([string]$Message) {
     Write-Error "error: $Message"
     exit 1
 }
+
+
 
 function Sha256File([string]$Path) {
     $getFileHash = Get-Command Get-FileHash -ErrorAction SilentlyContinue
@@ -109,22 +122,19 @@ function WriteAsciiLfFile([string]$Output, [string[]]$Lines) {
 
 function WritePackageChecksums([string]$Root, [string]$Output) {
     $rootFull = [System.IO.Path]::GetFullPath($Root)
-    $entries = Get-ChildItem -LiteralPath $rootFull -Recurse -File |
+    [string[]]$entries = @(Get-ChildItem -LiteralPath $rootFull -Recurse -File |
         Where-Object { $_.Name -ne "SHA256SUMS.txt" } |
         ForEach-Object {
             $relative = (RelativePath $rootFull $_.FullName).Replace("\", "/")
             if ($relative.StartsWith("../") -or $relative.Contains("/../") -or $relative.Contains("\")) {
                 Fail "non-portable package checksum path: $relative"
             }
-            [pscustomobject]@{
-                Path = $_.FullName
-                Relative = $relative
-            }
-        } |
-        Sort-Object -Property Relative
+            $relative
+        })
+    [Array]::Sort($entries, [StringComparer]::Ordinal)
 
     $lines = foreach ($entry in $entries) {
-        "$(Sha256File $entry.Path)  $($entry.Relative)"
+        "$(Sha256File (Join-Path $rootFull $entry))  $entry"
     }
     WriteAsciiLfFile $Output $lines
 }
@@ -208,6 +218,7 @@ if ($ReuseReleaseBinaries -ne (-not [string]::IsNullOrWhiteSpace($ReleaseBinaryM
 }
 
 $version = WorkspaceVersion
+$null = Get-ConptyManifest $Target
 if ([string]::IsNullOrWhiteSpace($PlatformLabel)) {
     $PlatformLabel = TargetLabel $Target
 }
@@ -234,21 +245,7 @@ if ($buildsReleaseMsvc -and $originalRustFlags -notlike "*+crt-static*") {
 }
 try {
     if (-not $SkipBuild -and -not $ReuseReleaseBinaries) {
-        # Build the daemon with the full helper before enabling tiny-cli. The
-        # packaged daemon must retain web support even though the public binary
-        # is relinked with the tiny command surface below.
-        & cargo @cargoArgs --bin rmux --bin rmux-daemon
-        if ($LASTEXITCODE -ne 0) {
-            Fail "cargo build full rmux helper and daemon failed"
-        }
-        Copy-Item -LiteralPath $binary -Destination $helperBinary -Force
-
-        $tinyCargoArgs = @($cargoArgs)
-        $tinyCargoArgs += @("--features", "tiny-cli")
-        & cargo @tinyCargoArgs --bin rmux
-        if ($LASTEXITCODE -ne 0) {
-            Fail "cargo build tiny rmux failed"
-        }
+        Invoke-Notices (@("build", "--binary-dir", (Split-Path -Parent $binary), "--", "cargo") + $cargoArgs)
     }
 } finally {
     if ($null -eq $originalRustFlags) {
@@ -257,6 +254,9 @@ try {
         $env:RUSTFLAGS = $originalRustFlags
     }
 }
+
+$noticeRequirement = if ($SkipBuild) { "--optional" } else { "--required" }
+Invoke-Notices @("verify", "--binary-dir", (Split-Path -Parent $binary), $noticeRequirement)
 
 $completionCache = if ($env:RMUX_COMPLETIONS_DIR) {
     $env:RMUX_COMPLETIONS_DIR
@@ -310,58 +310,78 @@ if (Test-Path -LiteralPath $stageDir) {
     Remove-Item -LiteralPath $stageDir -Recurse -Force
 }
 New-Item -ItemType Directory -Force -Path $stageDir | Out-Null
+# The two directories the ConPTY runtime and the generated files are written
+# into directly. Every placement that comes from the layout plan creates its
+# own parent.
 New-Item -ItemType Directory -Force -Path (Join-Path $stageDir "share/rmux") | Out-Null
-New-Item -ItemType Directory -Force -Path (Join-Path $stageDir "share/bash-completion/completions") | Out-Null
-New-Item -ItemType Directory -Force -Path (Join-Path $stageDir "share/zsh/site-functions") | Out-Null
-New-Item -ItemType Directory -Force -Path (Join-Path $stageDir "share/fish/vendor_completions.d") | Out-Null
-New-Item -ItemType Directory -Force -Path (Join-Path $stageDir "share/powershell/Completions") | Out-Null
-New-Item -ItemType Directory -Force -Path (Join-Path $stageDir "share/elvish/lib") | Out-Null
 New-Item -ItemType Directory -Force -Path (Join-Path $stageDir "libexec/rmux") | Out-Null
 
-Copy-Item -LiteralPath $binary -Destination (Join-Path $stageDir "rmux.exe")
-Copy-Item -LiteralPath $helperBinary -Destination (Join-Path $stageDir "libexec/rmux/rmux.exe")
-Copy-Item -LiteralPath $daemonBinary -Destination (Join-Path $stageDir "rmux-daemon.exe")
-Copy-Item -LiteralPath "scripts/install-windows.ps1" -Destination (Join-Path $stageDir "install.ps1")
-Copy-Item -LiteralPath "README.md", "LICENSE-APACHE", "LICENSE-MIT", "docs/man/rmux.1" -Destination $stageDir
 $completionDir = Join-Path ([System.IO.Path]::GetTempPath()) "rmux-completions-$([System.Guid]::NewGuid().ToString('N'))"
 New-Item -ItemType Directory -Force -Path $completionDir | Out-Null
 try {
-    $completionFiles = @("rmux.bash", "_rmux", "rmux.fish", "_rmux.ps1", "rmux.elv")
+    # Which completion files this package needs is the descriptor's answer,
+    # not a list kept here: a source renamed there is generated, cached and
+    # staged under its new name.
+    $completionFiles = @(Invoke-LayoutTool @("--with-notices", "source-names", "--variant", "windows-archive",
+        "--kind", "completion"))
+    # The same projection, with the shell each completion is generated from:
+    # the key the generator reports its own files under.
+    $completionOrigins = @(Invoke-LayoutTool @("--with-notices", "source-names", "--variant", "windows-archive",
+        "--kind", "completion", "--with-origin"))
     if (-not $SkipBuild) {
-        cargo run --quiet --package xtask -- generate-completions --output-dir $completionDir | Out-Null
+        # The generator writes under its own names and says what it wrote.
+        # Those files are then prepared under the names the descriptor gives
+        # them, so a renamed source is served by the generator's real output
+        # instead of being looked for under a name nothing produces.
+        $generatedDir = Join-Path $completionDir "generated"
+        $reportedCompletions = @(cargo run --quiet --package xtask -- generate-completions --output-dir $generatedDir)
         if ($LASTEXITCODE -ne 0) {
             Fail "failed to generate shell completions"
         }
+        Copy-LayoutGeneratedSources -Reported $reportedCompletions `
+            -Expected $completionOrigins -To $completionDir | Out-Null
         try {
             if (Test-Path -LiteralPath $completionCache) {
                 Remove-Item -LiteralPath $completionCache -Recurse -Force -ErrorAction SilentlyContinue
             }
             New-Item -ItemType Directory -Force -Path $completionCache -ErrorAction Stop | Out-Null
-            foreach ($completionFile in $completionFiles) {
-                Copy-Item -LiteralPath (Join-Path $completionDir $completionFile) -Destination (Join-Path $completionCache $completionFile) -Force -ErrorAction Stop
-            }
+            Copy-LayoutSourceFiles -Names $completionFiles -From $completionDir `
+                -To $completionCache -Missing "generated completion is missing" | Out-Null
         } catch {
             Write-Warning "unable to refresh completion cache ${completionCache}: $_"
         }
     } else {
-        foreach ($completionFile in $completionFiles) {
-            $source = Join-Path $completionCache $completionFile
-            if (-not (Test-Path -LiteralPath $source -PathType Leaf)) {
-                Fail "-SkipBuild requires prebuilt completions in $completionCache; rerun without -SkipBuild or set RMUX_COMPLETIONS_DIR"
-            }
-            Copy-Item -LiteralPath $source -Destination (Join-Path $completionDir $completionFile)
-        }
+        Copy-LayoutSourceFiles -Names $completionFiles -From $completionCache `
+            -To $completionDir `
+            -Missing ("-SkipBuild requires prebuilt completions in $completionCache; " +
+                "rerun without -SkipBuild or set RMUX_COMPLETIONS_DIR") | Out-Null
     }
-    Copy-Item -LiteralPath (Join-Path $completionDir "rmux.bash") -Destination (Join-Path $stageDir "share/bash-completion/completions/rmux")
-    Copy-Item -LiteralPath (Join-Path $completionDir "_rmux") -Destination (Join-Path $stageDir "share/zsh/site-functions/_rmux")
-    Copy-Item -LiteralPath (Join-Path $completionDir "rmux.fish") -Destination (Join-Path $stageDir "share/fish/vendor_completions.d/rmux.fish")
-    Copy-Item -LiteralPath (Join-Path $completionDir "_rmux.ps1") -Destination (Join-Path $stageDir "share/powershell/Completions/_rmux.ps1")
-    Copy-Item -LiteralPath (Join-Path $completionDir "rmux.elv") -Destination (Join-Path $stageDir "share/elvish/lib/rmux.elv")
+
+    # What this package carries from the build, the repository and the
+    # completions is the projection of the shared layout descriptor: which
+    # file is read, and where it is placed, are both the plan's answer. A
+    # source renamed in the descriptor is read under its new name here.
+    $stagePlan = @(Invoke-LayoutTool @("--with-notices", "stage-plan", "--variant", "windows-archive",
+        "--repo", (Get-Location).Path,
+        "--binaries", (Split-Path -Parent $binary),
+        "--completions", $completionDir,
+        "--only-sources", "binary,repo,completion"))
+    Copy-LayoutStagePlan -Plan $stagePlan -Stage $stageDir | Out-Null
 } finally {
     if (Test-Path -LiteralPath $completionDir) {
         Remove-Item -LiteralPath $completionDir -Recurse -Force
     }
 }
+
+Invoke-Notices @("stage", "--binary-dir", (Split-Path -Parent $binary),
+    "--root", $stageDir, "--variant", "windows-archive", $noticeRequirement)
+
+# The ConPTY runtime keeps its own native acquisition: a digest-pinned
+# archive, the two pinned entries, their PE machine and their signatures. Its
+# placements are declared by the runtime manifest and held against the
+# descriptor by the tree check below.
+Copy-ConptyRuntime $Target $ConptyPackage $stageDir
+Assert-ConptyPackage $stageDir $Target
 
 $binaryAbs = [System.IO.Path]::GetFullPath($binary)
 $helperBinaryAbs = [System.IO.Path]::GetFullPath($helperBinary)
@@ -379,6 +399,11 @@ $releaseArtifact = ($Configuration -eq "release") -and
     ((-not $SkipBuild -and -not $ReuseReleaseBinaries) -or $ReuseReleaseBinaries) -and
     (-not $gitDirty)
 $generatedAtUtc = GitOutput @("show", "-s", "--format=%cI", "HEAD")
+
+# The format identity the package declares is the descriptor's, so a change of
+# package contract moves it in one place for builders, validators and
+# installers at once.
+$packageLayoutId = Get-LayoutLine @("--with-notices", "layout-id", "--variant", "windows-archive")
 
 $metadata = [ordered]@{
     schema = 1
@@ -402,7 +427,8 @@ $metadata = [ordered]@{
     package_name = $packageName
     package_target = $Target
     package_target_label = $PlatformLabel
-    package_layout = "rmux-windows-package-v2"
+    package_layout = $packageLayoutId
+    conpty_runtime_manifest = "share/rmux/conpty-runtime.json"
     archive_format = "zip"
     skip_build = [bool]$SkipBuild
     reuse_release_binaries = [bool]$ReuseReleaseBinaries
@@ -413,15 +439,25 @@ $metadataPath = Join-Path $stageDir "share/rmux/artifact-metadata.json"
 New-Item -ItemType Directory -Force -Path (Split-Path -Parent $metadataPath) | Out-Null
 $metadata | ConvertTo-Json -Depth 5 | Set-Content -LiteralPath $metadataPath -Encoding utf8
 
+# The installer inside the package installs what the shared layout descriptor
+# projects, so that projection travels with the package.
+$layoutManifestPath = Join-Path $stageDir "share/rmux/package-layout.tsv"
+$layoutManifestLines = @(Invoke-LayoutTool @("--with-notices", "manifest", "--variant", "windows-archive"))
+WriteAsciiLfFile $layoutManifestPath $layoutManifestLines
+
 WritePackageChecksums $stageDir (Join-Path $stageDir "SHA256SUMS.txt")
+
+# Refuse a staged package that omits a declared file or carries an extra one.
+Invoke-LayoutTool @("--with-notices", "check-tree", "--variant", "windows-archive", "--root", $stageDir) | Out-Null
 
 if (Test-Path -LiteralPath $archivePath) {
     Remove-Item -LiteralPath $archivePath -Force
 }
-Compress-Archive -Path $stageDir -DestinationPath $archivePath -Force
+Write-ReproducibleWindowsArchive $stageDir $archivePath $generatedAtUtc
 
 $archiveSha256 = Sha256File $archivePath
 WriteAsciiLfFile $checksumsPath @("$archiveSha256  $([System.IO.Path]::GetFileName($archivePath))")
+Invoke-Notices @("publish", "--binary-dir", (Split-Path -Parent $binary), "--archive", $archivePath, $noticeRequirement)
 
 Write-Output "package=$archivePath"
 Write-Output "sha256=$archiveSha256"

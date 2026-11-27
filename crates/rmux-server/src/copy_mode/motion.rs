@@ -1,8 +1,22 @@
 use rmux_proto::RmuxError;
 
 use super::text::{owner_positions, scrollbar_slider_height, WordBoundary};
-use super::types::CopyPosition;
+use super::types::{CopyPosition, ModeKeys};
 use super::{CopyModeState, RecentreTopBottomPosition, RecentreTopBottomState};
+
+/// The column that page motions keep, with the length of the line where it
+/// was taken (tmux's `lastcx` and `lastsx`).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(super) struct PageColumn {
+    x: u32,
+    line_length: u32,
+}
+
+#[derive(Debug, Clone, Copy)]
+enum PageSize {
+    Full,
+    Half,
+}
 
 impl CopyModeState {
     pub(super) fn cmd_cursor_down(&mut self) -> Result<(), RmuxError> {
@@ -69,7 +83,7 @@ impl CopyModeState {
 
     pub(super) fn cmd_end_of_line(&mut self) -> Result<(), RmuxError> {
         self.cursor.y = self.logical_line_end_y(self.cursor.y);
-        self.cursor.x = self.line_end_x(self.cursor.y);
+        self.cursor.x = self.cursor_limit(self.cursor.y);
         self.sync_selection_with_cursor();
         Ok(())
     }
@@ -98,39 +112,130 @@ impl CopyModeState {
     }
 
     pub(super) fn cmd_page_up(&mut self) -> Result<(), RmuxError> {
-        let step = usize::from(self.rows().max(1));
-        self.top_line = self.top_line.saturating_sub(step);
-        self.cursor.y = self.cursor.y.saturating_sub(step);
-        self.ensure_cursor_visible();
-        self.sync_selection_with_cursor();
+        self.page_up(PageSize::Full);
         Ok(())
     }
 
     pub(super) fn cmd_page_down(&mut self) -> Result<(), RmuxError> {
-        let step = usize::from(self.rows().max(1));
-        self.top_line = (self.top_line + step).min(self.bottom_top_line());
-        self.cursor.y = (self.cursor.y + step).min(self.total_lines().saturating_sub(1));
-        self.ensure_cursor_visible();
-        self.sync_selection_with_cursor();
+        self.page_down(PageSize::Full);
         Ok(())
     }
 
     pub(super) fn cmd_halfpage_up(&mut self) -> Result<(), RmuxError> {
-        let step = usize::from(self.rows().max(1) / 2).max(1);
-        self.top_line = self.top_line.saturating_sub(step);
-        self.cursor.y = self.cursor.y.saturating_sub(step);
-        self.ensure_cursor_visible();
-        self.sync_selection_with_cursor();
+        self.page_up(PageSize::Half);
         Ok(())
     }
 
     pub(super) fn cmd_halfpage_down(&mut self) -> Result<(), RmuxError> {
-        let step = usize::from(self.rows().max(1) / 2).max(1);
-        self.top_line = (self.top_line + step).min(self.bottom_top_line());
-        self.cursor.y = (self.cursor.y + step).min(self.total_lines().saturating_sub(1));
+        self.page_down(PageSize::Half);
+        Ok(())
+    }
+
+    /// tmux's `window_copy_pageup1`: the view moves up by the page step and
+    /// the cursor keeps its screen row; at the top of the history the view
+    /// stops and the cursor moves up that step on the screen instead.
+    fn page_up(&mut self, size: PageSize) {
+        let column = self.take_page_column();
+        let step = self.page_step(size);
+        let mut screen_y = self.cursor_screen_row();
+        if self.top_line < step {
+            self.top_line = 0;
+            screen_y = screen_y.saturating_sub(step);
+        } else {
+            self.top_line -= step;
+        }
+        self.cursor.y = self.top_line + screen_y;
+        self.finish_page_motion(column);
+    }
+
+    /// tmux's `window_copy_pagedown1`: the mirror of [`Self::page_up`],
+    /// stopping on the last screen row at the bottom of the history.
+    fn page_down(&mut self, size: PageSize) {
+        let column = self.take_page_column();
+        let step = self.page_step(size);
+        let mut screen_y = self.cursor_screen_row();
+        let bottom = self.bottom_top_line();
+        if bottom.saturating_sub(self.top_line) < step {
+            self.top_line = bottom;
+            screen_y = (screen_y + step).min(usize::from(self.rows()) - 1);
+        } else {
+            self.top_line += step;
+        }
+        self.cursor.y = (self.top_line + screen_y).min(self.total_lines() - 1);
+        self.finish_page_motion(column);
+    }
+
+    /// A page is the pane height less two rows, half a page is half of it,
+    /// and a pane of one or two rows pages by one row.
+    fn page_step(&self, size: PageSize) -> usize {
+        let rows = usize::from(self.rows());
+        match size {
+            _ if rows <= 2 => 1,
+            PageSize::Full => rows - 2,
+            PageSize::Half => rows / 2,
+        }
+    }
+
+    fn cursor_screen_row(&self) -> usize {
+        self.cursor
+            .y
+            .saturating_sub(self.top_line)
+            .min(usize::from(self.rows()) - 1)
+    }
+
+    /// tmux's `lastcx` and `lastsx`: a cursor that is not at the end of its
+    /// line records its column and that line's length, and a cursor at the end
+    /// of its line keeps the column recorded before.
+    fn take_page_column(&mut self) -> u32 {
+        let length = self.line_length(self.cursor.y);
+        if self.cursor.x != length {
+            self.page_column = PageColumn {
+                x: self.cursor.x,
+                line_length: length,
+            };
+        }
+        self.page_column.x
+    }
+
+    /// Outside a rectangle selection, the cursor goes to the end of its new
+    /// line when it was at the end of the recorded line or would fall past
+    /// the end of the new one.
+    fn finish_page_motion(&mut self, column: u32) {
+        let line = self.line(self.cursor.y);
+        self.cursor.x = line.owning_cell_x(column).unwrap_or(column);
+        if self.selection.is_none() || !self.rectangle {
+            let length = self.line_length(self.cursor.y);
+            if (column >= self.page_column.line_length && column != length) || column > length {
+                self.cursor.y = self.logical_line_end_y(self.cursor.y);
+                self.cursor.x = self.cursor_limit(self.cursor.y);
+            }
+        }
         self.ensure_cursor_visible();
         self.sync_selection_with_cursor();
-        Ok(())
+    }
+
+    /// tmux's `grid_line_length`: the columns up to the last non-blank cell.
+    pub(super) fn line_length(&self, y: usize) -> u32 {
+        let line = self.line(y);
+        owner_positions(&line)
+            .into_iter()
+            .rev()
+            .find_map(|x| {
+                line.cell(x)
+                    .filter(|cell| !cell.text().chars().all(char::is_whitespace))
+                    .map(|cell| x + u32::from(cell.width().max(1)))
+            })
+            .map_or(0, |length| length.min(line.width()))
+    }
+
+    /// tmux's `window_copy_cursor_limit`: the end of a line is past its last
+    /// cell in emacs keys and on its last cell in vi keys.
+    fn cursor_limit(&self, y: usize) -> u32 {
+        let length = self.line_length(y);
+        match self.mode_keys {
+            ModeKeys::Vi => length.saturating_sub(1),
+            ModeKeys::Emacs => length,
+        }
     }
 
     pub(super) fn cmd_history_top(&mut self) -> Result<(), RmuxError> {
@@ -274,48 +379,34 @@ impl CopyModeState {
         Ok(())
     }
 
-    pub(super) fn cmd_next_prompt(&mut self, only_after: bool) -> Result<(), RmuxError> {
-        let start = if only_after {
-            self.cursor.y.saturating_add(1)
-        } else {
-            self.cursor.y
-        };
-        for y in start..self.total_lines() {
-            if self
-                .backing
-                .absolute_line_view(y)
-                .is_some_and(|line| line.start_prompt())
-            {
-                self.cursor.y = y;
-                self.cursor.x = 0;
-                self.ensure_cursor_visible();
-                self.sync_selection_with_cursor();
-                break;
-            }
-        }
+    pub(super) fn cmd_next_prompt(&mut self, output: bool) -> Result<(), RmuxError> {
+        self.move_to_shell_mark(self.cursor.y.saturating_add(1)..self.total_lines(), output);
         Ok(())
     }
 
-    pub(super) fn cmd_previous_prompt(&mut self, only_before: bool) -> Result<(), RmuxError> {
-        let start = if only_before {
-            self.cursor.y.saturating_sub(1)
-        } else {
-            self.cursor.y
-        };
-        for y in (0..=start).rev() {
-            if self
-                .backing
-                .absolute_line_view(y)
-                .is_some_and(|line| line.start_prompt())
-            {
+    pub(super) fn cmd_previous_prompt(&mut self, output: bool) -> Result<(), RmuxError> {
+        self.move_to_shell_mark((0..self.cursor.y).rev(), output);
+        Ok(())
+    }
+
+    fn move_to_shell_mark(&mut self, rows: impl Iterator<Item = usize>, output: bool) {
+        for y in rows {
+            if self.backing.absolute_line_view(y).is_some_and(|line| {
+                if output {
+                    line.start_output()
+                } else {
+                    line.start_prompt()
+                }
+            }) {
                 self.cursor.y = y;
                 self.cursor.x = 0;
-                self.ensure_cursor_visible();
+                // tmux anchors a history match at the top, and restores the
+                // live viewport when the match belongs to the visible screen.
+                self.top_line = y.min(self.bottom_top_line());
                 self.sync_selection_with_cursor();
                 break;
             }
         }
-        Ok(())
     }
 
     pub(super) fn cmd_next_matching_bracket(&mut self) -> Result<(), RmuxError> {
@@ -428,7 +519,10 @@ impl CopyModeState {
 
     pub(super) fn cmd_jump_to_mark(&mut self) -> Result<(), RmuxError> {
         if let Some(mark) = self.mark {
-            self.cursor = mark;
+            // Every backing change clamps the mark already; clamping again
+            // here keeps a later backing path from handing `line()` a row past
+            // the screen.
+            self.cursor = self.clamp_position(mark);
             self.ensure_cursor_visible();
             self.sync_selection_with_cursor();
         }

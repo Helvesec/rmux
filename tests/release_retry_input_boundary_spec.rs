@@ -506,7 +506,6 @@ failures = []
 passed = {"governed": 0, "protected": 0}
 with tempfile.TemporaryDirectory(
     prefix=".rmux-r4-boundary-",
-    dir=pathlib.Path.cwd(),
 ) as temporary:
     fixture = pathlib.Path(temporary) / "workflow.yml"
     for group, cases in (("governed", governed), ("protected", protected)):
@@ -587,7 +586,6 @@ cases = (
 failures = []
 with tempfile.TemporaryDirectory(
     prefix=".rmux-r4-quote-boundary-",
-    dir=pathlib.Path.cwd(),
 ) as temporary:
     fixture = pathlib.Path(temporary) / "workflow.yml"
     for name, source, expected_rejection in cases:

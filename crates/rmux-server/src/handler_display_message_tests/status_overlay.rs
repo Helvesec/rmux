@@ -47,8 +47,8 @@ async fn create_status_off_attach(
 ) {
     let handler = RequestHandler::new();
     let session = session_name(name);
-    assert!(matches!(
-        handler
+    crate::session_fixture::assert_new_session(
+        &handler
             .handle(Request::NewSession(NewSessionRequest {
                 session_name: session.clone(),
                 detached: true,
@@ -56,8 +56,7 @@ async fn create_status_off_attach(
                 environment: None,
             }))
             .await,
-        Response::NewSession(_)
-    ));
+    );
     {
         let mut state = handler.state.lock().await;
         state

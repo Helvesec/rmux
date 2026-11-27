@@ -72,3 +72,4 @@ pub use driver::PaneDriver;
 pub use state::{PaneLifecycle, PaneState};
 pub use theme::{cell_style, color, glyph_symbol, modifier};
 pub use widget::PaneWidget;
+pub use widget::SceneWidget;

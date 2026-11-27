@@ -3,9 +3,7 @@ use std::collections::HashMap;
 use rmux_proto::types::OptionScopeSelector;
 use rmux_proto::{OptionName, PaneTarget, SessionName, WindowTarget};
 
-use super::mutation::{
-    default_array_items, default_scalar_text, normalize_scalar_value, split_array_assignment,
-};
+use super::mutation::{default_array_items, normalize_scalar_value, reset_scalar};
 use super::registry::{
     option_metadata, registry, resolve_exact_option_name, resolve_option_name, DefaultValue,
     GlobalRoot,
@@ -61,20 +59,13 @@ impl OptionStore {
         session_name: Option<&'a SessionName>,
         option: OptionName,
     ) -> Option<&'a str> {
-        let query = OptionQuery::known(option);
-        let resolved = match session_name {
-            Some(session_name) => self
-                .resolve_query(&ResolveContext::Session(session_name), &query)
-                .map(OptionEntry::rendered),
-            None => self
-                .resolve_query(&ResolveContext::Server, &query)
-                .map(OptionEntry::rendered),
-        };
-        if let Some(resolved) = resolved {
-            Some(resolved)
-        } else {
-            self.default_rendered_value(&query)
-        }
+        self.resolve_known_value(
+            match session_name {
+                Some(name) => ResolveContext::Session(name),
+                None => ResolveContext::Server,
+            },
+            option,
+        )
     }
 
     /// Resolves the effective window value using the tmux-style parent chain.
@@ -85,15 +76,7 @@ impl OptionStore {
         window_index: u32,
         option: OptionName,
     ) -> Option<&'a str> {
-        let query = OptionQuery::known(option);
-        let resolved = self
-            .resolve_query(&ResolveContext::Window(session_name, window_index), &query)
-            .map(OptionEntry::rendered);
-        if let Some(resolved) = resolved {
-            Some(resolved)
-        } else {
-            self.default_rendered_value(&query)
-        }
+        self.resolve_known_value(ResolveContext::Window(session_name, window_index), option)
     }
 
     /// Resolves the effective pane value using the tmux-style parent chain.
@@ -105,18 +88,21 @@ impl OptionStore {
         pane_index: u32,
         option: OptionName,
     ) -> Option<&'a str> {
+        self.resolve_known_value(
+            ResolveContext::Pane(session_name, window_index, pane_index),
+            option,
+        )
+    }
+
+    fn resolve_known_value<'a>(
+        &'a self,
+        context: ResolveContext<'a>,
+        option: OptionName,
+    ) -> Option<&'a str> {
         let query = OptionQuery::known(option);
-        let resolved = self
-            .resolve_query(
-                &ResolveContext::Pane(session_name, window_index, pane_index),
-                &query,
-            )
-            .map(OptionEntry::rendered);
-        if let Some(resolved) = resolved {
-            Some(resolved)
-        } else {
-            self.default_rendered_value(&query)
-        }
+        self.resolve_query(&context, &query)
+            .map(OptionEntry::rendered)
+            .or_else(|| self.default_rendered_value(&query))
     }
 
     /// Resolves the effective array values for the known option.
@@ -126,86 +112,73 @@ impl OptionStore {
         session_name: Option<&SessionName>,
         option: OptionName,
     ) -> Vec<String> {
+        self.resolve_array_entries(session_name, option)
+            .into_iter()
+            .map(|(_, value)| value)
+            .collect()
+    }
+
+    /// Resolves an array while preserving sparse option indexes.
+    #[must_use]
+    pub fn resolve_array_entries(
+        &self,
+        session_name: Option<&SessionName>,
+        option: OptionName,
+    ) -> Vec<(u32, String)> {
         let query = OptionQuery::known(option);
         if !query.is_array() {
             return Vec::new();
         }
-
-        let resolved = match session_name {
-            Some(session_name) => self
-                .resolve_query(&ResolveContext::Session(session_name), &query)
-                .map(OptionEntry::array_values),
-            None => self
-                .resolve_query(&ResolveContext::Server, &query)
-                .map(OptionEntry::array_values),
+        let context = match session_name {
+            Some(name) => ResolveContext::Session(name),
+            None => ResolveContext::Server,
         };
-        if let Some(resolved) = resolved {
-            return resolved;
-        }
+        self.resolve_query(&context, &query)
+            .map(OptionEntry::array_entries)
+            .unwrap_or_else(|| super::render::default_array_show_values(&query))
+    }
 
-        match query.default_value() {
-            Some(DefaultValue::Scalar(value)) => split_array_assignment(value, query.separator()),
-            Some(DefaultValue::Array(values)) => {
-                values.iter().map(|value| (*value).to_owned()).collect()
-            }
-            None => Vec::new(),
+    /// Resolves indexed values with the selected pane, window or global inheritance tree.
+    #[must_use]
+    pub fn resolve_array_entries_for_scope(
+        &self,
+        scope: &OptionScopeSelector,
+        option: OptionName,
+    ) -> Vec<(u32, String)> {
+        let query = OptionQuery::known(option);
+        if !query.is_array() {
+            return Vec::new();
         }
+        self.resolve_query(
+            &super::scope::ShowScope::from_selector(scope).resolve_context(),
+            &query,
+        )
+        .map(OptionEntry::array_entries)
+        .unwrap_or_else(|| super::render::default_array_show_values(&query))
     }
 
     /// Resolves a string-keyed option in a session context.
     #[must_use]
     pub fn resolve_name(&self, session_name: Option<&SessionName>, name: &str) -> Option<String> {
-        let query = resolve_option_name(name).ok()?;
-        match session_name {
-            // tmux format.c::format_find checks server options first, then the
-            // context-specific tree, then any wider parents for that context.
-            Some(session_name) => self
-                .resolve_name_from_nodes(
-                    &query,
-                    [
-                        Some(&self.server_global),
-                        self.sessions.get(session_name),
-                        Some(&self.session_global),
-                    ],
-                )
-                .or_else(|| self.default_value_as_string(&query)),
-            None => self
-                .resolve_name_from_nodes(&query, [Some(&self.server_global)])
-                .or_else(|| self.default_value_as_string(&query)),
-        }
+        self.resolve_named_value(
+            session_name.map_or(ResolveContext::Server, ResolveContext::Session),
+            name,
+            false,
+        )
     }
 
-    /// Resolves a string-keyed option for tmux format evaluation in a session context.
+    /// Resolves an exact option name for format evaluation in a session context.
     #[must_use]
     pub fn resolve_name_for_format(
         &self,
         session_name: Option<&SessionName>,
         name: &str,
     ) -> Option<String> {
-        let query = resolve_exact_option_name(name).ok()?;
-        let value = match session_name {
-            Some(session_name) => self
-                .resolve_name_from_nodes(
-                    &query,
-                    [
-                        Some(&self.server_global),
-                        self.sessions.get(session_name),
-                        Some(&self.session_global),
-                    ],
-                )
-                .or_else(|| self.default_value_as_string(&query)),
-            None => self
-                .resolve_name_from_nodes(
-                    &query,
-                    [
-                        Some(&self.server_global),
-                        Some(&self.session_global),
-                        Some(&self.window_global),
-                    ],
-                )
-                .or_else(|| self.default_value_as_string(&query)),
-        }?;
-        Some(format_rendered_option_value(&query, value))
+        self.resolve_named_value(
+            session_name.map_or(ResolveContext::Server, ResolveContext::Session),
+            name,
+            true,
+        )
     }
 
     /// Resolves a string-keyed option in a window context.
@@ -216,22 +189,14 @@ impl OptionStore {
         window_index: u32,
         name: &str,
     ) -> Option<String> {
-        let query = resolve_option_name(name).ok()?;
-        let target = WindowTarget::with_window(session_name.clone(), window_index);
-        self.resolve_name_from_nodes(
-            &query,
-            [
-                Some(&self.server_global),
-                self.windows.get(&target),
-                Some(&self.window_global),
-                self.sessions.get(session_name),
-                Some(&self.session_global),
-            ],
+        self.resolve_named_value(
+            ResolveContext::Window(session_name, window_index),
+            name,
+            false,
         )
-        .or_else(|| self.default_value_as_string(&query))
     }
 
-    /// Resolves a string-keyed option for tmux format evaluation in a window context.
+    /// Resolves an exact option name for format evaluation in a window context.
     #[must_use]
     pub fn resolve_name_for_window_format(
         &self,
@@ -239,21 +204,11 @@ impl OptionStore {
         window_index: u32,
         name: &str,
     ) -> Option<String> {
-        let query = resolve_exact_option_name(name).ok()?;
-        let target = WindowTarget::with_window(session_name.clone(), window_index);
-        let value = self
-            .resolve_name_from_nodes(
-                &query,
-                [
-                    Some(&self.server_global),
-                    self.windows.get(&target),
-                    Some(&self.window_global),
-                    self.sessions.get(session_name),
-                    Some(&self.session_global),
-                ],
-            )
-            .or_else(|| self.default_value_as_string(&query))?;
-        Some(format_rendered_option_value(&query, value))
+        self.resolve_named_value(
+            ResolveContext::Window(session_name, window_index),
+            name,
+            true,
+        )
     }
 
     /// Resolves a string-keyed option in a pane context.
@@ -265,24 +220,14 @@ impl OptionStore {
         pane_index: u32,
         name: &str,
     ) -> Option<String> {
-        let query = resolve_option_name(name).ok()?;
-        let pane_target = PaneTarget::with_window(session_name.clone(), window_index, pane_index);
-        let window_target = WindowTarget::with_window(session_name.clone(), window_index);
-        self.resolve_name_from_nodes(
-            &query,
-            [
-                Some(&self.server_global),
-                self.panes.get(&pane_target),
-                self.windows.get(&window_target),
-                Some(&self.window_global),
-                self.sessions.get(session_name),
-                Some(&self.session_global),
-            ],
+        self.resolve_named_value(
+            ResolveContext::Pane(session_name, window_index, pane_index),
+            name,
+            false,
         )
-        .or_else(|| self.default_value_as_string(&query))
     }
 
-    /// Resolves a string-keyed option for tmux format evaluation in a pane context.
+    /// Resolves an exact option name for format evaluation in a pane context.
     #[must_use]
     pub fn resolve_name_for_pane_format(
         &self,
@@ -291,43 +236,84 @@ impl OptionStore {
         pane_index: u32,
         name: &str,
     ) -> Option<String> {
-        let query = resolve_exact_option_name(name).ok()?;
-        let pane_target = PaneTarget::with_window(session_name.clone(), window_index, pane_index);
-        let window_target = WindowTarget::with_window(session_name.clone(), window_index);
-        let value = self
-            .resolve_name_from_nodes(
-                &query,
-                [
-                    Some(&self.server_global),
-                    self.panes.get(&pane_target),
-                    self.windows.get(&window_target),
-                    Some(&self.window_global),
-                    self.sessions.get(session_name),
-                    Some(&self.session_global),
-                ],
-            )
-            .or_else(|| self.default_value_as_string(&query))?;
-        Some(format_rendered_option_value(&query, value))
+        self.resolve_named_value(
+            ResolveContext::Pane(session_name, window_index, pane_index),
+            name,
+            true,
+        )
     }
 
-    /// Returns the option snapshot that future panes in a session should inherit.
+    fn resolve_named_value(
+        &self,
+        context: ResolveContext<'_>,
+        name: &str,
+        format: bool,
+    ) -> Option<String> {
+        let query = if format {
+            resolve_exact_option_name(name)
+        } else {
+            resolve_option_name(name)
+        }
+        .ok()?;
+        // Format lookup examines the server first, then each contextual tree.
+        let mut nodes = vec![Some(&self.server_global)];
+        match context {
+            ResolveContext::Server => {
+                if format {
+                    nodes.extend([Some(&self.session_global), Some(&self.window_global)]);
+                }
+            }
+            ResolveContext::Session(session) => {
+                nodes.extend([self.sessions.get(session), Some(&self.session_global)])
+            }
+            ResolveContext::Window(session, window) => nodes.extend([
+                self.windows
+                    .get(&WindowTarget::with_window(session.clone(), window)),
+                Some(&self.window_global),
+                self.sessions.get(session),
+                Some(&self.session_global),
+            ]),
+            ResolveContext::Pane(session, window, pane) => nodes.extend([
+                self.panes
+                    .get(&PaneTarget::with_window(session.clone(), window, pane)),
+                self.windows
+                    .get(&WindowTarget::with_window(session.clone(), window)),
+                Some(&self.window_global),
+                self.sessions.get(session),
+                Some(&self.session_global),
+            ]),
+            ResolveContext::SessionGlobal => nodes.push(Some(&self.session_global)),
+            ResolveContext::WindowGlobal => nodes.push(Some(&self.window_global)),
+        }
+        let value = self
+            .resolve_name_from_nodes(&query, nodes)
+            .or_else(|| self.default_value_as_string(&query))?;
+        Some(if format {
+            format_rendered_option_value(&query, value)
+        } else {
+            value
+        })
+    }
+
+    /// Returns the legacy typed snapshot (named-only options are not projected).
     #[must_use]
     pub fn resolved(&self, session_name: &SessionName) -> HashMap<OptionName, String> {
         registry()
             .iter()
-            .map(|metadata| {
-                let query = OptionQuery::known(metadata.option());
+            .filter_map(|metadata| {
+                let option = metadata.wire_option()?;
+                let query = OptionQuery::registered(metadata);
                 let value = self
-                    .resolve(Some(session_name), metadata.option())
+                    .resolve(Some(session_name), option)
                     .map(str::to_owned)
                     .or_else(|| self.default_value_as_string(&query))
                     .unwrap_or_default();
-                (metadata.option(), value)
+                Some((option, value))
             })
             .collect()
     }
 
-    /// Returns the option snapshot for a pane after the full inheritance chain is applied.
+    /// Returns the legacy typed pane snapshot after applying inheritance.
     #[must_use]
     pub fn resolved_for_pane(
         &self,
@@ -337,14 +323,15 @@ impl OptionStore {
     ) -> HashMap<OptionName, String> {
         registry()
             .iter()
-            .map(|metadata| {
-                let query = OptionQuery::known(metadata.option());
+            .filter_map(|metadata| {
+                let option = metadata.wire_option()?;
+                let query = OptionQuery::registered(metadata);
                 let value = self
-                    .resolve_for_pane(session_name, window_index, pane_index, metadata.option())
+                    .resolve_for_pane(session_name, window_index, pane_index, option)
                     .map(str::to_owned)
                     .or_else(|| self.default_value_as_string(&query))
                     .unwrap_or_default();
-                (metadata.option(), value)
+                Some((option, value))
             })
             .collect()
     }
@@ -396,36 +383,11 @@ impl OptionStore {
         scope: &OptionScopeSelector,
         query: &OptionQuery,
     ) -> Option<String> {
-        match scope {
-            OptionScopeSelector::ServerGlobal => self
-                .resolve_query(&ResolveContext::Server, query)
-                .and_then(|entry| entry.value(query.index()).map(str::to_owned)),
-            OptionScopeSelector::SessionGlobal => self
-                .resolve_query(&ResolveContext::SessionGlobal, query)
-                .and_then(|entry| entry.value(query.index()).map(str::to_owned)),
-            OptionScopeSelector::WindowGlobal => self
-                .resolve_query(&ResolveContext::WindowGlobal, query)
-                .and_then(|entry| entry.value(query.index()).map(str::to_owned)),
-            OptionScopeSelector::Session(session_name) => self
-                .resolve_query(&ResolveContext::Session(session_name), query)
-                .and_then(|entry| entry.value(query.index()).map(str::to_owned)),
-            OptionScopeSelector::Window(target) => self
-                .resolve_query(
-                    &ResolveContext::Window(target.session_name(), target.window_index()),
-                    query,
-                )
-                .and_then(|entry| entry.value(query.index()).map(str::to_owned)),
-            OptionScopeSelector::Pane(target) => self
-                .resolve_query(
-                    &ResolveContext::Pane(
-                        target.session_name(),
-                        target.window_index(),
-                        target.pane_index(),
-                    ),
-                    query,
-                )
-                .and_then(|entry| entry.value(query.index()).map(str::to_owned)),
-        }
+        self.resolve_query(
+            &super::scope::ShowScope::from_selector(scope).resolve_context(),
+            query,
+        )
+        .and_then(|entry| entry.value(query.index()).map(str::to_owned))
     }
 
     pub(super) fn explicit_value_for_scope(
@@ -475,7 +437,7 @@ impl OptionStore {
             Some(OptionEntry::new_array(query, scope, items))
         } else {
             let value =
-                normalize_scalar_value(query, Some(default_scalar_text(default)), None).ok()?;
+                normalize_scalar_value(query, Some(reset_scalar(query, default)), None).ok()?;
             Some(OptionEntry::new_scalar(query, scope, value))
         }
     }

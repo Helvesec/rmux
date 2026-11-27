@@ -413,6 +413,69 @@ fn source_file_missing_quiet_include_is_recoverable_and_silent() -> Result<(), B
 }
 
 #[test]
+fn startup_and_sourced_configs_continue_after_an_invalid_style_line() -> Result<(), Box<dyn Error>>
+{
+    // tmux 3.7b: `-f` starts with rc=0 and `source-file` returns rc=1 with
+    // only "invalid style: ab\u{e9}" on stderr; in both cases the lines
+    // around it apply.
+    let harness = CrossPlatformHarness::new("invalid-style-config")?;
+    let config = harness.tmpdir().join("invalid-style.conf");
+    fs::write(
+        &config,
+        "set-option -g @style-before one\n\
+         set-option -g status-style 'ab\u{e9}'\n\
+         set-option -g @style-after two\n",
+    )?;
+
+    harness.success([
+        OsStr::new("-f"),
+        config.as_os_str(),
+        OsStr::new("new-session"),
+        OsStr::new("-d"),
+        OsStr::new("-s"),
+        OsStr::new("cfg"),
+    ])?;
+    assert_option(&harness, "@style-before", "one")?;
+    assert_option(&harness, "@style-after", "two")?;
+
+    harness.success(["set-option", "-gu", "@style-before"])?;
+    harness.success(["set-option", "-gu", "@style-after"])?;
+    let sourced = harness.run([OsStr::new("source-file"), config.as_os_str()])?;
+    assert_eq!(sourced.status.code(), Some(1), "{sourced:?}");
+    assert_eq!(
+        String::from_utf8_lossy(&sourced.stderr),
+        "invalid style: ab\u{e9}\n"
+    );
+    assert_option(&harness, "@style-before", "one")?;
+    assert_option(&harness, "@style-after", "two")
+}
+
+#[test]
+fn non_ascii_style_and_colour_values_fail_like_tmux_without_panicking() -> Result<(), Box<dyn Error>>
+{
+    // tmux 3.7b: rc=1 with "invalid style: ab\u{e9}" on stderr, and
+    // #{c:abcde\u{e9}} prints an empty line; the server stays up.
+    let harness = CrossPlatformHarness::new("non-ascii-style")?;
+    harness.success(["new-session", "-d", "-s", "style"])?;
+
+    let output = harness.run(["set-option", "-g", "status-style", "ab\u{e9}"])?;
+    assert_eq!(output.status.code(), Some(1), "{output:?}");
+    assert_eq!(
+        String::from_utf8_lossy(&output.stderr),
+        "invalid style: ab\u{e9}\n"
+    );
+    assert_eq!(
+        harness.stdout(["display-message", "-p", "#{c:abcde\u{e9}}"])?,
+        "\n"
+    );
+    assert_eq!(
+        harness.stdout(["display-message", "-p", "alive"])?,
+        "alive\n"
+    );
+    Ok(())
+}
+
+#[test]
 fn source_file_unquoted_hash_format_comments_match_tmux_boolean_toggle(
 ) -> Result<(), Box<dyn Error>> {
     let harness = CrossPlatformHarness::new("source-config-hash-comment")?;

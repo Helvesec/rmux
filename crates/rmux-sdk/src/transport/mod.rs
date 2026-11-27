@@ -12,6 +12,7 @@ use tokio::sync::{mpsc, oneshot};
 use crate::{Result, RmuxError};
 
 mod actor;
+mod admission;
 mod cancellation;
 mod deadline;
 mod failure;
@@ -19,6 +20,7 @@ mod pending;
 mod state;
 
 use actor::{request_operation, run_actor, sdk_wait_id_for_request, ActorMessage};
+use admission::Admission;
 use cancellation::OrderedResponseGuard;
 pub(crate) use deadline::OperationDeadline;
 use failure::TransportFailure;
@@ -110,20 +112,21 @@ impl TransportClient {
             return Err(failure.to_error(&operation));
         }
 
+        let deadline = self.call_deadline();
         let (reply, response) = oneshot::channel();
-        self.run_with_deadline(&operation, async {
-            self.commands
-                .send(ActorMessage::Request {
-                    request,
-                    operation: operation.clone(),
-                    reply,
-                })
-                .await
-                .map_err(|_| self.closed_error(&operation))?;
+        let admission = Admission::default();
+        let command = ActorMessage::Request {
+            request,
+            operation: operation.clone(),
+            reply,
+            admission: admission.clone(),
+        };
 
-            // Once queued, the actor owns this FIFO exchange. If the
-            // caller drops its future, the actor must still consume and
-            // validate the response so later requests remain aligned.
+        // Dropping this future does not withdraw the command: once the actor
+        // admits it, the actor consumes and validates its response so later
+        // requests remain aligned.
+        self.run_with_deadline(&operation, deadline, Some(&admission), async {
+            self.send_command(&operation, command).await?;
             response.await.map_err(|_| self.closed_error(&operation))?
         })
         .await
@@ -143,21 +146,24 @@ impl TransportClient {
         })?;
         // The operation deadline covers dispatch through the daemon's armed
         // acknowledgement. The returned wait owns its separate match timeout.
-        let mut cancellation = OrderedResponseGuard::new(self);
+        let deadline = self.call_deadline();
+        let admission = Admission::default();
+        let command = ActorMessage::ArmedRequest {
+            request,
+            operation: operation.clone(),
+            reply,
+            armed,
+            wait_id,
+            admission: admission.clone(),
+        };
+        // Dropping this future withdraws a command the actor has not admitted
+        // yet; once admitted, the daemon may hold the wait, so it aborts the
+        // ordered transport.
+        let mut cancellation = OrderedResponseGuard::for_admission(self, admission.clone());
+        cancellation.arm();
         let armed_result = self
-            .run_with_deadline(&operation, async {
-                self.commands
-                    .send(ActorMessage::ArmedRequest {
-                        request,
-                        operation: operation.clone(),
-                        reply,
-                        armed,
-                        wait_id,
-                    })
-                    .await
-                    .map_err(|_| self.closed_error(&operation))?;
-                cancellation.arm();
-
+            .run_with_deadline(&operation, deadline, Some(&admission), async {
+                self.send_command(&operation, command).await?;
                 armed_response
                     .await
                     .map_err(|_| self.closed_error(&operation))?
@@ -185,17 +191,23 @@ impl TransportClient {
         let (reply, response) = oneshot::channel();
         let mut cancellation = OrderedResponseGuard::new(self);
         let result = self
-            .run_with_deadline(TRANSPORT_SHUTDOWN_OPERATION, async {
-                self.commands
-                    .send(ActorMessage::Shutdown { reply })
-                    .await
-                    .map_err(|_| self.closed_error(TRANSPORT_SHUTDOWN_OPERATION))?;
-                cancellation.arm();
+            .run_with_deadline(
+                TRANSPORT_SHUTDOWN_OPERATION,
+                self.call_deadline(),
+                None,
+                async {
+                    self.send_command(
+                        TRANSPORT_SHUTDOWN_OPERATION,
+                        ActorMessage::Shutdown { reply },
+                    )
+                    .await?;
+                    cancellation.arm();
 
-                response
-                    .await
-                    .map_err(|_| self.closed_error(TRANSPORT_SHUTDOWN_OPERATION))?
-            })
+                    response
+                        .await
+                        .map_err(|_| self.closed_error(TRANSPORT_SHUTDOWN_OPERATION))?
+                },
+            )
             .await;
         cancellation.disarm();
         result
@@ -241,23 +253,59 @@ impl TransportClient {
             .to_error(operation)
     }
 
-    async fn run_with_deadline<F, T>(&self, operation: &str, future: F) -> Result<T>
+    /// The deadline one transport call shares between waiting for the actor
+    /// to admit its command and waiting for its response.
+    fn call_deadline(&self) -> OperationDeadline {
+        self.operation_deadline
+            .unwrap_or_else(|| OperationDeadline::from_timeout(self.default_timeout))
+    }
+
+    /// Places one command in the bounded command queue. Success means only
+    /// that the command is buffered; the actor admits it later.
+    async fn send_command(&self, operation: &str, command: ActorMessage) -> Result<()> {
+        self.commands
+            .send(command)
+            .await
+            .map_err(|_| self.closed_error(operation))
+    }
+
+    /// Awaits one transport call until `deadline`.
+    ///
+    /// On expiry, a command that is still waiting for queue space or sitting
+    /// in the queue's buffer is withdrawn: it holds no FIFO response slot and
+    /// none of its bytes were written, so only this caller fails and the
+    /// shared transport stays usable. Once the actor has admitted the command
+    /// (or for a call without `admission`), expiry aborts the shared
+    /// transport, because a late response would otherwise be assigned to the
+    /// next request in FIFO order.
+    async fn run_with_deadline<F, T>(
+        &self,
+        operation: &str,
+        deadline: OperationDeadline,
+        admission: Option<&Admission>,
+        future: F,
+    ) -> Result<T>
     where
         F: Future<Output = Result<T>>,
     {
-        let deadline = self
-            .operation_deadline
-            .unwrap_or_else(|| OperationDeadline::from_timeout(self.default_timeout));
         let Some(remaining) = deadline.remaining_timeout() else {
             return future.await;
         };
 
+        // Tokio polls the future before checking its timer. An already-expired
+        // request must never reach the actor, which could admit it on another
+        // worker before timeout withdrawal. Shutdown keeps its close semantics.
+        if remaining.is_zero() && admission.is_some() {
+            return Err(deadline_failure(deadline, remaining).to_error(operation));
+        }
+
         match tokio::time::timeout(remaining, future).await {
             Ok(result) => result,
             Err(_) => {
-                let requested = deadline.requested_timeout().unwrap_or(remaining);
-                let failure = TransportFailure::timed_out(requested);
-                self.abort_with(failure.clone());
+                let failure = deadline_failure(deadline, remaining);
+                if !admission.is_some_and(Admission::withdraw) {
+                    self.abort_with(failure.clone());
+                }
                 Err(failure.to_error(operation))
             }
         }
@@ -267,6 +315,10 @@ impl TransportClient {
         self.state.set_terminal_failure(failure.clone());
         self.actor.abort();
     }
+}
+
+fn deadline_failure(deadline: OperationDeadline, remaining: Duration) -> TransportFailure {
+    TransportFailure::timed_out(deadline.requested_timeout().unwrap_or(remaining))
 }
 
 impl fmt::Debug for TransportClient {

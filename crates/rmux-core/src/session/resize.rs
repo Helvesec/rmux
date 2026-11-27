@@ -20,59 +20,8 @@ impl Session {
         pane_index: u32,
         adjustment: ResizePaneAdjustment,
     ) -> Result<(), RmuxError> {
-        if adjustment == ResizePaneAdjustment::Zoom {
-            return self.toggle_zoom_in_window(window_index, pane_index);
-        }
-
-        self.ensure_resize_target(window_index, pane_index)?;
-        let window = self
-            .window_at_mut(window_index)
-            .expect("addressed session window must exist");
-
-        match adjustment {
-            ResizePaneAdjustment::NoOp => {}
-            ResizePaneAdjustment::AbsoluteWidth { columns } => {
-                let _ = window.resize_pane_width(pane_index, columns);
-            }
-            ResizePaneAdjustment::AbsoluteHeight { rows } => {
-                let _ = window.resize_pane_height(pane_index, rows);
-            }
-            ResizePaneAdjustment::AbsoluteSize { columns, rows } => {
-                let _ = window.resize_pane_width(pane_index, columns);
-                let _ = window.resize_pane_height(pane_index, rows);
-            }
-            ResizePaneAdjustment::Composite {
-                columns,
-                rows,
-                relative,
-                cells,
-            } => {
-                if let Some(columns) = columns {
-                    let _ = window.resize_pane_width(pane_index, columns);
-                }
-                if let Some(rows) = rows {
-                    let _ = window.resize_pane_height(pane_index, rows);
-                }
-                if let Some(relative) = relative {
-                    let _ = window.resize_pane_by(pane_index, relative.to_adjustment(cells));
-                }
-            }
-            ResizePaneAdjustment::Up { cells } => {
-                let _ = window.resize_pane_by(pane_index, ResizePaneAdjustment::Up { cells });
-            }
-            ResizePaneAdjustment::Down { cells } => {
-                let _ = window.resize_pane_by(pane_index, ResizePaneAdjustment::Down { cells });
-            }
-            ResizePaneAdjustment::Left { cells } => {
-                let _ = window.resize_pane_by(pane_index, ResizePaneAdjustment::Left { cells });
-            }
-            ResizePaneAdjustment::Right { cells } => {
-                let _ = window.resize_pane_by(pane_index, ResizePaneAdjustment::Right { cells });
-            }
-            ResizePaneAdjustment::TrimBelow => {}
-            ResizePaneAdjustment::Zoom => unreachable!("zoom returned early"),
-        }
-        Ok(())
+        self.window_layout_context_mut(window_index)?
+            .resize_pane(pane_index, adjustment)
     }
 
     /// Resizes the addressed pane to an exact size along the split axis.
@@ -123,11 +72,8 @@ impl Session {
         window_index: u32,
         pane_index: u32,
     ) -> Result<(), RmuxError> {
-        self.ensure_resize_target(window_index, pane_index)?;
-        self.window_at_mut(window_index)
-            .expect("addressed session window must exist")
-            .toggle_zoom(pane_index);
-        Ok(())
+        self.window_layout_context_mut(window_index)?
+            .toggle_zoom(pane_index)
     }
 
     fn ensure_resize_target(&self, window_index: u32, pane_index: u32) -> Result<(), RmuxError> {
@@ -147,6 +93,10 @@ impl Session {
                 "pane index does not exist in session",
             ));
         }
+
+        self.window_at(window_index)
+            .expect("validated resize window exists")
+            .ensure_tiled_resize_target(pane_index)?;
 
         Ok(())
     }

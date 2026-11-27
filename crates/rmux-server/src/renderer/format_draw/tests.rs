@@ -67,6 +67,31 @@ fn leading_space_trim_removes_styled_separator_cell() {
 }
 
 #[test]
+fn leading_space_trim_reindexes_wide_continuation_slots() {
+    let line = format_draw_line(
+        "#[align=right bg=blue] 表A",
+        &Style::default(),
+        4,
+        &Utf8Config::default(),
+    )
+    .trim_leading_ascii_space();
+    let mut actual = Vec::new();
+    super::render_formatted_line_segment(&mut actual, 4, 2, &line, 1, 2);
+
+    let expected_line = format_draw_line(
+        " A",
+        &Style::parse("bg=blue").expect("style parses"),
+        2,
+        &Utf8Config::default(),
+    );
+    let mut expected = Vec::new();
+    render_formatted_line(&mut expected, 4, 2, &expected_line);
+
+    assert_eq!(line.width(), 3);
+    assert_eq!(actual, expected);
+}
+
+#[test]
 fn range_directives_split_click_targets_inside_one_surface() {
     let line = format_draw_line(
         "#[range=left]a#[range=window|9]b#[norange]c",
@@ -80,4 +105,18 @@ fn range_directives_split_click_targets_inside_one_surface() {
     assert_eq!(line.ranges[0].x, 0..=0);
     assert!(matches!(line.ranges[1].kind, StatusRangeType::Window(9)));
     assert_eq!(line.ranges[1].x, 1..=1);
+}
+
+#[test]
+fn projected_cell_segments_preserve_partial_slots() {
+    let base = Style::parse("fg=red,bg=blue").unwrap();
+    let line = format_draw_line("表A表", &base, 5, &Utf8Config::default());
+    for (start, width, expected) in [(1, 2, " A"), (0, 1, " "), (1, 3, " A "), (0, 5, "表A表")] {
+        let mut actual = Vec::new();
+        super::render_formatted_line_segment(&mut actual, 4, 2, &line, start, width);
+        let expected_line = format_draw_line(expected, &base, width, &Utf8Config::default());
+        let mut expected_frame = Vec::new();
+        render_formatted_line(&mut expected_frame, 4, 2, &expected_line);
+        assert_eq!(actual, expected_frame, "start={start} width={width}");
+    }
 }

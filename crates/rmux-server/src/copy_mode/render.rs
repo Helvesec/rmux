@@ -14,6 +14,10 @@ impl CopyModeState {
         screen
     }
 
+    pub(crate) fn backing_screen(&self) -> &rmux_core::Screen {
+        &self.backing
+    }
+
     pub(crate) fn render_snapshot(&self) -> CopyModeRenderSnapshot {
         CopyModeRenderSnapshot {
             screen: self.render_screen(),

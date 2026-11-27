@@ -78,4 +78,12 @@ Keep the report private until a fix is released. We will credit you in the advis
 
 ## Supported versions
 
-Security fixes go into the latest release. Update to the newest version before you report.
+For future stable 1.x releases, security fixes will cover the two most recent
+minor release lines: the current minor and the previous minor. Deprecations will
+be announced at least two minor releases or six months before removal.
+
+Pre-1.0 releases, including the planned 0.11 series, do not have a qualified
+SemVer 1.0 compatibility contract. Security fixes for pre-1.0 releases continue
+to go into the latest release; update to the newest version before you report.
+The 1.x support window above does not imply a two-minor backport commitment for
+0.x releases.

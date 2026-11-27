@@ -1,5 +1,7 @@
 use std::fmt::Write as _;
 
+use crate::PaneId;
+
 use super::{LayoutDirection, PANE_BORDER_CELLS, PANE_MINIMUM};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -24,7 +26,7 @@ impl LayoutGeometry {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) enum LayoutKind {
-    Pane,
+    Pane(PaneId),
     Split(LayoutDirection, Vec<LayoutCell>),
 }
 
@@ -36,10 +38,10 @@ pub(super) struct LayoutCell {
 
 impl LayoutCell {
     #[must_use]
-    pub(super) const fn pane(geometry: LayoutGeometry) -> Self {
+    pub(super) const fn pane(id: PaneId, geometry: LayoutGeometry) -> Self {
         Self {
             geometry,
-            kind: LayoutKind::Pane,
+            kind: LayoutKind::Pane(id),
         }
     }
 
@@ -58,7 +60,7 @@ impl LayoutCell {
     #[must_use]
     pub(super) fn leaf_count(&self) -> usize {
         match &self.kind {
-            LayoutKind::Pane => 1,
+            LayoutKind::Pane(_) => 1,
             LayoutKind::Split(_, children) => children.iter().map(Self::leaf_count).sum(),
         }
     }
@@ -95,45 +97,50 @@ impl LayoutCell {
         }
     }
 
-    pub(super) fn collect_leaf_geometries(&self, geometries: &mut Vec<LayoutGeometry>) {
+    pub(super) fn visit_leaves(&self, visit: &mut impl FnMut(PaneId, LayoutGeometry)) {
         match &self.kind {
-            LayoutKind::Pane => geometries.push(self.geometry),
+            LayoutKind::Pane(id) => visit(*id, self.geometry),
             LayoutKind::Split(_, children) => {
                 for child in children {
-                    child.collect_leaf_geometries(geometries);
+                    child.visit_leaves(visit);
                 }
             }
         }
     }
 
-    pub(super) fn collect_leaf_paths(
-        &self,
-        current_path: &mut Vec<usize>,
-        paths: &mut Vec<Vec<usize>>,
-    ) {
-        match &self.kind {
-            LayoutKind::Pane => paths.push(current_path.clone()),
+    pub(super) fn map_ids(&mut self, map: &mut impl FnMut(PaneId) -> PaneId) {
+        match &mut self.kind {
+            LayoutKind::Pane(id) => *id = map(*id),
             LayoutKind::Split(_, children) => {
-                for (index, child) in children.iter().enumerate() {
-                    current_path.push(index);
-                    child.collect_leaf_paths(current_path, paths);
-                    current_path.pop();
+                for child in children {
+                    child.map_ids(map);
                 }
+            }
+        }
+    }
+
+    pub(super) fn leaf_path(&self, id: PaneId) -> Option<Vec<usize>> {
+        match &self.kind {
+            LayoutKind::Pane(leaf_id) => (*leaf_id == id).then(Vec::new),
+            LayoutKind::Split(_, children) => {
+                children.iter().enumerate().find_map(|(index, child)| {
+                    let mut path = child.leaf_path(id)?;
+                    path.insert(0, index);
+                    Some(path)
+                })
             }
         }
     }
 
     #[must_use]
-    pub(super) fn dump_body(&self, pane_id_iter: &mut impl Iterator<Item = u32>) -> String {
+    pub(super) fn dump_body(&self) -> String {
         let mut body = format!(
             "{}x{},{},{}",
             self.geometry.width, self.geometry.height, self.geometry.x, self.geometry.y
         );
         match &self.kind {
-            LayoutKind::Pane => {
-                if let Some(pane_id) = pane_id_iter.next() {
-                    let _ = write!(&mut body, ",{pane_id}");
-                }
+            LayoutKind::Pane(id) => {
+                let _ = write!(&mut body, ",{}", id.as_u32());
             }
             LayoutKind::Split(direction, children) => {
                 let (open, close) = match direction {
@@ -145,7 +152,7 @@ impl LayoutCell {
                     if index > 0 {
                         body.push(',');
                     }
-                    body.push_str(&child.dump_body(pane_id_iter));
+                    body.push_str(&child.dump_body());
                 }
                 body.push(close);
             }
@@ -154,9 +161,45 @@ impl LayoutCell {
     }
 
     #[must_use]
+    pub(super) fn import_dimensions_are_safe(&self) -> bool {
+        let limit = i32::MAX as u32;
+        if self.geometry.width > limit || self.geometry.height > limit {
+            return false;
+        }
+        let LayoutKind::Split(direction, children) = &self.kind else {
+            return true;
+        };
+        if children.is_empty() {
+            return false;
+        }
+        let mut total = 0_u32;
+        for (index, child) in children.iter().enumerate() {
+            if !child.import_dimensions_are_safe() {
+                return false;
+            }
+            let size = match direction {
+                LayoutDirection::LeftRight => child.geometry.width,
+                LayoutDirection::TopBottom => child.geometry.height,
+            };
+            let border = if index == 0 { 0 } else { PANE_BORDER_CELLS };
+            let Some(next) = total
+                .checked_add(border)
+                .and_then(|sum| sum.checked_add(size))
+            else {
+                return false;
+            };
+            if next > limit {
+                return false;
+            }
+            total = next;
+        }
+        true
+    }
+
+    #[must_use]
     pub(super) fn check(&self) -> bool {
         match &self.kind {
-            LayoutKind::Pane => true,
+            LayoutKind::Pane(_) => true,
             LayoutKind::Split(direction, children) => {
                 if children.is_empty() {
                     return false;
@@ -199,7 +242,7 @@ impl LayoutCell {
         self.geometry.x = x;
         self.geometry.y = y;
         match &mut self.kind {
-            LayoutKind::Pane => {}
+            LayoutKind::Pane(_) => {}
             LayoutKind::Split(direction, children) => {
                 let mut cursor = 0_u32;
                 for child in children {
@@ -225,7 +268,7 @@ impl LayoutCell {
     #[must_use]
     pub(super) fn resize_check(&self, direction: LayoutDirection) -> u32 {
         match &self.kind {
-            LayoutKind::Pane => {
+            LayoutKind::Pane(_) => {
                 let available = match direction {
                     LayoutDirection::LeftRight => self.geometry.width,
                     LayoutDirection::TopBottom => self.geometry.height,
@@ -344,35 +387,34 @@ impl LayoutCell {
         changed
     }
 
-    pub(super) fn fix_root_size_if_needed(&mut self) {
+    pub(super) fn fix_root_size_if_needed(&mut self) -> bool {
         let LayoutKind::Split(direction, children) = &self.kind else {
-            return;
+            return true;
         };
-        if children.is_empty() {
-            return;
+        let Some(first) = children.first() else {
+            return false;
+        };
+        let mut total = 0_u32;
+        for (index, child) in children.iter().enumerate() {
+            let size = match direction {
+                LayoutDirection::LeftRight => child.geometry.width,
+                LayoutDirection::TopBottom => child.geometry.height,
+            };
+            let border = if index == 0 { 0 } else { PANE_BORDER_CELLS };
+            let Some(next) = total
+                .checked_add(border)
+                .and_then(|sum| sum.checked_add(size))
+            else {
+                return false;
+            };
+            total = next;
         }
-
-        let (expected_width, expected_height) = match direction {
-            LayoutDirection::LeftRight => (
-                children
-                    .iter()
-                    .map(|child| child.geometry.width + PANE_BORDER_CELLS)
-                    .sum::<u32>()
-                    .saturating_sub(PANE_BORDER_CELLS),
-                children[0].geometry.height,
-            ),
-            LayoutDirection::TopBottom => (
-                children[0].geometry.width,
-                children
-                    .iter()
-                    .map(|child| child.geometry.height + PANE_BORDER_CELLS)
-                    .sum::<u32>()
-                    .saturating_sub(PANE_BORDER_CELLS),
-            ),
+        let (width, height) = match direction {
+            LayoutDirection::LeftRight => (total, first.geometry.height),
+            LayoutDirection::TopBottom => (first.geometry.width, total),
         };
-
-        self.geometry.width = expected_width;
-        self.geometry.height = expected_height;
-        self.fix_offsets(0, 0);
+        self.geometry.width = width;
+        self.geometry.height = height;
+        true
     }
 }

@@ -45,6 +45,7 @@ fn status_job_cache_evicts_old_completed_entries() {
                 output: String::new(),
                 updated_at: Some(now + Duration::from_millis(index as u64)),
                 in_flight: false,
+                job_id: None,
             },
         );
     }
@@ -66,6 +67,7 @@ fn status_job_cache_honors_render_ttl() {
             output: "cached".to_owned(),
             updated_at: Some(Instant::now()),
             in_flight: false,
+            job_id: None,
         },
     );
 
@@ -147,6 +149,75 @@ fn status_job_normal_completion_reaps_background_descendants() {
 }
 
 #[cfg(unix)]
+type ChildObservationHook =
+    Box<dyn FnOnce(&mut rmux_os::process_tree::ProcessTreeChild, bool, Instant)>;
+
+#[cfg(unix)]
+thread_local! {
+    static CHILD_OBSERVATION_HOOK: std::cell::RefCell<Option<ChildObservationHook>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(unix)]
+pub(super) fn after_child_observation(
+    child: &mut rmux_os::process_tree::ProcessTreeChild,
+    exited: bool,
+    started: Instant,
+) {
+    let hook = CHILD_OBSERVATION_HOOK.with(|slot| slot.borrow_mut().take());
+    if let Some(hook) = hook {
+        hook(child, exited, started);
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn status_job_preserves_pre_deadline_completion_after_stale_running_observation() {
+    let probe = StatusJobProcessProbe::new("stale-observation");
+    let release = probe.root.join("release");
+    let command = format!(
+        "while [ ! -f {} ]; do sleep 0.01; done; {}",
+        shell_quote_path(&release),
+        probe.normal_completion_command(),
+    );
+    CHILD_OBSERVATION_HOOK.with(|slot| {
+        *slot.borrow_mut() = Some(Box::new(move |child, exited, started| {
+            assert!(!exited, "the gate must keep the first observation running");
+            std::fs::write(&release, b"go").expect("release the status shell");
+            loop {
+                let completed = child.has_exited().expect("observe native shell exit");
+                assert!(
+                    started.elapsed() < super::STATUS_JOB_TIMEOUT,
+                    "fixture must establish completion before the unchanged deadline"
+                );
+                if completed {
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(1));
+            }
+            // Resume with the original false observation after the deadline.
+            // The old elapsed-time check here selected timeout and discarded
+            // `complete`; reuse the supplied native negative witness for that path.
+            std::thread::sleep(
+                super::STATUS_JOB_TIMEOUT.saturating_sub(started.elapsed())
+                    + Duration::from_millis(50),
+            );
+        }));
+    });
+    let started = Instant::now();
+    let output = run_status_job(&command, None);
+    let hook_unused = CHILD_OBSERVATION_HOOK.with(|slot| slot.borrow_mut().take().is_some());
+
+    assert!(!hook_unused, "the controlled observation must run");
+    assert_eq!(output, "complete");
+    assert!(started.elapsed() < Duration::from_secs(2));
+    assert_probe_processes_dead(
+        &probe.wait_for_descendant_count(1),
+        "completion after a stale running observation",
+    );
+}
+
+#[cfg(unix)]
 #[test]
 fn status_job_normal_completion_does_not_join_an_escaped_stdout_writer() {
     let probe = EscapedStatusWriterProbe::new();
@@ -187,14 +258,34 @@ fn status_job_cache_releases_only_after_process_tree_cleanup() {
     let probe = StatusJobProcessProbe::new("cache-cleanup");
     let command = probe.command();
     let key = StatusJobKey::new(&command, None);
+    let start_observed_generation = |expected| {
+        let deadline = Instant::now() + Duration::from_secs(3);
+        loop {
+            let descendants = read_probe_pids(&probe.descendants);
+            if descendants.len() >= expected {
+                return descendants;
+            }
+            // The job may time out before its descendant gets CPU to record
+            // its PID. Poll the cache as a renderer would, retrying only after
+            // completion, and check cleanup before admitting another attempt.
+            if !runtime.cache_entry_in_flight(&key) {
+                assert_probe_processes_dead(&descendants, "completed cache attempt");
+                let _ = runtime.cached_output(&command, None, Duration::ZERO);
+            }
+            assert!(
+                Instant::now() < deadline,
+                "status cache did not establish {expected} observed generations; \
+                 got {descendants:?}"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    };
 
-    let _ = runtime.cached_output(&command, None, Duration::ZERO);
-    let first_generation = probe.wait_for_descendant_count(1);
+    let first_generation = start_observed_generation(1);
     wait_for_status_job_in_flight(&runtime, &key, false);
     assert_probe_processes_dead(&first_generation, "first cache generation");
 
-    let _ = runtime.cached_output(&command, None, Duration::ZERO);
-    let second_generation = probe.wait_for_descendant_count(2);
+    let second_generation = start_observed_generation(2);
     let live = second_generation
         .iter()
         .filter(|pid| rmux_os::process::is_live(**pid))

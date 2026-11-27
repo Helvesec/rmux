@@ -1,8 +1,6 @@
 //! Process inspection helpers.
 
 use std::collections::HashMap;
-#[cfg(all(unix, target_os = "macos"))]
-use std::ffi::CStr;
 #[cfg(any(unix, windows))]
 use std::ffi::OsString;
 use std::io;
@@ -10,13 +8,21 @@ use std::io;
 use std::os::fd::{AsRawFd, BorrowedFd};
 #[cfg(unix)]
 use std::os::unix::ffi::OsStringExt;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
+#[cfg(target_os = "macos")]
+mod macos_impl;
 #[cfg(windows)]
-#[path = "process_windows.rs"]
 mod windows_process;
 #[cfg(target_os = "linux")]
 use linux_impl::{
+    command_name_impl, current_path_impl, environment_impl, executable_path_impl, fd_path_impl,
+    is_live_impl, raw_environment_impl,
+};
+#[cfg(all(test, target_os = "macos"))]
+use macos_impl::environment_from_macos_procargs;
+#[cfg(target_os = "macos")]
+use macos_impl::{
     command_name_impl, current_path_impl, environment_impl, executable_path_impl, fd_path_impl,
     is_live_impl, raw_environment_impl,
 };
@@ -184,8 +190,8 @@ mod linux_impl {
     use std::path::PathBuf;
 
     use super::{
-        environment_from_nul_entries, executable_name, linux_cwd_path_string,
-        raw_environment_from_nul_entries,
+        environment_from_nul_entries, linux_cwd_path_string, raw_environment_from_nul_entries,
+        window_name_from_process_name,
     };
 
     pub(super) fn current_path_impl(pid: u32) -> io::Result<Option<String>> {
@@ -196,8 +202,15 @@ mod linux_impl {
         }
     }
 
+    /// Reads the name from `/proc/<pid>/cmdline` only, as tmux 3.7b does.
+    ///
+    /// `cmdline` is empty while `execve` installs the new image, and `comm`
+    /// is rewritten in that same window: a concurrent `comm` read can return
+    /// a torn name such as `slee` while `bash` execs `sleep` (measured on
+    /// Linux 7.0). Report no name instead; callers then fall back to the
+    /// pane's own command, as tmux does.
     pub(super) fn command_name_impl(pid: u32) -> io::Result<Option<String>> {
-        Ok(command_name_from_linux_cmdline(pid).or_else(|| command_name_from_linux_comm(pid)))
+        Ok(command_name_from_linux_cmdline(pid))
     }
 
     pub(super) fn executable_path_impl(pid: u32) -> io::Result<Option<String>> {
@@ -213,13 +226,11 @@ mod linux_impl {
         let first = cmdline
             .split(|byte| *byte == 0)
             .find(|segment| !segment.is_empty())?;
-        executable_name(std::str::from_utf8(first).ok()?)
+        window_name_from_process_name(std::str::from_utf8(first).ok()?)
     }
 
-    fn command_name_from_linux_comm(pid: u32) -> Option<String> {
-        let comm = std::fs::read_to_string(format!("/proc/{pid}/comm")).ok()?;
-        executable_name(comm.trim())
-    }
+    #[cfg(test)]
+    mod tests;
 
     pub(super) fn fd_path_impl(pid: u32, fd: i32) -> io::Result<Option<PathBuf>> {
         match std::fs::read_link(format!("/proc/{pid}/fd/{fd}")) {
@@ -256,163 +267,6 @@ mod linux_impl {
         };
         Ok(Some(raw_environment_from_nul_entries(&environ)))
     }
-}
-
-#[cfg(target_os = "macos")]
-fn current_path_impl(pid: u32) -> io::Result<Option<String>> {
-    let mut info = std::mem::MaybeUninit::<libc::proc_vnodepathinfo>::zeroed();
-    let size = std::mem::size_of::<libc::proc_vnodepathinfo>();
-    let Some(pid) = pid.try_into().ok() else {
-        return Ok(None);
-    };
-    let Some(size_i32) = size.try_into().ok() else {
-        return Ok(None);
-    };
-    let read = unsafe {
-        // SAFETY: `info` points to writable memory sized for the requested flavor.
-        libc::proc_pidinfo(
-            pid,
-            libc::PROC_PIDVNODEPATHINFO,
-            0,
-            info.as_mut_ptr().cast(),
-            size_i32,
-        )
-    };
-    if usize::try_from(read)
-        .map(|read| read < size)
-        .unwrap_or(true)
-    {
-        return Ok(None);
-    }
-
-    let info = unsafe {
-        // SAFETY: `proc_pidinfo` reported that it initialized the full structure.
-        info.assume_init()
-    };
-    Ok(string_from_c_chars(info.pvi_cdir.vip_path.as_ptr().cast()))
-}
-
-#[cfg(target_os = "macos")]
-fn command_name_impl(pid: u32) -> io::Result<Option<String>> {
-    Ok(command_name_from_macos_pidpath(pid).or_else(|| command_name_from_macos_proc_name(pid)))
-}
-
-#[cfg(target_os = "macos")]
-fn executable_path_impl(pid: u32) -> io::Result<Option<String>> {
-    Ok(macos_pidpath(pid))
-}
-
-#[cfg(target_os = "macos")]
-fn command_name_from_macos_pidpath(pid: u32) -> Option<String> {
-    executable_name(&macos_pidpath(pid)?)
-}
-
-#[cfg(target_os = "macos")]
-fn macos_pidpath(pid: u32) -> Option<String> {
-    let mut buffer = [0 as libc::c_char; libc::PROC_PIDPATHINFO_MAXSIZE as usize];
-    let written = unsafe {
-        // SAFETY: `buffer` is writable for the size passed to `proc_pidpath`.
-        libc::proc_pidpath(
-            pid.try_into().ok()?,
-            buffer.as_mut_ptr().cast(),
-            buffer.len().try_into().ok()?,
-        )
-    };
-    if written <= 0 {
-        return None;
-    }
-    string_from_c_chars(buffer.as_ptr())
-}
-
-#[cfg(target_os = "macos")]
-fn command_name_from_macos_proc_name(pid: u32) -> Option<String> {
-    let mut buffer = [0 as libc::c_char; 1024];
-    let written = unsafe {
-        // SAFETY: `buffer` is writable for the size passed to `proc_name`.
-        libc::proc_name(
-            pid.try_into().ok()?,
-            buffer.as_mut_ptr().cast(),
-            buffer.len().try_into().ok()?,
-        )
-    };
-    if written <= 0 {
-        return None;
-    }
-    string_from_c_chars(buffer.as_ptr()).and_then(|name| executable_name(&name))
-}
-
-#[cfg(target_os = "macos")]
-fn fd_path_impl(pid: u32, fd: i32) -> io::Result<Option<PathBuf>> {
-    let mut info = std::mem::MaybeUninit::<MacosVnodeFdInfoWithPath>::zeroed();
-    let size = std::mem::size_of::<MacosVnodeFdInfoWithPath>();
-    let Some(pid) = pid.try_into().ok() else {
-        return Ok(None);
-    };
-    let Some(size_i32) = size.try_into().ok() else {
-        return Ok(None);
-    };
-    let read = unsafe {
-        // SAFETY: `info` points to writable memory sized for the requested flavor.
-        libc::proc_pidfdinfo(
-            pid,
-            fd,
-            MACOS_PROC_PIDFDVNODEPATHINFO,
-            info.as_mut_ptr().cast(),
-            size_i32,
-        )
-    };
-    if usize::try_from(read)
-        .map(|read| read < size)
-        .unwrap_or(true)
-    {
-        return Ok(None);
-    }
-
-    let info = unsafe {
-        // SAFETY: `proc_pidfdinfo` reported that it initialized the full structure.
-        info.assume_init()
-    };
-    Ok(string_from_c_chars(info.pvip.vip_path.as_ptr().cast()).map(PathBuf::from))
-}
-
-#[cfg(target_os = "macos")]
-fn is_live_impl(pid: u32) -> io::Result<Option<bool>> {
-    let Some(pid) = libc::c_int::try_from(pid).ok() else {
-        return Ok(None);
-    };
-    let Some(size) = libc::c_int::try_from(std::mem::size_of::<libc::proc_bsdinfo>()).ok() else {
-        return Ok(None);
-    };
-    let mut info = std::mem::MaybeUninit::<libc::proc_bsdinfo>::zeroed();
-    let read = unsafe {
-        // SAFETY: `info` points to writable memory sized for the requested flavor.
-        libc::proc_pidinfo(
-            pid,
-            libc::PROC_PIDTBSDINFO,
-            0,
-            info.as_mut_ptr().cast(),
-            size,
-        )
-    };
-    if read < size {
-        return Ok(Some(false));
-    }
-
-    let info = unsafe {
-        // SAFETY: `proc_pidinfo` reported that it initialized the full structure.
-        info.assume_init()
-    };
-    Ok(Some(info.pbi_status != libc::SZOMB))
-}
-
-#[cfg(target_os = "macos")]
-fn environment_impl(pid: u32) -> io::Result<Option<HashMap<String, String>>> {
-    Ok(macos_procargs(pid).and_then(|buffer| environment_from_macos_procargs(&buffer)))
-}
-
-#[cfg(target_os = "macos")]
-fn raw_environment_impl(pid: u32) -> io::Result<Option<Vec<(OsString, OsString)>>> {
-    Ok(macos_procargs(pid).and_then(|buffer| raw_environment_from_macos_procargs(&buffer)))
 }
 
 #[cfg(windows)]
@@ -465,124 +319,6 @@ fn descendant_command_names_impl(pid: u32) -> io::Result<Vec<String>> {
     windows_process::descendant_command_names(pid)
 }
 
-#[cfg(target_os = "macos")]
-const MACOS_PROC_PIDFDVNODEPATHINFO: libc::c_int = 2;
-
-#[cfg(target_os = "macos")]
-#[repr(C)]
-struct MacosProcFileInfo {
-    fi_openflags: u32,
-    fi_status: u32,
-    fi_offset: libc::off_t,
-    fi_type: i32,
-    fi_guardflags: u32,
-}
-
-#[cfg(target_os = "macos")]
-#[repr(C)]
-struct MacosVnodeFdInfoWithPath {
-    pfi: MacosProcFileInfo,
-    pvip: libc::vnode_info_path,
-}
-
-#[cfg(target_os = "macos")]
-fn string_from_c_chars(chars: *const libc::c_char) -> Option<String> {
-    let value = unsafe {
-        // SAFETY: macOS libproc path/name buffers are nul-terminated on success.
-        CStr::from_ptr(chars)
-    }
-    .to_string_lossy()
-    .into_owned();
-    (!value.is_empty()).then_some(value)
-}
-
-#[cfg(target_os = "macos")]
-fn macos_procargs(pid: u32) -> Option<Vec<u8>> {
-    let pid = libc::c_int::try_from(pid).ok()?;
-    let mut mib = [libc::CTL_KERN, libc::KERN_PROCARGS2, pid];
-    let mib_len = u32::try_from(mib.len()).ok()?;
-    let mut size = 0;
-    let result = unsafe {
-        // SAFETY: The first sysctl call asks only for the required buffer size.
-        libc::sysctl(
-            mib.as_mut_ptr(),
-            mib_len,
-            std::ptr::null_mut(),
-            &mut size,
-            std::ptr::null_mut(),
-            0,
-        )
-    };
-    if result != 0 || size == 0 {
-        return None;
-    }
-
-    let mut buffer = vec![0; size];
-    let result = unsafe {
-        // SAFETY: `buffer` is writable for `size` bytes reported by sysctl.
-        libc::sysctl(
-            mib.as_mut_ptr(),
-            mib_len,
-            buffer.as_mut_ptr().cast(),
-            &mut size,
-            std::ptr::null_mut(),
-            0,
-        )
-    };
-    if result != 0 || size == 0 {
-        return None;
-    }
-    buffer.truncate(size);
-    Some(buffer)
-}
-
-#[cfg(target_os = "macos")]
-fn environment_from_macos_procargs(buffer: &[u8]) -> Option<HashMap<String, String>> {
-    let offset = macos_environment_offset(buffer)?;
-    environment_from_nul_entries(&buffer[offset..])
-}
-
-#[cfg(target_os = "macos")]
-fn raw_environment_from_macos_procargs(buffer: &[u8]) -> Option<Vec<(OsString, OsString)>> {
-    let offset = macos_environment_offset(buffer)?;
-    Some(raw_environment_from_nul_entries(&buffer[offset..]))
-}
-
-#[cfg(target_os = "macos")]
-fn macos_environment_offset(buffer: &[u8]) -> Option<usize> {
-    let argc_size = std::mem::size_of::<libc::c_int>();
-    if buffer.len() < argc_size {
-        return None;
-    }
-    let mut argc_bytes = [0; std::mem::size_of::<libc::c_int>()];
-    argc_bytes.copy_from_slice(&buffer[..argc_size]);
-    let argc = libc::c_int::from_ne_bytes(argc_bytes);
-    if argc < 0 {
-        return None;
-    }
-
-    let mut offset = skip_nul_terminated(buffer, argc_size)?;
-    offset = skip_nul_padding(buffer, offset);
-    for _ in 0..argc {
-        offset = skip_nul_terminated(buffer, offset)?;
-    }
-    Some(skip_nul_padding(buffer, offset))
-}
-
-#[cfg(target_os = "macos")]
-fn skip_nul_terminated(buffer: &[u8], offset: usize) -> Option<usize> {
-    let relative_end = buffer.get(offset..)?.iter().position(|byte| *byte == 0)?;
-    Some(offset + relative_end + 1)
-}
-
-#[cfg(target_os = "macos")]
-fn skip_nul_padding(buffer: &[u8], mut offset: usize) -> usize {
-    while buffer.get(offset).is_some_and(|byte| *byte == 0) {
-        offset += 1;
-    }
-    offset
-}
-
 #[cfg(any(unix, test))]
 fn environment_from_nul_entries(environ: &[u8]) -> Option<HashMap<String, String>> {
     let mut values = HashMap::new();
@@ -623,8 +359,44 @@ fn raw_environment_from_nul_entries(environ: &[u8]) -> Vec<(OsString, OsString)>
     values
 }
 
+/// tmux 3.7b `parse_window_name` applied to the name `osdep_get_name`
+/// reports for a pane's foreground process: argv[0] on Linux, the executable
+/// file name on macOS.
+///
+/// A process title set by `exec -a` or setproctitle (`my prog x`,
+/// `nginx: master process nginx`) keeps only its first word, and only a name
+/// that starts with `/` is reduced to its basename: `./a.out` stays whole.
+///
+/// Two deliberate divergences: a name that parses to nothing (`-`, `\x01`)
+/// reports no name, so callers fall back to the pane's command instead of
+/// showing an empty window name, and trailing non-ASCII characters are kept
+/// where tmux's byte-wise `isalnum`/`ispunct` trim turns `café` into `caf`.
+#[cfg(unix)]
+fn window_name_from_process_name(process_name: &str) -> Option<String> {
+    let mut name = process_name.strip_prefix('"').unwrap_or(process_name);
+    if let Some(quote) = name.find('"') {
+        name = &name[..quote];
+    }
+    name = name.strip_prefix("exec ").unwrap_or(name);
+    name = name.trim_start_matches([' ', '-']);
+    if let Some(space) = name.find(' ') {
+        name = &name[..space];
+    }
+    name = name.trim_end_matches(|character: char| character.is_ascii_control());
+    if name.starts_with('/') {
+        // POSIX basename: trailing slashes go, and `/` stays `/`.
+        let without_trailing = name.trim_end_matches('/');
+        name = match without_trailing.rsplit_once('/') {
+            Some((_, base)) => base,
+            None => "/",
+        };
+    }
+    (!name.is_empty()).then(|| name.to_owned())
+}
+
+#[cfg(windows)]
 fn executable_name(path: &str) -> Option<String> {
-    let name = Path::new(path).file_name()?.to_string_lossy();
+    let name = std::path::Path::new(path).file_name()?.to_string_lossy();
     let trimmed = name.trim_start_matches('-');
     (!trimmed.is_empty()).then(|| trimmed.to_owned())
 }

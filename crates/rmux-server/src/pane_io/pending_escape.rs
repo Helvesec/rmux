@@ -1,5 +1,6 @@
 use std::time::Duration;
 
+use rmux_core::kitty_keyboard::{AcquiredDecoder, FRAME_LIMIT};
 use tokio::time::Instant;
 
 const BRACKETED_PASTE_START: &[u8] = b"\x1b[200~";
@@ -11,13 +12,25 @@ const C1_TERMINAL_STRING_LEADERS: &[u8] = &[0x90, 0x98, 0x9d, 0x9e, 0x9f];
 /// can legitimately pause much longer than that (10 ms by default), so use a
 /// separate idle budget and move it only when the retained input grows.
 const RETAINED_CONTROL_IDLE_TIMEOUT: Duration = Duration::from_secs(8);
-const CONSUMED_OSC_PREFIXES: &[&[u8]] = &[
-    b"\x1b]4;",
-    b"\x1b]10;",
-    b"\x1b]11;",
-    b"\x1b]12;",
-    b"\x1b]52;",
-];
+const CONSUMED_OSC_PREFIXES: &[&[u8]] = &[b"\x1b]10;", b"\x1b]11;", b"\x1b]12;", b"\x1b]52;"];
+/// tmux 3.7b `tty_keys_palette` reports an unterminated OSC 4 as a partial
+/// key: it waits for the keyboard escape-time, then `first_key` reads it as
+/// M-] and the rest as typed text. Its body is short and never streams.
+const PALETTE_RESPONSE_PREFIX: &[u8] = b"\x1b]4;";
+/// tmux 3.7b raises the partial-key delay to this floor while a query sent to
+/// the client terminal is unanswered (tty-keys.c:979-985), so a response split
+/// across reads is still read whole instead of as typed keys.
+const ACTIVE_QUERY_ESCAPE_TIME: Duration = Duration::from_millis(500);
+
+/// The keyboard deadline a new retention lifetime arms: `escape-time`, raised
+/// to tmux's active-query floor while a correlated palette query waits.
+pub(super) fn keyboard_escape_time(escape_time: Duration, active_query: bool) -> Duration {
+    if active_query {
+        escape_time.max(ACTIVE_QUERY_ESCAPE_TIME)
+    } else {
+        escape_time
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum PendingEscapeKind {
@@ -70,12 +83,15 @@ fn pending_escape_kind(input: &[u8]) -> Option<PendingEscapeKind> {
 /// streaming above instead.
 fn is_ambiguous_escape_prefix(input: &[u8]) -> bool {
     matches!(input, b"\x1b" | b"\x1bO" | b"\x1b\x1b")
+        || is_partial_escape_prefixed_key(input)
         || is_ambiguous_terminal_string_leader(input)
         || is_unterminated_csi_prefix(input)
+        || is_quarantined_keyboard_frame(input)
         || is_partial_x10_mouse(input)
         || is_partial_bracketed_paste_start(input)
         || is_partial_kitty_apc_start(input)
         || is_partial_consumed_osc_prefix(input)
+        || is_unterminated_palette_response(input)
         || is_partial_meta_utf8(input)
 }
 
@@ -98,8 +114,31 @@ fn is_unterminated_generic_terminal_string(input: &[u8]) -> bool {
         || matches!(input, [leader, ..] if C1_TERMINAL_STRING_LEADERS.contains(leader) && input.len() > 1)
 }
 
+/// `decode_escape_key` waits after Escape and the start of a CSI or SS3 key,
+/// tmux's Meta prefix, until the key completes or escape-time expires.
+fn is_partial_escape_prefixed_key(input: &[u8]) -> bool {
+    match input {
+        [b'\x1b', b'\x1b', b'O'] => true,
+        [b'\x1b', b'\x1b', b'[', parameters @ ..] => parameters
+            .iter()
+            .all(|byte| byte.is_ascii_digit() || *byte == b';'),
+        _ => false,
+    }
+}
+
 fn is_unterminated_csi_prefix(input: &[u8]) -> bool {
     input.starts_with(b"\x1b[") && input[2..].iter().all(|byte| (0x20..=0x3f).contains(byte))
+}
+
+fn is_quarantined_keyboard_frame(input: &[u8]) -> bool {
+    // Admission can retain an invalid numeric candidate past a final-looking
+    // byte. Keep its keyboard deadline, using the same framing authority.
+    if !input.starts_with(b"\x1b[") {
+        return false;
+    }
+    let mut decoder = rmux_core::kitty_keyboard::AcquiredDecoder::new();
+    decoder.feed(input, |_| {});
+    decoder.has_pending_keyboard_frame()
 }
 
 fn is_partial_x10_mouse(input: &[u8]) -> bool {
@@ -122,6 +161,15 @@ fn is_partial_consumed_osc_prefix(input: &[u8]) -> bool {
     CONSUMED_OSC_PREFIXES
         .iter()
         .any(|prefix| !input.is_empty() && input.len() < prefix.len() && prefix.starts_with(input))
+}
+
+/// Retained `ESC ] 4 ;` input, its partial openers included. A complete
+/// response leaves retention through the decoders, so whatever is still held
+/// is unterminated and keeps the keyboard deadline of its first byte.
+fn is_unterminated_palette_response(input: &[u8]) -> bool {
+    !input.is_empty()
+        && (input.starts_with(PALETTE_RESPONSE_PREFIX)
+            || PALETTE_RESPONSE_PREFIX.starts_with(input))
 }
 
 fn is_partial_meta_utf8(input: &[u8]) -> bool {
@@ -167,6 +215,37 @@ pub(super) struct PendingEscapeFlush {
     streaming_len: Option<usize>,
 }
 
+/// Observe framing before admission can compact an overlong keyboard frame.
+pub(super) struct PendingInputDispatch {
+    retained_before: usize,
+    appended: usize,
+    continued_bounded_keyboard: bool,
+}
+
+impl PendingInputDispatch {
+    pub(super) fn capture(pending: &[u8], bytes: &[u8]) -> Self {
+        let mut continued_bounded_keyboard = false;
+        if pending.starts_with(b"\x1b")
+            && !pending.starts_with(BRACKETED_PASTE_START)
+            && pending.len().saturating_add(bytes.len()) > FRAME_LIMIT
+        {
+            let mut decoder = AcquiredDecoder::new();
+            decoder.feed(pending, |_| {});
+            if decoder.has_pending_keyboard_frame() || matches!(pending, b"\x1b" | b"\x1b[") {
+                let mut crossed_boundary = false;
+                decoder.feed(bytes, |_| crossed_boundary = true);
+                continued_bounded_keyboard =
+                    !crossed_boundary && decoder.has_pending_keyboard_frame();
+            }
+        }
+        Self {
+            retained_before: pending.len(),
+            appended: bytes.len(),
+            continued_bounded_keyboard,
+        }
+    }
+}
+
 impl PendingEscapeFlush {
     pub(super) fn deadline(&self) -> Option<Instant> {
         self.deadline
@@ -180,20 +259,29 @@ impl PendingEscapeFlush {
 
     pub(super) fn observe_input_dispatch(
         &mut self,
-        retained_before: usize,
-        appended: usize,
+        dispatch: PendingInputDispatch,
         pending_input: &[u8],
     ) {
-        // A retained sequence is a continuation only when the decoder kept
+        // An unbounded retained sequence is a continuation when the decoder kept
         // every previously retained byte and every newly appended byte. Any
         // other result means that it consumed or transformed input, so a
         // non-empty suffix belongs to a new retention lifetime even when its
         // grammar kind, length, and contents happen to match the old one.
+        let PendingInputDispatch {
+            retained_before,
+            appended,
+            continued_bounded_keyboard,
+        } = dispatch;
         let retained_after = pending_input.len();
         let continued_unchanged = retained_before > 0
             && retained_after > 0
             && retained_after == retained_before.saturating_add(appended);
-        if !continued_unchanged {
+        // The keyboard decoder deliberately caps storage. Its framing result,
+        // not stored length or prefix equality, distinguishes continuation from
+        // a final/interruption followed by a new (possibly identical) suffix.
+        let continued_quarantine =
+            continued_bounded_keyboard && is_quarantined_keyboard_frame(pending_input);
+        if !continued_unchanged && !continued_quarantine {
             self.clear();
         }
         // Multiple attach frames may be decoded before the scheduler calls
@@ -253,325 +341,4 @@ impl PendingEscapeFlush {
 }
 
 #[cfg(test)]
-mod tests {
-    use std::{thread, time::Duration};
-
-    use tokio::time::Instant;
-
-    use super::{is_pending_escape, PendingEscapeFlush, RETAINED_CONTROL_IDLE_TIMEOUT};
-
-    #[test]
-    fn every_retained_short_escape_family_arms_without_moving_its_deadline() {
-        for input in [
-            b"\x1b".as_slice(),
-            b"\x1b[".as_slice(),
-            b"\x1bO".as_slice(),
-            b"\x1bP".as_slice(),
-            b"\x1bX".as_slice(),
-            b"\x1b]".as_slice(),
-            b"\x1b^".as_slice(),
-            b"\x1b_".as_slice(),
-            b"\x1b\x1b".as_slice(),
-            b"\x90".as_slice(),
-            b"\x98".as_slice(),
-            b"\x9d".as_slice(),
-            b"\x9e".as_slice(),
-            b"\x9f".as_slice(),
-            b"\x1b[20".as_slice(),
-            b"\x1b[12;".as_slice(),
-            b"\x1b[<".as_slice(),
-            b"\x1b[M!".as_slice(),
-            b"\x1b\xe6".as_slice(),
-            b"\x1b\xe6\x97".as_slice(),
-            b"\x1b\xf0\x9f".as_slice(),
-            b"\x1b\xf0\x9f\x92".as_slice(),
-        ] {
-            assert!(is_pending_escape(input), "{input:?} must be classified");
-            let mut flush = PendingEscapeFlush::default();
-            flush.sync(input, Duration::from_millis(500));
-            assert!(flush.deadline().is_some(), "{input:?} must arm");
-        }
-
-        let mut flush = PendingEscapeFlush::default();
-        flush.sync(b"\x1b[", Duration::from_millis(500));
-        let first = flush.deadline().expect("CSI opener arms");
-        flush.sync(b"\x1b[12", Duration::from_millis(1));
-        assert_eq!(
-            flush.deadline(),
-            Some(first),
-            "numeric CSI growth must keep the original ambiguity deadline"
-        );
-
-        let mut meta_utf8 = PendingEscapeFlush::default();
-        meta_utf8.sync(b"\x1b\xf0", Duration::from_millis(500));
-        let first = meta_utf8.deadline().expect("Meta-UTF-8 lead arms");
-        meta_utf8.sync(b"\x1b\xf0\x9f\x92", Duration::from_millis(1));
-        assert_eq!(
-            meta_utf8.deadline(),
-            Some(first),
-            "Meta-UTF-8 growth must stay classified until its expected length"
-        );
-    }
-
-    #[test]
-    fn invalid_meta_bytes_use_the_keyboard_deadline() {
-        for invalid in (0x80..=0xbf).chain(0xf8..=0xff) {
-            let input = [b'\x1b', invalid];
-            assert!(
-                is_pending_escape(&input),
-                "ESC + invalid UTF-8 byte {invalid:#04x} is retained by the key decoder"
-            );
-
-            let mut flush = PendingEscapeFlush::default();
-            let before = Instant::now();
-            flush.sync(&input, Duration::from_millis(500));
-            let deadline = flush.deadline().expect("retained input must time out");
-            assert!(deadline >= before + Duration::from_millis(500));
-            assert!(
-                deadline < before + Duration::from_secs(1),
-                "invalid Meta input must not receive the 8-second stream budget"
-            );
-        }
-    }
-
-    #[test]
-    fn streaming_escape_bodies_use_a_long_idle_and_rearm_only_on_growth() {
-        for (opener, grown) in [
-            (b"\x1b]52;".as_slice(), b"\x1b]52;c;AAAA".as_slice()),
-            (b"\x1b_G".as_slice(), b"\x1b_Gi=7;AAAA".as_slice()),
-            (b"\x1b[200~".as_slice(), b"\x1b[200~slow body".as_slice()),
-        ] {
-            let mut flush = PendingEscapeFlush::default();
-            let before = Instant::now();
-            flush.sync(opener, Duration::from_millis(10));
-            let armed = flush.deadline().expect("stream opener must arm");
-            assert!(
-                armed >= before + RETAINED_CONTROL_IDLE_TIMEOUT,
-                "{opener:?} must not inherit the 10 ms keyboard escape-time"
-            );
-            assert!(
-                armed <= Instant::now() + RETAINED_CONTROL_IDLE_TIMEOUT,
-                "{opener:?} must still expire after the dedicated idle budget"
-            );
-
-            flush.sync(grown, Duration::from_millis(10));
-            let rearmed = flush.deadline().expect("stream growth must rearm");
-            assert!(rearmed >= armed, "{grown:?} must move the idle deadline");
-
-            flush.sync(grown, Duration::from_millis(1));
-            assert_eq!(
-                flush.deadline(),
-                Some(rearmed),
-                "unchanged stream must not move its deadline"
-            );
-        }
-    }
-
-    #[test]
-    fn every_modal_terminal_string_body_gets_a_bounded_streaming_deadline() {
-        for input in [
-            b"\x1bPbody".as_slice(),
-            b"\x1bXbody".as_slice(),
-            b"\x1b]777;body".as_slice(),
-            b"\x1b^body".as_slice(),
-            b"\x1b_Qbody".as_slice(),
-            b"\x90body".as_slice(),
-            b"\x98body".as_slice(),
-            b"\x9dbody".as_slice(),
-            b"\x9ebody".as_slice(),
-            b"\x9fbody".as_slice(),
-        ] {
-            let mut flush = PendingEscapeFlush::default();
-            let before = Instant::now();
-            flush.sync(input, Duration::from_millis(10));
-            let deadline = flush.deadline().expect("terminal string body must arm");
-            assert!(
-                deadline >= before + RETAINED_CONTROL_IDLE_TIMEOUT,
-                "{input:?} must use the bounded streaming idle budget"
-            );
-            assert!(
-                deadline <= Instant::now() + RETAINED_CONTROL_IDLE_TIMEOUT,
-                "{input:?} must not be retained indefinitely"
-            );
-        }
-    }
-
-    #[test]
-    fn recognized_terminal_control_openers_promote_to_streaming_deadline() {
-        for (prefix, control_like, grown) in [
-            (
-                b"\x1b]".as_slice(),
-                b"\x1b]52;".as_slice(),
-                b"\x1b]52;c;AAAA".as_slice(),
-            ),
-            (
-                b"\x1b_".as_slice(),
-                b"\x1b_G".as_slice(),
-                b"\x1b_Gi=7;AAAA".as_slice(),
-            ),
-            (
-                b"\x1bP".as_slice(),
-                b"\x1bPq".as_slice(),
-                b"\x1bPquery".as_slice(),
-            ),
-            (
-                b"\x90".as_slice(),
-                b"\x90q".as_slice(),
-                b"\x90query".as_slice(),
-            ),
-        ] {
-            let mut flush = PendingEscapeFlush::default();
-            flush.sync(prefix, Duration::from_millis(500));
-            let keyboard_deadline = flush.deadline().expect("Meta prefix must arm");
-
-            let before_stream = Instant::now();
-            flush.sync(control_like, Duration::from_millis(500));
-            let streaming_deadline = flush.deadline().expect("stream opener must arm");
-            assert!(
-                streaming_deadline >= before_stream + RETAINED_CONTROL_IDLE_TIMEOUT,
-                "{control_like:?} must outlive the Meta-key deadline"
-            );
-            assert!(streaming_deadline > keyboard_deadline);
-
-            flush.sync(grown, Duration::from_millis(500));
-            assert!(
-                flush.deadline().expect("grown stream remains armed") >= streaming_deadline,
-                "{grown:?} growth must refresh the streaming idle deadline"
-            );
-        }
-
-        let mut split_prefix = PendingEscapeFlush::default();
-        split_prefix.sync(b"\x1b", Duration::from_millis(500));
-        let keyboard_deadline = split_prefix.deadline().expect("Escape must arm");
-        let before_stream = Instant::now();
-        split_prefix.sync(b"\x1b]52;c;AAAA", Duration::from_millis(500));
-        assert!(
-            split_prefix
-                .deadline()
-                .is_some_and(|deadline| deadline >= before_stream + RETAINED_CONTROL_IDLE_TIMEOUT),
-            "an ESC / ] transport split must promote once the OSC opener is recognized"
-        );
-        assert!(split_prefix.deadline() > Some(keyboard_deadline));
-    }
-
-    #[test]
-    fn coalesced_true_osc_and_apc_growth_keep_streaming_provenance() {
-        for (opener, grown) in [
-            (b"\x1b]52;c;AA".as_slice(), b"\x1b]52;c;AAAA".as_slice()),
-            (b"\x1b_Gi=7;PAY".as_slice(), b"\x1b_Gi=7;PAYLOAD".as_slice()),
-        ] {
-            let mut flush = PendingEscapeFlush::default();
-            flush.observe_input_dispatch(0, opener.len(), opener);
-            flush.observe_input_dispatch(opener.len(), grown.len() - opener.len(), grown);
-
-            let before = Instant::now();
-            flush.sync(grown, Duration::from_millis(500));
-            assert!(
-                flush
-                    .deadline()
-                    .is_some_and(|deadline| deadline >= before + RETAINED_CONTROL_IDLE_TIMEOUT),
-                "{grown:?} must not acquire Meta provenance while frames coalesce"
-            );
-        }
-    }
-
-    #[test]
-    fn validated_paste_and_apc_survive_a_pause_longer_than_escape_time() {
-        let escape_time = Duration::from_millis(5);
-        let mut paste = PendingEscapeFlush::default();
-        let mut apc = PendingEscapeFlush::default();
-        paste.sync(b"\x1b[200~slow body", escape_time);
-        apc.sync(b"\x1b_Gi=7;slow-body", escape_time);
-        let paste_deadline = paste.deadline().expect("paste idle deadline");
-        let apc_deadline = apc.deadline().expect("APC idle deadline");
-
-        thread::sleep(Duration::from_millis(15));
-
-        assert!(Instant::now() < paste_deadline);
-        assert!(Instant::now() < apc_deadline);
-        paste.sync(b"\x1b[200~slow body", escape_time);
-        apc.sync(b"\x1b_Gi=7;slow-body", escape_time);
-        assert_eq!(paste.deadline(), Some(paste_deadline));
-        assert_eq!(apc.deadline(), Some(apc_deadline));
-    }
-
-    #[test]
-    fn stream_completion_rearms_a_new_ambiguous_suffix_with_escape_time() {
-        let mut flush = PendingEscapeFlush::default();
-        let paste = b"\x1b[200~body";
-        flush.sync(paste, Duration::from_millis(10));
-        let streaming_deadline = flush.deadline().expect("paste stream arms");
-
-        flush.observe_input_dispatch(paste.len(), 1, b"\x1b");
-        let before_escape = Instant::now();
-        flush.sync(b"\x1b", Duration::from_millis(10));
-        let escape_deadline = flush.deadline().expect("new Escape suffix arms");
-        assert!(escape_deadline >= before_escape + Duration::from_millis(10));
-        assert!(escape_deadline < streaming_deadline);
-
-        flush.observe_input_dispatch(1, 3, b"\x1b[12");
-        flush.sync(b"\x1b[12", Duration::from_secs(1));
-        assert_eq!(
-            flush.deadline(),
-            Some(escape_deadline),
-            "growth of the same keyboard ambiguity keeps its original deadline"
-        );
-
-        flush.observe_input_dispatch(4, 3, b"\x1b_G");
-        let before_stream = Instant::now();
-        flush.sync(b"\x1b_G", Duration::from_millis(10));
-        assert!(
-            flush.deadline().expect("APC stream arms")
-                >= before_stream + RETAINED_CONTROL_IDLE_TIMEOUT,
-            "an ambiguous-to-streaming transition restores the long idle budget"
-        );
-    }
-
-    #[test]
-    fn dispatch_observation_distinguishes_continuation_from_replacement() {
-        let mut flush = PendingEscapeFlush::default();
-        flush.sync(b"\x1b", Duration::from_secs(1));
-        let original_deadline = flush.deadline().expect("Escape arms");
-
-        flush.observe_input_dispatch(1, 2, b"\x1b[1");
-        flush.sync(b"\x1b[1", Duration::from_secs(3));
-        assert_eq!(
-            flush.deadline(),
-            Some(original_deadline),
-            "retaining the entire old prefix plus every appended byte is a continuation"
-        );
-
-        flush.observe_input_dispatch(3, 2, b"\x1b");
-        assert!(
-            flush.deadline().is_none(),
-            "consuming input before retaining a suffix starts a new lifetime"
-        );
-        flush.sync(b"\x1b", Duration::from_secs(3));
-        assert!(
-            flush.deadline().expect("replacement Escape arms")
-                > original_deadline + Duration::from_secs(1),
-            "the replacement receives its own deadline"
-        );
-    }
-
-    #[test]
-    fn non_escape_retention_and_complete_sequences_do_not_arm() {
-        for input in [
-            b"".as_slice(),
-            b"plain".as_slice(),
-            b"\xe6\x97".as_slice(),
-            b"\xf0\x9f\x92".as_slice(),
-            b"\x1b\xe6\x97\xa5".as_slice(),
-            b"\x1b\xf0\x9f\x92\xa1".as_slice(),
-            b"\x1b[A".as_slice(),
-            b"\x1b[<a".as_slice(),
-        ] {
-            let mut flush = PendingEscapeFlush::default();
-            flush.sync(input, Duration::from_millis(500));
-            assert!(
-                flush.deadline().is_none(),
-                "{input:?} is not a timed retained escape state"
-            );
-        }
-    }
-}
+mod tests;

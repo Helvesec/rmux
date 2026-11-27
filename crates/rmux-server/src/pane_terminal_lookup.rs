@@ -1,7 +1,7 @@
-use rmux_core::{PaneGeometry, PaneId, SessionStore};
+use rmux_core::{ManagedSessionStore, PaneGeometry, PaneId};
 use rmux_proto::{RmuxError, SessionName, TerminalSize};
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct SessionPane {
     pub(crate) id: PaneId,
     pub(crate) window_index: u32,
@@ -11,7 +11,7 @@ pub(crate) struct SessionPane {
 }
 
 pub(crate) fn initial_pane(
-    sessions: &SessionStore,
+    sessions: &ManagedSessionStore,
     session_name: &SessionName,
 ) -> Result<SessionPane, RmuxError> {
     let session = sessions
@@ -34,7 +34,7 @@ pub(crate) fn initial_pane(
 }
 
 pub(crate) fn pane_id_for_target(
-    sessions: &SessionStore,
+    sessions: &ManagedSessionStore,
     session_name: &SessionName,
     window_index: u32,
     pane_index: u32,

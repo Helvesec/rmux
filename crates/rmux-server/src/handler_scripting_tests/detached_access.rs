@@ -371,10 +371,23 @@ async fn popup_internal_menu_captures_interacting_attach_origin_and_target() {
             "display-popup -N -c {attach_pid} -t {beta}:0.0 -w 20 -h 6"
         ))
         .expect("popup parses");
-    handler
-        .execute_parsed_commands_for_test(popup_requester_pid, popup)
-        .await
-        .expect("popup opens");
+    // A detached requester's display-popup completes only when its popup leaves the client, as
+    // in tmux, so it runs alongside the interaction below and is released at the end.
+    let opening = tokio::spawn({
+        let handler = handler.clone();
+        async move {
+            handler
+                .execute_parsed_commands_for_test(popup_requester_pid, popup)
+                .await
+        }
+    });
+    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        while !handler.overlay_active(attach_pid).await {
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("popup opens");
     drop(scope);
 
     let rect = {
@@ -401,6 +414,17 @@ async fn popup_internal_menu_captures_interacting_attach_origin_and_target() {
     let menu = popup.nested_menu.as_ref().expect("nested menu is active");
     assert_eq!(menu.origin.requester_pid(), attach_pid);
     assert_eq!(menu.current_target.session_name(), &alpha);
+    drop(active_attach);
+
+    handler
+        .clear_interactive_overlay(attach_pid, true)
+        .await
+        .expect("close the popup");
+    tokio::time::timeout(std::time::Duration::from_secs(5), opening)
+        .await
+        .expect("closing the popup completes its command")
+        .expect("the popup command task")
+        .expect("the popup command succeeds");
 }
 
 #[tokio::test]
@@ -697,7 +721,7 @@ async fn assert_stale_callback_rejected(
     if matches!(path, CallbackPath::Hook) {
         let setup = CommandParser::new()
             .parse(&format!(
-                "set-hook -g after-display-message {{ set-buffer -b {buffer_name} forbidden }}"
+                "set-hook -g after-list-sessions {{ set-buffer -b {buffer_name} forbidden }}"
             ))
             .expect("hook setup parses");
         handler
@@ -775,7 +799,7 @@ async fn run_callback(
         }
         CallbackPath::Hook => {
             let commands = CommandParser::new()
-                .parse("display-message -p callback")
+                .parse("list-sessions -F callback")
                 .expect("hook trigger parses");
             handler
                 .execute_parsed_commands_for_test(requester_pid, commands)
@@ -812,8 +836,8 @@ async fn create_callback_attach(
     name: &str,
 ) -> tokio::sync::mpsc::UnboundedReceiver<crate::pane_io::AttachControl> {
     let session_name = SessionName::new(name).expect("valid callback session name");
-    assert!(matches!(
-        handler
+    crate::session_fixture::assert_new_session(
+        &handler
             .handle(Request::NewSession(NewSessionRequest {
                 session_name: session_name.clone(),
                 detached: true,
@@ -821,8 +845,7 @@ async fn create_callback_attach(
                 environment: None,
             }))
             .await,
-        Response::NewSession(_)
-    ));
+    );
     register_callback_attach(handler, requester_pid, session_name).await
 }
 
@@ -839,8 +862,8 @@ async fn register_callback_attach(
 }
 
 async fn create_detached_callback_session(handler: &RequestHandler, session_name: SessionName) {
-    assert!(matches!(
-        handler
+    crate::session_fixture::assert_new_session(
+        &handler
             .handle(Request::NewSession(NewSessionRequest {
                 session_name,
                 detached: true,
@@ -848,8 +871,7 @@ async fn create_detached_callback_session(handler: &RequestHandler, session_name
                 environment: None,
             }))
             .await,
-        Response::NewSession(_)
-    ));
+    );
 }
 
 async fn set_named_buffer(handler: &RequestHandler, name: &str, content: &[u8]) {

@@ -258,3 +258,49 @@ fn pane_ids_are_unique_across_successive_splits_even_if_the_counter_regresses() 
         pane_ids.len()
     );
 }
+
+#[test]
+fn floating_resize_exact_and_new_split_reject_without_mutation() {
+    for mixed in [false, true] {
+        let mut session = Session::new(
+            session_name("float-resize"),
+            TerminalSize {
+                cols: 120,
+                rows: 40,
+            },
+        );
+        if mixed {
+            session.split_active_pane().unwrap();
+            session.split_active_pane().unwrap();
+        }
+        session
+            .window_layout_context_mut(0)
+            .unwrap()
+            .float_pane(
+                u32::from(mixed),
+                crate::FloatingPaneRect::new(3, 4, 30, 10).unwrap(),
+            )
+            .unwrap();
+        let target = u32::from(mixed);
+        if mixed {
+            session.toggle_zoom_in_window(0, 0).unwrap();
+        }
+        for direction in [SplitDirection::Vertical, SplitDirection::Horizontal] {
+            for operation in 0..3 {
+                let before = session.window().clone();
+                let result = match operation {
+                    0 => session.resize_pane_to_in_window(0, target, direction, 20),
+                    _ => session.resize_new_split_pane_to_in_window(
+                        0,
+                        target,
+                        direction,
+                        20,
+                        operation == 1,
+                    ),
+                };
+                assert_eq!(session.window(), &before);
+                assert!(matches!(result, Err(RmuxError::Server(_))));
+            }
+        }
+    }
+}

@@ -369,16 +369,20 @@ fn choose_buffer_parses_as_queued_mode_tree_command() {
 }
 
 #[test]
-fn mode_tree_commands_reject_tmux_invalid_auto_accept_flag() {
+fn mode_tree_commands_accept_tmux_auto_accept_flag() {
     for command in ["choose-tree", "choose-buffer", "choose-client"] {
-        let error = parse_args(&[command, "-y", "1"]).unwrap_err();
-
-        assert!(
-            error
-                .to_string()
-                .contains(&format!("command {command}: unknown flag -y")),
-            "{error}"
-        );
+        for flags in [vec!["-y"], vec!["-y", "65536"], vec!["-yN"], vec!["-Ny"]] {
+            let mut arguments = vec![command];
+            arguments.extend(flags);
+            let cli = parse_args(&arguments).expect("tmux 3.7b accepts boolean -y");
+            let queued = match cli.command.expect("parsed command") {
+                super::super::Command::ChooseTree(args) => args.queue_command,
+                super::super::Command::ChooseBuffer(args) => args.queue_command,
+                super::super::Command::ChooseClient(args) => args.queue_command,
+                _ => panic!("expected chooser"),
+            };
+            assert_eq!(queued, arguments.join(" "));
+        }
     }
 }
 
@@ -898,5 +902,44 @@ fn queued_and_gated_commands_use_clap_help() {
     ] {
         let error = parse_args(&[command, "--help"]).unwrap_err();
         assert_eq!(error.kind(), clap::error::ErrorKind::DisplayHelp);
+    }
+}
+
+#[test]
+fn choose_templates_reject_extra_arguments_like_tmux() {
+    for (command, canonical) in [
+        ("choose-tree", "choose-tree"),
+        ("choose-client", "choose-client"),
+        ("choose-buffer", "choose-buffer"),
+        ("choose-window", "choose-tree"),
+        ("choose-session", "choose-tree"),
+    ] {
+        for tail in [
+            vec!["one", "two"],
+            vec!["one", "two", "three"],
+            vec!["--", "one", "two"],
+            vec!["-F", "#{pane_title}", "one", "two"],
+            vec!["one", "-N"],
+            vec!["-y", "one", "two"],
+        ] {
+            let mut argv = vec![command];
+            argv.extend(tail);
+            let error = parse_args(&argv).unwrap_err();
+            assert_eq!(
+                error.to_string().trim(),
+                format!("error: command {canonical}: too many arguments (need at most 1)"),
+                "{argv:?}"
+            );
+        }
+        for tail in [
+            vec![],
+            vec!["one"],
+            vec!["display-message one two"],
+            vec!["--", "-N"],
+        ] {
+            let mut argv = vec![command];
+            argv.extend(tail);
+            assert!(parse_args(&argv).is_ok(), "{argv:?}");
+        }
     }
 }

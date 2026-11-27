@@ -3,6 +3,9 @@
 use rmux_core::{BoxLines, PaneGeometry, Style};
 use rmux_proto::TerminalSize;
 
+mod popup;
+pub(crate) use popup::render_popup_overlay;
+
 use super::status::status_message_line_index;
 use super::{RenderedPrompt, StatusGeometry};
 use crate::format_runtime::RuntimeFormatContext;
@@ -207,7 +210,7 @@ pub(crate) fn resolve_overlay_rect(
 }
 
 pub(crate) fn status_line_layout(
-    session: &rmux_core::Session,
+    session: rmux_core::ManagedSessionView<'_>,
     options: &rmux_core::OptionStore,
     attached_count: usize,
     prompt: Option<&RenderedPrompt>,
@@ -343,64 +346,13 @@ pub(crate) fn render_menu_overlay(spec: &MenuRenderSpec) -> Vec<u8> {
     frame
 }
 
-pub(crate) fn render_popup_overlay(spec: &PopupRenderSpec) -> Vec<u8> {
-    let mut frame = Vec::new();
-    fill_rect(&mut frame, spec.rect, &spec.style);
-    if spec.border_lines.visible() {
-        draw_box(
-            &mut frame,
-            spec.rect,
-            &spec.border_style,
-            spec.border_lines,
-            Some(spec.title.as_str()),
-            TitleAlign::Centre,
-        );
-    }
-
-    let inner = inner_rect(spec.rect, spec.border_lines);
-    match &spec.content {
-        PopupContent::Surface(rows) => {
-            for (index, row) in rows.iter().enumerate() {
-                let Some(y) = content_row_y(inner, index) else {
-                    break;
-                };
-                draw_surface_row(&mut frame, inner.x, y, row, usize::from(inner.width));
-            }
-        }
-        PopupContent::Text(lines) => {
-            for (index, line) in lines.iter().enumerate() {
-                let Some(y) = content_row_y(inner, index) else {
-                    break;
-                };
-                draw_formatted_text(
-                    &mut frame,
-                    inner.x,
-                    y,
-                    line,
-                    &spec.style,
-                    usize::from(inner.width),
-                );
-            }
-        }
-    }
-    frame
-}
-
-fn content_row_y(inner: OverlayRect, index: usize) -> Option<u16> {
-    let row = inner
-        .y
-        .saturating_add(u16::try_from(index).unwrap_or(u16::MAX));
-    (row < inner.y.saturating_add(inner.height)).then_some(row)
-}
-
 fn popup_centre_x(cols: u16, width: u16) -> i64 {
     let value = (i64::from(cols).saturating_sub(1)) / 2 - i64::from(width) / 2;
     value.max(0)
 }
 
 fn popup_centre_y(rows: u16, height: u16) -> i64 {
-    let value = (i64::from(rows).saturating_sub(1)) / 2 + i64::from(height) / 2;
-    value.min(i64::from(rows.saturating_sub(height)))
+    (i64::from(rows).saturating_sub(1)) / 2 + i64::from(height) / 2
 }
 
 fn popup_mouse_centre_x(cols: u16, width: u16, mouse_x: u16) -> i64 {
@@ -581,22 +533,6 @@ fn draw_styled_text(frame: &mut Vec<u8>, x: u16, y: u16, text: &str, style: &Sty
     frame.extend_from_slice(super::style_sgr_bytes(style, true).as_slice());
     frame.extend_from_slice(text.as_bytes());
     frame.extend_from_slice(b"\x1b[0m\x1b[u");
-}
-
-/// Draws one captured terminal row verbatim.
-///
-/// The row is clipped to the popup's inner width without splitting an escape
-/// sequence, and is bracketed by resets so neither the popup style nor a
-/// trailing attribute from the process bleeds into the rest of the frame.
-fn draw_surface_row(frame: &mut Vec<u8>, x: u16, y: u16, row: &[u8], width: usize) {
-    let clipped = super::truncate_rendered_pane_line(row, width, &rmux_core::Utf8Config::default());
-    if clipped.is_empty() {
-        return;
-    }
-    frame.extend_from_slice(b"\x1b7\x1b[0m");
-    frame.extend_from_slice(super::cursor_position_bytes(y, x).as_slice());
-    frame.extend_from_slice(&clipped);
-    frame.extend_from_slice(b"\x1b[0m\x1b8");
 }
 
 fn draw_formatted_text(

@@ -72,26 +72,23 @@ impl OptionStore {
                     .iter()
                     .filter(|metadata| metadata.visible_in(show_scope.mask()))
                 {
-                    let query = OptionQuery::known(metadata.option());
+                    let query = OptionQuery::registered(metadata);
                     lines.extend(self.render_show_lines_for_query(
                         &show_scope,
                         &query,
                         value_only,
                         mode,
+                        false,
                     ));
                 }
             }
             ShowOptionsMode::Explicit => {
                 if let Some(node) = self.node_for_show_scope(&show_scope) {
-                    for entry in node
-                        .entries
-                        .values()
-                        .filter(|entry| entry.known_option.is_none())
-                    {
+                    for entry in node.entries.values().filter(|entry| entry.is_user()) {
                         lines.extend(render_entry_show_lines(entry, value_only));
                     }
                     for entry in node.entries.values() {
-                        if entry.known_option.is_some() {
+                        if !entry.is_user() {
                             lines.extend(render_entry_show_lines(entry, value_only));
                         }
                     }
@@ -107,42 +104,9 @@ impl OptionStore {
         scope: &ShowScope,
         query: &OptionQuery,
     ) -> Option<String> {
-        match scope {
-            ShowScope::Server => self
-                .resolve_query(&ResolveContext::Server, query)
-                .and_then(|entry| entry.value(query.index()).map(str::to_owned))
-                .or_else(|| self.default_value_as_string(query)),
-            ShowScope::SessionGlobal => self
-                .resolve_query(&ResolveContext::SessionGlobal, query)
-                .and_then(|entry| entry.value(query.index()).map(str::to_owned))
-                .or_else(|| self.default_value_as_string(query)),
-            ShowScope::WindowGlobal => self
-                .resolve_query(&ResolveContext::WindowGlobal, query)
-                .and_then(|entry| entry.value(query.index()).map(str::to_owned))
-                .or_else(|| self.default_value_as_string(query)),
-            ShowScope::Session(session_name) => self
-                .resolve_query(&ResolveContext::Session(session_name), query)
-                .and_then(|entry| entry.value(query.index()).map(str::to_owned))
-                .or_else(|| self.default_value_as_string(query)),
-            ShowScope::Window(target) => self
-                .resolve_query(
-                    &ResolveContext::Window(target.session_name(), target.window_index()),
-                    query,
-                )
-                .and_then(|entry| entry.value(query.index()).map(str::to_owned))
-                .or_else(|| self.default_value_as_string(query)),
-            ShowScope::Pane(target) => self
-                .resolve_query(
-                    &ResolveContext::Pane(
-                        target.session_name(),
-                        target.window_index(),
-                        target.pane_index(),
-                    ),
-                    query,
-                )
-                .and_then(|entry| entry.value(query.index()).map(str::to_owned))
-                .or_else(|| self.default_value_as_string(query)),
-        }
+        self.resolve_query(&scope.resolve_context(), query)
+            .and_then(|entry| entry.value(query.index()).map(str::to_owned))
+            .or_else(|| self.default_value_as_string(query))
     }
 
     fn resolved_user_values_for_show_scope(&self, scope: &ShowScope) -> Vec<(String, String)> {
@@ -164,7 +128,7 @@ impl OptionStore {
         let mut values = BTreeMap::<String, String>::new();
         for node in self.user_chain_for_context(&context) {
             for (name, entry) in &node.entries {
-                if entry.known_option.is_none() {
+                if entry.is_user() {
                     values
                         .entry(name.clone())
                         .or_insert_with(|| entry.rendered.clone());
@@ -188,7 +152,8 @@ impl OptionStore {
         } else {
             mode
         };
-        let lines = self.render_show_lines_for_query(&resolved_scope, &query, value_only, mode);
+        let lines =
+            self.render_show_lines_for_query(&resolved_scope, &query, value_only, mode, true);
         if query.is_user() && lines.is_empty() {
             return Err(RmuxError::Message(format!(
                 "invalid option: {}",
@@ -212,6 +177,7 @@ impl OptionStore {
         query: &OptionQuery,
         value_only: bool,
         mode: ShowOptionsMode,
+        named_query: bool,
     ) -> Vec<String> {
         if query.is_user() {
             return match mode {
@@ -249,7 +215,11 @@ impl OptionStore {
                     .unwrap_or_default(),
             };
             if values.is_empty() && !value_only && empty_array_shows_name(scope, mode, query) {
-                return vec![query.canonical_name().to_owned()];
+                return vec![if named_query {
+                    query.canonical_name().to_owned()
+                } else {
+                    self.show_name_for_mode(scope, query, mode)
+                }];
             }
             return values
                 .into_iter()
@@ -324,28 +294,7 @@ impl OptionStore {
         scope: &ShowScope,
         query: &OptionQuery,
     ) -> Vec<(u32, String)> {
-        let resolved = match scope {
-            ShowScope::Server => self.resolve_query(&ResolveContext::Server, query),
-            ShowScope::SessionGlobal => self.resolve_query(&ResolveContext::SessionGlobal, query),
-            ShowScope::WindowGlobal => self.resolve_query(&ResolveContext::WindowGlobal, query),
-            ShowScope::Session(session_name) => {
-                self.resolve_query(&ResolveContext::Session(session_name), query)
-            }
-            ShowScope::Window(target) => self.resolve_query(
-                &ResolveContext::Window(target.session_name(), target.window_index()),
-                query,
-            ),
-            ShowScope::Pane(target) => self.resolve_query(
-                &ResolveContext::Pane(
-                    target.session_name(),
-                    target.window_index(),
-                    target.pane_index(),
-                ),
-                query,
-            ),
-        };
-
-        resolved
+        self.resolve_query(&scope.resolve_context(), query)
             .map(OptionEntry::array_entries)
             .unwrap_or_else(|| default_array_show_values(query))
     }

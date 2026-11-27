@@ -1,6 +1,6 @@
 use std::collections::{BTreeMap, HashMap};
 
-use rmux_core::{PaneId, Session};
+use rmux_core::PaneId;
 use rmux_proto::{OptionScopeSelector, PaneTarget, RmuxError, SessionName};
 
 use super::{session_not_found, HandlerState};
@@ -12,23 +12,21 @@ impl HandlerState {
         let mut aliases = self
             .sessions
             .iter()
+            .map(|session| (session.name(), session))
             .flat_map(|(session_name, session)| {
-                session
-                    .windows()
-                    .iter()
-                    .flat_map(move |(window_index, window)| {
-                        window
-                            .panes()
-                            .iter()
-                            .filter(move |pane| pane.id() == pane_id)
-                            .map(move |pane| {
-                                PaneTarget::with_window(
-                                    session_name.clone(),
-                                    *window_index,
-                                    pane.index(),
-                                )
-                            })
-                    })
+                session.windows().flat_map(move |(window_index, window)| {
+                    window
+                        .panes()
+                        .iter()
+                        .filter(move |pane| pane.id() == pane_id)
+                        .map(move |pane| {
+                            PaneTarget::with_window(
+                                session_name.clone(),
+                                window_index,
+                                pane.index(),
+                            )
+                        })
+                })
             })
             .collect::<Vec<_>>();
         aliases.sort_by(|left, right| {
@@ -54,10 +52,14 @@ impl HandlerState {
         Ok(pane_id)
     }
 
-    pub(crate) fn synchronize_pane_alias_options_from_session(
+    pub(crate) fn synchronize_pane_alias_options_from_name(
         &mut self,
-        source: &Session,
+        name: &SessionName,
     ) -> Result<(), RmuxError> {
+        let source = self
+            .sessions
+            .session(name)
+            .ok_or_else(|| session_not_found(name))?;
         let sources = pane_option_slots(source)
             .into_values()
             .filter_map(|targets| targets.into_iter().next())
@@ -146,12 +148,7 @@ impl HandlerState {
         session_name: &SessionName,
     ) -> Result<(), RmuxError> {
         self.rekey_pane_options_after_session_change(before, session_name)?;
-        let session = self
-            .sessions
-            .session(session_name)
-            .cloned()
-            .ok_or_else(|| session_not_found(session_name))?;
-        self.synchronize_pane_alias_options_from_session(&session)
+        self.synchronize_pane_alias_options_from_name(session_name)
     }
 
     pub(crate) fn rekey_pane_options_between_snapshots(
@@ -180,7 +177,7 @@ impl HandlerState {
 }
 
 fn pane_id_for_target(
-    sessions: &rmux_core::SessionStore,
+    sessions: &rmux_core::ManagedSessionStore,
     target: &PaneTarget,
 ) -> Result<PaneId, RmuxError> {
     sessions
@@ -193,7 +190,7 @@ fn pane_id_for_target(
         })
 }
 
-fn pane_option_slots(session: &Session) -> PaneSlotSnapshot {
+fn pane_option_slots(session: rmux_core::ManagedSessionView<'_>) -> PaneSlotSnapshot {
     let mut slots = PaneSlotSnapshot::new();
     for (window_index, window) in session.windows() {
         for pane in window.panes() {
@@ -202,7 +199,7 @@ fn pane_option_slots(session: &Session) -> PaneSlotSnapshot {
                 .or_default()
                 .push(PaneTarget::with_window(
                     session.name().clone(),
-                    *window_index,
+                    window_index,
                     pane.index(),
                 ));
         }

@@ -2,11 +2,15 @@ use rmux_proto::LayoutName;
 
 use super::Window;
 
-const LAYOUT_CYCLE: [LayoutName; 5] = [
+/// The order of tmux 3.7b `layout_sets` (`layout-set.c`), which
+/// `next-layout` and `previous-layout` walk, mirrored variants included.
+const LAYOUT_CYCLE: [LayoutName; 7] = [
     LayoutName::EvenHorizontal,
     LayoutName::EvenVertical,
     LayoutName::MainHorizontal,
+    LayoutName::MainHorizontalMirrored,
     LayoutName::MainVertical,
+    LayoutName::MainVerticalMirrored,
     LayoutName::Tiled,
 ];
 
@@ -22,11 +26,27 @@ impl Window {
         main_width: Option<u16>,
         main_height: Option<u16>,
     ) {
+        self.set_layout_with_tiled_max_columns(layout, main_width, main_height, None);
+    }
+
+    /// Applies a named layout, keeping the `tiled-layout-max-columns` bound the
+    /// caller resolved so later rebuilds of this window reuse it.
+    ///
+    /// `tiled_max_columns` is `None` for no bound, which is what the option's
+    /// `0` means and what every unbounded caller passes.
+    pub(crate) fn set_layout_with_tiled_max_columns(
+        &mut self,
+        layout: LayoutName,
+        main_width: Option<u16>,
+        main_height: Option<u16>,
+        tiled_max_columns: Option<u16>,
+    ) {
         self.auto_unzoom();
         self.layout = layout;
         self.last_layout = Some(layout);
         self.requested_main_width = main_width;
         self.requested_main_height = main_height;
+        self.tiled_max_columns = tiled_max_columns;
         self.rebuild_named_layout_tree(layout);
     }
 
@@ -40,8 +60,18 @@ impl Window {
         main_width: Option<u16>,
         main_height: Option<u16>,
     ) -> LayoutName {
+        self.next_layout_with_tiled_max_columns(main_width, main_height, None)
+    }
+
+    /// Selects the next layout of the cycle, carrying the resolved bound.
+    pub(crate) fn next_layout_with_tiled_max_columns(
+        &mut self,
+        main_width: Option<u16>,
+        main_height: Option<u16>,
+        tiled_max_columns: Option<u16>,
+    ) -> LayoutName {
         let layout = next_cycle_layout(self.last_layout);
-        self.set_layout_with_main_pane_size(layout, main_width, main_height);
+        self.set_layout_with_tiled_max_columns(layout, main_width, main_height, tiled_max_columns);
         layout
     }
 
@@ -55,17 +85,29 @@ impl Window {
         main_width: Option<u16>,
         main_height: Option<u16>,
     ) -> LayoutName {
+        self.previous_layout_with_tiled_max_columns(main_width, main_height, None)
+    }
+
+    /// Selects the previous layout of the cycle, carrying the resolved bound.
+    pub(crate) fn previous_layout_with_tiled_max_columns(
+        &mut self,
+        main_width: Option<u16>,
+        main_height: Option<u16>,
+        tiled_max_columns: Option<u16>,
+    ) -> LayoutName {
         let layout = previous_cycle_layout(self.last_layout);
-        self.set_layout_with_main_pane_size(layout, main_width, main_height);
+        self.set_layout_with_tiled_max_columns(layout, main_width, main_height, tiled_max_columns);
         layout
     }
 
     pub(crate) fn recalculate_geometry(&mut self) {
+        self.reconcile_borrowed_pane_owners();
         if let Some(tree) = &mut self.layout_tree {
             tree.resize(self.size);
             self.size = tree.size();
-            tree.apply_to_panes(&mut self.panes);
+            tree.apply_to_matching_panes(&mut self.panes);
         }
+        self.apply_floating_stack_to_panes();
     }
 }
 
@@ -89,16 +131,18 @@ fn previous_cycle_layout(last_layout: Option<LayoutName>) -> LayoutName {
     }
 }
 
+/// Index of `layout` in [`LAYOUT_CYCLE`]. The match is exhaustive so a new
+/// `LayoutName` variant must be placed in the cycle before it compiles.
 fn cycle_position(layout: LayoutName) -> usize {
-    let layout = match layout {
-        LayoutName::MainHorizontalMirrored => LayoutName::MainHorizontal,
-        LayoutName::MainVerticalMirrored => LayoutName::MainVertical,
-        layout => layout,
-    };
-    LAYOUT_CYCLE
-        .iter()
-        .position(|candidate| *candidate == layout)
-        .expect("all cycle-eligible LayoutName variants must be in the tmux cycle")
+    match layout {
+        LayoutName::EvenHorizontal => 0,
+        LayoutName::EvenVertical => 1,
+        LayoutName::MainHorizontal => 2,
+        LayoutName::MainHorizontalMirrored => 3,
+        LayoutName::MainVertical => 4,
+        LayoutName::MainVerticalMirrored => 5,
+        LayoutName::Tiled => 6,
+    }
 }
 
 #[cfg(test)]
@@ -199,34 +243,72 @@ mod tests {
         assert_eq!(window.layout(), LayoutName::Tiled);
     }
 
+    /// tmux 3.7b oracle: 80x24, two `split-window`, then eight `next-layout`
+    /// visit the seven `layout_sets`, mirrored variants included, and the
+    /// eighth step wraps to even-horizontal.
     #[test]
-    fn layout_cycle_uses_tmux_order_not_enum_declaration_order() {
-        let mut window = Window::new(TerminalSize { cols: 80, rows: 24 });
+    fn next_layout_walks_all_seven_tmux_layouts_and_wraps_on_the_eighth_step() {
+        let mut window = window_with_two_panes();
+        window.split_after_position(1);
 
-        for expected in [
+        for (step, expected) in [
             LayoutName::EvenHorizontal,
             LayoutName::EvenVertical,
             LayoutName::MainHorizontal,
+            LayoutName::MainHorizontalMirrored,
             LayoutName::MainVertical,
+            LayoutName::MainVerticalMirrored,
             LayoutName::Tiled,
-        ] {
-            assert_eq!(window.next_layout(), expected);
+            LayoutName::EvenHorizontal,
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            assert_eq!(
+                window.next_layout(),
+                expected,
+                "next-layout step {}",
+                step + 1
+            );
+            assert_eq!(window.layout(), expected);
+        }
+    }
+
+    /// tmux 3.7b oracle: `previous-layout` walks the same seven layouts
+    /// backward, mirrored variants included, and wraps to tiled.
+    #[test]
+    fn previous_layout_walks_all_seven_tmux_layouts_backward_and_wraps() {
+        let mut window = window_with_two_panes();
+        window.split_after_position(1);
+        window.set_layout(LayoutName::EvenHorizontal);
+
+        for (step, expected) in [
+            LayoutName::Tiled,
+            LayoutName::MainVerticalMirrored,
+            LayoutName::MainVertical,
+            LayoutName::MainHorizontalMirrored,
+            LayoutName::MainHorizontal,
+            LayoutName::EvenVertical,
+            LayoutName::EvenHorizontal,
+            LayoutName::Tiled,
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            assert_eq!(
+                window.previous_layout(),
+                expected,
+                "previous-layout step {}",
+                step + 1
+            );
+            assert_eq!(window.layout(), expected);
         }
     }
 
     #[test]
-    fn previous_layout_cycles_backward_through_tmux_order() {
-        let mut window = Window::new(TerminalSize { cols: 80, rows: 24 });
-        window.set_layout(LayoutName::EvenHorizontal);
-
-        for expected in [
-            LayoutName::Tiled,
-            LayoutName::MainVertical,
-            LayoutName::MainHorizontal,
-            LayoutName::EvenVertical,
-            LayoutName::EvenHorizontal,
-        ] {
-            assert_eq!(window.previous_layout(), expected);
+    fn cycle_position_indexes_every_layout_of_the_cycle() {
+        for (index, layout) in super::LAYOUT_CYCLE.into_iter().enumerate() {
+            assert_eq!(super::cycle_position(layout), index, "{layout}");
         }
     }
 
@@ -271,7 +353,7 @@ mod tests {
         assert!(window.resize_pane_by(2, ResizePaneAdjustment::Right { cells: 7 }));
         assert_eq!(window.pane(0).expect("pane exists").geometry().cols(), 60);
 
-        window.set_layout(LayoutName::MainHorizontal);
+        window.set_layout(LayoutName::MainHorizontalMirrored);
         assert_eq!(window.next_layout(), LayoutName::MainVertical);
 
         assert_eq!(window.pane(0).expect("pane exists").geometry().cols(), 80);

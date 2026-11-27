@@ -1,6 +1,6 @@
 # Roadmap
 
-This roadmap covers the next year of RMUX work. It is not a promise that every
+This roadmap describes planned RMUX work. It is not a promise that every
 item will land in a specific release.
 
 ## Completed Foundations
@@ -24,11 +24,24 @@ item will land in a specific release.
 3. **Supply-chain assurance**: improve direct-download authenticity, release
    provenance, reproducibility checks, and package-manager validation.
 4. **SDK stability**: grow typed automation APIs without breaking existing
-   public crates, and keep the Python SDK aligned with the Rust SDK.
+   public Rust crates within their accepted support boundaries.
 5. **Documentation**: keep the repository docs, rmux.io docs, examples, and
    package-manager instructions consistent with the current release.
 6. **External review**: pursue independent review for the Web Share crypto and
    release process when funding and reviewer availability make it practical.
+
+## Post-1.0 Python/TypeScript SDK qualification
+
+This explicit milestone follows RMUX 1.0; no date or minor version is assigned.
+Python `librmux` and TypeScript `@rmux/sdk` are excluded from new RMUX 1.0
+artifacts, bundled implementations and positive SDK support/build/package
+manifests. Historical 0.6 publications and aliases remain identifiable.
+
+Before making a new support promise, assign package owners and approve the
+supported surface mapped to the common schema. Require exact source/package/RMUX
+bindings, installed consumers, API and migration baselines, lifecycle and
+platform evidence, release ownership and independent review. See the
+[scope and qualification obligations](scripting-sdk.md#additional-language-sdk-scope).
 
 ## Out of Scope
 

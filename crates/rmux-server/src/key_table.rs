@@ -1,6 +1,6 @@
 use rmux_core::{
     key_code_is_mouse_move, key_code_lookup_bits, key_string_lookup_string, KeyBinding, KeyCode,
-    Session, KEYC_ANY, KEYC_MASK_KEY, KEYC_MASK_MODIFIERS,
+    KEYC_ANY, KEYC_MASK_KEY, KEYC_MASK_MODIFIERS,
 };
 use rmux_proto::{OptionName, PaneTarget};
 
@@ -42,7 +42,34 @@ pub(crate) fn decode_attached_key(input: &[u8], backspace: Option<u8>) -> Attach
 }
 
 pub(crate) fn default_key_table_name(state: &HandlerState, target: &PaneTarget) -> String {
-    if target_is_in_copy_mode(state, target) {
+    key_table_name_for_mode(state, target, target_is_in_copy_mode(state, target))
+}
+
+/// Client listings and client renders sweep every session that shows a
+/// changed window. A poisoned active pane reports its session's non-copy
+/// table instead of failing every request that refreshes its clients.
+pub(crate) fn listed_session_key_table_name(
+    state: &HandlerState,
+    session: rmux_core::ManagedSessionView<'_>,
+) -> String {
+    let target = active_pane_target(session);
+    let in_copy_mode = state
+        .transcript_handle(&target)
+        .ok()
+        .is_some_and(|transcript| {
+            transcript
+                .lock_for_cross_pane_sweep()
+                .is_some_and(|transcript| transcript.copy_mode_state().is_some())
+        });
+    key_table_name_for_mode(state, &target, in_copy_mode)
+}
+
+fn key_table_name_for_mode(
+    state: &HandlerState,
+    target: &PaneTarget,
+    in_copy_mode: bool,
+) -> String {
+    if in_copy_mode {
         return match ModeKeys::parse(state.options.resolve_for_pane(
             target.session_name(),
             target.window_index(),
@@ -64,20 +91,21 @@ pub(crate) fn default_key_table_name(state: &HandlerState, target: &PaneTarget) 
 
 pub(crate) fn effective_client_key_table_name(
     state: &HandlerState,
-    session: &Session,
+    session: rmux_core::ManagedSessionView<'_>,
     transient_table: Option<&str>,
 ) -> String {
     if let Some(table_name) = transient_table {
         return table_name.to_owned();
     }
 
-    default_key_table_name(
-        state,
-        &PaneTarget::with_window(
-            session.name().clone(),
-            session.active_window_index(),
-            session.active_pane_index(),
-        ),
+    listed_session_key_table_name(state, session)
+}
+
+fn active_pane_target(session: rmux_core::ManagedSessionView<'_>) -> PaneTarget {
+    PaneTarget::with_window(
+        session.name().clone(),
+        session.active_window_index(),
+        session.active_pane_index(),
     )
 }
 
@@ -175,13 +203,7 @@ fn target_is_in_copy_mode(state: &HandlerState, target: &PaneTarget) -> bool {
     state
         .transcript_handle(target)
         .ok()
-        .is_some_and(|transcript| {
-            transcript
-                .lock()
-                .expect("pane transcript mutex must not be poisoned")
-                .copy_mode_state()
-                .is_some()
-        })
+        .is_some_and(|transcript| transcript.lock().copy_mode_state().is_some())
 }
 
 fn decode_escape_key(input: &[u8], backspace: Option<u8>) -> AttachedKeyDecode {
@@ -191,6 +213,9 @@ fn decode_escape_key(input: &[u8], backspace: Option<u8>) -> AttachedKeyDecode {
         }
         ExtendedKeyDecode::Partial => return AttachedKeyDecode::Partial,
         ExtendedKeyDecode::Invalid => {}
+    }
+    if let Some(decoded) = decode_escape_prefixed_key(input) {
+        return decoded;
     }
 
     match input.get(1).copied() {
@@ -232,6 +257,140 @@ fn decode_escape_key(input: &[u8], backspace: Option<u8>) -> AttachedKeyDecode {
     }
 
     AttachedKeyDecode::Invalid
+}
+
+/// tmux 3.7b `tty_keys_next`: Escape before a key of the terminal key tree
+/// (a CSI or SS3 sequence) is that key with an explicit Meta, which has no
+/// `KEYC_IMPLIED_META`, so the pane receives Escape then the key's own
+/// sequence, in order. A key whose sequence already implies Meta stays an
+/// Escape followed by that key. The raw table maps Escape before the xterm
+/// Home and End to M-Home and M-End with implied Meta. `None` leaves every
+/// other Escape-prefixed input to the generic Meta rules.
+fn decode_escape_prefixed_key(input: &[u8]) -> Option<AttachedKeyDecode> {
+    let [b'\x1b', inner @ ..] = input else {
+        return None;
+    };
+    let [b'\x1b', introducer, ..] = inner else {
+        return None;
+    };
+    let decoded = match *introducer {
+        b'[' => decode_xterm_csi_key(inner),
+        b'O' => decode_ss3_key(inner),
+        _ => return None,
+    };
+    match decoded {
+        AttachedKeyDecode::Partial => Some(AttachedKeyDecode::Partial),
+        AttachedKeyDecode::Invalid => None,
+        AttachedKeyDecode::Matched { size, key } => Some(if is_xterm_home_or_end(&inner[..size]) {
+            AttachedKeyDecode::Matched {
+                size: size + 1,
+                key: key | rmux_core::KEYC_META | rmux_core::KEYC_IMPLIED_META,
+            }
+        } else if key & rmux_core::KEYC_IMPLIED_META != 0 {
+            AttachedKeyDecode::Matched {
+                size: 1,
+                key: KeyCode::from(b'\x1b'),
+            }
+        } else {
+            AttachedKeyDecode::Matched {
+                size: size + 1,
+                key: key | rmux_core::KEYC_META,
+            }
+        }),
+    }
+}
+
+fn is_xterm_home_or_end(sequence: &[u8]) -> bool {
+    matches!(sequence, b"\x1b[H" | b"\x1b[F" | b"\x1bOH" | b"\x1bOF")
+}
+
+/// The CSI keys of tmux 3.7b's terminal key tree: the plain forms, then the
+/// xterm forms with a modifier parameter (`tty_default_xterm_keys`).
+fn decode_xterm_csi_key(input: &[u8]) -> AttachedKeyDecode {
+    match decode_csi_key(input) {
+        AttachedKeyDecode::Invalid => decode_xterm_modified_key(input),
+        decoded => decoded,
+    }
+}
+
+/// Longest parameter run of `CSI number ; modifier final` (`24;8`).
+const XTERM_MODIFIED_PARAMETERS_MAX: usize = 5;
+
+/// `CSI 1 ; m A..D H F P..S` and `CSI n ; m ~`, with tmux's modifier table
+/// `tty_default_xterm_modifiers` (m = 2..9; Meta is implied by the sequence).
+pub(crate) fn decode_xterm_modified_key(input: &[u8]) -> AttachedKeyDecode {
+    let parameters = input.get(2..).unwrap_or_default();
+    let Some(end) = parameters
+        .iter()
+        .position(|byte| !byte.is_ascii_digit() && *byte != b';')
+    else {
+        return if parameters.len() <= XTERM_MODIFIED_PARAMETERS_MAX {
+            AttachedKeyDecode::Partial
+        } else {
+            AttachedKeyDecode::Invalid
+        };
+    };
+    let Some((number, modifier)) = std::str::from_utf8(&parameters[..end])
+        .ok()
+        .and_then(|text| text.split_once(';'))
+    else {
+        return AttachedKeyDecode::Invalid;
+    };
+    let key_name = match (number, parameters[end]) {
+        ("1", b'A') => "Up",
+        ("1", b'B') => "Down",
+        ("1", b'C') => "Right",
+        ("1", b'D') => "Left",
+        ("1", b'H') => "Home",
+        ("1", b'F') => "End",
+        ("1", b'P') => "F1",
+        ("1", b'Q') => "F2",
+        ("1", b'R') => "F3",
+        ("1", b'S') => "F4",
+        ("15", b'~') => "F5",
+        ("17", b'~') => "F6",
+        ("18", b'~') => "F7",
+        ("19", b'~') => "F8",
+        ("20", b'~') => "F9",
+        ("21", b'~') => "F10",
+        ("23", b'~') => "F11",
+        ("24", b'~') => "F12",
+        ("5", b'~') => "PPage",
+        ("6", b'~') => "NPage",
+        ("2", b'~') => "IC",
+        ("3", b'~') => "DC",
+        _ => return AttachedKeyDecode::Invalid,
+    };
+    let Some(modifiers) = modifier
+        .parse::<u8>()
+        .ok()
+        .and_then(xterm_parameter_modifiers)
+    else {
+        return AttachedKeyDecode::Invalid;
+    };
+    key_string_lookup_string(key_name).map_or(AttachedKeyDecode::Invalid, |key| {
+        AttachedKeyDecode::Matched {
+            size: 2 + end + 1,
+            key: key | modifiers,
+        }
+    })
+}
+
+fn xterm_parameter_modifiers(parameter: u8) -> Option<KeyCode> {
+    let bits = parameter
+        .checked_sub(1)
+        .filter(|bits| (1..=8).contains(bits))?;
+    let mut modifiers = 0;
+    if bits & 1 != 0 {
+        modifiers |= rmux_core::KEYC_SHIFT;
+    }
+    if bits & (2 | 8) != 0 {
+        modifiers |= rmux_core::KEYC_META | rmux_core::KEYC_IMPLIED_META;
+    }
+    if bits & 4 != 0 {
+        modifiers |= rmux_core::KEYC_CTRL;
+    }
+    Some(modifiers)
 }
 
 fn decode_csi_key(input: &[u8]) -> AttachedKeyDecode {
@@ -340,7 +499,7 @@ fn control_alpha_key(byte: u8) -> Option<KeyCode> {
 mod tests {
     use super::{decode_attached_key, effective_client_key_table_name, AttachedKeyDecode};
     use crate::pane_terminals::HandlerState;
-    use rmux_core::{key_code_lookup_bits, key_string_lookup_string, Session};
+    use rmux_core::{key_code_lookup_bits, key_string_lookup_string, KEYC_META};
     use rmux_proto::{OptionName, ScopeSelector, SessionName, SetOptionMode, TerminalSize};
 
     fn assert_attached_key(sequence: &[u8], expected_name: &str) {
@@ -358,7 +517,10 @@ mod tests {
     #[test]
     fn effective_client_table_uses_session_default_beneath_transient_table() {
         let session_name = SessionName::new("alpha").expect("valid session name");
-        let session = Session::new(session_name.clone(), TerminalSize { cols: 80, rows: 24 });
+        let session = crate::session_fixture::SessionFixture::new(
+            session_name.clone(),
+            TerminalSize { cols: 80, rows: 24 },
+        );
         let mut state = HandlerState::default();
         state
             .options
@@ -371,11 +533,11 @@ mod tests {
             .expect("session key-table option should be accepted");
 
         assert_eq!(
-            effective_client_key_table_name(&state, &session, None),
+            effective_client_key_table_name(&state, session.view(), None),
             "off"
         );
         assert_eq!(
-            effective_client_key_table_name(&state, &session, Some("prefix")),
+            effective_client_key_table_name(&state, session.view(), Some("prefix")),
             "prefix"
         );
     }
@@ -468,6 +630,98 @@ mod tests {
                 key_code_lookup_bits(key),
                 key_code_lookup_bits(key_string_lookup_string(name).expect("key parses")),
                 "{name} key bits"
+            );
+        }
+    }
+
+    /// tmux 3.7b `tty_keys_next`: Escape then a CSI or SS3 key is that key
+    /// with an explicit Meta, consumed together.
+    #[test]
+    fn attached_escape_before_a_csi_or_ss3_key_is_that_key_with_explicit_meta() {
+        for (sequence, name) in [
+            (b"\x1b\x1b[15~".as_slice(), "F5"),
+            (b"\x1b\x1b[24~".as_slice(), "F12"),
+            (b"\x1b\x1b[3~".as_slice(), "DC"),
+            (b"\x1b\x1b[6~".as_slice(), "NPage"),
+            (b"\x1b\x1b[A".as_slice(), "Up"),
+            (b"\x1b\x1bOA".as_slice(), "Up"),
+            (b"\x1b\x1bOP".as_slice(), "F1"),
+            (b"\x1b\x1b[Z".as_slice(), "BTab"),
+            (b"\x1b\x1b[1;2A".as_slice(), "S-Up"),
+            (b"\x1b\x1b[1;5D".as_slice(), "C-Left"),
+            (b"\x1b\x1b[15;2~".as_slice(), "S-F5"),
+            (b"\x1b\x1b[3;5~".as_slice(), "C-DC"),
+            (b"\x1b\x1b[1;2P".as_slice(), "S-F1"),
+        ] {
+            let AttachedKeyDecode::Matched { size, key } = decode_attached_key(sequence, None)
+            else {
+                panic!("Escape then {name} should decode from {sequence:?}");
+            };
+            assert_eq!(size, sequence.len(), "Escape then {name} consumed size");
+            assert_eq!(
+                key,
+                key_string_lookup_string(name).expect("key parses") | KEYC_META,
+                "Escape then {name} is {name} with Meta and without implied Meta"
+            );
+        }
+    }
+
+    #[test]
+    fn attached_escape_before_an_implied_meta_key_stays_an_escape_key() {
+        for sequence in [b"\x1b\x1b[1;3A".as_slice(), b"\x1b\x1b[15;3~".as_slice()] {
+            assert_eq!(
+                decode_attached_key(sequence, None),
+                AttachedKeyDecode::Matched { size: 1, key: 0x1b },
+                "{sequence:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn attached_escape_before_xterm_home_and_end_is_implied_meta_like_tmux() {
+        for (sequence, name) in [
+            (b"\x1b\x1b[H".as_slice(), "M-Home"),
+            (b"\x1b\x1b[F".as_slice(), "M-End"),
+            (b"\x1b\x1bOH".as_slice(), "M-Home"),
+            (b"\x1b\x1bOF".as_slice(), "M-End"),
+        ] {
+            assert_eq!(
+                decode_attached_key(sequence, None),
+                AttachedKeyDecode::Matched {
+                    size: 4,
+                    key: key_string_lookup_string(name).expect("key parses"),
+                },
+                "{sequence:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn attached_escape_before_an_unfinished_key_waits_and_other_meta_input_is_unchanged() {
+        for partial in [
+            b"\x1b\x1b".as_slice(),
+            b"\x1b\x1b[".as_slice(),
+            b"\x1b\x1b[15".as_slice(),
+            b"\x1b\x1b[15;".as_slice(),
+            b"\x1b\x1b[1;2".as_slice(),
+            b"\x1b\x1bO".as_slice(),
+        ] {
+            assert_eq!(
+                decode_attached_key(partial, None),
+                AttachedKeyDecode::Partial,
+                "{partial:?}"
+            );
+        }
+        for invalid in [
+            b"\x1b\x1ba".as_slice(),
+            b"\x1b\x1b[200~".as_slice(),
+            b"\x1b\x1b[1;2~".as_slice(),
+            b"\x1b\x1b[1;10A".as_slice(),
+        ] {
+            assert_eq!(
+                decode_attached_key(invalid, None),
+                AttachedKeyDecode::Invalid,
+                "{invalid:?}"
             );
         }
     }

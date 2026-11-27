@@ -3,6 +3,7 @@
 mod common;
 
 use std::error::Error;
+use std::future::{Future, IntoFuture};
 use std::io;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
@@ -18,7 +19,8 @@ use rmux_proto::{
     CAPABILITY_SDK_WAITS_ARMED,
 };
 use rmux_sdk::{
-    EnsureSession, Pane, PaneRef, RmuxBuilder, RmuxError, SessionName, TerminalLoadState,
+    EnsureSession, Pane, PaneRef, RmuxBuilder, RmuxError, SessionName, SplitDirection,
+    TerminalLoadState,
 };
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{UnixListener, UnixStream};
@@ -73,10 +75,10 @@ async fn wait_for_rejects_empty_needles_before_daemon_wait() -> TestResult {
         .await
         .expect_err("empty byte waits must be rejected locally");
     match error {
-        RmuxError::Protocol {
-            source: rmux_proto::RmuxError::Server(message),
-            ..
-        } => assert!(message.contains("must not be empty")),
+        RmuxError::Protocol { source, .. } if source.server_message().is_some() => {
+            let message = source.server_message().unwrap();
+            assert!(message.contains("must not be empty"))
+        }
         other => panic!("expected local protocol error, got {other:?}"),
     }
     drop(pane);
@@ -229,10 +231,10 @@ async fn wait_for_text_rejects_empty_needles_before_snapshot() -> TestResult {
         .await
         .expect_err("empty text waits must be rejected locally");
     match error {
-        RmuxError::Protocol {
-            source: rmux_proto::RmuxError::Server(message),
-            ..
-        } => assert!(message.contains("text must not be empty")),
+        RmuxError::Protocol { source, .. } if source.server_message().is_some() => {
+            let message = source.server_message().unwrap();
+            assert!(message.contains("text must not be empty"))
+        }
         other => panic!("expected local protocol error, got {other:?}"),
     }
     drop(pane);
@@ -356,12 +358,10 @@ async fn wait_for_text_observes_rendered_daemon_output() -> TestResult {
     let _lock = LIVE_DAEMON_LOCK.lock().await;
     let harness = Harness::start("text-live").await?;
     let rmux = harness.rmux();
-    let session = EnsureSession::named(session_name())
-        .create_only()
-        .ensure(&rmux)
-        .await?;
+    let session = live_session(&harness)?.ensure(&rmux).await?;
     let pane = session.pane(0, 0);
     let marker = "rmux_sdk_wait_text_live";
+    wait_for_live_shell(&pane).await?;
 
     pane.send_text("printf 'rmux_sdk_wait_text_%s\\n' live")
         .await?;
@@ -371,6 +371,117 @@ async fn wait_for_text_observes_rendered_daemon_output() -> TestResult {
         pane.snapshot().await?.visible_text().contains(marker),
         "wait_for_text returned before the daemon-rendered marker was visible"
     );
+
+    harness.finish().await
+}
+
+/// The live pane's shell, `HOME` and `ENV` come from [`live_session`], not from
+/// whoever runs the tests.
+///
+/// The daemon exports the shell it resolved, so the pane can report what
+/// spawned it. `HOME` is checked too, so this stays red when the launcher's own
+/// `SHELL` happens to be `/bin/sh`.
+#[tokio::test]
+async fn live_wait_session_pins_the_pane_environment() -> TestResult {
+    let _lock = LIVE_DAEMON_LOCK.lock().await;
+    let harness = Harness::start("env-pin").await?;
+    let rmux = harness.rmux();
+    let session = live_session(&harness)?.ensure(&rmux).await?;
+    let pane = session.pane(0, 0);
+    let home = harness.pane_home()?;
+    wait_for_live_shell(&pane).await?;
+
+    // The echo carries `%s`, so only the shell's own output can carry the values.
+    pane.send_text("printf 'Pinned=%s|%s|%s.\\n' \"$SHELL\" \"$HOME\" \"$ENV\"")
+        .await?;
+    pane.send_key("Enter").await?;
+    pane.wait_for_text(format!("Pinned={LIVE_PANE_SHELL}|{}|.", home.display()))
+        .await?;
+
+    harness.finish().await
+}
+
+/// `close` leaves no exit status, so the pane never settled: like `rmux
+/// wait-pane --quiet`, the wait must fail instead of reporting the vacant
+/// slot's empty snapshot as quiet while the session lives on.
+#[tokio::test]
+async fn quiet_load_state_fails_closed_when_observed_pane_is_closed() -> TestResult {
+    let _lock = LIVE_DAEMON_LOCK.lock().await;
+    let harness = Harness::start("quiet-closed").await?;
+    let rmux = harness.rmux();
+    let session = live_session(&harness)?.ensure(&rmux).await?;
+    let observed = session.pane(0, 0).split(SplitDirection::Right).await?;
+    let observed_id = observed.id().await?.expect("the split pane is live");
+    let closer = observed.clone();
+
+    let started = Instant::now();
+    let (outcome, closed) = tokio::join!(
+        observed
+            .wait_for_load_state(TerminalLoadState::Quiet)
+            .stable_for(Duration::from_secs(2))
+            .timeout(Duration::from_secs(10))
+            .into_future(),
+        async move {
+            tokio::time::sleep(Duration::from_millis(300)).await;
+            closer.close().await
+        }
+    );
+    closed?;
+    match outcome {
+        Err(RmuxError::PaneNotFound {
+            session_name,
+            pane_id,
+            ..
+        }) => {
+            assert_eq!(session_name, self::session_name());
+            assert_eq!(pane_id, observed_id);
+        }
+        other => panic!("a closed pane must fail the quiet wait, got {other:?}"),
+    }
+    assert!(
+        started.elapsed() < Duration::from_secs(2),
+        "the closed pane must fail the wait before its quiet window elapses"
+    );
+    assert!(session.exists().await?, "the session must outlive the pane");
+
+    harness.finish().await
+}
+
+/// A process exit is a final state: like `rmux wait-pane --quiet`, it ends the
+/// wait at once, with or without a surviving session, and the snapshot keeps
+/// the documented empty revision-0 shape of a pane that is no longer listed.
+#[tokio::test]
+async fn quiet_load_state_completes_when_observed_process_exits() -> TestResult {
+    let _lock = LIVE_DAEMON_LOCK.lock().await;
+    let harness = Harness::start("quiet-exit").await?;
+    let rmux = harness.rmux();
+    let session = live_session(&harness)?.ensure(&rmux).await?;
+    let first = session.pane(0, 0);
+    let observed = first.split(SplitDirection::Right).await?;
+
+    for (pane, session_survives) in [(observed, true), (first, false)] {
+        // Arm the wait on the live pane first: a pane already gone when the
+        // wait begins is a vacant slot, which keeps its full quiet window.
+        let started = Instant::now();
+        let (outcome, sent) = tokio::join!(
+            pane.wait_for_load_state(TerminalLoadState::Quiet)
+                .stable_for(Duration::from_secs(5))
+                .timeout(Duration::from_secs(10))
+                .into_future(),
+            async {
+                tokio::time::sleep(Duration::from_millis(300)).await;
+                pane.send_text("exit 7").await?;
+                pane.send_key("Enter").await
+            }
+        );
+        sent?;
+        assert_eq!(outcome?, rmux_sdk::PaneSnapshot::default());
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "a process exit must end the wait before its quiet window elapses"
+        );
+        assert_eq!(session.exists().await?, session_survives);
+    }
 
     harness.finish().await
 }
@@ -518,163 +629,155 @@ async fn expect_visible_text_rejects_invalid_regex_before_polling() -> TestResul
 
 #[tokio::test]
 async fn expect_visible_text_timeout_includes_last_snapshot() -> TestResult {
-    let socket = TestSocket::new("visible-timeout")?;
-    let listener = UnixListener::bind(socket.path())?;
-    let server = tokio::spawn(async move {
-        let mut peer = accept_peer(&listener).await?;
-        while let Some(request) = peer.read_request().await? {
-            match request {
-                Request::ListPanes(_) => {
-                    peer.write_response(Response::ListPanes(ListPanesResponse {
-                        output: CommandOutput::from_stdout(b"0:0:%1\n".to_vec()),
-                    }))
-                    .await?;
-                }
-                Request::Handshake(_) => {
-                    peer.write_response(Response::Handshake(
-                        rmux_proto::HandshakeResponse::current(),
-                    ))
-                    .await?;
-                }
-                Request::PaneSnapshotRef(_) => {
-                    peer.write_response(Response::PaneSnapshot(snapshot_response(
-                        "last visible screen",
-                        7,
-                    )))
-                    .await?;
-                }
-                other => panic!("visible wait should only poll snapshots, got {other:?}"),
-            }
-        }
-        TestResult::Ok(())
-    });
+    // A loaded host can spend a short deadline before the first snapshot
+    // arrives. That attempt times out without a last snapshot to report, so
+    // the wait is retried with a longer deadline until one snapshot lands.
+    for timeout in widening_deadlines(Duration::from_millis(35)) {
+        let socket = TestSocket::new("visible-timeout")?;
+        let listener = UnixListener::bind(socket.path())?;
+        let server = tokio::spawn(serve_snapshots_until_client_leaves(listener));
 
-    let pane = pane_for(socket.path(), Duration::from_secs(1)).await?;
-    let error = pane
-        .expect_visible_text()
-        .to_contain("never")
-        .timeout(Duration::from_millis(35))
-        .poll_interval(Duration::from_millis(10))
-        .await
-        .expect_err("missing visible text must time out");
-    let RmuxError::WaitTimeout { source, .. } = error else {
-        return Err(format!("expected visible wait timeout, got {error:?}").into());
-    };
-    assert_eq!(source.matcher(), "contain `never`");
-    assert!(source.last_visible_text().contains("last visible screen"));
-    drop(pane);
-    server.await??;
-    Ok(())
+        let pane = pane_for(socket.path(), Duration::from_secs(1)).await?;
+        let error = pane
+            .expect_visible_text()
+            .to_contain("never")
+            .timeout(timeout)
+            .poll_interval(Duration::from_millis(10))
+            .await
+            .expect_err("missing visible text must time out");
+        drop(pane);
+        server.await??;
+        let RmuxError::WaitTimeout { source, .. } = error else {
+            assert_timed_out(error, "wait for pane snapshot text");
+            continue;
+        };
+        assert_eq!(source.matcher(), "contain `never`");
+        assert!(source.last_visible_text().contains("last visible screen"));
+        return Ok(());
+    }
+    Err("every visible wait deadline expired before the first snapshot".into())
 }
 
 #[tokio::test]
 async fn visible_text_timeout_bounds_a_stalled_snapshot_rpc() -> TestResult {
-    let socket = TestSocket::new("visible-stalled-snapshot")?;
-    let listener = UnixListener::bind(socket.path())?;
-    let server = tokio::spawn(hold_first_snapshot_response(listener));
-
-    let pane = pane_for(socket.path(), Duration::from_secs(1)).await?;
-    let error = tokio::time::timeout(
-        Duration::from_millis(500),
-        pane.expect_visible_text()
-            .to_contain("never")
-            .timeout(Duration::from_millis(30)),
+    assert_wait_bounds_a_stalled_snapshot(
+        "visible-stalled-snapshot",
+        "wait for pane snapshot text",
+        |pane, timeout| async move {
+            pane.expect_visible_text()
+                .to_contain("never")
+                .timeout(timeout)
+                .await
+                .map(drop)
+        },
     )
     .await
-    .expect("the public wait deadline must beat the external watchdog")
-    .expect_err("a stalled snapshot must time out");
-    assert_timed_out(error, "wait for pane snapshot text");
-    drop(pane);
-    server.await??;
-    Ok(())
 }
 
 #[tokio::test]
 async fn load_state_timeout_bounds_a_stalled_snapshot_rpc() -> TestResult {
-    let socket = TestSocket::new("load-state-stalled-snapshot")?;
-    let listener = UnixListener::bind(socket.path())?;
-    let server = tokio::spawn(hold_first_snapshot_response(listener));
-
-    let pane = pane_for(socket.path(), Duration::from_secs(1)).await?;
-    let error = tokio::time::timeout(
-        Duration::from_millis(500),
-        pane.wait_for_load_state(TerminalLoadState::Quiet)
-            .timeout(Duration::from_millis(30)),
+    assert_wait_bounds_a_stalled_snapshot(
+        "load-state-stalled-snapshot",
+        "wait for terminal load-state snapshot",
+        |pane, timeout| async move {
+            pane.wait_for_load_state(TerminalLoadState::Quiet)
+                .timeout(timeout)
+                .await
+                .map(drop)
+        },
     )
     .await
-    .expect("the public wait deadline must beat the external watchdog")
-    .expect_err("a stalled snapshot must time out");
-    assert_timed_out(error, "wait for terminal load-state snapshot");
-    drop(pane);
-    server.await??;
-    Ok(())
 }
 
 #[tokio::test]
 async fn locator_timeout_bounds_a_stalled_snapshot_rpc() -> TestResult {
-    let socket = TestSocket::new("locator-stalled-snapshot")?;
-    let listener = UnixListener::bind(socket.path())?;
-    let server = tokio::spawn(hold_first_snapshot_response(listener));
-
-    let pane = pane_for(socket.path(), Duration::from_secs(1)).await?;
-    let error = tokio::time::timeout(
-        Duration::from_millis(500),
-        pane.get_by_text("never")
-            .wait_for()
-            .timeout(Duration::from_millis(30)),
+    assert_wait_bounds_a_stalled_snapshot(
+        "locator-stalled-snapshot",
+        "wait for locator snapshot",
+        |pane, timeout| async move {
+            pane.get_by_text("never")
+                .wait_for()
+                .timeout(timeout)
+                .await
+                .map(drop)
+        },
     )
     .await
-    .expect("the public wait deadline must beat the external watchdog")
-    .expect_err("a stalled snapshot must time out");
-    assert_timed_out(error, "wait for locator snapshot");
-    drop(pane);
-    server.await??;
-    Ok(())
 }
 
 #[tokio::test]
 async fn locator_assertion_timeout_bounds_a_stalled_snapshot_rpc() -> TestResult {
-    let socket = TestSocket::new("locator-assert-stalled-snapshot")?;
-    let listener = UnixListener::bind(socket.path())?;
-    let server = tokio::spawn(hold_first_snapshot_response(listener));
-
-    let pane = pane_for(socket.path(), Duration::from_secs(1)).await?;
-    let error = tokio::time::timeout(
-        Duration::from_millis(500),
-        pane.get_by_text("never")
-            .expect()
-            .to_be_visible()
-            .timeout(Duration::from_millis(30)),
+    assert_wait_bounds_a_stalled_snapshot(
+        "locator-assert-stalled-snapshot",
+        "wait for locator snapshot",
+        |pane, timeout| async move {
+            pane.get_by_text("never")
+                .expect()
+                .to_be_visible()
+                .timeout(timeout)
+                .await
+                .map(drop)
+        },
     )
     .await
-    .expect("the public wait deadline must beat the external watchdog")
-    .expect_err("a stalled snapshot must time out");
-    assert_timed_out(error, "wait for locator snapshot");
-    drop(pane);
-    server.await??;
-    Ok(())
 }
 
 #[tokio::test]
 async fn locator_action_timeout_bounds_a_stalled_snapshot_rpc() -> TestResult {
-    let socket = TestSocket::new("locator-action-stalled-snapshot")?;
-    let listener = UnixListener::bind(socket.path())?;
-    let server = tokio::spawn(hold_first_snapshot_response(listener));
-
-    let pane = pane_for(socket.path(), Duration::from_secs(1)).await?;
-    let error = tokio::time::timeout(
-        Duration::from_millis(500),
-        pane.get_by_text("never")
-            .timeout(Duration::from_millis(30))
-            .click(),
+    assert_wait_bounds_a_stalled_snapshot(
+        "locator-action-stalled-snapshot",
+        "wait for locator snapshot",
+        |pane, timeout| async move {
+            pane.get_by_text("never")
+                .timeout(timeout)
+                .click()
+                .await
+                .map(drop)
+        },
     )
     .await
-    .expect("the public wait deadline must beat the external watchdog")
-    .expect_err("a stalled snapshot must time out");
-    assert_timed_out(error, "wait for locator snapshot");
-    drop(pane);
-    server.await??;
-    Ok(())
+}
+
+/// Proves that a public wait deadline bounds a snapshot RPC the daemon never
+/// answers.
+///
+/// The deadline also covers the identity lookup and handshake that precede
+/// the snapshot RPC. On a loaded host it can expire there, and the client
+/// leaves before the stall exists. That attempt must still time out with the
+/// typed error, but it proves nothing about the stall, so the scenario is
+/// replayed with a longer deadline until the snapshot RPC is reached.
+async fn assert_wait_bounds_a_stalled_snapshot<W, F>(
+    label: &str,
+    operation: &str,
+    wait: W,
+) -> TestResult
+where
+    W: Fn(Pane, Duration) -> F,
+    F: Future<Output = Result<(), RmuxError>>,
+{
+    for timeout in widening_deadlines(Duration::from_millis(30)) {
+        let socket = TestSocket::new(label)?;
+        let listener = UnixListener::bind(socket.path())?;
+        let server = tokio::spawn(hold_first_snapshot_response(listener, timeout * 5));
+
+        let pane = pane_for(socket.path(), Duration::from_secs(1)).await?;
+        let error = tokio::time::timeout(timeout * 16, wait(pane.clone(), timeout))
+            .await
+            .expect("the public wait deadline must beat the external watchdog")
+            .expect_err("a stalled snapshot must time out");
+        assert_timed_out(error, operation);
+        drop(pane);
+        if server.await?? == SnapshotRpc::Stalled {
+            return Ok(());
+        }
+    }
+    Err(format!("{label}: every wait deadline expired before the snapshot RPC").into())
+}
+
+/// Deadlines for a timing scenario: the nominal one first, then doublings
+/// for a host too loaded to reach the scenario in time.
+fn widening_deadlines(nominal: Duration) -> impl Iterator<Item = Duration> {
+    (0..5).map(move |doublings| nominal * (1 << doublings))
 }
 
 async fn pane_for(socket_path: &Path, timeout: Duration) -> TestResult<Pane> {
@@ -691,6 +794,63 @@ fn target() -> PaneRef {
 
 fn session_name() -> SessionName {
     SessionName::new("wait").expect("valid test session name")
+}
+
+/// Shell every live-daemon pane in this file runs.
+const LIVE_PANE_SHELL: &str = "/bin/sh";
+
+/// Session the live-daemon tests drive, with a pane that owes nothing to the
+/// account running the tests.
+///
+/// The first pane of a new session starts from the environment of the client
+/// that creates it, here this test process read by pid, and the session's `-e`
+/// assignments override it. Its shell is the `default-shell` option, else that
+/// environment's `SHELL`, else the password database. Left alone, the pane runs
+/// the launcher's shell with the account's startup files, and the two-second
+/// text wait times their startup instead of rmux. `SHELL` alone is not enough:
+/// the pane is a login shell, so `/bin/sh` still reads `$HOME/.profile`, and an
+/// interactive `sh` sources the file named by `ENV`. Both lead nowhere here.
+///
+/// An empty `HISTFILE` keeps the shell off the disk when it leaves: after
+/// `exit` prints `logout`, an interactive shell still writes and truncates its
+/// history file before it closes the PTY, so a slow disk would keep an exited
+/// pane listed and time that write instead of the daemon's exit handling.
+fn live_session(harness: &Harness) -> TestResult<EnsureSession> {
+    Ok(EnsureSession::named(session_name())
+        .create_only()
+        .environment(live_pane_environment(&harness.pane_home()?)))
+}
+
+fn live_pane_environment(home: &Path) -> [String; 4] {
+    [
+        format!("SHELL={LIVE_PANE_SHELL}"),
+        format!("HOME={}", home.display()),
+        "ENV=".to_owned(),
+        "HISTFILE=".to_owned(),
+    ]
+}
+
+/// Bound for a live pane's shell to come up and run its first line.
+///
+/// Pinning `HOME` and `ENV` leaves the system startup: `exec` of `/bin/sh`,
+/// `/etc/profile` (`path_helper` on macOS) and the disk they read. A stall
+/// there is not rmux's, so it gets this bound, not the two-second one of
+/// [`Harness::rmux`].
+const LIVE_SHELL_STARTUP_TIMEOUT: Duration = Duration::from_secs(60);
+
+/// Returns once the pane's shell has read and run a line.
+///
+/// Text typed afterwards is read at once, so a two-second wait that follows
+/// times rmux's input, rendering and snapshots, not the shell's startup.
+async fn wait_for_live_shell(pane: &Pane) -> TestResult {
+    // The echo carries `%s`, so only the shell's own output reads `Ready.`.
+    pane.send_text("printf 'Ready%s\\n' .").await?;
+    pane.send_key("Enter").await?;
+    pane.expect_visible_text()
+        .to_contain("Ready.")
+        .timeout(LIVE_SHELL_STARTUP_TIMEOUT)
+        .await?;
+    Ok(())
 }
 
 async fn accept_peer(listener: &UnixListener) -> TestResult<Peer> {
@@ -857,30 +1017,90 @@ async fn expect_snapshot(peer: &mut Peer, text: &str, revision: u64) -> TestResu
         .await
 }
 
-async fn hold_first_snapshot_response(listener: UnixListener) -> TestResult {
+async fn serve_snapshots_until_client_leaves(listener: UnixListener) -> TestResult {
     let mut peer = accept_peer(&listener).await?;
-    expect_list_panes(&mut peer).await?;
-    let mut request = peer.expect_request().await?;
+    while let Some(request) = peer.next_request_unless_departed().await? {
+        let response = match request {
+            Request::ListPanes(_) => Response::ListPanes(ListPanesResponse {
+                output: CommandOutput::from_stdout(b"0:0:%1\n".to_vec()),
+            }),
+            Request::Handshake(_) => Response::Handshake(HandshakeResponse::current()),
+            Request::PaneSnapshotRef(_) => {
+                Response::PaneSnapshot(snapshot_response("last visible screen", 7))
+            }
+            other => panic!("visible wait should only poll snapshots, got {other:?}"),
+        };
+        // The client leaves at its deadline, possibly with a snapshot still
+        // in flight; this fake daemon then has nobody left to answer.
+        if !peer.write_response_unless_departed(response).await? {
+            break;
+        }
+    }
+    Ok(())
+}
+
+/// How far a client got before leaving [`hold_first_snapshot_response`].
+#[derive(Debug, PartialEq, Eq)]
+enum SnapshotRpc {
+    /// The snapshot RPC arrived and stayed unanswered for the whole hold.
+    Stalled,
+    /// The client left before sending the snapshot RPC.
+    NotReached,
+}
+
+async fn hold_first_snapshot_response(
+    listener: UnixListener,
+    hold: Duration,
+) -> TestResult<SnapshotRpc> {
+    let mut peer = accept_peer(&listener).await?;
+    if !reach_first_snapshot_request(&mut peer).await? {
+        return Ok(SnapshotRpc::NotReached);
+    }
+    tokio::time::sleep(hold).await;
+    Ok(SnapshotRpc::Stalled)
+}
+
+/// Answers the requests that precede a wait's first pane snapshot RPC.
+///
+/// Returns `false` when the client leaves before that RPC.
+async fn reach_first_snapshot_request(peer: &mut Peer) -> TestResult<bool> {
+    let Some(request) = peer.next_request_unless_departed().await? else {
+        return Ok(false);
+    };
+    let Request::ListPanes(list) = &request else {
+        panic!("snapshot wait must list panes before capture, got {request:?}");
+    };
+    assert_eq!(list.target, session_name());
+    assert!(
+        matches!(list.target_window_index, Some(0) | None),
+        "snapshot identity lookup must stay in the target session"
+    );
+    let Some(mut request) = peer.answer_list_panes_then_read().await? else {
+        return Ok(false);
+    };
     if let Request::ListPanes(list) = &request {
         assert_eq!(list.target, session_name());
         assert_eq!(list.target_window_index, None);
-        peer.write_response(Response::ListPanes(ListPanesResponse {
-            output: CommandOutput::from_stdout(b"0:0:%1\n".to_vec()),
-        }))
-        .await?;
-        request = peer.expect_request().await?;
+        let Some(next) = peer.answer_list_panes_then_read().await? else {
+            return Ok(false);
+        };
+        request = next;
     }
     if matches!(request, Request::Handshake(_)) {
-        peer.write_response(Response::Handshake(HandshakeResponse::current()))
-            .await?;
-        request = peer.expect_request().await?;
+        let handshake = Response::Handshake(HandshakeResponse::current());
+        if !peer.write_response_unless_departed(handshake).await? {
+            return Ok(false);
+        }
+        let Some(next) = peer.next_request_unless_departed().await? else {
+            return Ok(false);
+        };
+        request = next;
     }
     assert!(
         matches!(request, Request::PaneSnapshotRef(_)),
         "snapshot wait must issue a pane snapshot RPC, got {request:?}"
     );
-    tokio::time::sleep(Duration::from_millis(150)).await;
-    Ok(())
+    Ok(true)
 }
 
 fn snapshot_response(text: &str, revision: u64) -> PaneSnapshotResponse {
@@ -995,6 +1215,45 @@ impl Peer {
         self.stream.flush().await?;
         Ok(())
     }
+
+    /// Reads the next request, or `None` once the client has left.
+    ///
+    /// A client that leaves with responses still unread resets the
+    /// connection instead of closing it, so a reset also means departure.
+    async fn next_request_unless_departed(&mut self) -> TestResult<Option<Request>> {
+        match self.read_request().await {
+            Err(error) if is_client_departure(error.as_ref()) => Ok(None),
+            result => result,
+        }
+    }
+
+    /// Writes a response, or returns `false` when the client has left.
+    async fn write_response_unless_departed(&mut self, response: Response) -> TestResult<bool> {
+        match self.write_response(response).await {
+            Ok(()) => Ok(true),
+            Err(error) if is_client_departure(error.as_ref()) => Ok(false),
+            Err(error) => Err(error),
+        }
+    }
+
+    async fn answer_list_panes_then_read(&mut self) -> TestResult<Option<Request>> {
+        let list = Response::ListPanes(ListPanesResponse {
+            output: CommandOutput::from_stdout(b"0:0:%1\n".to_vec()),
+        });
+        if !self.write_response_unless_departed(list).await? {
+            return Ok(None);
+        }
+        self.next_request_unless_departed().await
+    }
+}
+
+fn is_client_departure(error: &(dyn Error + Send + Sync + 'static)) -> bool {
+    error.downcast_ref::<io::Error>().is_some_and(|error| {
+        matches!(
+            error.kind(),
+            io::ErrorKind::ConnectionReset | io::ErrorKind::BrokenPipe
+        )
+    })
 }
 
 struct TestSocket {
@@ -1030,7 +1289,7 @@ impl Drop for TestSocket {
 }
 
 struct Harness {
-    _root: TestRoot,
+    root: TestRoot,
     socket_path: PathBuf,
     child: Option<Child>,
 }
@@ -1049,10 +1308,17 @@ impl Harness {
         wait_for_daemon_ready(&socket_path, &mut child).await?;
 
         Ok(Self {
-            _root: root,
+            root,
             socket_path,
             child: Some(child),
         })
+    }
+
+    /// Empty `HOME` for live panes, so no account startup file is reachable.
+    fn pane_home(&self) -> TestResult<PathBuf> {
+        let home = self.root.path().join("home");
+        std::fs::create_dir_all(&home)?;
+        Ok(home)
     }
 
     fn rmux(&self) -> rmux_sdk::Rmux {

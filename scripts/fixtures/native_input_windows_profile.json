@@ -1,0 +1,468 @@
+{
+  "cells": [
+    "sdk",
+    "proto"
+  ],
+  "origin": {
+    "assessment_sha256": "09012d971f75671a0a49111b02f4f91d6263c4f6d7f1217444d00fd86578759e",
+    "source": "SDK071 native-assessment-v3; four shared missing loads also confirmed for proto by review112",
+    "historical_native_credit": false
+  },
+  "loads": [
+    {
+      "path": "C:\\Users\\example\\.rustup\\toolchains\\1.96.1-x86_64-pc-windows-msvc\\bin\\cargo.exe",
+      "role": "$TOOLCHAIN/bin/cargo.exe",
+      "observed_pid": 9652,
+      "observed_sequence": 2206170,
+      "observed_load_at": "2026-10-02T13:35:45.942692000+01:59"
+    },
+    {
+      "path": "C:\\Windows\\System32\\ntdll.dll",
+      "role": "$SYSTEMROOT/System32/ntdll.dll",
+      "observed_pid": 9652,
+      "observed_sequence": 2206170,
+      "observed_load_at": "2026-10-02T13:35:45.942716100+01:59"
+    },
+    {
+      "path": "C:\\Windows\\System32\\kernel32.dll",
+      "role": "$SYSTEMROOT/System32/kernel32.dll",
+      "observed_pid": 9652,
+      "observed_sequence": 2206170,
+      "observed_load_at": "2026-10-02T13:35:45.961140100+01:59"
+    },
+    {
+      "path": "C:\\Windows\\System32\\KernelBase.dll",
+      "role": "$SYSTEMROOT/System32/KernelBase.dll",
+      "observed_pid": 9652,
+      "observed_sequence": 2206170,
+      "observed_load_at": "2026-10-02T13:35:45.961209900+01:59"
+    },
+    {
+      "path": "C:\\Windows\\System32\\bcryptprimitives.dll",
+      "role": "$SYSTEMROOT/System32/bcryptprimitives.dll",
+      "observed_pid": 9652,
+      "observed_sequence": 2206170,
+      "observed_load_at": "2026-10-02T13:35:45.962484000+01:59"
+    },
+    {
+      "path": "C:\\Windows\\System32\\ws2_32.dll",
+      "role": "$SYSTEMROOT/System32/ws2_32.dll",
+      "observed_pid": 9652,
+      "observed_sequence": 2206170,
+      "observed_load_at": "2026-10-02T13:35:45.962614200+01:59"
+    },
+    {
+      "path": "C:\\Windows\\System32\\ucrtbase.dll",
+      "role": "$SYSTEMROOT/System32/ucrtbase.dll",
+      "observed_pid": 9652,
+      "observed_sequence": 2206170,
+      "observed_load_at": "2026-10-02T13:35:45.962679200+01:59"
+    },
+    {
+      "path": "C:\\Windows\\System32\\rpcrt4.dll",
+      "role": "$SYSTEMROOT/System32/rpcrt4.dll",
+      "observed_pid": 9652,
+      "observed_sequence": 2206170,
+      "observed_load_at": "2026-10-02T13:35:45.962746300+01:59"
+    },
+    {
+      "path": "C:\\Windows\\System32\\advapi32.dll",
+      "role": "$SYSTEMROOT/System32/advapi32.dll",
+      "observed_pid": 9652,
+      "observed_sequence": 2206170,
+      "observed_load_at": "2026-10-02T13:35:45.962827700+01:59"
+    },
+    {
+      "path": "C:\\Windows\\System32\\msvcrt.dll",
+      "role": "$SYSTEMROOT/System32/msvcrt.dll",
+      "observed_pid": 9652,
+      "observed_sequence": 2206170,
+      "observed_load_at": "2026-10-02T13:35:45.962940000+01:59"
+    },
+    {
+      "path": "C:\\Windows\\System32\\sechost.dll",
+      "role": "$SYSTEMROOT/System32/sechost.dll",
+      "observed_pid": 9652,
+      "observed_sequence": 2206170,
+      "observed_load_at": "2026-10-02T13:35:45.963060400+01:59"
+    },
+    {
+      "path": "C:\\Windows\\System32\\bcrypt.dll",
+      "role": "$SYSTEMROOT/System32/bcrypt.dll",
+      "observed_pid": 9652,
+      "observed_sequence": 2206170,
+      "observed_load_at": "2026-10-02T13:35:45.963077400+01:59"
+    },
+    {
+      "path": "C:\\Windows\\System32\\crypt32.dll",
+      "role": "$SYSTEMROOT/System32/crypt32.dll",
+      "observed_pid": 9652,
+      "observed_sequence": 2206170,
+      "observed_load_at": "2026-10-02T13:35:45.963195000+01:59"
+    },
+    {
+      "path": "C:\\Windows\\System32\\user32.dll",
+      "role": "$SYSTEMROOT/System32/user32.dll",
+      "observed_pid": 9652,
+      "observed_sequence": 2206170,
+      "observed_load_at": "2026-10-02T13:35:45.963304700+01:59"
+    },
+    {
+      "path": "C:\\Windows\\System32\\win32u.dll",
+      "role": "$SYSTEMROOT/System32/win32u.dll",
+      "observed_pid": 9652,
+      "observed_sequence": 2206170,
+      "observed_load_at": "2026-10-02T13:35:45.963390300+01:59"
+    },
+    {
+      "path": "C:\\Windows\\System32\\gdi32.dll",
+      "role": "$SYSTEMROOT/System32/gdi32.dll",
+      "observed_pid": 9652,
+      "observed_sequence": 2206170,
+      "observed_load_at": "2026-10-02T13:35:45.963459000+01:59"
+    },
+    {
+      "path": "C:\\Windows\\System32\\gdi32full.dll",
+      "role": "$SYSTEMROOT/System32/gdi32full.dll",
+      "observed_pid": 9652,
+      "observed_sequence": 2206170,
+      "observed_load_at": "2026-10-02T13:35:45.963525600+01:59"
+    },
+    {
+      "path": "C:\\Windows\\System32\\msvcp_win.dll",
+      "role": "$SYSTEMROOT/System32/msvcp_win.dll",
+      "observed_pid": 9652,
+      "observed_sequence": 2206170,
+      "observed_load_at": "2026-10-02T13:35:45.963586300+01:59"
+    },
+    {
+      "path": "C:\\Windows\\System32\\shell32.dll",
+      "role": "$SYSTEMROOT/System32/shell32.dll",
+      "observed_pid": 9652,
+      "observed_sequence": 2206170,
+      "observed_load_at": "2026-10-02T13:35:45.963686600+01:59"
+    },
+    {
+      "path": "C:\\Windows\\System32\\ole32.dll",
+      "role": "$SYSTEMROOT/System32/ole32.dll",
+      "observed_pid": 9652,
+      "observed_sequence": 2206170,
+      "observed_load_at": "2026-10-02T13:35:45.963839200+01:59"
+    },
+    {
+      "path": "C:\\Windows\\System32\\combase.dll",
+      "role": "$SYSTEMROOT/System32/combase.dll",
+      "observed_pid": 9652,
+      "observed_sequence": 2206170,
+      "observed_load_at": "2026-10-02T13:35:45.963931200+01:59"
+    },
+    {
+      "path": "C:\\Windows\\System32\\IPHLPAPI.DLL",
+      "role": "$SYSTEMROOT/System32/IPHLPAPI.DLL",
+      "observed_pid": 9652,
+      "observed_sequence": 2206170,
+      "observed_load_at": "2026-10-02T13:35:45.964152000+01:59"
+    },
+    {
+      "path": "C:\\Windows\\System32\\secur32.dll",
+      "role": "$SYSTEMROOT/System32/secur32.dll",
+      "observed_pid": 9652,
+      "observed_sequence": 2206170,
+      "observed_load_at": "2026-10-02T13:35:45.964156100+01:59"
+    },
+    {
+      "path": "C:\\Windows\\System32\\winhttp.dll",
+      "role": "$SYSTEMROOT/System32/winhttp.dll",
+      "observed_pid": 9652,
+      "observed_sequence": 2206170,
+      "observed_load_at": "2026-10-02T13:35:45.964178100+01:59"
+    },
+    {
+      "path": "C:\\Windows\\System32\\userenv.dll",
+      "role": "$SYSTEMROOT/System32/userenv.dll",
+      "observed_pid": 9652,
+      "observed_sequence": 2206170,
+      "observed_load_at": "2026-10-02T13:35:45.964284400+01:59"
+    },
+    {
+      "path": "C:\\Windows\\System32\\cryptbase.dll",
+      "role": "$SYSTEMROOT/System32/cryptbase.dll",
+      "observed_pid": 9652,
+      "observed_sequence": 2206170,
+      "observed_load_at": "2026-10-02T13:35:45.964490100+01:59"
+    },
+    {
+      "path": "C:\\Windows\\System32\\sspicli.dll",
+      "role": "$SYSTEMROOT/System32/sspicli.dll",
+      "observed_pid": 9652,
+      "observed_sequence": 2206170,
+      "observed_load_at": "2026-10-02T13:35:45.964643400+01:59"
+    },
+    {
+      "path": "C:\\Windows\\System32\\cryptsp.dll",
+      "role": "$SYSTEMROOT/System32/cryptsp.dll",
+      "observed_pid": 9652,
+      "observed_sequence": 2206170,
+      "observed_load_at": "2026-10-02T13:35:45.970415400+01:59"
+    },
+    {
+      "path": "C:\\Windows\\System32\\rsaenh.dll",
+      "role": "$SYSTEMROOT/System32/rsaenh.dll",
+      "observed_pid": 9652,
+      "observed_sequence": 2206170,
+      "observed_load_at": "2026-10-02T13:35:45.970638800+01:59"
+    },
+    {
+      "path": "C:\\Windows\\System32\\apphelp.dll",
+      "role": "$SYSTEMROOT/System32/apphelp.dll",
+      "observed_pid": 9652,
+      "observed_sequence": 2206170,
+      "observed_load_at": "2026-10-02T13:35:45.988535800+01:59"
+    },
+    {
+      "path": "C:\\Windows\\System32\\vcruntime140.dll",
+      "role": "$SYSTEMROOT/System32/vcruntime140.dll",
+      "observed_pid": 1864,
+      "observed_sequence": 2206171,
+      "observed_load_at": "2026-10-02T13:35:45.992197700+01:59"
+    },
+    {
+      "path": "C:\\Users\\example\\AppData\\Local\\Programs\\Python\\Python313\\python.exe",
+      "role": "$PYTHON/python.exe",
+      "observed_pid": 25184,
+      "observed_sequence": 2206172,
+      "observed_load_at": "2026-10-02T13:35:46.000210300+01:59"
+    },
+    {
+      "path": "C:\\Users\\example\\AppData\\Local\\Programs\\Python\\Python313\\vcruntime140.dll",
+      "role": "$PYTHON/vcruntime140.dll",
+      "observed_pid": 25184,
+      "observed_sequence": 2206172,
+      "observed_load_at": "2026-10-02T13:35:46.002489800+01:59"
+    },
+    {
+      "path": "C:\\Users\\example\\AppData\\Local\\Programs\\Python\\Python313\\python313.dll",
+      "role": "$PYTHON/python313.dll",
+      "observed_pid": 25184,
+      "observed_sequence": 2206172,
+      "observed_load_at": "2026-10-02T13:35:46.002494100+01:59"
+    },
+    {
+      "path": "C:\\Windows\\System32\\version.dll",
+      "role": "$SYSTEMROOT/System32/version.dll",
+      "observed_pid": 25184,
+      "observed_sequence": 2206172,
+      "observed_load_at": "2026-10-02T13:35:46.003204100+01:59"
+    },
+    {
+      "path": "C:\\Users\\example\\AppData\\Local\\Programs\\Python\\Python313\\python3.dll",
+      "role": "$PYTHON/python3.dll",
+      "observed_pid": 25184,
+      "observed_sequence": 2206172,
+      "observed_load_at": "2026-10-02T13:35:46.020809200+01:59"
+    },
+    {
+      "path": "C:\\Users\\example\\AppData\\Local\\Programs\\Python\\Python313\\DLLs\\_hashlib.pyd",
+      "role": "$PYTHON/DLLs/_hashlib.pyd",
+      "observed_pid": 25184,
+      "observed_sequence": 2206172,
+      "observed_load_at": "2026-10-02T13:35:46.021280600+01:59"
+    },
+    {
+      "path": "C:\\Users\\example\\AppData\\Local\\Programs\\Python\\Python313\\DLLs\\libcrypto-3.dll",
+      "role": "$PYTHON/DLLs/libcrypto-3.dll",
+      "observed_pid": 25184,
+      "observed_sequence": 2206172,
+      "observed_load_at": "2026-10-02T13:35:46.021711000+01:59"
+    },
+    {
+      "path": "C:\\Users\\example\\AppData\\Local\\Programs\\Python\\Python313\\DLLs\\_bz2.pyd",
+      "role": "$PYTHON/DLLs/_bz2.pyd",
+      "observed_pid": 25184,
+      "observed_sequence": 2206172,
+      "observed_load_at": "2026-10-02T13:35:46.043203900+01:59"
+    },
+    {
+      "path": "C:\\Users\\example\\AppData\\Local\\Programs\\Python\\Python313\\DLLs\\_lzma.pyd",
+      "role": "$PYTHON/DLLs/_lzma.pyd",
+      "observed_pid": 25184,
+      "observed_sequence": 2206172,
+      "observed_load_at": "2026-10-02T13:35:46.044678700+01:59"
+    },
+    {
+      "path": "C:\\Program Files\\Git\\cmd\\git.exe",
+      "role": "$GIT/cmd/git.exe",
+      "observed_pid": 10228,
+      "observed_sequence": 2206173,
+      "observed_load_at": "2026-10-02T13:35:46.059065100+01:59"
+    },
+    {
+      "path": "C:\\Windows\\System32\\shlwapi.dll",
+      "role": "$SYSTEMROOT/System32/shlwapi.dll",
+      "observed_pid": 10228,
+      "observed_sequence": 2206173,
+      "observed_load_at": "2026-10-02T13:35:46.062562400+01:59"
+    },
+    {
+      "path": "C:\\Windows\\System32\\SHCore.dll",
+      "role": "$SYSTEMROOT/System32/SHCore.dll",
+      "observed_pid": 10228,
+      "observed_sequence": 2206173,
+      "observed_load_at": "2026-10-02T13:35:46.064765500+01:59"
+    },
+    {
+      "path": "C:\\Program Files\\Git\\mingw64\\bin\\git.exe",
+      "role": "$GIT/mingw64/bin/git.exe",
+      "observed_pid": 13456,
+      "observed_sequence": 2206174,
+      "observed_load_at": "2026-10-02T13:35:46.068750400+01:59"
+    },
+    {
+      "path": "C:\\Program Files\\Git\\mingw64\\bin\\libiconv-2.dll",
+      "role": "$GIT/mingw64/bin/libiconv-2.dll",
+      "observed_pid": 13456,
+      "observed_sequence": 2206174,
+      "observed_load_at": "2026-10-02T13:35:46.071444500+01:59"
+    },
+    {
+      "path": "C:\\Program Files\\Git\\mingw64\\bin\\libintl-8.dll",
+      "role": "$GIT/mingw64/bin/libintl-8.dll",
+      "observed_pid": 13456,
+      "observed_sequence": 2206174,
+      "observed_load_at": "2026-10-02T13:35:46.071455900+01:59"
+    },
+    {
+      "path": "C:\\Program Files\\Git\\mingw64\\bin\\libpcre2-8-0.dll",
+      "role": "$GIT/mingw64/bin/libpcre2-8-0.dll",
+      "observed_pid": 13456,
+      "observed_sequence": 2206174,
+      "observed_load_at": "2026-10-02T13:35:46.071561400+01:59"
+    },
+    {
+      "path": "C:\\Program Files\\Git\\mingw64\\bin\\zlib1.dll",
+      "role": "$GIT/mingw64/bin/zlib1.dll",
+      "observed_pid": 13456,
+      "observed_sequence": 2206174,
+      "observed_load_at": "2026-10-02T13:35:46.072049000+01:59"
+    },
+    {
+      "path": "C:\\Windows\\System32\\ntmarta.dll",
+      "role": "$SYSTEMROOT/System32/ntmarta.dll",
+      "observed_pid": 13456,
+      "observed_sequence": 2206174,
+      "observed_load_at": "2026-10-02T13:35:46.079491000+01:59"
+    },
+    {
+      "path": "C:\\Users\\example\\.rustup\\toolchains\\1.96.1-x86_64-pc-windows-msvc\\bin\\rustc.exe",
+      "role": "$TOOLCHAIN/bin/rustc.exe",
+      "observed_pid": 14672,
+      "observed_sequence": 2206177,
+      "observed_load_at": "2026-10-02T13:35:46.138502900+01:59"
+    },
+    {
+      "path": "C:\\Users\\example\\.rustup\\toolchains\\1.96.1-x86_64-pc-windows-msvc\\bin\\rustc_driver-668d82ea7cf189b0.dll",
+      "role": "$TOOLCHAIN/bin/rustc_driver-668d82ea7cf189b0.dll",
+      "observed_pid": 14672,
+      "observed_sequence": 2206177,
+      "observed_load_at": "2026-10-02T13:35:46.141659400+01:59"
+    },
+    {
+      "path": "C:\\Windows\\System32\\oleaut32.dll",
+      "role": "$SYSTEMROOT/System32/oleaut32.dll",
+      "observed_pid": 14672,
+      "observed_sequence": 2206177,
+      "observed_load_at": "2026-10-02T13:35:46.141759700+01:59"
+    },
+    {
+      "path": "C:\\Windows\\System32\\kernel.appcore.dll",
+      "role": "$SYSTEMROOT/System32/kernel.appcore.dll",
+      "observed_pid": 14672,
+      "observed_sequence": 2206177,
+      "observed_load_at": "2026-10-02T13:35:46.149179600+01:59"
+    },
+    {
+      "path": "C:\\Windows\\System32\\mswsock.dll",
+      "role": "$SYSTEMROOT/System32/mswsock.dll",
+      "observed_pid": 9652,
+      "observed_sequence": 2206170,
+      "observed_load_at": "2026-10-02T13:35:46.393064300+01:59"
+    },
+    {
+      "path": "C:\\Program Files (x86)\\Microsoft Visual Studio\\2022\\BuildTools\\VC\\Tools\\MSVC\\14.44.35207\\bin\\Hostx64\\x64\\link.exe",
+      "role": "$MSVC/bin/Hostx64/x64/link.exe",
+      "observed_pid": 11776,
+      "observed_sequence": 2206231,
+      "observed_load_at": "2026-10-02T13:35:47.063952000+01:59"
+    },
+    {
+      "path": "C:\\Windows\\System32\\psapi.dll",
+      "role": "$SYSTEMROOT/System32/psapi.dll",
+      "observed_pid": 11776,
+      "observed_sequence": 2206231,
+      "observed_load_at": "2026-10-02T13:35:47.066450100+01:59"
+    },
+    {
+      "path": "C:\\Program Files (x86)\\Microsoft Visual Studio\\2022\\BuildTools\\VC\\Tools\\MSVC\\14.44.35207\\bin\\Hostx64\\x64\\vcruntime140.dll",
+      "role": "$MSVC/bin/Hostx64/x64/vcruntime140.dll",
+      "observed_pid": 11776,
+      "observed_sequence": 2206231,
+      "observed_load_at": "2026-10-02T13:35:47.066680400+01:59"
+    },
+    {
+      "path": "C:\\Program Files (x86)\\Microsoft Visual Studio\\2022\\BuildTools\\VC\\Tools\\MSVC\\14.44.35207\\bin\\Hostx64\\x64\\vcruntime140_1.dll",
+      "role": "$MSVC/bin/Hostx64/x64/vcruntime140_1.dll",
+      "observed_pid": 11776,
+      "observed_sequence": 2206231,
+      "observed_load_at": "2026-10-02T13:35:47.066695100+01:59"
+    },
+    {
+      "path": "C:\\Program Files (x86)\\Microsoft Visual Studio\\2022\\BuildTools\\VC\\Tools\\MSVC\\14.44.35207\\bin\\Hostx64\\x64\\msvcp140.dll",
+      "role": "$MSVC/bin/Hostx64/x64/msvcp140.dll",
+      "observed_pid": 11776,
+      "observed_sequence": 2206231,
+      "observed_load_at": "2026-10-02T13:35:47.066743700+01:59"
+    },
+    {
+      "path": "C:\\Program Files (x86)\\Microsoft Visual Studio\\2022\\BuildTools\\VC\\Tools\\MSVC\\14.44.35207\\bin\\Hostx64\\x64\\tbbmalloc.dll",
+      "role": "$MSVC/bin/Hostx64/x64/tbbmalloc.dll",
+      "observed_pid": 11776,
+      "observed_sequence": 2206231,
+      "observed_load_at": "2026-10-02T13:35:47.067025900+01:59"
+    },
+    {
+      "path": "C:\\Program Files (x86)\\Microsoft Visual Studio\\2022\\BuildTools\\VC\\Tools\\MSVC\\14.44.35207\\bin\\Hostx64\\x64\\msvcp140_atomic_wait.dll",
+      "role": "$MSVC/bin/Hostx64/x64/msvcp140_atomic_wait.dll",
+      "observed_pid": 11776,
+      "observed_sequence": 2206231,
+      "observed_load_at": "2026-10-02T13:35:47.067051600+01:59"
+    },
+    {
+      "path": "C:\\Program Files (x86)\\Microsoft Visual Studio\\2022\\BuildTools\\VC\\Tools\\MSVC\\14.44.35207\\bin\\Hostx64\\x64\\mspdbcore.dll",
+      "role": "$MSVC/bin/Hostx64/x64/mspdbcore.dll",
+      "observed_pid": 11776,
+      "observed_sequence": 2206231,
+      "observed_load_at": "2026-10-02T13:35:47.070368300+01:59"
+    },
+    {
+      "path": "C:\\Program Files (x86)\\Microsoft Visual Studio\\2022\\BuildTools\\VC\\Tools\\MSVC\\14.44.35207\\bin\\Hostx64\\x64\\msobj140.dll",
+      "role": "$MSVC/bin/Hostx64/x64/msobj140.dll",
+      "observed_pid": 11776,
+      "observed_sequence": 2206231,
+      "observed_load_at": "2026-10-02T13:35:47.080271400+01:59"
+    },
+    {
+      "path": "C:\\Users\\example\\AppData\\Local\\Programs\\Python\\Python313\\DLLs\\_ctypes.pyd",
+      "role": "$PYTHON/DLLs/_ctypes.pyd",
+      "observed_pid": 5104,
+      "observed_sequence": 2208401,
+      "observed_load_at": "2026-10-02T13:36:30.626769700+01:59"
+    },
+    {
+      "path": "C:\\Users\\example\\AppData\\Local\\Programs\\Python\\Python313\\DLLs\\libffi-8.dll",
+      "role": "$PYTHON/DLLs/libffi-8.dll",
+      "observed_pid": 5104,
+      "observed_sequence": 2208401,
+      "observed_load_at": "2026-10-02T13:36:30.627259200+01:59"
+    }
+  ]
+}

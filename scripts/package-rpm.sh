@@ -15,6 +15,8 @@ Options:
   --skip-build                    Package an existing binary
   --allow-stale-binary            Allow --skip-build for local-only packaging
   --reuse-release-binary          Allow --skip-build for a release binary built earlier in CI
+  --payload-provenance <file>     Bind declared payload source to staged binaries
+  SOURCE_DATE_EPOCH=<seconds>     RPM/changelog epoch (default: commit time)
   --homepage <url>                Package homepage (default: https://rmux.io)
   -h, --help                      Show this help
 USAGE
@@ -91,6 +93,83 @@ strip_linux_tiny_binary() {
   strip -s "$binary_path" || die "failed to strip package binary: $binary_path"
 }
 
+layout_tool() {
+  printf '%s\n' "$repo_root/scripts/packaging/layout-current"
+}
+
+# Preparing sources and staging them are the same operations for every shell
+# builder; they live beside the descriptor and are called from here. The path
+# comes from this script, which is known before any option is read.
+. "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/packaging/prepare-sources.sh"
+
+# The generated spec installs fresh copies. Pin their archive timestamps and
+# the RPM build header to the source epoch, independently of wall clock and
+# the hostname of the builder. Payload bytes and declared modes stay intact.
+build_rpm_archive() {
+  local topdir spec arch epoch
+  topdir="$1"
+  spec="$2"
+  arch="$3"
+  epoch="${SOURCE_DATE_EPOCH-$(git show -s --format=%ct HEAD)}"
+  case "$epoch" in ''|*[!0-9]*) die "invalid SOURCE_DATE_EPOCH: $epoch" ;; esac
+  SOURCE_DATE_EPOCH="$epoch" rpmbuild \
+    --define "_topdir $topdir" \
+    --define "_buildhost rmux" \
+    --define "use_source_date_epoch_as_buildtime 1" \
+    --define "clamp_mtime_to_source_date_epoch 1" \
+    --target "$arch" \
+    -bb "$spec"
+}
+
+# Resolve time once for the entire packaging operation. The exported value is
+# also consumed by build_rpm_archive, so changelog and RPM headers agree.
+set_rpm_source_time() {
+  SOURCE_DATE_EPOCH="${SOURCE_DATE_EPOCH-$(git show -s --format=%ct HEAD)}"
+  case "$SOURCE_DATE_EPOCH" in ''|*[!0-9]*) die "invalid SOURCE_DATE_EPOCH: $SOURCE_DATE_EPOCH" ;; esac
+  changelog_date="$(LC_ALL=C date -u -d "@$SOURCE_DATE_EPOCH" '+%a %b %d %Y')" ||
+    die "invalid SOURCE_DATE_EPOCH: $SOURCE_DATE_EPOCH"
+  export SOURCE_DATE_EPOCH
+}
+
+# RPM sources are flat, while the canonical provenance validator binds package
+# paths. A temporary hardlink view exposes exactly those staged bytes without
+# duplicating or executing them. The descriptor supplies both names and paths.
+rpm_payload_provenance() {
+  python3 - "$repo_root" "$work_dir" "$configuration" "$1" <<'PYTHON'
+import json
+import os
+from pathlib import Path
+import sys
+import tempfile
+
+repo, work, configuration, declaration_path = sys.argv[1:]
+sys.path.insert(0, str(Path(repo) / "scripts/packaging"))
+import layout
+
+try:
+    declaration = json.loads(Path(declaration_path).read_text())
+    if not isinstance(declaration, dict) or declaration.get("configuration") != configuration:
+        raise layout.LayoutError("payload provenance configuration differs")
+    from layout_profiles import with_notices
+    descriptor = with_notices(layout.load(Path(repo) / "scripts/packaging/rmux-package-layout.json"))
+    roles = layout.payload_binary_roles(descriptor, "rpm")
+    sources = {entry["id"]: entry["source"]["name"]
+               for entry, _ in layout.entries(descriptor, "rpm") if entry["id"] in roles}
+    with tempfile.TemporaryDirectory(prefix="payload-provenance.", dir=work) as root:
+        for role, relative in roles.items():
+            destination = Path(root) / relative
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            os.link(Path(work) / "SOURCES" / sources[role], destination)
+        result = layout.payload_provenance(descriptor, "rpm", root, declaration)
+    print(layout.embeddable_field("payload_provenance", result))
+except (OSError, ValueError, layout.LayoutError) as error:
+    print("payload provenance: " + str(error), file=sys.stderr)
+    sys.exit(1)
+PYTHON
+}
+
+# Copy every non-binary package source the layout descriptor names into the
+# RPM sources tree, under the file name the generated spec installs from.
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 configuration="release"
 target="x86_64-unknown-linux-gnu"
@@ -99,6 +178,7 @@ rpm_release="1"
 skip_build=0
 allow_stale_binary=0
 reuse_release_binary=0
+payload_provenance_file=""
 homepage="${RMUX_HOMEPAGE:-https://rmux.io}"
 
 while [ "$#" -gt 0 ]; do
@@ -135,6 +215,11 @@ while [ "$#" -gt 0 ]; do
       reuse_release_binary=1
       shift
       ;;
+    --payload-provenance)
+      [ "$#" -ge 2 ] || die "--payload-provenance requires a value"
+      payload_provenance_file="$2"
+      shift 2
+      ;;
     --homepage)
       [ "$#" -ge 2 ] || die "--homepage requires a value"
       homepage="$2"
@@ -167,6 +252,7 @@ need rpmbuild
 need sha256sum
 
 cd "$repo_root"
+set_rpm_source_time
 version="$(workspace_version)"
 [ -n "$version" ] || die "unable to read workspace package version"
 rpm_arch="$(rpm_arch_for_target "$target")"
@@ -185,11 +271,13 @@ helper_binary="$target_dir/$target/$profile_dir/rmux-full"
 daemon_binary="$target_dir/$target/$profile_dir/rmux-daemon"
 completion_cache="${RMUX_COMPLETIONS_DIR:-$target_dir/$target/$profile_dir/completions}"
 if [ "$skip_build" -eq 0 ]; then
-  "${compatible_build[@]}" "${cargo_args[@]}" --bin rmux
-  cp "$binary" "$helper_binary"
-  "${compatible_build[@]}" "${cargo_args[@]}" --features tiny-cli --bin rmux
-  "${compatible_build[@]}" "${cargo_args[@]}" --bin rmux-daemon
+  "${RMUX_PYTHON:-python3}" "$repo_root/scripts/packaging/notices.py" build \
+    --binary-dir "$(dirname "$binary")" -- "${compatible_build[@]}" "${cargo_args[@]}"
 fi
+notice_required=(--optional)
+if [ "$skip_build" -eq 0 ] || [ "$reuse_release_binary" -eq 1 ]; then notice_required=(--required); fi
+"${RMUX_PYTHON:-python3}" "$repo_root/scripts/packaging/notices.py" verify \
+  --binary-dir "$(dirname "$binary")" "${notice_required[@]}"
 [ -x "$binary" ] || die "expected executable binary was not found: $binary"
 [ -x "$helper_binary" ] || die "expected executable private helper binary was not found: $helper_binary"
 [ -x "$daemon_binary" ] || die "expected executable daemon binary was not found: $daemon_binary"
@@ -224,10 +312,10 @@ binary_bytes="$(wc -c < "$packaged_binary" | tr -d ' ')"
 helper_binary_bytes="$(wc -c < "$packaged_helper" | tr -d ' ')"
 daemon_binary_bytes="$(wc -c < "$packaged_daemon" | tr -d ' ')"
 glibc_floor_script="$repo_root/scripts/glibc-symbol-floor.sh"
-binary_glibc_min="$($glibc_floor_script "$packaged_binary")"
-helper_binary_glibc_min="$($glibc_floor_script "$packaged_helper")"
-daemon_binary_glibc_min="$($glibc_floor_script "$packaged_daemon")"
-package_glibc_min="$($glibc_floor_script "$packaged_binary" "$packaged_helper" "$packaged_daemon")"
+binary_glibc_min="$("$glibc_floor_script" "$packaged_binary")"
+helper_binary_glibc_min="$("$glibc_floor_script" "$packaged_helper")"
+daemon_binary_glibc_min="$("$glibc_floor_script" "$packaged_daemon")"
+package_glibc_min="$("$glibc_floor_script" "$packaged_binary" "$packaged_helper" "$packaged_daemon")"
 max_supported_glibc="${RMUX_MAX_SUPPORTED_GLIBC:-2.31}"
 case "$max_supported_glibc" in ''|*[!0-9.]*|.*|*.|*..*) die "invalid RMUX_MAX_SUPPORTED_GLIBC: $max_supported_glibc" ;; esac
 if [ "$(printf '%s\n%s\n' "$package_glibc_min" "$max_supported_glibc" | LC_ALL=C sort -V | tail -n 1)" != "$max_supported_glibc" ]; then
@@ -243,7 +331,17 @@ if [ "$configuration" != "release" ] || [ "$git_dirty" = true ] || { [ "$skip_bu
   release_artifact=false
 fi
 generated_at_utc="$(git show -s --format=%cI HEAD)"
-changelog_date="$(LC_ALL=C date -u '+%a %b %d %Y')"
+payload_provenance_field=""
+if [ -n "$payload_provenance_file" ]; then
+  payload_provenance_field="$(rpm_payload_provenance "$payload_provenance_file")" ||
+    die "declared payload provenance does not match the staged payload"
+fi
+
+# The format identity the package declares is the descriptor's, so a change of
+# package contract moves it in one place for builders, validators and
+# installers at once.
+package_layout_id="$("$(layout_tool)" layout-id --variant rpm)" ||
+  die "could not project the package layout identity"
 
 metadata="$work_dir/SOURCES/artifact-metadata.json"
 cat > "$metadata" <<EOF
@@ -274,7 +372,8 @@ cat > "$metadata" <<EOF
   "package_name": "rmux-$version-$rpm_release.$rpm_arch",
   "package_target": "$target",
   "package_target_label": "$platform_label",
-  "package_layout": "rmux-rpm-package-v2",
+  "package_layout": "$package_layout_id",
+$payload_provenance_field
   "archive_format": "rpm",
   "skip_build": $([ "$skip_build" -eq 1 ] && printf true || printf false),
   "reuse_release_binary": $([ "$reuse_release_binary" -eq 1 ] && printf true || printf false),
@@ -283,29 +382,39 @@ cat > "$metadata" <<EOF
 }
 EOF
 
-cp README.md LICENSE-APACHE LICENSE-MIT docs/man/rmux.1 "$work_dir/SOURCES/"
 completion_tmp="$(mktemp -d "${TMPDIR:-/tmp}/rmux-completions.XXXXXX")"
 if [ "$skip_build" -eq 0 ]; then
-  cargo run --quiet --package xtask -- generate-completions --output-dir "$completion_tmp" >/dev/null
+  # The generator writes under its own names and says what it wrote; those
+  # files are then prepared under the names the descriptor gives them, so a
+  # source renamed there is served by the generator's real output.
+  completion_generated="$completion_tmp/generated"
+  mkdir -p "$completion_generated"
+  cargo run --quiet --package xtask -- generate-completions \
+    --output-dir "$completion_generated" > "$completion_tmp/generated.tsv"
+  prepare_generated_sources "rpm" completion \
+    "$completion_tmp/generated.tsv" "$completion_tmp"
   rm -rf "$completion_cache"
   mkdir -p "$completion_cache"
-  cp "$completion_tmp/rmux.bash" "$completion_tmp/_rmux" "$completion_tmp/rmux.fish" \
-    "$completion_tmp/_rmux.ps1" "$completion_tmp/rmux.elv" "$completion_cache/"
+  prepare_cached_sources "rpm" completion "$completion_tmp" "$completion_cache" \
+    "generated completion is missing"
 else
-  for completion_file in rmux.bash _rmux rmux.fish _rmux.ps1 rmux.elv; do
-    [ -f "$completion_cache/$completion_file" ] || die "--skip-build requires prebuilt completions in $completion_cache; rerun without --skip-build or set RMUX_COMPLETIONS_DIR"
-    cp "$completion_cache/$completion_file" "$completion_tmp/$completion_file"
-  done
+  prepare_cached_sources "rpm" completion "$completion_cache" "$completion_tmp" \
+    "--skip-build requires prebuilt completions in $completion_cache; rerun without --skip-build or set RMUX_COMPLETIONS_DIR"
 fi
-mkdir -p "$work_dir/SOURCES/completions"
-install -m 0644 "$completion_tmp/rmux.bash" "$work_dir/SOURCES/completions/rmux.bash"
-install -m 0644 "$completion_tmp/_rmux" "$work_dir/SOURCES/completions/_rmux"
-install -m 0644 "$completion_tmp/rmux.fish" "$work_dir/SOURCES/completions/rmux.fish"
-install -m 0644 "$completion_tmp/_rmux.ps1" "$work_dir/SOURCES/completions/_rmux.ps1"
-install -m 0644 "$completion_tmp/rmux.elv" "$work_dir/SOURCES/completions/rmux.elv"
+stage_rpm_sources "$work_dir/SOURCES" "$repo_root" "$completion_tmp"
+
+"${RMUX_PYTHON:-python3}" "$repo_root/scripts/packaging/notices.py" stage \
+  --binary-dir "$(dirname "$binary")" --root "$work_dir/SOURCES" --variant rpm "${notice_required[@]}"
+
+# The spec installs and owns exactly what the shared layout descriptor
+# projects for the RPM variant, with its modes.
+rpm_install_lines="$("$(layout_tool)" rpm-spec-install \
+  --binaries-dir "$work_dir/SOURCES")" || die "could not project the RPM install list"
+rpm_files_lines="$("$(layout_tool)" rpm-files)" || die "could not project the RPM file list"
 
 cat > "$spec_path" <<EOF
 %global debug_package %{nil}
+%global _build_id_links none
 %global __os_install_post %{nil}
 
 Name: rmux
@@ -327,44 +436,17 @@ a daemon runtime, a Rust SDK, and native Windows support.
 
 %install
 rm -rf %{buildroot}
-install -Dm0755 "$binary_abs" %{buildroot}%{_bindir}/rmux
-install -Dm0755 "$helper_binary_abs" %{buildroot}%{_libexecdir}/rmux/rmux
-install -Dm0755 "$daemon_binary_abs" %{buildroot}%{_bindir}/rmux-daemon
-install -Dm0644 %{_sourcedir}/rmux.1 %{buildroot}%{_mandir}/man1/rmux.1
-install -Dm0644 %{_sourcedir}/artifact-metadata.json %{buildroot}%{_datadir}/rmux/artifact-metadata.json
-install -Dm0644 %{_sourcedir}/completions/rmux.bash %{buildroot}%{_datadir}/bash-completion/completions/rmux
-install -Dm0644 %{_sourcedir}/completions/_rmux %{buildroot}%{_datadir}/zsh/site-functions/_rmux
-install -Dm0644 %{_sourcedir}/completions/rmux.fish %{buildroot}%{_datadir}/fish/vendor_completions.d/rmux.fish
-install -Dm0644 %{_sourcedir}/completions/_rmux.ps1 %{buildroot}%{_datadir}/powershell/Completions/_rmux.ps1
-install -Dm0644 %{_sourcedir}/completions/rmux.elv %{buildroot}%{_datadir}/elvish/lib/rmux.elv
-install -Dm0644 %{_sourcedir}/README.md %{buildroot}%{_docdir}/rmux/README.md
-install -Dm0644 %{_sourcedir}/LICENSE-APACHE %{buildroot}%{_docdir}/rmux/LICENSE-APACHE
-install -Dm0644 %{_sourcedir}/LICENSE-MIT %{buildroot}%{_docdir}/rmux/LICENSE-MIT
+$rpm_install_lines
 
 %files
-%{_bindir}/rmux
-%{_libexecdir}/rmux/rmux
-%{_bindir}/rmux-daemon
-%{_mandir}/man1/rmux.1*
-%{_datadir}/rmux/artifact-metadata.json
-%{_datadir}/bash-completion/completions/rmux
-%{_datadir}/zsh/site-functions/_rmux
-%{_datadir}/fish/vendor_completions.d/rmux.fish
-%{_datadir}/powershell/Completions/_rmux.ps1
-%{_datadir}/elvish/lib/rmux.elv
-%doc %{_docdir}/rmux/README.md
-%license %{_docdir}/rmux/LICENSE-APACHE
-%license %{_docdir}/rmux/LICENSE-MIT
+$rpm_files_lines
 
 %changelog
 * $changelog_date Helvesec <release@rmux.io> - $version-$rpm_release
 - RMUX $version binary package.
 EOF
 
-rpmbuild \
-  --define "_topdir $work_dir" \
-  --target "$rpm_arch" \
-  -bb "$spec_path"
+build_rpm_archive "$work_dir" "$spec_path" "$rpm_arch"
 
 rpm_path="$(find "$work_dir/RPMS" -type f -name 'rmux-*.rpm' | LC_ALL=C sort | head -n 1)"
 [ -n "$rpm_path" ] || die "rpmbuild did not produce an RPM"
@@ -372,6 +454,8 @@ archive_path="$dist_dir/$(basename "$rpm_path")"
 rm -f "$archive_path"
 mv "$rpm_path" "$archive_path"
 archive_sha256="$(update_checksums "$checksums_path" "$archive_path")"
+"${RMUX_PYTHON:-python3}" "$repo_root/scripts/packaging/notices.py" publish \
+  --binary-dir "$(dirname "$binary")" --archive "$archive_path" "${notice_required[@]}"
 
 printf 'package=%s\n' "$archive_path"
 printf 'sha256=%s\n' "$archive_sha256"

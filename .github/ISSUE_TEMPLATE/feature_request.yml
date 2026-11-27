@@ -1,0 +1,45 @@
+{
+  "name": "Feature request",
+  "description": "Describe a proposed RMUX behavior.",
+  "body": [
+    {
+      "type": "markdown",
+      "attributes": {
+        "value": "For security reports, follow SECURITY.md. Remove secrets from commands and logs."
+      }
+    },
+    {
+      "type": "input",
+      "id": "version",
+      "attributes": {
+        "label": "RMUX version and source",
+        "description": "Paste rmux -V; include the package channel or exact source commit."
+      },
+      "validations": {
+        "required": true
+      }
+    },
+    {
+      "type": "input",
+      "id": "platform",
+      "attributes": {
+        "label": "OS build, architecture and terminal",
+        "description": "Include the exact OS build, shell and terminal. Windows 10 is not qualified for 0.11."
+      },
+      "validations": {
+        "required": true
+      }
+    },
+    {
+      "type": "textarea",
+      "id": "reproduction",
+      "attributes": {
+        "label": "Reproduction or requested behavior",
+        "description": "Give minimal commands, expected behavior, actual behavior and relevant redacted output."
+      },
+      "validations": {
+        "required": true
+      }
+    }
+  ]
+}

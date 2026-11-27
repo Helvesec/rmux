@@ -163,14 +163,64 @@ fn utf8_overlong_start_byte_emits_replacement() {
 }
 
 #[test]
-fn utf8_invalid_continuation_restarts_sequence() {
-    let mut parser = InputParser::new();
-    let mut writer = RecordingWriter::new(80, 24);
-    // Start 3-byte sequence 0xE2, then 0xC3 (another start byte instead of continuation).
-    parser.parse(b"\xe2\xc3\xa9", &mut writer);
-    // Should emit U+FFFD for the broken 3-byte, then decode 0xC3 0xA9 = 'é'.
-    assert!(writer.chars.contains(&'\u{FFFD}'));
-    assert!(writer.chars.contains(&'é'));
+fn utf8_non_continuation_byte_is_consumed_by_the_open_sequence() {
+    // tmux 3.7b utf8_append keeps every top-bit byte until the announced size:
+    // 0xE2 0xC3 0xA9 is one broken 3-byte sequence, not U+FFFD then 'é'.
+    let (_, w) = parse(b"\xe2\xc3\xa9");
+    assert_eq!(w.chars, vec!['\u{FFFD}']);
+}
+
+/// Each row was measured with tmux 3.7b: `cat` of the bytes in a 40x3 pane,
+/// then `capture-pane -p` (first line) and `#{cursor_x}`.
+#[test]
+fn invalid_utf8_captures_like_tmux_3_7b() {
+    const R: &str = "\u{FFFD}";
+    let cases: [(&[u8], String, u32); 21] = [
+        (b"a\xc3\xc3\xa9b|", format!("a{R}{R}b|"), 5),
+        (b"a\xc0\x80b|", format!("a{R}{R}b|"), 5),
+        (b"a\xf5\x80\x80\x80b|", format!("a{R}{R}{R}{R}b|"), 7),
+        (b"a\xe2\xc3\xa9b|", format!("a{R}b|"), 4),
+        (b"a\xc3Ab|", format!("a{R}Ab|"), 5),
+        (b"a\xc3\x07b|", format!("a{R}b|"), 4),
+        (b"a\xc3 b|", format!("a{R} b|"), 5),
+        (b"a\x80b|", format!("a{R}b|"), 4),
+        (b"a\xfe\xffb|", format!("a{R}{R}b|"), 5),
+        (b"a\xc1\xbfb|", format!("a{R}{R}b|"), 5),
+        (b"a\xf8\x80\x80\x80\x80b|", format!("a{R}{R}{R}{R}{R}b|"), 8),
+        (b"a\xed\xa0\x80b|", format!("a{R}b|"), 4),
+        (b"a\xe0\x80\x80b|", format!("a{R}b|"), 4),
+        (b"a\xf0\x80\x80\x80b|", format!("a{R}b|"), 4),
+        (b"a\xe2\x82Xb|", format!("a{R}Xb|"), 5),
+        (b"a\xf0\x9f\x98b|", format!("a{R}b|"), 4),
+        (b"a\xf0\x9f\xc3\xa9b|", format!("a{R}b|"), 4),
+        (b"a\xc3\xc3\xc3\xa9b|", format!("a{R}\u{e9}b|"), 5),
+        (b"a\xc3\xa9b|", "a\u{e9}b|".to_owned(), 4),
+        (b"a\xe2\x82\xacb|", "a\u{20ac}b|".to_owned(), 4),
+        (b"a\xf0\x9f\x98\x80b|", "a\u{1f600}b|".to_owned(), 5),
+    ];
+    for (input, expected, cursor_x) in cases {
+        let mut screen = crate::Screen::new(rmux_proto::TerminalSize { cols: 40, rows: 3 }, 0);
+        InputParser::new().parse(input, &mut screen);
+        let capture = screen.capture_transcript(
+            crate::ScreenCaptureRange::default(),
+            crate::GridRenderOptions::default(),
+        );
+        let first_line = capture
+            .split(|byte| *byte == b'\n')
+            .next()
+            .unwrap_or_default();
+        assert_eq!(
+            first_line,
+            expected.as_bytes(),
+            "capture of {input:x?}: {}",
+            String::from_utf8_lossy(first_line)
+        );
+        assert_eq!(
+            screen.cursor_position(),
+            (cursor_x, 0),
+            "cursor of {input:x?}"
+        );
+    }
 }
 
 // ─── Hardening: DECRPM queries ────────────────────────────────────

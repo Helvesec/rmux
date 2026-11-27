@@ -7,19 +7,19 @@ async fn parsed_queue_accepts_tmux_swap_window_flag_clusters() {
             session: "swap-ds",
             command: "swap-window -ds one -tswap-ds:0",
             add_d_window: false,
-            expected_names: &["one", "rmux"],
+            expected_names: &["one", "zero"],
         },
         SwapClusterCase {
             session: "swap-dt",
             command: "swap-window -dt +1 -sswap-dt:0",
             add_d_window: false,
-            expected_names: &["one", "rmux"],
+            expected_names: &["one", "zero"],
         },
         SwapClusterCase {
             session: "swap-sd",
             command: "swap-window -sd -t swap-sd:1",
             add_d_window: true,
-            expected_names: &["rmux", "d", "one"],
+            expected_names: &["zero", "d", "one"],
         },
     ] {
         assert_parsed_swap_cluster(case).await;
@@ -30,8 +30,8 @@ async fn parsed_queue_accepts_tmux_swap_window_flag_clusters() {
 async fn parsed_queue_does_not_expand_the_swap_window_flag_surface() {
     let handler = RequestHandler::new();
     let alpha = session_name("alpha");
-    assert!(matches!(
-        handler
+    crate::session_fixture::assert_new_session(
+        &handler
             .handle(Request::NewSession(NewSessionRequest {
                 session_name: alpha.clone(),
                 detached: true,
@@ -39,8 +39,7 @@ async fn parsed_queue_does_not_expand_the_swap_window_flag_surface() {
                 environment: None,
             }))
             .await,
-        Response::NewSession(_)
-    ));
+    );
     create_named_window(&handler, &alpha, "one", 1).await;
 
     let parsed = CommandParser::new()
@@ -67,8 +66,8 @@ struct SwapClusterCase {
 async fn assert_parsed_swap_cluster(case: SwapClusterCase) {
     let handler = RequestHandler::new();
     let session_name = session_name(case.session);
-    assert!(matches!(
-        handler
+    crate::session_fixture::assert_new_session(
+        &handler
             .handle(Request::NewSession(NewSessionRequest {
                 session_name: session_name.clone(),
                 detached: true,
@@ -76,7 +75,17 @@ async fn assert_parsed_swap_cluster(case: SwapClusterCase) {
                 environment: None,
             }))
             .await,
-        Response::NewSession(_)
+    );
+    // Pin window 0's name: the shell would otherwise rename it while the swap
+    // runs, and only the window order is under test here.
+    assert!(matches!(
+        handler
+            .handle(Request::RenameWindow(rmux_proto::RenameWindowRequest {
+                target: WindowTarget::with_window(session_name.clone(), 0),
+                name: "zero".to_owned(),
+            }))
+            .await,
+        Response::RenameWindow(_)
     ));
 
     create_named_window(&handler, &session_name, "one", 1).await;
@@ -105,7 +114,7 @@ async fn assert_parsed_swap_cluster(case: SwapClusterCase) {
         .expect("session exists");
     let names = session
         .windows()
-        .values()
+        .map(|(_, window)| window)
         .map(|window| window.name().expect("named fixture window"))
         .collect::<Vec<_>>();
     assert_eq!(names, case.expected_names, "{}", case.command);

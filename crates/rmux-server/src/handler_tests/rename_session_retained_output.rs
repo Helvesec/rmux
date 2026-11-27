@@ -20,7 +20,7 @@ async fn create_session(handler: &RequestHandler, name: &SessionName) -> Session
             environment: None,
         }))
         .await;
-    assert!(matches!(response, Response::NewSession(_)), "{response:?}");
+    crate::session_fixture::assert_new_session(&response);
     handler
         .state
         .lock()
@@ -57,7 +57,7 @@ async fn create_grouped_session(
             skip_environment_update: false,
         })))
         .await;
-    assert!(matches!(response, Response::NewSession(_)), "{response:?}");
+    crate::session_fixture::assert_new_session(&response);
     handler
         .state
         .lock()

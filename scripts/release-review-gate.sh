@@ -14,6 +14,9 @@ On Windows, prefer scripts/release-review-gate-windows.ps1. Running this Bash
 gate through WSL may require a healthy Linux Rust toolchain and network access.
 
 Options:
+  --qualification-dir DIR  Run the complete native qualification recipe once in
+                           a new persistent evidence directory. No skip/delta flags.
+                           Requires RMUX_FROZEN_TMUX (measured tmux 3.7b).
   --target-dir DIR     Cargo target dir. Defaults to /tmp/rmux-release-review-target.
   --layout DIR         Reuse or populate a release layout directory.
   --section NAME       Run one section: static, perf, lint, server, xterm, cli, tmux,
@@ -87,12 +90,20 @@ skip_package_build=0
 no_tmux=0
 section=all
 evidence_mode=full
+qualification_dir=""
+target_dir_explicit=0
 
 while [ "$#" -gt 0 ]; do
   case "$1" in
+    --qualification-dir)
+      [ "$#" -ge 2 ] || die "--qualification-dir requires a new evidence directory"
+      qualification_dir="$2"
+      shift 2
+      ;;
     --target-dir)
       [ "$#" -ge 2 ] || die "--target-dir requires a directory"
       target_dir="$2"
+      target_dir_explicit=1
       shift 2
       ;;
     --layout)
@@ -131,6 +142,15 @@ while [ "$#" -gt 0 ]; do
       ;;
   esac
 done
+
+if [ -n "$qualification_dir" ]; then
+  [ "$section" = all ] && [ "$evidence_mode" = full ] &&
+    [ "$skip_package" -eq 0 ] && [ "$skip_package_build" -eq 0 ] && [ "$no_tmux" -eq 0 ] &&
+    [ -z "$layout" ] && [ "$target_dir_explicit" -eq 0 ] ||
+    die "qualification requires the complete recipe and canonical private target; no skip, section, layout or delta"
+  exec python3 "$repo_root/scripts/validation/contracts.py" --root "$repo_root" \
+    --run-qualification "$qualification_dir"
+fi
 
 case "$section" in
   all|static|perf|lint|server|xterm|cli|tmux|runtime-sdk|package) ;;
@@ -198,6 +218,7 @@ printf 'rust-min-stack=%s\n' "$RUST_MIN_STACK"
 
 if section_enabled static; then
   run_step "release TOML reader self-test" python3 scripts/toml_reader.py --self-test
+  run_step "publication identity regression" "${RMUX_PYTHON:-python3}" -B -m unittest discover -s scripts/release -p 'test_publication*.py'
   run_step "release versions" scripts/check-release-versions.sh
   run_step "changelog release audit" python3 scripts/check-changelog-release.py CHANGELOG.md
   run_step "tmux divergence ledger" python3 scripts/check-tmux-release-ledger.py
@@ -290,6 +311,7 @@ print(environment.get("host_fingerprint") or "")
 fi
 
 if section_enabled static; then
+  run_step "release documentation allowlist" "${RMUX_PYTHON:-python3}" scripts/release_docs_allowlist.py
   run_step "worktree hygiene" scripts/check-worktree-hygiene.sh
   if [ "$evidence_mode" = full ]; then
     run_step "platform neutrality" scripts/check-platform-neutrality.sh
@@ -297,6 +319,10 @@ if section_enabled static; then
 fi
 
 if section_enabled lint; then
+  run_step "feature compilation gate regression" \
+    "${RMUX_PYTHON:-python3}" -m unittest discover -s scripts -p test_feature_powerset.py
+  run_step "workspace and isolated feature powerset" \
+    "${RMUX_PYTHON:-python3}" scripts/check_feature_powerset.py
   run_step "workspace clippy" \
     cargo clippy --workspace --all-targets --locked -- -D warnings
 fi
@@ -306,14 +332,17 @@ if section_enabled server; then
     cargo test -p rmux-server --lib --locked -- --test-threads=1
 fi
 
-if section_enabled xterm; then
+if section_enabled xterm || section_enabled tmux; then
   command -v npm >/dev/null 2>&1 ||
-    die "npm is required for the pinned independent xterm.js recovery oracle"
+    die "npm is required for the pinned independent xterm.js oracles"
+  run_step "pinned xterm.js oracle dependencies" \
+    npm --prefix tests/xterm-oracle ci --ignore-scripts --no-audit --no-fund
+fi
+
+if section_enabled xterm; then
   run_step "xterm.js oracle filter selects tests" \
     scripts/assert-cargo-filter-nonempty.sh 1 -- test -p rmux-server --lib --locked \
       pane_recovery::tests::keyframes_converge_in_independent_xterm_oracle
-  run_step "pinned xterm.js oracle dependencies" \
-    npm --prefix tests/xterm-oracle ci --ignore-scripts --no-audit --no-fund
   run_step "independent xterm.js recovery oracle" \
     cargo test -p rmux-server --lib --locked \
       pane_recovery::tests::keyframes_converge_in_independent_xterm_oracle -- \
@@ -321,10 +350,11 @@ if section_enabled xterm; then
 fi
 
 if section_enabled cli; then
+  # tiny_main tests live in the rmux binaries; integration targets select none of them.
   run_step "tiny parser filter selects tests" \
-    scripts/assert-cargo-filter-nonempty.sh 1 -- test -p rmux --features tiny-cli tiny_main --locked
+    scripts/assert-cargo-filter-nonempty.sh 1 -- test -p rmux --features tiny-cli --bins tiny_main --locked
   run_step "tiny parser and boundary tests" \
-    cargo test -p rmux --features tiny-cli tiny_main --locked
+    cargo test -p rmux --features tiny-cli --bins tiny_main --locked
   if [ "$evidence_mode" = full ]; then
     run_step "mutating target-action retry filter selects tests" \
       scripts/assert-cargo-filter-nonempty.sh 1 -- test -p rmux --bin rmux --locked target_action_retry_is_limited
@@ -350,6 +380,8 @@ if section_enabled cli; then
 fi
 
 if section_enabled tmux; then
+  run_step "pinned xterm viewport prerequisite" \
+    "${RMUX_XTERM_NODE:-node}" tests/xterm-oracle/viewport-oracle.mjs --check
   if [ "$evidence_mode" = full ]; then
     run_step "source-file tmux oracle filter selects tests" \
       scripts/assert-cargo-filter-nonempty.sh 2 -- test --locked --test unix_source_file_tmux_oracle

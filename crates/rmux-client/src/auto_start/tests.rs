@@ -587,3 +587,45 @@ fn auto_start_treats_competing_startup_success_as_connected() {
     );
     assert_eq!(launch_calls.load(Ordering::Relaxed), 1);
 }
+
+mod fd_inheritance_support {
+    include!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../tests/support/daemon_fd_inheritance.rs"
+    ));
+}
+
+#[test]
+fn cli_hidden_daemon_closes_high_inherited_fd() {
+    fd_inheritance_support::check(
+        "auto_start::tests::cli_hidden_daemon_closes_high_inherited_fd",
+        |binary, endpoint| {
+            #[cfg(target_os = "linux")]
+            {
+                use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+                // SAFETY: eventfd returns a fresh descriptor owned only here.
+                let raw = unsafe { libc::eventfd(0, libc::EFD_CLOEXEC) };
+                assert!(raw >= 0);
+                let ready = unsafe { OwnedFd::from_raw_fd(raw) };
+                let mut command = super::hidden_daemon_command_preserving_fd(
+                    binary,
+                    endpoint,
+                    &AutoStartConfig::disabled(),
+                    false,
+                    ready.as_raw_fd(),
+                );
+                rmux_os::daemon::spawn_hidden_daemon_command(&mut command).unwrap()
+            }
+            #[cfg(not(target_os = "linux"))]
+            {
+                let mut command = super::hidden_daemon_command(
+                    binary,
+                    endpoint,
+                    &AutoStartConfig::disabled(),
+                    false,
+                );
+                rmux_os::daemon::spawn_hidden_daemon_command(&mut command).unwrap()
+            }
+        },
+    );
+}

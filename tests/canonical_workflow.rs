@@ -11,8 +11,9 @@ use std::time::{Duration, Instant};
 
 use common::{
     assert_only_default_socket, assert_success, child_process_states, read_until_contains,
-    read_until_contains_all, stderr, stdout, verify_fixture_coherence, AttachedSession, CliHarness,
-    BINARY_OVERRIDE_ENV, CANONICAL_SESSION_WORKFLOW, WORKFLOW_COLORTERM_PRINT_COMMAND,
+    read_until_contains_all, run_success_with_transient_retry, stderr, stdout,
+    verify_fixture_coherence, AttachedSession, CliHarness, BINARY_OVERRIDE_ENV,
+    CANONICAL_SESSION_WORKFLOW, WORKFLOW_COLORTERM_PRINT_COMMAND,
 };
 use rmux_pty::TerminalSize;
 
@@ -234,45 +235,6 @@ fn rapid_create_kill_churn_reaps_children_without_socket_leaks() -> Result<(), B
         assert_only_default_socket(harness.socket_path())?;
     }
 
-    Ok(())
-}
-
-fn run_success_with_transient_retry(
-    harness: &CliHarness,
-    args: &[&str],
-) -> Result<(), Box<dyn Error>> {
-    let mut last_output = None;
-
-    for _ in 0..3 {
-        let output = harness.run(args)?;
-        if output.status.code() == Some(0)
-            && stdout(&output).is_empty()
-            && stderr(&output).is_empty()
-        {
-            return Ok(());
-        }
-
-        let retryable = stderr(&output).contains("Resource temporarily unavailable");
-        last_output = Some(output);
-        if !retryable {
-            break;
-        }
-
-        std::thread::sleep(Duration::from_millis(50));
-    }
-
-    let output = last_output.as_ref().expect("at least one command attempt");
-    assert_eq!(
-        output.status.code(),
-        Some(0),
-        "expected successful command {:?}, got status {:?}\nstdout:\n{}\nstderr:\n{}",
-        args,
-        output.status,
-        stdout(output),
-        stderr(output)
-    );
-    assert!(stdout(output).is_empty(), "stdout should be empty");
-    assert!(stderr(output).is_empty(), "stderr should be empty");
     Ok(())
 }
 

@@ -13,41 +13,27 @@ use crate::handles::split::SplitDirection;
 use crate::transport::{OperationDeadline, TransportClient};
 use crate::{PaneId, PaneRef, ProcessSpec, Result, RmuxEndpoint, RmuxError, TerminalSizeSpec};
 
-#[path = "pane/capture_pane.rs"]
 mod capture_pane;
-#[path = "pane/foreground.rs"]
+mod exit_probe;
 mod foreground;
-#[path = "pane/info.rs"]
 mod info;
-#[path = "pane/input.rs"]
 mod input;
-#[path = "pane/lifecycle.rs"]
 mod lifecycle;
-#[path = "pane/options.rs"]
 mod options;
-#[path = "pane/output.rs"]
 mod output;
-#[path = "pane/queries.rs"]
 mod queries;
-#[path = "pane/snapshot.rs"]
 pub(crate) mod snapshot;
-#[path = "pane/spawn.rs"]
 mod spawn;
-#[path = "pane/split.rs"]
 mod split;
-#[path = "pane/split_builder.rs"]
 mod split_builder;
-#[path = "pane/state_events.rs"]
 mod state_events;
-#[path = "pane/target.rs"]
 mod target;
-#[path = "pane/title.rs"]
 mod title;
-#[path = "pane/waits.rs"]
 mod waits;
 
 pub use capture_pane::{PaneCapture, PaneCaptureBuilder};
 pub use foreground::{ForegroundSource, ForegroundSources, ForegroundState};
+pub(in crate::handles) use info::apply_live_details;
 use info::current_pane_ref_for_id;
 use input::{resize_to_size, send_key, send_text};
 use lifecycle::{close_pane, respawn_pane};
@@ -92,7 +78,10 @@ pub enum PaneCloseOutcome {
 /// Process and policy fields for [`Pane::respawn`].
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct PaneRespawnOptions {
-    /// Whether a running pane should be killed before respawning.
+    /// Whether a running pane should be replaced before respawning.
+    ///
+    /// As with tmux `respawn-pane -k`, on Unix the previous terminal is hung
+    /// up: a process that ignores `SIGHUP` keeps running.
     pub kill: bool,
     /// Optional working-directory override for the new process.
     pub start_directory: Option<PathBuf>,
@@ -429,6 +418,10 @@ impl Pane {
     /// [`PaneCloseOutcome::AlreadyClosed`]. Dropping a [`Pane`] handle remains
     /// inert; this consuming method is the SDK operation that explicitly
     /// closes the pane slot and its process.
+    ///
+    /// As with tmux `kill-pane`, on Unix closing hangs up the pane terminal
+    /// and sends no further signal: a process that ignores `SIGHUP` keeps
+    /// running.
     pub async fn close(self) -> Result<PaneCloseOutcome> {
         close_pane(self.begin_operation_handle()).await
     }

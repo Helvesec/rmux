@@ -26,6 +26,10 @@ impl PaneExitStatus {
         }
     }
 
+    pub(super) const fn is_stale(self) -> bool {
+        self.stale
+    }
+
     pub(super) fn json_value(self) -> Value {
         json!({
             "stale": self.stale,

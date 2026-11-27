@@ -1,15 +1,23 @@
+mod family_tests;
+
 use super::{CursorScope, OuterTerminal, OuterTerminalContext};
-use rmux_core::{OptionStore, Session};
+use rmux_core::{alternate_screen_exit_sequence, input::mode, OptionStore};
 use rmux_proto::{
-    ClientTerminalContext, OptionName, ScopeSelector, SessionName, SetOptionMode, TerminalSize,
+    ClientTerminalContext, OptionName, PaneTarget, ScopeSelector, SessionName, SetOptionMode,
+    TerminalSize, WindowTarget,
 };
+
+use crate::pane_screen_state::PaneScreenState;
 
 fn session_name(value: &str) -> SessionName {
     SessionName::new(value).expect("valid session name")
 }
 
-fn make_session() -> Session {
-    Session::new(session_name("alpha"), TerminalSize { cols: 80, rows: 24 })
+fn make_session() -> crate::session_fixture::SessionFixture {
+    crate::session_fixture::SessionFixture::new(
+        session_name("alpha"),
+        TerminalSize { cols: 80, rows: 24 },
+    )
 }
 
 const MOUSE_ENABLE_SEQUENCE: &str = "\u{1b}[?1006h\u{1b}[?1000h\u{1b}[?1002h";
@@ -181,7 +189,25 @@ fn attach_sequences_follow_focus_and_extended_key_options() {
     assert!(stop.contains(MOUSE_DISABLE_SEQUENCE));
     assert!(stop.contains("\u{1b}[?1004l"));
     assert!(stop.contains("\u{1b}[>4m"));
-    assert!(stop.ends_with("\u{1b}[?1049l\u{1b}[23;0;0t"));
+    assert!(stop.ends_with("\u{1b}[?1049l\u{1b}[23;0;0t\u{1b}[?25h"));
+}
+
+#[test]
+fn attach_stop_restores_outer_cursor_after_alternate_screen_exit() {
+    const TERM: &str = "xterm-256color";
+
+    let terminal = OuterTerminal::resolve(
+        &OptionStore::new(),
+        OuterTerminalContext::from_pairs(&[("TERM", TERM)]),
+    );
+    let stop = terminal.attach_stop_sequence();
+    let mut expected_suffix = alternate_screen_exit_sequence(TERM).to_vec();
+    expected_suffix.extend_from_slice(b"\x1b[?25h");
+
+    assert!(
+        stop.ends_with(&expected_suffix),
+        "attach stop must exit the alternate screen before its final outer-terminal cursor show: {stop:?}"
+    );
 }
 
 #[test]
@@ -403,7 +429,7 @@ fn render_prelude_without_resolved_title_writes_neither_title_nor_path() {
         "set-titles off must not drive OSC 7 either, got {prelude:?}"
     );
     // The rest of the prelude is untouched by the title gate.
-    assert!(prelude.contains("\u{1b}]12;rgb:cd/00/00\u{7}"));
+    assert!(prelude.contains("\u{1b}]12;rgb:80/00/00\u{7}"));
 }
 
 /// A resolved title is the expanded `set-titles-string`, never the bare pane
@@ -700,8 +726,13 @@ fn render_title_prelude(
     options: &OptionStore,
     update: super::ClientTitleUpdate<'_>,
 ) -> String {
-    String::from_utf8(terminal.render_prelude(&make_session(), options, CursorScope::Pane, update))
-        .expect("utf8")
+    String::from_utf8(terminal.render_prelude(
+        make_session().view(),
+        options,
+        CursorScope::Pane,
+        update,
+    ))
+    .expect("utf8")
 }
 
 #[test]
@@ -730,6 +761,71 @@ fn cursor_style_transition_preserves_terminal_default_on_initial_default_attach(
 }
 
 #[test]
+fn cursor_state_transition_replays_explicit_blink_for_terminal_default_shape() {
+    let terminal = OuterTerminal::resolve(
+        &OptionStore::new(),
+        OuterTerminalContext::from_pairs(&[("TERM", "xterm-256color")]),
+    );
+    let inherited = rmux_core::resolve_cursor_style_state(0, 0, 0);
+    let blinking = rmux_core::resolve_cursor_style_state(
+        0,
+        mode::MODE_CURSOR_BLINKING | mode::MODE_CURSOR_BLINKING_SET,
+        0,
+    );
+    let steady = rmux_core::resolve_cursor_style_state(0, mode::MODE_CURSOR_BLINKING_SET, 0);
+
+    assert_eq!(
+        terminal.render_cursor_state_transition(None, inherited),
+        None
+    );
+    assert_eq!(
+        terminal.render_cursor_state_transition(None, blinking),
+        Some("\x1b[?12h".to_owned())
+    );
+    assert_eq!(
+        terminal.render_cursor_state_transition(Some(blinking), steady),
+        Some("\x1b[?12l".to_owned())
+    );
+    assert_eq!(
+        terminal.render_cursor_state_transition(Some(steady), inherited),
+        Some("\x1b[2 q".to_owned())
+    );
+}
+
+#[test]
+fn cursor_state_transition_clears_default_blink_without_style_capabilities() {
+    let options = terminal_options(&[(OptionName::TerminalOverrides, "xterm*:Ss@:Se@")]);
+    let terminal = OuterTerminal::resolve(
+        &options,
+        OuterTerminalContext::from_pairs(&[("TERM", "xterm-256color")]),
+    );
+    let inherited = rmux_core::resolve_cursor_style_state(0, 0, 0);
+    let blinking = rmux_core::resolve_cursor_style_state(
+        0,
+        mode::MODE_CURSOR_BLINKING | mode::MODE_CURSOR_BLINKING_SET,
+        0,
+    );
+    let unsupported_bar = rmux_core::resolve_cursor_style_state(6, 0, 0);
+
+    assert_eq!(
+        terminal.render_cursor_state_transition(None, blinking),
+        Some("\x1b[?12h".to_owned())
+    );
+    assert_eq!(
+        terminal.render_cursor_state_transition(Some(blinking), inherited),
+        Some("\x1b[0 q".to_owned())
+    );
+    assert_eq!(
+        terminal.render_cursor_state_transition(Some(blinking), unsupported_bar),
+        Some("\x1b[0 q".to_owned())
+    );
+    assert_eq!(
+        terminal.render_cursor_state_transition(Some(unsupported_bar), inherited),
+        Some("\x1b[0 q".to_owned())
+    );
+}
+
+#[test]
 fn cursor_style_transition_resets_only_when_leaving_an_explicit_style() {
     let terminal = OuterTerminal::resolve(
         &OptionStore::new(),
@@ -745,6 +841,142 @@ fn cursor_style_transition_resets_only_when_leaving_an_explicit_style() {
         Some("\u{1b}[6 q".to_owned())
     );
     assert_eq!(terminal.render_cursor_style_transition(Some(6), 6), None);
+}
+
+#[test]
+fn cursor_style_transition_replays_pane_a_to_b_to_a() {
+    let terminal = OuterTerminal::resolve(
+        &OptionStore::new(),
+        OuterTerminalContext::from_pairs(&[("TERM", "xterm-256color")]),
+    );
+
+    assert_eq!(
+        terminal.render_cursor_style_transition(Some(6), 3),
+        Some("\x1b[3 q".to_owned())
+    );
+    assert_eq!(
+        terminal.render_cursor_style_transition(Some(3), 6),
+        Some("\x1b[6 q".to_owned())
+    );
+}
+
+#[test]
+fn pane_cursor_resolution_combines_shape_blink_and_scoped_default() {
+    let session = make_session();
+    let terminal = OuterTerminal::resolve(
+        &OptionStore::new(),
+        OuterTerminalContext::from_pairs(&[("TERM", "xterm-256color")]),
+    );
+    let blinking = mode::MODE_CURSOR_BLINKING | mode::MODE_CURSOR_BLINKING_SET;
+    let mut pane_state = PaneScreenState {
+        mode: blinking,
+        alternate_on: false,
+        title: String::new(),
+        path: String::new(),
+        cursor_position: (0, 0),
+        cursor_style: 6,
+    };
+    assert_eq!(
+        terminal.resolve_cursor_style(
+            session.view(),
+            &OptionStore::new(),
+            Some(&pane_state),
+            CursorScope::Pane,
+        ),
+        5
+    );
+
+    let mut options = OptionStore::new();
+    options
+        .set(
+            ScopeSelector::Window(WindowTarget::with_window(session.name().clone(), 0)),
+            OptionName::CursorStyle,
+            "bar".to_owned(),
+            SetOptionMode::Replace,
+        )
+        .expect("window cursor style");
+    pane_state.cursor_style = 0;
+    assert_eq!(
+        terminal.resolve_cursor_style(
+            session.view(),
+            &options,
+            Some(&pane_state),
+            CursorScope::Pane,
+        ),
+        5
+    );
+
+    options
+        .set(
+            ScopeSelector::Pane(PaneTarget::with_window(session.name().clone(), 0, 0)),
+            OptionName::CursorStyle,
+            "underline".to_owned(),
+            SetOptionMode::Replace,
+        )
+        .expect("pane cursor style override");
+    assert_eq!(
+        terminal.resolve_cursor_style(
+            session.view(),
+            &options,
+            Some(&pane_state),
+            CursorScope::Pane,
+        ),
+        3
+    );
+}
+
+#[test]
+fn prompt_cursor_scopes_do_not_mutate_or_inherit_the_pane_cursor() {
+    let session = make_session();
+    let terminal = OuterTerminal::resolve(
+        &OptionStore::new(),
+        OuterTerminalContext::from_pairs(&[("TERM", "xterm-256color")]),
+    );
+    let mut options = OptionStore::new();
+    options
+        .set(
+            ScopeSelector::Global,
+            OptionName::PromptCursorStyle,
+            "underline".to_owned(),
+            SetOptionMode::Replace,
+        )
+        .expect("prompt cursor style");
+    options
+        .set(
+            ScopeSelector::Global,
+            OptionName::PromptCommandCursorStyle,
+            "blinking-bar".to_owned(),
+            SetOptionMode::Replace,
+        )
+        .expect("command prompt cursor style");
+    let pane_state = PaneScreenState {
+        mode: 0,
+        alternate_on: false,
+        title: String::new(),
+        path: String::new(),
+        cursor_position: (0, 0),
+        cursor_style: 2,
+    };
+
+    assert_eq!(
+        terminal.resolve_cursor_style(
+            session.view(),
+            &options,
+            Some(&pane_state),
+            CursorScope::Prompt,
+        ),
+        4
+    );
+    assert_eq!(
+        terminal.resolve_cursor_style(
+            session.view(),
+            &options,
+            Some(&pane_state),
+            CursorScope::CommandPrompt,
+        ),
+        5
+    );
+    assert_eq!(pane_state.cursor_style, 2);
 }
 
 #[test]
@@ -958,11 +1190,213 @@ fn split_override_segments_handles_escaped_colons_and_empty_segments() {
     assert_eq!(segments, vec![""]);
 }
 
+/// Appends global terminal-option entries the way `set -as` does, on top of the
+/// shipped defaults.
+fn terminal_options(entries: &[(OptionName, &str)]) -> OptionStore {
+    let mut options = OptionStore::new();
+    for (option, value) in entries {
+        options
+            .set(
+                ScopeSelector::Global,
+                *option,
+                (*value).to_owned(),
+                SetOptionMode::Append,
+            )
+            .expect("terminal option append succeeds");
+    }
+    options
+}
+
+/// A native Windows attach: the client reports no `TERM` at all.
+fn empty_term_context() -> OuterTerminalContext {
+    let context = OuterTerminalContext::default();
+    assert_eq!(context.term_name(), "");
+    context
+}
+
+/// Both an absent `TERM` and an explicitly empty one resolve to the empty name.
+fn empty_term_contexts() -> [OuterTerminalContext; 2] {
+    let contexts = [
+        empty_term_context(),
+        OuterTerminalContext::from_pairs(&[("TERM", "")]),
+    ];
+    assert!(contexts
+        .iter()
+        .all(|context| context.term_name().is_empty()));
+    contexts
+}
+
 #[test]
-fn empty_term_skips_feature_and_override_matching() {
+fn default_terminal_selectors_do_not_match_empty_term() {
+    // The shipped defaults are all named selectors, so a client with no TERM
+    // still resolves to nothing. Both arrays are pinned: now that an empty name
+    // is matched as it stands, a default that ever gained an all-wildcard
+    // selector would silently switch itself on for every such client.
     let options = OptionStore::new();
-    let terminal = OuterTerminal::resolve(&options, OuterTerminalContext::default());
-    assert_eq!(terminal.features_string(), "");
+    assert_eq!(
+        options.resolve_array_values(None, OptionName::TerminalFeatures),
+        vec![
+            "xterm*:clipboard:ccolour:cstyle:focus:title".to_owned(),
+            "screen*:title".to_owned(),
+            "rxvt*:ignorefkeys".to_owned(),
+        ]
+    );
+    assert_eq!(
+        options.resolve_array_values(None, OptionName::TerminalOverrides),
+        vec!["linux*:AX@".to_owned()]
+    );
+
+    for context in empty_term_contexts() {
+        let terminal = OuterTerminal::resolve(&options, context);
+        assert_eq!(terminal.features_string(), "");
+        assert!(!terminal.supports_sixel());
+    }
+}
+
+#[test]
+fn wildcard_terminal_feature_enables_sixel_for_empty_term() {
+    // Issue #211: native Windows sets no TERM. Every all-wildcard selector must
+    // be matched rather than skipped merely because the terminal name is empty.
+    for selector in ["*:sixel", "**:sixel"] {
+        let options = terminal_options(&[(OptionName::TerminalFeatures, selector)]);
+        for context in empty_term_contexts() {
+            let terminal = OuterTerminal::resolve(&options, context);
+            assert!(terminal.supports_sixel(), "selector {selector:?}");
+            assert!(terminal.features_string().contains("sixel"));
+        }
+    }
+}
+
+#[test]
+fn wildcard_terminal_override_enables_sixel_for_empty_term() {
+    // The override route is the capability-side twin and must stay symmetric.
+    for selector in ["*:Sxl", "**:Sxl"] {
+        let options = terminal_options(&[(OptionName::TerminalOverrides, selector)]);
+        for context in empty_term_contexts() {
+            let terminal = OuterTerminal::resolve(&options, context);
+            assert!(terminal.supports_sixel(), "selector {selector:?}");
+            assert!(terminal.features_string().contains("sixel"));
+        }
+    }
+}
+
+#[test]
+fn named_terminal_selectors_still_do_not_match_empty_term() {
+    // The documented `xterm*:sixel` recipe genuinely does not apply to a client
+    // that reports no terminal name; only an explicit wildcard does. An absent
+    // TERM must not be treated as matching every named pattern.
+    for entries in [
+        vec![(OptionName::TerminalFeatures, "xterm:sixel")],
+        vec![(OptionName::TerminalOverrides, "xterm:Sxl")],
+        vec![(OptionName::TerminalFeatures, "xterm*:sixel")],
+        vec![(OptionName::TerminalOverrides, "xterm*:Sxl")],
+        vec![(OptionName::TerminalFeatures, "?:sixel")],
+        vec![(OptionName::TerminalOverrides, "?:Sxl")],
+        vec![(OptionName::TerminalFeatures, "[x]:sixel")],
+        vec![(OptionName::TerminalOverrides, "[x]:Sxl")],
+        vec![(OptionName::TerminalFeatures, "\\*:sixel")],
+        vec![(OptionName::TerminalOverrides, "\\*:Sxl")],
+    ] {
+        let options = terminal_options(&entries);
+        for context in empty_term_contexts() {
+            let terminal = OuterTerminal::resolve(&options, context);
+            assert!(
+                !terminal.supports_sixel(),
+                "{entries:?} must not match an empty terminal name"
+            );
+            assert_eq!(terminal.features_string(), "");
+        }
+    }
+}
+
+#[test]
+fn malformed_terminal_selectors_stay_rejected_for_empty_term() {
+    // An empty selector matches the empty string under fnmatch, so the explicit
+    // malformed-entry rejection is what keeps `:sixel` and `:Sxl` inert. Both
+    // routes must keep rejecting them rather than letting them through on a
+    // client with no TERM.
+    for entries in [
+        vec![(OptionName::TerminalFeatures, ":sixel")],
+        vec![(OptionName::TerminalFeatures, "   :sixel")],
+        vec![(OptionName::TerminalOverrides, ":Sxl")],
+    ] {
+        let options = terminal_options(&entries);
+        let terminal = OuterTerminal::resolve(&options, empty_term_context());
+        assert!(
+            !terminal.supports_sixel(),
+            "{entries:?} is malformed and must not apply"
+        );
+        assert_eq!(terminal.features_string(), "");
+    }
+}
+
+#[test]
+fn wildcard_terminal_selectors_still_match_named_terms() {
+    // The empty-name route must not be bought by weakening the ordinary one.
+    for entries in [
+        vec![(OptionName::TerminalFeatures, "*:sixel")],
+        vec![(OptionName::TerminalOverrides, "*:Sxl")],
+    ] {
+        let options = terminal_options(&entries);
+        let terminal = OuterTerminal::resolve(
+            &options,
+            OuterTerminalContext::from_pairs(&[("TERM", "xterm-256color")]),
+        );
+        assert!(
+            terminal.supports_sixel(),
+            "{entries:?} must match xterm too"
+        );
+        // The named defaults keep applying alongside the wildcard entry.
+        assert!(terminal.features_string().contains("clipboard"));
+    }
+}
+
+#[test]
+fn terminal_override_removal_wins_over_wildcard_feature_for_empty_term() {
+    // Overrides are applied after features, so `Sxl@` still removes what
+    // `*:sixel` enabled — precedence is unchanged by the empty terminal name.
+    let options = terminal_options(&[
+        (OptionName::TerminalFeatures, "*:sixel"),
+        (OptionName::TerminalOverrides, "*:Sxl@"),
+    ]);
+
+    let terminal = OuterTerminal::resolve(&options, empty_term_context());
+
+    assert!(!terminal.supports_sixel());
+}
+
+#[test]
+fn xt_reintroduction_and_its_removal_both_reach_an_empty_term() {
+    // A wildcard `XT` now reaches a client with no TERM, which makes the second
+    // override pass reachable there too: XT re-introduces bpaste/focus/title,
+    // and the explicit `Enbp@`/`Dsbp@` removals in the same entry still win.
+    let options = terminal_options(&[(OptionName::TerminalOverrides, "*:XT:Enbp@:Dsbp@")]);
+
+    let terminal = OuterTerminal::resolve(&options, empty_term_context());
+
+    let features = terminal.features_string();
+    assert!(features.contains("focus"), "XT should enable focus");
+    assert!(features.contains("title"), "XT should enable title");
+    assert!(
+        !features.contains("bpaste"),
+        "the second override pass must still honour the explicit removal"
+    );
+}
+
+#[test]
+fn context_features_still_enable_sixel_for_empty_term() {
+    // `rmux -T sixel` reaches the terminal through the context features, which
+    // are applied last and stay authoritative even against an explicit `Sxl@`
+    // removal.
+    let options = terminal_options(&[(OptionName::TerminalOverrides, "*:Sxl@")]);
+    let context = empty_term_context().with_client_terminal(&ClientTerminalContext {
+        terminal_features: vec!["sixel".to_owned()],
+        utf8: false,
+    });
+
+    let terminal = OuterTerminal::resolve(&options, context);
+
+    assert!(terminal.supports_sixel());
 }
 
 #[test]
@@ -1065,7 +1499,7 @@ fn colour_to_rgb_256_palette_boundaries() {
 #[test]
 fn colour_to_rgb_bright_ansi_colours() {
     // SGR 90 = bright black
-    assert_eq!(super::colour_to_rgb(90), Some((127, 127, 127)));
+    assert_eq!(super::colour_to_rgb(90), Some((128, 128, 128)));
     // SGR 97 = bright white
     assert_eq!(super::colour_to_rgb(97), Some((255, 255, 255)));
 }
@@ -1199,6 +1633,16 @@ fn override_removal_wins_over_xt_reintroduction() {
 }
 
 #[test]
+fn override_removal_wins_over_vt100_family_reintroduction() {
+    let options = terminal_options(&[(OptionName::TerminalOverrides, "xterm*:Enbp@")]);
+    let terminal = OuterTerminal::resolve(
+        &options,
+        OuterTerminalContext::from_pairs(&[("TERM", "xterm-256color")]),
+    );
+    assert!(!terminal.has_bracketed_paste());
+}
+
+#[test]
 fn override_removal_wins_over_tc_rgb() {
     // Tc triggers RGB, but if AX@ removes default_colours, RGB should
     // still be set (Tc only controls RGB, not AX). Verify Tc works and
@@ -1220,4 +1664,69 @@ fn override_removal_wins_over_tc_rgb() {
 
     let features = terminal.features_string();
     assert!(features.contains("RGB"), "Tc should enable RGB");
+}
+
+#[test]
+fn cursor_colour_uses_the_same_tmux_palette_as_colour_formats() {
+    let palette = [
+        (0, 0, 0),
+        (128, 0, 0),
+        (0, 128, 0),
+        (128, 128, 0),
+        (0, 0, 128),
+        (128, 0, 128),
+        (0, 128, 128),
+        (192, 192, 192),
+        (128, 128, 128),
+        (255, 0, 0),
+        (0, 255, 0),
+        (255, 255, 0),
+        (0, 0, 255),
+        (255, 0, 255),
+        (0, 255, 255),
+        (255, 255, 255),
+    ];
+    for (index, rgb) in palette.into_iter().enumerate() {
+        assert_eq!(
+            super::colour_to_rgb(super::COLOUR_FLAG_256 | index as i32),
+            Some(rgb)
+        );
+        let ansi = if index < 8 {
+            index as i32
+        } else {
+            index as i32 + 82
+        };
+        assert_eq!(super::colour_to_rgb(ansi), Some(rgb));
+    }
+}
+
+#[test]
+fn terminal_features_reports_declarations_without_inventing_xterm_fallback_features() {
+    for (value, colorterm, expected) in [
+        ("xterm*:title", "", "bpaste,focus,title"),
+        ("xterm*:title:RGB", "", "bpaste,focus,RGB,title"),
+        ("xterm*:title", "truecolor", "bpaste,focus,RGB,title"),
+        (
+            "xterm*:clipboard:ccolour:cstyle:focus:title",
+            "",
+            "bpaste,ccolour,clipboard,cstyle,focus,title",
+        ),
+    ] {
+        let mut options = OptionStore::new();
+        options
+            .set(
+                ScopeSelector::Global,
+                OptionName::TerminalFeatures,
+                value.into(),
+                SetOptionMode::Replace,
+            )
+            .unwrap();
+        let terminal = OuterTerminal::resolve(
+            &options,
+            OuterTerminalContext::from_pairs(&[("TERM", "xterm"), ("COLORTERM", colorterm)]),
+        );
+        assert_eq!(terminal.features_string(), expected);
+        assert!(terminal.supports_rgb);
+        assert!(terminal.supports_mouse);
+    }
 }

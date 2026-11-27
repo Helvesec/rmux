@@ -4,14 +4,42 @@ use super::Window;
 use crate::layout::{LayoutDirection, LayoutOptions, LayoutTree};
 
 impl Window {
+    pub(crate) fn ensure_tiled_resize_target(&self, pane_index: u32) -> Result<(), RmuxError> {
+        if self
+            .pane_id(pane_index)
+            .is_some_and(|id| self.is_floating_pane_id(id))
+        {
+            return Err(RmuxError::Server(
+                "generic resize requires a tiled pane; use floating resize".to_owned(),
+            ));
+        }
+        Ok(())
+    }
+
     pub(crate) fn resize_main_pane(&mut self, adjustment: ResizePaneAdjustment) {
+        if !matches!(
+            adjustment,
+            ResizePaneAdjustment::Zoom
+                | ResizePaneAdjustment::NoOp
+                | ResizePaneAdjustment::TrimBelow
+        ) && self
+            .panes
+            .first()
+            .is_some_and(|pane| self.ensure_tiled_resize_target(pane.index()).is_err())
+        {
+            return;
+        }
+        self.reconcile_borrowed_pane_owners();
         match adjustment {
             ResizePaneAdjustment::NoOp => return,
             ResizePaneAdjustment::AbsoluteWidth { columns } => {
                 self.auto_unzoom();
                 if self.custom_layout {
+                    let Some(pane_id) = self.panes.first().map(crate::Pane::id) else {
+                        return;
+                    };
                     let resized = self.layout_tree.as_mut().is_some_and(|tree| {
-                        tree.resize_pane_to(0, LayoutDirection::LeftRight, u32::from(columns))
+                        tree.resize_pane_to(pane_id, LayoutDirection::LeftRight, u32::from(columns))
                     });
                     if resized {
                         self.apply_layout_tree();
@@ -23,8 +51,11 @@ impl Window {
             ResizePaneAdjustment::AbsoluteHeight { rows } => {
                 self.auto_unzoom();
                 if self.custom_layout {
+                    let Some(pane_id) = self.panes.first().map(crate::Pane::id) else {
+                        return;
+                    };
                     let resized = self.layout_tree.as_mut().is_some_and(|tree| {
-                        tree.resize_pane_to(0, LayoutDirection::TopBottom, u32::from(rows))
+                        tree.resize_pane_to(pane_id, LayoutDirection::TopBottom, u32::from(rows))
                     });
                     if resized {
                         self.apply_layout_tree();
@@ -94,7 +125,11 @@ impl Window {
     }
 
     pub(crate) fn resize_pane_width(&mut self, pane_index: u32, columns: u16) -> bool {
-        let Some(position) = self.pane_position(pane_index) else {
+        if self.ensure_tiled_resize_target(pane_index).is_err() {
+            return false;
+        }
+        self.reconcile_borrowed_pane_owners();
+        let Some(pane_id) = self.pane_id(pane_index) else {
             return false;
         };
 
@@ -105,7 +140,7 @@ impl Window {
 
         self.auto_unzoom();
         let resized = self.layout_tree.as_mut().is_some_and(|tree| {
-            tree.resize_pane_to(position, LayoutDirection::LeftRight, u32::from(columns))
+            tree.resize_pane_to(pane_id, LayoutDirection::LeftRight, u32::from(columns))
         });
         if resized {
             self.requested_main_width = None;
@@ -115,7 +150,11 @@ impl Window {
     }
 
     pub(crate) fn resize_pane_height(&mut self, pane_index: u32, rows: u16) -> bool {
-        let Some(position) = self.pane_position(pane_index) else {
+        if self.ensure_tiled_resize_target(pane_index).is_err() {
+            return false;
+        }
+        self.reconcile_borrowed_pane_owners();
+        let Some(pane_id) = self.pane_id(pane_index) else {
             return false;
         };
 
@@ -126,7 +165,7 @@ impl Window {
 
         self.auto_unzoom();
         let resized = self.layout_tree.as_mut().is_some_and(|tree| {
-            tree.resize_pane_to(position, LayoutDirection::TopBottom, u32::from(rows))
+            tree.resize_pane_to(pane_id, LayoutDirection::TopBottom, u32::from(rows))
         });
         if resized {
             self.requested_main_height = None;
@@ -141,13 +180,17 @@ impl Window {
         direction: SplitDirection,
         new_size: u32,
     ) -> bool {
-        let Some(position) = self.pane_position(pane_index) else {
+        if self.ensure_tiled_resize_target(pane_index).is_err() {
+            return false;
+        }
+        self.reconcile_borrowed_pane_owners();
+        let Some(pane_id) = self.pane_id(pane_index) else {
             return false;
         };
         self.auto_unzoom();
         let resized = self.layout_tree.as_mut().is_some_and(|tree| {
             tree.resize_pane_to(
-                position,
+                pane_id,
                 LayoutDirection::from_split_direction(direction),
                 new_size,
             )
@@ -171,8 +214,26 @@ impl Window {
         new_size: u32,
         inserted_before_target: bool,
     ) -> bool {
+        if self.ensure_tiled_resize_target(new_pane_index).is_err() {
+            return false;
+        }
         let new_size = new_size.max(1);
         if inserted_before_target {
+            // The new pane precedes the pane it split, so its own border is
+            // the one between them; a size bounded to their shared cell
+            // never reaches the neighbour before it.
+            let Some(pane_id) = self.pane_id(new_pane_index) else {
+                return false;
+            };
+            let Some(cell) = self.layout_tree.as_ref().and_then(|tree| {
+                tree.cell_with_next_sibling(
+                    pane_id,
+                    LayoutDirection::from_split_direction(direction),
+                )
+            }) else {
+                return false;
+            };
+            let new_size = before_split_pane_size(cell, new_size);
             return self.resize_pane_to(new_pane_index, direction, new_size);
         }
 
@@ -208,7 +269,11 @@ impl Window {
         pane_index: u32,
         adjustment: ResizePaneAdjustment,
     ) -> bool {
-        let Some(position) = self.pane_position(pane_index) else {
+        if self.ensure_tiled_resize_target(pane_index).is_err() {
+            return false;
+        }
+        self.reconcile_borrowed_pane_owners();
+        let Some(pane_id) = self.pane_id(pane_index) else {
             return false;
         };
         let (direction, change) = match adjustment {
@@ -231,7 +296,7 @@ impl Window {
         let resized = self
             .layout_tree
             .as_mut()
-            .is_some_and(|tree| tree.resize_pane_by(position, direction, change));
+            .is_some_and(|tree| tree.resize_pane_by(pane_id, direction, change));
         if resized {
             self.sync_requested_main_size_after_directional_resize();
             self.apply_layout_tree();
@@ -240,10 +305,11 @@ impl Window {
     }
 
     pub(crate) fn apply_custom_layout(&mut self, layout: &str) -> Result<(), RmuxError> {
+        self.reconcile_borrowed_pane_owners();
         if self.panes.is_empty() {
             return Err(RmuxError::Server("invalid layout".to_owned()));
         }
-        let tree = LayoutTree::parse(layout, self.panes.len())?;
+        let tree = LayoutTree::parse(layout, &self.tiled_pane_ids())?;
         self.size = tree.size();
         self.layout_tree = Some(tree);
         self.custom_layout = true;
@@ -262,13 +328,14 @@ impl Window {
     }
 
     pub(crate) fn spread_layout(&mut self, pane_index: u32) -> bool {
-        let Some(position) = self.pane_position(pane_index) else {
+        self.reconcile_borrowed_pane_owners();
+        let Some(pane_id) = self.pane_id(pane_index) else {
             return false;
         };
         let spread = self
             .layout_tree
             .as_mut()
-            .is_some_and(|tree| tree.spread_from_leaf(position));
+            .is_some_and(|tree| tree.spread_from_leaf(pane_id));
         if spread {
             self.apply_layout_tree();
         }
@@ -279,16 +346,24 @@ impl Window {
         LayoutOptions::default()
             .with_requested_main_width(self.requested_main_width)
             .with_requested_main_height(self.requested_main_height)
-            .with_tiled_max_columns(None)
+            .with_tiled_max_columns(self.tiled_max_columns)
     }
 
     pub(super) fn rebuild_named_layout_tree(&mut self, layout: LayoutName) {
+        self.reconcile_borrowed_pane_owners();
         if self.panes.is_empty() {
             self.layout_tree = None;
             self.custom_layout = false;
             return;
         }
-        let tree = LayoutTree::named(layout, self.panes.len(), self.size, self.layout_options());
+        let pane_ids = self.tiled_pane_ids();
+        if pane_ids.is_empty() {
+            self.layout_tree = None;
+            self.custom_layout = false;
+            self.apply_floating_stack_to_panes();
+            return;
+        }
+        let tree = LayoutTree::named(layout, &pane_ids, self.size, self.layout_options());
         self.size = tree.size();
         self.layout_tree = Some(tree);
         self.custom_layout = false;
@@ -296,9 +371,12 @@ impl Window {
     }
 
     pub(super) fn apply_layout_tree(&mut self) {
+        self.reconcile_borrowed_pane_owners();
+        self.sync_resize_topology();
         if let Some(tree) = &self.layout_tree {
-            tree.apply_to_panes(&mut self.panes);
+            tree.apply_to_matching_panes(&mut self.panes);
         }
+        self.apply_floating_stack_to_panes();
     }
 
     fn sync_requested_main_size_after_directional_resize(&mut self) {
@@ -316,4 +394,20 @@ impl Window {
             _ => {}
         }
     }
+}
+
+/// The size tmux 3.7b's `layout_split_pane` gives a pane split in before its
+/// target (`split-window -b -l`, `join-pane -b -l`) inside the `cell` cells
+/// the two panes share with their border: the target keeps `cell - 1 -
+/// requested`, and each pane keeps between one cell and `cell - 2`. tmux
+/// computes the target's share in unsigned arithmetic, so a request of at
+/// least the whole cell wraps, the target keeps `cell - 2` and the new pane
+/// one cell, the layout tmux 3.7b draws.
+fn before_split_pane_size(cell: u32, requested: u32) -> u32 {
+    let largest_share = cell.saturating_sub(2).max(1);
+    let target_share = cell
+        .wrapping_sub(requested)
+        .wrapping_sub(1)
+        .clamp(1, largest_share);
+    cell.saturating_sub(1).saturating_sub(target_share).max(1)
 }

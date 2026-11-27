@@ -1,5 +1,5 @@
 use std::io;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use super::ProcessTreeController;
 
@@ -51,6 +51,29 @@ impl ProcessTreeController {
             let _ = timeout;
             self.terminate()?;
             Ok(true)
+        }
+    }
+
+    /// Force-terminates the tree during a shutdown that shares `deadline`
+    /// across several trees, and reports whether shutdown may treat it as
+    /// settled.
+    ///
+    /// Linux observes descendant quiescence until `deadline` through
+    /// [`Self::terminate_and_wait`]; an observation error reports `false`.
+    /// Other platforms deliver the force-termination request without
+    /// observing descendants and report `true`.
+    pub fn terminate_for_shutdown(&self, deadline: Instant) -> bool {
+        #[cfg(target_os = "linux")]
+        {
+            self.terminate_and_wait(deadline.saturating_duration_since(Instant::now()))
+                .unwrap_or(false)
+        }
+
+        #[cfg(not(target_os = "linux"))]
+        {
+            let _ = deadline;
+            let _ = self.terminate();
+            true
         }
     }
 }

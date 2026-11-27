@@ -7,6 +7,8 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 mod common;
+#[path = "request_end_to_end/command_surface.rs"]
+mod request_command_surface;
 
 use common::{send_request, session_name, start_server, wait_for_socket_removal, TestHarness};
 use rmux_proto::{
@@ -19,12 +21,19 @@ use rmux_proto::{
 };
 use tokio::time::sleep;
 
-const COMMAND_SURFACE_COUNT: usize = 82;
+const COMMAND_SURFACE_COUNT: usize = 91;
 const HANDLER_DISPATCH_ANCHORS: [&str; 2] = [
     "async fn dispatch_request(",
     "async fn dispatch_request_inner(",
 ];
-const INTERNAL_REQUEST_COMMANDS: [&str; 50] = [
+// This guard compares command-family representatives plus the output/stream
+// and runtime-execution endpoints, not all public wire requests or CLI verbs.
+// Alternate command paths use the existing family name; negotiation, target
+// resolution, control/daemon management and SDK lease/wait/snapshot/option/state
+// primitives are outside this scope. Output/stream endpoints are explicitly in
+// scope despite also serving the SDK. The literal subtraction below is not a
+// variant-to-command bijection: command_name() already merges several variants.
+const INTERNAL_REQUEST_COMMANDS: [&str; 53] = [
     "attach-session-ext",
     "attach-session-ext2",
     "attach-session-ext3",
@@ -64,11 +73,15 @@ const INTERNAL_REQUEST_COMMANDS: [&str; 50] = [
     "sdk-wait-output",
     "sdk-wait-for-output-ref",
     "sdk-wait-for-output",
+    // Source stdin exchange frames are consumed by the listener, not commands.
+    "source-file-input-data-v1",
+    "source-file-relay-v1",
     "subscribe-pane-state",
     "subscribe-pane-output-ref",
     "set-hook-mutation",
     "set-option-by-name",
     "split-window-ext",
+    "split-window-command-v1",
     "split-window-identity",
     "split-window-target-action",
     "switch-client-ext",
@@ -109,6 +122,8 @@ const COMMAND_SURFACE: [&str; COMMAND_SURFACE_COUNT] = [
     "respawn-pane",
     "kill-pane",
     "select-layout",
+    "export-window-snapshot",
+    "restore-window-snapshot",
     "next-layout",
     "previous-layout",
     "resize-pane",
@@ -159,6 +174,19 @@ const COMMAND_SURFACE: [&str; COMMAND_SURFACE_COUNT] = [
     "list-sessions",
     "list-panes",
     "web-share",
+    "runtime-command-execution",
+    // C2S131/135 execute multiple command families, so keep their routing names;
+    // C2S132 is a split-window path, already represented by that family above.
+    "runtime-command-execution-v2",
+    // Public V2 commands documented in docs/man/rmux.1 and the inventory.
+    "export-window-snapshot-v2",
+    "restore-window-snapshot-v2",
+    // Internal wire variant serving the public new-pane command.
+    "new-pane-input-v1",
+    // Internal wire variant serving the public source-file command.
+    "source-file-input-v1",
+    // Internal ResizePaneAxes wire variant serving public resize-pane.
+    "resize-pane-axes",
 ];
 
 #[test]
@@ -170,19 +198,28 @@ fn request_command_surface_matches_handler_dispatch() -> Result<(), Box<dyn Erro
         "pub enum Request",
     )?;
     let request_name_commands = extract_request_command_names(
-        &repo_root.join("crates/rmux-proto/src/request.rs"),
+        &repo_root.join("crates/rmux-proto/src/request/routing.rs"),
         "match self",
     )?;
-    let handler_commands = extract_match_variant_commands(
-        &repo_root.join("crates/rmux-server/src/handler_dispatch.rs"),
-        &HANDLER_DISPATCH_ANCHORS,
-        "Request::",
-    )?;
+    let handler_commands =
+        extract_handler_dispatch_commands(&repo_root.join("crates/rmux-server/src"))?;
 
+    for transport in ["source-file-input-data-v1", "source-file-relay-v1"] {
+        assert!(request_enum_commands.contains(transport));
+        assert!(request_name_commands.contains(transport));
+        assert!(
+            !handler_commands.contains(transport),
+            "source stdin transport frame exposed by command dispatch: {transport}"
+        );
+    }
     assert_eq!(expected.len(), COMMAND_SURFACE_COUNT);
     assert_eq!(filter_internal_commands(request_enum_commands), expected);
-    assert_eq!(filter_internal_commands(request_name_commands), expected);
     assert_eq!(filter_internal_commands(handler_commands), expected);
+    request_command_surface::assert_public_commands()?;
+    assert_eq!(
+        filter_internal_commands(request_name_commands),
+        request_command_surface::expected_routing_names(&expected)
+    );
     Ok(())
 }
 
@@ -197,6 +234,12 @@ fn split_handler_dispatch_surface_still_detects_a_missing_command() -> Result<()
         }
 
         async fn dispatch_request_inner() {
+            if let Request::RuntimeCommandExecution(request) = request {
+                return execute(request);
+            }
+            if let Request::RuntimeCommandExecutionV2(request) = request {
+                return execute_v2(request);
+            }
             match request {
                 Request::ShowBuffer(request) => dispatch(request),
             }
@@ -207,10 +250,16 @@ fn split_handler_dispatch_surface_still_detects_a_missing_command() -> Result<()
         &HANDLER_DISPATCH_ANCHORS,
         "Request::",
     )?;
-    let expected = ["if-shell", "run-shell", "show-buffer"]
-        .into_iter()
-        .map(str::to_owned)
-        .collect::<BTreeSet<_>>();
+    let expected = [
+        "if-shell",
+        "run-shell",
+        "show-buffer",
+        "runtime-command-execution",
+        "runtime-command-execution-v2",
+    ]
+    .into_iter()
+    .map(str::to_owned)
+    .collect::<BTreeSet<_>>();
     let missing = expected
         .difference(&actual)
         .cloned()
@@ -218,6 +267,76 @@ fn split_handler_dispatch_surface_still_detects_a_missing_command() -> Result<()
 
     assert_eq!(missing, BTreeSet::from(["if-shell".to_owned()]));
     assert_ne!(actual, expected);
+    Ok(())
+}
+
+#[test]
+fn handler_dispatch_surface_spans_files_and_rejects_omissions() -> Result<(), Box<dyn Error>> {
+    let harness = TestHarness::new("dispatch-source");
+    let source_dir = harness.socket_path().parent().expect("fixture directory");
+    fs::create_dir_all(source_dir.join("handler/dispatch_support"))?;
+    fs::write(
+        source_dir.join("handler/dispatch_support.rs"),
+        r#"
+            async fn dispatch_request() {
+                match request {
+                    Request::RunShell(request) => dispatch(request),
+                    request => dispatch_request_inner(request),
+                }
+            }
+        "#,
+    )?;
+    let inner = r#"
+        async fn dispatch_request_inner() {
+            if let Request::RuntimeCommandExecution(request) = request {
+                return execute(request);
+            }
+            if let Request::RuntimeCommandExecutionV2(request) = request {
+                return execute_v2(request);
+            }
+            match request {
+                Request::IfShell(request) => dispatch(request),
+                Request::ShowBuffer(request) => dispatch(request),
+            }
+        }
+        fn unrelated() {
+            Request::ShowBuffer(request);
+        }
+    "#;
+    let inner_path = source_dir.join("handler/dispatch_support/commands.rs");
+    fs::write(&inner_path, inner)?;
+    let expected = [
+        "if-shell",
+        "run-shell",
+        "show-buffer",
+        "runtime-command-execution",
+        "runtime-command-execution-v2",
+    ]
+    .into_iter()
+    .map(str::to_owned)
+    .collect::<BTreeSet<_>>();
+    assert_eq!(extract_handler_dispatch_commands(source_dir)?, expected);
+
+    fs::write(
+        &inner_path,
+        inner.replace("Request::ShowBuffer(request) => dispatch(request),", ""),
+    )?;
+    let actual = extract_handler_dispatch_commands(source_dir)?;
+    assert_eq!(
+        expected
+            .difference(&actual)
+            .cloned()
+            .collect::<BTreeSet<_>>(),
+        BTreeSet::from(["show-buffer".to_owned()])
+    );
+    assert_ne!(actual, expected);
+    fs::write(
+        &inner_path,
+        "fn unrelated() { Request::ShowBuffer(request); }",
+    )?;
+    assert!(extract_handler_dispatch_commands(source_dir).is_err());
+    fs::remove_file(inner_path)?;
+    assert!(extract_handler_dispatch_commands(source_dir).is_err());
     Ok(())
 }
 
@@ -270,22 +389,21 @@ async fn buffer_capture_and_scripting_requests_round_trip() -> Result<(), Box<dy
 }
 
 async fn create_detached_test_session(socket_path: &Path) -> Result<(), Box<dyn Error>> {
-    assert!(matches!(
-        send_request(
+    crate::common::assert_new_session(
+        &send_request(
             socket_path,
             &Request::NewSession(NewSessionRequest {
                 session_name: session_name("alpha"),
                 detached: true,
                 size: Some(TerminalSize {
                     cols: 120,
-                    rows: 40
+                    rows: 40,
                 }),
                 environment: None,
             }),
         )
         .await?,
-        Response::NewSession(_)
-    ));
+    );
     Ok(())
 }
 
@@ -605,22 +723,21 @@ async fn rename_listing_and_wait_for_requests_round_trip_over_real_socket(
     let alpha = session_name("alpha");
     let gamma = session_name("gamma");
 
-    assert!(matches!(
-        send_request(
+    crate::common::assert_new_session(
+        &send_request(
             harness.socket_path(),
             &Request::NewSession(NewSessionRequest {
                 session_name: alpha.clone(),
                 detached: true,
                 size: Some(TerminalSize {
                     cols: 120,
-                    rows: 40
+                    rows: 40,
                 }),
                 environment: None,
             }),
         )
         .await?,
-        Response::NewSession(_)
-    ));
+    );
     assert!(matches!(
         send_request(
             harness.socket_path(),
@@ -879,13 +996,25 @@ fn extract_request_command_names(
     Ok(commands)
 }
 
-fn extract_match_variant_commands(
-    path: &Path,
-    anchors: &[&str],
-    prefix: &str,
+fn extract_handler_dispatch_commands(
+    source_dir: &Path,
 ) -> Result<BTreeSet<String>, Box<dyn Error>> {
-    let contents = fs::read_to_string(path)?;
-    extract_match_variant_commands_from_contents(&contents, anchors, prefix)
+    let mut commands = BTreeSet::new();
+    for (file, anchor) in [
+        ("handler/dispatch_support.rs", HANDLER_DISPATCH_ANCHORS[0]),
+        (
+            "handler/dispatch_support/commands.rs",
+            HANDLER_DISPATCH_ANCHORS[1],
+        ),
+    ] {
+        let contents = fs::read_to_string(source_dir.join(file))?;
+        commands.extend(extract_match_variant_commands_from_contents(
+            &contents,
+            &[anchor],
+            "Request::",
+        )?);
+    }
+    Ok(commands)
 }
 
 fn extract_match_variant_commands_from_contents(
@@ -899,6 +1028,7 @@ fn extract_match_variant_commands_from_contents(
         let block = extract_braced_block(contents, anchor)?;
         for line in block.lines() {
             let trimmed = line.trim_start();
+            let trimmed = trimmed.strip_prefix("if let ").unwrap_or(trimmed);
             if !trimmed.starts_with(prefix) {
                 continue;
             }

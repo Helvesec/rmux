@@ -1,62 +1,71 @@
 //! Shared tmux-style fnmatch glob matching.
 
 /// Returns whether `text` matches the tmux-style `pattern`.
+///
+/// Runs in O(pattern x text) time. Every atom other than `*` consumes exactly
+/// one character, so when an atom fails only the most recent `*` needs to
+/// absorb one more character: an earlier star can never make a match possible
+/// that the later one cannot. A recursive search that retried every star
+/// independently was exponential in the number of stars, and a `-t` target of
+/// a few dozen characters froze the whole server.
 #[must_use]
 pub fn fnmatch(pattern: &str, text: &str) -> bool {
     let pattern = pattern.chars().collect::<Vec<_>>();
     let text = text.chars().collect::<Vec<_>>();
-    fnmatch_from(&pattern, &text, 0, 0)
-}
 
-fn fnmatch_from(pattern: &[char], text: &[char], pattern_index: usize, text_index: usize) -> bool {
-    if pattern_index == pattern.len() {
-        return text_index == text.len();
+    let mut pattern_index = 0;
+    let mut text_index = 0;
+    // Pattern index just past the latest star, and the text index that star
+    // currently stops before.
+    let mut latest_star: Option<(usize, usize)> = None;
+
+    while text_index < text.len() {
+        if pattern.get(pattern_index) == Some(&'*') {
+            pattern_index = skip_stars(&pattern, pattern_index);
+            latest_star = Some((pattern_index, text_index));
+            continue;
+        }
+        if let Some(next_pattern) = match_single(&pattern, pattern_index, text[text_index]) {
+            pattern_index = next_pattern;
+            text_index += 1;
+            continue;
+        }
+        let Some((star_pattern, star_text)) = latest_star else {
+            return false;
+        };
+        latest_star = Some((star_pattern, star_text + 1));
+        pattern_index = star_pattern;
+        text_index = star_text + 1;
     }
 
-    match pattern[pattern_index] {
-        '*' => {
-            // Collapse consecutive stars to prevent exponential recursion.
-            let mut next_pattern = pattern_index + 1;
-            while next_pattern < pattern.len() && pattern[next_pattern] == '*' {
-                next_pattern += 1;
-            }
-            (text_index..=text.len())
-                .any(|next_text| fnmatch_from(pattern, text, next_pattern, next_text))
-        }
-        '?' => {
-            text_index < text.len()
-                && fnmatch_from(pattern, text, pattern_index + 1, text_index + 1)
-        }
-        '[' => {
-            if text_index >= text.len() {
-                return false;
-            }
-            if let Some((matched, next_pattern)) =
-                bracket_match(pattern, pattern_index, text[text_index])
-            {
-                matched && fnmatch_from(pattern, text, next_pattern, text_index + 1)
-            } else {
-                text[text_index] == '['
-                    && fnmatch_from(pattern, text, pattern_index + 1, text_index + 1)
-            }
-        }
+    skip_stars(&pattern, pattern_index) == pattern.len()
+}
+
+fn skip_stars(pattern: &[char], mut pattern_index: usize) -> usize {
+    while pattern.get(pattern_index) == Some(&'*') {
+        pattern_index += 1;
+    }
+    pattern_index
+}
+
+/// Matches the one-character atom at `pattern_index` against `value` and
+/// returns the pattern index after the atom, or `None` when it does not match
+/// (including when the pattern is exhausted).
+fn match_single(pattern: &[char], pattern_index: usize, value: char) -> Option<usize> {
+    match *pattern.get(pattern_index)? {
+        '?' => Some(pattern_index + 1),
+        '[' => match bracket_match(pattern, pattern_index, value) {
+            Some((matched, next_pattern)) => matched.then_some(next_pattern),
+            // An unterminated class is a literal `[`.
+            None => (value == '[').then_some(pattern_index + 1),
+        },
         '\\' => {
-            let next_pattern = pattern_index + 1;
-            let literal = pattern.get(next_pattern).copied().unwrap_or('\\');
-            let consumed_pattern = if next_pattern < pattern.len() {
-                pattern_index + 2
-            } else {
-                pattern_index + 1
-            };
-            text_index < text.len()
-                && text[text_index] == literal
-                && fnmatch_from(pattern, text, consumed_pattern, text_index + 1)
+            // A trailing backslash matches itself.
+            let literal = pattern.get(pattern_index + 1).copied().unwrap_or('\\');
+            let next_pattern = (pattern_index + 2).min(pattern.len());
+            (value == literal).then_some(next_pattern)
         }
-        literal => {
-            text_index < text.len()
-                && text[text_index] == literal
-                && fnmatch_from(pattern, text, pattern_index + 1, text_index + 1)
-        }
+        literal => (value == literal).then_some(pattern_index + 1),
     }
 }
 
@@ -174,5 +183,35 @@ mod tests {
         assert!(fnmatch("rxvt*", "rxvt-unicode-256color"));
         assert!(fnmatch("linux*", "linux"));
         assert!(!fnmatch("xterm*", "tmux-256color"));
+    }
+
+    /// R3396 A4: `*a*a...*a*b` against a run of `a` made the recursive matcher
+    /// retry every star at every position, O(text^stars). Twenty stars over
+    /// forty characters would run for years; the linear matcher answers in
+    /// microseconds, so the deadline only has to survive a loaded host.
+    #[test]
+    fn fnmatch_many_stars_against_a_long_text_finish_quickly() {
+        use std::sync::mpsc;
+        use std::time::Duration;
+
+        let (sender, receiver) = mpsc::channel();
+        std::thread::spawn(move || {
+            let text = "a".repeat(40);
+            let mut answers = Vec::new();
+            for stars in [12, 20, 39, 41] {
+                let pattern = format!("{}*b", "*a".repeat(stars));
+                answers.push(fnmatch(&pattern, &text));
+                answers.push(fnmatch(&pattern, &format!("{text}b")));
+            }
+            let _ = sender.send(answers);
+        });
+
+        let answers = receiver
+            .recv_timeout(Duration::from_secs(5))
+            .expect("a glob with many stars must not backtrack exponentially");
+        assert_eq!(
+            answers,
+            [false, true, false, true, false, true, false, false]
+        );
     }
 }

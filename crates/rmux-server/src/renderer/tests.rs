@@ -5,7 +5,7 @@ use crate::copy_mode::CopyModeSummary;
 use crate::pane_terminals::HandlerState;
 use rmux_core::{
     input::{mode, InputParser},
-    OptionStore, Screen, Session, Style, Utf8Config,
+    FloatingPaneRect, OptionStore, Screen, Style, Utf8Config,
 };
 use rmux_proto::{
     OptionName, ResizePaneAdjustment, ScopeSelector, SessionName, SetOptionMode, SplitDirection,
@@ -16,8 +16,11 @@ fn session_name(value: &str) -> SessionName {
     SessionName::new(value).expect("valid session name")
 }
 
-fn session_with_three_panes() -> Session {
-    let mut session = Session::new(session_name("alpha"), TerminalSize { cols: 80, rows: 24 });
+fn session_with_three_panes() -> crate::session_fixture::SessionFixture {
+    let mut session = crate::session_fixture::SessionFixture::new(
+        session_name("alpha"),
+        TerminalSize { cols: 80, rows: 24 },
+    );
     session.split_active_pane().expect("first split succeeds");
     session.split_pane(1).expect("second split succeeds");
     session
@@ -40,7 +43,27 @@ fn visible_line_text(screen: &Screen, row: usize, cols: usize) -> String {
     text
 }
 
-fn render_until_contains(session: &Session, options: &OptionStore, needle: &str) -> String {
+fn float_pane(
+    session: &mut crate::session_fixture::SessionFixture,
+    pane_index: u32,
+    rect: FloatingPaneRect,
+) {
+    session
+        .store
+        .window_layout_context_mut(&WindowTarget::with_window(
+            session.name().clone(),
+            session.active_window_index(),
+        ))
+        .expect("window layout context")
+        .float_pane(pane_index, rect)
+        .expect("pane can float");
+}
+
+fn render_until_contains(
+    session: rmux_core::ManagedSessionView<'_>,
+    options: &OptionStore,
+    needle: &str,
+) -> String {
     let state = HandlerState::default();
     let deadline = std::time::Instant::now() + status_job_test_deadline();
     loop {
@@ -125,6 +148,17 @@ fn rendered_pane_line_truncates_to_pane_width_without_counting_sgr() {
 }
 
 #[test]
+fn rendered_pane_line_zero_width_is_a_noop() {
+    let utf8 = Utf8Config::default();
+    let clipped = super::truncate_rendered_pane_line(b"\x1b[31mabcdef", 0, &utf8);
+
+    assert!(
+        clipped.is_empty(),
+        "a zero-width row must not emit a style-only control sequence: {clipped:?}"
+    );
+}
+
+#[test]
 fn rendered_pane_line_closes_hyperlink_when_visible_text_is_clipped() {
     let utf8 = Utf8Config::default();
     let close = "\u{1b}]8;;\u{1b}\\";
@@ -172,12 +206,12 @@ fn rendered_pane_line_keeps_composed_cells_at_pane_width() {
 #[test]
 fn pane_render_keeps_modified_emoji_text_at_right_edge() {
     let size = TerminalSize { cols: 5, rows: 3 };
-    let session = Session::new(session_name("alpha"), size);
+    let session = crate::session_fixture::SessionFixture::new(session_name("alpha"), size);
     let pane = session.window().pane(0).expect("pane 0 exists");
     let screen = screen_with("👋🏽ABC".as_bytes(), size);
 
     let frame = String::from_utf8(super::render_pane_screen(
-        &session,
+        session.view(),
         &OptionStore::new(),
         pane,
         &screen,
@@ -191,11 +225,96 @@ fn pane_render_keeps_modified_emoji_text_at_right_edge() {
 }
 
 #[test]
+fn pane_render_projects_signed_floating_source_origin() {
+    let mut session = crate::session_fixture::SessionFixture::new(
+        session_name("alpha"),
+        TerminalSize { cols: 10, rows: 4 },
+    );
+    session.split_active_pane().expect("split succeeds");
+    float_pane(
+        &mut session,
+        1,
+        FloatingPaneRect::new(-3, 0, 8, 2).expect("valid floating rect"),
+    );
+    let pane = session.window().pane(1).expect("floating pane");
+    let screen = screen_with(b"ABCDEFGH", TerminalSize { cols: 8, rows: 2 });
+
+    let frame = String::from_utf8(super::render_pane_screen(
+        session.view(),
+        &OptionStore::new(),
+        pane,
+        &screen,
+    ))
+    .expect("pane frame is utf-8");
+
+    assert!(frame.contains("\u{1b}[1;1H\u{1b}[0mDEFGH"), "{frame:?}");
+    assert!(
+        !frame.contains("ABCDEFGH"),
+        "off-screen source cells must not be repainted: {frame:?}"
+    );
+}
+
+#[test]
+fn pane_cursor_hides_when_front_floating_frame_occludes_cursor_cell() {
+    let mut session = crate::session_fixture::SessionFixture::new(
+        session_name("alpha"),
+        TerminalSize { cols: 10, rows: 4 },
+    );
+    session.split_active_pane().expect("split succeeds");
+    float_pane(
+        &mut session,
+        1,
+        FloatingPaneRect::new(0, 0, 5, 2).expect("valid floating rect"),
+    );
+    let pane = session.window().pane(0).expect("rear tiled pane");
+    let screen = Screen::new(TerminalSize { cols: 10, rows: 3 }, 100);
+
+    let frame = String::from_utf8(super::render_pane_cursor(
+        session.view(),
+        &OptionStore::new(),
+        pane,
+        &screen,
+    ))
+    .expect("cursor frame is utf-8");
+
+    assert_eq!(frame, "\u{1b}[?25l");
+}
+
+#[test]
+fn render_projects_floating_frame_borders_from_scene() {
+    let mut session = crate::session_fixture::SessionFixture::new(
+        session_name("alpha"),
+        TerminalSize { cols: 10, rows: 4 },
+    );
+    session.split_active_pane().expect("split succeeds");
+    float_pane(
+        &mut session,
+        1,
+        FloatingPaneRect::new(1, 1, 4, 1).expect("valid floating rect"),
+    );
+
+    let frame = String::from_utf8(render(session.view(), &OptionStore::new()))
+        .expect("render frame is utf-8");
+
+    assert!(
+        frame.contains("\u{1b}[1;1H\u{1b}[32m┌"),
+        "floating frame should render from resolved scene: {frame:?}"
+    );
+    assert!(
+        frame.contains("\u{1b}[3;6H┘"),
+        "floating frame should include the clipped lower-right corner: {frame:?}"
+    );
+}
+
+#[test]
 fn copy_mode_position_truncation_does_not_style_separator_before_bracket() {
-    let session = Session::new(session_name("alpha"), TerminalSize { cols: 6, rows: 4 });
+    let session = crate::session_fixture::SessionFixture::new(
+        session_name("alpha"),
+        TerminalSize { cols: 6, rows: 4 },
+    );
     let pane = session.window().pane(0).expect("pane 0 exists");
     let frame = String::from_utf8(super::render_copy_mode_position(
-        &session,
+        session.view(),
         &OptionStore::new(),
         0,
         pane,
@@ -216,11 +335,64 @@ fn copy_mode_position_truncation_does_not_style_separator_before_bracket() {
 }
 
 #[test]
+fn copy_mode_position_trimmed_wide_segment_keeps_badge_style() {
+    let mut session = crate::session_fixture::SessionFixture::new(
+        session_name("alpha"),
+        TerminalSize { cols: 2, rows: 4 },
+    );
+    float_pane(
+        &mut session,
+        0,
+        FloatingPaneRect::new(-6, 0, 8, 2).expect("valid floating rect"),
+    );
+    let pane = session.window().pane(0).expect("pane 0 exists");
+    let mut options = OptionStore::new();
+    options
+        .set(
+            ScopeSelector::Global,
+            OptionName::CopyModePositionFormat,
+            " 表A".to_owned(),
+            SetOptionMode::Replace,
+        )
+        .expect("copy-mode position format option set succeeds");
+    options
+        .set(
+            ScopeSelector::Global,
+            OptionName::CopyModePositionStyle,
+            "bg=blue".to_owned(),
+            SetOptionMode::Replace,
+        )
+        .expect("copy-mode position style option set succeeds");
+    let frame = String::from_utf8(super::render_copy_mode_position(
+        session.view(),
+        &options,
+        0,
+        pane,
+        &copy_mode_summary_with_time(0),
+        1,
+        false,
+    ))
+    .expect("copy-mode position frame is utf-8");
+
+    assert!(
+        frame.contains("\u{1b}[0;44m A") || frame.contains("\u{1b}[44m A"),
+        "partial wide cell and following lead must keep the badge style: {frame:?}"
+    );
+    assert!(
+        !frame.contains(" \u{1b}[0;44mA") && !frame.contains(" \u{1b}[44mA"),
+        "partial wide cell must not render before badge styling starts: {frame:?}"
+    );
+}
+
+#[test]
 fn copy_mode_position_without_time_does_not_style_separator_before_bracket() {
-    let session = Session::new(session_name("alpha"), TerminalSize { cols: 100, rows: 4 });
+    let session = crate::session_fixture::SessionFixture::new(
+        session_name("alpha"),
+        TerminalSize { cols: 100, rows: 4 },
+    );
     let pane = session.window().pane(0).expect("pane 0 exists");
     let frame = String::from_utf8(super::render_copy_mode_position(
-        &session,
+        session.view(),
         &OptionStore::new(),
         0,
         pane,
@@ -242,7 +414,10 @@ fn copy_mode_position_without_time_does_not_style_separator_before_bracket() {
 
 #[test]
 fn copy_mode_position_badge_stays_out_of_the_line_number_gutter() {
-    let session = Session::new(session_name("alpha"), TerminalSize { cols: 6, rows: 4 });
+    let session = crate::session_fixture::SessionFixture::new(
+        session_name("alpha"),
+        TerminalSize { cols: 6, rows: 4 },
+    );
     let pane = session.window().pane(0).expect("pane 0 exists");
     let mut options = OptionStore::new();
     options
@@ -258,7 +433,13 @@ fn copy_mode_position_badge_stays_out_of_the_line_number_gutter() {
     summary.history_size = 0;
     summary.backing_rows = 4;
     let frame = String::from_utf8(super::render_copy_mode_position(
-        &session, &options, 0, pane, &summary, 0, false,
+        session.view(),
+        &options,
+        0,
+        pane,
+        &summary,
+        0,
+        false,
     ))
     .expect("copy-mode position frame is utf-8");
 
@@ -270,7 +451,10 @@ fn copy_mode_position_badge_stays_out_of_the_line_number_gutter() {
 
 #[test]
 fn copy_mode_position_uses_tmux_absolute_line_number_formats() {
-    let session = Session::new(session_name("alpha"), TerminalSize { cols: 20, rows: 10 });
+    let session = crate::session_fixture::SessionFixture::new(
+        session_name("alpha"),
+        TerminalSize { cols: 20, rows: 10 },
+    );
     let pane = session.window().pane(0).expect("pane 0 exists");
     let mut options = OptionStore::new();
     options
@@ -288,14 +472,26 @@ fn copy_mode_position_uses_tmux_absolute_line_number_formats() {
     summary.scroll_position = 31;
 
     let absolute = String::from_utf8(super::render_copy_mode_position(
-        &session, &options, 0, pane, &summary, 31, false,
+        session.view(),
+        &options,
+        0,
+        pane,
+        &summary,
+        31,
+        false,
     ))
     .expect("copy-mode position frame is utf-8");
     assert!(absolute.contains("[1/41]"), "absolute format: {absolute:?}");
 
     summary.line_numbers_enabled = false;
     let mouse_origin = String::from_utf8(super::render_copy_mode_position(
-        &session, &options, 0, pane, &summary, 31, false,
+        session.view(),
+        &options,
+        0,
+        pane,
+        &summary,
+        31,
+        false,
     ))
     .expect("copy-mode position frame is utf-8");
     assert!(
@@ -306,13 +502,16 @@ fn copy_mode_position_uses_tmux_absolute_line_number_formats() {
 
 #[test]
 fn hidden_copy_mode_position_emits_no_badge() {
-    let session = Session::new(session_name("alpha"), TerminalSize { cols: 20, rows: 4 });
+    let session = crate::session_fixture::SessionFixture::new(
+        session_name("alpha"),
+        TerminalSize { cols: 20, rows: 4 },
+    );
     let pane = session.window().pane(0).expect("pane 0 exists");
     let mut summary = copy_mode_summary_with_time(0);
     summary.show_position = false;
 
     assert!(super::render_copy_mode_position(
-        &session,
+        session.view(),
         &OptionStore::new(),
         0,
         pane,
@@ -325,7 +524,10 @@ fn hidden_copy_mode_position_emits_no_badge() {
 
 #[test]
 fn clipped_cursor_marker_is_repainted_after_position_badge() {
-    let session = Session::new(session_name("alpha"), TerminalSize { cols: 8, rows: 2 });
+    let session = crate::session_fixture::SessionFixture::new(
+        session_name("alpha"),
+        TerminalSize { cols: 8, rows: 2 },
+    );
     let pane = session.window().pane(0).expect("pane 0 exists");
     let mut options = OptionStore::new();
     options
@@ -341,7 +543,13 @@ fn clipped_cursor_marker_is_repainted_after_position_badge() {
     summary.cursor_x = 7;
 
     let frame = String::from_utf8(super::render_copy_mode_position(
-        &session, &options, 0, pane, &summary, 1, false,
+        session.view(),
+        &options,
+        0,
+        pane,
+        &summary,
+        1,
+        false,
     ))
     .expect("copy-mode position frame is utf-8");
     assert!(
@@ -423,7 +631,10 @@ fn style_parser_maps_supported_forms_to_exact_ansi_bytes() {
 
 #[test]
 fn sessions_without_visible_borders_emit_status_only_when_enabled() {
-    let session = Session::new(session_name("alpha"), TerminalSize { cols: 80, rows: 24 });
+    let session = crate::session_fixture::SessionFixture::new(
+        session_name("alpha"),
+        TerminalSize { cols: 80, rows: 24 },
+    );
     assert!(border_cells(
         session.window(),
         session.active_pane_index(),
@@ -431,8 +642,8 @@ fn sessions_without_visible_borders_emit_status_only_when_enabled() {
         Style::default()
     )
     .is_empty());
-    let default_frame =
-        String::from_utf8(render(&session, &OptionStore::new())).expect("status frame is utf-8");
+    let default_frame = String::from_utf8(render(session.view(), &OptionStore::new()))
+        .expect("status frame is utf-8");
     assert!(default_frame.contains("[alpha]"));
     assert!(!default_frame.contains('┬'));
 
@@ -445,30 +656,39 @@ fn sessions_without_visible_borders_emit_status_only_when_enabled() {
             SetOptionMode::Replace,
         )
         .expect("status off succeeds");
-    assert!(render(&session, &status_off).is_empty());
+    assert!(render(session.view(), &status_off).is_empty());
 
-    let mut narrow = Session::new(session_name("narrow"), TerminalSize { cols: 3, rows: 2 });
+    let mut narrow = crate::session_fixture::SessionFixture::new(
+        session_name("narrow"),
+        TerminalSize { cols: 3, rows: 2 },
+    );
     narrow.split_active_pane().expect("split succeeds");
     narrow.resize_terminal(TerminalSize { cols: 1, rows: 2 });
-    assert!(!render(&narrow, &OptionStore::new()).is_empty());
+    assert!(!render(narrow.view(), &OptionStore::new()).is_empty());
 
-    let mut zero_height = Session::new(session_name("flat"), TerminalSize { cols: 80, rows: 3 });
+    let mut zero_height = crate::session_fixture::SessionFixture::new(
+        session_name("flat"),
+        TerminalSize { cols: 80, rows: 3 },
+    );
     zero_height
         .split_active_pane_with_direction(SplitDirection::Horizontal)
         .expect("split succeeds");
     zero_height.resize_terminal(TerminalSize { cols: 80, rows: 0 });
-    assert!(render(&zero_height, &OptionStore::new()).is_empty());
+    assert!(render(zero_height.view(), &OptionStore::new()).is_empty());
 }
 
 #[test]
 fn zoomed_sessions_clear_before_redrawing_active_pane() {
-    let mut session = Session::new(session_name("alpha"), TerminalSize { cols: 80, rows: 24 });
+    let mut session = crate::session_fixture::SessionFixture::new(
+        session_name("alpha"),
+        TerminalSize { cols: 80, rows: 24 },
+    );
     session.split_active_pane().expect("split succeeds");
     session
         .resize_pane(0, ResizePaneAdjustment::Zoom)
         .expect("zoom succeeds");
 
-    let frame = render(&session, &OptionStore::new());
+    let frame = render(session.view(), &OptionStore::new());
     assert!(
         frame.starts_with(b"\x1b[0m\x1b[H\x1b[2J"),
         "zoom repaint must clear stale non-active pane cells before drawing"
@@ -478,7 +698,7 @@ fn zoomed_sessions_clear_before_redrawing_active_pane() {
 #[test]
 fn zoomed_sessions_render_only_the_active_pane_screen() {
     let size = TerminalSize { cols: 20, rows: 6 };
-    let mut session = Session::new(session_name("alpha"), size);
+    let mut session = crate::session_fixture::SessionFixture::new(session_name("alpha"), size);
     session.split_active_pane().expect("split succeeds");
     session
         .resize_pane(0, ResizePaneAdjustment::Zoom)
@@ -488,14 +708,14 @@ fn zoomed_sessions_render_only_the_active_pane_screen() {
     let inactive_pane = session.window().pane(1).expect("pane 1 exists");
 
     let active_frame = String::from_utf8(super::render_pane_screen(
-        &session,
+        session.view(),
         &options,
         active_pane,
         &screen_with(b"VISIBLE_LEFT", size),
     ))
     .expect("active pane frame is utf-8");
     let inactive_frame = super::render_pane_screen(
-        &session,
+        session.view(),
         &options,
         inactive_pane,
         &screen_with(b"HIDDEN_RIGHT", size),
@@ -511,13 +731,18 @@ fn zoomed_sessions_render_only_the_active_pane_screen() {
 #[test]
 fn pane_render_leaves_default_cells_at_terminal_default_without_user_style() {
     let size = TerminalSize { cols: 6, rows: 2 };
-    let session = Session::new(session_name("alpha"), size);
+    let session = crate::session_fixture::SessionFixture::new(session_name("alpha"), size);
     let pane = session.window().pane(0).expect("pane 0 exists");
     let screen = screen_with(b"\x1b[44mB\x1b[0mD", size);
     let options = OptionStore::new();
 
-    let frame = String::from_utf8(super::render_pane_screen(&session, &options, pane, &screen))
-        .expect("pane frame is utf-8");
+    let frame = String::from_utf8(super::render_pane_screen(
+        session.view(),
+        &options,
+        pane,
+        &screen,
+    ))
+    .expect("pane frame is utf-8");
 
     assert!(frame.contains("\u{1b}[44mB"), "{frame:?}");
     assert!(frame.contains("\u{1b}[49mD"), "{frame:?}");
@@ -525,38 +750,43 @@ fn pane_render_leaves_default_cells_at_terminal_default_without_user_style() {
 }
 
 #[test]
-fn pane_render_uses_line_clear_for_unstyled_full_width_panes() {
+fn pane_render_uses_spaces_for_small_tail_and_el_for_empty_full_width_row() {
     let size = TerminalSize { cols: 12, rows: 3 };
-    let session = Session::new(session_name("alpha"), size);
+    let session = crate::session_fixture::SessionFixture::new(session_name("alpha"), size);
     let pane = session.window().pane(0).expect("pane 0 exists");
     let screen = screen_with(b"short", size);
     let options = OptionStore::new();
 
-    let frame = String::from_utf8(super::render_pane_screen(&session, &options, pane, &screen))
-        .expect("pane frame is utf-8");
+    let frame = String::from_utf8(super::render_pane_screen(
+        session.view(),
+        &options,
+        pane,
+        &screen,
+    ))
+    .expect("pane frame is utf-8");
 
     assert!(
-        frame.contains("\u{1b}[1;1H\u{1b}[0mshort\u{1b}[0m\u{1b}[K"),
+        frame.contains("\u{1b}[1;1H\u{1b}[0mshort       "),
         "{frame:?}"
     );
     assert!(frame.contains("\u{1b}[2;1H\u{1b}[0m\u{1b}[K"), "{frame:?}");
     assert!(
-        !frame.contains("short       "),
-        "full-width unstyled panes should clear trailing cells instead of padding: {frame:?}"
+        !frame.contains("short\u{1b}[K"),
+        "tmux keeps literal spaces for nonempty tails below ten columns: {frame:?}"
     );
 }
 
 #[test]
 fn pane_selection_overlay_style_expands_defaults_and_overrides() {
     let size = TerminalSize { cols: 6, rows: 2 };
-    let session = Session::new(session_name("alpha"), size);
+    let session = crate::session_fixture::SessionFixture::new(session_name("alpha"), size);
     let pane = session.window().pane(0).expect("pane 0 exists");
 
     // Default: copy-mode-selection-style is "#{E:mode-style}", which must
     // expand through the format engine to the mode-style default instead of
     // reaching the cell style parser as a raw template (issue #90).
     let options = OptionStore::new();
-    let style = super::pane_screen::pane_selection_overlay_style(&session, &options, pane)
+    let style = super::pane_screen::pane_selection_overlay_style(session.view(), &options, pane)
         .expect("default selection style expands");
     assert!(
         style.contains("fg=black") && style.contains("bg=yellow"),
@@ -573,7 +803,7 @@ fn pane_selection_overlay_style_expands_defaults_and_overrides() {
             SetOptionMode::Replace,
         )
         .expect("set mode-style");
-    let style = super::pane_screen::pane_selection_overlay_style(&session, &options, pane)
+    let style = super::pane_screen::pane_selection_overlay_style(session.view(), &options, pane)
         .expect("inherited selection style expands");
     assert!(
         style.contains("bg=blue"),
@@ -598,7 +828,7 @@ fn pane_selection_overlay_style_expands_defaults_and_overrides() {
             SetOptionMode::Replace,
         )
         .expect("set copy-mode-selection-style");
-    let style = super::pane_screen::pane_selection_overlay_style(&session, &options, pane)
+    let style = super::pane_screen::pane_selection_overlay_style(session.view(), &options, pane)
         .expect("explicit selection style expands");
     assert!(
         style.contains("bg=red") && !style.contains("bg=blue"),
@@ -609,13 +839,13 @@ fn pane_selection_overlay_style_expands_defaults_and_overrides() {
 #[test]
 fn styled_pane_screen_borrows_when_no_overlay_is_needed() {
     let size = TerminalSize { cols: 6, rows: 2 };
-    let session = Session::new(session_name("alpha"), size);
+    let session = crate::session_fixture::SessionFixture::new(session_name("alpha"), size);
     let pane = session.window().pane(0).expect("pane 0 exists");
     let screen = screen_with(b"D", size);
     let options = OptionStore::new();
 
     assert!(matches!(
-        super::styled_pane_screen(&session, &options, pane, &screen),
+        super::pane_screen::styled_pane_screen(session.view(), &options, pane, &screen),
         std::borrow::Cow::Borrowed(_)
     ));
 }
@@ -624,12 +854,12 @@ fn selected_cell_colours(
     options: &OptionStore,
 ) -> (rmux_core::input::Colour, rmux_core::input::Colour) {
     let size = TerminalSize { cols: 6, rows: 2 };
-    let session = Session::new(session_name("alpha"), size);
+    let session = crate::session_fixture::SessionFixture::new(session_name("alpha"), size);
     let pane = session.window().pane(0).expect("pane 0 exists");
     let mut screen = screen_with(b"D", size);
     screen.mark_selected_row_range(0, 0, 0);
 
-    let styled = super::styled_pane_screen(&session, options, pane, &screen);
+    let styled = super::pane_screen::styled_pane_screen(session.view(), options, pane, &screen);
     let mut colours = None;
     assert!(styled.visit_visible_line_cells(0, 1, |cell| {
         colours = Some((cell.fg(), cell.bg()));
@@ -669,60 +899,450 @@ fn copy_mode_selection_style_tracks_mode_style_until_explicitly_overridden() {
 #[test]
 fn attach_render_golden_normal_idle_pane_is_byte_stable() {
     let size = TerminalSize { cols: 6, rows: 2 };
-    let session = Session::new(session_name("alpha"), size);
+    let session = crate::session_fixture::SessionFixture::new(session_name("alpha"), size);
     let pane = session.window().pane(0).expect("pane 0 exists");
     let screen = screen_with(b"D", size);
     let options = OptionStore::new();
 
     assert_eq!(
-        super::render_pane_screen(&session, &options, pane, &screen),
-        b"\x1b[s\x1b[?25l\x1b[0m\x1b[1;1H\x1b[0mD\x1b[0m\x1b[K\x1b[0m\x1b[u\x1b[1;2H\x1b[?25h"
+        super::render_pane_screen(session.view(), &options, pane, &screen),
+        b"\x1b[s\x1b[?25l\x1b[0m\x1b[1;1H\x1b[0mD     \x1b[0m\x1b[u\x1b[1;2H\x1b[?25h"
     );
 }
 
 #[test]
 fn attach_render_pane_screen_with_prompt_preserves_prompt_cursor() {
     let size = TerminalSize { cols: 6, rows: 2 };
-    let session = Session::new(session_name("alpha"), size);
+    let session = crate::session_fixture::SessionFixture::new(session_name("alpha"), size);
     let pane = session.window().pane(0).expect("pane 0 exists");
     let screen = screen_with(b"D", size);
     let options = OptionStore::new();
 
     assert_eq!(
-        super::render_pane_screen_preserving_prompt_cursor(&session, &options, pane, &screen),
-        b"\x1b[s\x1b[?25l\x1b[0m\x1b[1;1H\x1b[0mD\x1b[0m\x1b[K\x1b[0m\x1b[u\x1b[?25h"
+        super::render_pane_screen_preserving_prompt_cursor(session.view(), &options, pane, &screen),
+        b"\x1b[s\x1b[?25l\x1b[0m\x1b[1;1H\x1b[0mD     \x1b[0m\x1b[u\x1b[?25h"
     );
 }
 
 #[test]
-fn pane_render_keeps_padding_for_split_panes_to_avoid_clearing_neighbors() {
+fn pane_render_uses_spaces_for_small_split_tail_without_clearing_neighbors() {
     let size = TerminalSize { cols: 20, rows: 4 };
-    let mut session = Session::new(session_name("alpha"), size);
+    let mut session = crate::session_fixture::SessionFixture::new(session_name("alpha"), size);
     session.split_active_pane().expect("split succeeds");
     let pane = session.window().pane(0).expect("pane 0 exists");
     let screen = screen_with(b"left", size);
     let options = OptionStore::new();
 
-    let frame = String::from_utf8(super::render_pane_screen(&session, &options, pane, &screen))
-        .expect("pane frame is utf-8");
+    let frame = String::from_utf8(super::render_pane_screen(
+        session.view(),
+        &options,
+        pane,
+        &screen,
+    ))
+    .expect("pane frame is utf-8");
 
     assert!(
         !frame.contains("\u{1b}[K"),
         "split-pane repaint must not clear to terminal EOL: {frame:?}"
+    );
+    assert!(
+        frame.contains("left      "),
+        "tmux keeps literal spaces for a split tail below ten columns: {frame:?}"
+    );
+}
+
+#[test]
+fn gh217_pane_render_matches_tmux_tail_clear_ladder_at_terminal_right_edge() {
+    let size = TerminalSize { cols: 20, rows: 2 };
+    let session = crate::session_fixture::SessionFixture::new(session_name("alpha"), size);
+    let pane = session.window().pane(0).expect("pane 0 exists");
+    let options = OptionStore::new();
+
+    for tail in 1_usize..=12 {
+        let content = "x".repeat(usize::from(size.cols) - tail);
+        let screen = screen_with(content.as_bytes(), size);
+        let frame = super::render_pane_screen(session.view(), &options, pane, &screen);
+        let mut expected = content.into_bytes();
+        if tail <= 9 {
+            expected.extend(std::iter::repeat_n(b' ', tail));
+        } else {
+            expected.extend_from_slice(b"\x1b[K");
+        }
+
+        assert!(
+            frame
+                .windows(expected.len())
+                .any(|window| window == expected.as_slice()),
+            "right-edge tail {tail} must use the measured tmux ladder: {frame:?}"
+        );
+    }
+
+    let empty = super::render_pane_screen(session.view(), &options, pane, &Screen::new(size, 100));
+    assert!(
+        empty
+            .windows(b"\x1b[1;1H\x1b[0m\x1b[K".len())
+            .any(|window| window == b"\x1b[1;1H\x1b[0m\x1b[K"),
+        "an empty right-edge row must use EL: {empty:?}"
+    );
+}
+
+#[test]
+fn gh217_pane_render_uses_bounded_split_tail_clears_and_preserves_neighbor() {
+    let size = TerminalSize { cols: 41, rows: 2 };
+    let mut session = crate::session_fixture::SessionFixture::new(session_name("alpha"), size);
+    session.split_active_pane().expect("split succeeds");
+    let pane = session.window().pane(0).expect("left pane exists");
+    assert_eq!(pane.geometry().x(), 0);
+    assert_eq!(pane.geometry().cols(), 20);
+    let options = OptionStore::new();
+
+    for tail in 1_usize..=12 {
+        let content = "x".repeat(usize::from(pane.geometry().cols()) - tail);
+        let screen = screen_with(content.as_bytes(), size);
+        let frame = super::render_pane_screen(session.view(), &options, pane, &screen);
+        let mut expected = content.into_bytes();
+        if tail <= 9 {
+            expected.extend(std::iter::repeat_n(b' ', tail));
+        } else {
+            expected.extend_from_slice(format!("\x1b[{tail}X").as_bytes());
+        }
+
+        assert!(
+            frame
+                .windows(expected.len())
+                .any(|window| window == expected.as_slice()),
+            "left split tail {tail} must stay bounded to the pane: {frame:?}"
+        );
+        assert!(
+            !frame
+                .windows(b"\x1b[K".len())
+                .any(|window| window == b"\x1b[K"),
+            "a left split must never clear through its neighbor: {frame:?}"
+        );
+        if tail == 10 {
+            let mut outer = Screen::new(size, 0);
+            let mut parser = InputParser::new();
+            parser.parse(
+                format!("{}|{}", "L".repeat(20), "R".repeat(20)).as_bytes(),
+                &mut outer,
+            );
+            parser.parse(&frame, &mut outer);
+            let replayed = visible_line_text(&outer, 0, usize::from(size.cols));
+            assert_eq!(&replayed[20..], &format!("|{}", "R".repeat(20)));
+        }
+    }
+
+    let frame = super::render_pane_screen(session.view(), &options, pane, &Screen::new(size, 100));
+    assert!(
+        frame
+            .windows(b"\x1b[1;20H\x1b[1K".len())
+            .any(|window| window == b"\x1b[1;20H\x1b[1K"),
+        "an empty left split row must use bounded EL1: {frame:?}"
+    );
+
+    let mut outer = Screen::new(size, 0);
+    let mut parser = InputParser::new();
+    parser.parse(
+        format!("{}|{}", "L".repeat(20), "R".repeat(20)).as_bytes(),
+        &mut outer,
+    );
+    parser.parse(&frame, &mut outer);
+    let replayed = visible_line_text(&outer, 0, usize::from(size.cols));
+    assert_eq!(&replayed[20..], &format!("|{}", "R".repeat(20)));
+
+    let right_pane = session.window().pane(1).expect("right pane exists");
+    assert_eq!(right_pane.geometry().x(), 21);
+    assert_eq!(right_pane.geometry().cols(), 20);
+    for tail in 1_usize..=12 {
+        let content = "y".repeat(usize::from(right_pane.geometry().cols()) - tail);
+        let screen = screen_with(content.as_bytes(), size);
+        let right_frame = super::render_pane_screen(session.view(), &options, right_pane, &screen);
+        let mut expected = content.into_bytes();
+        if tail <= 9 {
+            expected.extend(std::iter::repeat_n(b' ', tail));
+        } else {
+            expected.extend_from_slice(b"\x1b[K");
+        }
+        assert!(
+            right_frame
+                .windows(expected.len())
+                .any(|window| window == expected.as_slice()),
+            "right split tail {tail} must use the terminal-edge ladder: {right_frame:?}"
+        );
+    }
+
+    let right_frame = super::render_pane_screen(
+        session.view(),
+        &options,
+        right_pane,
+        &Screen::new(size, 100),
+    );
+    assert!(
+        right_frame
+            .windows(b"\x1b[1;22H\x1b[0m\x1b[K".len())
+            .any(|window| window == b"\x1b[1;22H\x1b[0m\x1b[K"),
+        "an empty right split row must use EL: {right_frame:?}"
+    );
+    let mut outer = Screen::new(size, 0);
+    let mut parser = InputParser::new();
+    parser.parse(
+        format!("{}|{}", "L".repeat(20), "R".repeat(20)).as_bytes(),
+        &mut outer,
+    );
+    parser.parse(&right_frame, &mut outer);
+    let replayed = visible_line_text(&outer, 0, usize::from(size.cols));
+    assert_eq!(&replayed[..21], &format!("{}|", "L".repeat(20)));
+}
+
+#[test]
+fn gh217_pane_render_establishes_background_before_bounded_erase() {
+    let size = TerminalSize { cols: 20, rows: 2 };
+    let session = crate::session_fixture::SessionFixture::new(session_name("alpha"), size);
+    let window = WindowTarget::with_window(session.name().clone(), 0);
+    let pane = session.window().pane(0).expect("pane 0 exists");
+    let screen = screen_with(b"styled", size);
+    let mut options = OptionStore::new();
+    options
+        .set(
+            ScopeSelector::Window(window),
+            OptionName::WindowActiveStyle,
+            "bg=blue".to_owned(),
+            SetOptionMode::Replace,
+        )
+        .expect("window style set succeeds");
+
+    let frame = super::render_pane_screen(session.view(), &options, pane, &screen);
+    assert!(
+        frame
+            .windows(b"\x1b[44mstyled\x1b[K".len())
+            .any(|window| window == b"\x1b[44mstyled\x1b[K"),
+        "the pane background must be active when EL erases the tail: {frame:?}"
+    );
+    let empty_frame =
+        super::render_pane_screen(session.view(), &options, pane, &Screen::new(size, 100));
+    assert!(
+        empty_frame
+            .windows(b"\x1b[44m\x1b[K".len())
+            .any(|window| window == b"\x1b[44m\x1b[K"),
+        "an empty styled row must establish its background before EL: {empty_frame:?}"
+    );
+
+    let split_size = TerminalSize { cols: 41, rows: 2 };
+    let mut split_session =
+        crate::session_fixture::SessionFixture::new(session_name("split"), split_size);
+    split_session.split_active_pane().expect("split succeeds");
+    let split_window = WindowTarget::with_window(split_session.name().clone(), 0);
+    let split_pane = split_session.window().pane(0).expect("left pane exists");
+    let mut split_options = OptionStore::new();
+    split_options
+        .set(
+            ScopeSelector::Window(split_window),
+            OptionName::WindowStyle,
+            "bg=blue".to_owned(),
+            SetOptionMode::Replace,
+        )
+        .expect("split pane style set succeeds");
+    let split_frame = super::render_pane_screen(
+        split_session.view(),
+        &split_options,
+        split_pane,
+        &screen_with(b"styled", split_size),
+    );
+    assert!(
+        split_frame
+            .windows(b"\x1b[44mstyled\x1b[14X".len())
+            .any(|window| window == b"\x1b[44mstyled\x1b[14X"),
+        "the pane background must be active when ECH erases a split tail: {split_frame:?}"
+    );
+    let empty_split_frame = super::render_pane_screen(
+        split_session.view(),
+        &split_options,
+        split_pane,
+        &Screen::new(split_size, 100),
+    );
+    assert!(
+        empty_split_frame
+            .windows(b"\x1b[44m\x1b[1;20H\x1b[1K".len())
+            .any(|window| window == b"\x1b[44m\x1b[1;20H\x1b[1K"),
+        "an empty styled split row must establish its background before EL1: {empty_split_frame:?}"
+    );
+}
+
+#[test]
+fn gh217_pane_render_treats_application_authored_trailing_spaces_as_empty() {
+    let size = TerminalSize { cols: 20, rows: 2 };
+    let session = crate::session_fixture::SessionFixture::new(session_name("alpha"), size);
+    let pane = session.window().pane(0).expect("pane 0 exists");
+    let screen = screen_with(b"A       ", size);
+
+    let frame = super::render_pane_screen(session.view(), &OptionStore::new(), pane, &screen);
+    assert!(
+        frame
+            .windows(b"A\x1b[K".len())
+            .any(|window| window == b"A\x1b[K"),
+        "tmux clears the seven matching application spaces as one empty tail: {frame:?}"
+    );
+    assert!(
+        !frame
+            .windows(b"A       \x1b[K".len())
+            .any(|window| window == b"A       \x1b[K"),
+        "the candidate must not retain the application-space discriminator literally: {frame:?}"
+    );
+}
+
+#[test]
+fn gh217_pane_render_keeps_wide_cells_before_an_empty_tail() {
+    let size = TerminalSize { cols: 20, rows: 2 };
+    let session = crate::session_fixture::SessionFixture::new(session_name("alpha"), size);
+    let pane = session.window().pane(0).expect("pane 0 exists");
+    let frame = super::render_pane_screen(
+        session.view(),
+        &OptionStore::new(),
+        pane,
+        &screen_with("表       ".as_bytes(), size),
+    );
+
+    assert!(
+        frame
+            .windows("表\x1b[K".len())
+            .any(|window| window == "表\x1b[K".as_bytes()),
+        "a double-width cell must remain before the empty tail: {frame:?}"
+    );
+}
+
+#[test]
+fn gh217_pane_render_matches_tmux_empty_cell_predicate_for_space_tails() {
+    let size = TerminalSize { cols: 20, rows: 2 };
+    let session = crate::session_fixture::SessionFixture::new(session_name("alpha"), size);
+    let pane = session.window().pane(0).expect("pane 0 exists");
+    let options = OptionStore::new();
+
+    let matching_background = super::render_pane_screen(
+        session.view(),
+        &options,
+        pane,
+        &screen_with(b"\x1b[44mA       \x1b[K\x1b[0m", size),
+    );
+    assert!(
+        matching_background
+            .windows(b"\x1b[44mA\x1b[K".len())
+            .any(|window| window == b"\x1b[44mA\x1b[K"),
+        "matching-background spaces are tmux-empty: {matching_background:?}"
+    );
+
+    let foreground_only = super::render_pane_screen(
+        session.view(),
+        &options,
+        pane,
+        &screen_with(b"A\x1b[31m       ", size),
+    );
+    assert!(
+        foreground_only
+            .windows(b"A\x1b[31m\x1b[K".len())
+            .any(|window| window == b"A\x1b[31m\x1b[K"),
+        "foreground alone does not make a matching space nonempty: {foreground_only:?}"
+    );
+
+    let attributed = super::render_pane_screen(
+        session.view(),
+        &options,
+        pane,
+        &screen_with(b"A\x1b[1m       ", size),
+    );
+    assert!(
+        attributed
+            .windows(b"A\x1b[1m       ".len())
+            .any(|window| window == b"A\x1b[1m       "),
+        "attributed spaces are not tmux-empty: {attributed:?}"
+    );
+
+    let linked = super::render_pane_screen(
+        session.view(),
+        &options,
+        pane,
+        &screen_with(
+            b"A\x1b]8;;https://example.test\x1b\\       \x1b]8;;\x1b\\",
+            size,
+        ),
+    );
+    assert!(
+        linked
+            .windows(b"A\x1b]8;;https://example.test\x1b\\       \x1b]8;;\x1b\\\x1b[K".len())
+            .any(|window| {
+                window == b"A\x1b]8;;https://example.test\x1b\\       \x1b]8;;\x1b\\\x1b[K"
+            }),
+        "hyperlinked spaces are not tmux-empty: {linked:?}"
+    );
+}
+
+#[test]
+fn gh217_empty_narrow_rows_use_spaces_before_the_escape_threshold() {
+    let size = TerminalSize { cols: 5, rows: 2 };
+    let session = crate::session_fixture::SessionFixture::new(session_name("alpha"), size);
+    let pane = session.window().pane(0).expect("pane 0 exists");
+    let frame = super::render_pane_screen(
+        session.view(),
+        &OptionStore::new(),
+        pane,
+        &Screen::new(size, 100),
+    );
+
+    assert!(
+        frame
+            .windows(b"\x1b[1;1H\x1b[0m     ".len())
+            .any(|window| window == b"\x1b[1;1H\x1b[0m     "),
+        "a narrow full-width empty row must use literal spaces: {frame:?}"
+    );
+    assert!(
+        !frame
+            .windows(b"\x1b[K".len())
+            .any(|window| window == b"\x1b[K"),
+        "a five-column row must not use EL: {frame:?}"
+    );
+
+    let split_size = TerminalSize { cols: 11, rows: 2 };
+    let mut split_session =
+        crate::session_fixture::SessionFixture::new(session_name("split"), split_size);
+    split_session.split_active_pane().expect("split succeeds");
+    let split_pane = split_session.window().pane(0).expect("left pane exists");
+    assert_eq!(split_pane.geometry().cols(), 5);
+    let split_frame = super::render_pane_screen(
+        split_session.view(),
+        &OptionStore::new(),
+        split_pane,
+        &Screen::new(split_size, 100),
+    );
+
+    assert!(
+        split_frame
+            .windows(b"\x1b[1;1H\x1b[0m     ".len())
+            .any(|window| window == b"\x1b[1;1H\x1b[0m     "),
+        "a narrow non-terminal-EOL row must use literal spaces: {split_frame:?}"
+    );
+    assert!(
+        !split_frame
+            .windows(b"\x1b[1K".len())
+            .any(|window| window == b"\x1b[1K"),
+        "a five-column split must not use EL1: {split_frame:?}"
     );
 }
 
 #[test]
 fn pane_render_resets_before_default_split_pane_row_after_styled_row() {
     let size = TerminalSize { cols: 20, rows: 4 };
-    let mut session = Session::new(session_name("alpha"), size);
+    let mut session = crate::session_fixture::SessionFixture::new(session_name("alpha"), size);
     session.split_active_pane().expect("split succeeds");
     let pane = session.window().pane(0).expect("pane 0 exists");
     let screen = screen_with(b"\x1b[48;5;255m          \r\n\x1b[0mplain", size);
     let options = OptionStore::new();
 
-    let frame = String::from_utf8(super::render_pane_screen(&session, &options, pane, &screen))
-        .expect("pane frame is utf-8");
+    let frame = String::from_utf8(super::render_pane_screen(
+        session.view(),
+        &options,
+        pane,
+        &screen,
+    ))
+    .expect("pane frame is utf-8");
 
     assert!(
         frame.contains("\u{1b}[1;1H\u{1b}[0m\u{1b}[48;5;255m"),
@@ -741,7 +1361,7 @@ fn pane_render_resets_before_default_split_pane_row_after_styled_row() {
 #[test]
 fn pane_render_applies_window_style_to_default_cells() {
     let size = TerminalSize { cols: 6, rows: 2 };
-    let session = Session::new(session_name("alpha"), size);
+    let session = crate::session_fixture::SessionFixture::new(session_name("alpha"), size);
     let window = WindowTarget::with_window(session.name().clone(), 0);
     let pane = session.window().pane(0).expect("pane 0 exists");
     let screen = screen_with(b"\x1b[44mB\x1b[0mD", size);
@@ -755,8 +1375,13 @@ fn pane_render_applies_window_style_to_default_cells() {
         )
         .expect("window style set succeeds");
 
-    let frame = String::from_utf8(super::render_pane_screen(&session, &options, pane, &screen))
-        .expect("pane frame is utf-8");
+    let frame = String::from_utf8(super::render_pane_screen(
+        session.view(),
+        &options,
+        pane,
+        &screen,
+    ))
+    .expect("pane frame is utf-8");
 
     assert!(frame.contains("\u{1b}[44mB"), "{frame:?}");
     assert!(frame.contains("\u{1b}[40mD"), "{frame:?}");
@@ -769,7 +1394,7 @@ fn pane_render_applies_window_style_to_default_cells() {
 #[test]
 fn pane_render_active_style_overlays_window_style_for_default_cells() {
     let size = TerminalSize { cols: 6, rows: 2 };
-    let session = Session::new(session_name("alpha"), size);
+    let session = crate::session_fixture::SessionFixture::new(session_name("alpha"), size);
     let window = WindowTarget::with_window(session.name().clone(), 0);
     let pane = session.window().pane(0).expect("pane 0 exists");
     let screen = screen_with(b"D", size);
@@ -788,15 +1413,23 @@ fn pane_render_active_style_overlays_window_style_for_default_cells() {
             .expect("window style set succeeds");
     }
 
-    let frame = String::from_utf8(super::render_pane_screen(&session, &options, pane, &screen))
-        .expect("pane frame is utf-8");
+    let frame = String::from_utf8(super::render_pane_screen(
+        session.view(),
+        &options,
+        pane,
+        &screen,
+    ))
+    .expect("pane frame is utf-8");
 
     assert!(frame.contains("\u{1b}[41mD"), "{frame:?}");
 }
 
 #[test]
 fn two_pane_sessions_render_the_main_vertical_border_column_and_exact_frame_bytes() {
-    let mut session = Session::new(session_name("alpha"), TerminalSize { cols: 4, rows: 2 });
+    let mut session = crate::session_fixture::SessionFixture::new(
+        session_name("alpha"),
+        TerminalSize { cols: 4, rows: 2 },
+    );
     session.split_active_pane().expect("split succeeds");
     let cells = border_cells(
         session.window(),
@@ -816,7 +1449,10 @@ fn two_pane_sessions_render_the_main_vertical_border_column_and_exact_frame_byte
 
 #[test]
 fn two_pane_sessions_colour_only_the_active_half_of_the_shared_border() {
-    let mut session = Session::new(session_name("alpha"), TerminalSize { cols: 10, rows: 4 });
+    let mut session = crate::session_fixture::SessionFixture::new(
+        session_name("alpha"),
+        TerminalSize { cols: 10, rows: 4 },
+    );
     session.split_active_pane().expect("split succeeds");
     let inactive = border_style(Some("blue"));
     let active = border_style(Some("red"));
@@ -874,7 +1510,10 @@ fn four_pane_sessions_keep_vertical_splits_as_full_height_bars() {
 
 #[test]
 fn lower_vertical_split_joins_top_bottom_border_with_a_top_tee() {
-    let mut session = Session::new(session_name("alpha"), TerminalSize { cols: 80, rows: 24 });
+    let mut session = crate::session_fixture::SessionFixture::new(
+        session_name("alpha"),
+        TerminalSize { cols: 80, rows: 24 },
+    );
     let bottom = session
         .split_active_pane_with_direction(SplitDirection::Horizontal)
         .expect("horizontal split succeeds");
@@ -968,7 +1607,7 @@ fn renderer_uses_session_option_resolution_and_renders_status_when_enabled() {
             .expect("option set succeeds");
     }
 
-    let frame = render(&session, &options);
+    let frame = render(session.view(), &options);
     let frame_text = String::from_utf8_lossy(&frame);
 
     assert!(frame_text.contains("\u{1b}[33m"));
@@ -986,7 +1625,7 @@ fn renderer_uses_session_option_resolution_and_renders_status_when_enabled() {
             SetOptionMode::Replace,
         )
         .expect("status on succeeds");
-    let status_frame = render(&session, &options);
+    let status_frame = render(session.view(), &options);
     let status_text = String::from_utf8_lossy(&status_frame);
     assert!(status_text.contains("status al"));
     assert!(status_text.contains("\u{1b}[24;1H"));
@@ -1014,7 +1653,7 @@ fn renderer_applies_pane_border_line_style() {
         )
         .expect("pane-border-lines option set succeeds");
 
-    let frame = String::from_utf8(render(&session, &options)).expect("frame is utf8");
+    let frame = String::from_utf8(render(session.view(), &options)).expect("frame is utf8");
 
     assert!(frame.contains('┃'), "{frame:?}");
     assert!(!frame.contains('│'), "{frame:?}");
@@ -1034,7 +1673,7 @@ fn top_status_reserves_the_first_row_and_offsets_border_cells() {
         )
         .expect("status-position top succeeds");
 
-    let frame = String::from_utf8(render(&session, &options)).expect("frame is utf-8");
+    let frame = String::from_utf8(render(session.view(), &options)).expect("frame is utf-8");
 
     assert!(frame.contains("\u{1b}[1;1H"));
     assert!(frame.contains("\u{1b}[2;41H"));
@@ -1043,7 +1682,10 @@ fn top_status_reserves_the_first_row_and_offsets_border_cells() {
 
 #[test]
 fn status_window_list_uses_expanded_truncation_justify_and_raw_flags() {
-    let mut session = Session::new(session_name("alpha"), TerminalSize { cols: 20, rows: 4 });
+    let mut session = crate::session_fixture::SessionFixture::new(
+        session_name("alpha"),
+        TerminalSize { cols: 20, rows: 4 },
+    );
     session
         .insert_window_with_initial_pane(1, TerminalSize { cols: 20, rows: 4 })
         .expect("window 1 insert succeeds");
@@ -1080,7 +1722,7 @@ fn status_window_list_uses_expanded_truncation_justify_and_raw_flags() {
             .expect("status option set succeeds");
     }
 
-    let frame = String::from_utf8(render(&session, &options)).expect("frame is utf-8");
+    let frame = String::from_utf8(render(session.view(), &options)).expect("frame is utf-8");
 
     assert!(frame.contains("Lalp"), "{frame}");
     assert!(frame.contains("1*"), "{frame}");
@@ -1089,7 +1731,10 @@ fn status_window_list_uses_expanded_truncation_justify_and_raw_flags() {
 
 #[test]
 fn status_format_override_replaces_default_status_line() {
-    let session = Session::new(session_name("alpha"), TerminalSize { cols: 20, rows: 3 });
+    let session = crate::session_fixture::SessionFixture::new(
+        session_name("alpha"),
+        TerminalSize { cols: 20, rows: 3 },
+    );
     let mut options = OptionStore::new();
     options
         .set_by_name(
@@ -1103,7 +1748,7 @@ fn status_format_override_replaces_default_status_line() {
         )
         .expect("status-format option set succeeds");
 
-    let frame = String::from_utf8(render(&session, &options)).expect("frame is utf-8");
+    let frame = String::from_utf8(render(session.view(), &options)).expect("frame is utf-8");
 
     assert!(frame.contains("custom alpha"), "{frame}");
     assert!(!frame.contains("0:zsh"), "{frame}");
@@ -1112,7 +1757,7 @@ fn status_format_override_replaces_default_status_line() {
 #[test]
 fn status_numeric_value_reserves_and_renders_multiple_status_lines() {
     let size = TerminalSize { cols: 20, rows: 6 };
-    let session = Session::new(session_name("alpha"), size);
+    let session = crate::session_fixture::SessionFixture::new(session_name("alpha"), size);
     let mut options = OptionStore::new();
     options
         .set(
@@ -1140,7 +1785,7 @@ fn status_numeric_value_reserves_and_renders_multiple_status_lines() {
             .expect("status-format option set succeeds");
     }
 
-    let frame = render(&session, &options);
+    let frame = render(session.view(), &options);
     let screen = screen_with(&frame, size);
 
     assert_eq!(
@@ -1165,7 +1810,10 @@ fn status_numeric_value_reserves_and_renders_multiple_status_lines() {
 
 #[test]
 fn status_left_expands_shell_job() {
-    let session = Session::new(session_name("alpha"), TerminalSize { cols: 80, rows: 3 });
+    let session = crate::session_fixture::SessionFixture::new(
+        session_name("alpha"),
+        TerminalSize { cols: 80, rows: 3 },
+    );
     let mut options = OptionStore::new();
     let marker = format!("statusjob{}", std::process::id());
     let command = format!("#(echo {marker})");
@@ -1186,13 +1834,16 @@ fn status_left_expands_shell_job() {
             .expect("status option set succeeds");
     }
 
-    let frame = render_until_contains(&session, &options, &marker);
+    let frame = render_until_contains(session.view(), &options, &marker);
     assert!(frame.contains(&marker), "{frame}");
 }
 
 #[test]
 fn status_format_expands_shell_job() {
-    let session = Session::new(session_name("alpha"), TerminalSize { cols: 80, rows: 3 });
+    let session = crate::session_fixture::SessionFixture::new(
+        session_name("alpha"),
+        TerminalSize { cols: 80, rows: 3 },
+    );
     let mut options = OptionStore::new();
     let marker = format!("statusformatjob{}", std::process::id());
     options
@@ -1207,13 +1858,16 @@ fn status_format_expands_shell_job() {
         )
         .expect("status-format option set succeeds");
 
-    let frame = render_until_contains(&session, &options, &marker);
+    let frame = render_until_contains(session.view(), &options, &marker);
     assert!(frame.contains(&marker), "{frame}");
 }
 
 #[test]
 fn status_format_expands_shell_job_introduced_by_status_left() {
-    let session = Session::new(session_name("alpha"), TerminalSize { cols: 80, rows: 3 });
+    let session = crate::session_fixture::SessionFixture::new(
+        session_name("alpha"),
+        TerminalSize { cols: 80, rows: 3 },
+    );
     let mut options = OptionStore::new();
     let marker = format!("statusleftjob{}", std::process::id());
     let status_left = format!("X#(echo {marker})Y");
@@ -1231,14 +1885,14 @@ fn status_format_expands_shell_job_introduced_by_status_left() {
             .expect("status option set succeeds");
     }
 
-    let frame = render_until_contains(&session, &options, &marker);
+    let frame = render_until_contains(session.view(), &options, &marker);
     assert!(frame.contains(&format!("X{marker}Y")), "{frame}");
 }
 
 #[test]
 fn status_right_inline_styles_do_not_consume_length_budget() {
     let size = TerminalSize { cols: 20, rows: 3 };
-    let session = Session::new(session_name("alpha"), size);
+    let session = crate::session_fixture::SessionFixture::new(session_name("alpha"), size);
     let mut options = OptionStore::new();
     for (option, value) in [
         (OptionName::StatusLeft, ""),
@@ -1260,7 +1914,7 @@ fn status_right_inline_styles_do_not_consume_length_budget() {
             .expect("status option set succeeds");
     }
 
-    let screen = screen_with(&render(&session, &options), size);
+    let screen = screen_with(&render(session.view(), &options), size);
     let status = visible_line_text(&screen, 2, usize::from(size.cols));
 
     assert_eq!(status, "          CLOCK-DATE", "{status:?}");
@@ -1269,7 +1923,7 @@ fn status_right_inline_styles_do_not_consume_length_budget() {
 #[test]
 fn explicit_status_format_width_modifier_ignores_inline_styles() {
     let size = TerminalSize { cols: 20, rows: 3 };
-    let session = Session::new(session_name("alpha"), size);
+    let session = crate::session_fixture::SessionFixture::new(session_name("alpha"), size);
     let mut options = OptionStore::new();
     for (option, value) in [
         (
@@ -1288,7 +1942,7 @@ fn explicit_status_format_width_modifier_ignores_inline_styles() {
             .expect("status option set succeeds");
     }
 
-    let screen = screen_with(&render(&session, &options), size);
+    let screen = screen_with(&render(session.view(), &options), size);
     let status = visible_line_text(&screen, 2, usize::from(size.cols));
 
     assert_eq!(status, "          CLOCK-DATE", "{status:?}");
@@ -1297,7 +1951,7 @@ fn explicit_status_format_width_modifier_ignores_inline_styles() {
 #[test]
 fn status_left_inline_styles_preserve_unicode_cell_truncation() {
     let size = TerminalSize { cols: 12, rows: 3 };
-    let session = Session::new(session_name("alpha"), size);
+    let session = crate::session_fixture::SessionFixture::new(session_name("alpha"), size);
     let mut options = OptionStore::new();
     for (option, value) in [
         (OptionName::StatusLeft, "#[fg=red]表A#[bold]👋🏽B"),
@@ -1316,7 +1970,7 @@ fn status_left_inline_styles_preserve_unicode_cell_truncation() {
             .expect("status option set succeeds");
     }
 
-    let screen = screen_with(&render(&session, &options), size);
+    let screen = screen_with(&render(session.view(), &options), size);
     let status = visible_line_text(&screen, 2, usize::from(size.cols));
 
     // Screen visitors expose each wide glyph's continuation cell as a space.
@@ -1326,7 +1980,7 @@ fn status_left_inline_styles_preserve_unicode_cell_truncation() {
 #[test]
 fn status_component_limit_keeps_a_zwj_grapheme_whole_product_divergence() {
     let size = TerminalSize { cols: 8, rows: 3 };
-    let session = Session::new(session_name("alpha"), size);
+    let session = crate::session_fixture::SessionFixture::new(session_name("alpha"), size);
     let mut options = OptionStore::new();
     for (option, value) in [
         (OptionName::StatusLeft, "#[fg=red]👩\u{200d}💻A"),
@@ -1345,7 +1999,7 @@ fn status_component_limit_keeps_a_zwj_grapheme_whole_product_divergence() {
             .expect("status option set succeeds");
     }
 
-    let frame = render(&session, &options);
+    let frame = render(session.view(), &options);
     let frame = String::from_utf8(frame).expect("status frame is utf-8");
     assert!(
         frame.contains("👩\u{200d}💻"),
@@ -1356,7 +2010,10 @@ fn status_component_limit_keeps_a_zwj_grapheme_whole_product_divergence() {
 
 #[test]
 fn status_fill_applies_background_when_text_background_is_default() {
-    let session = Session::new(session_name("alpha"), TerminalSize { cols: 8, rows: 2 });
+    let session = crate::session_fixture::SessionFixture::new(
+        session_name("alpha"),
+        TerminalSize { cols: 8, rows: 2 },
+    );
     let mut options = OptionStore::new();
 
     for (option, value) in [
@@ -1376,30 +2033,38 @@ fn status_fill_applies_background_when_text_background_is_default() {
             .expect("status option set succeeds");
     }
 
-    let frame = String::from_utf8(render(&session, &options)).expect("frame is utf-8");
+    let frame = String::from_utf8(render(session.view(), &options)).expect("frame is utf-8");
     assert!(frame.contains("\u{1b}[44m"));
 }
 
 #[test]
 fn status_only_render_starts_from_a_reset_sgr_state() {
-    let session = Session::new(session_name("alpha"), TerminalSize { cols: 8, rows: 2 });
+    let session = crate::session_fixture::SessionFixture::new(
+        session_name("alpha"),
+        TerminalSize { cols: 8, rows: 2 },
+    );
 
-    let frame = String::from_utf8(render(&session, &OptionStore::new())).expect("frame is utf-8");
+    let frame =
+        String::from_utf8(render(session.view(), &OptionStore::new())).expect("frame is utf-8");
     assert!(frame.starts_with("\u{1b}7\u{1b}[0m"));
 }
 
 #[test]
 fn prompt_status_render_positions_cursor_on_the_input_cell() {
-    let session = Session::new(session_name("alpha"), TerminalSize { cols: 20, rows: 4 });
+    let session = crate::session_fixture::SessionFixture::new(
+        session_name("alpha"),
+        TerminalSize { cols: 20, rows: 4 },
+    );
     let prompt = super::RenderedPrompt {
         prompt: "rename-window ".to_owned(),
         input: String::new(),
         cursor: 0,
         command_prompt: false,
+        completion_menu: Vec::new(),
     };
 
     let frame = String::from_utf8(super::render_with_attached_count_and_prompt(
-        &session,
+        session.view(),
         &OptionStore::new(),
         1,
         Some(&prompt),
@@ -1414,12 +2079,15 @@ fn prompt_status_render_positions_cursor_on_the_input_cell() {
 
 #[test]
 fn pane_cursor_render_repositions_and_shows_the_terminal_cursor() {
-    let session = Session::new(session_name("alpha"), TerminalSize { cols: 20, rows: 4 });
+    let session = crate::session_fixture::SessionFixture::new(
+        session_name("alpha"),
+        TerminalSize { cols: 20, rows: 4 },
+    );
     let pane = session.active_pane().expect("active pane exists");
     let screen = screen_with(b"abc", TerminalSize { cols: 20, rows: 3 });
 
     let frame = String::from_utf8(super::render_pane_cursor(
-        &session,
+        session.view(),
         &OptionStore::new(),
         pane,
         &screen,
@@ -1431,13 +2099,16 @@ fn pane_cursor_render_repositions_and_shows_the_terminal_cursor() {
 
 #[test]
 fn pane_cursor_render_hides_terminal_cursor_when_screen_cursor_is_hidden() {
-    let session = Session::new(session_name("alpha"), TerminalSize { cols: 20, rows: 4 });
+    let session = crate::session_fixture::SessionFixture::new(
+        session_name("alpha"),
+        TerminalSize { cols: 20, rows: 4 },
+    );
     let pane = session.active_pane().expect("active pane exists");
     let screen = screen_with(b"\x1b[?25l", TerminalSize { cols: 20, rows: 3 });
     assert_eq!(screen.mode() & mode::MODE_CURSOR, 0);
 
     let frame = String::from_utf8(super::render_pane_cursor(
-        &session,
+        session.view(),
         &OptionStore::new(),
         pane,
         &screen,
@@ -1449,16 +2120,23 @@ fn pane_cursor_render_hides_terminal_cursor_when_screen_cursor_is_hidden() {
 
 #[test]
 fn border_render_starts_from_a_reset_sgr_state() {
-    let mut session = Session::new(session_name("alpha"), TerminalSize { cols: 8, rows: 4 });
+    let mut session = crate::session_fixture::SessionFixture::new(
+        session_name("alpha"),
+        TerminalSize { cols: 8, rows: 4 },
+    );
     session.split_active_pane().expect("split succeeds");
 
-    let frame = String::from_utf8(render(&session, &OptionStore::new())).expect("frame is utf-8");
+    let frame =
+        String::from_utf8(render(session.view(), &OptionStore::new())).expect("frame is utf-8");
     assert!(frame.starts_with("\u{1b}[s\u{1b}[0m"));
 }
 
 #[test]
 fn status_bar_runs_include_session_attached_in_status_context() {
-    let session = Session::new(session_name("alpha"), TerminalSize { cols: 4, rows: 2 });
+    let session = crate::session_fixture::SessionFixture::new(
+        session_name("alpha"),
+        TerminalSize { cols: 4, rows: 2 },
+    );
     let mut options = OptionStore::new();
 
     for (option, value) in [
@@ -1477,11 +2155,11 @@ fn status_bar_runs_include_session_attached_in_status_context() {
             .expect("status option set succeeds");
     }
 
-    let rendered_with_attach = status_bar_runs(&session, &options, 4, 1)
+    let rendered_with_attach = status_bar_runs(session.view(), &options, 4, 1)
         .into_iter()
         .map(|run| run.text)
         .collect::<String>();
-    let rendered_without_attach = status_bar_runs(&session, &options, 4, 0)
+    let rendered_without_attach = status_bar_runs(session.view(), &options, 4, 0)
         .into_iter()
         .map(|run| run.text)
         .collect::<String>();
@@ -1492,9 +2170,12 @@ fn status_bar_runs_include_session_attached_in_status_context() {
 
 #[test]
 fn status_message_text_cannot_emit_control_characters_into_the_status_row() {
-    let session = Session::new(session_name("alpha"), TerminalSize { cols: 20, rows: 4 });
+    let session = crate::session_fixture::SessionFixture::new(
+        session_name("alpha"),
+        TerminalSize { cols: 20, rows: 4 },
+    );
     let frame = String::from_utf8(super::render_status_message(
-        &session,
+        session.view(),
         &OptionStore::new(),
         "hi\nthere\t\x1b[31m",
     ))
@@ -1507,9 +2188,12 @@ fn status_message_text_cannot_emit_control_characters_into_the_status_row() {
 
 #[test]
 fn status_message_renders_default_message_style_from_message_format() {
-    let session = Session::new(session_name("alpha"), TerminalSize { cols: 20, rows: 4 });
+    let session = crate::session_fixture::SessionFixture::new(
+        session_name("alpha"),
+        TerminalSize { cols: 20, rows: 4 },
+    );
     let frame = String::from_utf8(super::render_status_message(
-        &session,
+        session.view(),
         &OptionStore::new(),
         "No next window",
     ))
@@ -1523,9 +2207,12 @@ fn status_message_renders_default_message_style_from_message_format() {
 
 #[test]
 fn status_message_style_fills_the_full_status_line() {
-    let session = Session::new(session_name("alpha"), TerminalSize { cols: 20, rows: 4 });
+    let session = crate::session_fixture::SessionFixture::new(
+        session_name("alpha"),
+        TerminalSize { cols: 20, rows: 4 },
+    );
     let frame = String::from_utf8(super::render_status_message(
-        &session,
+        session.view(),
         &OptionStore::new(),
         "No next window",
     ))
@@ -1541,7 +2228,7 @@ fn status_message_style_fills_the_full_status_line() {
 #[test]
 fn status_message_uses_message_line_with_multiline_status() {
     let size = TerminalSize { cols: 20, rows: 5 };
-    let session = Session::new(session_name("alpha"), size);
+    let session = crate::session_fixture::SessionFixture::new(session_name("alpha"), size);
     let mut options = OptionStore::new();
     for (option, value) in [(OptionName::Status, "2"), (OptionName::MessageLine, "1")] {
         options
@@ -1554,7 +2241,7 @@ fn status_message_uses_message_line_with_multiline_status() {
             .expect("status option set succeeds");
     }
 
-    let frame = super::render_status_message(&session, &options, "line-one");
+    let frame = super::render_status_message(session.view(), &options, "line-one");
     let screen = screen_with(&frame, size);
 
     assert_eq!(visible_line_text(&screen, 3, 8), "        ");
@@ -1566,7 +2253,7 @@ fn status_message_uses_last_terminal_row_when_status_is_off() {
     // Oracle tmux 3.7b: disabling status changes the backing row from status
     // storage to pane content, but does not suppress the message overlay.
     let size = TerminalSize { cols: 20, rows: 5 };
-    let session = Session::new(session_name("alpha"), size);
+    let session = crate::session_fixture::SessionFixture::new(session_name("alpha"), size);
     let mut options = OptionStore::new();
     options
         .set(
@@ -1577,7 +2264,7 @@ fn status_message_uses_last_terminal_row_when_status_is_off() {
         )
         .expect("status off");
 
-    let frame = super::render_status_message(&session, &options, "status-off");
+    let frame = super::render_status_message(session.view(), &options, "status-off");
     let screen = screen_with(&frame, size);
 
     for row in 0..4 {
@@ -1588,9 +2275,12 @@ fn status_message_uses_last_terminal_row_when_status_is_off() {
 
 #[test]
 fn status_message_truncates_by_display_width_instead_of_scalar_count() {
-    let session = Session::new(session_name("alpha"), TerminalSize { cols: 3, rows: 4 });
+    let session = crate::session_fixture::SessionFixture::new(
+        session_name("alpha"),
+        TerminalSize { cols: 3, rows: 4 },
+    );
     let frame = String::from_utf8(super::render_status_message(
-        &session,
+        session.view(),
         &OptionStore::new(),
         "表ab",
     ))
@@ -1602,7 +2292,10 @@ fn status_message_truncates_by_display_width_instead_of_scalar_count() {
 
 #[test]
 fn status_bar_spacing_uses_display_width_for_cjk_and_emoji() {
-    let session = Session::new(session_name("alpha"), TerminalSize { cols: 6, rows: 4 });
+    let session = crate::session_fixture::SessionFixture::new(
+        session_name("alpha"),
+        TerminalSize { cols: 6, rows: 4 },
+    );
     let mut options = OptionStore::new();
 
     for (option, value) in [
@@ -1621,7 +2314,7 @@ fn status_bar_spacing_uses_display_width_for_cjk_and_emoji() {
             .expect("status option set succeeds");
     }
 
-    let rendered = status_bar_runs(&session, &options, 6, 0)
+    let rendered = status_bar_runs(session.view(), &options, 6, 0)
         .into_iter()
         .map(|run| run.text)
         .collect::<String>();
@@ -1631,7 +2324,10 @@ fn status_bar_spacing_uses_display_width_for_cjk_and_emoji() {
 
 #[test]
 fn pane_active_border_style_conditionals_are_runtime_expanded() {
-    let mut session = Session::new(session_name("alpha"), TerminalSize { cols: 10, rows: 4 });
+    let mut session = crate::session_fixture::SessionFixture::new(
+        session_name("alpha"),
+        TerminalSize { cols: 10, rows: 4 },
+    );
     session.split_active_pane().expect("split succeeds");
     let session_name = session.name().clone();
     let window = WindowTarget::with_window(session_name.clone(), 0);
@@ -1654,10 +2350,154 @@ fn pane_active_border_style_conditionals_are_runtime_expanded() {
         )
         .expect("active border style set succeeds");
 
-    let frame = render(&session, &options);
+    let frame = render(session.view(), &options);
     let frame_text = String::from_utf8_lossy(&frame);
 
     assert!(frame_text.contains("\u{1b}[32m"));
     assert!(frame_text.contains("\u{1b}[31m"));
     assert!(!frame_text.contains("\u{1b}[34m"));
 }
+
+#[test]
+fn projected_cell_crop_preserves_wide_edges() {
+    for (text, start, width, expected) in [
+        ("表ABC", 1, 3, " AB"),
+        ("A表BC", 0, 2, "A "),
+        ("表ABC", 0, 1, " "),
+        ("表A表", 1, 3, " A "),
+        ("表ABC", 0, 5, "表ABC"),
+        ("e\u{301}ABC", 1, 3, "ABC"),
+        ("e\u{301}ABC", 0, 1, "e\u{301}"),
+    ] {
+        let row = super::pane_row::crop_rendered_pane_row(
+            text.as_bytes(),
+            start,
+            width,
+            &Utf8Config::default(),
+        );
+        assert_eq!(row.bytes(), expected.as_bytes(), "{text:?} {start} {width}");
+        assert_eq!(usize::from(row.columns()), width);
+    }
+}
+
+#[test]
+fn projected_cell_crop_preserves_zwj_and_ansi() {
+    let row = super::pane_row::crop_rendered_pane_row(
+        "\x1b[31m👩‍💻ABC".as_bytes(),
+        2,
+        3,
+        &Utf8Config::default(),
+    );
+    assert_eq!(row.bytes(), b"\x1b[31mABC");
+    assert_eq!(row.columns(), 3);
+}
+
+#[test]
+fn projected_cell_crop_respects_custom_width_and_styles() {
+    let mut options = OptionStore::new();
+    options
+        .set(
+            rmux_proto::ScopeSelector::Global,
+            rmux_proto::OptionName::CodepointWidths,
+            "A=2".to_owned(),
+            rmux_proto::SetOptionMode::Append,
+        )
+        .unwrap();
+    let utf8 = Utf8Config::from_options(&options);
+    for (text, start, width, expected) in [
+        ("ABC", 1, 2, " B"),
+        ("ABC", 0, 1, " "),
+        ("\x1b[31mA\x1b[32mBC", 1, 2, "\x1b[31m \x1b[32mB"),
+    ] {
+        let row = super::pane_row::crop_rendered_pane_row(text.as_bytes(), start, width, &utf8);
+        assert_eq!(row.bytes(), expected.as_bytes());
+        assert_eq!(usize::from(row.columns()), width);
+    }
+}
+
+#[test]
+fn projected_cell_crop_keeps_ansi_inside_composed_cell_and_closes_links() {
+    for (text, start, width, expected) in [
+        ("\x1b[31m👩\x1b[32m‍💻ABC", 2, 3, "\x1b[31m\x1b[32mABC"),
+        (
+            "\x1b[31me\x1b[32m\u{301}AB",
+            0,
+            1,
+            "\x1b[31me\x1b[32m\u{301}",
+        ),
+        (
+            "\x1b]8;;https://example.test\x07表ABC",
+            1,
+            2,
+            "\x1b]8;;https://example.test\x07 A\x1b]8;;\x1b\\",
+        ),
+    ] {
+        let row = super::pane_row::crop_rendered_pane_row(
+            text.as_bytes(),
+            start,
+            width,
+            &Utf8Config::default(),
+        );
+        assert_eq!(row.bytes(), expected.as_bytes());
+        assert_eq!(usize::from(row.columns()), width);
+    }
+}
+
+#[test]
+fn projected_cell_crop_preserves_empty_row_style_and_zero_width_noop() {
+    let utf8 = Utf8Config::default();
+    let row = super::pane_row::crop_rendered_pane_row(b"\x1b[44m", 0, 3, &utf8);
+    assert_eq!(row.bytes(), b"\x1b[44m");
+    assert_eq!(row.columns(), 0);
+    let row = super::pane_row::crop_rendered_pane_row(b"X\x1b[44m", 20, 3, &utf8);
+    assert_eq!(row.bytes(), b"\x1b[44m");
+    assert_eq!(row.columns(), 0);
+    let row = super::pane_row::crop_rendered_pane_row(b"\x1b[44m", 0, 0, &utf8);
+    assert!(row.bytes().is_empty());
+}
+
+#[path = "single_float_tests.rs"]
+mod single_float_tests;
+
+#[path = "scrollbar_only_tests.rs"]
+mod scrollbar_only_tests;
+
+#[test]
+fn prompt_renders_over_content_with_status_disabled_in_both_edit_modes() {
+    use super::{render_with_attached_count_and_prompt, RenderedPrompt};
+    let session = crate::session_fixture::SessionFixture::new(
+        SessionName::new("prompt-overlay").unwrap(),
+        TerminalSize { cols: 20, rows: 6 },
+    );
+    let mut options = OptionStore::new();
+    options
+        .set(
+            ScopeSelector::Global,
+            OptionName::Status,
+            "off".into(),
+            SetOptionMode::Replace,
+        )
+        .unwrap();
+    for command_prompt in [false, true] {
+        let prompt = RenderedPrompt {
+            prompt: "PROMPT".into(),
+            input: "abc".into(),
+            cursor: 2,
+            command_prompt,
+            completion_menu: Vec::new(),
+        };
+        let frame =
+            render_with_attached_count_and_prompt(session.view(), &options, 1, Some(&prompt));
+        assert!(frame
+            .windows(b"PROMPTabc".len())
+            .any(|part| part == b"PROMPTabc"));
+        assert!(frame
+            .windows(b"\x1b[6;9H".len())
+            .any(|part| part == b"\x1b[6;9H"));
+    }
+    let frame = render_with_attached_count_and_prompt(session.view(), &options, 1, None);
+    assert!(!frame.windows(b"PROMPT".len()).any(|part| part == b"PROMPT"));
+}
+
+#[path = "tests/status_format_sparse.rs"]
+mod status_format_sparse;

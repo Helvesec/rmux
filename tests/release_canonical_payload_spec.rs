@@ -112,6 +112,7 @@ import pathlib
 import sys
 
 repo, root = map(pathlib.Path, sys.argv[1:])
+sys.path.insert(0, str(repo / "scripts/release"))
 path = repo / "scripts/release/canonical-crate-set.py"
 spec = importlib.util.spec_from_file_location("canonical_crate_set", path)
 module = importlib.util.module_from_spec(spec)
@@ -249,4 +250,175 @@ fn canonical_payload_helpers_are_executable() {
             .mode();
         assert_ne!(mode & 0o111, 0, "{filename} is not executable");
     }
+}
+
+fn run_python_fixture(label: &str, script: &str) {
+    let root = temp_dir(label);
+    let fixture = root.join("fixture.py");
+    fs::write(&fixture, script).expect("write publish order fixture");
+    let cargo = std::env::var("CARGO").unwrap_or_else(|_| "cargo".to_owned());
+    let output = Command::new(python())
+        .arg("-B")
+        .arg(&fixture)
+        .arg(repo_root())
+        .arg(&root)
+        .arg(cargo)
+        .output()
+        .expect("run publish order fixture");
+    assert!(
+        output.status.success(),
+        "stdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    fs::remove_dir_all(root).expect("remove publish order fixture");
+}
+
+const LOAD_CRATE_SET: &str = r#"
+import importlib.util
+import os
+import pathlib
+import sys
+
+repo, root = pathlib.Path(sys.argv[1]), pathlib.Path(sys.argv[2])
+cargo = sys.argv[3]
+sys.path.insert(0, str(repo / "scripts/release"))
+path = repo / "scripts/release/canonical-crate-set.py"
+spec = importlib.util.spec_from_file_location("canonical_crate_set", path)
+module = importlib.util.module_from_spec(spec)
+assert spec.loader is not None
+spec.loader.exec_module(module)
+"#;
+
+#[test]
+fn real_workspace_publishes_every_crate_after_each_dependency_cargo_keeps() {
+    // Cargo keeps every non-dev edge, and every dev edge that declares a
+    // version, in the packaged manifest; crates.io must already serve it.
+    run_python_fixture(
+        "real-order",
+        &format!(
+            "{LOAD_CRATE_SET}{}",
+            r#"
+environment = {**os.environ, "CARGO_NET_OFFLINE": "true"}
+metadata = module.cargo_metadata(source_dir=repo, cargo=cargo, environment=environment)
+members = set(metadata["workspace_members"])
+root_package = next(
+    package for package in metadata["packages"]
+    if package["id"] in members and package["name"] == "rmux"
+)
+packages = module.publishable_packages(metadata, root_package["version"])
+order, dependencies = module.dependency_order(packages)
+position = {name: index for index, name in enumerate(order)}
+violations = []
+checked = 0
+for package in packages:
+    for dependency in package["dependencies"]:
+        name = dependency["name"]
+        if name not in position or dependency.get("path") is None:
+            continue
+        if dependency.get("kind") == "dev" and dependency["req"] == "*":
+            continue
+        checked += 1
+        if position[name] >= position[package["name"]]:
+            violations.append(
+                f"{package['name']} (#{position[package['name']] + 1}) needs "
+                f"{name} {dependency['req']} [{dependency.get('kind') or 'normal'}] "
+                f"published at #{position[name] + 1}"
+            )
+        if name not in dependencies[package["name"]]:
+            violations.append(f"{package['name']} omits workspace dependency {name}")
+assert checked > 0, "the real workspace exposed no internal edge"
+assert not violations, "publish order: " + ", ".join(order) + "\n" + "\n".join(violations)
+"#
+        ),
+    );
+}
+
+#[test]
+fn publish_order_counts_kept_dev_edges_and_packaged_manifests_bind_them() {
+    run_python_fixture(
+        "kept-dev-order",
+        &format!(
+            "{LOAD_CRATE_SET}{}",
+            r#"
+import io
+import tarfile
+
+def edge(name, kind=None, req="^0.9.0", target=None):
+    return {"name": name, "kind": kind, "req": req, "path": f"../{name}", "target": target}
+
+def package(name, dependencies):
+    return {"name": name, "id": f"{name}-id", "version": "0.9.0",
+            "publish": ["crates-io"], "dependencies": dependencies}
+
+packages = [
+    # A path-only dev edge is stripped by Cargo and may close a test cycle.
+    package("crate-a", [edge("crate-b", kind="dev", req="*")]),
+    # A versioned dev edge stays in the packaged manifest and orders first.
+    package("crate-b", [edge("crate-c", kind="dev", target="cfg(unix)")]),
+    package("crate-c", [edge("crate-a")]),
+]
+order, dependencies = module.dependency_order(packages)
+assert order == ["crate-a", "crate-c", "crate-b"], order
+assert dependencies == {
+    "crate-a": [], "crate-b": ["crate-c"], "crate-c": ["crate-a"],
+}, dependencies
+cycle = [
+    package("crate-x", [edge("crate-y", kind="dev")]),
+    package("crate-y", [edge("crate-x")]),
+]
+try:
+    module.dependency_order(cycle)
+except ValueError as error:
+    assert "cycle" in str(error), error
+else:
+    raise AssertionError("a versioned dev cycle was accepted")
+
+def write_crate(directory, name, manifest):
+    data = manifest.encode()
+    buffer = io.BytesIO()
+    with tarfile.open(fileobj=buffer, mode="w:gz") as archive:
+        info = tarfile.TarInfo(f"{name}-0.9.0/Cargo.toml")
+        info.size = len(data)
+        archive.addfile(info, io.BytesIO(data))
+    (directory / f"{name}-0.9.0.crate").write_bytes(buffer.getvalue())
+
+def packaged(label, manifests):
+    directory = root / label
+    directory.mkdir()
+    for name, manifest in manifests.items():
+        write_crate(directory, name, manifest)
+    return directory
+
+header = '[package]\nname = "{0}"\nversion = "0.9.0"\n'
+accepted = packaged("accepted", {
+    "crate-a": header.format("crate-a"),
+    "crate-b": header.format("crate-b")
+    + '\n[target."cfg(unix)".dev-dependencies.crate-c]\nversion = "0.9.0"\n',
+    "crate-c": header.format("crate-c")
+    + '\n[dependencies.crate-a]\nversion = "0.9.0"\n\n[dependencies.serde]\nversion = "1"\n',
+})
+module.verify_packaged_requirements(order, dependencies, accepted, "0.9.0")
+
+for label, manifest in {
+    # Metadata reports an explicit version "*" exactly like a path-only edge.
+    "star": '\n[dev-dependencies.crate-b]\nversion = "*"\n',
+    "renamed": '\n[target."cfg(windows)".dev-dependencies.alias]\n'
+    'package = "crate-c"\nversion = "0.9.0"\n',
+    "build": '\n[build-dependencies]\ncrate-b = "0.9.0"\n',
+}.items():
+    rejected = packaged(label, {
+        "crate-a": header.format("crate-a") + manifest,
+        "crate-b": header.format("crate-b"),
+        "crate-c": header.format("crate-c"),
+    })
+    try:
+        module.verify_packaged_requirements(order, dependencies, rejected, "0.9.0")
+    except ValueError as error:
+        assert "crate-a" in str(error) and "publish predecessors" in str(error), error
+    else:
+        raise AssertionError(f"packaged {label} requirement escaped the order")
+"#
+        ),
+    );
 }

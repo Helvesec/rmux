@@ -64,7 +64,7 @@ async fn create_session(handler: &RequestHandler, name: &str) {
             environment: None,
         }))
         .await;
-    assert!(matches!(response, Response::NewSession(_)));
+    crate::session_fixture::assert_new_session(&response);
     handler
         .wait_for_pane_startup_to_finish_for_test(&PaneTarget::new(session_name(name), 0))
         .await;

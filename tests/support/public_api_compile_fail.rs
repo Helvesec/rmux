@@ -1,10 +1,29 @@
+#[cfg(not(target_has_atomic = "64"))]
+use portable_atomic::AtomicU64;
 use std::ffi::OsString;
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::process::Command;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::process::{Command, Output};
+#[cfg(target_has_atomic = "64")]
+use std::sync::atomic::AtomicU64;
+use std::sync::atomic::Ordering;
 
 static NEXT_PROJECT_ID: AtomicU64 = AtomicU64::new(0);
+
+#[cfg(windows)]
+#[path = "native_consumer_output.rs"]
+mod native_consumer_output;
+
+// One boundary for the three Rust-owned consumer launches.
+pub(crate) fn consumer_output(command: &mut Command, case: &str) -> std::io::Result<Output> {
+    #[cfg(windows)]
+    if native_consumer_output::enabled(command) {
+        return native_consumer_output::output(command, case);
+    }
+    #[cfg(not(windows))]
+    let _ = case;
+    command.output()
+}
 
 pub(crate) struct CompileFailCase {
     name: &'static str,
@@ -42,9 +61,11 @@ pub(crate) fn assert_compile_fail_cases(
 ) {
     let project = ConsumerProject::new(dependency, manifest_dir, cases);
     let cargo_executable = std::env::var_os("CARGO").unwrap_or_else(|| OsString::from("cargo"));
+    let identity_session = project.qualify(dependency, manifest_dir);
 
     for case in cases {
-        let output = Command::new(&cargo_executable)
+        let mut command = Command::new(&cargo_executable);
+        command
             .args([
                 "check",
                 "--offline",
@@ -55,14 +76,19 @@ pub(crate) fn assert_compile_fail_cases(
             ])
             .current_dir(&project.root)
             .env("CARGO_TARGET_DIR", project.root.join("target"))
-            .env("CARGO_NET_OFFLINE", "true")
-            .output()
-            .unwrap_or_else(|error| {
-                panic!(
-                    "failed to launch cargo for compile-fail case `{}`: {error}",
-                    case.name
-                )
-            });
+            .env("CARGO_NET_OFFLINE", "true");
+        if let Some(session) = &identity_session {
+            project.check(session);
+            command
+                .arg("--locked")
+                .env("RMUX_IDENTITY_DOC_SESSION", session);
+        }
+        let output = consumer_output(&mut command, case.name).unwrap_or_else(|error| {
+            panic!(
+                "failed to launch cargo for compile-fail case `{}`: {error}",
+                case.name
+            )
+        });
         let stderr = String::from_utf8_lossy(&output.stderr);
 
         assert!(
@@ -85,10 +111,15 @@ struct ConsumerProject {
 impl ConsumerProject {
     fn new(dependency: &str, manifest_dir: &Path, cases: &[CompileFailCase]) -> Self {
         let project_id = NEXT_PROJECT_ID.fetch_add(1, Ordering::Relaxed);
-        let root = std::env::temp_dir().join(format!(
+        let base = std::env::var_os("RMUX_IDENTITY_TARGET")
+            .map(|target| PathBuf::from(target).join("consumer-inputs"))
+            .unwrap_or_else(std::env::temp_dir);
+        fs::create_dir_all(&base).expect("create compile-fail project parent");
+        let root = base.join(format!(
             "{dependency}-public-api-compile-fail-{}-{project_id}",
             std::process::id()
         ));
+        fs::create_dir(&root).expect("create fresh compile-fail project");
         let bin_dir = root.join("src").join("bin");
         fs::create_dir_all(&bin_dir).unwrap_or_else(|error| {
             panic!(
@@ -130,10 +161,62 @@ impl ConsumerProject {
 
         Self { root }
     }
+
+    fn identity_command(&self) -> Option<Command> {
+        let python = std::env::var_os("RMUX_IDENTITY_PYTHON")?;
+        let script = std::env::var_os("RMUX_IDENTITY_SCRIPT")
+            .expect("qualified consumer requires identity script");
+        let mut command = Command::new(python);
+        if cfg!(windows) && std::env::var_os("RMUX_NATIVE_INPUT_MANIFEST").is_some() {
+            command.args(["-I", "-S", "-B"]);
+        }
+        command.arg(script).arg("consumer");
+        Some(command)
+    }
+
+    fn qualify(&self, dependency: &str, manifest_dir: &Path) -> Option<String> {
+        let mut command = self.identity_command()?;
+        command
+            .args(["prepare"])
+            .arg(&self.root)
+            .arg(manifest_dir)
+            .arg(dependency);
+        let output =
+            consumer_output(&mut command, "consumer-prepare").expect("launch consumer attribution");
+        assert!(
+            output.status.success(),
+            "consumer attribution failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        Some(
+            String::from_utf8(output.stdout)
+                .expect("consumer session encoding")
+                .trim()
+                .to_owned(),
+        )
+    }
+
+    fn check(&self, session: &str) {
+        let mut command = self.identity_command().expect("qualified consumer checker");
+        command
+            .arg("check")
+            .env("RMUX_IDENTITY_DOC_SESSION", session)
+            .env("CARGO_TARGET_DIR", self.root.join("target"));
+        let output =
+            consumer_output(&mut command, "consumer-check").expect("launch consumer check");
+        assert!(
+            output.status.success(),
+            "consumer check failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
 }
 
 impl Drop for ConsumerProject {
     fn drop(&mut self) {
+        if std::env::var_os("RMUX_IDENTITY_TARGET").is_some() {
+            return;
+        }
         let _ = fs::remove_dir_all(&self.root);
     }
 }

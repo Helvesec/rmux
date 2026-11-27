@@ -30,6 +30,14 @@ static EXIT_COMMIT_PAUSES: Mutex<Vec<(ExitCommitPauseKey, Arc<ClockModeIdentityP
     Mutex::new(Vec::new());
 static RESTORE_COMMIT_PAUSES: Mutex<Vec<(ExitCommitPauseKey, Arc<ClockModeIdentityPause>)>> =
     Mutex::new(Vec::new());
+/// The copy-mode entry, once it has prepared everything under `state` and let
+/// that lock go, just before it takes the transcript it is about to write.
+static COPY_ENTRY_COMMIT_PAUSES: Mutex<Vec<(ExitCommitPauseKey, Arc<ClockModeIdentityPause>)>> =
+    Mutex::new(Vec::new());
+/// `copy-mode -q` on a pane whose top mode is a tree, after it has taken
+/// `state` and before it awaits `active_attach`.
+static CANCEL_ALL_TREE_PAUSES: Mutex<Vec<(ExitCommitPauseKey, Arc<ClockModeIdentityPause>)>> =
+    Mutex::new(Vec::new());
 
 impl RequestHandler {
     pub(in crate::handler) fn install_live_clock_mode_exit_pause_for_test(
@@ -78,6 +86,42 @@ impl RequestHandler {
         pause_once(
             &(self.test_handler_key(), target.clone()),
             &RESTORE_COMMIT_PAUSES,
+        )
+        .await;
+    }
+
+    pub(in crate::handler) fn install_copy_mode_entry_commit_pause_for_test(
+        &self,
+        target: PaneTarget,
+    ) -> Arc<ClockModeIdentityPause> {
+        install_pause((self.test_handler_key(), target), &COPY_ENTRY_COMMIT_PAUSES)
+    }
+
+    pub(in crate::handler) async fn pause_before_copy_mode_entry_commit_for_test(
+        &self,
+        target: &PaneTarget,
+    ) {
+        pause_once(
+            &(self.test_handler_key(), target.clone()),
+            &COPY_ENTRY_COMMIT_PAUSES,
+        )
+        .await;
+    }
+
+    pub(in crate::handler) fn install_cancel_all_tree_pause_for_test(
+        &self,
+        target: PaneTarget,
+    ) -> Arc<ClockModeIdentityPause> {
+        install_pause((self.test_handler_key(), target), &CANCEL_ALL_TREE_PAUSES)
+    }
+
+    pub(in crate::handler) async fn pause_before_cancel_all_tree_attach_for_test(
+        &self,
+        target: &PaneTarget,
+    ) {
+        pause_once(
+            &(self.test_handler_key(), target.clone()),
+            &CANCEL_ALL_TREE_PAUSES,
         )
         .await;
     }

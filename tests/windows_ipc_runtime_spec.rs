@@ -164,6 +164,89 @@ fn function_name(line: &str) -> Option<&str> {
     Some(name.split(['(', '<']).next().unwrap_or(name))
 }
 
+#[test]
+fn rust_source_collection_preserves_recursive_runtime_guard() {
+    let root = source_fixture("recursive");
+    let nested = root.join("crates/example/tests/nested");
+    fs::create_dir_all(&nested).expect("create nested sources");
+    let source = nested.join("runtime.rs");
+    let plain = "#[test]\nfn binds() {\n    LocalListener::bind(path);\n}\n";
+    fs::write(&source, plain).expect("write nested source");
+    fs::write(nested.join("notes.txt"), plain).expect("write non-Rust file");
+    // A directory with a Rust suffix must still be traversed.
+    let dotted = root.join("module.rs");
+    fs::create_dir(&dotted).expect("create Rust-suffixed directory");
+    let neighbor = dotted.join("neighbor.rs");
+    fs::write(&neighbor, "// recursive neighbor\n").expect("write neighbor");
+
+    let mut sources = rust_sources(&root);
+    sources.sort();
+    let mut expected = vec![source.clone(), neighbor];
+    expected.sort();
+    assert_eq!(sources, expected);
+    assert_eq!(
+        bind_sites_without_a_runtime(&fs::read_to_string(source).expect("read nested source")),
+        vec![3]
+    );
+    for allowed in [
+        plain.replace("#[test]\nfn", "#[tokio::test]\nasync fn"),
+        plain
+            .replace(
+                "    LocalListener",
+                "    runtime.block_on(async {\n    LocalListener",
+            )
+            .replace(";\n}", ";\n    });\n}"),
+        plain.replace(
+            "    LocalListener",
+            "    let _guard = runtime.enter();\n    LocalListener",
+        ),
+    ] {
+        assert!(bind_sites_without_a_runtime(&allowed).is_empty());
+    }
+}
+
+#[test]
+fn rust_source_collection_excludes_generated_trees() {
+    let root = source_fixture("generated");
+    for excluded in ["target", ".git", "node_modules", ".local-records"] {
+        let directory = root.join("nested").join(excluded).join("deeper");
+        fs::create_dir_all(&directory).expect("create generated tree");
+        fs::write(directory.join("generated.rs"), "// not workspace source\n")
+            .expect("write generated source");
+    }
+    assert!(rust_sources(&root).is_empty());
+}
+
+#[cfg(unix)]
+#[test]
+fn rust_source_collection_ignores_symlinks_including_recursive_neighbor() {
+    use std::os::unix::fs::symlink;
+
+    let root = source_fixture("symlinks");
+    let nested = root.join("nested");
+    fs::create_dir(&nested).expect("create source directory");
+    let source = nested.join("real.rs");
+    fs::write(&source, "// real source\n").expect("write real source");
+    symlink(".", nested.join("recursive")).expect("link recursive neighbor");
+    symlink("nested", root.join("alias")).expect("link directory alias");
+    symlink("nested/real.rs", root.join("alias.rs")).expect("link source alias");
+    symlink("missing", root.join("dangling.rs")).expect("link dangling source");
+    assert_eq!(rust_sources(&root), vec![source]);
+}
+
+fn source_fixture(label: &str) -> PathBuf {
+    let nonce = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("clock before epoch")
+        .as_nanos();
+    let root = std::env::temp_dir().join(format!(
+        "rmux-rust-sources-{label}-{}-{nonce}",
+        std::process::id()
+    ));
+    fs::create_dir(&root).expect("create source fixture");
+    root
+}
+
 fn rust_sources(root: &Path) -> Vec<PathBuf> {
     let mut sources = Vec::new();
     let mut pending = vec![root.to_path_buf()];
@@ -174,11 +257,19 @@ fn rust_sources(root: &Path) -> Vec<PathBuf> {
         for entry in entries.flatten() {
             let path = entry.path();
             let name = entry.file_name();
-            if path.is_dir() {
-                if !matches!(name.to_str(), Some("target" | ".git" | "node_modules")) {
+            // Do not follow aliases or recursive links in generated fixtures.
+            let file_type = entry.file_type().expect("read source entry type");
+            if file_type.is_dir() {
+                // Hidden directories (`.git`, local records) are never workspace source.
+                let generated = name.to_str().is_some_and(|name| {
+                    name.starts_with('.') || matches!(name, "target" | "node_modules")
+                });
+                if !generated {
                     pending.push(path);
                 }
-            } else if path.extension().and_then(|extension| extension.to_str()) == Some("rs") {
+            } else if file_type.is_file()
+                && path.extension().and_then(|extension| extension.to_str()) == Some("rs")
+            {
                 sources.push(path);
             }
         }

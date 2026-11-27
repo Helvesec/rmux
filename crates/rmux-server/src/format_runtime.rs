@@ -1,47 +1,75 @@
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 
+use crate::client_format::{ClientFormatBindings, ClientLoopSnapshot};
+use crate::pane_screen_state::PaneScreenState;
 use crate::pane_terminals::HandlerState;
+use crate::pane_transcript::{PaneTranscript, PaneTranscriptReach};
 use chrono::Local;
-use rmux_core::formats::{
-    expand_time_tokens, render_template, render_template_preserving_jobs, FormatContext,
-    FormatVariable, FormatVariables,
+use rmux_core::formats::{expand_time_tokens, render_template, FormatContext, FormatVariables};
+use rmux_core::{
+    BufferStore, EnvironmentStore, ManagedSessionStore, OptionStore, Pane, PaneId, Window,
 };
-use rmux_core::{BufferStore, EnvironmentStore, OptionStore, Pane, Session, SessionStore, Window};
 use rmux_proto::OptionName;
 use rmux_proto::{PaneTarget, SessionName, TerminalSize};
 
 static SERVER_START_TIME: OnceLock<i64> = OnceLock::new();
 
-#[path = "format_runtime/geometry.rs"]
+mod dispatch;
+#[cfg(test)]
+#[path = "format_runtime/gatt1_tests.rs"]
+mod gatt1_tests;
 mod geometry;
-#[path = "format_runtime/index.rs"]
 mod index;
-#[path = "format_runtime/loops.rs"]
+mod jobs;
 mod loops;
-#[path = "format_runtime/path.rs"]
 mod path;
-#[path = "format_runtime/process.rs"]
+#[cfg(test)]
+#[path = "format_runtime/ppath1_tests.rs"]
+mod ppath1_tests;
 mod process;
-#[path = "format_runtime/variables.rs"]
+#[cfg(test)]
+#[path = "format_runtime/sgord1_tests.rs"]
+mod sgord1_tests;
 mod variables;
-#[path = "format_runtime/window.rs"]
+#[cfg(test)]
+#[path = "format_runtime/wac1_tests.rs"]
+mod wac1_tests;
+
+#[cfg(test)]
+#[path = "format_runtime/wacl1_tests.rs"]
+mod wacl1_tests;
+#[cfg(test)]
+#[path = "format_runtime/wgl1_tests.rs"]
+mod wgl1_tests;
 mod window;
+mod window_name;
 
 pub(crate) use path::pane_path_from_osc7;
 
+#[derive(Clone)]
 pub(crate) struct RuntimeFormatContext<'a> {
     base: FormatContext,
+    jobs: Option<jobs::FormatJobContext>,
     state: Option<&'a HandlerState>,
     options: Option<&'a OptionStore>,
     environment: Option<&'a EnvironmentStore>,
-    session_store: Option<&'a SessionStore>,
+    session_store: Option<&'a ManagedSessionStore>,
     buffers: Option<&'a BufferStore>,
-    session: Option<&'a Session>,
+    session: Option<rmux_core::ManagedSessionView<'a>>,
     window_index: Option<u32>,
     window: Option<&'a Window>,
     pane: Option<&'a Pane>,
+    // The pane the request named, read through the fail-fast transcript lock.
+    named_pane: Option<PaneId>,
     client_size: Option<TerminalSize>,
+    client_loop_snapshots: Option<&'a [ClientLoopSnapshot]>,
+    client_bindings: Option<ClientFormatBindings>,
+    // Automatic-name children must read the stored name, including contexts
+    // cloned by L or reconstructed by S/W/P and name lookup.
+    expanding_automatic_name: bool,
+    // Shared by every context derived from one expansion: one name per window.
+    window_names: window_name::ExpansionWindowNames,
     hide_session_size: bool,
 }
 
@@ -49,6 +77,7 @@ impl<'a> RuntimeFormatContext<'a> {
     pub(crate) fn new(base: FormatContext) -> Self {
         Self {
             base,
+            jobs: None,
             state: None,
             options: None,
             environment: None,
@@ -58,7 +87,12 @@ impl<'a> RuntimeFormatContext<'a> {
             window_index: None,
             window: None,
             pane: None,
+            named_pane: None,
             client_size: None,
+            client_loop_snapshots: None,
+            client_bindings: None,
+            expanding_automatic_name: false,
+            window_names: window_name::ExpansionWindowNames::default(),
             hide_session_size: false,
         }
     }
@@ -77,7 +111,7 @@ impl<'a> RuntimeFormatContext<'a> {
         self
     }
 
-    pub(crate) fn with_session(mut self, session: &'a Session) -> Self {
+    pub(crate) fn with_session(mut self, session: rmux_core::ManagedSessionView<'a>) -> Self {
         self.session = Some(session);
         self
     }
@@ -93,9 +127,50 @@ impl<'a> RuntimeFormatContext<'a> {
         self
     }
 
+    /// [`Self::with_pane`] for the pane the request names: a poisoned
+    /// transcript answers "pane %N unavailable" instead of expanding empty.
+    pub(crate) fn with_named_pane(mut self, pane: &'a Pane) -> Self {
+        self.named_pane = Some(pane.id());
+        self.with_pane(pane)
+    }
+
     pub(crate) fn with_client_size(mut self, client_size: TerminalSize) -> Self {
         self.client_size = Some(client_size);
         self
+    }
+
+    pub(crate) fn without_client_size(mut self) -> Self {
+        self.client_size = None;
+        self
+    }
+
+    pub(crate) fn with_client_loop_snapshots(
+        mut self,
+        snapshots: &'a [ClientLoopSnapshot],
+    ) -> Self {
+        self.client_loop_snapshots = Some(snapshots);
+        self
+    }
+
+    pub(crate) fn with_client_bindings(mut self, bindings: ClientFormatBindings) -> Self {
+        self.client_bindings = Some(bindings);
+        self
+    }
+
+    pub(super) fn inherit_client_loop_context(
+        &self,
+        mut runtime: RuntimeFormatContext<'a>,
+    ) -> RuntimeFormatContext<'a> {
+        runtime = self.inherit_jobs(runtime);
+        runtime.expanding_automatic_name = self.expanding_automatic_name;
+        runtime.window_names = self.window_names.clone();
+        if let Some(snapshots) = self.client_loop_snapshots {
+            runtime = runtime.with_client_loop_snapshots(snapshots);
+        }
+        if let Some(bindings) = self.client_bindings.as_ref() {
+            runtime = bindings.apply(runtime);
+        }
+        runtime
     }
 
     pub(crate) fn without_session_size(mut self) -> Self {
@@ -164,33 +239,55 @@ impl<'a> RuntimeFormatContext<'a> {
     }
 
     fn session_name(&self) -> Option<&SessionName> {
-        self.session.map(Session::name)
+        self.session.map(|session| session.name())
+    }
+
+    /// Reads this context's pane under [`HandlerState::observe_pane_transcript`]:
+    /// a poisoned pane the request only reached expands empty instead of
+    /// failing the whole request; the pane it named answers unavailable.
+    fn observe_pane_transcript<R>(&self, read: impl FnOnce(&PaneTranscript) -> R) -> Option<R> {
+        let session = self.session?;
+        let pane = self.pane?;
+        self.state?.observe_pane_transcript(
+            session.name(),
+            pane.id(),
+            self.pane_transcript_reach(pane.id()),
+            read,
+        )
+    }
+
+    /// The policy follows the pane id, not the context: a clone of the named
+    /// context keeps it strict, while #{S:} #{W:} #{P:} loops build fresh
+    /// contexts and reach their panes, the named one included.
+    fn pane_transcript_reach(&self, pane_id: PaneId) -> PaneTranscriptReach {
+        if self.named_pane == Some(pane_id) {
+            PaneTranscriptReach::Named
+        } else {
+            PaneTranscriptReach::Reached
+        }
+    }
+
+    fn with_observed_pane_screen<R>(
+        &self,
+        render: impl FnOnce(&rmux_core::Screen) -> R,
+    ) -> Option<R> {
+        self.observe_pane_transcript(|transcript| render(transcript.screen()))
+    }
+
+    fn pane_screen_state(&self) -> Option<PaneScreenState> {
+        self.observe_pane_transcript(|transcript| PaneScreenState::from_screen(transcript.screen()))
     }
 
     fn pane_history_size(&self) -> Option<String> {
-        let session = self.session?;
-        let pane = self.pane?;
-        let stats = self
-            .state?
-            .pane_history_size_stats(session.name(), pane.id())?;
-        Some(stats.size.to_string())
+        self.observe_pane_transcript(|transcript| transcript.history_size().to_string())
     }
 
     fn pane_history_limit(&self) -> Option<String> {
-        let session = self.session?;
-        let pane = self.pane?;
-        let stats = self
-            .state?
-            .pane_history_size_stats(session.name(), pane.id())?;
-        Some(stats.limit.to_string())
+        self.observe_pane_transcript(|transcript| transcript.history_limit().to_string())
     }
 
     fn pane_history_bytes(&self) -> Option<String> {
-        let session = self.session?;
-        let pane = self.pane?;
-        self.state?
-            .pane_history_bytes(session.name(), pane.id())
-            .map(|bytes| bytes.to_string())
+        self.observe_pane_transcript(|transcript| transcript.tmux_history_bytes().to_string())
     }
 
     fn pane_lifecycle(&self) -> Option<&crate::pane_terminals::PaneLifecycleState> {
@@ -217,120 +314,97 @@ impl<'a> RuntimeFormatContext<'a> {
     }
 
     fn pane_output_sequence(&self) -> Option<String> {
-        let session = self.session?;
-        let pane = self.pane?;
-        self.state?
-            .pane_output_sequence(session.name(), pane.id())
+        self.observe_pane_transcript(PaneTranscript::output_sequence)
             .or_else(|| self.pane_lifecycle().map(|state| state.output_sequence))
             .map(|sequence| sequence.to_string())
     }
 
-    fn pane_cursor_position(&self) -> Option<(u32, u32)> {
+    fn session_program_status_json(&self) -> Option<String> {
+        let state = self.state?;
         let session = self.session?;
-        let pane = self.pane?;
-        self.state?
-            .pane_copy_mode_render_screen(session.name(), pane.id())
-            .map(|screen| screen.cursor_position())
-            .or_else(|| {
-                self.state?
-                    .pane_screen_state(session.name(), pane.id())
-                    .map(|state| state.cursor_position)
+        let panes = session
+            .windows()
+            .flat_map(|(window_index, window)| {
+                window
+                    .panes()
+                    .iter()
+                    .filter_map(|pane| {
+                        let status = state.pane_program_status(session.name(), pane.id())?;
+                        Some(serde_json::json!({
+                            "pane_id": format!("%{}", pane.id().as_u32()),
+                            "window_index": window_index,
+                            "pane_index": crate::pane_indices::visible_pane_index(
+                                session, &state.options, window_index, pane.index()
+                            ),
+                            "summary": status.summary(), "observed": status.observed(),
+                        }))
+                    })
+                    .collect::<Vec<_>>()
             })
+            .collect::<Vec<_>>();
+        Some(serde_json::json!({"version": 1, "panes": panes}).to_string())
+    }
+
+    fn pane_program_status(&self, field: &str) -> Option<String> {
+        let status = self
+            .state?
+            .pane_program_status(self.session?.name(), self.pane?.id())?;
+        let summary = status.summary();
+        if field == "json" {
+            return Some(
+                serde_json::json!({"version": 1, "observed": status.observed(), "summary": summary, "records": status.records()})
+                    .to_string(),
+            );
+        }
+        let record = summary?;
+        match field {
+            "state" => Some(record.state.as_str().to_owned()),
+            "app" => record.app,
+            "id" => Some(record.id),
+            "kind" => record.kind,
+            "progress" => record.progress.map(|value| value.to_string()),
+            "title" => record.title,
+            "message" => record.message,
+            _ => None,
+        }
+    }
+
+    fn pane_cursor_position(&self) -> Option<(u32, u32)> {
+        self.observe_pane_transcript(PaneTranscript::copy_mode_render_screen)
+            .flatten()
+            .map(|screen| screen.cursor_position())
+            .or_else(|| Some(self.pane_screen_state()?.cursor_position))
     }
 
     fn pane_screen_mode(&self) -> Option<u32> {
-        let session = self.session?;
-        let pane = self.pane?;
-        Some(
-            self.state?
-                .pane_screen_state(session.name(), pane.id())?
-                .mode,
-        )
+        Some(self.pane_screen_state()?.mode)
     }
 
     fn pane_alternate_on(&self) -> Option<String> {
-        let session = self.session?;
-        let pane = self.pane?;
-        let state = self.state?.pane_screen_state(session.name(), pane.id())?;
-        Some(bool_string(state.alternate_on))
+        Some(bool_string(self.pane_screen_state()?.alternate_on))
     }
 
     fn pane_title(&self) -> Option<String> {
-        let session = self.session?;
-        let pane = self.pane?;
-        let state = self.state?.pane_screen_state(session.name(), pane.id())?;
-        Some(state.title)
+        Some(self.pane_screen_state()?.title)
     }
 
     fn pane_screen_path(&self) -> Option<String> {
-        let session = self.session?;
-        let pane = self.pane?;
-        let state = self.state?.pane_screen_state(session.name(), pane.id())?;
-        path::pane_path_from_osc7(&state.path)
+        path::pane_path_from_osc7(&self.pane_screen_state()?.path)
     }
 
-    fn automatic_window_name(&self) -> Option<String> {
-        let state = self.state?;
-        let session_name = self.session_name()?;
-        let window_index = self.window_index?;
-        let window = self.window?;
-        let tracked = state.tracks_auto_named_window(session_name, window_index);
-        if !crate::automatic_rename::window_allows_automatic_rename(
-            &state.options,
-            session_name,
-            window_index,
-            window,
-            tracked,
-        ) {
-            return None;
-        }
-
-        let template = state
-            .options
-            .resolve_for_window(
-                session_name,
-                window_index,
-                OptionName::AutomaticRenameFormat,
-            )
-            .unwrap_or_default();
-        if template.is_empty() {
-            return None;
-        }
-
-        let rendered =
-            render_runtime_template(template, &AutoRenameFormatContext { inner: self }, false);
-        (!rendered.is_empty()).then_some(rendered)
-    }
-
-    fn window_name(&self) -> Option<String> {
-        self.automatic_window_name()
-            .or_else(|| self.base.format_value(FormatVariable::WindowName))
-    }
-
-    fn rendered_window_name(&self, window_index: u32, window: &'a Window) -> Option<String> {
-        let state = self.state?;
-        let session = self.session?;
-        let mut context = FormatContext::from_session(session)
-            .with_session_attached(self.session_attached_count())
-            .with_window(
-                window_index,
-                window,
-                window_index == session.active_window_index(),
-                Some(window_index) == session.last_window_index(),
-            );
-        if let Some(pane) = window.active_pane() {
-            context = context.with_window_pane(window, pane);
-        }
-        let runtime = RuntimeFormatContext::new(context)
-            .with_state(state)
-            .with_session(session)
-            .with_window(window_index, window);
-        let runtime = if let Some(pane) = window.active_pane() {
-            runtime.with_pane(pane)
-        } else {
-            runtime
-        };
-        runtime.window_name()
+    /// The path the *targeted* pane's own shell announced, exactly as it
+    /// announced it.
+    ///
+    /// The source publishes `wp->base.path` as it stands - the empty string
+    /// while nothing has set it, and no value at all without a pane
+    /// (`tmux-3.7b/format.c:2268-2277`) - so a user who lists the panes and
+    /// matches a line against the URI a shell announced finds it unchanged.
+    /// `pane_screen_path` above decodes that same announcement into a local
+    /// path for the callers that need one; this variable must not, or the
+    /// percent escapes and the host of the announced URI would not survive the
+    /// listing they are matched in.
+    fn pane_announced_path(&self) -> Option<String> {
+        Some(self.pane_screen_state()?.path)
     }
 
     fn pane_pid(&self) -> Option<String> {
@@ -393,10 +467,8 @@ impl<'a> RuntimeFormatContext<'a> {
     }
 
     fn pane_copy_mode_summary(&self) -> Option<crate::copy_mode::CopyModeSummary> {
-        let session = self.session?;
-        let pane = self.pane?;
-        self.state?
-            .pane_copy_mode_summary(session.name(), pane.id())
+        self.observe_pane_transcript(PaneTranscript::copy_mode_summary)
+            .flatten()
     }
 
     fn copy_mode_position_values(&self) -> Option<(usize, usize)> {
@@ -414,10 +486,8 @@ impl<'a> RuntimeFormatContext<'a> {
     }
 
     fn pane_mode_name(&self) -> Option<String> {
-        let session = self.session?;
-        let pane = self.pane?;
-        self.state?
-            .pane_mode_name(session.name(), pane.id())
+        self.observe_pane_transcript(PaneTranscript::pane_mode_name)
+            .flatten()
             .map(str::to_owned)
     }
 
@@ -435,14 +505,8 @@ impl<'a> RuntimeFormatContext<'a> {
     }
 
     fn pane_in_mode(&self) -> bool {
-        let Some(session) = self.session else {
-            return false;
-        };
-        let Some(pane) = self.pane else {
-            return false;
-        };
-        self.state
-            .is_some_and(|state| state.pane_in_mode(session.name(), pane.id()))
+        self.observe_pane_transcript(PaneTranscript::pane_in_mode)
+            .unwrap_or(false)
     }
 
     fn marked_pane_set(&self) -> bool {
@@ -509,49 +573,6 @@ impl<'a> RuntimeFormatContext<'a> {
     }
 }
 
-struct AutoRenameFormatContext<'a> {
-    inner: &'a RuntimeFormatContext<'a>,
-}
-
-impl FormatVariables for AutoRenameFormatContext<'_> {
-    fn format_value(&self, variable: FormatVariable) -> Option<String> {
-        if variable == FormatVariable::WindowName {
-            return self.inner.base.format_value(variable);
-        }
-        self.inner.format_value(variable)
-    }
-
-    fn format_loop(
-        &self,
-        scope: char,
-        body: &str,
-        current_body: Option<&str>,
-        count_only: bool,
-    ) -> Option<String> {
-        self.inner
-            .format_loop(scope, body, current_body, count_only)
-    }
-
-    fn format_name_exists(&self, scope: Option<char>, name: &str) -> Option<bool> {
-        self.inner.format_name_exists(scope, name)
-    }
-
-    fn format_search(&self, options: &str, pattern: &str) -> Option<String> {
-        self.inner.format_search(options, pattern)
-    }
-
-    fn format_value_by_name(&self, name: &str) -> Option<String> {
-        if name == "window_name" {
-            return self
-                .inner
-                .base
-                .format_value_by_name(name)
-                .or_else(|| self.inner.base.format_value(FormatVariable::WindowName));
-        }
-        self.inner.format_value_by_name(name)
-    }
-}
-
 pub(crate) fn render_runtime_template<V>(template: &str, variables: &V, expand_time: bool) -> String
 where
     V: FormatVariables + ?Sized,
@@ -562,22 +583,6 @@ where
         template.to_owned()
     };
     render_template(&template, variables)
-}
-
-pub(crate) fn render_runtime_template_preserving_jobs<V>(
-    template: &str,
-    variables: &V,
-    expand_time: bool,
-) -> String
-where
-    V: FormatVariables + ?Sized,
-{
-    let template = if expand_time {
-        expand_time_tokens(template)
-    } else {
-        template.to_owned()
-    };
-    render_template_preserving_jobs(&template, variables)
 }
 
 pub(crate) fn render_automatic_window_name(runtime: &RuntimeFormatContext<'_>) -> Option<String> {
@@ -597,28 +602,5 @@ fn server_start_time() -> i64 {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::render_runtime_template;
-    use rmux_core::formats::FormatContext;
-
-    #[test]
-    fn render_runtime_template_expands_strftime_tokens_before_formats() {
-        let rendered = render_runtime_template("%H:%M", &FormatContext::new(), true);
-        let bytes = rendered.as_bytes();
-
-        assert_eq!(bytes.len(), 5);
-        assert!(bytes[0].is_ascii_digit());
-        assert!(bytes[1].is_ascii_digit());
-        assert_eq!(bytes[2], b':');
-        assert!(bytes[3].is_ascii_digit());
-        assert!(bytes[4].is_ascii_digit());
-    }
-
-    #[test]
-    fn render_runtime_template_keeps_invalid_percent_literals() {
-        assert_eq!(
-            render_runtime_template("cpu 100%", &FormatContext::new(), true),
-            "cpu 100%"
-        );
-    }
-}
+#[path = "format_runtime/tests.rs"]
+mod tests;

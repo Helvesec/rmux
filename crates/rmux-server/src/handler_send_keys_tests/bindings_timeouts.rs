@@ -1,5 +1,9 @@
 use super::*;
 
+/// Bounds a wait for a key-table timer boundary: a lost timer fails here
+/// instead of hanging the test. It is not a synchronization delay.
+const KEY_TABLE_TIMER_TIMEOUT: Duration = Duration::from_secs(5);
+
 #[tokio::test]
 async fn send_prefix_reports_the_configured_prefix_key() {
     let handler = RequestHandler::new();
@@ -13,7 +17,7 @@ async fn send_prefix_reports_the_configured_prefix_key() {
             environment: None,
         }))
         .await;
-    assert!(matches!(created, Response::NewSession(_)));
+    crate::session_fixture::assert_new_session(&created);
 
     let response = handler
         .handle(Request::SendPrefix(SendPrefixRequest {
@@ -283,7 +287,7 @@ async fn repeating_non_repeat_lookup_restarts_in_the_default_table() {
             environment: None,
         }))
         .await;
-    assert!(matches!(created, Response::NewSession(_)));
+    crate::session_fixture::assert_new_session(&created);
 
     let (control_tx, _control_rx) = mpsc::unbounded_channel();
     let _attach_id = handler
@@ -384,7 +388,7 @@ async fn prefix_timeout_clears_the_prefix_table_without_waiting_for_the_next_key
             environment: None,
         }))
         .await;
-    assert!(matches!(created, Response::NewSession(_)));
+    crate::session_fixture::assert_new_session(&created);
 
     let configured = handler
         .handle(Request::SetOption(SetOptionRequest {
@@ -401,6 +405,8 @@ async fn prefix_timeout_clears_the_prefix_table_without_waiting_for_the_next_key
         .register_attach(requester_pid, alpha.clone(), control_tx)
         .await;
 
+    let expiry_pause = handler.install_attached_key_table_timer_expiry_pause();
+    let refresh_pause = handler.install_attached_key_table_timer_refresh_pause();
     let dispatched = handler
         .handle(Request::SendKeysExt(SendKeysExtRequest {
             target: Some(PaneTarget::new(alpha, 0)),
@@ -420,16 +426,28 @@ async fn prefix_timeout_clears_the_prefix_table_without_waiting_for_the_next_key
         Response::SendKeys(SendKeysResponse { key_count: 1 })
     );
 
-    {
+    let prefix_deadline = {
         let active_attach = handler.active_attach.lock().await;
         let active = active_attach
             .by_pid
             .get(&requester_pid)
             .expect("attached client should remain registered");
         assert_eq!(active.key_table_name.as_deref(), Some("prefix"));
-    }
+        active
+            .key_table_set_at
+            .expect("prefix table records its start")
+            + Duration::from_millis(25)
+    };
 
-    sleep(Duration::from_millis(100)).await;
+    stall_runtime_past(prefix_deadline);
+    tokio::time::timeout(KEY_TABLE_TIMER_TIMEOUT, expiry_pause.reached.notified())
+        .await
+        .expect("prefix timer expires without a next key");
+    expiry_pause.release.notify_one();
+    tokio::time::timeout(KEY_TABLE_TIMER_TIMEOUT, refresh_pause.reached.notified())
+        .await
+        .expect("prefix timer commits the key table reset");
+    refresh_pause.release.notify_one();
 
     let active_attach = handler.active_attach.lock().await;
     let active = active_attach
@@ -456,7 +474,7 @@ async fn repeat_timeout_clears_custom_key_tables_without_waiting_for_the_next_ke
             environment: None,
         }))
         .await;
-    assert!(matches!(created, Response::NewSession(_)));
+    crate::session_fixture::assert_new_session(&created);
 
     let configured = handler
         .handle(Request::SetOption(SetOptionRequest {
@@ -497,6 +515,8 @@ async fn repeat_timeout_clears_custom_key_tables_without_waiting_for_the_next_ke
         .await;
     assert!(matches!(switched, Response::SwitchClient(_)));
 
+    let expiry_pause = handler.install_attached_key_table_timer_expiry_pause();
+    let refresh_pause = handler.install_attached_key_table_timer_refresh_pause();
     let dispatched = handler
         .handle(Request::SendKeysExt(SendKeysExtRequest {
             target: Some(PaneTarget::new(alpha, 0)),
@@ -516,7 +536,7 @@ async fn repeat_timeout_clears_custom_key_tables_without_waiting_for_the_next_ke
         Response::SendKeys(SendKeysResponse { key_count: 1 })
     );
 
-    {
+    let repeat_deadline = {
         let active_attach = handler.active_attach.lock().await;
         let active = active_attach
             .by_pid
@@ -524,10 +544,20 @@ async fn repeat_timeout_clears_custom_key_tables_without_waiting_for_the_next_ke
             .expect("attached client should remain registered");
         assert_eq!(active.key_table_name.as_deref(), Some("my-table"));
         assert!(active.repeat_active);
-        assert!(active.repeat_deadline.is_some());
-    }
+        active
+            .repeat_deadline
+            .expect("repeat binding arms its deadline")
+    };
 
-    sleep(Duration::from_millis(100)).await;
+    stall_runtime_past(repeat_deadline);
+    tokio::time::timeout(KEY_TABLE_TIMER_TIMEOUT, expiry_pause.reached.notified())
+        .await
+        .expect("repeat timer expires without a next key");
+    expiry_pause.release.notify_one();
+    tokio::time::timeout(KEY_TABLE_TIMER_TIMEOUT, refresh_pause.reached.notified())
+        .await
+        .expect("repeat timer commits the key table reset");
+    refresh_pause.release.notify_one();
 
     let active_attach = handler.active_attach.lock().await;
     let active = active_attach
@@ -585,4 +615,15 @@ async fn unbind_key_all_removes_active_bindings_without_dropping_default_tables(
         })))
         .await;
     assert!(matches!(rebound, Response::BindKey(_)));
+}
+
+/// Blocks the runtime thread until `deadline` has passed, before the spawned
+/// key-table timer task gets its first poll, as a loaded host does. A
+/// wall-clock wait registered before the stall then wakes no later than the
+/// timer, and the current-thread scheduler polls the test first, so it could
+/// read the key table before the timer task resets it.
+fn stall_runtime_past(deadline: std::time::Instant) {
+    std::thread::sleep(
+        deadline.saturating_duration_since(std::time::Instant::now()) + Duration::from_millis(5),
+    );
 }

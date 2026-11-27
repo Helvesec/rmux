@@ -1,5 +1,9 @@
+#[cfg(not(target_has_atomic = "64"))]
+use portable_atomic::AtomicU64;
 use std::io;
-use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+#[cfg(target_has_atomic = "64")]
+use std::sync::atomic::AtomicU64;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -21,17 +25,6 @@ pub(crate) enum OutboundQueueResult {
     Backpressure,
     Closed,
     Full,
-}
-
-impl OutboundQueueResult {
-    fn as_str(self) -> &'static str {
-        match self {
-            Self::Queued => "queued",
-            Self::Backpressure => "backpressure",
-            Self::Closed => "closed",
-            Self::Full => "full",
-        }
-    }
 }
 
 pub(crate) struct WebSocketOutbound {
@@ -134,7 +127,18 @@ impl Drop for AccountedDataPermit<'_> {
 }
 
 impl WebSocketOutbound {
-    pub(crate) fn spawn(writer: WebSocketWriter, sealer: FrameSealer) -> Self {
+    pub(super) fn spawn(writer: WebSocketWriter, sealer: FrameSealer) -> Self {
+        Self::spawn_with_write_timeout(writer, sealer, WEB_WRITE_TIMEOUT)
+    }
+
+    // Every wire write of this connection, data or control, must finish within
+    // `write_timeout` or the writer stops. Production always passes
+    // WEB_WRITE_TIMEOUT.
+    fn spawn_with_write_timeout(
+        writer: WebSocketWriter,
+        sealer: FrameSealer,
+        write_timeout: Duration,
+    ) -> Self {
         let (tx, rx) = mpsc::channel(VIEWER_CHANNEL_CAP);
         let (control_tx, control_rx) = mpsc::unbounded_channel();
         let writer = EncryptedWebSocketWriter::new(writer, sealer);
@@ -150,6 +154,7 @@ impl WebSocketOutbound {
             latest_epoch.clone(),
             latest_keyframe.clone(),
             keyframe_wakeup_pending.clone(),
+            write_timeout,
         ));
         Self {
             tx,
@@ -167,15 +172,12 @@ impl WebSocketOutbound {
         let permit = match self.reserve_data_slot(len) {
             Ok(permit) => permit,
             Err(result) => {
-                trace_outbound_queue("frame", len, result, false);
                 return result;
             }
         };
         let epoch = self.latest_epoch.load(Ordering::Acquire);
         permit.send(DataCmd::Frame { bytes, epoch });
-        let result = OutboundQueueResult::Queued;
-        trace_outbound_queue("frame", len, result, false);
-        result
+        OutboundQueueResult::Queued
     }
 
     pub(crate) fn queue_snapshot(&self, bytes: Vec<u8>) -> OutboundQueueResult {
@@ -183,15 +185,12 @@ impl WebSocketOutbound {
         let permit = match self.reserve_data_slot(len) {
             Ok(permit) => permit,
             Err(result) => {
-                trace_outbound_queue("snapshot", len, result, false);
                 return result;
             }
         };
         let epoch = self.latest_epoch.fetch_add(1, Ordering::AcqRel) + 1;
         permit.send(DataCmd::Snapshot { bytes, epoch });
-        let result = OutboundQueueResult::Queued;
-        trace_outbound_queue("snapshot", len, result, false);
-        result
+        OutboundQueueResult::Queued
     }
 
     pub(crate) fn queue_keyframe(&self, frames: Vec<Vec<u8>>) -> OutboundQueueResult {
@@ -199,9 +198,7 @@ impl WebSocketOutbound {
         let mut latest = match self.latest_keyframe.lock() {
             Ok(latest) => latest,
             Err(_) => {
-                let result = OutboundQueueResult::Closed;
-                trace_outbound_queue("keyframe", len, result, false);
-                return result;
+                return OutboundQueueResult::Closed;
             }
         };
         let replaced_len = latest.as_ref().map_or(0, |keyframe| keyframe.backlog.len);
@@ -209,7 +206,6 @@ impl WebSocketOutbound {
         {
             Ok(backlog) => backlog,
             Err(result) => {
-                trace_outbound_queue("keyframe", len, result, false);
                 return result;
             }
         };
@@ -224,19 +220,15 @@ impl WebSocketOutbound {
         });
         drop(latest);
         if self.keyframe_wakeup_pending.swap(true, Ordering::AcqRel) {
-            let result = OutboundQueueResult::Queued;
-            trace_outbound_queue("keyframe", len, result, true);
-            return result;
+            return OutboundQueueResult::Queued;
         }
-        let result = match self.control_tx.send(ControlCmd::Keyframe) {
+        match self.control_tx.send(ControlCmd::Keyframe) {
             Ok(()) => OutboundQueueResult::Queued,
             Err(_) => {
                 self.keyframe_wakeup_pending.store(false, Ordering::Release);
                 OutboundQueueResult::Closed
             }
-        };
-        trace_outbound_queue("keyframe", len, result, false);
-        result
+        }
     }
 
     pub(crate) async fn write_text(&self, text: &str) -> io::Result<()> {
@@ -321,6 +313,12 @@ impl WebSocketOutbound {
     }
 
     #[cfg(test)]
+    pub(crate) fn stalled_for_test() -> (Self, impl Sized) {
+        let (outbound, data, control) = Self::test_channels();
+        (outbound, (data, control))
+    }
+
+    #[cfg(test)]
     fn test_channels() -> (
         Self,
         mpsc::Receiver<DataCmd>,
@@ -361,6 +359,7 @@ fn keyframe_len(frames: &[Vec<u8>]) -> usize {
         .fold(0usize, |total, frame| total.saturating_add(frame.len()))
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn writer_task(
     mut writer: EncryptedWebSocketWriter,
     mut rx: mpsc::Receiver<DataCmd>,
@@ -369,6 +368,7 @@ async fn writer_task(
     latest_epoch: Arc<AtomicU64>,
     latest_keyframe: Arc<Mutex<Option<KeyframeCmd>>>,
     keyframe_wakeup_pending: Arc<AtomicBool>,
+    write_timeout: Duration,
 ) {
     loop {
         tokio::select! {
@@ -380,6 +380,7 @@ async fn writer_task(
                     latest_epoch.as_ref(),
                     latest_keyframe.as_ref(),
                     keyframe_wakeup_pending.as_ref(),
+                    write_timeout,
                 ).await {
                     break;
                 }
@@ -388,8 +389,9 @@ async fn writer_task(
                 if !handle_data_cmd(
                     &mut writer,
                     cmd,
-                    backlog_bytes.as_ref(),
+                    &backlog_bytes,
                     latest_epoch.as_ref(),
+                    write_timeout,
                 ).await {
                     break;
                 }
@@ -402,20 +404,26 @@ async fn writer_task(
 async fn handle_data_cmd(
     writer: &mut EncryptedWebSocketWriter,
     cmd: DataCmd,
-    backlog_bytes: &AtomicUsize,
+    backlog_bytes: &Arc<AtomicUsize>,
     latest_epoch: &AtomicU64,
+    write_timeout: Duration,
 ) -> bool {
+    // Dequeuing transfers ownership to the writer; it does not drain the
+    // connection. Keep the charge until success, error, timeout or cancellation.
+    let len = match &cmd {
+        DataCmd::Frame { bytes, .. } | DataCmd::Snapshot { bytes, .. } => bytes.len(),
+    };
+    let _in_flight = AccountedBacklog {
+        backlog_bytes: backlog_bytes.clone(),
+        len,
+    };
     match cmd {
         DataCmd::Frame { bytes, epoch } => {
-            subtract_backlog(backlog_bytes, bytes.len());
             if epoch < latest_epoch.load(Ordering::Acquire) {
                 return true;
             }
-            let _span = crate::perf_instrument::span("web_writer")
-                .with_str("frame", "output")
-                .with_usize("bytes", bytes.len())
-                .with_u64("epoch", epoch);
-            if let Err(error) = write_with_timeout(writer.write_binary(&bytes)).await {
+            if let Err(error) = write_with_timeout(write_timeout, writer.write_binary(&bytes)).await
+            {
                 warn!(
                     frame = "output",
                     epoch,
@@ -426,15 +434,11 @@ async fn handle_data_cmd(
             }
         }
         DataCmd::Snapshot { bytes, epoch } => {
-            subtract_backlog(backlog_bytes, bytes.len());
             if epoch < latest_epoch.load(Ordering::Acquire) {
                 return true;
             }
-            let _span = crate::perf_instrument::span("web_writer")
-                .with_str("frame", "snapshot")
-                .with_usize("bytes", bytes.len())
-                .with_u64("epoch", epoch);
-            if let Err(error) = write_with_timeout(writer.write_binary(&bytes)).await {
+            if let Err(error) = write_with_timeout(write_timeout, writer.write_binary(&bytes)).await
+            {
                 warn!(
                     frame = "snapshot",
                     epoch,
@@ -455,6 +459,7 @@ async fn handle_control_cmd(
     latest_epoch: &AtomicU64,
     latest_keyframe: &Mutex<Option<KeyframeCmd>>,
     keyframe_wakeup_pending: &AtomicBool,
+    write_timeout: Duration,
 ) -> bool {
     match cmd {
         ControlCmd::Keyframe => {
@@ -470,13 +475,9 @@ async fn handle_control_cmd(
                 return true;
             }
             for (index, frame) in keyframe.frames.iter().enumerate() {
-                let _span = crate::perf_instrument::span("web_writer")
-                    .with_str("frame", "keyframe")
-                    .with_usize("bytes", frame.len())
-                    .with_usize("frame_index", index)
-                    .with_usize("frame_count", keyframe.frames.len())
-                    .with_u64("epoch", keyframe.epoch);
-                if let Err(error) = write_with_timeout(writer.write_binary(frame)).await {
+                if let Err(error) =
+                    write_with_timeout(write_timeout, writer.write_binary(frame)).await
+                {
                     warn!(
                         frame = "keyframe",
                         epoch = keyframe.epoch,
@@ -491,10 +492,7 @@ async fn handle_control_cmd(
             latest_epoch.fetch_max(keyframe.epoch, Ordering::Release);
         }
         ControlCmd::Text { text, done } => {
-            let _span = crate::perf_instrument::span("web_writer")
-                .with_str("frame", "text")
-                .with_usize("bytes", text.len());
-            let result = write_with_timeout(writer.write_text(&text)).await;
+            let result = write_with_timeout(write_timeout, writer.write_text(&text)).await;
             let failed = log_writer_failure("text", &result);
             let _ = done.send(result);
             if failed {
@@ -502,12 +500,11 @@ async fn handle_control_cmd(
             }
         }
         ControlCmd::Close { code, reason, done } => {
-            let _span = crate::perf_instrument::span("web_writer")
-                .with_str("frame", "close")
-                .with_usize("bytes", reason.len());
             let result = match code {
-                Some(code) => write_with_timeout(writer.write_close_code(code, &reason)).await,
-                None => write_with_timeout(writer.write_close()).await,
+                Some(code) => {
+                    write_with_timeout(write_timeout, writer.write_close_code(code, &reason)).await
+                }
+                None => write_with_timeout(write_timeout, writer.write_close()).await,
             };
             let failed = log_writer_failure("close", &result);
             let _ = done.send(result);
@@ -516,10 +513,7 @@ async fn handle_control_cmd(
             }
         }
         ControlCmd::Pong { payload, done } => {
-            let _span = crate::perf_instrument::span("web_writer")
-                .with_str("frame", "pong")
-                .with_usize("bytes", payload.len());
-            let result = write_with_timeout(writer.write_pong(&payload)).await;
+            let result = write_with_timeout(write_timeout, writer.write_pong(&payload)).await;
             let failed = log_writer_failure("pong", &result);
             let _ = done.send(result);
             if failed {
@@ -527,10 +521,7 @@ async fn handle_control_cmd(
             }
         }
         ControlCmd::Ping { payload, done } => {
-            let _span = crate::perf_instrument::span("web_writer")
-                .with_str("frame", "ping")
-                .with_usize("bytes", payload.len());
-            let result = write_with_timeout(writer.write_ping(&payload)).await;
+            let result = write_with_timeout(write_timeout, writer.write_ping(&payload)).await;
             let failed = log_writer_failure("ping", &result);
             let _ = done.send(result);
             if failed {
@@ -539,21 +530,6 @@ async fn handle_control_cmd(
         }
     }
     true
-}
-
-fn trace_outbound_queue(
-    kind: &'static str,
-    bytes: usize,
-    result: OutboundQueueResult,
-    coalesced: bool,
-) {
-    crate::perf_instrument::event("queue_backpressure")
-        .with_str("queue", "web_outbound")
-        .with_str("kind", kind)
-        .with_usize("bytes", bytes)
-        .with_str("result", result.as_str())
-        .with_bool("coalesced", coalesced)
-        .emit();
 }
 
 fn log_writer_failure(frame: &'static str, result: &io::Result<()>) -> bool {
@@ -575,11 +551,11 @@ fn subtract_backlog(backlog_bytes: &AtomicUsize, len: usize) {
     });
 }
 
-async fn write_with_timeout<F>(operation: F) -> io::Result<()>
+async fn write_with_timeout<F>(write_timeout: Duration, operation: F) -> io::Result<()>
 where
     F: std::future::Future<Output = io::Result<()>>,
 {
-    match timeout(WEB_WRITE_TIMEOUT, operation).await {
+    match timeout(write_timeout, operation).await {
         Ok(result) => result,
         Err(_) => Err(io::Error::new(
             io::ErrorKind::TimedOut,
@@ -589,239 +565,9 @@ where
 }
 
 #[cfg(test)]
-mod tests {
-    use std::sync::atomic::Ordering;
+#[path = "outbound/tests.rs"]
+mod tests;
 
-    use super::{
-        subtract_backlog, ControlCmd, DataCmd, OutboundQueueResult, WebSocketOutbound,
-        VIEWER_CHANNEL_CAP, WEB_OUTBOUND_BYTES_MAX,
-    };
-
-    #[tokio::test]
-    async fn data_slot_accounts_backlog_before_publication() {
-        let (outbound, mut data_rx, _control_rx) = WebSocketOutbound::test_channels();
-
-        let permit = outbound
-            .reserve_data_slot(4)
-            .expect("reserve accounted data slot");
-
-        assert_eq!(outbound.backlog_bytes.load(Ordering::Acquire), 4);
-        assert!(data_rx.try_recv().is_err());
-
-        permit.send(DataCmd::Frame {
-            bytes: vec![b'r', b'm', b'u', b'x'],
-            epoch: 0,
-        });
-        let command = data_rx.recv().await.expect("published data command");
-        let DataCmd::Frame { bytes, epoch } = command else {
-            panic!("expected frame command");
-        };
-        assert_eq!(bytes, b"rmux");
-        assert_eq!(epoch, 0);
-        subtract_backlog(outbound.backlog_bytes.as_ref(), bytes.len());
-        assert_eq!(outbound.backlog_bytes.load(Ordering::Acquire), 0);
-    }
-
-    #[tokio::test]
-    async fn dropping_unsent_data_slot_rolls_back_accounting() {
-        let (outbound, mut data_rx, _control_rx) = WebSocketOutbound::test_channels();
-
-        let permit = outbound
-            .reserve_data_slot(4)
-            .expect("reserve accounted data slot");
-        assert_eq!(outbound.backlog_bytes.load(Ordering::Acquire), 4);
-
-        drop(permit);
-
-        assert_eq!(outbound.backlog_bytes.load(Ordering::Acquire), 0);
-        assert!(data_rx.try_recv().is_err());
-    }
-
-    #[tokio::test]
-    async fn keyframe_replaces_latest_even_when_data_queue_is_full() {
-        let (outbound, _data_rx, mut control_rx) = WebSocketOutbound::test_channels();
-
-        for _ in 0..VIEWER_CHANNEL_CAP {
-            assert_eq!(
-                outbound.queue_frame(vec![b'x']),
-                OutboundQueueResult::Queued
-            );
-        }
-        assert_eq!(outbound.queue_frame(vec![b'y']), OutboundQueueResult::Full);
-
-        assert_eq!(
-            outbound.queue_keyframe(vec![vec![b'o', b'l', b'd']]),
-            OutboundQueueResult::Queued
-        );
-        assert_eq!(
-            outbound.queue_keyframe(vec![vec![b'n', b'e', b'w']]),
-            OutboundQueueResult::Queued
-        );
-
-        assert!(matches!(control_rx.try_recv(), Ok(ControlCmd::Keyframe)));
-        assert!(control_rx.try_recv().is_err());
-        let latest = outbound.latest_keyframe.lock().expect("keyframe lock");
-        let latest = latest.as_ref().expect("latest keyframe retained");
-        assert_eq!(latest.frames, vec![vec![b'n', b'e', b'w']]);
-        assert_eq!(latest.epoch, outbound.latest_epoch.load(Ordering::Acquire));
-    }
-
-    #[tokio::test]
-    async fn keyframe_then_data_respects_shared_backlog_limit() {
-        let (outbound, _data_rx, mut control_rx) = WebSocketOutbound::test_channels();
-
-        assert_eq!(
-            outbound.queue_keyframe(vec![vec![0; WEB_OUTBOUND_BYTES_MAX]]),
-            OutboundQueueResult::Queued
-        );
-        assert_eq!(
-            outbound.backlog_bytes.load(Ordering::Acquire),
-            WEB_OUTBOUND_BYTES_MAX
-        );
-        assert_eq!(
-            outbound.queue_frame(vec![0]),
-            OutboundQueueResult::Backpressure
-        );
-        assert!(matches!(control_rx.try_recv(), Ok(ControlCmd::Keyframe)));
-    }
-
-    #[tokio::test]
-    async fn replacing_latest_keyframe_transfers_its_backlog_reservation() {
-        let (outbound, _data_rx, mut control_rx) = WebSocketOutbound::test_channels();
-
-        assert_eq!(
-            outbound.queue_keyframe(vec![vec![b'o'; WEB_OUTBOUND_BYTES_MAX]]),
-            OutboundQueueResult::Queued
-        );
-        assert_eq!(
-            outbound.queue_keyframe(vec![vec![b'n'; WEB_OUTBOUND_BYTES_MAX]]),
-            OutboundQueueResult::Queued
-        );
-
-        assert_eq!(
-            outbound.backlog_bytes.load(Ordering::Acquire),
-            WEB_OUTBOUND_BYTES_MAX
-        );
-        assert!(matches!(control_rx.try_recv(), Ok(ControlCmd::Keyframe)));
-        assert!(control_rx.try_recv().is_err());
-        let latest = outbound.latest_keyframe.lock().expect("keyframe lock");
-        assert_eq!(latest.as_ref().expect("latest keyframe").frames[0][0], b'n');
-    }
-
-    #[tokio::test]
-    async fn in_flight_keyframe_remains_in_the_shared_backlog_budget() {
-        let (outbound, _data_rx, mut control_rx) = WebSocketOutbound::test_channels();
-
-        assert_eq!(
-            outbound.queue_keyframe(vec![vec![0; WEB_OUTBOUND_BYTES_MAX - 1]]),
-            OutboundQueueResult::Queued
-        );
-        assert!(matches!(control_rx.try_recv(), Ok(ControlCmd::Keyframe)));
-        outbound
-            .keyframe_wakeup_pending
-            .store(false, Ordering::Release);
-        let in_flight = outbound
-            .latest_keyframe
-            .lock()
-            .expect("keyframe lock")
-            .take()
-            .expect("in-flight keyframe");
-
-        assert_eq!(
-            outbound.queue_keyframe(vec![vec![0; 2]]),
-            OutboundQueueResult::Backpressure
-        );
-        assert_eq!(
-            outbound.queue_keyframe(vec![vec![0]]),
-            OutboundQueueResult::Queued
-        );
-        assert_eq!(
-            outbound.backlog_bytes.load(Ordering::Acquire),
-            WEB_OUTBOUND_BYTES_MAX
-        );
-
-        drop(in_flight);
-        assert_eq!(outbound.backlog_bytes.load(Ordering::Acquire), 1);
-        drop(
-            outbound
-                .latest_keyframe
-                .lock()
-                .expect("keyframe lock")
-                .take(),
-        );
-        assert_eq!(outbound.backlog_bytes.load(Ordering::Acquire), 0);
-    }
-
-    #[tokio::test]
-    async fn snapshots_respect_backlog_byte_limit() {
-        let (outbound, _data_rx, _control_rx) = WebSocketOutbound::test_channels();
-
-        assert_eq!(
-            outbound.queue_frame(vec![0; WEB_OUTBOUND_BYTES_MAX]),
-            OutboundQueueResult::Queued
-        );
-        assert_eq!(
-            outbound.queue_frame(vec![0]),
-            OutboundQueueResult::Backpressure
-        );
-        assert_eq!(
-            outbound.queue_snapshot(vec![0]),
-            OutboundQueueResult::Backpressure
-        );
-        assert_eq!(
-            outbound.backlog_bytes.load(Ordering::Acquire),
-            WEB_OUTBOUND_BYTES_MAX
-        );
-    }
-
-    #[tokio::test]
-    async fn keyframes_respect_backlog_byte_limit_without_advancing_epoch() {
-        let (outbound, _data_rx, mut control_rx) = WebSocketOutbound::test_channels();
-
-        assert_eq!(
-            outbound.queue_frame(vec![0; WEB_OUTBOUND_BYTES_MAX]),
-            OutboundQueueResult::Queued
-        );
-        assert_eq!(
-            outbound.queue_keyframe(vec![vec![0]]),
-            OutboundQueueResult::Backpressure
-        );
-
-        assert_eq!(outbound.latest_epoch.load(Ordering::Acquire), 0);
-        assert!(control_rx.try_recv().is_err());
-        let latest = outbound.latest_keyframe.lock().expect("keyframe lock");
-        assert!(latest.is_none());
-    }
-
-    #[tokio::test]
-    async fn oversized_keyframes_are_rejected_without_epoch_gap() {
-        let (outbound, _data_rx, mut control_rx) = WebSocketOutbound::test_channels();
-
-        assert_eq!(
-            outbound.queue_keyframe(vec![vec![0; WEB_OUTBOUND_BYTES_MAX], vec![0]]),
-            OutboundQueueResult::Backpressure
-        );
-
-        assert_eq!(outbound.latest_epoch.load(Ordering::Acquire), 0);
-        assert!(control_rx.try_recv().is_err());
-        let latest = outbound.latest_keyframe.lock().expect("keyframe lock");
-        assert!(latest.is_none());
-    }
-
-    #[tokio::test]
-    async fn write_ping_enqueues_control_ping_with_payload() {
-        let (outbound, _data_rx, mut control_rx) = WebSocketOutbound::test_channels();
-        let writer = tokio::spawn(async move { outbound.write_ping(b"rmux").await });
-
-        let command = control_rx.recv().await.expect("control command");
-        match command {
-            ControlCmd::Ping { payload, done } => {
-                assert_eq!(payload, b"rmux");
-                done.send(Ok(())).expect("complete ping write");
-            }
-            _ => panic!("expected ping command"),
-        }
-
-        writer.await.expect("ping task should not panic").unwrap();
-    }
-}
+#[cfg(test)]
+#[path = "outbound/slow_reader_tests.rs"]
+mod slow_reader_tests;

@@ -136,8 +136,8 @@ pub(crate) async fn handle_session_client_text(
                 )
                 .await
             {
-                Ok(true) => session.select_window_for_view(window_index),
-                Ok(false) => tracing::debug!(window_index, "web session select window ignored"),
+                Ok(Some(selection)) => session.select_window_for_view(selection),
+                Ok(None) => tracing::debug!(window_index, "web session select window ignored"),
                 Err(error) => tracing::debug!(?error, "web session select window ignored"),
             }
             Ok(SessionClientTextOutcome::Snapshot)

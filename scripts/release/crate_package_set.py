@@ -8,6 +8,8 @@ import tarfile
 from pathlib import Path
 from typing import Any
 
+from sdk_distribution_policy import applies, crate_archive
+
 MAX_PACKAGE_SET_BYTES = 256 * 1024 * 1024
 MAX_MEMBER_BYTES = 32 * 1024 * 1024
 MAX_MEMBERS = 128
@@ -69,6 +71,11 @@ def unpack(package_set: Path, output: Path) -> dict[str, Any]:
 def validate(
     manifest: dict[str, Any], root: Path, *, source_sha: str, version: str
 ) -> list[dict[str, Any]]:
+    if applies(version) and set(manifest) != {
+        "schema_version", "repository_id", "source_git_sha", "version",
+        "publish_order", "package_count", "packages",
+    }:
+        raise ValueError("1.0 crate manifest fields differ; additional SDK support is excluded")
     packages = manifest.get("packages")
     order = manifest.get("publish_order")
     if (
@@ -117,6 +124,7 @@ def validate(
             or file_hash(path) != package["sha256"]
         ):
             raise ValueError("crate package bytes differ from their manifest")
+        crate_archive(path, name, version)
         expected_files.add(f"crates/{filename}")
         by_name[name] = package
     if (

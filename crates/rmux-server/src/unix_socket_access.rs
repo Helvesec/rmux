@@ -1,10 +1,10 @@
 use std::ffi::OsString;
 use std::fs::{self, File};
 use std::io;
-use std::os::unix::fs::{MetadataExt, PermissionsExt};
+use std::os::unix::fs::{FileTypeExt, MetadataExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 
-use rustix::fs::{AtFlags, FileType, Mode};
+use rustix::fs::{flock, AtFlags, FileType, FlockOperation, Mode};
 
 use crate::unix_socket::{
     real_user_id, SocketFileIdentity, UnixTransportAccess, OWNER_ONLY_SOCKET_MODE,
@@ -14,6 +14,9 @@ use crate::unix_socket::{
 const GROUP_AND_OTHER_TRAVERSE_MASK: u32 = 0o011;
 const GROUP_AND_OTHER_WRITE_MASK: u32 = 0o022;
 const STICKY_MODE: u32 = 0o1000;
+/// Nested socket directories below `rmux-UID` are short; the bound keeps a
+/// narrowing scan finite even if the managed tree is unexpectedly deep.
+const MANAGED_SCAN_DEPTH: usize = 8;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct TransportModes {
@@ -117,10 +120,13 @@ impl UnixSocketAccessController {
             return Ok(());
         };
         let expected = endpoint.expected_modes(self.access);
-        endpoint.validate_directories(&expected)?;
         match endpoint.validate_socket(&expected) {
-            Ok(()) => Ok(()),
-            Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+            Ok(()) => endpoint.validate_directories(&expected),
+            // Without this socket a sibling server finds no shared socket here
+            // and may close the managed traverse bits; the rebind reopens them,
+            // so only those sibling-owned bits are tolerated, never widened.
+            Err(error) if error.kind() == io::ErrorKind::NotFound => endpoint
+                .validate_directories(&endpoint.expected_modes(UnixTransportAccess::OwnerOnly)),
             Err(error) => Err(error),
         }
     }
@@ -173,7 +179,17 @@ impl UnixSocketAccessController {
         })?;
         let previous_identity = endpoint.socket_identity;
         endpoint.socket_identity = socket_identity;
-        if let Err(error) = endpoint.validate_modes(&endpoint.expected_modes(self.access)) {
+        // A sibling that found no shared socket here may have closed the
+        // managed traverse bits; the bind never reopens them, so the rebind
+        // does it here, under the managed lock.
+        let reopened = if self.access == UnixTransportAccess::AllowListed {
+            endpoint.write_modes(&endpoint.expected_modes(self.access), self.access, false)
+        } else {
+            Ok(())
+        };
+        if let Err(error) =
+            reopened.and_then(|()| endpoint.validate_modes(&endpoint.expected_modes(self.access)))
+        {
             endpoint.socket_identity = previous_identity;
             return Err(error);
         }
@@ -296,6 +312,7 @@ impl FilesystemEndpoint {
         target: UnixTransportAccess,
         fail_after_first_change: bool,
     ) -> io::Result<()> {
+        let _managed_lock = self.lock_managed_root()?;
         let current = TransportModes {
             directories: self
                 .directories
@@ -325,7 +342,14 @@ impl FilesystemEndpoint {
                     .zip(current.directories)
                     .zip(&desired.directories)
                 {
-                    changed |= directory.set_mode_if_needed(current_mode, *target_mode)?;
+                    let target_mode = if directory.managed_by_rmux
+                        && self.another_shared_socket_below(directory)?
+                    {
+                        *target_mode | (current_mode & GROUP_AND_OTHER_TRAVERSE_MASK)
+                    } else {
+                        *target_mode
+                    };
+                    changed |= directory.set_mode_if_needed(current_mode, target_mode)?;
                     Self::inject_failure(fail_after_first_change, changed)?;
                 }
                 changed |= self.set_socket_mode_if_needed(current.socket, desired.socket)?;
@@ -333,6 +357,27 @@ impl FilesystemEndpoint {
         }
         let _ = changed;
         Ok(())
+    }
+
+    /// Serializes managed-directory mode changes across every server of this
+    /// user, so a narrowing scan cannot race a sibling that is widening.
+    fn lock_managed_root(&self) -> io::Result<Option<ManagedRootLock<'_>>> {
+        let Some(root) = self
+            .directories
+            .iter()
+            .rev()
+            .find(|directory| directory.managed_by_rmux)
+        else {
+            return Ok(None);
+        };
+        flock(&root.file, FlockOperation::LockExclusive).map_err(errno_to_io)?;
+        Ok(Some(ManagedRootLock { file: &root.file }))
+    }
+
+    /// Whether another server's socket below `directory` is open to
+    /// allowlisted users, and so still needs the shared traverse bits.
+    fn another_shared_socket_below(&self, directory: &DirectoryEndpoint) -> io::Result<bool> {
+        shared_socket_below(&directory.path, self.socket_identity, MANAGED_SCAN_DEPTH)
     }
 
     fn rollback_error(
@@ -386,6 +431,59 @@ impl FilesystemEndpoint {
     }
 }
 
+struct ManagedRootLock<'a> {
+    file: &'a File,
+}
+
+impl Drop for ManagedRootLock<'_> {
+    fn drop(&mut self) {
+        let _ = flock(self.file, FlockOperation::Unlock);
+    }
+}
+
+fn shared_socket_below(
+    path: &Path,
+    own_socket: SocketFileIdentity,
+    depth: usize,
+) -> io::Result<bool> {
+    // Entries, and whole nested directories, vanish while a sibling server
+    // shuts down; what is gone holds no shared socket.
+    let Some(entries) = present(fs::read_dir(path))? else {
+        return Ok(false);
+    };
+    for entry in entries {
+        let Some(entry) = present(entry)? else {
+            continue;
+        };
+        let Some(file_type) = present(entry.file_type())? else {
+            continue;
+        };
+        if file_type.is_socket() {
+            let Some(metadata) = present(entry.metadata())? else {
+                continue;
+            };
+            let is_own = metadata.dev() == own_socket.device && metadata.ino() == own_socket.inode;
+            if !is_own && metadata.permissions().mode() & 0o077 != 0 {
+                return Ok(true);
+            }
+        } else if file_type.is_dir()
+            && depth > 0
+            && shared_socket_below(&entry.path(), own_socket, depth - 1)?
+        {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+fn present<T>(result: io::Result<T>) -> io::Result<Option<T>> {
+    match result {
+        Ok(value) => Ok(Some(value)),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(error),
+    }
+}
+
 fn portable_stat_device(stat: &rustix::fs::Stat) -> u64 {
     // libc's dev_t width differs across supported Unix targets. The cast is
     // redundant on Linux but required on macOS and some BSDs.
@@ -417,7 +515,14 @@ impl DirectoryEndpoint {
                 ),
             ));
         }
-        let private_mode = metadata.permissions().mode() & 0o7777;
+        let mode = metadata.permissions().mode() & 0o7777;
+        // The traverse bits of a managed directory belong to every server of
+        // this user that shares it; this endpoint's own private mode excludes them.
+        let private_mode = if managed_by_rmux {
+            mode & !GROUP_AND_OTHER_TRAVERSE_MASK
+        } else {
+            mode
+        };
         Ok(Self {
             file,
             path: path.to_path_buf(),
@@ -448,7 +553,8 @@ impl DirectoryEndpoint {
                 ),
             ));
         }
-        if metadata.permissions().mode() & 0o7777 != expected_mode {
+        let mode = metadata.permissions().mode() & 0o7777;
+        if (mode ^ expected_mode) & !self.sibling_owned_bits(expected_mode) != 0 {
             return Err(io::Error::new(
                 io::ErrorKind::PermissionDenied,
                 format!(
@@ -458,6 +564,16 @@ impl DirectoryEndpoint {
             ));
         }
         Ok(())
+    }
+
+    /// Traverse bits another server may hold open on a managed directory
+    /// while this endpoint does not need them.
+    fn sibling_owned_bits(&self, expected_mode: u32) -> u32 {
+        if self.managed_by_rmux && expected_mode & GROUP_AND_OTHER_TRAVERSE_MASK == 0 {
+            GROUP_AND_OTHER_TRAVERSE_MASK
+        } else {
+            0
+        }
     }
 
     fn set_mode_if_needed(&self, current: u32, target: u32) -> io::Result<bool> {

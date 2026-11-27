@@ -1,10 +1,14 @@
 #![cfg(unix)]
 
+#[cfg(not(target_has_atomic = "64"))]
+use portable_atomic::AtomicU64;
 use serde_json::{json, Value};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
-use std::sync::atomic::{AtomicU64, Ordering};
+#[cfg(target_has_atomic = "64")]
+use std::sync::atomic::AtomicU64;
+use std::sync::atomic::Ordering;
 
 const AUTHORIZE: &str =
     include_str!("../.github/actions/release-linux-repository-recovery-authorize/action.yml");
@@ -327,7 +331,7 @@ for manager in ('APT', 'RPM'):
     else:
         raise SystemExit(f'{manager} republish was accepted')
 
-with tempfile.TemporaryDirectory() as root:
+with tempfile.TemporaryDirectory(dir=pathlib.Path.cwd().parent) as root:
     root = pathlib.Path(root)
     published = root / 'published'
     staging = root / 'staging'
@@ -484,7 +488,7 @@ def api_artifact(artifact_id, name, digest):
         },
     }
 
-with tempfile.TemporaryDirectory(dir=pathlib.Path.cwd()) as temporary:
+with tempfile.TemporaryDirectory(dir=pathlib.Path.cwd().parent) as temporary:
     root = pathlib.Path(temporary)
     paths = {
         'plan': root / 'downstream-channel-plan.json',
@@ -554,7 +558,7 @@ publisher = importlib.util.module_from_spec(spec)
 assert spec.loader is not None
 spec.loader.exec_module(publisher)
 
-with tempfile.TemporaryDirectory(dir=pathlib.Path.cwd()) as temporary:
+with tempfile.TemporaryDirectory(dir=pathlib.Path.cwd().parent) as temporary:
     root = pathlib.Path(temporary)
     (root / 'PACKAGE_REPOSITORY_BASE').write_text('a' * 40 + '\n', encoding='utf-8')
     required = {

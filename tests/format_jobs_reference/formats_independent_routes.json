@@ -1,0 +1,24 @@
+{
+  "schema": 1,
+  "name": "independent-formats-five-routes-043",
+  "selection": "Hand-selected expressions for tmux 3.7b, without reading or deriving cases from the RMUX formats registry.",
+  "routes": ["startup", "cli", "source-file", "queue", "binding"],
+  "session": "alpha",
+  "target": "alpha:0.0",
+  "startup": "set-option -s exit-empty off\nset-option -g default-shell /usr/bin/bash\nset-option -g status off\nset-option -g automatic-rename off\nnew-session -d -s alpha -n zeta -x 40 -y 16 /usr/bin/bash --noprofile --norc -c 'printf \"%s\\n\" \"$$\" > @ROOT@/main.pid; while IFS= read -r line; do :; done'\nset-option -t alpha @nested '#{session_name}:#{pane_index}'\nset-environment -t alpha ROUTE043_ENV 'env with spaces'\n",
+  "cases": [
+    {"id": "context", "format": "#{session_name}|#{window_name}|#{window_index}|#{pane_index}|#{pane_width}|#{pane_height}"},
+    {"id": "conditional", "format": "#{?#{==:#{session_name},alpha},match,other}"},
+    {"id": "substitution", "format": "#{s/a/A/g:session_name}|#{s/$/END/:window_name}"},
+    {"id": "option-recursive", "format": "#{E:@nested}"},
+    {"id": "environment", "format": "#{ROUTE043_ENV}"},
+    {"id": "quoted", "format": "quote 'single' \"double\" dollar$ back\\slash ; #{session_name} café"},
+    {"id": "empty", "format": "#{missing043}"},
+    {"id": "literal-hash", "format": "##{session_name}|#S|#I|#P|tail#"}
+  ],
+  "errors": [
+    {"route": "source-file", "type": "runtime"},
+    {"route": "source-file", "type": "parse"},
+    {"route": "queue", "type": "runtime"}
+  ]
+}

@@ -1,4 +1,4 @@
-use rmux_core::{OptionStore, Session};
+use rmux_core::OptionStore;
 use rmux_proto::{OptionName, TerminalSize};
 
 use crate::status_lines::status_line_count;
@@ -28,7 +28,10 @@ pub(crate) struct StatusGeometry {
 }
 
 impl StatusGeometry {
-    pub(crate) fn for_session(session: &Session, options: &OptionStore) -> Self {
+    pub(crate) fn for_session(
+        session: rmux_core::ManagedSessionView<'_>,
+        options: &OptionStore,
+    ) -> Self {
         let terminal_size = session.terminal_size();
         let layout_size = session.window().size();
         let status = options.resolve(Some(session.name()), OptionName::Status);
@@ -82,11 +85,20 @@ impl StatusGeometry {
         }
     }
 
-    pub(in crate::renderer) const fn content_size(self) -> TerminalSize {
+    pub(crate) const fn content_size(self) -> TerminalSize {
         TerminalSize {
             cols: self.content_cols,
             rows: self.content_rows,
         }
+    }
+
+    pub(crate) fn status_rect(self) -> Option<crate::renderer::OverlayRect> {
+        self.status_y.map(|y| crate::renderer::OverlayRect {
+            x: 0,
+            y,
+            width: self.terminal_size.cols,
+            height: self.status_lines,
+        })
     }
 
     pub(crate) const fn content_y_offset(self) -> u16 {
@@ -130,11 +142,11 @@ impl StatusGeometry {
 #[cfg(test)]
 mod tests {
     use super::{StatusGeometry, StatusOverlayRow};
-    use rmux_core::{OptionStore, Session};
+    use rmux_core::OptionStore;
     use rmux_proto::{OptionName, ScopeSelector, SessionName, SetOptionMode, TerminalSize};
 
-    fn session() -> Session {
-        Session::new(
+    fn session() -> crate::session_fixture::SessionFixture {
+        crate::session_fixture::SessionFixture::new(
             SessionName::new("overlay-row").expect("valid session name"),
             TerminalSize { cols: 20, rows: 6 },
         )
@@ -144,7 +156,7 @@ mod tests {
     fn message_overlay_row_models_status_and_content_backing() {
         let session = session();
         let mut options = OptionStore::new();
-        let status_geometry = StatusGeometry::for_session(&session, &options);
+        let status_geometry = StatusGeometry::for_session(session.view(), &options);
         assert_eq!(
             status_geometry.message_overlay_row(0),
             Some(StatusOverlayRow::Status(5))
@@ -158,7 +170,7 @@ mod tests {
                 SetOptionMode::Replace,
             )
             .expect("status off");
-        let content_geometry = StatusGeometry::for_session(&session, &options);
+        let content_geometry = StatusGeometry::for_session(session.view(), &options);
         assert_eq!(
             content_geometry.message_overlay_row(0),
             Some(StatusOverlayRow::Content(5))
@@ -171,11 +183,11 @@ mod tests {
             TerminalSize { cols: 0, rows: 6 },
             TerminalSize { cols: 20, rows: 0 },
         ] {
-            let session = Session::new(
+            let session = crate::session_fixture::SessionFixture::new(
                 SessionName::new("degenerate-overlay").expect("valid session name"),
                 size,
             );
-            let geometry = StatusGeometry::for_session(&session, &OptionStore::new());
+            let geometry = StatusGeometry::for_session(session.view(), &OptionStore::new());
             assert_eq!(geometry.message_overlay_row(0), None);
         }
     }

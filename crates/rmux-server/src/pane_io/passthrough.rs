@@ -85,7 +85,7 @@ fn osc52_passthrough_is_valid_for_forward(passthrough: &TerminalPassthrough) -> 
     super::reader::osc52_payload_decodes(payload)
 }
 
-fn passthrough_requires_cursor_position(kind: TerminalPassthroughKind) -> bool {
+pub(super) fn passthrough_requires_cursor_position(kind: TerminalPassthroughKind) -> bool {
     match kind {
         TerminalPassthroughKind::Raw
         | TerminalPassthroughKind::KittyGraphics
@@ -143,7 +143,7 @@ mod tests {
                 &OptionStore::default(),
                 OuterTerminalContext::from_pairs(&[("TERM", "xterm-kitty")]),
             ),
-            cursor_style: 0,
+            cursor_style: 0.into(),
             active_pane_geometry: PaneGeometry::new(5, 6, 80, 24),
             raw_passthrough: false,
             kitty_graphics_passthrough: true,
@@ -177,7 +177,7 @@ mod tests {
                 &OptionStore::default(),
                 OuterTerminalContext::from_pairs(&[("TERM", "xterm-kitty")]),
             ),
-            cursor_style: 0,
+            cursor_style: 0.into(),
             active_pane_geometry: PaneGeometry::new(5, 6, 80, 24),
             raw_passthrough: false,
             kitty_graphics_passthrough: true,
@@ -214,7 +214,7 @@ mod tests {
                 &OptionStore::default(),
                 OuterTerminalContext::from_pairs(&[("TERM", "foot")]),
             ),
-            cursor_style: 0,
+            cursor_style: 0.into(),
             active_pane_geometry: PaneGeometry::new(5, 6, 80, 24),
             raw_passthrough: false,
             kitty_graphics_passthrough: false,
@@ -244,7 +244,7 @@ mod tests {
                 &OptionStore::default(),
                 OuterTerminalContext::from_pairs(&[("TERM", "xterm-256color")]),
             ),
-            cursor_style: 0,
+            cursor_style: 0.into(),
             active_pane_geometry: PaneGeometry::new(5, 6, 80, 24),
             raw_passthrough: true,
             kitty_graphics_passthrough: false,
@@ -290,7 +290,7 @@ mod tests {
                 &options,
                 OuterTerminalContext::from_pairs(&[("TERM", "xterm-256color")]),
             ),
-            cursor_style: 0,
+            cursor_style: 0.into(),
             active_pane_geometry: PaneGeometry::new(5, 6, 80, 24),
             raw_passthrough: false,
             kitty_graphics_passthrough: false,
@@ -354,7 +354,7 @@ mod tests {
                 &OptionStore::default(),
                 OuterTerminalContext::from_pairs(&[("TERM", "xterm-256color")]),
             ),
-            cursor_style: 0,
+            cursor_style: 0.into(),
             active_pane_geometry: PaneGeometry::new(5, 6, 80, 24),
             raw_passthrough: false,
             kitty_graphics_passthrough: false,
@@ -387,7 +387,7 @@ mod tests {
                 &OptionStore::default(),
                 OuterTerminalContext::from_pairs(&[("TERM", "xterm-kitty")]),
             ),
-            cursor_style: 0,
+            cursor_style: 0.into(),
             active_pane_geometry: PaneGeometry::new(5, 6, 80, 24),
             raw_passthrough: false,
             kitty_graphics_passthrough: false,
@@ -421,7 +421,7 @@ mod tests {
                 &OptionStore::default(),
                 OuterTerminalContext::from_pairs(&[("TERM", "foot")]),
             ),
-            cursor_style: 0,
+            cursor_style: 0.into(),
             active_pane_geometry: PaneGeometry::new(0, 0, 80, 24),
             raw_passthrough: false,
             kitty_graphics_passthrough: false,

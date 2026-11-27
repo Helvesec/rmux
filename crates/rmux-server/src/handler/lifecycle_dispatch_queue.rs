@@ -1,5 +1,5 @@
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Mutex;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
 
 use tokio::sync::mpsc;
 
@@ -10,6 +10,20 @@ pub(in crate::handler) struct LifecycleDispatchOutbox<T> {
     sender: mpsc::Sender<T>,
     receiver: Mutex<Option<mpsc::Receiver<T>>>,
     active: AtomicBool,
+    pending: Arc<AtomicUsize>,
+}
+
+/// Counts one lifecycle event from its admission until its hook has run.
+///
+/// The item that carries it drops it once dispatched, or when it is refused
+/// or discarded, so an abandoned event never stays counted.
+#[derive(Debug)]
+pub(in crate::handler) struct PendingLifecycleDispatch(Arc<AtomicUsize>);
+
+impl Drop for PendingLifecycleDispatch {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::SeqCst);
+    }
 }
 
 impl<T> LifecycleDispatchOutbox<T> {
@@ -19,7 +33,19 @@ impl<T> LifecycleDispatchOutbox<T> {
             sender,
             receiver: Mutex::new(Some(receiver)),
             active: AtomicBool::new(false),
+            pending: Arc::new(AtomicUsize::new(0)),
         }
+    }
+
+    /// Counts an event about to be admitted until the returned token drops.
+    pub(in crate::handler) fn begin_pending(&self) -> PendingLifecycleDispatch {
+        self.pending.fetch_add(1, Ordering::SeqCst);
+        PendingLifecycleDispatch(Arc::clone(&self.pending))
+    }
+
+    /// Whether an admitted lifecycle event has not finished running its hook.
+    pub(in crate::handler) fn has_pending(&self) -> bool {
+        self.pending.load(Ordering::SeqCst) != 0
     }
 
     pub(in crate::handler) fn activate(&self) -> Option<mpsc::Receiver<T>> {
@@ -114,6 +140,18 @@ mod tests {
 
         assert_eq!(receiver.try_recv(), Ok(1));
         assert!(receiver.try_recv().is_err());
+    }
+
+    #[test]
+    fn a_pending_event_is_counted_until_its_token_drops() {
+        let outbox = LifecycleDispatchOutbox::<u8>::new(1);
+        assert!(!outbox.has_pending());
+        let first = outbox.begin_pending();
+        let second = outbox.begin_pending();
+        drop(first);
+        assert!(outbox.has_pending(), "one event is still pending");
+        drop(second);
+        assert!(!outbox.has_pending());
     }
 
     #[tokio::test]

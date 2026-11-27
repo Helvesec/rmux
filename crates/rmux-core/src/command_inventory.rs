@@ -2,15 +2,18 @@
 
 use std::borrow::Cow;
 use std::fmt;
-use std::sync::OnceLock;
 
 use crate::command_parser::{CommandEntry, COMMAND_TABLE};
 use crate::formats::{render_template, FormatContext};
 
-#[path = "command_inventory/signatures.rs"]
+mod short_options;
 mod signatures;
 
-use signatures::LIST_COMMAND_SIGNATURES;
+pub use short_options::command_short_option_spec;
+
+use signatures::{list_command_usage, LIST_COMMAND_SIGNATURES};
+
+const _: () = crate::command_schema::metadata::verify_signatures(LIST_COMMAND_SIGNATURES);
 
 /// Typed short-option metadata used by internal command normalization.
 ///
@@ -132,34 +135,17 @@ fn add_internal_short_options(command_name: &str, spec: &mut CommandShortOptionS
     // `list-commands`. Keep normalization metadata separate so the public
     // inventory remains oracle-exact.
     match command_name {
+        // FNP1 advertises these as required, not bracketed optional groups.
+        "new-pane" => spec.add_internal_value_flags("txyXY"),
         "join-pane" | "move-pane" => spec.add_internal_value_flags("p"),
         "list-buffers" => spec.add_internal_boolean_flags("r"),
+        "choose-tree" | "choose-buffer" | "choose-client" => spec.add_internal_boolean_flags("y"),
         "load-buffer" => spec.add_internal_boolean_flags("w"),
+        // RMUX's pane-style mutation is dispatched but omitted from the
+        // tmux-compatible public list-commands signature.
+        "select-pane" => spec.add_internal_value_flags("P"),
         _ => {}
     }
-}
-
-/// Returns typed short-option metadata for a public command.
-///
-/// Metadata is derived from the same frozen signature rendered by
-/// `list-commands`, including adjacent option groups and tmux's `-L|-S|-U`
-/// spelling for mutually exclusive boolean flags.
-#[must_use]
-pub fn command_short_option_spec(command_name: &str) -> Option<&'static CommandShortOptionSpec> {
-    static SPECS: OnceLock<Vec<(&'static str, CommandShortOptionSpec)>> = OnceLock::new();
-    SPECS
-        .get_or_init(|| {
-            LIST_COMMAND_SIGNATURES
-                .iter()
-                .map(|(name, usage)| {
-                    let mut spec = CommandShortOptionSpec::from_usage(usage);
-                    add_internal_short_options(name, &mut spec);
-                    (*name, spec)
-                })
-                .collect()
-        })
-        .iter()
-        .find_map(|(name, spec)| (*name == command_name).then_some(spec))
 }
 
 fn single_short_flag(option: &str) -> Option<char> {
@@ -170,68 +156,8 @@ fn single_short_flag(option: &str) -> Option<char> {
 
 /// Exact-only RMUX command extensions shared by client parsing and internal
 /// server canonicalization. They never participate in tmux prefix matching.
-pub const RMUX_EXTENSION_COMMANDS: &[CommandEntry] = &[
-    CommandEntry {
-        name: "capabilities",
-        alias: None,
-    },
-    CommandEntry {
-        name: "claude",
-        alias: None,
-    },
-    CommandEntry {
-        name: "doctor",
-        alias: None,
-    },
-    CommandEntry {
-        name: "setup",
-        alias: None,
-    },
-    CommandEntry {
-        name: "wait-pane",
-        alias: None,
-    },
-    CommandEntry {
-        name: "pane-snapshot",
-        alias: None,
-    },
-    CommandEntry {
-        name: "stream-pane",
-        alias: None,
-    },
-    CommandEntry {
-        name: "collect-pane-output",
-        alias: None,
-    },
-    CommandEntry {
-        name: "locator",
-        alias: None,
-    },
-    CommandEntry {
-        name: "expect-pane",
-        alias: None,
-    },
-    CommandEntry {
-        name: "find-panes",
-        alias: None,
-    },
-    CommandEntry {
-        name: "find-sessions",
-        alias: None,
-    },
-    CommandEntry {
-        name: "broadcast-keys",
-        alias: None,
-    },
-    CommandEntry {
-        name: "with-session",
-        alias: None,
-    },
-    CommandEntry {
-        name: "web-share",
-        alias: None,
-    },
-];
+pub const RMUX_EXTENSION_COMMANDS: &[CommandEntry] =
+    crate::command_schema::metadata::EXTENSION_COMMANDS;
 
 /// A typed command-name resolution failure from `list-commands`.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -407,14 +333,7 @@ fn render_list_commands_template(
     render_template(template, &variables)
 }
 
-fn list_command_usage(name: &str) -> &'static str {
-    LIST_COMMAND_SIGNATURES
-        .iter()
-        .find_map(|(command_name, usage)| (*command_name == name).then_some(*usage))
-        .unwrap_or("")
-}
-
-fn list_command_usage_without_alias(name: &str) -> Cow<'static, str> {
+pub(crate) fn list_command_usage_without_alias(name: &str) -> Cow<'static, str> {
     let usage = list_command_usage(name);
     if let Some(rest) = usage
         .strip_prefix('(')
@@ -491,6 +410,9 @@ mod tests {
         let list_buffers =
             command_short_option_spec("list-buffers").expect("list-buffers signature");
         assert!(list_buffers.is_boolean('r'));
+        let select_pane = command_short_option_spec("select-pane").unwrap();
+        assert!(select_pane.takes_value('P'));
+        assert!(!select_pane.is_boolean('P'));
         assert!(command_short_option_spec("not-a-command").is_none());
     }
 
@@ -507,6 +429,21 @@ mod tests {
 
         assert!(!load_buffer.contains("-w"));
         assert!(!list_buffers.contains("-r"));
+        let select_pane = LIST_COMMAND_SIGNATURES
+            .iter()
+            .find_map(|(name, usage)| (*name == "select-pane").then_some(*usage))
+            .unwrap();
+        assert!(!select_pane.contains("-P"));
+    }
+
+    #[test]
+    fn chooser_auto_confirmation_flag_is_internal_boolean() {
+        for name in ["choose-tree", "choose-buffer", "choose-client"] {
+            let spec = command_short_option_spec(name).expect("chooser exists");
+            assert!(spec.is_boolean('y'), "{name} accepts -y");
+            assert!(!spec.takes_value('y'), "{name} -y preserves the template");
+            assert!(!CommandShortOptionSpec::from_usage(list_command_usage(name)).is_boolean('y'));
+        }
     }
 
     #[test]

@@ -1,7 +1,7 @@
 use rmux_client::Connection;
 use rmux_proto::{
     encode_internal_pane_exit_probe, PaneId, PaneSnapshotResponse, PaneTarget, PaneTargetRef,
-    ResolveTargetType, Response, SessionId, SessionName, Target,
+    ResolveTargetType, Response, RmuxError, SessionId, SessionName, Target,
 };
 
 use crate::cli_args::TargetSpec;
@@ -23,6 +23,22 @@ pub(super) struct StableWaitTarget {
 impl StableWaitTarget {
     pub(super) fn target_ref(&self) -> PaneTargetRef {
         PaneTargetRef::by_id(self.session_name.clone(), self.pane_id)
+    }
+
+    /// Whether a daemon refusal reports this target's pane or session gone.
+    /// Requests address the pane by id, so a removed pane is `PaneNotFound`
+    /// and a removed session is `SessionNotFound`, each naming this target.
+    pub(super) fn is_gone_error(&self, error: &RmuxError) -> bool {
+        match error {
+            RmuxError::PaneNotFound {
+                session_name,
+                pane_id,
+            } => *session_name == self.session_name && *pane_id == self.pane_id,
+            RmuxError::SessionNotFound(session_name) => {
+                session_name.as_str() == self.session_name.as_str()
+            }
+            _ => false,
+        }
     }
 
     pub(super) fn refreshed_target_ref(

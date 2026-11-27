@@ -80,11 +80,7 @@ pub(super) async fn split_pane_with_process(
     };
 
     Ok(SplitPaneOutcome {
-        target: PaneRef::new(
-            response.pane.session_name().clone(),
-            response.pane.window_index(),
-            response.pane.pane_index(),
-        ),
+        target: PaneRef::from_proto(response.pane),
         pane_id: response.pane_id,
     })
 }

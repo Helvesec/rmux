@@ -108,3 +108,22 @@ fn tag_all_descends_through_no_tag_headers() {
     assert!(!mode.tagged.contains("root"));
     assert!(!mode.tagged.contains("header"));
 }
+
+#[test]
+fn chooser_y_is_boolean_and_only_tree_enables_auto_confirmation() {
+    for name in ["choose-tree", "choose-buffer", "choose-client"] {
+        for flags in ["", "-y", "-yN", "-Ny", "-y -y"] {
+            let parsed = CommandParser::new()
+                .parse_one_group(&format!("{name} {flags} '65536'"))
+                .expect("chooser parses");
+            let mode = RequestHandler::parse_mode_tree_queue_command(parsed.commands()[0].clone())
+                .expect("chooser accepts -y")
+                .expect("chooser recognized");
+            assert_eq!(
+                mode.auto_accept,
+                name == "choose-tree" && flags.contains('y')
+            );
+            assert_eq!(mode.template.as_deref(), Some("65536"));
+        }
+    }
+}

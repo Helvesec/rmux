@@ -128,7 +128,7 @@ dependencies = [
  "bitflags",
  "cexpr",
  "clang-sys",
- "itertools",
+ "itertools 0.13.0",
  "log",
  "prettyplease",
  "proc-macro2",
@@ -219,9 +219,9 @@ dependencies = [
 
 [[package]]
 name = "chacha20"
-version = "0.10.0"
+version = "0.10.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "6f8d983286843e49675a4b7a2d174efe136dc93a18d69130dd18198a6c167601"
+checksum = "65c35e4b699c7e15ccbe7ee35c005e4fc0a278d22238a2857e6ce2dadeda1b06"
 dependencies = [
  "cfg-if",
  "cpufeatures 0.3.0",
@@ -334,6 +334,20 @@ name = "compact_str"
 version = "0.8.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7fd622ebbb56a5b2ccb651b32b911cdeb2a9b4b11776b2473bf26a26a286244e"
+dependencies = [
+ "castaway",
+ "cfg-if",
+ "itoa",
+ "rustversion",
+ "ryu",
+ "static_assertions",
+]
+
+[[package]]
+name = "compact_str"
+version = "0.9.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "9dfdd1c2274d9aa354115b09dc9a901d6c5576818cdf70d14cae2bdb47df00ab"
 dependencies = [
  "castaway",
  "cfg-if",
@@ -552,6 +566,12 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d9c4f5dac5e15c24eb999c26181a6ca40b39fe946cbe4c263c7209467bc83af2"
 
 [[package]]
+name = "foldhash"
+version = "0.2.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "77ce24cb58228fbb8aa041425bb1050850ac19177686ea6e0f41a70416f56fdb"
+
+[[package]]
 name = "futures-core"
 version = "0.3.32"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -634,7 +654,7 @@ checksum = "9229cfe53dfd69f0609a49f65461bd93001ea1ef889cd5529dd176593f5338a1"
 dependencies = [
  "allocator-api2",
  "equivalent",
- "foldhash",
+ "foldhash 0.1.5",
 ]
 
 [[package]]
@@ -642,6 +662,11 @@ name = "hashbrown"
 version = "0.17.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ed5909b6e89a2db4456e54cd5f673791d7eca6732202bbf2a9cc504fe2f9b84a"
+dependencies = [
+ "allocator-api2",
+ "equivalent",
+ "foldhash 0.2.0",
+]
 
 [[package]]
 name = "hax-lib"
@@ -803,6 +828,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "itertools"
+version = "0.14.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "2b192c782037fadd9cfa75548310488aabdbf3d2da73885b31bd0abd03351285"
+dependencies = [
+ "either",
+]
+
+[[package]]
 name = "itoa"
 version = "1.0.18"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -817,6 +851,16 @@ dependencies = [
  "cfg-if",
  "futures-util",
  "wasm-bindgen",
+]
+
+[[package]]
+name = "kasuari"
+version = "0.4.13"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "72f14c90e40a6133f4805b83542a7ed7364f56070b447f56e7f4e90297122209"
+dependencies = [
+ "hashbrown 0.17.1",
+ "thiserror",
 ]
 
 [[package]]
@@ -901,6 +945,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "line-clipping"
+version = "0.3.8"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e752191d037c44ad111a8caa762921926658402f01cc1253f7bef2020ece4f5e"
+dependencies = [
+ "bitflags",
+]
+
+[[package]]
 name = "linux-raw-sys"
 version = "0.12.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -934,6 +987,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "234cf4f4a04dc1f57e24b96cc0cd600cf2af460d4161ac5ecdd0af8e1f3b2a38"
 dependencies = [
  "hashbrown 0.15.5",
+]
+
+[[package]]
+name = "lru"
+version = "0.18.5"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "ef9ac18847474e638e3702b76c65d4eb93428471a74778ef0f1be711717f89b5"
+dependencies = [
+ "hashbrown 0.17.1",
 ]
 
 [[package]]
@@ -1075,6 +1137,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "portable-atomic"
+version = "1.15.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "05c8b63e8d9609db387f0324918f81d68fe27748f084ef092fb35954d0539a85"
+
+[[package]]
 name = "prettyplease"
 version = "0.2.37"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1148,7 +1216,7 @@ version = "0.10.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d2e8e8bcc7961af1fdac401278c6a831614941f6164ee3bf4ce61b7edb162207"
 dependencies = [
- "chacha20 0.10.0",
+ "chacha20 0.10.2",
  "getrandom 0.4.3",
  "rand_core 0.10.1",
 ]
@@ -1176,25 +1244,74 @@ checksum = "eabd94c2f37801c20583fc49dd5cd6b0ba68c716787c2dd6ed18571e1e63117b"
 dependencies = [
  "bitflags",
  "cassowary",
- "compact_str",
+ "compact_str 0.8.2",
  "indoc",
  "instability",
- "itertools",
- "lru",
+ "itertools 0.13.0",
+ "lru 0.12.5",
  "paste",
- "strum",
+ "strum 0.26.3",
  "unicode-segmentation",
- "unicode-truncate",
+ "unicode-truncate 1.1.0",
+ "unicode-width 0.2.0",
+]
+
+[[package]]
+name = "ratatui"
+version = "0.30.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "3274ba0a2c5e1bcad2a2005d20f4dc59dad26b2eb0940fb094500dba4099d57d"
+dependencies = [
+ "instability",
+ "ratatui-core",
+ "ratatui-widgets",
+]
+
+[[package]]
+name = "ratatui-core"
+version = "0.1.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "cbb175c433c8e28a809d1f5773a2ae96e68c0ce40db865cbab1020bf33ae479c"
+dependencies = [
+ "bitflags",
+ "compact_str 0.9.1",
+ "hashbrown 0.17.1",
+ "itertools 0.14.0",
+ "kasuari",
+ "lru 0.18.5",
+ "strum 0.28.0",
+ "thiserror",
+ "unicode-segmentation",
+ "unicode-truncate 2.0.1",
  "unicode-width 0.2.0",
 ]
 
 [[package]]
 name = "ratatui-rmux"
-version = "0.10.0"
+version = "0.11.0"
 dependencies = [
- "ratatui",
+ "ratatui 0.30.2",
+ "ratatui-core",
  "rmux-sdk",
  "tokio",
+]
+
+[[package]]
+name = "ratatui-widgets"
+version = "0.3.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "66e3d19bcc9130ca376277d93b60767ff121ace3be06f5f95f81dd68956407d1"
+dependencies = [
+ "bitflags",
+ "hashbrown 0.17.1",
+ "indoc",
+ "instability",
+ "itertools 0.14.0",
+ "line-clipping",
+ "ratatui-core",
+ "strum 0.28.0",
+ "unicode-segmentation",
+ "unicode-width 0.2.0",
 ]
 
 [[package]]
@@ -1237,14 +1354,16 @@ checksum = "d6f6ff9a378485b298a5286656da665ba74413d36db0979633275d2e708145d4"
 
 [[package]]
 name = "rmux"
-version = "0.10.0"
+version = "0.11.0"
 dependencies = [
  "chrono",
  "clap",
  "embed-manifest",
  "libc",
+ "portable-atomic",
  "qrcode",
- "ratatui",
+ "ratatui 0.29.0",
+ "rmux-bootstrap",
  "rmux-client",
  "rmux-core",
  "rmux-os",
@@ -1255,20 +1374,35 @@ dependencies = [
  "rustix",
  "serde_json",
  "tokio",
+ "toml",
+ "windows-sys",
+]
+
+[[package]]
+name = "rmux-bootstrap"
+version = "0.11.0"
+dependencies = [
+ "libc",
+ "rmux-ipc",
+ "rmux-os",
+ "rmux-proto",
+ "rustix",
+ "tokio",
  "windows-sys",
 ]
 
 [[package]]
 name = "rmux-client"
-version = "0.10.0"
+version = "0.11.0"
 dependencies = [
  "libc",
+ "portable-atomic",
+ "rmux-bootstrap",
  "rmux-core",
  "rmux-ipc",
  "rmux-os",
  "rmux-proto",
  "rmux-pty",
- "rmux-sdk",
  "rmux-server",
  "rustix",
  "signal-hook",
@@ -1279,18 +1413,23 @@ dependencies = [
 
 [[package]]
 name = "rmux-core"
-version = "0.10.0"
+version = "0.11.0"
 dependencies = [
+ "base64",
  "chrono",
- "compact_str",
+ "compact_str 0.8.2",
+ "portable-atomic",
  "regex",
  "rmux-proto",
+ "rmux-types",
+ "serde_json",
+ "sha2",
  "unicode-width 0.1.14",
 ]
 
 [[package]]
 name = "rmux-ipc"
-version = "0.10.0"
+version = "0.11.0"
 dependencies = [
  "getrandom 0.3.4",
  "libc",
@@ -1304,7 +1443,7 @@ dependencies = [
 
 [[package]]
 name = "rmux-os"
-version = "0.10.0"
+version = "0.11.0"
 dependencies = [
  "libc",
  "rmux-types",
@@ -1314,18 +1453,20 @@ dependencies = [
 
 [[package]]
 name = "rmux-proto"
-version = "0.10.0"
+version = "0.11.0"
 dependencies = [
  "bincode",
+ "portable-atomic",
  "rmux-types",
  "serde",
  "serde_json",
+ "sha2",
  "thiserror",
 ]
 
 [[package]]
 name = "rmux-pty"
-version = "0.10.0"
+version = "0.11.0"
 dependencies = [
  "getrandom 0.3.4",
  "libc",
@@ -1338,24 +1479,19 @@ dependencies = [
 ]
 
 [[package]]
-name = "rmux-render-core"
-version = "0.10.0"
-dependencies = [
- "ratatui",
- "serde",
-]
-
-[[package]]
 name = "rmux-sdk"
-version = "0.10.0"
+version = "0.11.0"
 dependencies = [
  "bincode",
  "crossterm",
  "libc",
+ "portable-atomic",
  "regex",
+ "rmux-bootstrap",
  "rmux-ipc",
  "rmux-os",
  "rmux-proto",
+ "rmux-types",
  "rustix",
  "serde",
  "serde_json",
@@ -1366,7 +1502,7 @@ dependencies = [
 
 [[package]]
 name = "rmux-server"
-version = "0.10.0"
+version = "0.11.0"
 dependencies = [
  "async-recursion",
  "base64",
@@ -1376,7 +1512,9 @@ dependencies = [
  "glob",
  "hkdf",
  "httparse",
+ "portable-atomic",
  "regex",
+ "rmux-bootstrap",
  "rmux-core",
  "rmux-ipc",
  "rmux-os",
@@ -1398,14 +1536,16 @@ dependencies = [
 
 [[package]]
 name = "rmux-types"
-version = "0.10.0"
+version = "0.11.0"
 dependencies = [
+ "bincode",
  "serde",
+ "serde_json",
 ]
 
 [[package]]
 name = "rmux-web-crypto"
-version = "0.10.0"
+version = "0.11.0"
 dependencies = [
  "chacha20poly1305",
  "hex-literal",
@@ -1435,9 +1575,9 @@ dependencies = [
 
 [[package]]
 name = "rustix"
-version = "1.1.4"
+version = "1.1.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b6fe4565b9518b83ef4f91bb47ce29620ca828bd32cb7e408f0062e9930ba190"
+checksum = "e5e76742e5294153d4dde1207dbec5bdd81eef6fabdc0d2118babadabfd858aa"
 dependencies = [
  "bitflags",
  "errno",
@@ -1627,7 +1767,16 @@ version = "0.26.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "8fec0f0aef304996cf250b31b5a10dee7980c85da9d759361292b8bca5a18f06"
 dependencies = [
- "strum_macros",
+ "strum_macros 0.26.4",
+]
+
+[[package]]
+name = "strum"
+version = "0.28.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "9628de9b8791db39ceda2b119bbe13134770b56c138ec1d3af810d045c04f9bd"
+dependencies = [
+ "strum_macros 0.28.0",
 ]
 
 [[package]]
@@ -1640,6 +1789,18 @@ dependencies = [
  "proc-macro2",
  "quote",
  "rustversion",
+ "syn",
+]
+
+[[package]]
+name = "strum_macros"
+version = "0.28.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "ab85eea0270ee17587ed4156089e10b9e6880ee688791d45a905f5b1ca36f664"
+dependencies = [
+ "heck",
+ "proc-macro2",
+ "quote",
  "syn",
 ]
 
@@ -1682,9 +1843,9 @@ dependencies = [
 
 [[package]]
 name = "tokio"
-version = "1.52.3"
+version = "1.53.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "8fc7f01b389ac15039e4dc9531aa973a135d7a4135281b12d7c1bc79fd57fffe"
+checksum = "ce3335fa71841cda333a58d7615b03901380ecf09d59b3296d21f8bbac0dde4e"
 dependencies = [
  "bytes",
  "libc",
@@ -1803,9 +1964,20 @@ version = "1.1.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b3644627a5af5fa321c95b9b235a72fd24cd29c648c2c379431e6628655627bf"
 dependencies = [
- "itertools",
+ "itertools 0.13.0",
  "unicode-segmentation",
  "unicode-width 0.1.14",
+]
+
+[[package]]
+name = "unicode-truncate"
+version = "2.0.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "16b380a1238663e5f8a691f9039c73e1cdae598a30e9855f541d29b08b53e9a5"
+dependencies = [
+ "itertools 0.14.0",
+ "unicode-segmentation",
+ "unicode-width 0.2.0",
 ]
 
 [[package]]
@@ -2032,12 +2204,15 @@ dependencies = [
 
 [[package]]
 name = "xtask"
-version = "0.10.0"
+version = "0.11.0"
 dependencies = [
  "clap",
  "clap_complete",
  "rmux-core",
  "rmux-proto",
+ "serde",
+ "serde_json",
+ "toml",
 ]
 
 [[package]]

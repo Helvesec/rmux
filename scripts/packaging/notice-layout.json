@@ -1,0 +1,72 @@
+{
+  "schema": 1,
+  "identities": {
+    "unix-archive": "rmux-package-v4",
+    "windows-archive": "rmux-windows-package-v4",
+    "debian": "rmux-debian-package-v3",
+    "rpm": "rmux-rpm-package-v3"
+  },
+  "entries": [
+    {
+      "id": "license",
+      "variants": {
+        "unix-archive": {
+          "install": "share/licenses/rmux/LICENSE",
+          "install_optional": true
+        }
+      }
+    },
+    {
+      "id": "license-apache",
+      "variants": {
+        "unix-archive": {
+          "install": "share/licenses/rmux/LICENSE-APACHE",
+          "install_optional": true
+        }
+      }
+    },
+    {
+      "id": "license-mit",
+      "variants": {
+        "unix-archive": {
+          "install": "share/licenses/rmux/LICENSE-MIT",
+          "install_optional": true
+        }
+      }
+    },
+    {
+      "id": "third-party-notices",
+      "source": {
+        "kind": "generated",
+        "name": "THIRD-PARTY-NOTICES.txt"
+      },
+      "role": "file",
+      "content_class": "license",
+      "variants": {
+        "unix-archive": {
+          "path": "share/licenses/rmux/THIRD-PARTY-NOTICES.txt",
+          "optional": true,
+          "mode": "0644",
+          "install": "share/licenses/rmux/THIRD-PARTY-NOTICES.txt",
+          "install_optional": true
+        },
+        "windows-archive": {
+          "path": "share/licenses/rmux/THIRD-PARTY-NOTICES.txt",
+          "optional": true,
+          "install": "share/licenses/rmux/THIRD-PARTY-NOTICES.txt",
+          "install_optional": true
+        },
+        "debian": {
+          "path": "usr/share/doc/rmux/THIRD-PARTY-NOTICES.txt",
+          "optional": true,
+          "mode": "0644"
+        },
+        "rpm": {
+          "path": "usr/share/doc/rmux/THIRD-PARTY-NOTICES.txt",
+          "optional": true,
+          "mode": "0644"
+        }
+      }
+    }
+  ]
+}

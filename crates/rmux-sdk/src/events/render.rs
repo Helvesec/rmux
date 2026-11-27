@@ -90,7 +90,9 @@ impl PaneRenderStream {
         })
     }
 
-    /// Overrides the debounce used before capturing snapshots after output.
+    /// Overrides the delay used to coalesce pending shared surface updates.
+    ///
+    /// This does not issue a fresh snapshot RPC for each output burst.
     #[must_use]
     pub const fn with_debounce(mut self, debounce: Duration) -> Self {
         self.debounce = debounce;
@@ -264,7 +266,7 @@ impl PaneRenderStream {
             if self.output.next_sequence() <= before {
                 stale_empty_polls = stale_empty_polls.saturating_add(1);
                 if stale_empty_polls > 1 {
-                    return Err(RmuxError::protocol(rmux_proto::RmuxError::Server(
+                    return Err(RmuxError::from_proto(rmux_proto::RmuxError::Server(
                         "pane surface advanced beyond its correlated output cursor".to_owned(),
                     )));
                 }
@@ -316,17 +318,17 @@ async fn initial_surface_frame(surface: &mut PaneSurfaceStream) -> Result<PaneSu
             Some(PaneSurfaceEvent::Reset(frame)) => return Ok(frame),
             Some(PaneSurfaceEvent::Lifecycle(_)) => {}
             Some(PaneSurfaceEvent::End(reason)) => {
-                return Err(RmuxError::protocol(rmux_proto::RmuxError::Server(format!(
-                    "pane surface stream ended during render setup: {reason:?}"
-                ))));
+                return Err(RmuxError::from_proto(rmux_proto::RmuxError::Server(
+                    format!("pane surface stream ended during render setup: {reason:?}"),
+                )));
             }
             Some(PaneSurfaceEvent::Patch(_)) => {
-                return Err(RmuxError::protocol(rmux_proto::RmuxError::Server(
+                return Err(RmuxError::from_proto(rmux_proto::RmuxError::Server(
                     "pane surface stream emitted a patch before its initial reset".to_owned(),
                 )));
             }
             None => {
-                return Err(RmuxError::protocol(rmux_proto::RmuxError::Server(
+                return Err(RmuxError::from_proto(rmux_proto::RmuxError::Server(
                     "pane surface stream closed before its initial reset".to_owned(),
                 )));
             }

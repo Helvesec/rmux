@@ -7,6 +7,7 @@ import json
 import subprocess
 from pathlib import Path
 from typing import Any
+from release_evidence import file_hash
 
 REPOSITORY = "Helvesec/rmux"
 PREDICATE_TYPE = "https://rmux.io/attestations/release-promotion-authorization/v1"
@@ -89,10 +90,16 @@ def verify_promotion_attestation(
     }
     if not expected_subjects or set(assets) != set(expected_subjects):
         raise ValueError("promotion attestation subject set is not exhaustive")
+    records = [record for record in predicate["assets"] if record["role"] != "checksums"]
+    if len(records) != len(expected_subjects):
+        raise ValueError("promotion attestation subjects are duplicated")
     for name in sorted(expected_subjects):
         subject = assets[name]
         if subject.is_symlink() or not subject.is_file():
             raise ValueError(f"attested subject must be one regular file: {name}")
+        record = next(record for record in records if record["name"] == name)
+        if subject.stat().st_size != record["size"] or file_hash(subject) != record["sha256"]:
+            raise ValueError(f"attested asset bytes differ: {name}")
         result = subprocess.run(
             [
                 str(verifier),
@@ -131,7 +138,7 @@ def verify_promotion_attestation(
             raise ValueError(
                 "promotion attestation verification output is invalid"
             ) from error
-        if not isinstance(output, list) or len(output) != 1:
+        if not isinstance(output, list) or len(output) != 1 or not isinstance(output[0], dict):
             raise ValueError("exactly one promotion attestation must verify")
         verification = output[0].get("verificationResult")
         statement = (
@@ -153,3 +160,5 @@ def verify_promotion_attestation(
             or statement.get("predicate") != predicate
         ):
             raise ValueError("verified promotion attestation statement changed")
+        if subject.stat().st_size != record["size"] or file_hash(subject) != record["sha256"]:
+            raise ValueError(f"attested asset bytes differ: {name}")

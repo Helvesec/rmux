@@ -21,7 +21,9 @@ const HIT_BUFFER: &str = "issue96-tmux-sgr-hit";
 #[test]
 fn tmux_parent_sgr_key_batch_dispatches_the_live_mouse_binding() -> Result<(), Box<dyn Error>> {
     let _serial = windows_cli_serial::acquire("issue96-tmux-sgr-key-batch")?;
-    let binary = PathBuf::from(env!("CARGO_BIN_EXE_rmux"));
+    let binary = PathBuf::from(rmux_os::build_identity::cargo_binary(env!(
+        "CARGO_BIN_EXE_rmux"
+    )));
     let label = format!("i96-tmux-sgr-{}", unique_suffix()?);
     let _server = ServerGuard::new(&binary, label.clone());
 

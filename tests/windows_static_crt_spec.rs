@@ -1,5 +1,9 @@
+#[path = "support/python3.rs"]
+mod python3;
+
 #[test]
 fn windows_release_builds_and_reuses_only_static_crt_binaries() {
+    // Keep full, tiny and daemon build provenance bound to CRT verification.
     let workflow = include_str!("../.github/workflows/release.yml");
     let package = include_str!("../scripts/package-windows.ps1");
     let verify = include_str!("../scripts/verify-package-windows.ps1");
@@ -35,27 +39,78 @@ fn windows_release_builds_and_reuses_only_static_crt_binaries() {
         );
     }
 
-    let static_flag = package
-        .find("$env:RUSTFLAGS = \"$originalRustFlags -C target-feature=+crt-static\".Trim()")
-        .expect("direct package static CRT flag");
-    let full_build = package
-        .find("& cargo @cargoArgs --bin rmux --bin rmux-daemon")
-        .expect("full Windows and daemon build");
-    let tiny_build = package
-        .find("& cargo @tinyCargoArgs --bin rmux")
-        .expect("tiny Windows build");
-    let restore = package
-        .find("Remove-Item Env:\\RUSTFLAGS -ErrorAction SilentlyContinue")
-        .expect("RUSTFLAGS restoration");
-    assert!(
-        [full_build, tiny_build]
-            .into_iter()
-            .all(|build| static_flag < build && build < restore),
-        "all release builds must complete before RUSTFLAGS restoration"
+    let cargo_start = package
+        .find("$cargoArgs =")
+        .expect("package Cargo arguments");
+    let cargo_end = package[cargo_start..]
+        .find("$targetDir =")
+        .map(|offset| cargo_start + offset)
+        .expect("end of package Cargo arguments");
+    assert_eq!(
+        package[cargo_start..cargo_end].trim(),
+        r#"$cargoArgs = @("build", "--package", "rmux", "--locked", "--target", $Target)
+if ($Configuration -eq "release") {
+    $cargoArgs += "--release"
+}"#
     );
+
+    // Notices now own the three Cargo builds. Pin the complete calling scope,
+    // then execute the driver to check each role, its flags and failure path.
+    let build_start = package
+        .find("$buildsReleaseMsvc =")
+        .expect("MSVC build scope");
+    let build_end = package[build_start..]
+        .find("$noticeRequirement =")
+        .map(|offset| build_start + offset)
+        .expect("end of MSVC build scope");
+    assert_eq!(
+        package[build_start..build_end].trim(),
+        r#"$buildsReleaseMsvc = $Configuration -eq "release" -and
+    $Target -match '-pc-windows-msvc$' -and
+    -not $SkipBuild -and
+    -not $ReuseReleaseBinaries
+$originalRustFlags = $env:RUSTFLAGS
+if ($buildsReleaseMsvc -and $originalRustFlags -notlike "*+crt-static*") {
+    $env:RUSTFLAGS = "$originalRustFlags -C target-feature=+crt-static".Trim()
+}
+try {
+    if (-not $SkipBuild -and -not $ReuseReleaseBinaries) {
+        Invoke-Notices (@("build", "--binary-dir", (Split-Path -Parent $binary), "--", "cargo") + $cargoArgs)
+    }
+} finally {
+    if ($null -eq $originalRustFlags) {
+        Remove-Item Env:\RUSTFLAGS -ErrorAction SilentlyContinue
+    } else {
+        $env:RUSTFLAGS = $originalRustFlags
+    }
+}"#,
+        "all delegated builds must inherit static CRT flags before restoration"
+    );
+    let invoke = package
+        .split("function Invoke-Notices([string[]]$Arguments) {\n")
+        .nth(1)
+        .and_then(|body| body.split_once("\n}").map(|(body, _)| body))
+        .expect("notice driver invocation");
+    assert_eq!(
+        invoke,
+        r#"    $python = Resolve-LayoutPython
+    & $python (Join-Path $PSScriptRoot "packaging/notices.py") @Arguments
+    if ($LASTEXITCODE -ne 0) { Fail "third-party notice generation or payload binding failed" }"#
+    );
+    let output = python3::command()
+        .args([
+            "-B",
+            "-c",
+            include_str!("fixtures/windows_notice_build.py"),
+            env!("CARGO_MANIFEST_DIR"),
+        ])
+        .output()
+        .expect("execute notice build driver fixture");
     assert!(
-        !package.contains("@daemonCargoArgs"),
-        "the daemon must be built with the full helper instead of a third Cargo invocation"
+        output.status.success(),
+        "notice build contract failed: stdout={} stderr={}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
     );
 
     let reuse_validation = package

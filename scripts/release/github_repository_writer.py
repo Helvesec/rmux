@@ -9,7 +9,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, Callable
 
 from github_repository_commit_plan import (
     CREATE_COMMIT_MUTATION,
@@ -511,6 +511,7 @@ def publish(
     message: str,
     managed_prefixes: tuple[str, ...] = (),
     expected_base: str | None = None,
+    admit_base: Callable[[str], None] | None = None,
 ) -> PublishOutcome:
     base_commit = branch_head(api, full_name, branch)
     existing_paths = (
@@ -529,6 +530,10 @@ def publish(
         managed_expected=managed_expected,
     ):
         return PublishOutcome("no-op-exact", False, base_commit)
+    if admit_base is not None:
+        # The atomic write is conditioned on this exact base commit, whose
+        # bytes are known here to differ from the requested updates.
+        admit_base(base_commit)
     if expected_base is not None and base_commit != expected_base:
         raise ValueError("downstream repository changed after payload preparation")
     deletions = managed_existing - managed_expected

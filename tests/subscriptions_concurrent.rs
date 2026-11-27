@@ -174,7 +174,8 @@ fn concurrent_subscribe_unsubscribe_and_caps_cross_server_boundary() -> Result<(
 #[test]
 fn disconnect_ttl_and_pane_removal_cleanup_release_subscription_caps() -> Result<(), Box<dyn Error>>
 {
-    let limits = SubscriptionLimits::new(4, 1, 2, Duration::from_millis(30));
+    // Disconnect and pane removal must release caps without help from TTL expiry.
+    let limits = SubscriptionLimits::new(1, 1, 2, Duration::from_secs(300));
     let harness = Harness::new("subscriptions-cleanup", limits)?;
 
     let disconnect_session = session_name("disconnect");
@@ -186,20 +187,22 @@ fn disconnect_ttl_and_pane_removal_cleanup_release_subscription_caps() -> Result
     }
     eventually_subscribes(&harness, disconnect_target.clone())?;
 
+    let ttl_limits = SubscriptionLimits::new(1, 1, 2, Duration::from_millis(30));
+    let ttl_harness = Harness::new("subscriptions-ttl", ttl_limits)?;
     let ttl_session = session_name("ttl");
     let ttl_target = PaneTarget::with_window(ttl_session.clone(), 0, 0);
-    create_session(&harness, ttl_session)?;
-    let mut stale_connection = harness.connect()?;
+    create_session(&ttl_harness, ttl_session)?;
+    let mut stale_connection = ttl_harness.connect()?;
     let stale = subscribe(&mut stale_connection, ttl_target.clone())?;
-    thread::sleep(Duration::from_millis(60));
-    let mut replacement = harness.connect()?;
-    let _ = subscribe(&mut replacement, ttl_target)?;
+    let mut replacement = ttl_harness.connect()?;
+    let _ = eventually_subscribes_on_connection(&mut replacement, ttl_target)?;
     assert!(matches!(
         stale_connection.roundtrip(&Request::PaneOutputCursor(PaneOutputCursorRequest {
             subscription_id: stale.subscription_id,
             max_events: Some(1),
         }))?,
-        Response::Error(_)
+        Response::Error(ErrorResponse { error })
+            if error.to_string().contains("subscription not found")
     ));
 
     let pane_session = session_name("pane-removal");
@@ -207,6 +210,12 @@ fn disconnect_ttl_and_pane_removal_cleanup_release_subscription_caps() -> Result
     create_session(&harness, pane_session)?;
     let mut subscribed = harness.connect()?;
     let removed = subscribe(&mut subscribed, pane_target.clone())?;
+    assert_limit_error(subscribed.roundtrip(&Request::SubscribePaneOutput(
+        SubscribePaneOutputRequest {
+            target: disconnect_target.clone(),
+            start: PaneOutputSubscriptionStart::Now,
+        },
+    ))?);
     let mut killer = harness.connect()?;
     assert!(matches!(
         killer.roundtrip(&Request::KillPane(KillPaneRequest {
@@ -215,15 +224,17 @@ fn disconnect_ttl_and_pane_removal_cleanup_release_subscription_caps() -> Result
         }))?,
         Response::KillPane(_)
     ));
+    // KillPane starts the final-output drain. Observe cap release before any
+    // explicit unsubscribe, which would otherwise perform the cleanup for us.
+    let _ = eventually_subscribes_on_connection(&mut subscribed, disconnect_target)?;
     assert!(matches!(
         subscribed.roundtrip(&Request::UnsubscribePaneOutput(
             UnsubscribePaneOutputRequest {
                 subscription_id: removed.subscription_id,
             },
         ))?,
-        Response::UnsubscribePaneOutput(response) if response.removed
+        Response::UnsubscribePaneOutput(response) if !response.removed
     ));
-    let _ = eventually_subscribes_on_connection(&mut subscribed, disconnect_target)?;
 
     Ok(())
 }
@@ -417,13 +428,22 @@ fn eventually_subscribes_on_connection(
     connection: &mut Connection,
     target: PaneTarget,
 ) -> Result<SubscribePaneOutputResponse, Box<dyn Error>> {
-    for _ in 0..200 {
-        match subscribe(connection, target.clone()) {
-            Ok(response) => return Ok(response),
-            Err(_) => thread::sleep(Duration::from_millis(20)),
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while Instant::now() < deadline {
+        match connection.roundtrip(&Request::SubscribePaneOutput(SubscribePaneOutputRequest {
+            target: target.clone(),
+            start: PaneOutputSubscriptionStart::Now,
+        }))? {
+            Response::SubscribePaneOutput(response) => return Ok(response),
+            Response::Error(ErrorResponse { error })
+                if error.to_string().contains("subscription limit exceeded") =>
+            {
+                thread::sleep(Duration::from_millis(20));
+            }
+            other => return Err(format!("unexpected subscribe response: {other:?}").into()),
         }
     }
-    Err("subscription cap was not released after pane exit".into())
+    Err("subscription cap was not released before the deadline".into())
 }
 
 fn send_keys(

@@ -1,6 +1,5 @@
 //! Demonstrates `Pane::find_text()` — locate a literal in the visible buffer.
 
-#[path = "sdk_demo_helpers/mod.rs"]
 mod sdk_demo_helpers;
 
 #[tokio::main]

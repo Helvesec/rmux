@@ -1,7 +1,31 @@
+use std::collections::BTreeMap;
+
 use rmux_proto::RmuxError;
 
 use super::super::target_error::invalid_window_target;
 use super::super::Session;
+use crate::{AlertFlags, WindowId, WINLINK_ALERTFLAGS};
+
+pub(in crate::session) fn select_existing_window(
+    window_index: u32,
+    active_window: &mut u32,
+    last_window: &mut Option<u32>,
+    window_stack: &mut Vec<u32>,
+    group_initial_window_id: &mut Option<WindowId>,
+    winlink_alert_flags: &mut BTreeMap<u32, AlertFlags>,
+) {
+    if *active_window == window_index {
+        return;
+    }
+
+    crate::session::visit_history::record_visit(window_stack, *active_window, window_index);
+    *last_window = Some(*active_window);
+    *active_window = window_index;
+    *group_initial_window_id = None;
+    if let Some(flags) = winlink_alert_flags.get_mut(&window_index) {
+        flags.remove(WINLINK_ALERTFLAGS);
+    }
+}
 
 impl Session {
     /// Selects the active window by index.
@@ -10,12 +34,14 @@ impl Session {
             return Err(invalid_window_target(&self.name, window_index));
         }
 
-        if self.active_window != window_index {
-            self.last_window = Some(self.active_window);
-            self.active_window = window_index;
-            self.group_initial_window_id = None;
-            let _ = self.clear_all_winlink_alert_flags(window_index);
-        }
+        select_existing_window(
+            window_index,
+            &mut self.active_window,
+            &mut self.last_window,
+            &mut self.window_stack,
+            &mut self.group_initial_window_id,
+            &mut self.winlink_alert_flags,
+        );
 
         Ok(())
     }

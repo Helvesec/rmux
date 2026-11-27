@@ -21,8 +21,8 @@ fn session_name(value: &str) -> SessionName {
 }
 
 async fn new_session(handler: &RequestHandler, session_name: &SessionName) {
-    assert!(matches!(
-        handler
+    crate::session_fixture::assert_new_session(
+        &handler
             .handle(Request::NewSession(NewSessionRequest {
                 session_name: session_name.clone(),
                 detached: true,
@@ -30,8 +30,7 @@ async fn new_session(handler: &RequestHandler, session_name: &SessionName) {
                 environment: None,
             }))
             .await,
-        Response::NewSession(_)
-    ));
+    );
 }
 
 async fn new_window(
@@ -99,6 +98,8 @@ fn drain_control_notifications(rx: &mut mpsc::Receiver<ControlServerEvent>) -> V
             Ok(
                 ControlServerEvent::SessionChanged(_)
                 | ControlServerEvent::SessionChangedAt { .. }
+                | ControlServerEvent::FormatSubscriptions(_)
+                | ControlServerEvent::PaneOutputActions(_)
                 | ControlServerEvent::Refresh,
             ) => {}
             Ok(ControlServerEvent::Exit(reason)) => {
@@ -764,6 +765,83 @@ async fn detached_control_clients_skip_session_scoped_window_notifications() {
 }
 
 #[tokio::test]
+async fn detached_control_display_messages_require_a_session_but_print_still_works() {
+    let handler = RequestHandler::new();
+    let alpha = session_name("message-session");
+    new_session(&handler, &alpha).await;
+    let mut control_rx = register_control_client(&handler, 609, None).await;
+    let _ = drain_control_notifications(&mut control_rx);
+
+    for target in [None, Some(Target::Session(alpha.clone()))] {
+        for message in ["", "NOTICE"] {
+            let response = dispatch_as(
+                &handler,
+                609,
+                Request::DisplayMessage(DisplayMessageRequest {
+                    target: target.clone(),
+                    print: false,
+                    message: Some(message.to_owned()),
+                    empty_target_context: false,
+                }),
+            )
+            .await;
+            assert_eq!(
+                response,
+                Response::DisplayMessage(rmux_proto::DisplayMessageResponse::no_output())
+            );
+            assert!(drain_control_notifications(&mut control_rx).is_empty());
+        }
+    }
+    let response = dispatch_as(
+        &handler,
+        609,
+        Request::DisplayMessage(DisplayMessageRequest {
+            target: Some(Target::Session(alpha.clone())),
+            print: true,
+            message: Some("PRINT".to_owned()),
+            empty_target_context: false,
+        }),
+    )
+    .await;
+    assert_eq!(
+        response.command_output().map(|output| output.stdout()),
+        Some(b"PRINT\n".as_slice())
+    );
+    let mut recipient_rx = register_control_client(&handler, 608, Some(alpha.clone())).await;
+    let _ = drain_control_notifications(&mut recipient_rx);
+    for command in [
+        "display-message ''",
+        "run-shell -C 'display-message \"'",
+        "run-shell -C -d 0 'display-message \"'",
+        "run-shell -C -d 0.001 'display-message \"'",
+    ] {
+        let parsed = handler.parse_control_commands(command).await.unwrap();
+        let result = handler.execute_control_commands(609, parsed).await;
+        assert!(result.error.is_none(), "{command}: {result:?}");
+        assert!(drain_control_notifications(&mut control_rx).is_empty());
+        assert_eq!(
+            drain_control_notifications(&mut recipient_rx),
+            ["%message "]
+        );
+    }
+    handler.set_control_session(609, Some(alpha)).await.unwrap();
+    let _ = drain_control_notifications(&mut control_rx);
+    let response = dispatch_as(
+        &handler,
+        609,
+        Request::DisplayMessage(DisplayMessageRequest {
+            target: None,
+            print: false,
+            message: Some(String::new()),
+            empty_target_context: false,
+        }),
+    )
+    .await;
+    assert!(matches!(response, Response::DisplayMessage(_)));
+    assert_eq!(drain_control_notifications(&mut control_rx), ["%message "]);
+}
+
+#[tokio::test]
 async fn display_message_for_control_client_uses_message_notification() {
     let handler = RequestHandler::new();
     let alpha = session_name("alpha");
@@ -888,7 +966,7 @@ async fn display_message_for_control_client_uses_message_notification() {
         .await
         .sessions
         .session(&session_name("alpha"))
-        .and_then(rmux_core::Session::active_pane_id)
+        .and_then(|session| session.active_pane_id())
         .expect("alpha active pane");
     let response = handler
         .handle_display_message_for_stable_pane(
@@ -971,7 +1049,7 @@ async fn rejected_session_control_message_is_not_added_to_show_messages() {
         .await
         .sessions
         .session(&alpha)
-        .and_then(rmux_core::Session::active_pane_id)
+        .and_then(|session| session.active_pane_id())
         .expect("active pane");
 
     let response = handler
@@ -1114,7 +1192,7 @@ async fn startup_config_errors_do_not_block_first_regular_command() {
     )
     .await;
 
-    assert!(matches!(response, Response::NewSession(_)));
+    crate::session_fixture::assert_new_session(&response);
 
     let mut control_rx = register_control_client(&handler, 711, None).await;
     assert_eq!(

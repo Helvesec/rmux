@@ -225,3 +225,9 @@ fn c0_nul_is_noop() {
         .collect();
     assert!(meaningful.is_empty());
 }
+
+#[test]
+fn winops_reports_default_pixel_geometry() {
+    let (parser, _) = parse(b"\x1b[16t\x1b[14t");
+    assert_eq!(parser.reply_buf, b"\x1b[6;32;16t\x1b[4;768;1280t");
+}

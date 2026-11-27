@@ -10,14 +10,23 @@
 //! The slot/child machinery lives in [`crate::test_shell::final_sink`] because
 //! the deferred-start proof in `handler_session` needs the same child and
 //! cannot reach into this private test tree.
+//!
+//! `let _ = attach_to(..)` drops the attach guard, and with it the control
+//! receiver, on the spot; `#[must_use]` only rejects the bare statement. The
+//! deny below turns every such discard in this tree into a compile error.
+#![deny(let_underscore_drop)]
 
 use std::time::Instant;
 
 use super::*;
 use crate::test_shell::final_sink::{
     create_final_sink_session, describe_missing_bracketed_mode, observe_pane_output,
-    split_final_sink_pane, FinalSinkSlot,
+    split_final_sink_pane, AttachedFinalSinkClient, FinalSinkSlot,
 };
+use attached_client::attach_to;
+
+#[path = "bracketed_paste_final_sink/attached_client.rs"]
+mod attached_client;
 
 const OPEN: &[u8] = b"\x1b[200~";
 const CLOSE: &[u8] = b"\x1b[201~";
@@ -84,15 +93,6 @@ pub(super) async fn wait_for_bracketed_mode(
     }
 }
 
-pub(super) async fn attach_to(handler: &RequestHandler, session: &rmux_proto::SessionName) -> u32 {
-    let requester_pid = std::process::id();
-    let (control_tx, _control_rx) = mpsc::unbounded_channel();
-    let _attach_id = handler
-        .register_attach(requester_pid, session.clone(), control_tx)
-        .await;
-    requester_pid
-}
-
 async fn select_pane(handler: &RequestHandler, target: &PaneTarget) {
     let selected = handler
         .handle(Request::SelectPane(Box::new(SelectPaneRequest {
@@ -147,9 +147,9 @@ async fn active_aware_pane_child_receives_the_bracketed_paste_delimiters() {
     let slot = FinalSinkSlot::new("aware", &expected, true);
 
     started_final_sink_pane(&handler, &session, &slot, true).await;
-    let requester_pid = attach_to(&handler, &session).await;
-    handler
-        .handle_attached_live_input_for_test(requester_pid, &expected)
+    let client = attach_to(&handler, &session).await;
+    client
+        .send(&handler, &expected)
         .await
         .expect("attached bracketed paste");
 
@@ -166,13 +166,97 @@ async fn active_unaware_pane_child_receives_only_the_paste_body() {
     let slot = FinalSinkSlot::new("unaware", body, false);
 
     started_final_sink_pane(&handler, &session, &slot, false).await;
-    let requester_pid = attach_to(&handler, &session).await;
-    handler
-        .handle_attached_live_input_for_test(requester_pid, &wrapped(body))
+    let client = attach_to(&handler, &session).await;
+    client
+        .send(&handler, &wrapped(body))
         .await
         .expect("attached bracketed paste");
 
     slot.assert_application_bytes("an unaware child must receive the body with no delimiters");
+}
+
+async fn assert_clock_mode_paste(label: &str, bracket_aware: bool, fragmented: bool) {
+    let handler = RequestHandler::new();
+    let session = session_name(label);
+    let paste = wrapped(RICH_BODY.as_bytes());
+    let mut expected = if bracket_aware {
+        paste.clone()
+    } else {
+        RICH_BODY.as_bytes().to_vec()
+    };
+    expected.extend_from_slice(b"TAIL");
+    let slot = FinalSinkSlot::new(label, &expected, bracket_aware);
+    #[cfg(unix)]
+    let slot = slot.until_controlled_eof();
+
+    let target = started_final_sink_pane(&handler, &session, &slot, bracket_aware).await;
+    handler.disable_pane_focus_reports_for_test(&target).await;
+    // Clock mode publishes overlays; the client keeps their receiver alive.
+    let client = AttachedFinalSinkClient::register(&handler, &session).await;
+    client
+        .send(&handler, b"\x02t")
+        .await
+        .expect("clock-mode entry");
+    assert!(handler.target_is_in_clock_mode(&target).await.unwrap());
+
+    let paste_len = paste.len();
+    let mut input = paste;
+    input.extend_from_slice(b"TAIL");
+    let chunks = if fragmented {
+        vec![
+            &input[..2],
+            &input[2..4],
+            &input[4..OPEN.len() + 3],
+            &input[OPEN.len() + 3..paste_len - 4],
+            &input[paste_len - 4..paste_len - 1],
+            &input[paste_len - 1..],
+        ]
+    } else {
+        vec![input.as_slice()]
+    };
+    let mut pending_input = Vec::new();
+    for (index, chunk) in chunks.iter().enumerate() {
+        client
+            .send_read(&handler, &mut pending_input, chunk)
+            .await
+            .expect("clock-mode paste and same-chunk tail");
+        if index + 1 < chunks.len() {
+            assert!(handler.target_is_in_clock_mode(&target).await.unwrap());
+        }
+    }
+    assert!(pending_input.is_empty());
+    assert!(!handler.target_is_in_clock_mode(&target).await.unwrap());
+    // Unix writes paste, tail and VEOF through the same ordered PTY. VEOF is
+    // outside the assertion payload: one flushes the last partial line, the
+    // next makes the child's unbounded read return EOF. No quiet-period pass.
+    #[cfg(unix)]
+    client
+        .send(&handler, b"\x04\x04")
+        .await
+        .expect("controlled end of the application stream");
+    slot.assert_application_bytes(
+        "clock-mode must reroute the entire paste using the child's mode, followed by the tail",
+    );
+}
+
+#[tokio::test]
+async fn clock_mode_complete_paste_preserves_delimiters_for_an_aware_child() {
+    assert_clock_mode_paste("clock-complete-aware", true, false).await;
+}
+
+#[tokio::test]
+async fn clock_mode_complete_paste_strips_delimiters_for_an_unaware_child() {
+    assert_clock_mode_paste("clock-complete-unaware", false, false).await;
+}
+
+#[tokio::test]
+async fn clock_mode_fragmented_paste_preserves_delimiters_for_an_aware_child() {
+    assert_clock_mode_paste("clock-fragmented-aware", true, true).await;
+}
+
+#[tokio::test]
+async fn clock_mode_fragmented_paste_strips_delimiters_for_an_unaware_child() {
+    assert_clock_mode_paste("clock-fragmented-unaware", false, true).await;
 }
 
 /// More UTF-16 code units than one `write_windows_console_utf8` record batch,
@@ -195,9 +279,9 @@ async fn bracketed_paste_child_receives_a_body_crossing_the_record_batch_boundar
     let slot = FinalSinkSlot::new("batch", &expected, true);
 
     started_final_sink_pane(&handler, &session, &slot, true).await;
-    let requester_pid = attach_to(&handler, &session).await;
-    handler
-        .handle_attached_live_input_for_test(requester_pid, &expected)
+    let client = attach_to(&handler, &session).await;
+    client
+        .send(&handler, &expected)
         .await
         .expect("attached bracketed paste");
 
@@ -214,7 +298,7 @@ async fn split_bracketed_paste_delimiters_reach_the_child_unchanged() {
     let slot = FinalSinkSlot::new("split", &expected, true);
 
     started_final_sink_pane(&handler, &session, &slot, true).await;
-    let requester_pid = attach_to(&handler, &session).await;
+    let client = attach_to(&handler, &session).await;
 
     // Representative interior splits of both delimiters, which is what a real
     // client produces when a paste straddles read boundaries.
@@ -227,8 +311,8 @@ async fn split_bracketed_paste_delimiters_reach_the_child_unchanged() {
         &expected[expected.len() - 4..expected.len() - 1],
         &expected[expected.len() - 1..],
     ] {
-        handler
-            .handle_attached_live_input(requester_pid, &mut pending_input, chunk)
+        client
+            .send_read(&handler, &mut pending_input, chunk)
             .await
             .expect("split bracketed paste chunk");
     }
@@ -268,11 +352,11 @@ async fn assert_mixed_synchronized_final_sink(label: &str, active_pane: u32) {
     .await;
     set_synchronize_panes(&handler, &session).await;
 
-    let requester_pid = attach_to(&handler, &session).await;
+    let client = attach_to(&handler, &session).await;
     // The client always sends the wrapped form; the server must recompute the
     // mode for each destination instead of reusing the source pane's.
-    handler
-        .handle_attached_live_input_for_test(requester_pid, &aware_expected)
+    client
+        .send(&handler, &aware_expected)
         .await
         .expect("synchronized bracketed paste");
 
@@ -318,12 +402,9 @@ async fn assert_paste_arrives_between_the_keystrokes(label: &str, bracket_aware:
     let slot = FinalSinkSlot::new(label, &expected, bracket_aware);
 
     started_final_sink_pane(&handler, &session, &slot, bracket_aware).await;
-    let requester_pid = attach_to(&handler, &session).await;
+    let client = attach_to(&handler, &session).await;
     for chunk in [b"x".as_slice(), &wrapped_body, b"z".as_slice()] {
-        handler
-            .handle_attached_live_input_for_test(requester_pid, chunk)
-            .await
-            .expect("attached input");
+        client.send(&handler, chunk).await.expect("attached input");
     }
 
     slot.assert_application_bytes(
@@ -405,9 +486,9 @@ async fn pane_input_and_raw_attached_keystrokes_are_never_wrapped_for_an_aware_c
         "unexpected pane-input response: {response:?}"
     );
 
-    let requester_pid = attach_to(&handler, &session).await;
-    handler
-        .handle_attached_live_input_for_test(requester_pid, raw)
+    let client = attach_to(&handler, &session).await;
+    client
+        .send(&handler, raw)
         .await
         .expect("raw attached keystrokes");
 
@@ -415,3 +496,6 @@ async fn pane_input_and_raw_attached_keystrokes_are_never_wrapped_for_an_aware_c
         "SDK/raw keystrokes and pane-input must reach the child unwrapped",
     );
 }
+
+#[path = "bracketed_paste_final_sink/attach_lifetime.rs"]
+mod attach_lifetime;

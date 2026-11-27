@@ -43,7 +43,7 @@
 > [!NOTE]
 > RMUX には E2E Web 多重化機能があります。[詳しくはドキュメントを参照してください。](../web-share.md)
 >
-> RMUX は現在 Python と TypeScript の SDK を提供しています: [librmux](https://pypi.org/project/librmux/), [@rmux/sdk](https://www.npmjs.com/package/@rmux/sdk)。
+> 過去に公開された Python/TypeScript SDK は RMUX 0.6 向けです：[librmux 0.6.1](https://pypi.org/project/librmux/0.6.1/)、[@rmux/sdk 0.6.5](https://www.npmjs.com/package/@rmux/sdk/v/0.6.5)。RMUX 1.0 の配布と SDK サポートの対象外です。
 >
 > 機能要望や問題報告は [issue を作成](https://github.com/Helvesec/rmux/issues)してください。
 
@@ -238,18 +238,31 @@ tunnel provider を使う、自分の ingress を持ち込む、静的 frontend 
 
 ## 🧰 スクリプト/API
 
-SDK はローカル RMUX daemon に接続し、自動化向けに sessions、panes、
-streams、waits、snapshots を公開します。
+Rust SDK はローカル daemon の型付き IPC を利用します。過去の Python/TypeScript
+ラッパーは別途インストールした RMUX CLI を呼び出します。新しい RMUX 1.0 の配布、
+同梱実装、および SDK サポート・成果物・ビルド・パッケージの対応対象一覧から除外されます。
+[Post-1.0 Python/TypeScript SDK qualification](../ROADMAP.md#post-10-pythontypescript-sdk-qualification)
+は RMUX 1.0 後の明示的なマイルストーンです。[SDK の範囲](../scripting-sdk.md#additional-language-sdk-scope)を参照してください。
+
+リリース済みの 0.10.0 daemon（プロトコル 8）には 0.10.0 の SDK を使用します。
+0.11.0 daemon（プロトコル 9）を使う場合は、`/path/to/rmux` を daemon のビルドに使った
+ソースのパスに置き換えて、Rust プロジェクト内で次のコマンドを実行してください。
 
 ```sh
-cargo add rmux-sdk
-pip install librmux
-npm install @rmux/sdk
+cargo add --path "/path/to/rmux/crates/rmux-sdk"
+```
+
+以下は過去のバージョン向けの例です。`librmux 0.6.1` は RMUX 0.6.1、
+`@rmux/sdk 0.6.5` は RMUX 0.6.x が対象です。RMUX 1.0 用のインストール手順ではありません。
+
+```sh
+pip install librmux==0.6.1
+npm install @rmux/sdk@0.6.5
 ```
 
 - Rust SDK: [`rmux-sdk`](https://crates.io/crates/rmux-sdk)
-- Python SDK: [`librmux`](https://pypi.org/project/librmux/)
-- TypeScript SDK: [`@rmux/sdk`](https://www.npmjs.com/package/@rmux/sdk)
+- Python SDK: [`librmux 0.6.1` — RMUX 0.6.1](https://pypi.org/project/librmux/0.6.1/)
+- TypeScript SDK: [`@rmux/sdk 0.6.5` — RMUX 0.6.x](https://www.npmjs.com/package/@rmux/sdk/v/0.6.5)
 
 <a id="documentation"></a>
 
@@ -311,7 +324,6 @@ fn render(snapshot: PaneSnapshot, area: Rect, buffer: &mut Buffer) {
 | `rmux-server` | Tokio daemon と request dispatch | support crate |
 | `rmux-client` | ローカル IPC client と attach plumbing | support crate |
 | `rmux` | CLI と隠し daemon entrypoint | public binary |
-| `rmux-render-core` | 共有 snapshot rendering core | workspace-internal |
 
 <a id="platform-support"></a>
 
@@ -342,7 +354,7 @@ set -as terminal-features 'xterm-kitty:kitty-graphics'
 set -as terminal-features 'xterm*:sixel'
 ```
 
-SIXEL passthrough は自動化された Unix PTY attach regression suite でカバーされています。Windows では、OS が対応していれば RMUX は modern ConPTY passthrough を有効にしますが、SIXEL display は外側の terminal に依存します。トラブルシュート時にこの backend mode を無効化するには `RMUX_CONPTY_NO_PASSTHROUGH=1` を設定してください。
+SIXEL passthrough は自動化された Unix PTY attach regression suite でカバーされています。Windows で OSC の問い合わせと応答を転送するには、pane をホストする実行ファイル（通常は `rmux-daemon.exe`）と同じディレクトリに、同じバージョンの Microsoft `conpty.dll` と `OpenConsole.exe`（1.24.2607.10001 以降）が必要です。現在のパッケージ作成スクリプトには、この任意のランタイムは含まれません。SIXEL 表示には外側の terminal も関係し、この OSC 検証では確認していません。`RMUX_CONPTY_NO_PASSTHROUGH=1` はシステムコンソールを選択し、従来のペースト互換ビットを無効にします。
 
 <a id="verification"></a>
 

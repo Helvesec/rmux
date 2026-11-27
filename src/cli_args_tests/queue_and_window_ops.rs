@@ -1,6 +1,32 @@
 use super::*;
 
 #[test]
+fn runtime_canonical_queue_preserves_controls_after_path_prefixes() {
+    for prefix in ["/", "cmy:0/", "C:\\", "\\\\host\\share\\", "é/", "🚀/"] {
+        for ch in (1u8..=31).chain([127]).map(char::from) {
+            let expected = format!("{prefix}{ch}tail/$HOME/'\"");
+            let rendered = rmux_core::command_parser::CommandArgument::String(expected.clone())
+                .to_tmux_reparse_string();
+            let cli = super::super::parse_with_runtime_command_groups(
+                ["rmux", "list-sessions"],
+                &[super::super::RuntimeCommandGroup::Canonical(format!(
+                    "display-message -p -- {rendered}"
+                ))],
+            )
+            .unwrap();
+            let commands = cli.into_command_queue();
+            assert!(
+                matches!(
+                    &commands[0],
+                    super::super::Command::DisplayMessage(args) if args.message == [expected.clone()]
+                ),
+                "{expected:?}: {rendered:?}"
+            );
+        }
+    }
+}
+
+#[test]
 fn argv_semicolons_build_an_ordered_command_queue() {
     let cli = parse_args(&["list-sessions;", "display-message", "-p", "ok"]).unwrap();
     let commands = cli.into_command_queue();
@@ -33,13 +59,12 @@ fn standalone_argv_semicolon_builds_an_ordered_command_queue() {
 }
 
 #[test]
-fn argv_command_queue_rejects_refresh_client_pan_fields() {
+fn argv_command_queue_accepts_refresh_client_pan_fields() {
     for args in [
         &["list-sessions", ";", "refresh-client", "-L", "10"][..],
         &["list-sessions", ";", "refresh-client", "10"][..],
     ] {
-        let error = parse_args(args).expect_err("refresh-client pan field must fail in argv queue");
-        assert_eq!(error.kind(), clap::error::ErrorKind::UnknownArgument);
+        parse_args(args).expect("refresh-client pan field parses in argv queue");
     }
 }
 

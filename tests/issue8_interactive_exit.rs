@@ -84,7 +84,7 @@ fn issue_8_prompt_created_window_exit_removes_dead_pane() -> Result<(), Box<dyn 
 }
 
 #[test]
-fn fresh_pane_title_starts_as_host_short_before_shell_updates_it() -> Result<(), Box<dyn Error>> {
+fn fresh_pane_title_starts_as_host_before_shell_updates_it() -> Result<(), Box<dyn Error>> {
     let harness = CliHarness::new("issue8-initial-pane-title")?;
     let mut daemon = harness.start_hidden_daemon()?;
 
@@ -95,11 +95,11 @@ fn fresh_pane_title_starts_as_host_short_before_shell_updates_it() -> Result<(),
         "-p",
         "-t",
         "alpha:0.0",
-        "#{pane_title}|#{host_short}",
+        "#{pane_title}|#{host}",
     ])?;
     let title = common::stdout(&output);
-    let (pane_title, host_short) = title.trim().split_once('|').expect("format separator");
-    assert_eq!(pane_title, host_short);
+    let (pane_title, host) = title.trim().split_once('|').expect("format separator");
+    assert_eq!(pane_title, host);
 
     terminate_child(daemon.child_mut())?;
     Ok(())
@@ -128,9 +128,9 @@ fn osc_title_rename_is_ignored_when_allow_set_title_is_off() -> Result<(), Box<d
     ])?);
     thread::sleep(Duration::from_millis(500));
 
-    let title = pane_title_and_host_short(&harness, "alpha:0.0")?;
-    let (pane_title, host_short) = title.trim().split_once('|').expect("format separator");
-    assert_eq!(pane_title, host_short);
+    let title = pane_title_and_host(&harness, "alpha:0.0")?;
+    let (pane_title, host) = title.trim().split_once('|').expect("format separator");
+    assert_eq!(pane_title, host);
     assert_ne!(pane_title, "CLAUDETITLE");
 
     terminate_child(daemon.child_mut())?;
@@ -160,8 +160,8 @@ fn osc_title_rename_is_applied_when_allow_set_title_is_on() -> Result<(), Box<dy
     ])?);
     thread::sleep(Duration::from_millis(500));
 
-    let title = pane_title_and_host_short(&harness, "alpha:0.0")?;
-    let (pane_title, _host_short) = title.trim().split_once('|').expect("format separator");
+    let title = pane_title_and_host(&harness, "alpha:0.0")?;
+    let (pane_title, _host) = title.trim().split_once('|').expect("format separator");
     assert_eq!(pane_title, "CLAUDETITLE");
 
     terminate_child(daemon.child_mut())?;
@@ -225,13 +225,13 @@ fn rapid_confirm_before_accept_after_split_reaches_prompt() -> Result<(), Box<dy
     Ok(())
 }
 
-fn pane_title_and_host_short(harness: &CliHarness, target: &str) -> Result<String, Box<dyn Error>> {
+fn pane_title_and_host(harness: &CliHarness, target: &str) -> Result<String, Box<dyn Error>> {
     let output = harness.run(&[
         "display-message",
         "-p",
         "-t",
         target,
-        "#{pane_title}|#{host_short}",
+        "#{pane_title}|#{host}",
     ])?;
     Ok(common::stdout(&output))
 }

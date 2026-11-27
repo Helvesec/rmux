@@ -369,6 +369,9 @@ async fn retained_palette_response_survives_modal_replacement() {
     let alpha = session_name("palette-modal-replacement");
     let requester_pid = std::process::id();
     create_send_keys_test_session(&handler, &alpha).await;
+    handler
+        .disable_pane_focus_reports_for_test(&PaneTarget::new(alpha.clone(), 0))
+        .await;
     let (control_tx, _control_rx) = mpsc::unbounded_channel();
     let _attach_id = handler
         .register_attach(requester_pid, alpha.clone(), control_tx)
@@ -428,12 +431,13 @@ async fn incomplete_palette_like_user_input_resolves_on_escape_timeout() {
         .await
         .expect("palette-like user prefix resolves at timeout");
     assert!(pending_input.is_empty());
-    let active_attach = handler.active_attach.lock().await;
-    assert!(active_attach.by_pid[&requester_pid].prompt.is_none());
-    drop(active_attach);
+    // tmux 3.7b reads it at the escape time as M-], which the prompt ignores,
+    // and then the text `4;`: the prompt stays open and the pane gets nothing.
+    let prompt = handler.attached_prompt_render(requester_pid).await;
+    assert_eq!(prompt.map(|prompt| prompt.input).as_deref(), Some("4;"));
 
     capture.finish(&handler, &alpha).await;
-    capture.assert_contents(&handler, b"]4;").await;
+    capture.assert_contents(&handler, b"").await;
 }
 
 #[tokio::test]

@@ -3,19 +3,19 @@
 use std::fmt;
 use std::time::Duration;
 
+use crate::handles::pane::apply_live_details;
 use crate::handles::session::unexpected_response;
 use crate::transport::{OperationDeadline, TransportClient};
 use crate::{
-    InfoSnapshot, PaneId, PaneInfo, PaneProcessState, PaneRef, Result, RmuxEndpoint, RmuxError,
-    SessionId, SessionInfo, TerminalSizeSpec, WindowId, WindowInfo, WindowRef,
+    InfoSnapshot, LayoutName, PaneId, PaneInfo, PaneProcessState, PaneRef, Result, RmuxEndpoint,
+    RmuxError, SessionId, SessionInfo, TerminalSizeSpec, WindowId, WindowInfo, WindowRef,
 };
 use rmux_proto::{
-    KillWindowRequest, LayoutName, ListPanesRequest, ListSessionsRequest, ListWindowsRequest,
+    KillWindowRequest, ListPanesRequest, ListSessionsRequest, ListWindowsRequest,
     RenameWindowRequest, Request, ResizeWindowRequest, Response, SelectLayoutRequest,
     SelectLayoutTarget, SelectWindowRequest,
 };
 
-#[path = "window/new_builder.rs"]
 mod new_builder;
 
 pub use new_builder::NewWindowBuilder;
@@ -131,11 +131,54 @@ impl Window {
     /// Returns a sticky info snapshot for this window and its listed panes.
     ///
     /// The snapshot is assembled from live daemon `list-sessions`,
-    /// `list-windows`, and `list-panes` responses. If the target has already
+    /// `list-windows`, and `list-panes` responses, plus the per-pane details
+    /// probe of [`Pane::info`](crate::Pane::info); a pane the probe cannot
+    /// resolve keeps `PaneProcessState::Unknown`. If the target has already
     /// been closed, the returned snapshot contains only the still-observable
     /// session metadata, or is empty when the session is gone.
     pub async fn info(&self) -> Result<InfoSnapshot> {
         window_info_snapshot(&self.transport.begin_operation(), &self.target).await
+    }
+
+    /// Reads the current slot as a complete owned scene after capability negotiation.
+    pub async fn scene(&self) -> Result<crate::SceneSnapshot> {
+        self.read_scene(None).await
+    }
+
+    /// Reads only if the session and window still match the captured identities.
+    /// Recycled slots fail before any projection is returned; this is read-only.
+    pub async fn scene_for(&self, captured: &crate::SceneSnapshot) -> Result<crate::SceneSnapshot> {
+        self.read_scene(Some((captured.session_id, captured.window_id)))
+            .await
+    }
+
+    async fn read_scene(
+        &self,
+        expected_identity: Option<(SessionId, WindowId)>,
+    ) -> Result<crate::SceneSnapshot> {
+        let client = self.transport.begin_operation();
+        crate::capabilities::require(&client, &[rmux_proto::scene::CAPABILITY_SCENE_V1]).await?;
+        let query = rmux_proto::scene::SceneQuery {
+            window_index: self.target.window_index,
+            expected_identity,
+        };
+        let format = query.encode().map_err(RmuxError::from_proto)?;
+        match client
+            .request(Request::ListWindows(Box::new(ListWindowsRequest {
+                target: self.target.session_name.clone(),
+                format: Some(format),
+                filter: None,
+                sort_order: None,
+                reversed: false,
+            })))
+            .await?
+        {
+            Response::ListWindows(response) => {
+                crate::SceneSnapshot::decode(&response.output.stdout)
+            }
+            Response::Error(error) => Err(RmuxError::from_proto(error.error)),
+            response => Err(unexpected_response("scene.window.v1", response)),
+        }
     }
 
     /// Selects this window in its session.
@@ -161,7 +204,7 @@ impl Window {
         .await
     }
 
-    /// Applies a named layout to this window.
+    /// Applies an SDK-owned named layout to this window.
     pub async fn select_layout(&self, layout: LayoutName) -> Result<()> {
         select_window_layout(&self.transport.begin_operation(), &self.target, layout).await
     }
@@ -240,7 +283,7 @@ async fn select_window_layout(
     match client
         .request(Request::SelectLayout(SelectLayoutRequest {
             target: SelectLayoutTarget::Window(target.to_proto()),
-            layout,
+            layout: layout.to_proto(),
         }))
         .await?
     {
@@ -252,14 +295,14 @@ async fn select_window_layout(
 async fn close_window(client: &TransportClient, target: WindowRef) -> Result<WindowCloseOutcome> {
     let response = client
         .request(Request::KillWindow(KillWindowRequest {
-            target: (&target).into(),
+            target: target.to_proto(),
             kill_all_others: false,
         }))
         .await;
 
     match response {
         Ok(Response::KillWindow(response)) => Ok(WindowCloseOutcome::Closed {
-            active: response.target.into(),
+            active: WindowRef::from_proto(response.target),
         }),
         Ok(response) => Err(unexpected_response("kill-window", response)),
         Err(error) if is_already_closed_error(&error, &target) => {
@@ -297,7 +340,7 @@ async fn window_info_snapshot(
 
     let panes = list_window_panes_or_empty(client, target).await?;
     let session_id = session.id;
-    let pane_infos = panes
+    let mut pane_infos = panes
         .into_iter()
         .map(|pane| {
             let mut info = PaneInfo::new(pane.id, window.id, session_id);
@@ -306,7 +349,17 @@ async fn window_info_snapshot(
             info.process = PaneProcessState::Unknown;
             info
         })
-        .collect();
+        .collect::<Vec<_>>();
+    if let Err(error) =
+        apply_live_details(client, &target.session_name, &mut pane_infos, window.size).await
+    {
+        // The window vanished between the pane listing and the details
+        // probe: degrade to the undecorated snapshot, the same tolerance
+        // the pane listing itself applies.
+        if !is_already_closed_error(&error, target) {
+            return Err(error);
+        }
+    }
 
     Ok(InfoSnapshot::new(
         vec![session],
@@ -429,7 +482,7 @@ impl TryFrom<rmux_proto::WindowListEntry> for ListedWindow {
             index: entry.target.window_index(),
             id: parse_window_id(&entry.window_id)?,
             name: entry.name,
-            size: entry.size.into(),
+            size: TerminalSizeSpec::from_proto(entry.size),
         })
     }
 }
@@ -448,7 +501,7 @@ fn parse_session_info_line(line: &str) -> Result<SessionInfo> {
 
     Ok(SessionInfo::new(
         parse_session_id(id)?,
-        rmux_proto::SessionName::new(name)?,
+        rmux_proto::SessionName::new(name).map_err(RmuxError::from)?,
     ))
 }
 
@@ -523,17 +576,15 @@ fn parse_bool_flag(value: &str, field: &str) -> Result<bool> {
 }
 
 fn parse_error(message: impl Into<String>) -> RmuxError {
-    RmuxError::protocol(rmux_proto::RmuxError::Server(message.into()))
+    RmuxError::from_proto(rmux_proto::RmuxError::Server(message.into()))
 }
 
 fn is_already_closed_error(error: &RmuxError, target: &WindowRef) -> bool {
-    match error {
-        RmuxError::Protocol {
-            source: rmux_proto::RmuxError::SessionNotFound(session),
-        } => session == target.session_name.as_str(),
-        RmuxError::Protocol {
-            source: rmux_proto::RmuxError::InvalidTarget { value, reason },
-        } => {
+    match error.protocol_source() {
+        Some(rmux_proto::RmuxError::SessionNotFound(session)) => {
+            session == target.session_name.as_str()
+        }
+        Some(rmux_proto::RmuxError::InvalidTarget { value, reason }) => {
             value == &target.to_proto().to_string()
                 && reason == "window index does not exist in session"
         }

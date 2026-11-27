@@ -16,8 +16,9 @@ Accepted subset, which covers ``Cargo.toml`` and
 ``tests/reference/tmux_compat/divergences.toml``: comments, table headers,
 array-of-tables headers, dotted keys, bare/basic/literal keys, basic and
 literal strings, integers, floats, booleans, arrays (including multi-line
-arrays with a trailing comma) and inline tables. Everything else - multi-line
-strings, dates, times - raises :class:`TOMLDecodeError` naming the line, so an
+arrays with a trailing comma), multi-line basic strings and inline tables.
+Everything else - multi-line literal strings, dates, times - raises
+:class:`TOMLDecodeError` naming the line, so an
 unsupported construct is a loud gate failure and never a silently different
 parse. Duplicate keys and redefined tables are rejected, as ``tomllib``
 rejects them, because accepting them would change parsed values.
@@ -155,23 +156,51 @@ class _Parser:
 
     # -- strings ----------------------------------------------------------
 
-    def _parse_basic_string(self) -> str:
-        if self._starts_with('"""'):
-            raise self._fail("multi-line basic strings are not supported")
-        self._expect('"')
+    def _parse_basic_string(self, multiline: bool = False) -> str:
+        if self._starts_with('"""') and not multiline:
+            raise self._fail("multi-line strings are not allowed in keys")
+        self._pos += 3 if multiline else 1
+        if multiline:
+            self._string_newline()
         chunks: List[str] = []
         while True:
-            if self._eof() or self._text[self._pos] in "\r\n":
+            if self._eof() or (not multiline and self._peek() in "\r\n"):
                 raise self._fail("unterminated basic string")
             char = self._text[self._pos]
             if char == '"':
-                self._pos += 1
+                if multiline:
+                    end = self._pos
+                    while end < len(self._text) and self._text[end] == '"':
+                        end += 1
+                    count = end - self._pos
+                    if count > 5:
+                        raise self._fail("too many closing quotes")
+                    self._pos = end
+                    chunks.append('"' * (count - 3 if count >= 3 else count))
+                    if count < 3:
+                        continue
+                else:
+                    self._pos += 1
                 return "".join(chunks)
+            if multiline and self._string_newline():
+                chunks.append("\n")
+                continue
+            if (ord(char) < 32 and char != "\t") or ord(char) == 127:
+                raise self._fail("invalid control character in basic string")
             if char != "\\":
                 chunks.append(char)
                 self._pos += 1
                 continue
             self._pos += 1
+            if multiline and self._peek() in (" ", "\t", "\r", "\n"):
+                self._skip_spaces()
+                if not self._string_newline():
+                    raise self._fail("continuation requires a newline")
+                while True:
+                    self._skip_spaces()
+                    if not self._string_newline():
+                        break
+                continue
             if self._eof():
                 raise self._fail("unterminated escape sequence")
             escape = self._text[self._pos]
@@ -187,9 +216,22 @@ class _Parser:
                 ):
                     raise self._fail(f"invalid \\{escape} escape sequence")
                 self._pos += width
-                chunks.append(chr(int(digits, 16)))
+                scalar = int(digits, 16)
+                if scalar > 0x10FFFF or 0xD800 <= scalar <= 0xDFFF:
+                    raise self._fail("invalid Unicode scalar in escape sequence")
+                chunks.append(chr(scalar))
                 continue
             raise self._fail(f"unsupported escape sequence \\{escape}")
+
+    def _string_newline(self) -> bool:
+        """Consume LF or CRLF; bare CR is never a string newline."""
+        if self._starts_with("\r\n"):
+            self._pos += 2
+            return True
+        if self._peek() == "\n":
+            self._pos += 1
+            return True
+        return False
 
     def _parse_literal_string(self) -> str:
         if self._starts_with("'''"):
@@ -211,7 +253,7 @@ class _Parser:
         if char == "":
             raise self._fail("expected a value")
         if char == '"':
-            return self._parse_basic_string()
+            return self._parse_basic_string(multiline=self._starts_with('"""'))
         if char == "'":
             return self._parse_literal_string()
         if char == "[":
@@ -428,7 +470,7 @@ tests = ["tests/a.rs::b_product_divergence"]
 _SELF_TEST_REJECTIONS = (
     ('a = 1\na = 2\n', "duplicate key"),
     ('[a]\nk = 1\n[a]\n', "defined twice"),
-    ('a = """x"""\n', "multi-line basic strings"),
+    ('"""a""" = 1\n', "not allowed in keys"),
     ("a = '''x'''\n", "multi-line literal strings"),
     ("a = 1979-05-27\n", "date and time values"),
     ("a = 07:32:00\n", "date and time values"),
@@ -452,6 +494,11 @@ def _check(condition: bool, message: str) -> None:
 
 def _self_test() -> int:
     parsed = loads(_SELF_TEST_DOCUMENT)
+    _check(
+        loads('description = """\nfirst\nsecond\n"""')
+        == {"description": "first\nsecond\n"},
+        "normalized manifest multi-line description",
+    )
     _check(parsed["schema"] == 1, "integer value")
     _check(parsed["enabled"] is True and parsed["disabled"] is False, "boolean values")
     _check(parsed["ratio"] == 1.5 and parsed["scaled"] == 2000.0, "float values")
@@ -487,7 +534,7 @@ def _self_test() -> int:
 
     print(
         "toml-reader-self-test=ok "
-        f"cases={len(_SELF_TEST_REJECTIONS) + 1} "
+        f"cases={len(_SELF_TEST_REJECTIONS) + 2} "
         f"python={sys.version_info[0]}.{sys.version_info[1]}.{sys.version_info[2]} "
         f"floor={PYTHON_FLOOR[0]}.{PYTHON_FLOOR[1]}"
     )

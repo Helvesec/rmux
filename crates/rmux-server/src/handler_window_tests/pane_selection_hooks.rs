@@ -19,7 +19,7 @@ async fn selection_hook_fixture(label: &str) -> (RequestHandler, SessionName) {
         .lock()
         .await
         .sessions
-        .session_mut(&session)
+        .session_setup(&session)
         .expect("fixture session exists")
         .select_pane_in_window(0, 0)
         .expect("fixture selects pane zero");

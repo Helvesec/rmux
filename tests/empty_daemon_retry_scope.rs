@@ -108,13 +108,18 @@ fn requester_only_shutdown_still_follows_its_ack() -> Result<(), Box<dyn Error>>
     let mut sdk = connect(harness.socket_path())?;
 
     assert!(matches!(kill_alpha(&mut sdk)?, Response::KillSession(_)));
+    // A reply does not close a persistent Unix requester. Prove the ACK left
+    // it usable, then release the final transport before waiting for exit-empty.
+    assert_empty_sessions(sdk.list_sessions(empty_list_request())?)?;
+    assert!(generation_is_alive(generation)?);
+    drop(sdk);
     assert!(
         wait_for_generation_exit(generation, PROCESS_TIMEOUT)?,
-        "the requester-only path should stop after delivering its ACK"
+        "the requester-only path should stop after its acknowledged connection closes"
     );
     assert!(
-        sdk.list_sessions(empty_list_request()).is_err(),
-        "the stopped requester-only connection must not serve another request"
+        connect(harness.socket_path()).is_err(),
+        "the stopped generation must not accept another connection"
     );
     Ok(())
 }
@@ -179,6 +184,11 @@ fn a_concurrent_rescue_session_cancels_the_pending_empty_shutdown() -> Result<()
         })?,
         Response::KillSession(_)
     ));
+    // The rescue requester now owns the last transport, just as the original
+    // requester did before the rescue. Its ACK alone must not close it.
+    assert_empty_sessions(rescue.list_sessions(empty_list_request())?)?;
+    assert!(generation_is_alive(generation)?);
+    drop(rescue);
     assert!(wait_for_generation_exit(generation, PROCESS_TIMEOUT)?);
     Ok(())
 }

@@ -1,13 +1,13 @@
 use rmux_proto::{RmuxError, SessionName};
 
-use crate::{Pane, SessionId, SessionStore, Window};
+use crate::{Pane, SessionId, Window};
 
 use super::matching::{
     parse_prefixed_id, target_not_found, unique_match, MatchMode, ResolvedParts,
 };
 use super::TargetFindFlags;
 
-impl SessionStore {
+impl super::storage::TargetStore<'_> {
     pub(super) fn resolve_session_part(
         &self,
         value: &str,
@@ -20,7 +20,8 @@ impl SessionStore {
                 .ok_or_else(|| target_not_found(value, "session"));
         }
 
-        if let Ok(name) = SessionName::new(value.to_owned()) {
+        // Target text names an existing session in its canonical form.
+        if let Ok(name) = SessionName::from_canonical(value) {
             if let Some(session) = self.session(&name) {
                 return Ok(session.name().clone());
             }

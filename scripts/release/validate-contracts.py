@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import re
 import subprocess
+import sys
 from pathlib import Path
 from typing import Any
 
@@ -24,6 +25,7 @@ from shadow_contract import (
     validate_candidate_policy as validate_shadow_candidate_policy,
 )
 from strict_json import read_json_object
+from web_compatibility_contract import validate_published
 
 ROOT = Path(__file__).resolve().parents[2]
 CONTRACT_DIR = ROOT / ".github" / "release"
@@ -32,6 +34,7 @@ STANDARD_RUNNER_LABELS = {
     "macos-15-intel",
     "ubuntu-22.04",
     "ubuntu-22.04-arm",
+    "ubuntu-24.04",
     "ubuntu-latest",
     "windows-latest",
 }
@@ -160,9 +163,9 @@ def validate_candidate() -> None:
         for right in range(left + 1, len(qualification_sets))
     ):
         raise ValueError("qualification job conclusion sets overlap")
-    if len(set.union(*qualification_sets)) != 54 or len(qualification_success) != 53:
+    if len(set.union(*qualification_sets)) != 55 or len(qualification_success) != 54:
         raise ValueError(
-            "qualification contract must contain 53 successes and one variable cache job"
+            "qualification contract must contain 54 successes and one variable cache job"
         )
     qualification_shards = {
         name
@@ -193,10 +196,10 @@ def validate_candidate() -> None:
         raise ValueError("candidate run cannot have variable job conclusions")
     if (
         len(candidate_success) != 26
-        or len(candidate_skipped) != 26
+        or len(candidate_skipped) != 27
         or set(candidate_success) & set(candidate_skipped)
     ):
-        raise ValueError("candidate contract must contain 26 successes and 26 skips")
+        raise ValueError("candidate contract must contain 26 successes and 27 skips")
     runner_policy = contract.get("runner_policy")
     if not isinstance(runner_policy, dict) or runner_policy.get("provider") != (
         "github_standard_hosted"
@@ -302,6 +305,11 @@ def validate_candidate() -> None:
         "benches/perf/baselines/release-0.9.0-linux.json",
         "benches/perf/baselines/release-0.9.0.json",
         "deny.toml",
+        "tests/conformance/kitty_keyboard/coverage.json",
+        "tests/conformance/kitty_keyboard/obligations.jsonl",
+        "tests/conformance/kitty_keyboard/pin.json",
+        "tests/conformance/kitty_keyboard/policies.json",
+        "tests/conformance/kitty_keyboard/vectors.jsonl",
         "tests/reference/tmux_compat/divergences.toml",
         "tests/reference/tmux_compat/error_exit_matrix.yaml",
         "tests/reference/tmux_compat/frozen_reference.yaml",
@@ -539,7 +547,23 @@ def validate_measurement_budget() -> None:
         raise ValueError("failed release baseline anchors must disclose their scope")
 
 
+def validate_kitty_corpus() -> None:
+    result = subprocess.run(
+        [sys.executable, "-B", str(ROOT / "scripts/check-kitty-conformance.py")],
+        cwd=ROOT,
+        input="",
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    if result.returncode != 0:
+        raise ValueError("Kitty corpus integrity failed: " + result.stderr.strip())
+
+
 def main() -> int:
+    validate_published(ROOT)
+    from candidate_route import validate_contract as validate_rehearsal_contract
+    validate_rehearsal_contract(ROOT)
     validate_candidate()
     validate_candidate_workflow()
     validate_canonical_build()
@@ -549,6 +573,7 @@ def main() -> int:
     validate_downstream_contracts(ROOT)
     validate_measurement_budget()
     validate_repository_contracts(ROOT)
+    validate_kitty_corpus()
     print("release-contracts-ok")
     return 0
 

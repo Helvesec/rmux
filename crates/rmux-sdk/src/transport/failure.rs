@@ -124,6 +124,6 @@ fn handshake_protocol_error(error: &rmux_proto::RmuxError) -> RmuxError {
                 rmux_proto::CAPABILITY_HANDSHAKE
             ),
         ),
-        error => RmuxError::protocol(error.clone()),
+        error => RmuxError::from_proto(error.clone()),
     }
 }

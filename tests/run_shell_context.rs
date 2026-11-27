@@ -361,3 +361,122 @@ fn shell_quote(path: &std::path::Path) -> String {
 fn shell_quote_str(value: &str) -> String {
     format!("'{}'", value.replace('\'', "'\\''"))
 }
+
+#[test]
+fn callback_error_and_identical_shell_text_keep_distinct_control_status(
+) -> Result<(), Box<dyn Error>> {
+    let (harness, _daemon) = current_target_harness("run-shell-callback-status")?;
+    for mode in ["-C", "-CC"] {
+        for (body, callback, expected) in [
+            ("not-a-command", true, 1),
+            ("printf 'unknown command: not-a-command\\n'", false, 0),
+            (
+                "printf 'unknown command: not-a-command\\n'; exit 7",
+                false,
+                7,
+            ),
+        ] {
+            for delay in [None, Some("0"), Some("0.001")] {
+                let mut args = vec![mode, "run-shell"];
+                if callback {
+                    args.push("-C");
+                }
+                if let Some(delay) = delay {
+                    args.extend(["-d", delay]);
+                }
+                args.push(body);
+                let output = harness.run(&args)?;
+                assert_eq!(output.status.code(), Some(expected), "{args:?}: {output:?}");
+                let text = stdout(&output);
+                assert!(text.contains("%end "), "{text}");
+                assert!(!text.contains("%error "), "{text}");
+                assert!(text.find("%end ") < text.find("unknown command:"), "{text}");
+                assert!(stderr(&output).is_empty(), "{output:?}");
+            }
+        }
+    }
+    let output = harness.run(&[
+        "display-message",
+        "-p",
+        "BEFORE",
+        ";",
+        "run-shell",
+        "-C",
+        "not-a-command",
+        ";",
+        "display-message",
+        "-p",
+        "AFTER",
+    ])?;
+    assert_eq!(output.status.code(), Some(1));
+    assert_eq!(stdout(&output), "BEFORE\nAFTER\n");
+    assert_eq!(stderr(&output), "unknown command: not-a-command\n");
+    let file = harness.tmpdir().join("callback.conf");
+    fs::write(
+        &file,
+        "run-shell -C not-a-command\ndisplay-message -p AFTER\n",
+    )?;
+    for mode in [vec![], vec!["-C"]] {
+        let mut args = mode.clone();
+        args.extend(["source-file", file.to_str().unwrap()]);
+        let output = harness.run(&args)?;
+        assert_eq!(output.status.code(), Some(1), "{output:?}");
+        let diagnostic = format!("{}:1: unknown command: not-a-command", file.display());
+        if mode.is_empty() {
+            assert_eq!(stdout(&output), "AFTER\n");
+            assert_eq!(stderr(&output), format!("{diagnostic}\n"));
+        } else {
+            let text = stdout(&output);
+            assert!(text.contains(&diagnostic), "{text}");
+            assert!(!text.contains("%error "), "{text}");
+            assert!(text.contains("AFTER\n"), "{text}");
+        }
+    }
+    Ok(())
+}
+
+#[test]
+fn sourced_callback_errors_retain_file_and_line() -> Result<(), Box<dyn Error>> {
+    let (harness, _daemon) = current_target_harness("source-callback-location")?;
+    let file = harness.tmpdir().join("callback.conf");
+    for delay in ["", "-d 0", "-d 0.001"] {
+        let body = format!("run-shell -C {delay} not-a-command");
+        let output = harness.run(&["if-shell", "-F", "1", &body])?;
+        assert_eq!(output.status.code(), Some(1));
+        assert_eq!(stdout(&output), "");
+        assert_eq!(stderr(&output), "unknown command: not-a-command\n");
+        fs::write(
+            &file,
+            format!(
+                "# line one\n\nrun-shell -C {delay} not-a-command\n\
+                 display-message -p AFTER\n\
+                 run-shell -C {delay} another-missing-command\n"
+            ),
+        )?;
+        for mode in [vec![], vec!["-C"], vec!["-CC"]] {
+            let mut args = mode.clone();
+            args.extend(["source-file", file.to_str().unwrap()]);
+            let output = harness.run(&args)?;
+            let first = format!("{}:3: unknown command: not-a-command\n", file.display());
+            let second = format!(
+                "{}:5: unknown command: another-missing-command\n",
+                file.display()
+            );
+            assert_eq!(
+                output.status.code(),
+                Some(1),
+                "{delay} {mode:?}: {output:?}"
+            );
+            if mode.is_empty() {
+                assert_eq!(stdout(&output), "AFTER\n");
+                assert_eq!(stderr(&output), format!("{first}{second}"), "{delay}");
+            } else {
+                let text = stdout(&output);
+                assert!(text.contains(&first) && text.contains(&second), "{text}");
+                assert!(!text.contains("%error "), "{text}");
+                assert!(stderr(&output).is_empty());
+            }
+        }
+    }
+    Ok(())
+}

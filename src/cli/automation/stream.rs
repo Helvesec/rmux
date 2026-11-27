@@ -1,6 +1,6 @@
 use std::path::Path;
 
-use rmux_proto::{PaneOutputSubscriptionId, PaneOutputSubscriptionStart, Response};
+use rmux_proto::{PaneOutputSubscriptionId, PaneOutputSubscriptionStart, Response, RmuxError};
 use serde_json::json;
 
 use crate::cli_args::{CollectPaneOutputArgs, StreamPaneArgs};
@@ -8,14 +8,16 @@ use crate::cli_response::tmux_cli_error_message;
 
 use super::super::ExitFailure;
 use super::common::{
-    check_disabled, connect_cli, pane_process_state, pane_snapshot, resolve_pane_ref,
-    sleep_poll_interval, stdout_closed, visible_lines, visible_text, write_json, write_stderr_line,
-    write_stdout_bytes, write_stdout_bytes_or_broken_pipe, PaneProcessState, StdoutWrite,
-    SCHEMA_VERSION,
+    check_disabled, connect_cli, sleep_poll_interval, stdout_closed, visible_lines, visible_text,
+    write_json, write_stderr_line, write_stdout_bytes, write_stdout_bytes_or_broken_pipe,
+    StdoutWrite, SCHEMA_VERSION,
 };
+use super::pane_exit::PaneExitStatus;
+use super::wait_target::{self, StableWaitProcessState, StableWaitTarget};
 
 const CURSOR_BATCH_EVENTS: u16 = 128;
-const LINE_BUFFER_MAX: usize = 1_048_576;
+#[cfg(test)]
+use rmux_sdk::automation::LINE_BUFFER_MAX;
 
 pub(crate) fn run_stream_pane(
     args: StreamPaneArgs,
@@ -23,10 +25,11 @@ pub(crate) fn run_stream_pane(
 ) -> Result<i32, ExitFailure> {
     check_disabled("RMUX_DISABLE_STREAM_PANE", "stream-pane")?;
     let mut connection = connect_cli(socket_path)?;
-    let target = resolve_pane_ref(&mut connection, args.target.as_ref(), "stream-pane")?;
+    // The lag snapshot must follow the subscribed pane across session renames.
+    let mut target = wait_target::resolve(&mut connection, args.target.as_ref(), "stream-pane")?;
     let subscription_id = subscribe(
         &mut connection,
-        target.clone(),
+        target.target_ref(),
         PaneOutputSubscriptionStart::Oldest,
     )?;
     let line_mode = args.lines && !args.raw;
@@ -43,7 +46,7 @@ pub(crate) fn run_stream_pane(
             line_buffer.clear();
             line_buffer_force_flushed = false;
             if !wrote_stdout {
-                match write_lag_snapshot_seed(&mut connection, target.clone(), line_mode)? {
+                match write_lag_snapshot_seed(&mut connection, &mut target, line_mode)? {
                     LagSnapshotSeed::Written => wrote_stdout = true,
                     LagSnapshotSeed::BrokenPipe => {
                         let _ = connection.unsubscribe_pane_output(subscription_id);
@@ -92,10 +95,10 @@ enum LagSnapshotSeed {
 
 fn write_lag_snapshot_seed(
     connection: &mut rmux_client::Connection,
-    target: rmux_proto::PaneTargetRef,
+    target: &mut StableWaitTarget,
     line_mode: bool,
 ) -> Result<LagSnapshotSeed, ExitFailure> {
-    let snapshot = pane_snapshot(connection, target)?;
+    let snapshot = wait_target::snapshot(connection, target)?;
     if line_mode {
         let mut wrote = false;
         for line in visible_lines(&snapshot) {
@@ -133,11 +136,13 @@ pub(crate) fn run_collect_pane_output(
 ) -> Result<i32, ExitFailure> {
     check_disabled("RMUX_DISABLE_STREAM_PANE", "collect-pane-output")?;
     let mut connection = connect_cli(socket_path)?;
-    let target_ref =
-        resolve_pane_ref(&mut connection, args.target.as_ref(), "collect-pane-output")?;
+    // The pane is followed by its session and pane identities: a session
+    // name captured here goes stale as soon as the session is renamed.
+    let mut target =
+        wait_target::resolve(&mut connection, args.target.as_ref(), "collect-pane-output")?;
     let subscription_id = subscribe(
         &mut connection,
-        target_ref.clone(),
+        target.target_ref(),
         PaneOutputSubscriptionStart::Oldest,
     )?;
     let mut output = Vec::new();
@@ -164,11 +169,7 @@ pub(crate) fn run_collect_pane_output(
             }
         }
         if pane_exit.is_none() {
-            if let PaneProcessState::Exited(value) =
-                pane_process_state(&mut connection, &target_ref)?
-            {
-                pane_exit = Some(value);
-            }
+            pane_exit = observed_pane_exit(&mut connection, &mut target)?;
         }
         if saw_eof && pane_exit.is_some() {
             break;
@@ -212,6 +213,19 @@ pub(crate) fn run_collect_pane_output(
     write_stdout_bytes(&output)
 }
 
+/// The collected pane's exit status once its process has ended, `None` while
+/// it runs. A removed session reports a stale exit, as a removed pane does.
+fn observed_pane_exit(
+    connection: &mut rmux_client::Connection,
+    target: &mut StableWaitTarget,
+) -> Result<Option<PaneExitStatus>, ExitFailure> {
+    Ok(match wait_target::process_state(connection, target)? {
+        StableWaitProcessState::Alive => None,
+        StableWaitProcessState::Exited { status, .. } => Some(status),
+        StableWaitProcessState::TargetGone => Some(PaneExitStatus::stale()),
+    })
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) struct OutputLag {
     pub(super) missed_events: u64,
@@ -228,15 +242,22 @@ pub(super) fn subscribe(
     target: rmux_proto::PaneTargetRef,
     start: PaneOutputSubscriptionStart,
 ) -> Result<PaneOutputSubscriptionId, ExitFailure> {
+    try_subscribe(connection, target, start)?.map_err(|error| subscription_refused(&error))
+}
+
+/// Subscribes to pane output and hands back a daemon refusal as its typed
+/// error, so the caller decides on the variant rather than on its message.
+pub(super) fn try_subscribe(
+    connection: &mut rmux_client::Connection,
+    target: rmux_proto::PaneTargetRef,
+    start: PaneOutputSubscriptionStart,
+) -> Result<Result<PaneOutputSubscriptionId, RmuxError>, ExitFailure> {
     match connection
         .subscribe_pane_output_ref(target, start)
         .map_err(ExitFailure::from_client)?
     {
-        Response::SubscribePaneOutput(response) => Ok(response.subscription_id),
-        Response::Error(error) => Err(ExitFailure::new(
-            1,
-            tmux_cli_error_message("stream-pane", &error.error),
-        )),
+        Response::SubscribePaneOutput(response) => Ok(Ok(response.subscription_id)),
+        Response::Error(error) => Ok(Err(error.error)),
         other => Err(ExitFailure::new(
             1,
             format!(
@@ -245,6 +266,10 @@ pub(super) fn subscribe(
             ),
         )),
     }
+}
+
+pub(super) fn subscription_refused(error: &RmuxError) -> ExitFailure {
+    ExitFailure::new(1, tmux_cli_error_message("stream-pane", error))
 }
 
 pub(super) fn poll_output(
@@ -274,6 +299,12 @@ fn poll_output_inner(
         .map_err(ExitFailure::from_client)?
     {
         Response::PaneOutputCursor(response) => {
+            rmux_sdk::automation::validate_subscription_id(
+                "pane-output-cursor",
+                subscription_id,
+                response.subscription_id,
+            )
+            .map_err(|error| ExitFailure::new(1, error.to_string()))?;
             let mut saw_eof = false;
             let chunks = response
                 .events
@@ -294,6 +325,12 @@ fn poll_output_inner(
             })
         }
         Response::PaneOutputLag(response) => {
+            rmux_sdk::automation::validate_subscription_id(
+                "pane-output-lag",
+                subscription_id,
+                response.subscription_id,
+            )
+            .map_err(|error| ExitFailure::new(1, error.to_string()))?;
             if report_lag {
                 write_stderr_line(&format!(
                     "{command_name}: pane output lagged; missed {} events",
@@ -376,29 +413,12 @@ fn split_lines_bounded<F>(
     buffer: &mut Vec<u8>,
     force_flushed: &mut bool,
     bytes: &[u8],
-    mut emit: F,
+    emit: F,
 ) -> Result<(), ExitFailure>
 where
     F: FnMut(Vec<u8>) -> Result<(), ExitFailure>,
 {
-    for byte in bytes {
-        if *byte == b'\n' {
-            if buffer.is_empty() && *force_flushed {
-                *force_flushed = false;
-                continue;
-            }
-            emit(std::mem::take(buffer))?;
-            *force_flushed = false;
-        } else {
-            buffer.push(*byte);
-            *force_flushed = false;
-            if buffer.len() >= LINE_BUFFER_MAX {
-                emit(std::mem::take(buffer))?;
-                *force_flushed = true;
-            }
-        }
-    }
-    Ok(())
+    rmux_sdk::automation::split_lines_bounded(buffer, force_flushed, bytes, emit)
 }
 
 #[cfg(test)]

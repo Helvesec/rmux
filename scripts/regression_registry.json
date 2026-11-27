@@ -1,0 +1,783 @@
+{
+  "version": 1,
+  "provenance": {
+    "history": {
+      "path": "historical-projects/rmux-v28-progress/history.json",
+      "sha256": "384f690fd210a33a9fcd0018eed6d62e20168942a81d1186c301efff6405c41a"
+    },
+    "history_source": {
+      "id": "20260929-grid",
+      "path": "historical-projects/grid-archive/grid-20260928/GRID-grille.json",
+      "sha256": "e0e1f848a443d1a9195e465de32a6ee7f9ef03861f5c11b0d8f83004009f2cec"
+    },
+    "scope": "D17: accepted regressions of L01.4/L08.1/L08.6/L08.7/L11.5/L12.4/L16.2/L14.5. Historical receipts locate recipes, never prove the current candidate. L08.1 replays the Linux grid; macOS is supplementary historical evidence only. L11.5 is a documentary D5 fallback with grid — and no native cell. Existing OS/population and identity guards are preserved.",
+    "unselected_cells": {
+      "windows": "L01.4 recipe accepted on Windows 11; L08.1/L08.6/L08.7/L12.4/L16.2/L14.5 have no accepted selectable Windows recipe and remain NON_PROUVÉ. L11.5 has grid — and no native cell. Windows 10 is deferred.",
+      "macos": "L01.4/L08.7 recipes only. L08.1 has a Linux grid; its historical macOS supplement is not a selectable grid cell. L08.6/L12.4/L16.2/L14.5 remain NON_PROUVÉ on macOS. L11.5 has grid — and no native cell."
+    }
+  },
+  "threat_model": {
+    "path": "docs/assurance-case.md",
+    "heading": "## RMUX threat model\n",
+    "sha256": "aa0b33333a8ed8614aa70dbaff2edce1518f1c9830558d151a9643e5d68b290a"
+  },
+  "receipts": {
+    "tree-closed": {
+      "path": "historical-projects/audit-archive-20260928/decisions/PASS-20260930T1025-L12.4-CLOSED.json",
+      "sha256": "15e368ef05280996ab04ee7605f877f2f30b09ced35e5c5092d711243f2537f4"
+    },
+    "tree-commands": {
+      "path": "historical-projects/audit-int-train-direct-041/.rmux-audit/int041/tree-v5-linux/commands.json",
+      "sha256": "b417fbda6465682e5f2cefdbd7e45daa297493854d5b54d860926516dd195849"
+    },
+    "web-closed": {
+      "path": "historical-projects/audit-archive-20260928/decisions/PASS-20261001T0100-L16.2-CLOSED.json",
+      "sha256": "5e059fd6e37e8cb799efc90381a37042d5fcb758e988c3775ba37e08d6874f10"
+    },
+    "web-review": {
+      "path": "historical-projects/audit-archive-20260928/results/R1-WEB-LINUX-FINAL-PROOF-REVIEW-057/REVUE.md",
+      "sha256": "cb5ff3ca2e422803e19a867943a71acae1df0d6759a63994ae9a0b6d388f4dfb"
+    },
+    "web-author": {
+      "path": "historical-projects/audit-archive-20260928/results/S5-L16-WEB-LINUX-RESUME-CLOSE-025/REMISE.md",
+      "sha256": "e5ff081b87bc15f6dfcac75d74418b967dbccad1177dbe54291dfbdbd3e64c26"
+    },
+    "supply-review": {
+      "path": "historical-projects/audit-archive-20260928/results/R1-L14-INT105-LINE-CLOSURE-REVIEW-163/REVUE.md",
+      "sha256": "b8f7053c6a04128bc62b1f8c06fccf4d7c9b9ed649ac3812f28875bee4fc2ca0"
+    },
+    "supply-author": {
+      "path": "historical-projects/audit-archive-20260928/results/S6-L14-SUPPLY-CODE-012/REMISE.md",
+      "sha256": "e58388beb738fa5e3b0a1085da7e3487b3fbf008d2ec0968b89394fc8459187c"
+    },
+    "supply-native": {
+      "path": "historical-projects/audit-archive-20260928/.rmux-audit/S6-L14-NOTICE-LINUX-DELIVERY-FINISH-052/native-union.json",
+      "sha256": "0b7466b9b915d0d792c581d45f9c42e43208c2d179bd6e569e3773370902dccf"
+    },
+    "formats-closed": {
+      "path": "historical-projects/audit-archive-20260928/results/R1-L086-C3-S1077-CLOSURE-REVIEW-210/REVUE.md",
+      "sha256": "fa4852df7a8313e3fb3b860c5f00c00f64b0bbec48f3a8a894ec93cefcfa70bb"
+    },
+    "formats-prior": {
+      "path": "historical-projects/audit-archive-20260928/results/R1-L086-INT118-LINUX-FF-CLOSURE-REVIEW-209/REVUE.md",
+      "sha256": "c22970345afcad41601c51ac8d2bc762ea94be437864a04748cdab16ca126822"
+    },
+    "formats-commands": {
+      "path": "historical-projects/audit-archive-20260928/.rmux-audit/INT118/cells-commands.json",
+      "sha256": "025113c5e0c4aba4e56826949661738f87fa62c808e39f68e429126895658db5"
+    },
+    "send-keys-closed": {
+      "path": "historical-projects/audit-archive-20260928/results/R1-INT118-GROUP-NATIVE-FF-REVIEW-216/REVUE.md",
+      "sha256": "85a973c1924057103b9fbdaa17e9efe0a429fba8e906326349f8940022fcb441"
+    },
+    "send-keys-commands": {
+      "path": "historical-projects/audit-archive-20260928/.rmux-audit/INT118/group-linux-receipts/cells-commands.json",
+      "sha256": "1d8914ec983ba32515c199a3289d43901857a0e90675332f1e2f37fb1bacb61e"
+    },
+    "ratchets-closed": {
+      "path": "historical-projects/audit-archive-20260928/results/R1-L014-INT151-LANDED-CLOSURE-REVIEW-290/REVUE.md",
+      "sha256": "c96c1ca31a49039a3dfb40295621bb0b636eed3698662be50dc4bbcbc80c239a"
+    },
+    "ratchets-suite": {
+      "path": "historical-projects/audit-int150/.rmux-audit/INT150/suite-receipt.json",
+      "sha256": "311f0bfb7816e29f6c6526713208c2ac570fa24dc2aab5e6a3bfb08b9e0d89c6"
+    },
+    "ratchets-windows-review": {
+      "path": "historical-projects/audit-archive-20260928/results/R1-INT144-NATIVE-FF-PROOFS-REVIEW-281/REVUE.md",
+      "sha256": "832d1c7599d5a4c08244828ff320577ca8cdc9ab8a447f9be7541ef286193f96"
+    },
+    "ratchets-windows-recipe": {
+      "path": "historical-projects/audit-archive-20260928/.rmux-audit/INT144/windows-support144/windows-parser144.py",
+      "sha256": "e1e26c355f58b692074c54af6bb1447ef1db04a94eaad8843967ef9cf508b64f"
+    },
+    "options-closed": {
+      "path": "historical-projects/audit-archive-20260928/results/R1-INT270-C4-H-U-NATIVE-REVIEW-510/REVUE.md",
+      "sha256": "aa305ea28fc1e824f627f1daea394f6fa3ac921f39d70ee86e336134fb6d143a"
+    },
+    "options-prior": {
+      "path": "historical-projects/audit-archive-20260928/results/R1-INT269-L081-NATIVE-GROUPED-REVIEW-509/REVUE.md",
+      "sha256": "23608b36ae86c6db6a1bb1fec54521ef53d82665a73109624a596b4aaf794131"
+    },
+    "options-bank-commands": {
+      "path": "historical-projects/audit-archive-20260928/.rmux-audit/INT269/native-light-copies/evidence/LINUX-BANK-FINAL.json",
+      "sha256": "31a30c97f80c510bc95ad677a3767a97017c21b3aa0d2cf119e877669ab608ff"
+    },
+    "options-flags-plan": {
+      "path": "historical-projects/audit-archive-20260928/.rmux-audit/INT270/mac/NATIVE-C4-PLAN.json",
+      "sha256": "ee1a64f3c2fcb0140d63cea52818229cf97aa1d8234defcd7e12289e8d66955d"
+    },
+    "options-flags-commands": {
+      "path": "historical-projects/audit-archive-20260928/.rmux-audit/INT270/native-light-copies/PAIR-COMPARISON.json",
+      "sha256": "2034b04d0c8a26a39302c25377569e3287497e77ee8444a993c0bda9ae03eba4"
+    },
+    "kitty-closed": {
+      "path": "historical-projects/audit-archive-20260928/results/R1-L115-D5-CENTRAL-CLOSURE-REVIEW-523/REVUE.md",
+      "sha256": "7bbbe74499f1b91916194cbd1a102b2958df667a8babd6ccd01b443d4845e15f"
+    }
+  },
+  "commands": [
+    {
+      "id": "tree-preview",
+      "argv": [
+        "cargo",
+        "test",
+        "--locked",
+        "--offline",
+        "-p",
+        "rmux-server",
+        "--lib",
+        "mode_tree_support",
+        "--",
+        "--test-threads=1"
+      ],
+      "sources": [
+        "crates/rmux-server/src/handler_mode_tree/tests/preview_rendering.rs"
+      ],
+      "coverage": [
+        {
+          "line": "L12.4",
+          "criteria": [
+            "3.composition"
+          ],
+          "os": [
+            "linux"
+          ],
+          "receipts": [
+            "tree-closed",
+            "tree-commands"
+          ]
+        }
+      ],
+      "min_tests": 136,
+      "required_tests": [
+        "l12_tree_preview_unicode_is_not_always_empty"
+      ]
+    },
+    {
+      "id": "web-quotas-render",
+      "argv": [
+        "cargo",
+        "test",
+        "--locked",
+        "--offline",
+        "-p",
+        "rmux-server",
+        "--lib",
+        "--",
+        "web",
+        "scene",
+        "pane_transfer_scroll_on_clear",
+        "--test-threads=1"
+      ],
+      "sources": [
+        "crates/rmux-server/src/handler_web_tests.rs",
+        "crates/rmux-server/src/handler_web_initial_render_tests.rs",
+        "crates/rmux-server/src/web/server/rate_limit.rs",
+        "crates/rmux-server/src/web/outbound/tests.rs"
+      ],
+      "coverage": [
+        {
+          "line": "L16.2",
+          "criteria": [
+            "4.web"
+          ],
+          "os": [
+            "linux"
+          ],
+          "receipts": [
+            "web-closed",
+            "web-review",
+            "web-author"
+          ]
+        }
+      ],
+      "min_tests": 330,
+      "required_tests": [
+        "web_scene_render_allows_independent_session_lookup",
+        "allows_exactly_the_budget_then_fails_closed",
+        "refills_after_the_window_elapses"
+      ]
+    },
+    {
+      "id": "web-no-listener",
+      "argv": [
+        "python",
+        "scripts/regression_registry_checks.py",
+        "web-no-listener"
+      ],
+      "sources": [
+        "scripts/regression_registry_checks.py",
+        "scripts/fixtures/web_no_listener_sdk.rs"
+      ],
+      "coverage": [
+        {
+          "line": "L16.2",
+          "criteria": [
+            "4.web"
+          ],
+          "os": [
+            "linux"
+          ],
+          "receipts": [
+            "web-closed",
+            "web-review",
+            "web-author"
+          ]
+        }
+      ]
+    },
+    {
+      "id": "license-allowlist",
+      "argv": [
+        "cargo",
+        "deny",
+        "check",
+        "licenses"
+      ],
+      "sources": [
+        "deny.toml",
+        "Cargo.lock"
+      ],
+      "coverage": [
+        {
+          "line": "L14.5",
+          "criteria": [
+            "4.supply"
+          ],
+          "os": [
+            "linux"
+          ],
+          "receipts": [
+            "supply-review",
+            "supply-author"
+          ]
+        }
+      ]
+    },
+    {
+      "id": "notice-distribution",
+      "argv": [
+        "python",
+        "tests/fixtures/release_notice_distribution.py"
+      ],
+      "sources": [
+        "tests/fixtures/release_notice_distribution.py"
+      ],
+      "coverage": [
+        {
+          "line": "L14.5",
+          "criteria": [
+            "4.supply"
+          ],
+          "os": [
+            "linux"
+          ],
+          "receipts": [
+            "supply-review",
+            "supply-author"
+          ]
+        }
+      ]
+    },
+    {
+      "id": "notice-built-graph",
+      "argv": [
+        "python",
+        "scripts/regression_registry_checks.py",
+        "notice-build"
+      ],
+      "sources": [
+        "scripts/regression_registry_checks.py",
+        "scripts/packaging/notices.py",
+        "xtask/src/third_party_notice.rs"
+      ],
+      "coverage": [
+        {
+          "line": "L14.5",
+          "criteria": [
+            "4.supply"
+          ],
+          "os": [
+            "linux"
+          ],
+          "receipts": [
+            "supply-review",
+            "supply-native"
+          ]
+        }
+      ]
+    },
+    {
+      "id": "reviewed-threat-model",
+      "argv": [
+        "python",
+        "scripts/regression_registry_checks.py",
+        "threat-model"
+      ],
+      "sources": [
+        "scripts/regression_registry_checks.py",
+        "docs/assurance-case.md"
+      ],
+      "coverage": [
+        {
+          "line": "L14.5",
+          "criteria": [
+            "4.supply"
+          ],
+          "os": [
+            "linux"
+          ],
+          "receipts": [
+            "supply-review"
+          ]
+        }
+      ]
+    },
+    {
+      "id": "independent-formats-corpus",
+      "argv": [
+        "python",
+        "scripts/regression_registry_checks.py",
+        "formats-corpus"
+      ],
+      "sources": [
+        "scripts/regression_registry_checks.py",
+        "tests/format_jobs_reference.py",
+        "tests/format_jobs_reference/bounded.py",
+        "tests/format_jobs_reference/routes.py",
+        "tests/format_jobs_reference/formats_independent_routes.json",
+        "tests/format_jobs_reference/formats_independent_routes_expected.json",
+        "tests/format_jobs_reference/test_routes.py"
+      ],
+      "coverage": [
+        {
+          "line": "L08.6",
+          "criteria": [
+            "2A.formats-rest"
+          ],
+          "os": [
+            "linux"
+          ],
+          "receipts": [
+            "formats-closed",
+            "formats-prior",
+            "formats-commands"
+          ]
+        }
+      ]
+    },
+    {
+      "id": "formats-core-lib",
+      "argv": [
+        "cargo",
+        "test",
+        "--locked",
+        "--offline",
+        "-p",
+        "rmux-core",
+        "--lib",
+        "--",
+        "--test-threads=6"
+      ],
+      "sources": [
+        "crates/rmux-core/src/options/tests/registry_metadata.rs",
+        "crates/rmux-core/src/options/render.rs",
+        "crates/rmux-core/src/options/tests.rs",
+        "crates/rmux-core/src/options/tests/empty_user_show.rs"
+      ],
+      "coverage": [
+        {
+          "line": "L08.6",
+          "criteria": [
+            "2A.formats-rest"
+          ],
+          "os": [
+            "linux"
+          ],
+          "receipts": [
+            "formats-closed",
+            "formats-prior"
+          ]
+        }
+      ],
+      "min_tests": 1600,
+      "required_tests": [
+        "options::tests::registry_metadata::generated_options_bank_inventory"
+      ]
+    },
+    {
+      "id": "formats-core-options-ignored",
+      "argv": [
+        "python",
+        "scripts/regression_registry_checks.py",
+        "options-bank"
+      ],
+      "test_argv": [
+        "cargo",
+        "test",
+        "--locked",
+        "--offline",
+        "-p",
+        "rmux-core",
+        "options::tests::registry_metadata::generated_options_bank_inventory",
+        "--",
+        "--ignored",
+        "--exact"
+      ],
+      "sources": [
+        "scripts/regression_registry_checks.py",
+        "scripts/regression_registry.py",
+        "crates/rmux-core/src/options/tests/registry_metadata.rs",
+        "crates/rmux-core/src/options/tests/frozen.rs",
+        "tests/reference/tmux_compat/frozen_reference.yaml"
+      ],
+      "coverage": [
+        {
+          "line": "L08.6",
+          "criteria": [
+            "2A.formats-rest"
+          ],
+          "os": [
+            "linux"
+          ],
+          "receipts": [
+            "formats-commands",
+            "formats-prior",
+            "formats-closed"
+          ]
+        }
+      ],
+      "min_tests": 1,
+      "required_tests": [
+        "options::tests::registry_metadata::generated_options_bank_inventory"
+      ]
+    },
+    {
+      "id": "send-keys-cli",
+      "argv": [
+        "cargo",
+        "test",
+        "--locked",
+        "--offline",
+        "-p",
+        "rmux",
+        "--test",
+        "send_keys_formats",
+        "--",
+        "--test-threads=1"
+      ],
+      "sources": [
+        "tests/send_keys_formats.rs"
+      ],
+      "coverage": [
+        {
+          "line": "L08.7",
+          "criteria": [
+            "2A.formats-rest",
+            "2A.send-f"
+          ],
+          "os": [
+            "linux",
+            "macos"
+          ],
+          "receipts": [
+            "send-keys-closed",
+            "send-keys-commands"
+          ]
+        }
+      ],
+      "min_tests": 7,
+      "required_tests": [
+        "send_keys_formats_cli_neighbors",
+        "send_keys_formats_source_and_queue_use_execution_context",
+        "send_keys_formats_startup_config",
+        "send_keys_formats_copy_mode_single_argv_boundary",
+        "send_keys_plain_copy_mode_single_argv_boundary"
+      ]
+    },
+    {
+      "id": "send-keys-lib",
+      "argv": [
+        "cargo",
+        "test",
+        "--locked",
+        "--offline",
+        "-p",
+        "rmux-server",
+        "--lib",
+        "--",
+        "handler::tests::send_keys_tests::format_expansion::",
+        "handler::tests::send_keys_tests::basic_dispatch::send_keys_plain_input_uses_copy_mode_until_copy_mode_exits",
+        "handler::tests::send_keys_tests::basic_dispatch::send_keys_k_",
+        "handler::tests::send_keys_tests::basic_dispatch::switch_client_t_sets_custom_key_table_for_next_k_dispatch",
+        "--test-threads=1"
+      ],
+      "sources": [
+        "crates/rmux-server/src/handler_send_keys_tests/format_expansion.rs",
+        "crates/rmux-server/src/handler_send_keys_tests/basic_dispatch.rs"
+      ],
+      "coverage": [
+        {
+          "line": "L08.7",
+          "criteria": [
+            "2A.formats-rest",
+            "2A.send-f"
+          ],
+          "os": [
+            "linux",
+            "macos"
+          ],
+          "receipts": [
+            "send-keys-closed",
+            "send-keys-commands"
+          ]
+        }
+      ],
+      "min_tests": 11,
+      "required_tests": [
+        "format_flag_without_copy_mode_ext2_preserves_literals_and_count",
+        "format_flag_without_copy_mode_binding_keeps_payload_literal",
+        "format_expansion_copy_mode_command_uses_current_target",
+        "format_expansion_plain_copy_mode_preserves_argument_boundary",
+        "send_keys_plain_input_uses_copy_mode_until_copy_mode_exits",
+        "send_keys_k_dispatches_prefix_table_bindings",
+        "send_keys_k_binding_task_preserves_disabled_hook_context",
+        "send_keys_k_prefix_precedes_a_transient_key_table",
+        "send_keys_k_uses_copy_mode_bindings_until_copy_mode_exits",
+        "send_keys_k_uses_copy_mode_vi_bindings_when_mode_keys_is_vi",
+        "switch_client_t_sets_custom_key_table_for_next_k_dispatch"
+      ]
+    },
+    {
+      "id": "source-inventory-ratchets",
+      "argv": [
+        "python",
+        "scripts/regression_registry_checks.py",
+        "source-inventory"
+      ],
+      "sources": [
+        "scripts/regression_registry_checks.py",
+        "scripts/source-inventory/Cargo.toml",
+        "scripts/source-inventory/Cargo.lock",
+        "scripts/source-inventory/inventory.py",
+        "scripts/source-inventory/compare.py",
+        "scripts/source-inventory/production_gate.py",
+        "scripts/source-inventory/test_inventory.py",
+        "scripts/source-inventory/test_production_policy.py",
+        "scripts/source-inventory/test_lot_envelopes.py",
+        "scripts/source-inventory/test_composition_coverage.py",
+        "scripts/source-inventory/test_repository_classification.py"
+      ],
+      "coverage": [
+        {
+          "line": "L01.4",
+          "criteria": [
+            "transverse"
+          ],
+          "os": [
+            "linux",
+            "macos",
+            "windows"
+          ],
+          "receipts": [
+            "ratchets-closed",
+            "ratchets-suite",
+            "ratchets-windows-review",
+            "ratchets-windows-recipe"
+          ]
+        }
+      ]
+    },
+    {
+      "id": "options-per-option",
+      "argv": [
+        "python",
+        "scripts/regression_registry_checks.py",
+        "options-per-option"
+      ],
+      "sources": [
+        "scripts/regression_registry_checks.py",
+        "scripts/regression_registry_options.py",
+        "scripts/regression_registry_options_flags.json",
+        "tests/options_bank.py",
+        "tests/options_bank_contract.json",
+        "tests/options_bank_linux.py",
+        "tests/options_geometry_linux.py",
+        "crates/rmux-core/src/options/tests/registry_metadata.rs"
+      ],
+      "coverage": [
+        {
+          "line": "L08.1",
+          "criteria": [
+            "2A.options"
+          ],
+          "os": [
+            "linux"
+          ],
+          "receipts": [
+            "options-closed",
+            "options-prior",
+            "options-bank-commands",
+            "options-flags-plan",
+            "options-flags-commands"
+          ]
+        }
+      ],
+      "population": {
+        "options": 153,
+        "phases": 306,
+        "first": [
+          "default-shell",
+          "status-interval"
+        ],
+        "flag_operations_per_phase": 58
+      },
+      "recipe": {
+        "driver": [
+          "python",
+          "-B",
+          "tests/options_bank_linux.py",
+          "per-option",
+          "CONTRACT",
+          "PHASE",
+          "OUTPUT"
+        ],
+        "timeout_seconds": 420,
+        "source": "current HEAD only; fresh registry and contracts; oracle first"
+      }
+    }
+  ],
+  "cells": [
+    {
+      "line": "L12.4",
+      "os": "linux",
+      "commands": [
+        "tree-preview"
+      ]
+    },
+    {
+      "line": "L16.2",
+      "os": "linux",
+      "commands": [
+        "web-quotas-render",
+        "web-no-listener"
+      ]
+    },
+    {
+      "line": "L14.5",
+      "os": "linux",
+      "commands": [
+        "license-allowlist",
+        "notice-distribution",
+        "notice-built-graph",
+        "reviewed-threat-model"
+      ]
+    },
+    {
+      "line": "L08.6",
+      "os": "linux",
+      "commands": [
+        "independent-formats-corpus",
+        "formats-core-lib",
+        "formats-core-options-ignored"
+      ]
+    },
+    {
+      "line": "L08.7",
+      "os": "linux",
+      "commands": [
+        "send-keys-cli",
+        "send-keys-lib"
+      ]
+    },
+    {
+      "line": "L08.7",
+      "os": "macos",
+      "commands": [
+        "send-keys-cli",
+        "send-keys-lib"
+      ]
+    },
+    {
+      "line": "L01.4",
+      "os": "linux",
+      "commands": [
+        "source-inventory-ratchets"
+      ]
+    },
+    {
+      "line": "L01.4",
+      "os": "macos",
+      "commands": [
+        "source-inventory-ratchets"
+      ]
+    },
+    {
+      "line": "L01.4",
+      "os": "windows",
+      "commands": [
+        "source-inventory-ratchets"
+      ]
+    },
+    {
+      "line": "L08.1",
+      "os": "linux",
+      "commands": [
+        "options-per-option"
+      ]
+    }
+  ],
+  "documentary": [
+    {
+      "line": "L11.5",
+      "criteria": [
+        "3.kitty-native"
+      ],
+      "os": [],
+      "basis": "D5 fallback; L11.4 REPORTÉE D71",
+      "receipts": [
+        "kitty-closed"
+      ],
+      "sources": [
+        "Cargo.toml",
+        "crates/rmux-core/Cargo.toml",
+        "crates/rmux-server/Cargo.toml",
+        "crates/rmux-core/src/screen/writer.rs",
+        "crates/rmux-core/src/input/writer.rs",
+        "README.md",
+        "docs/man/rmux.1",
+        "crates/rmux-core/tests/kitty_fallback.rs",
+        "xtask/src/msrv/tests.rs",
+        "xtask/src/msrv/cells.rs"
+      ],
+      "protectors": [
+        {
+          "source": "crates/rmux-core/tests/kitty_fallback.rs",
+          "test": "kitty_keyboard_falls_back_unless_explicitly_enabled"
+        },
+        {
+          "source": "xtask/src/msrv/tests.rs",
+          "test": "server_powerset_checks_test_targets_without_workspace_feature_unification"
+        },
+        {
+          "source": "xtask/src/msrv/tests.rs",
+          "test": "no_default_sdk_targets_are_checked_without_workspace_feature_unification"
+        }
+      ],
+      "gates": [
+        "scripts/gate-unix-fast.sh",
+        "scripts/gate-windows-fast.ps1"
+      ],
+      "review_scope": "Review default features for full/tiny CLI, daemon and libraries and the README/man fallback together. Existing workspace tests protect the fallback and independent feature matrix; no L11.4 native qualification.",
+      "reviewed_sources": {
+        "Cargo.toml": "5f699f255f2e06aae766523f829482778b6ff19990b9a302302ea74968514e66",
+        "crates/rmux-core/Cargo.toml": "842c71fbd04cd662b9d165590b610aa0e5abd2d112e8ba2ebec8fdb6f833797a",
+        "crates/rmux-server/Cargo.toml": "8a63fc0bf3cb448faf4497c5aebf968a037418e94bb30b8c2f7b859b2a650d22",
+        "crates/rmux-core/src/screen/writer.rs": "50951cd37ff2013e9748399a5a7d6e39b5b9fada98ff558f0d36c59765b11bf7",
+        "crates/rmux-core/src/input/writer.rs": "5f09cac3cf206be327cdc1abd992dc9318a73a85234cfc2f2129d5a95e11b724",
+        "README.md": "ce6b196dece5d81679e789850d285c03f63a1c3117ffd5e8ca22adf3c380e11b",
+        "docs/man/rmux.1": "c23fc28f989f7176fa4949a30dc989f3c0d7ff5b30d488dfeb4db9124d13c1ce"
+      }
+    }
+  ]
+}

@@ -9,11 +9,17 @@ state.
 
 ## Usage
 
+For a 0.11.0 daemon (wire 9), use the adapter and SDK from the same checkout.
+Replace `/path/to/rmux` in both paths with its location. Once both 0.11.0
+crates are published, you can omit the paths and keep the version requirements.
+
+For a path containing an apostrophe, use double quotes and forward slashes (for example, `"C:/src/team's/rmux/crates/rmux-sdk"`).
+
 ```toml
 [dependencies]
-ratatui = "0.29"
-ratatui-rmux = "0.10.0"
-rmux-sdk = "0.10.0"
+ratatui = "0.30"
+ratatui-rmux = { path = '/path/to/rmux/crates/ratatui-rmux', version = "0.11.0" }
+rmux-sdk = { path = '/path/to/rmux/crates/rmux-sdk', version = "0.11.0" }
 ```
 
 ```rust

@@ -15,12 +15,14 @@ fn claude_install_skill_writes_user_level_skill() -> Result<(), Box<dyn Error>> 
     let home = root.join("home");
     fs::create_dir_all(&home)?;
 
-    let output = Command::new(env!("CARGO_BIN_EXE_rmux"))
-        .arg("claude")
-        .arg("install-skill")
-        .env("HOME", &home)
-        .env("USERPROFILE", &home)
-        .output()?;
+    let output = Command::new(rmux_os::build_identity::cargo_binary(env!(
+        "CARGO_BIN_EXE_rmux"
+    )))
+    .arg("claude")
+    .arg("install-skill")
+    .env("HOME", &home)
+    .env("USERPROFILE", &home)
+    .output()?;
 
     assert!(
         output.status.success(),
@@ -47,12 +49,14 @@ fn claude_install_skill_writes_user_level_skill() -> Result<(), Box<dyn Error>> 
         "stdout should mention repository skill source, got {stdout:?}"
     );
 
-    let second = Command::new(env!("CARGO_BIN_EXE_rmux"))
-        .arg("claude")
-        .arg("install-skill")
-        .env("HOME", &home)
-        .env("USERPROFILE", &home)
-        .output()?;
+    let second = Command::new(rmux_os::build_identity::cargo_binary(env!(
+        "CARGO_BIN_EXE_rmux"
+    )))
+    .arg("claude")
+    .arg("install-skill")
+    .env("HOME", &home)
+    .env("USERPROFILE", &home)
+    .output()?;
     assert!(
         second.status.success(),
         "second install should be idempotent\nstdout:\n{}\nstderr:\n{}",
@@ -85,12 +89,14 @@ fn claude_install_skill_backs_up_existing_custom_skill() -> Result<(), Box<dyn E
     fs::create_dir_all(skill.parent().expect("skill parent"))?;
     fs::write(&skill, "custom user skill\n")?;
 
-    let output = Command::new(env!("CARGO_BIN_EXE_rmux"))
-        .arg("claude")
-        .arg("install-skill")
-        .env("HOME", &home)
-        .env("USERPROFILE", &home)
-        .output()?;
+    let output = Command::new(rmux_os::build_identity::cargo_binary(env!(
+        "CARGO_BIN_EXE_rmux"
+    )))
+    .arg("claude")
+    .arg("install-skill")
+    .env("HOME", &home)
+    .env("USERPROFILE", &home)
+    .output()?;
 
     assert!(
         output.status.success(),
@@ -124,11 +130,13 @@ fn claude_install_skill_refuses_to_overwrite_symlink() -> Result<(), Box<dyn Err
     fs::write(&target, "custom target\n")?;
     symlink(&target, &skill)?;
 
-    let output = Command::new(env!("CARGO_BIN_EXE_rmux"))
-        .arg("claude")
-        .arg("install-skill")
-        .env("HOME", &home)
-        .output()?;
+    let output = Command::new(rmux_os::build_identity::cargo_binary(env!(
+        "CARGO_BIN_EXE_rmux"
+    )))
+    .arg("claude")
+    .arg("install-skill")
+    .env("HOME", &home)
+    .output()?;
 
     assert!(
         !output.status.success(),

@@ -40,6 +40,8 @@ pub(crate) enum WaitForRegistration {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum WaitForWake {
     Ready,
+    /// Released by an idle exit's flush: the wait ends as if it had been served.
+    Flushed,
     Shutdown,
 }
 
@@ -222,7 +224,19 @@ impl WaitForStore {
         Ok(())
     }
 
-    pub(crate) fn shutdown(&mut self) {
+    /// Releases every waiter and lock and forgets every channel, as tmux 3.7b's
+    /// `cmd_wait_for_flush` does before an idle exit; later waits still work.
+    pub(crate) fn flush(&mut self) {
+        for (_, state) in self.channels.drain() {
+            for waiter in state.signal_waiters.into_iter().chain(state.lock_waiters) {
+                let _ = waiter.wake.send(WaitForWake::Flushed);
+            }
+        }
+    }
+
+    /// Wakes every waiter for good; returns whether this call began the shutdown.
+    pub(crate) fn shutdown(&mut self) -> bool {
+        let first = !self.shutting_down;
         self.shutting_down = true;
         for state in self.channels.values_mut() {
             for waiter in state.signal_waiters.drain(..) {
@@ -236,6 +250,7 @@ impl WaitForStore {
             state.granted_lock_waiter = None;
         }
         self.channels.clear();
+        first
     }
 
     #[cfg(test)]
@@ -318,4 +333,44 @@ fn grant_next_lock_waiter(state: &mut WaitForChannel) -> bool {
     }
 
     false
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{WaitForRegistration, WaitForStore, WaitForWake};
+
+    fn waiting(registration: WaitForRegistration) -> tokio::sync::oneshot::Receiver<WaitForWake> {
+        match registration {
+            WaitForRegistration::Waiting { receiver, .. } => receiver,
+            other => panic!("expected a waiting registration, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_flush_releases_every_waiter_and_lock_and_keeps_later_waits_working() {
+        let mut store = WaitForStore::default();
+        let mut signal = waiting(store.register_wait("signal".to_owned()));
+        assert!(matches!(
+            store.register_lock("lock".to_owned()),
+            WaitForRegistration::Ready
+        ));
+        let mut lock = waiting(store.register_lock("lock".to_owned()));
+
+        store.flush();
+
+        assert_eq!(signal.try_recv(), Ok(WaitForWake::Flushed));
+        assert_eq!(lock.try_recv(), Ok(WaitForWake::Flushed));
+        assert_eq!(store.waiter_counts("signal"), (0, 0, false));
+        assert_eq!(store.waiter_counts("lock"), (0, 0, false));
+        assert!(
+            matches!(
+                store.register_lock("lock".to_owned()),
+                WaitForRegistration::Ready
+            ),
+            "the flushed lock is free again"
+        );
+        let mut later = waiting(store.register_wait("signal".to_owned()));
+        store.signal("signal").expect("signal after a flush");
+        assert_eq!(later.try_recv(), Ok(WaitForWake::Ready));
+    }
 }

@@ -20,7 +20,7 @@ async fn create_session(handler: &RequestHandler, name: &str) {
             environment: None,
         }))
         .await;
-    assert!(matches!(response, Response::NewSession(_)));
+    crate::session_fixture::assert_new_session(&response);
 }
 
 async fn set_after_new_window_hook(handler: &RequestHandler, command: &str, append: bool) {
@@ -153,6 +153,37 @@ async fn appended_after_new_window_hooks_run_once_in_order() {
 }
 
 #[tokio::test]
+async fn a_hook_holding_a_command_list_runs_every_command_like_tmux() {
+    // tmux 3.7b: `set-hook -g after-new-window 'a ; b'` runs a then b,
+    // whether the list is written on one line or on several.
+    for (buffer, list) in [
+        (
+            "hook-list",
+            "set-buffer -a -b hook-list A ; set-buffer -a -b hook-list B",
+        ),
+        (
+            "hook-lines",
+            "set-buffer -a -b hook-lines A\nset-buffer -a -b hook-lines B",
+        ),
+    ] {
+        let handler = RequestHandler::new();
+        let alpha = session_name("alpha");
+        create_session(&handler, alpha.as_str()).await;
+        set_hook(
+            &handler,
+            ScopeSelector::Global,
+            HookName::AfterNewWindow,
+            list,
+        )
+        .await;
+
+        let _ = create_window(&handler, &alpha).await;
+
+        assert_eq!(buffer_text(&handler, buffer).await.as_deref(), Some("AB"));
+    }
+}
+
+#[tokio::test]
 async fn after_new_window_runs_distinct_kill_window_lifecycle_hooks_in_tmux_order() {
     let handler = RequestHandler::new();
     let alpha = session_name("nested-lifecycle-alpha");
@@ -231,7 +262,7 @@ async fn same_after_hook_does_not_reenter_when_its_command_creates_a_window() {
             .session(&alpha)
             .expect("session survives")
             .windows()
-            .len(),
+            .count(),
         3
     );
 }
@@ -280,7 +311,7 @@ async fn lifecycle_hook_commands_cannot_enqueue_a_second_lifecycle_generation() 
     );
     let state = handler.state.lock().await;
     let beta_session = state.sessions.session(&beta).expect("beta survives");
-    assert_eq!(beta_session.windows().len(), 1);
+    assert_eq!(beta_session.windows().count(), 1);
     assert!(beta_session.window_at(0).is_some());
 }
 
@@ -407,7 +438,7 @@ async fn session_scoped_after_hook_can_run_a_distinct_session_lifecycle_hook() {
     );
     let state = handler.state.lock().await;
     let session = state.sessions.session(&beta).expect("session survives");
-    assert_eq!(session.windows().len(), 1);
+    assert_eq!(session.windows().count(), 1);
     assert!(session.window_at(0).is_some());
 }
 

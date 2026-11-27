@@ -193,3 +193,64 @@ async fn the_title_resolves_the_client_key_table_and_terminal() {
         "an attached client's own terminal and key table must reach the title"
     );
 }
+
+#[tokio::test]
+async fn same_session_switch_keeps_the_live_transient_key_table_in_its_frame() {
+    let handler = RequestHandler::new();
+    let alpha = session_name("same-session-key-table");
+    new_detached_session(&handler, &alpha).await;
+
+    let attach_pid = 41_824;
+    let mut control_rx = attach_sized_client(
+        &handler,
+        &alpha,
+        attach_pid,
+        TerminalSize { cols: 90, rows: 25 },
+    )
+    .await;
+    handler
+        .set_attached_key_table_for_test(attach_pid, Some("prefix".to_owned()))
+        .await
+        .expect("transient key table installs");
+    set_global(
+        &handler,
+        OptionName::SetTitlesString,
+        "K=#{client_key_table}",
+    )
+    .await;
+    set_global(&handler, OptionName::SetTitles, "on").await;
+    assert_eq!(
+        delivered_titles(&mut control_rx),
+        vec!["K=prefix".to_owned()],
+        "the opening frame must use the live transient key table"
+    );
+
+    let response = handler
+        .handle(Request::SwitchClient(SwitchClientRequest {
+            target: alpha.clone(),
+        }))
+        .await;
+    assert!(
+        matches!(response, Response::SwitchClient(_)),
+        "{response:?}"
+    );
+    let _ = delivered_titles(&mut control_rx);
+
+    assert_eq!(
+        remembered_title(&handler, attach_pid).await,
+        Some("K=prefix".to_owned()),
+        "same-session switch rendering must preserve the live key table"
+    );
+    assert_eq!(
+        handler
+            .active_attach
+            .lock()
+            .await
+            .by_pid
+            .get(&attach_pid)
+            .expect("attach remains registered")
+            .key_table_name
+            .as_deref(),
+        Some("prefix")
+    );
+}

@@ -17,7 +17,7 @@ async fn attached_session_mutations_emit_refresh_switches() {
             environment: None,
         }))
         .await;
-    assert!(matches!(created, Response::NewSession(_)));
+    crate::session_fixture::assert_new_session(&created);
 
     let (control_tx, mut control_rx) = mpsc::unbounded_channel();
     let _attach_id = handler
@@ -108,7 +108,7 @@ async fn switch_client_updates_the_tracked_session_for_follow_up_refreshes() {
                 environment: None,
             }))
             .await;
-        assert!(matches!(created, Response::NewSession(_)));
+        crate::session_fixture::assert_new_session(&created);
     }
 
     let split = handler
@@ -194,7 +194,7 @@ async fn choose_tree_renders_after_cli_switch_client() {
             environment: None,
         }))
         .await;
-    assert!(matches!(created, Response::NewSession(_)));
+    crate::session_fixture::assert_new_session(&created);
     drain_attach_controls(&mut control_rx);
 
     let switched = handler
@@ -229,6 +229,82 @@ async fn choose_tree_renders_after_cli_switch_client() {
 }
 
 #[tokio::test]
+async fn issue_81_choose_tree_renders_after_another_process_switches_the_client() {
+    // Issue #81: with a second client attached (desktop and phone), a script
+    // spawned by a binding runs `switch-client -c <client> -t <session>` from
+    // its own process. The named client must switch and still draw
+    // choose-tree afterwards.
+    let handler = RequestHandler::new();
+    let attached_pid = std::process::id();
+    let script_pid = attached_pid.wrapping_add(1);
+    let other_pid = attached_pid.wrapping_add(2);
+    let alpha = session_name("alpha");
+    let beta = session_name("beta");
+    let gamma = session_name("gamma");
+    let mut control_rx = create_attached_session(&handler, attached_pid, &alpha).await;
+    let _other_rx = create_attached_session(&handler, other_pid, &gamma).await;
+
+    let created = handler
+        .handle(Request::NewSession(NewSessionRequest {
+            session_name: beta.clone(),
+            detached: true,
+            size: Some(TerminalSize { cols: 80, rows: 24 }),
+            environment: None,
+        }))
+        .await;
+    crate::session_fixture::assert_new_session(&created);
+    drain_attach_controls(&mut control_rx);
+
+    let switched = handler
+        .dispatch(
+            script_pid,
+            Request::SwitchClientExt3(Box::new(rmux_proto::request::SwitchClientExt3Request {
+                target_client: Some(attached_pid.to_string()),
+                target: Some(beta.to_string()),
+                key_table: None,
+                last_session: false,
+                next_session: false,
+                previous_session: false,
+                toggle_read_only: false,
+                sort_order: None,
+                skip_environment_update: false,
+                zoom: false,
+            })),
+        )
+        .await
+        .response;
+    assert!(
+        matches!(switched, Response::SwitchClient(_)),
+        "switch-client -c from another process must succeed: {switched:?}"
+    );
+    let _ = recv_matching_attach_control(&mut control_rx, "switch to beta", |control| {
+        matches!(control, AttachControl::Switch(_))
+    })
+    .await;
+    drain_attach_controls(&mut control_rx);
+
+    handler
+        .handle_attached_live_input_for_test(attached_pid, b"\x02s")
+        .await
+        .expect("prefix s opens choose-tree after switch-client -c");
+
+    let overlay = recv_overlay_frame(&mut control_rx, "choose-tree after switch-client -c").await;
+    assert!(
+        overlay.contains("sort:") && overlay.contains("alpha") && overlay.contains("beta"),
+        "choose-tree should render sessions after switch-client -c, got: {overlay:?}"
+    );
+    let active_attach = handler.active_attach.lock().await;
+    assert_eq!(
+        active_attach
+            .by_pid
+            .get(&other_pid)
+            .map(|active| &active.session_name),
+        Some(&gamma),
+        "switch-client -c must leave the other attached client alone"
+    );
+}
+
+#[tokio::test]
 async fn terminal_feature_mutations_refresh_attached_targets_with_client_context() {
     let handler = RequestHandler::new();
     let requester_pid = 42;
@@ -242,7 +318,7 @@ async fn terminal_feature_mutations_refresh_attached_targets_with_client_context
             environment: None,
         }))
         .await;
-    assert!(matches!(created, Response::NewSession(_)));
+    crate::session_fixture::assert_new_session(&created);
 
     let (control_tx, mut control_rx) = mpsc::unbounded_channel();
     let _attach_id = handler
@@ -286,7 +362,7 @@ async fn allow_passthrough_mutations_refresh_attached_targets() {
             environment: None,
         }))
         .await;
-    assert!(matches!(created, Response::NewSession(_)));
+    crate::session_fixture::assert_new_session(&created);
 
     let (control_tx, mut control_rx) = mpsc::unbounded_channel();
     let _attach_id = handler
@@ -333,7 +409,7 @@ async fn allow_passthrough_enables_sixel_for_sixel_terminals() {
             environment: None,
         }))
         .await;
-    assert!(matches!(created, Response::NewSession(_)));
+    crate::session_fixture::assert_new_session(&created);
 
     let (control_tx, mut control_rx) = mpsc::unbounded_channel();
     let _attach_id = handler
@@ -363,6 +439,131 @@ async fn allow_passthrough_enables_sixel_for_sixel_terminals() {
 }
 
 #[tokio::test]
+async fn wildcard_terminal_feature_reaches_initial_attach_without_term() {
+    let handler = RequestHandler::new();
+    let requester_pid = u32::MAX - 211;
+    let alpha = session_name("alpha");
+
+    let created = handler
+        .handle(Request::NewSession(NewSessionRequest {
+            session_name: alpha.clone(),
+            detached: true,
+            size: Some(TerminalSize { cols: 80, rows: 24 }),
+            environment: None,
+        }))
+        .await;
+    crate::session_fixture::assert_new_session(&created);
+
+    let set = handler
+        .handle(Request::SetOption(SetOptionRequest {
+            scope: ScopeSelector::Global,
+            option: OptionName::TerminalFeatures,
+            value: "*:sixel".to_owned(),
+            mode: SetOptionMode::Append,
+        }))
+        .await;
+    assert!(matches!(set, Response::SetOption(_)));
+
+    // This deliberately nonexistent requester has no process environment, so
+    // the real first-attach path builds an empty terminal name.
+    let outcome = handler
+        .dispatch(
+            requester_pid,
+            Request::AttachSession(rmux_proto::AttachSessionRequest { target: alpha }),
+        )
+        .await;
+
+    assert!(matches!(outcome.response, Response::AttachSession(_)));
+    let target = outcome.attach.expect("attach upgrade").target;
+    assert_eq!(target.outer_terminal.context().term_name(), "");
+    assert!(target.outer_terminal.supports_sixel());
+    assert!(target.outer_terminal.features_string().contains("sixel"));
+}
+
+#[tokio::test]
+async fn wildcard_terminal_options_reach_an_attached_client_without_term() {
+    // Issue #211: a native Windows client attaches with no TERM. The refresh
+    // path must let an explicit `terminal-features '*:sixel'` reach the attach
+    // target's sixel gate. The override route is exercised too: both option
+    // names are declared to affect attached rendering, so both must actually
+    // redrive the refresh and resolve against the empty terminal name.
+    let handler = RequestHandler::new();
+    let requester_pid = 44;
+    let alpha = session_name("alpha");
+
+    let created = handler
+        .handle(Request::NewSession(NewSessionRequest {
+            session_name: alpha.clone(),
+            detached: true,
+            size: Some(TerminalSize { cols: 80, rows: 24 }),
+            environment: None,
+        }))
+        .await;
+    crate::session_fixture::assert_new_session(&created);
+
+    let (control_tx, mut control_rx) = mpsc::unbounded_channel();
+    let _attach_id = handler
+        .register_attach_with_terminal_context(
+            requester_pid,
+            alpha,
+            control_tx,
+            OuterTerminalContext::default(),
+        )
+        .await;
+
+    let set = handler
+        .handle(Request::SetOption(SetOptionRequest {
+            scope: ScopeSelector::Global,
+            option: OptionName::AllowPassthrough,
+            value: "on".to_owned(),
+            mode: SetOptionMode::Replace,
+        }))
+        .await;
+    assert!(matches!(set, Response::SetOption(_)));
+
+    let target = recv_switch_target(&mut control_rx, "passthrough refresh").await;
+    assert!(
+        !target.sixel_passthrough,
+        "a client with no TERM has no sixel until it is configured"
+    );
+
+    let set = handler
+        .handle(Request::SetOption(SetOptionRequest {
+            scope: ScopeSelector::Global,
+            option: OptionName::TerminalFeatures,
+            value: "*:sixel".to_owned(),
+            mode: SetOptionMode::Append,
+        }))
+        .await;
+    assert!(matches!(set, Response::SetOption(_)));
+
+    let target = recv_switch_target(&mut control_rx, "terminal feature refresh").await;
+    assert!(
+        target.sixel_passthrough,
+        "terminal-features '*:sixel' must reach a client that reports no TERM"
+    );
+    assert!(target.outer_terminal.features_string().contains("sixel"));
+
+    let set = handler
+        .handle(Request::SetOption(SetOptionRequest {
+            scope: ScopeSelector::Global,
+            option: OptionName::TerminalOverrides,
+            value: "*:Sxl@".to_owned(),
+            mode: SetOptionMode::Append,
+        }))
+        .await;
+    assert!(matches!(set, Response::SetOption(_)));
+
+    let target = recv_switch_target(&mut control_rx, "terminal override refresh").await;
+    assert!(
+        !target.sixel_passthrough,
+        "terminal-overrides '*:Sxl@' must reach the same client and still win \
+         over the feature entry"
+    );
+    assert!(!target.outer_terminal.features_string().contains("sixel"));
+}
+
+#[tokio::test]
 async fn allow_passthrough_all_shares_the_active_pane_gate() {
     let handler = RequestHandler::new();
     let requester_pid = 43;
@@ -376,7 +577,7 @@ async fn allow_passthrough_all_shares_the_active_pane_gate() {
             environment: None,
         }))
         .await;
-    assert!(matches!(created, Response::NewSession(_)));
+    crate::session_fixture::assert_new_session(&created);
 
     let (control_tx, mut control_rx) = mpsc::unbounded_channel();
     let _attach_id = handler
@@ -420,7 +621,7 @@ async fn kitty_passthrough_is_disabled_while_active_pane_is_in_copy_mode() {
             environment: None,
         }))
         .await;
-    assert!(matches!(created, Response::NewSession(_)));
+    crate::session_fixture::assert_new_session(&created);
 
     let (control_tx, mut control_rx) = mpsc::unbounded_channel();
     let _attach_id = handler
@@ -486,7 +687,7 @@ async fn different_requester_pids_can_control_the_sole_active_attach() {
                 environment: None,
             }))
             .await;
-        assert!(matches!(created, Response::NewSession(_)));
+        crate::session_fixture::assert_new_session(&created);
     }
 
     let (control_tx, mut control_rx) = mpsc::unbounded_channel();
@@ -547,7 +748,7 @@ async fn rename_session_preserves_ambiguity_rules_for_switch_and_detach() {
                 environment: None,
             }))
             .await;
-        assert!(matches!(created, Response::NewSession(_)));
+        crate::session_fixture::assert_new_session(&created);
     }
 
     let (first_tx, _first_rx) = mpsc::unbounded_channel();

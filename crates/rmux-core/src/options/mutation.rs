@@ -13,8 +13,6 @@ use super::registry::{
 use super::storage::{ArrayItem, OptionEntry, StoredOptionValue};
 use super::{OptionMutationOutcome, OptionNotification, OptionQuery};
 
-const TMUX_NUMBER_MAX: i64 = i32::MAX as i64;
-
 /// Validates an option mutation against the legacy known-option registry.
 pub fn validate_option_mutation(
     option: OptionName,
@@ -36,6 +34,9 @@ pub fn validate_option_name_mutation(
     unset: bool,
 ) -> Result<OptionQuery, RmuxError> {
     let query = resolve_option_name(name)?;
+    if query.index().is_some() && !query.is_array() {
+        return Err(RmuxError::InvalidSetOption(format!("not an array: {name}")));
+    }
     validate_query_mutation(&query, scope, mode, value, unset)?;
     Ok(query)
 }
@@ -83,7 +84,7 @@ pub(super) fn normalize_scalar_value(
                 Some(current) => format!("{current}{}{raw}", query.separator()),
                 None => raw.to_owned(),
             };
-            if query.canonical_name() == "default-size" && !matches_default_size_pattern(&next) {
+            if query.canonical_name() == "default-size" && !matches_default_size_pattern(raw) {
                 return Err(RmuxError::InvalidSetOption(format!(
                     "value is invalid: {next}"
                 )));
@@ -98,7 +99,7 @@ pub(super) fn normalize_scalar_value(
             }
             Ok(StoredOptionValue::String(next))
         }
-        OptionValueType::Number { minimum } => {
+        OptionValueType::Number { minimum, maximum } => {
             let raw = value.ok_or_else(|| RmuxError::InvalidSetOption("empty value".to_owned()))?;
             let parsed = raw
                 .parse::<i64>()
@@ -108,7 +109,7 @@ pub(super) fn normalize_scalar_value(
                     "value is too small: {raw}"
                 )));
             }
-            if parsed > TMUX_NUMBER_MAX {
+            if parsed > i64::from(maximum) {
                 return Err(RmuxError::InvalidSetOption(format!(
                     "value is too large: {raw}"
                 )));
@@ -255,25 +256,30 @@ pub(super) fn default_array_items(
 
 pub(super) fn split_array_assignment(value: &str, separator: &str) -> Vec<String> {
     if separator.is_empty() {
-        return vec![value.to_owned()];
+        return if value.is_empty() {
+            Vec::new()
+        } else {
+            vec![value.to_owned()]
+        };
     }
-    if separator.contains(',') {
-        return value
-            .split(',')
-            .map(str::trim)
-            .filter(|segment| !segment.is_empty())
-            .map(str::to_owned)
-            .collect();
-    }
+    // tmux options_array_assign uses strsep: separator is a set of bytes,
+    // not one multi-character delimiter, and non-separator spaces are data.
     value
-        .split(separator)
-        .map(str::trim)
+        .split(|ch| separator.contains(ch))
         .filter(|segment| !segment.is_empty())
         .map(str::to_owned)
         .collect()
 }
 
-pub(super) fn default_scalar_text(default: DefaultValue) -> &'static str {
+pub(super) fn reset_scalar(query: &OptionQuery, default: DefaultValue) -> &'static str {
+    // Startup resolves an empty shell from the environment; a global reset
+    // restores tmux's compiled Unix default instead of repeating that lookup.
+    #[cfg(unix)]
+    if query.known_option() == Some(OptionName::DefaultShell) {
+        return "/bin/sh";
+    }
+    #[cfg(not(unix))]
+    let _ = query;
     match default {
         DefaultValue::Scalar(value) => value,
         DefaultValue::Array(_) => "",

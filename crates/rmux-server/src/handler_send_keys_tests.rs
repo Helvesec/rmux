@@ -19,6 +19,9 @@ use std::time::Duration;
 use tokio::sync::mpsc;
 use tokio::time::sleep;
 
+#[path = "handler_send_keys_tests/format_expansion.rs"]
+mod format_expansion;
+
 #[path = "handler_send_keys_tests/basic_dispatch.rs"]
 mod basic_dispatch;
 
@@ -33,6 +36,12 @@ use super::super::input_capture::RawPaneInputProbe;
 #[path = "handler_send_keys_tests/live_attach.rs"]
 mod live_attach;
 
+#[path = "handler_send_keys_tests/retained_key.rs"]
+mod retained_key;
+
+#[path = "handler_send_keys_tests/focus_mutation_regressions.rs"]
+mod focus_mutation_regressions;
+
 #[path = "handler_send_keys_tests/read_only_detach.rs"]
 mod read_only_detach;
 
@@ -41,6 +50,14 @@ mod read_only_navigation_security;
 
 #[path = "handler_send_keys_tests/kitty_keyboard.rs"]
 mod kitty_keyboard;
+#[path = "handler_send_keys_tests/kitty_native.rs"]
+mod kitty_native;
+#[path = "handler_send_keys_tests/kitty_review.rs"]
+mod kitty_review;
+#[path = "handler_send_keys_tests/kitty_review_quarantine.rs"]
+mod kitty_review_quarantine;
+#[path = "handler_send_keys_tests/kitty_runtime.rs"]
+mod kitty_runtime;
 
 #[cfg(windows)]
 #[path = "handler_send_keys_tests/windows_console_repeat.rs"]
@@ -73,6 +90,11 @@ mod mouse_copy_mode;
 #[path = "handler_send_keys_tests/copy_mode_mouse_origin.rs"]
 mod copy_mode_mouse_origin;
 
+// The G6 selection/copy parcours, driven from a real client's mouse reports through the default
+// bindings, with the copied content and the application delivery both measured on tmux 3.7b.
+#[path = "handler_send_keys_tests/g6_selection_copy.rs"]
+mod g6_selection_copy;
+
 #[path = "handler_send_keys_tests/copy_mode_vi.rs"]
 mod copy_mode_vi;
 
@@ -81,6 +103,9 @@ mod key_table_precedence;
 
 #[path = "handler_send_keys_tests/combined_input_credit.rs"]
 mod combined_input_credit;
+
+#[path = "handler_send_keys_tests/ris_scroll_policy.rs"]
+mod ris_scroll_policy;
 
 async fn handle_boxed(handler: &RequestHandler, request: Request) -> Response {
     Box::pin(handler.handle(request)).await
@@ -112,7 +137,7 @@ async fn create_send_keys_test_session(
             environment: None,
         }))
         .await;
-    assert!(matches!(created, Response::NewSession(_)));
+    crate::session_fixture::assert_new_session(&created);
 }
 
 async fn spawn_accounted_attach_control_drain(
@@ -192,8 +217,29 @@ async fn create_quiet_input_session(handler: &RequestHandler, session: &rmux_pro
             skip_environment_update: false,
         })))
         .await;
-    assert!(matches!(created, Response::NewSession(_)));
+    crate::session_fixture::assert_new_session(&created);
     handler
         .wait_for_pane_startup_to_finish_for_test(&PaneTarget::new(session.clone(), 0))
         .await;
+}
+
+// Timeline evidence for byte-exact focus fixtures. The full capture stays
+// intact; provenance is recorded at the committed focus writer.
+async fn trace_focus_capture(handler: &RequestHandler, target: &PaneTarget, stage: &str) {
+    let state = handler.state.lock().await;
+    let pane_id = state
+        .sessions
+        .session(target.session_name())
+        .and_then(|session| session.window_at(target.window_index()))
+        .and_then(|window| window.pane(target.pane_index()))
+        .expect("traced pane exists")
+        .id();
+    eprintln!(
+        "focus-trace at={:?} stage={stage} target={target} pane={pane_id:?} generation={} mode1004={} bytes={:?} committed_focus={:?}",
+        std::time::SystemTime::now(),
+        state.pane_output_generation_for_target(target, pane_id),
+        state.transcript_handle(target).expect("traced transcript").lock().mode() & mode::MODE_FOCUSON != 0,
+        state.pane_input_capture_for_test(target),
+        state.pane_focus_input_capture_for_test(target),
+    );
 }

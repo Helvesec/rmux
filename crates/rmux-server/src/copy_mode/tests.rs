@@ -10,7 +10,7 @@ fn build_screen(cols: u16, rows: u16, content: &str) -> Screen {
     screen
 }
 
-fn test_context() -> CopyModeCommandContext {
+pub(super) fn test_context() -> CopyModeCommandContext {
     CopyModeCommandContext {
         mode_keys: ModeKeys::Emacs,
         line_number_mode: CopyModeLineNumberMode::Off,
@@ -21,6 +21,59 @@ fn test_context() -> CopyModeCommandContext {
         refresh_screen: None,
         mouse: None,
     }
+}
+
+#[test]
+fn unchanged_resize_preserves_scrollback_cursor_selection_and_search() {
+    for context in [test_context(), vi_context()] {
+        let size = TerminalSize { cols: 20, rows: 3 };
+        let screen = build_screen(
+            20,
+            3,
+            "line1\r\nline2\r\nline3\r\nline4\r\nline5\r\nline6\r\n",
+        );
+        let mut state = CopyModeState::new(screen, None, false, &context, true, true);
+        // begin-selection clears search marks (tmux CLEAR_ALWAYS), so search
+        // last to hold scrollback, selection and search state together.
+        for (command, args) in [
+            ("history-top", Vec::new()),
+            ("begin-selection", Vec::new()),
+            ("cursor-down", Vec::new()),
+            ("search-forward", vec!["line2".to_owned()]),
+        ] {
+            assert!(
+                state.execute_command(command, &args, &context).is_ok(),
+                "{command}"
+            );
+        }
+        let summary = state.summary();
+        let view = state.render_screen();
+        assert!(summary.scroll_position > 0);
+        assert!(summary.selection_present);
+        assert!(summary.search_present);
+        // Both the initial attach and the subsequent client-size notification
+        // can apply the same dimensions; neither should alter copy mode.
+        state.resize(size);
+        state.resize(size);
+        assert_eq!(state.summary(), summary);
+        assert_eq!(state.render_screen(), view);
+    }
+}
+
+#[test]
+fn changed_resize_still_reflows_copy_mode_and_clears_selection() {
+    let mut state =
+        CopyModeState::for_test(build_screen(20, 3, "line1\r\nline2\r\nline3\r\nline4\r\n"));
+    let context = test_context();
+    assert!(state.execute_command("history-top", &[], &context).is_ok());
+    assert!(state
+        .execute_command("begin-selection", &[], &context)
+        .is_ok());
+    assert!(state.summary().selection_present);
+    let size = TerminalSize { cols: 12, rows: 5 };
+    state.resize(size);
+    assert_eq!(state.render_screen().size(), size);
+    assert!(!state.summary().selection_present);
 }
 
 #[test]
@@ -1363,6 +1416,67 @@ fn mark_and_jump_to_mark() {
     assert_eq!(state.cursor, mark_pos, "should jump back to mark position");
 }
 
+fn numbered_lines(count: usize, width: usize) -> String {
+    (1..=count).map(|n| format!("{n:0width$}\r\n")).collect()
+}
+
+/// Jump to the saved mark, then take the motion that read its line (R3319 H1).
+fn jump_to_mark_and_step_left(state: &mut CopyModeState) {
+    let ctx = test_context();
+    assert!(state.execute_command("jump-to-mark", &[], &ctx).is_ok());
+    assert!(state.execute_command("cursor-left", &[], &ctx).is_ok());
+    assert!(state.cursor.y < state.total_lines());
+    let _ = state.summary();
+}
+
+#[test]
+fn refresh_from_shorter_screen_keeps_mark_inside_backing() {
+    let mut state = CopyModeState::for_test(build_screen(20, 3, &numbered_lines(50, 4)));
+    let ctx = test_context();
+    assert!(state.execute_command("history-bottom", &[], &ctx).is_ok());
+    assert!(state.execute_command("set-mark", &[], &ctx).is_ok());
+    assert!(state.mark.is_some_and(|mark| mark.y >= 3));
+
+    // clear-history then refresh-from-pane, or refresh-from-pane on a
+    // shorter `-s` source, hands copy mode a backing with fewer lines than the
+    // mark's row.
+    state.refresh_from_screen(build_screen(20, 3, "short\r\n"));
+
+    assert_eq!(state.total_lines(), 3);
+    assert_eq!(state.mark, Some(CopyPosition { x: 0, y: 2 }));
+    jump_to_mark_and_step_left(&mut state);
+}
+
+#[test]
+fn reflowing_resize_keeps_mark_inside_backing() {
+    // Thirty-character lines wrap onto three ten-column rows each.
+    let mut state = CopyModeState::for_test(build_screen(10, 3, &numbered_lines(20, 30)));
+    let ctx = test_context();
+    assert!(state.execute_command("history-bottom", &[], &ctx).is_ok());
+    assert!(state.execute_command("set-mark", &[], &ctx).is_ok());
+    let marked_row = state.mark.expect("set-mark stores the mark").y;
+
+    state.resize(TerminalSize { cols: 40, rows: 3 });
+
+    assert!(
+        state.total_lines() <= marked_row,
+        "the reflow must shorten the backing"
+    );
+    let mark = state.mark.expect("resize keeps the mark");
+    assert_eq!(mark.y, state.total_lines() - 1);
+    jump_to_mark_and_step_left(&mut state);
+}
+
+#[test]
+fn jump_to_mark_clamps_a_mark_past_the_backing() {
+    let mut state = CopyModeState::for_test(build_screen(20, 3, "short\r\n"));
+    // A backing change that forgot `clamp_mark` leaves the mark here.
+    state.mark = Some(CopyPosition { x: 7, y: 40 });
+
+    jump_to_mark_and_step_left(&mut state);
+    assert_eq!(state.cursor.y, state.total_lines() - 1);
+}
+
 #[test]
 fn unknown_command_returns_error() {
     let screen = build_screen(20, 3, "hello");
@@ -1434,4 +1548,72 @@ fn rg15_next_space_at_end_lands_after_last_word_when_last_row_is_populated() {
     }
     assert_eq!(state.cursor, CopyPosition { x: 5, y: 2 });
     assert_eq!(state.summary().copy_cursor_word, "");
+}
+
+/// Two hundred lines whose lengths cycle through 1 to 13 columns.
+fn varied_lines() -> String {
+    (1..=200_u32)
+        .map(|n| {
+            let length = (n * 7) % 13 + 1;
+            let text: String = (b'a'..).take(length as usize).map(char::from).collect();
+            format!("{text}\r\n")
+        })
+        .collect()
+}
+
+/// Runs `commands` in a fresh copy mode over `content` on a 40-column pane
+/// and answers `(scroll_position, copy_cursor_x, copy_cursor_y)`.
+fn page_position(
+    context: &CopyModeCommandContext,
+    content: &str,
+    rows: u16,
+    commands: &[&str],
+) -> (usize, u32, usize) {
+    let screen = build_screen(40, rows, content);
+    let mut state = CopyModeState::new(screen, None, false, context, false, false);
+    for command in commands {
+        state.execute_command(command, &[], context).unwrap();
+    }
+    let summary = state.summary();
+    (summary.scroll_position, summary.cursor_x, summary.cursor_y)
+}
+
+#[test]
+fn page_motions_step_the_pane_height_less_two_and_keep_the_cursor_like_tmux() {
+    // Each expectation is a tmux 3.7b measurement on a 40-column pane holding
+    // `seq 1 200` (or the varied lines) with the cursor on the empty line
+    // below, read as `#{scroll_position},#{copy_cursor_x},#{copy_cursor_y}`.
+    let (vi, emacs) = (vi_context(), test_context());
+    let (seq, varied) = (numbered_lines(200, 0), varied_lines());
+    let three_pages_and_one_down = ["page-up", "page-up", "page-up", "page-down"];
+    let three_halves_and_one_down = ["halfpage-up", "halfpage-up", "halfpage-up", "halfpage-down"];
+    let column_five = ["cursor-up", "start-of-line"]
+        .into_iter()
+        .chain(["cursor-right"; 5]);
+    let column_five_three_pages: Vec<_> = column_five.clone().chain(["page-up"; 3]).collect();
+    let column_five_half_page: Vec<_> = column_five.chain(["halfpage-up"]).collect();
+
+    for (context, content, rows, commands, expected) in [
+        (&vi, &seq, 30, &["page-up"][..], (28, 2, 29)),
+        (&emacs, &seq, 30, &["page-up"], (28, 3, 29)),
+        (&vi, &seq, 30, &["page-up"; 9], (171, 0, 0)),
+        (&emacs, &seq, 30, &["page-up"; 9], (171, 1, 0)),
+        (&emacs, &seq, 30, &["history-top", "page-down"], (143, 0, 0)),
+        (&vi, &seq, 30, &three_pages_and_one_down, (56, 2, 29)),
+        (&emacs, &seq, 30, &["halfpage-up"], (15, 3, 29)),
+        (&vi, &seq, 30, &three_halves_and_one_down, (30, 2, 29)),
+        (&vi, &seq, 3, &["page-up"], (1, 2, 2)),
+        (&emacs, &seq, 2, &["page-up"], (1, 3, 1)),
+        (&vi, &varied, 5, &["page-up"], (3, 8, 4)),
+        (&emacs, &varied, 5, &["page-up"; 3], (9, 6, 4)),
+        (&emacs, &varied, 5, &column_five_three_pages, (9, 5, 3)),
+        (&vi, &varied, 5, &column_five_half_page, (2, 5, 3)),
+    ] {
+        assert_eq!(
+            page_position(context, content, rows, commands),
+            expected,
+            "{:?} {rows} rows: {commands:?}",
+            context.mode_keys
+        );
+    }
 }

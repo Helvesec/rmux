@@ -8,10 +8,7 @@
 //! environment variable and raw-terminal lifecycle management for attach-mode
 //! clients.
 
-#[cfg(unix)]
-pub mod attach;
-#[cfg(windows)]
-#[path = "attach_windows.rs"]
+#[cfg(any(unix, windows))]
 pub mod attach;
 mod attach_lock_state;
 pub mod auto_start;
@@ -45,7 +42,7 @@ pub use connection::{
     resolve_tmux_compatible_socket_path, socket_path_for_label, AttachSessionUpgrade,
     AttachTransition, ConnectResult, Connection, ControlModeUpgrade, ControlTransition,
 };
-pub use control::{drive_control_mode, drive_control_mode_with_stdio};
+pub use control::{drive_control_mode, drive_control_mode_with_stdio, ControlModeStatus};
 pub use endpoint_cleanup::wait_for_server_endpoint_cleanup;
 pub use nested::{
     detect_context, detect_parent, ensure_nested_context, require_nested_context, ClientContext,
@@ -66,6 +63,10 @@ pub enum ClientError {
     Attach(AttachError),
     /// The server closed the connection before sending a complete response frame.
     UnexpectedEof,
+    /// The server shut down while this client was attached. The attach stream
+    /// already restored the terminal and printed `[server exited]`; like tmux,
+    /// the client exits with status 1 and no further message.
+    ServerExited,
 }
 
 impl fmt::Display for ClientError {
@@ -76,6 +77,7 @@ impl fmt::Display for ClientError {
             Self::Attach(error) => write!(formatter, "attach error: {error}"),
             Self::UnexpectedEof => formatter
                 .write_str("server closed connection before a complete response frame arrived"),
+            Self::ServerExited => formatter.write_str("server exited"),
         }
     }
 }
@@ -86,7 +88,7 @@ impl std::error::Error for ClientError {
             Self::Io(error) => Some(error),
             Self::Protocol(error) => Some(error),
             Self::Attach(error) => Some(error),
-            Self::UnexpectedEof => None,
+            Self::UnexpectedEof | Self::ServerExited => None,
         }
     }
 }

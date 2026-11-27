@@ -1,0 +1,38 @@
+{
+  "scope": "L09.1 SDK/proto only; observed SDK071 missing loads, not historical repair",
+  "origin": {
+    "job": "R1-INT071-NATIVE-L09-L08-TARGETED-REVIEW-112",
+    "collector": "INT-NATIVE-PRIORITY-L09-L08-071",
+    "cell": "sdk-short"
+  },
+  "loads": [
+    {
+      "path": "C:\\Windows\\System32\\rsaenh.dll",
+      "pid": 9652,
+      "sequence": 2206170,
+      "load_at": "2026-10-02T13:35:45.970638800+01:59",
+      "fixed_input_sha256": null
+    },
+    {
+      "path": "C:\\Windows\\System32\\vcruntime140.dll",
+      "pid": 1864,
+      "sequence": 2206171,
+      "load_at": "2026-10-02T13:35:45.992197700+01:59",
+      "fixed_input_sha256": null
+    },
+    {
+      "path": "C:\\Windows\\System32\\ntmarta.dll",
+      "pid": 13456,
+      "sequence": 2206174,
+      "load_at": "2026-10-02T13:35:46.079491000+01:59",
+      "fixed_input_sha256": null
+    },
+    {
+      "path": "C:\\Windows\\System32\\kernel.appcore.dll",
+      "pid": 14672,
+      "sequence": 2206177,
+      "load_at": "2026-10-02T13:35:46.149179600+01:59",
+      "fixed_input_sha256": null
+    }
+  ]
+}

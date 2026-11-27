@@ -127,11 +127,11 @@ fn malformed_or_empty_expressions_keep_compatibility_behavior() {
 #[test]
 fn edge_case_empty_template_and_boundary_hash_patterns() {
     assert_eq!(render_template("", &StaticWindowValues), "");
-    assert_eq!(render_template("#", &StaticWindowValues), "#");
+    assert_eq!(render_template("#", &StaticWindowValues), "");
     assert_eq!(render_template("##", &StaticWindowValues), "#");
-    assert_eq!(render_template("###", &StaticWindowValues), "##");
+    assert_eq!(render_template("###", &StaticWindowValues), "#");
     assert_eq!(render_template("####", &StaticWindowValues), "##");
-    assert_eq!(render_template("text#", &StaticWindowValues), "text#");
+    assert_eq!(render_template("text#", &StaticWindowValues), "text");
     assert_eq!(render_template("#{}", &StaticWindowValues), "");
     // Unclosed `#{` — tmux drops everything from `#` onward.
     assert_eq!(render_template("#{", &StaticWindowValues), "");

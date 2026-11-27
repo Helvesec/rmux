@@ -25,7 +25,8 @@ enum ExitFailureKind {
     Generic,
     AmbiguousTarget,
     ServerAbsent,
-    UnsupportedWireVersion,
+    UnsupportedWireVersion { got: u32 },
+    Timeout,
 }
 
 impl ExitFailure {
@@ -54,7 +55,11 @@ impl ExitFailure {
     }
 
     pub(super) fn is_unsupported_wire_version(&self) -> bool {
-        self.kind == ExitFailureKind::UnsupportedWireVersion
+        matches!(self.kind, ExitFailureKind::UnsupportedWireVersion { .. })
+    }
+
+    pub(super) fn is_timeout(&self) -> bool {
+        self.kind == ExitFailureKind::Timeout
     }
 
     pub(crate) fn new(exit_code: i32, message: impl Into<String>) -> Self {
@@ -96,11 +101,15 @@ impl ExitFailure {
     }
 
     pub(super) fn from_clap(error: clap::Error) -> Self {
+        Self::from_clap_ref(&error)
+    }
+
+    pub(super) fn from_clap_ref(error: &clap::Error) -> Self {
         let exit_code = match error.kind() {
             clap::error::ErrorKind::DisplayHelp | clap::error::ErrorKind::DisplayVersion => 0,
             _ => 1,
         };
-        let message = tmux_compat_clap_message(&error);
+        let message = tmux_compat_clap_message(error);
 
         Self {
             exit_code,
@@ -112,10 +121,14 @@ impl ExitFailure {
     }
 
     pub(super) fn from_client(error: ClientError) -> Self {
-        let kind = if unsupported_wire_version(&error) {
-            ExitFailureKind::UnsupportedWireVersion
-        } else {
-            ExitFailureKind::Generic
+        let kind = match &error {
+            ClientError::Protocol(RmuxError::UnsupportedWireVersion { got, .. }) => {
+                ExitFailureKind::UnsupportedWireVersion { got: *got }
+            }
+            ClientError::Io(source) if source.kind() == std::io::ErrorKind::TimedOut => {
+                ExitFailureKind::Timeout
+            }
+            _ => ExitFailureKind::Generic,
         };
         Self::new_with_kind(1, error.to_string(), kind)
     }
@@ -133,29 +146,33 @@ impl ExitFailure {
     }
 
     pub(super) fn with_socket_context(self, socket_path: &Path) -> Self {
-        if self.kind == ExitFailureKind::UnsupportedWireVersion {
-            return Self::incompatible_daemon(socket_path);
+        if let ExitFailureKind::UnsupportedWireVersion { got } = self.kind {
+            return Self::incompatible_daemon(socket_path, got);
         }
         self
     }
 
-    fn incompatible_daemon(socket_path: &Path) -> Self {
+    fn incompatible_daemon(socket_path: &Path, daemon_wire_version: u32) -> Self {
+        let diagnostic = if (1..rmux_proto::RMUX_WIRE_VERSION).contains(&daemon_wire_version) {
+            format!(
+                "rmux: running daemon from an older release uses incompatible protocol {daemon_wire_version}; this client supports protocol {} on '{}'.",
+                rmux_proto::RMUX_WIRE_VERSION,
+                socket_path.display()
+            )
+        } else {
+            format!(
+                "rmux: running daemon on '{}' uses an incompatible protocol.",
+                socket_path.display()
+            )
+        };
         Self::new(
             1,
             format!(
-                "rmux: running daemon on '{}' uses an incompatible protocol.\nrmux: run `{}` to stop it, then retry.",
-                socket_path.display(),
+                "{diagnostic}\nrmux: stopping this daemon ends its sessions and running processes. Save your work with the matching client first.\nrmux: run `{}` to stop it, then retry.",
                 incompatible_daemon_kill_server_command(socket_path)
             ),
         )
     }
-}
-
-fn unsupported_wire_version(error: &ClientError) -> bool {
-    matches!(
-        error,
-        ClientError::Protocol(RmuxError::UnsupportedWireVersion { .. })
-    )
 }
 
 fn incompatible_daemon_kill_server_command(socket_path: &Path) -> String {
@@ -213,6 +230,14 @@ fn tmux_compat_clap_message(error: &clap::Error) -> String {
     if let Some(stripped) = message.strip_prefix("error: command ") {
         return format!("command {stripped}");
     }
+    // A command's `-?` prints tmux's usage line, whose trailing space is
+    // kept for a command without flags; help requests keep their text.
+    if error.kind() == clap::error::ErrorKind::UnknownArgument {
+        let rendered = error.to_string();
+        if let Some(usage) = rendered.strip_prefix("error: usage: ") {
+            return format!("usage: {}", usage.strip_suffix('\n').unwrap_or(usage));
+        }
+    }
     if let Some((_, option)) = message.rsplit_once(": invalid option: ") {
         let option = option.lines().next().unwrap_or(option);
         return format!("invalid option: {option}");
@@ -253,6 +278,57 @@ impl From<NestedContextError> for ExitFailure {
 #[cfg(test)]
 mod tests {
     use super::tmux_compat_clap_message;
+
+    #[test]
+    fn incompatible_daemon_diagnostic_retains_received_and_supported_protocols() {
+        let socket = std::path::Path::new("/private/rmux-diagnostic/socket");
+        let failure = super::ExitFailure::from_client(rmux_client::ClientError::Protocol(
+            rmux_proto::RmuxError::UnsupportedWireVersion {
+                got: 8,
+                minimum: 9,
+                maximum: 9,
+            },
+        ));
+        assert!(failure.is_unsupported_wire_version());
+        let failure = failure.with_socket_context(socket);
+        assert_eq!(failure.exit_code(), 1);
+        assert!(failure.use_stderr());
+        assert_eq!(
+            failure.message_termination(),
+            super::ExitMessageTermination::Line
+        );
+        assert_eq!(
+            failure.message(),
+            "rmux: running daemon from an older release uses incompatible protocol 8; this client supports protocol 9 on '/private/rmux-diagnostic/socket'.\nrmux: stopping this daemon ends its sessions and running processes. Save your work with the matching client first.\nrmux: run `rmux -S /private/rmux-diagnostic/socket kill-server` to stop it, then retry."
+        );
+
+        for got in [
+            0,
+            rmux_proto::RMUX_WIRE_VERSION,
+            rmux_proto::RMUX_WIRE_VERSION + 1,
+            u32::MAX,
+        ] {
+            let failure = super::ExitFailure::from_client(rmux_client::ClientError::Protocol(
+                rmux_proto::RmuxError::UnsupportedWireVersion {
+                    got,
+                    minimum: 9,
+                    maximum: 9,
+                },
+            ))
+            .with_socket_context(socket);
+            assert_eq!(failure.exit_code(), 1);
+            assert!(failure.use_stderr());
+            assert_eq!(
+                failure.message_termination(),
+                super::ExitMessageTermination::Line
+            );
+            assert_eq!(
+                failure.message(),
+                "rmux: running daemon on '/private/rmux-diagnostic/socket' uses an incompatible protocol.\nrmux: stopping this daemon ends its sessions and running processes. Save your work with the matching client first.\nrmux: run `rmux -S /private/rmux-diagnostic/socket kill-server` to stop it, then retry.",
+                "protocol {got} does not establish an older daemon"
+            );
+        }
+    }
 
     #[test]
     fn display_message_delay_errors_keep_single_tmux_line() {

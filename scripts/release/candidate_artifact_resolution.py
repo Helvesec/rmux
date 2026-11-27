@@ -8,6 +8,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+from candidate_route import CANONICAL, CandidateRoute
+
 from github_actions import get_repository, get_run, gh_api, read_json
 
 REPOSITORY = "Helvesec/rmux"
@@ -40,6 +42,7 @@ class ResolutionRequest:
     repository_json: Path | None = None
     run_json: Path | None = None
     artifacts_json: Path | None = None
+    route: CandidateRoute = CANONICAL
 
 
 def expected_specs(source_sha: str) -> tuple[ArtifactSpec, ...]:
@@ -171,8 +174,10 @@ def load_resolution_inputs(
 
 
 def verify_run(
-    repository: dict[str, Any], run: dict[str, Any], run_id: int, source_sha: str
+    repository: dict[str, Any], run: dict[str, Any], run_id: int, source_sha: str,
+    route: CandidateRoute = CANONICAL,
 ) -> dict[str, Any]:
+    route.validate_source(source_sha)
     require_equal(repository.get("id"), REPOSITORY_ID, "repository ID")
     require_equal(repository.get("full_name"), REPOSITORY, "repository name")
     expected = {
@@ -181,7 +186,7 @@ def verify_run(
         "path": WORKFLOW_PATH,
         "name": WORKFLOW_NAME,
         "event": "workflow_dispatch",
-        "head_branch": "main",
+        "head_branch": route.branch,
         "head_sha": source_sha,
         "run_attempt": 1,
         "status": "completed",
@@ -204,7 +209,7 @@ def verify_run(
         "workflow_path": WORKFLOW_PATH,
         "workflow_name": WORKFLOW_NAME,
         "event": "workflow_dispatch",
-        "branch": "main",
+        "branch": route.branch,
         "head_sha": source_sha,
         "status": "completed",
         "conclusion": "success",
@@ -248,9 +253,11 @@ def verify_artifact(
 
 
 def resolve_candidate_artifacts(request: ResolutionRequest) -> dict[str, Any]:
+    route = request.route
+    route.validate_source(request.source_sha)
     repository, run, artifacts, fixture_mode = load_resolution_inputs(request)
     run_proof = verify_run(
-        repository, run, request.candidate_run_id, request.source_sha
+        repository, run, request.candidate_run_id, request.source_sha, route
     )
     names = [artifact.get("name") for artifact in artifacts]
     if any(not isinstance(name, str) for name in names):
@@ -304,7 +311,7 @@ def resolve_candidate_artifacts(request: ResolutionRequest) -> dict[str, Any]:
             ):
                 raise ValueError(f"artifact changed after listing: {item['name']}")
     return {
-        "schema_version": 1,
+        **route.fields,
         "repository_id": REPOSITORY_ID,
         "candidate_run": run_proof,
         "expected_artifact_count": 11,
@@ -313,7 +320,7 @@ def resolve_candidate_artifacts(request: ResolutionRequest) -> dict[str, Any]:
 
 
 def load_candidate_resolution(
-    path: Path, run_id: int, source_sha: str
+    path: Path, run_id: int, source_sha: str, route: CandidateRoute = CANONICAL
 ) -> dict[str, Any]:
     value = read_json(path)
     if not isinstance(value, dict):
@@ -326,10 +333,12 @@ def load_candidate_resolution(
             "candidate_run",
             "expected_artifact_count",
             "artifacts",
-        },
+        } | route.extra_keys,
         "candidate artifact resolution",
     )
-    if value["schema_version"] != 1 or value["repository_id"] != REPOSITORY_ID:
+    route.validate_record(value)
+    route.validate_source(source_sha)
+    if value["repository_id"] != REPOSITORY_ID:
         raise ValueError("candidate artifact resolution identity changed")
     if value["expected_artifact_count"] != 11:
         raise ValueError("candidate artifact resolution cardinality changed")
@@ -340,7 +349,7 @@ def load_candidate_resolution(
         "workflow_path": WORKFLOW_PATH,
         "workflow_name": WORKFLOW_NAME,
         "event": "workflow_dispatch",
-        "branch": "main",
+        "branch": route.branch,
         "head_sha": source_sha,
         "status": "completed",
         "conclusion": "success",

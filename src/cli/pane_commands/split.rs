@@ -20,6 +20,9 @@ pub(in crate::cli) fn run_split_window(
     mut args: SplitWindowArgs,
     socket_path: &Path,
 ) -> Result<i32, ExitFailure> {
+    if args.keep_alive_on_exit {
+        return super::split_key::run(args, socket_path);
+    }
     if args.start_directory.is_none() {
         args.start_directory = std::env::current_dir().ok();
     }
@@ -46,20 +49,15 @@ pub(in crate::cli) fn run_split_window(
     } else {
         None
     };
-    let process_command = if stdin_to_empty_pane {
-        Some(ProcessCommand::Shell(String::new()))
-    } else {
-        None
-    };
     let response = connection.split_window_target_action(SplitWindowTargetActionRequest {
         target,
         direction,
         before: args.before,
         environment,
+        process_command: ProcessCommand::from_legacy_command(command.as_deref()),
         command,
-        process_command,
         start_directory: args.start_directory,
-        keep_alive_on_exit: (args.keep_alive_on_exit || stdin_to_empty_pane).then_some(true),
+        keep_alive_on_exit: args.keep_alive_on_exit.then_some(true),
         detached: args.detached,
         size,
         preserve_zoom: args.preserve_zoom,
@@ -128,13 +126,7 @@ fn run_split_window_legacy_with_stdin(
     } else {
         None
     };
-    let process_command = if stdin_to_empty_pane {
-        Some(ProcessCommand::Shell(String::new()))
-    } else {
-        None
-    };
     let response = if command.is_some()
-        || process_command.is_some()
         || args.start_directory.is_some()
         || args.detached
         || size.is_some()
@@ -149,11 +141,10 @@ fn run_split_window_legacy_with_stdin(
                 direction,
                 before: args.before,
                 environment,
+                process_command: ProcessCommand::from_legacy_command(command.as_deref()),
                 command,
-                process_command,
                 start_directory: args.start_directory,
-                keep_alive_on_exit: (args.keep_alive_on_exit || stdin_to_empty_pane)
-                    .then_some(true),
+                keep_alive_on_exit: args.keep_alive_on_exit.then_some(true),
                 detached: args.detached,
                 size,
                 preserve_zoom: args.preserve_zoom,
@@ -190,7 +181,7 @@ fn run_split_window_legacy_with_stdin(
     Ok(0)
 }
 
-fn read_stdin_payload() -> Result<Vec<u8>, ExitFailure> {
+pub(super) fn read_stdin_payload() -> Result<Vec<u8>, ExitFailure> {
     let mut bytes = Vec::new();
     std::io::Read::read_to_end(&mut std::io::stdin(), &mut bytes)
         .map_err(|error| ExitFailure::new(1, format!("failed to read stdin: {error}")))?;

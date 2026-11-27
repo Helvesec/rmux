@@ -1,5 +1,8 @@
 #![cfg(unix)]
 
+#[path = "support/executable_fixture.rs"]
+mod executable_fixture;
+
 use std::fs;
 use std::os::unix::fs::symlink;
 use std::os::unix::fs::PermissionsExt;
@@ -25,17 +28,21 @@ const PACKAGE_ASSETS: [(&str, &[u8], &[u8]); 2] = [
 ];
 const LOCAL_ASSET: (&str, &[u8]) = ("share/rmux/local-only", b"keep-local-asset\n");
 
+// The installer names its injection points after the descriptor entry that
+// places each executable, so a destination can move without renaming them.
+// helper and daemon are unchanged; the dispatcher's entry is cli, which the
+// installer used to call tiny.
 const FAILURE_CHECKPOINTS: [&str; 12] = [
     "after-preflight",
     "after-stage-helper",
     "after-stage-daemon",
-    "after-stage-tiny",
+    "after-stage-cli",
     "after-backup-helper",
     "after-backup-daemon",
-    "after-backup-tiny",
+    "after-backup-cli",
     "after-replace-helper",
     "after-replace-daemon",
-    "after-replace-tiny",
+    "after-replace-cli",
     "after-verify",
     "after-replace-asset",
 ];
@@ -43,12 +50,94 @@ const FAILURE_CHECKPOINTS: [&str; 12] = [
 const SIGNAL_CHECKPOINTS: [&str; 5] = [
     "after-replace-helper",
     "after-replace-daemon",
-    "after-replace-tiny",
+    "after-replace-cli",
     "after-verify",
     "after-replace-asset",
 ];
 
-struct TempRoot(PathBuf);
+// The layout manifest this archive carries, and the format it declares. It is
+// written here row by row instead of being projected, so these cases keep an
+// expectation of their own: a change in the descriptor cannot move both the
+// package and the assertion at once.
+const PACKAGE_LAYOUT: &[u8] = b"{\n  \"package_layout\": \"rmux-package-v3\"\n}\n";
+
+const MANIFEST: [(&str, &str, &str, &str, &str, &str); 8] = [
+    (
+        "libexec/rmux/rmux",
+        "0755",
+        "libexec/rmux/rmux",
+        "required",
+        "helper",
+        "executable",
+    ),
+    (
+        "bin/rmux-daemon",
+        "0755",
+        "bin/rmux-daemon",
+        "required",
+        "daemon",
+        "executable",
+    ),
+    (
+        "bin/rmux",
+        "0755",
+        "bin/rmux",
+        "required",
+        "cli",
+        "executable",
+    ),
+    (
+        "install.sh",
+        "0755",
+        "-",
+        "required",
+        "installer-unix",
+        "executable",
+    ),
+    (
+        "share/rmux/artifact-metadata.json",
+        "0644",
+        "share/rmux/artifact-metadata.json",
+        "required",
+        "artifact-metadata",
+        "file",
+    ),
+    (
+        "share/rmux/package-layout.tsv",
+        "0644",
+        "share/rmux/package-layout.tsv",
+        "required",
+        "package-manifest",
+        "file",
+    ),
+    (
+        "share/rmux/version",
+        "0644",
+        "share/rmux/version",
+        "required",
+        "version",
+        "file",
+    ),
+    (
+        "share/man/man1/rmux.1",
+        "0644",
+        "share/man/man1/rmux.1",
+        "required",
+        "man-page",
+        "file",
+    ),
+];
+
+/// Where a case builds its tree, and what becomes of it afterwards.
+///
+/// RMUX_TEST_FIXTURE_ROOT names a directory that keeps the fixtures: the case
+/// writes under it and `Drop` leaves it there, so a run can be examined after
+/// it. Without it the case uses the temporary directory and `Drop` removes it,
+/// as before.
+struct TempRoot {
+    path: PathBuf,
+    retained: bool,
+}
 
 impl TempRoot {
     fn new(label: &str) -> Self {
@@ -56,22 +145,25 @@ impl TempRoot {
             .duration_since(UNIX_EPOCH)
             .expect("clock before Unix epoch")
             .as_nanos();
-        let path = std::env::temp_dir().join(format!(
-            "rmux-unix-installer-{label}-{}-{nonce}",
-            std::process::id()
-        ));
+        let name = format!("rmux-unix-installer-{label}-{}-{nonce}", std::process::id());
+        let (path, retained) = match std::env::var_os("RMUX_TEST_FIXTURE_ROOT") {
+            Some(root) => (PathBuf::from(root).join(name), true),
+            None => (std::env::temp_dir().join(name), false),
+        };
         fs::create_dir_all(&path).expect("create installer fixture root");
-        Self(path)
+        Self { path, retained }
     }
 
     fn join(&self, path: impl AsRef<Path>) -> PathBuf {
-        self.0.join(path)
+        self.path.join(path)
     }
 }
 
 impl Drop for TempRoot {
     fn drop(&mut self) {
-        let _ = fs::remove_dir_all(&self.0);
+        if !self.retained {
+            let _ = fs::remove_dir_all(&self.path);
+        }
     }
 }
 
@@ -81,13 +173,11 @@ struct FileSnapshot {
     mode: u32,
 }
 
+/// Writes a fixture file with `mode`; the installer runs those whose mode lets it.
 fn write_file(path: &Path, contents: &[u8], mode: u32) {
     fs::create_dir_all(path.parent().expect("fixture file parent"))
         .expect("create fixture directory");
-    fs::write(path, contents).expect("write fixture file");
-    let mut permissions = fs::metadata(path).expect("fixture metadata").permissions();
-    permissions.set_mode(mode);
-    fs::set_permissions(path, permissions).expect("set fixture mode");
+    executable_fixture::write_executable(path, contents, mode).expect("write fixture file");
 }
 
 fn setup_archive(root: &TempRoot) -> PathBuf {
@@ -100,18 +190,39 @@ fn setup_named_archive(root: &TempRoot, name: &str) -> PathBuf {
     let source_script =
         PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("scripts/install-unix-archive.sh");
     let installer = archive.join("install.sh");
-    fs::copy(source_script, &installer).expect("copy Unix archive installer");
-    let mut permissions = fs::metadata(&installer)
-        .expect("installer metadata")
-        .permissions();
-    permissions.set_mode(0o755);
-    fs::set_permissions(&installer, permissions).expect("make installer executable");
+    let script = fs::read(source_script).expect("read Unix archive installer");
+    executable_fixture::write_executable(&installer, script, 0o755)
+        .expect("copy Unix archive installer");
 
     write_valid_archive_binaries(&archive);
     for (relative, _, contents) in PACKAGE_ASSETS {
         write_file(&archive.join(relative), contents, 0o644);
     }
+    write_file(
+        &archive.join("share/rmux/artifact-metadata.json"),
+        PACKAGE_LAYOUT,
+        0o644,
+    );
+    write_manifest(&archive, &[]);
     archive
+}
+
+/// The manifest the archive carries, minus the entries a case removes.
+fn write_manifest(archive: &Path, without: &[&str]) {
+    let mut manifest = String::new();
+    for (path, mode, destination, required, entry, role) in MANIFEST {
+        if without.contains(&path) {
+            continue;
+        }
+        manifest.push_str(&format!(
+            "{path}\t{mode}\t{destination}\t{required}\t{entry}\t{role}\n"
+        ));
+    }
+    write_file(
+        &archive.join("share/rmux/package-layout.tsv"),
+        manifest.as_bytes(),
+        0o644,
+    );
 }
 
 fn write_valid_archive_binaries(archive: &Path) {
@@ -300,6 +411,41 @@ fn assert_new_layout(prefix: &Path) {
 }
 
 #[test]
+fn explicit_package_uninstall_preserves_unowned_files_and_is_transactional() {
+    let root = TempRoot::new("explicit-uninstall");
+    let archive = setup_archive(&root);
+    let prefix = root.join("prefix");
+    let installed = run_installer(&archive, &prefix, None, None);
+    assert!(installed.status.success(), "{}", output_details(&installed));
+    write_file(&prefix.join(LOCAL_ASSET.0), LOCAL_ASSET.1, 0o600);
+    let before = snapshot_layout(&prefix);
+
+    let uninstall = || {
+        let mut command = installer_command(&archive, &prefix);
+        command.arg("--uninstall");
+        command
+    };
+    let failed = uninstall()
+        .env("RMUX_INSTALL_TEST_FAIL_AT", "after-remove-owned")
+        .output()
+        .expect("run interrupted uninstall");
+    assert!(!failed.status.success(), "{}", output_details(&failed));
+    assert!(String::from_utf8_lossy(&failed.stderr).contains("after-remove-owned"));
+    assert_old_layout_restored(&prefix, &before, "interrupted uninstall");
+    assert_new_layout(&prefix);
+
+    let removed = uninstall().output().expect("run explicit uninstall");
+    assert!(removed.status.success(), "{}", output_details(&removed));
+    for (path, _, destination, _, _, _) in MANIFEST {
+        if destination != "-" {
+            assert!(!prefix.join(destination).exists(), "retained owned {path}");
+        }
+    }
+    assert_eq!(fs::read(prefix.join(LOCAL_ASSET.0)).unwrap(), LOCAL_ASSET.1);
+    assert_no_transaction_residue(&prefix);
+}
+
+#[test]
 fn upgrade_failures_restore_every_old_binary_and_allow_a_clean_retry() {
     let root = TempRoot::new("upgrade-failures");
     let archive = setup_archive(&root);
@@ -427,6 +573,94 @@ fn preflight_rejects_a_non_file_destination_before_other_binaries_change() {
     assert_no_transaction_residue(&prefix);
 }
 
+// A rename onto a link to a directory moves the staged file into that
+// directory: the installer reported success without the daemon or the manual
+// page and wrote outside the prefix, and a dispatcher failure rolled back into
+// the same directory. Each such destination is refused before any staging.
+#[test]
+fn preflight_rejects_a_destination_linked_to_a_directory() {
+    let destinations = EXECUTABLES
+        .iter()
+        .map(|(relative, _)| *relative)
+        .chain(std::iter::once("share/man/man1/rmux.1"));
+    let mut problems = Vec::new();
+    for relative in destinations {
+        let root = TempRoot::new("directory-link");
+        let archive = setup_archive(&root);
+        let prefix = root.join("prefix");
+        let outside = root.join("outside");
+        fs::create_dir(&outside).expect("create directory outside the prefix");
+        setup_old_layout(&prefix);
+        setup_old_assets(&prefix);
+        let link = prefix.join(relative);
+        fs::remove_file(&link).expect("remove old destination fixture");
+        symlink(&outside, &link).expect("link destination to a directory");
+        let others: Vec<(&str, Vec<u8>)> = EXECUTABLES
+            .iter()
+            .map(|(other, _)| *other)
+            .chain(PACKAGE_ASSETS.iter().map(|(other, _, _)| *other))
+            .filter(|other| *other != relative)
+            .map(|other| (other, fs::read(prefix.join(other)).expect("read old file")))
+            .collect();
+
+        let output = run_installer(&archive, &prefix, None, None);
+        let mut problem = |what: String| problems.push(format!("{relative}: {what}"));
+        if output.status.success() {
+            problem("the installer reported success".to_owned());
+        }
+        let written: Vec<_> = fs::read_dir(&outside)
+            .expect("read outside directory")
+            .map(|entry| entry.expect("outside entry").file_name())
+            .collect();
+        if !written.is_empty() {
+            problem(format!("wrote outside the prefix: {written:?}"));
+        }
+        if fs::read_link(&link).ok().as_deref() != Some(outside.as_path()) {
+            problem("the destination link was not left in place".to_owned());
+        }
+        for (other, before) in others {
+            if fs::read(prefix.join(other)).ok().as_ref() != Some(&before) {
+                problem(format!("{other} changed"));
+            }
+        }
+        if !String::from_utf8_lossy(&output.stderr).contains("symbolic link to a directory") {
+            problem(format!(
+                "the refusal is not named: {}",
+                output_details(&output)
+            ));
+        }
+        assert_no_transaction_residue(&prefix);
+    }
+    assert!(problems.is_empty(), "{}", problems.join("\n"));
+}
+
+// The neighbor the refusal must not reach: a link to a file is replaced by the
+// new file itself, and the file it pointed to is left alone.
+#[test]
+fn upgrade_replaces_a_destination_linked_to_a_file() {
+    let root = TempRoot::new("file-link");
+    let archive = setup_archive(&root);
+    let prefix = root.join("prefix");
+    setup_old_layout(&prefix);
+    let daemon = prefix.join("bin/rmux-daemon");
+    let kept = root.join("kept-daemon");
+    write_file(&kept, b"#!/bin/sh\n# kept\nexit 0\n", 0o755);
+    fs::remove_file(&daemon).expect("remove old daemon fixture");
+    symlink(&kept, &daemon).expect("link daemon to a file");
+
+    let installed = run_installer(&archive, &prefix, None, None);
+    assert!(installed.status.success(), "{}", output_details(&installed));
+    assert!(!fs::symlink_metadata(&daemon)
+        .expect("daemon metadata")
+        .file_type()
+        .is_symlink());
+    assert_new_layout(&prefix);
+    assert_eq!(
+        fs::read(&kept).expect("read linked file"),
+        b"#!/bin/sh\n# kept\nexit 0\n"
+    );
+}
+
 #[test]
 fn rollback_preserves_an_existing_dispatcher_symlink() {
     let root = TempRoot::new("symlink-rollback");
@@ -442,7 +676,7 @@ fn rollback_preserves_an_existing_dispatcher_symlink() {
     );
     symlink("old-rmux-real", &tiny).expect("create old dispatcher symlink");
 
-    let failed = run_installer(&archive, &prefix, Some("after-replace-tiny"), None);
+    let failed = run_installer(&archive, &prefix, Some("after-replace-cli"), None);
     assert!(!failed.status.success(), "{}", output_details(&failed));
     assert!(fs::symlink_metadata(&tiny)
         .expect("restored tiny metadata")
@@ -459,7 +693,14 @@ fn rollback_preserves_an_existing_dispatcher_symlink() {
 fn archive_without_assets_installs_without_transaction_residue() {
     let root = TempRoot::new("no-assets");
     let archive = setup_archive(&root);
-    fs::remove_dir_all(archive.join("share")).expect("remove optional archive assets");
+    // The archive keeps the two files that declare its format and its layout;
+    // what it no longer carries is any asset to publish into the prefix.
+    let assets: Vec<&str> = PACKAGE_ASSETS.iter().map(|(path, _, _)| *path).collect();
+    for relative in &assets {
+        fs::remove_file(archive.join(relative)).expect("remove fixture asset");
+    }
+    fs::remove_dir_all(archive.join("share/man")).expect("remove emptied asset tree");
+    write_manifest(&archive, &assets);
     let prefix = root.join("prefix");
 
     let installed = run_installer(&archive, &prefix, None, None);
@@ -467,7 +708,13 @@ fn archive_without_assets_installs_without_transaction_residue() {
     for (relative, _) in EXECUTABLES {
         assert!(prefix.join(relative).is_file(), "missing {relative}");
     }
-    assert!(!prefix.join("share").exists());
+    for relative in &assets {
+        assert!(
+            !prefix.join(relative).exists(),
+            "installed an asset the archive does not carry: {relative}"
+        );
+    }
+    assert!(!prefix.join("share/man").exists());
     assert_no_transaction_residue(&prefix);
 }
 

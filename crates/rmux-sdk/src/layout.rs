@@ -1,4 +1,4 @@
-//! Declarative pane layout builders.
+//! Named window layouts and declarative pane layout builders.
 //!
 //! The layout builder is SDK-side composition. It creates panes through the
 //! public split/spawn surfaces, asks the daemon to spread the resulting tree,
@@ -11,6 +11,10 @@ use crate::{
     Pane, PaneSet, ProcessCommandSpec, Result, RmuxError, Session, SplitDirection, WindowRef,
 };
 use rmux_proto::{Request, Response, SelectLayoutTarget, SpreadLayoutRequest};
+
+mod name;
+
+pub use name::{LayoutName, ParseLayoutNameError};
 
 /// Entry point returned by [`Session::layout`].
 #[derive(Debug)]
@@ -469,7 +473,7 @@ fn row_count(pane_count: usize, columns: usize) -> usize {
 }
 
 fn layout_error(message: impl Into<String>) -> RmuxError {
-    RmuxError::protocol(rmux_proto::RmuxError::Server(format!(
+    RmuxError::from_proto(rmux_proto::RmuxError::Server(format!(
         "invalid layout builder request: {}",
         message.into()
     )))

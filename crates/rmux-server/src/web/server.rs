@@ -11,6 +11,8 @@ mod http;
 mod keepalive;
 mod pre_auth;
 mod rate_limit;
+#[cfg(test)]
+mod selection_delivery_pause;
 mod streams;
 mod write_timeout;
 

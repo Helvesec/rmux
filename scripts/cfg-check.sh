@@ -21,7 +21,8 @@ check_budget() {
 check_budget rmux-types crates/rmux-types/src 0
 check_budget rmux-core crates/rmux-core/src 0
 check_budget rmux-proto crates/rmux-proto/src 0
-check_budget rmux-server crates/rmux-server/src 5
+# Exact inventory and layer rationale: docs/platform-neutrality-budget.md
+check_budget rmux-server crates/rmux-server/src 9
 check_budget rmux-client crates/rmux-client/src 10
 check_budget rmux-ipc crates/rmux-ipc/src 15
 check_budget rmux-pty crates/rmux-pty/src 20

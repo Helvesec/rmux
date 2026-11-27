@@ -122,7 +122,11 @@ impl SelectionTransitionSnapshot {
     pub(in crate::handler) fn capture(state: &HandlerState) -> Self {
         let mut sessions = HashMap::new();
         let mut windows = HashMap::new();
-        for (_session_name, session) in state.sessions.iter() {
+        for (_session_name, session) in state
+            .sessions
+            .iter()
+            .map(|session| (session.name(), session))
+        {
             if let Some(window) = session.window_at(session.active_window_index()) {
                 sessions.insert(
                     session.id(),
@@ -131,7 +135,7 @@ impl SelectionTransitionSnapshot {
                     },
                 );
             }
-            for window in session.windows().values() {
+            for window in session.windows().map(|(_, window)| window) {
                 if let Some(pane) = window.active_pane() {
                     windows
                         .entry(window.id())
@@ -150,6 +154,7 @@ impl SelectionTransitionSnapshot {
         let mut changed = state
             .sessions
             .iter()
+            .map(|session| (session.name(), session))
             .filter_map(|(session_name, session)| {
                 let previous = self.sessions.get(&session.id())?;
                 let current_window_id = session
@@ -217,7 +222,11 @@ impl SelectionTransitionSnapshot {
                     .or_insert((pane.id(), target.clone()));
             }
         }
-        for (session_name, session) in state.sessions.iter() {
+        for (session_name, session) in state
+            .sessions
+            .iter()
+            .map(|session| (session.name(), session))
+        {
             for (window_index, window) in session.windows() {
                 let Some(pane) = window.active_pane() else {
                     continue;
@@ -225,7 +234,7 @@ impl SelectionTransitionSnapshot {
                 current.entry(window.id()).or_insert_with(|| {
                     (
                         pane.id(),
-                        WindowTarget::with_window(session_name.clone(), *window_index),
+                        WindowTarget::with_window(session_name.clone(), window_index),
                     )
                 });
             }

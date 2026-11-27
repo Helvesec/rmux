@@ -40,7 +40,7 @@ async fn window_management_requests_round_trip_through_the_socket() -> Result<()
             environment: None,
         }))
         .await?;
-    assert!(matches!(created, Response::NewSession(_)));
+    crate::common::assert_new_session(&created);
 
     let new_window = client
         .send_request(&Request::NewWindow(Box::new(NewWindowRequest {
@@ -124,7 +124,7 @@ async fn kill_window_all_others_cleans_up_removed_window_ptys() -> Result<(), Bo
             environment: None,
         }))
         .await?;
-    assert!(matches!(created, Response::NewSession(_)));
+    crate::common::assert_new_session(&created);
 
     assert!(matches!(
         client
@@ -232,7 +232,7 @@ async fn window_navigation_and_listing_requests_round_trip_through_the_socket(
             environment: None,
         }))
         .await?;
-    assert!(matches!(created, Response::NewSession(_)));
+    crate::common::assert_new_session(&created);
 
     assert!(matches!(
         client
@@ -399,7 +399,7 @@ async fn window_move_swap_and_rotate_requests_round_trip_through_the_socket(
                 environment: None,
             }))
             .await?;
-        assert!(matches!(created, Response::NewSession(_)));
+        crate::common::assert_new_session(&created);
     }
 
     assert!(matches!(

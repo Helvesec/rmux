@@ -3,8 +3,8 @@ use super::*;
 async fn handler_with_split_session(name: &str) -> (RequestHandler, SessionName) {
     let handler = RequestHandler::new();
     let session = session_name(name);
-    assert!(matches!(
-        handler
+    crate::session_fixture::assert_new_session(
+        &handler
             .handle(Request::NewSession(NewSessionRequest {
                 session_name: session.clone(),
                 detached: true,
@@ -12,8 +12,7 @@ async fn handler_with_split_session(name: &str) -> (RequestHandler, SessionName)
                 environment: None,
             }))
             .await,
-        Response::NewSession(_)
-    ));
+    );
     assert!(matches!(
         handler
             .handle(Request::SplitWindow(SplitWindowRequest {

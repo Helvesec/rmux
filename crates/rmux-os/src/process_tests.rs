@@ -209,6 +209,154 @@ fn parses_raw_nul_separated_environment_without_utf8_filtering() {
     );
 }
 
+/// Expected names measured on tmux 3.7b (Linux `exec -a`, macOS executable
+/// file name), except the two documented divergences at the end.
+#[cfg(unix)]
+#[test]
+fn process_names_parse_like_tmux_window_names() {
+    let measured = [
+        ("my prog x", Some("my")),
+        ("nginx: master process /usr/sbin/nginx", Some("nginx:")),
+        ("nginx: master process nginx -g daemon off;", Some("nginx:")),
+        ("gunicorn: master [app]", Some("gunicorn:")),
+        ("-bash", Some("bash")),
+        ("/usr/bin/my prog", Some("my")),
+        ("./a.out", Some("./a.out")),
+        ("bin/tool", Some("bin/tool")),
+        ("/opt/x/", Some("x")),
+        ("/", Some("/")),
+        ("\"quoted name\" y", Some("quoted")),
+        ("\"a\"b", Some("a")),
+        ("x\"y z", Some("x")),
+        ("\"/usr/bin/vi\"m", Some("vi")),
+        ("exec foo", Some("foo")),
+        ("  lead", Some("lead")),
+        ("hello", Some("hello")),
+        ("top\t", Some("top")),
+        ("ab\u{1}\u{2}", Some("ab")),
+        // Divergences: tmux shows an empty name and trims `café` to `caf`.
+        ("-", None),
+        ("\u{1}", None),
+        ("café x", Some("café")),
+    ];
+    for (process_name, expected) in measured {
+        assert_eq!(
+            window_name_from_process_name(process_name).as_deref(),
+            expected,
+            "process name {process_name:?}"
+        );
+    }
+}
+
+/// The pane's foreground process reports `my prog x`: as argv[0] on Linux and
+/// as its executable file name on macOS. tmux 3.7b names it `my` on both.
+#[cfg(unix)]
+#[test]
+fn command_name_keeps_only_the_first_word_of_a_process_title() {
+    let child = TitledSleep::spawn("rmux-os-title", "my prog x");
+    let name = child.command_name();
+    assert_eq!(name.as_deref(), Some("my"));
+}
+
+/// macOS names the executable file, so `proc_pidpath` must lose its
+/// directory before the name is parsed: a space in a directory would
+/// otherwise end the first word there and name the process `rmux-os`.
+#[cfg(target_os = "macos")]
+#[test]
+fn command_name_ignores_a_space_in_the_executable_directory() {
+    let child = TitledSleep::spawn("rmux-os spaced dir", "sleeper");
+    let name = child.command_name();
+    assert_eq!(name.as_deref(), Some("sleeper"));
+}
+
+/// A `sleep` child that reports `title` as its process name, killed, reaped
+/// and cleaned up on drop.
+///
+/// Linux reports argv[0]: the system `sleep` runs under that argv[0] and is
+/// never copied, so no freshly written executable can fail with ETXTBSY while
+/// another test thread forks. macOS reports the executable file name, so
+/// `sleep` is copied to `title` inside a directory of its own.
+#[cfg(unix)]
+struct TitledSleep {
+    child: std::process::Child,
+    copy: Option<PathBuf>,
+}
+
+#[cfg(unix)]
+impl TitledSleep {
+    fn spawn(dir_name: &str, title: &str) -> Self {
+        use std::os::unix::process::CommandExt;
+
+        let sleep = ["/bin/sleep", "/usr/bin/sleep"]
+            .into_iter()
+            .map(std::path::Path::new)
+            .find(|path| path.exists())
+            .expect("a sleep binary");
+        let copy = cfg!(target_os = "macos").then(|| {
+            let dir = std::env::temp_dir().join(format!("{dir_name}-{}", std::process::id()));
+            std::fs::create_dir_all(&dir).expect("create the titled sleep directory");
+            let copy = dir.join(title);
+            std::fs::copy(sleep, &copy).expect("copy sleep");
+            copy
+        });
+        let child = std::process::Command::new(copy.as_deref().unwrap_or(sleep))
+            .arg0(title)
+            .arg("30")
+            .spawn()
+            .expect("spawn the titled sleep");
+        let titled = Self { child, copy };
+        titled.wait_for_exec(title);
+        titled
+    }
+
+    /// Waits until the child reports the new image's own record, read
+    /// without the parser under test: Rust's spawn can return before Linux
+    /// has published the new argv, which then reads empty, cut short (`targ`)
+    /// or as the test binary that forked it.
+    fn wait_for_exec(&self, title: &str) {
+        let pid = self.child.id();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while !Self::exec_completed(pid, title) {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the titled sleep never finished its exec"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    fn exec_completed(pid: u32, title: &str) -> bool {
+        std::fs::read(format!("/proc/{pid}/cmdline"))
+            .is_ok_and(|cmdline| cmdline == format!("{title}\x0030\x00").as_bytes())
+    }
+
+    #[cfg(target_os = "macos")]
+    fn exec_completed(pid: u32, title: &str) -> bool {
+        executable_path(pid).is_some_and(|path| {
+            std::path::Path::new(&path).file_name() == Some(std::ffi::OsStr::new(title))
+        })
+    }
+
+    fn command_name(&self) -> Option<String> {
+        command_name(self.child.id())
+    }
+}
+
+#[cfg(unix)]
+impl Drop for TitledSleep {
+    fn drop(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+        if let Some(copy) = &self.copy {
+            let _ = std::fs::remove_file(copy);
+            if let Some(dir) = copy.parent() {
+                let _ = std::fs::remove_dir(dir);
+            }
+        }
+    }
+}
+
 #[cfg(all(unix, target_os = "macos"))]
 #[test]
 fn parses_macos_procargs_environment() {

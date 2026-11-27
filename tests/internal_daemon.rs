@@ -3,18 +3,24 @@
 mod common;
 
 use std::error::Error;
+use std::ffi::OsStr;
 use std::fs;
 use std::os::unix::fs::PermissionsExt;
+use std::os::unix::net::UnixListener;
+use std::path::Path;
 use std::process::{Child, Command, Stdio};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
+use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
 use rmux_client::{connect, ensure_server_running, INTERNAL_DAEMON_FLAG};
 use rmux_proto::{NewSessionRequest, NewSessionResponse, Request, Response, SessionName};
 
 use common::{
-    env_lock, stderr, terminate_child, unique_socket_path, wait_for_socket, write_hidden_launcher,
-    AutoStartCleanup, CliHarness, EnvVarGuard, BINARY_OVERRIDE_ENV,
-    BINARY_OVERRIDE_TEST_OPT_IN_ENV,
+    default_socket_path_in, env_lock, stderr, terminate_child, unique_socket_path, unique_tmpdir,
+    wait_for_socket, write_hidden_launcher, AutoStartCleanup, CliHarness, EnvVarGuard,
+    BINARY_OVERRIDE_ENV, BINARY_OVERRIDE_TEST_OPT_IN_ENV, STARTUP_TIMEOUT,
 };
 
 const CLIENT_VERSION_OVERRIDE_ENV: &str = "RMUX_INTERNAL_CLIENT_VERSION";
@@ -22,18 +28,17 @@ const CLIENT_VERSION_OVERRIDE_ENV: &str = "RMUX_INTERNAL_CLIENT_VERSION";
 #[test]
 fn hidden_daemon_mode_binds_requested_socket_and_serves_requests() -> Result<(), Box<dyn Error>> {
     let socket_path = unique_socket_path("hidden-daemon");
-    let mut child = Command::new(env!("CARGO_BIN_EXE_rmux"))
-        .arg(INTERNAL_DAEMON_FLAG)
-        .arg(&socket_path)
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()?;
+    let mut child = Command::new(rmux_os::build_identity::cargo_binary(env!(
+        "CARGO_BIN_EXE_rmux"
+    )))
+    .arg(INTERNAL_DAEMON_FLAG)
+    .arg(&socket_path)
+    .stdin(Stdio::null())
+    .stdout(Stdio::null())
+    .stderr(Stdio::null())
+    .spawn()?;
 
-    if let Err(error) = wait_for_socket(&socket_path, &mut child) {
-        let _ = terminate_child(&mut child);
-        return Err(error);
-    }
+    wait_for_socket(&socket_path, &mut child)?;
 
     let mut connection = connect(&socket_path)?;
     let response = connection.roundtrip(&Request::NewSession(NewSessionRequest {
@@ -143,5 +148,208 @@ fn wait_for_child_exit(child: &mut Child, timeout: Duration) -> Result<(), Box<d
             return Err(format!("stale daemon process {} did not exit", child.id()).into());
         }
         std::thread::sleep(Duration::from_millis(25));
+    }
+}
+
+/// A hidden daemon still starting when the harness gives up on it must not
+/// outlive that failure. The harness then removes its private RMUX_TMPDIR, so
+/// a late daemon that resolves its socket from that variable lands on the
+/// user's default socket under /tmp.
+#[test]
+fn failed_hidden_daemon_startup_wait_reaps_the_daemon() -> Result<(), Box<dyn Error>> {
+    let harness = CliHarness::new("hidden-startup-failure")?;
+    let socket_path = harness.socket_path().to_path_buf();
+    let _occupant = ReadinessRefusingOccupant::bind(&socket_path)?;
+    let mut daemon = stopped_before_exec(&harness.hidden_daemon_command()).spawn()?;
+
+    let startup = wait_for_socket(&socket_path, &mut daemon);
+    let survived = daemon.try_wait()?.is_none();
+    if survived {
+        // The daemon never ran past its stop, so it bound nothing anywhere.
+        daemon.kill()?;
+        daemon.wait()?;
+    }
+
+    assert!(
+        startup.is_err(),
+        "the occupant must fail the readiness probe"
+    );
+    assert!(
+        !survived,
+        "hidden daemon {} outlived its failed startup wait: {startup:?}",
+        daemon.id()
+    );
+    Ok(())
+}
+
+/// A starved host can stop a hidden daemon while its startup wait fails.
+/// The daemon handles SIGTERM, and a stopped process runs no handler, so the
+/// harness must resume it; otherwise the reap waits out the whole shutdown
+/// grace and falls back to SIGKILL, which skips the daemon's cleanup.
+#[test]
+fn failed_hidden_daemon_startup_wait_resumes_a_stopped_daemon_before_reaping_it(
+) -> Result<(), Box<dyn Error>> {
+    let harness = CliHarness::new("hidden-startup-stopped")?;
+    let socket_path = harness.socket_path().to_path_buf();
+    let _occupant = ReadinessRefusingOccupant::bind(&socket_path)?;
+    let mut daemon = stopped_before_exec(&harness.hidden_daemon_command()).spawn()?;
+    let stopped = wait_until_stopped(&daemon, STARTUP_TIMEOUT);
+    if stopped.is_err() {
+        let _ = daemon.kill();
+        let _ = daemon.wait();
+    }
+    stopped?;
+
+    let startup = wait_for_socket(&socket_path, &mut daemon);
+    let reaped = daemon.try_wait()?;
+    if reaped.is_none() {
+        // The daemon never ran past its stop, so it bound nothing anywhere.
+        daemon.kill()?;
+        daemon.wait()?;
+    }
+
+    assert!(
+        startup.is_err(),
+        "the occupant must fail the readiness probe"
+    );
+    let status = reaped.ok_or_else(|| {
+        format!(
+            "stopped hidden daemon {} outlived its failed startup wait",
+            daemon.id()
+        )
+    })?;
+    assert_eq!(
+        status.code(),
+        Some(STOPPED_WRAPPER_TERM_EXIT),
+        "stopped hidden daemon {} ended with {status} instead of handling its pending SIGTERM",
+        daemon.id()
+    );
+    Ok(())
+}
+
+#[test]
+fn harness_hidden_daemon_names_its_private_socket() -> Result<(), Box<dyn Error>> {
+    let harness = CliHarness::new("hidden-explicit-socket")?;
+    let command = harness.hidden_daemon_command();
+
+    let args: Vec<&OsStr> = command.get_args().collect();
+
+    assert_eq!(
+        args,
+        [
+            OsStr::new(INTERNAL_DAEMON_FLAG),
+            harness.socket_path().as_os_str()
+        ],
+        "a hidden daemon left to resolve RMUX_TMPDIR can bind the user's default socket"
+    );
+    Ok(())
+}
+
+#[test]
+fn default_socket_path_in_refuses_to_fall_back_to_the_user_default() -> Result<(), Box<dyn Error>> {
+    let missing = unique_tmpdir("missing-socket-root");
+    assert!(!missing.exists());
+
+    let resolved = default_socket_path_in(&missing);
+
+    assert!(
+        resolved.is_err(),
+        "a missing private root resolved {resolved:?} outside '{}'",
+        missing.display()
+    );
+    Ok(())
+}
+
+/// Exit code of the `stopped_before_exec` shell once it handles SIGTERM.
+const STOPPED_WRAPPER_TERM_EXIT: i32 = 143;
+
+/// Runs `command` from a shell that stops itself before the exec, so the
+/// child cannot bind or resolve anything until it receives SIGCONT. Like the
+/// daemon it stands for, the shell handles SIGTERM: Darwin ends a stopped
+/// process at once on a SIGTERM left to its default action, so only a
+/// handled SIGTERM needs the resume.
+fn stopped_before_exec(command: &Command) -> Command {
+    let mut wrapper = Command::new("/bin/sh");
+    wrapper
+        .arg("-c")
+        .arg(format!(
+            "trap 'exit {STOPPED_WRAPPER_TERM_EXIT}' TERM; kill -STOP $$ && exec \"$@\""
+        ))
+        .arg("sh")
+        .arg(command.get_program())
+        .args(command.get_args())
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+    for (name, value) in command.get_envs() {
+        match value {
+            Some(value) => wrapper.env(name, value),
+            None => wrapper.env_remove(name),
+        };
+    }
+    wrapper
+}
+
+/// Waits until `child` reports a stop. The stop report is consumed, which
+/// leaves the exit status to `Child`.
+fn wait_until_stopped(child: &Child, timeout: Duration) -> Result<(), Box<dyn Error>> {
+    let pid = libc::pid_t::try_from(child.id())?;
+    let deadline = Instant::now() + timeout;
+    loop {
+        let mut status: libc::c_int = 0;
+        // SAFETY: `child` is an owned, unreaped child, so `pid` names it.
+        let waited = unsafe { libc::waitpid(pid, &mut status, libc::WUNTRACED | libc::WNOHANG) };
+        if waited == pid && libc::WIFSTOPPED(status) {
+            return Ok(());
+        }
+        if waited != 0 {
+            return Err(
+                format!("child {pid} did not stop: waitpid {waited}, status {status:#x}").into(),
+            );
+        }
+        if Instant::now() >= deadline {
+            return Err(format!("child {pid} did not stop within {timeout:?}").into());
+        }
+        thread::sleep(Duration::from_millis(10));
+    }
+}
+
+/// Listens on a private socket path and closes every connection unanswered,
+/// so a readiness probe fails at once instead of after the startup bound.
+struct ReadinessRefusingOccupant {
+    stop: Arc<AtomicBool>,
+    acceptor: Option<JoinHandle<()>>,
+}
+
+impl ReadinessRefusingOccupant {
+    fn bind(socket_path: &Path) -> Result<Self, Box<dyn Error>> {
+        let parent = socket_path.parent().expect("socket parent");
+        fs::create_dir_all(parent)?;
+        fs::set_permissions(parent, fs::Permissions::from_mode(0o700))?;
+        let listener = UnixListener::bind(socket_path)?;
+        listener.set_nonblocking(true)?;
+        let stop = Arc::new(AtomicBool::new(false));
+        let acceptor_stop = Arc::clone(&stop);
+        let acceptor = thread::spawn(move || {
+            while !acceptor_stop.load(Ordering::Relaxed) {
+                match listener.accept() {
+                    Ok((stream, _)) => drop(stream),
+                    Err(_) => thread::sleep(Duration::from_millis(10)),
+                }
+            }
+        });
+        Ok(Self {
+            stop,
+            acceptor: Some(acceptor),
+        })
+    }
+}
+
+impl Drop for ReadinessRefusingOccupant {
+    fn drop(&mut self) {
+        self.stop.store(true, Ordering::Relaxed);
+        if let Some(acceptor) = self.acceptor.take() {
+            let _ = acceptor.join();
+        }
     }
 }

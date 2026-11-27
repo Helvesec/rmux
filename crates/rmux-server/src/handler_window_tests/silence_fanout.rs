@@ -243,7 +243,7 @@ async fn link_window_kill_clears_replaced_group_alerts_before_deadline_fanout() 
         for session_name in [&owner, &peer] {
             assert!(state
                 .sessions
-                .session_mut(session_name)
+                .session_setup(session_name)
                 .expect("destination group member exists")
                 .add_winlink_alert_flags(0, stale_flags));
         }

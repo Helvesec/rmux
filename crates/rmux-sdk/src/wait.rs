@@ -1,6 +1,5 @@
 //! Daemon-backed byte waits and snapshot-polled text wait helpers.
 
-#[path = "wait/visible.rs"]
 mod visible;
 
 use std::future::Future;
@@ -27,7 +26,7 @@ pub(crate) const WAIT_FOR_TEXT_OPERATION: &str = "wait for pane snapshot text";
 const WAIT_FOR_NEXT_BYTES_OPERATION: &str = "wait for next pane output bytes";
 const WAIT_FOR_TEXT_NEXT_OPERATION: &str = "wait for next pane output text";
 const WAIT_FOR_EXIT_OPERATION: &str = "wait for pane process exit";
-pub(crate) const TEXT_POLL_INTERVAL: Duration = Duration::from_millis(25);
+pub(crate) use crate::automation::POLL_INTERVAL as TEXT_POLL_INTERVAL;
 #[cfg(windows)]
 const SDK_WAIT_ARM_DISPATCH_SETTLE: Duration = Duration::from_millis(250);
 
@@ -123,7 +122,7 @@ impl std::fmt::Debug for ArmedWait {
 
 pub(crate) async fn wait_for_bytes(pane: &Pane, bytes: Vec<u8>) -> Result<()> {
     if bytes.is_empty() {
-        return Err(RmuxError::protocol(ProtoError::Server(
+        return Err(RmuxError::from_proto(ProtoError::Server(
             "SDK wait bytes must not be empty".to_owned(),
         )));
     }
@@ -135,7 +134,7 @@ pub(crate) async fn wait_for_bytes(pane: &Pane, bytes: Vec<u8>) -> Result<()> {
 
 pub(crate) async fn wait_for_next_bytes(pane: &Pane, bytes: Vec<u8>) -> Result<ArmedWait> {
     if bytes.is_empty() {
-        return Err(RmuxError::protocol(ProtoError::Server(
+        return Err(RmuxError::from_proto(ProtoError::Server(
             "SDK wait bytes must not be empty".to_owned(),
         )));
     }
@@ -146,7 +145,7 @@ pub(crate) async fn wait_for_next_bytes(pane: &Pane, bytes: Vec<u8>) -> Result<A
 
 pub(crate) async fn wait_for_text(pane: &Pane, text: String) -> Result<()> {
     if text.is_empty() {
-        return Err(RmuxError::protocol(ProtoError::Server(
+        return Err(RmuxError::from_proto(ProtoError::Server(
             "SDK wait text must not be empty".to_owned(),
         )));
     }
@@ -162,7 +161,7 @@ pub(crate) async fn wait_for_text(pane: &Pane, text: String) -> Result<()> {
 
 pub(crate) async fn wait_for_text_next(pane: &Pane, text: String) -> Result<ArmedWait> {
     if text.is_empty() {
-        return Err(RmuxError::protocol(ProtoError::Server(
+        return Err(RmuxError::from_proto(ProtoError::Server(
             "SDK wait text must not be empty".to_owned(),
         )));
     }
@@ -353,8 +352,29 @@ pub(crate) async fn snapshot_with_wait_deadline(
     last_snapshot: Option<&PaneSnapshot>,
     description: impl FnOnce() -> String,
 ) -> Result<PaneSnapshot> {
-    match with_wait_deadline(operation, timeout, deadline, pane.snapshot()).await {
-        Ok(snapshot) => Ok(snapshot),
+    bounded_wait_snapshot(
+        operation,
+        timeout,
+        deadline,
+        last_snapshot,
+        description,
+        pane.snapshot(),
+    )
+    .await
+}
+
+/// Bounds one snapshot-phase daemon exchange by the wait deadline. Once a
+/// snapshot was captured, running out of time is a wait timeout carrying it.
+pub(crate) async fn bounded_wait_snapshot<T>(
+    operation: &'static str,
+    timeout: Option<Duration>,
+    deadline: Option<Instant>,
+    last_snapshot: Option<&PaneSnapshot>,
+    description: impl FnOnce() -> String,
+    exchange: impl Future<Output = Result<T>>,
+) -> Result<T> {
+    match with_wait_deadline(operation, timeout, deadline, exchange).await {
+        Ok(value) => Ok(value),
         Err(error) if is_wait_deadline_error(&error) && last_snapshot.is_some() => {
             Err(RmuxError::wait_timeout(WaitTimeoutError::new(
                 description(),
@@ -427,21 +447,21 @@ fn sdk_wait_response_to_result(response: Response, expected_wait_id: SdkWaitId) 
             if response.wait_id == expected_wait_id
                 && response.outcome == SdkWaitOutcome::Cancelled =>
         {
-            Err(RmuxError::protocol(ProtoError::Server(format!(
+            Err(RmuxError::from_proto(ProtoError::Server(format!(
                 "SDK wait {} was cancelled",
                 response.wait_id.as_u64()
             ))))
         }
         Response::SdkWaitForOutput(response) => {
             if response.wait_id != expected_wait_id {
-                return Err(RmuxError::protocol(ProtoError::Server(format!(
+                return Err(RmuxError::from_proto(ProtoError::Server(format!(
                     "SDK wait response id {} did not match request id {}",
                     response.wait_id.as_u64(),
                     expected_wait_id.as_u64()
                 ))));
             }
 
-            Err(RmuxError::protocol(ProtoError::Server(format!(
+            Err(RmuxError::from_proto(ProtoError::Server(format!(
                 "SDK wait {} completed with unexpected outcome {:?}",
                 response.wait_id.as_u64(),
                 response.outcome

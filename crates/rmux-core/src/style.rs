@@ -9,11 +9,8 @@ use std::fmt;
 
 use crate::input::{Colour, GridAttr, COLOUR_DEFAULT};
 
-#[path = "style/colour.rs"]
 mod colour;
-#[path = "style/grammar.rs"]
 mod grammar;
-#[path = "style/types.rs"]
 mod types;
 
 pub use colour::{colour_to_string, parse_colour, ColourParseError};
@@ -518,6 +515,24 @@ mod tests {
         let mut style = original.clone();
         assert!(style_parse(&mut style, &default_base(), "fg=invalid").is_err());
         assert_eq!(style, original);
+    }
+
+    #[test]
+    fn non_ascii_tokens_are_invalid_styles_instead_of_panics() {
+        // A multi-byte character that straddles a directive prefix length
+        // must be reported like tmux's "invalid style", never sliced.
+        let mut tokens = vec!["ab\u{e9}".to_owned(), "abcde\u{e9}".to_owned()];
+        for prefix in [
+            "list=", "range=", "align=", "fill=", "fg=", "bg=", "us=", "width=", "pad=", "colour",
+            "color",
+        ] {
+            tokens.push(format!("{}\u{e9}", &prefix[..prefix.len() - 1]));
+            tokens.push(format!("{prefix}\u{e9}"));
+        }
+        for token in tokens {
+            assert!(Style::parse(&token).is_err(), "{token:?} must be invalid");
+            assert!(parse_colour(&token).is_err(), "{token:?} is not a colour");
+        }
     }
 
     #[test]

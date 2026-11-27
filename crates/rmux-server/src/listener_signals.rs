@@ -43,6 +43,7 @@ pub(crate) async fn handle_server_signal(
     match signal {
         Some(ServerSignal::Shutdown(reason)) => {
             debug!(reason, "requesting shutdown after server signal");
+            handler.close_every_session_for_signalled_exit().await;
             shutdown_handle.request_shutdown();
         }
         Some(ServerSignal::ChildChanged) => {

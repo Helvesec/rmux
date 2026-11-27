@@ -1,5 +1,8 @@
 use super::*;
 
+#[path = "control_alias_occurrence_tests.rs"]
+mod control_alias_occurrence_tests;
+
 use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
 use std::time::Duration;
@@ -430,7 +433,7 @@ async fn undeclared_control_client_never_shrinks_an_attached_session_like_tmux37
     // CLIENT_SIZECHANGED, so the 80x24 placeholder a control client starts with
     // is not a size candidate. rmux used to hand it to the policy and crushed
     // the session to the placeholder under latest and smallest.
-    // Probe: .rmux-audit/control-attach-8023/probe_ctl_attach_shrink.py
+    // Probe: control-attach-8023/probe_ctl_attach_shrink.py
     for (index, policy) in ["latest", "largest", "smallest", "manual"]
         .into_iter()
         .enumerate()
@@ -480,7 +483,7 @@ async fn undeclared_control_client_alone_never_resizes_the_session_like_tmux37()
     // client attaches without declaring a size. With no ordinary client to
     // outvote it the placeholder also won `largest`, so this cell is the one
     // that pins the rule for every automatic policy.
-    // Probe: .rmux-audit/control-attach-8023/probe_ctl_only_client.py
+    // Probe: control-attach-8023/probe_ctl_only_client.py
     for (index, policy) in ["latest", "largest", "smallest", "manual"]
         .into_iter()
         .enumerate()
@@ -503,6 +506,94 @@ async fn undeclared_control_client_alone_never_resizes_the_session_like_tmux37()
             "{policy}: the session keeps its own geometry, the control client owns none"
         );
     }
+}
+
+#[tokio::test]
+async fn ignore_size_control_client_never_resizes_the_session_like_tmux() {
+    let handler = RequestHandler::new();
+    let session = session_name("control-ignore-size");
+    create_session(&handler, session.clone(), INITIAL_SIZE).await;
+    let requester_pid = std::process::id();
+    let (_control_id, _events) =
+        register_control_client_with_id(&handler, requester_pid, &session).await;
+
+    let response = handler
+        .handle(Request::AttachSessionExt2(Box::new(
+            rmux_proto::request::AttachSessionExt2Request {
+                target: Some(session.clone()),
+                target_spec: None,
+                detach_other_clients: false,
+                kill_other_clients: false,
+                read_only: false,
+                skip_environment_update: true,
+                flags: Some(vec!["ignore-size".to_owned()]),
+                working_directory: None,
+                client_terminal: rmux_proto::ClientTerminalContext::default(),
+                client_size: None,
+            },
+        )))
+        .await;
+    assert!(!matches!(response, Response::Error(_)), "{response:?}");
+    let response = handler
+        .handle(Request::RefreshClient(Box::new(
+            refresh_client_size_request(requester_pid, CONTROL_SIZE),
+        )))
+        .await;
+    assert!(
+        matches!(response, Response::RefreshClient(_)),
+        "{response:?}"
+    );
+
+    assert_eq!(
+        control_client_size(&handler, requester_pid).await,
+        CONTROL_SIZE
+    );
+    assert_eq!(session_size(&handler, &session).await, INITIAL_SIZE);
+    let active_control = handler.active_control.lock().await;
+    let active = active_control
+        .by_pid
+        .get(&requester_pid)
+        .expect("control client remains registered");
+    assert!(crate::handler::format_control_client_flags(active).contains("ignore-size"));
+}
+
+#[tokio::test]
+async fn refresh_client_flags_toggle_ignore_size_on_a_control_client_like_tmux() {
+    let handler = RequestHandler::new();
+    let session = session_name("control-refresh-ignore-size");
+    create_session(&handler, session.clone(), INITIAL_SIZE).await;
+    let requester_pid = std::process::id();
+    let (_control_id, _events) =
+        register_control_client_with_id(&handler, requester_pid, &session).await;
+    let refresh = |flags: &str, size: TerminalSize| {
+        let mut request = refresh_client_size_request(requester_pid, size);
+        request.flags = Some(flags.to_owned());
+        Request::RefreshClient(Box::new(request))
+    };
+
+    let response = handler.handle(refresh("ignore-size", CONTROL_SIZE)).await;
+    assert!(
+        matches!(response, Response::RefreshClient(_)),
+        "{response:?}"
+    );
+    assert_eq!(session_size(&handler, &session).await, INITIAL_SIZE);
+
+    let response = handler.handle(refresh("!ignore-size", TARGET_SIZE)).await;
+    assert!(
+        matches!(response, Response::RefreshClient(_)),
+        "{response:?}"
+    );
+    assert_eq!(session_size(&handler, &session).await, TARGET_SIZE);
+
+    // tmux 3.7b also takes `read-only` here; it never changes window size.
+    let response = handler.handle(refresh("read-only", TARGET_SIZE)).await;
+    assert!(
+        matches!(response, Response::RefreshClient(_)),
+        "{response:?}"
+    );
+    assert_eq!(session_size(&handler, &session).await, TARGET_SIZE);
+    let response = handler.handle(refresh("bogus-flag", TARGET_SIZE)).await;
+    assert!(matches!(response, Response::Error(_)), "{response:?}");
 }
 
 #[tokio::test]
@@ -806,7 +897,7 @@ async fn switching_attached_client_notifies_the_source_session_layout_change_lik
 /// already sitting on the destination watches its window grow.
 ///
 /// Frozen tmux 3.7b oracle, measured 2026-07-25
-/// (`.rmux-audit/oracle/scenario_switch_destination.py` plus the status matrix):
+/// (`oracle/scenario_switch_destination.py` plus the status matrix):
 /// with a 101x41 PTY client on `source`, a 60x20 control client on `target`,
 /// default one-line status and `window-size largest`, after
 /// `switch-client -c <tty> -t target` the destination window grows
@@ -941,7 +1032,7 @@ async fn attach_session_from_an_attached_client_notifies_the_destination_layout_
 #[tokio::test]
 async fn attaching_client_notifies_the_destination_session_layout_change_like_tmux37() {
     // Frozen tmux 3.7b oracle, measured 2026-07-25
-    // (`.rmux-audit/oracle/scenario_attach_destination.py` plus the status
+    // (`oracle/scenario_attach_destination.py` plus the status
     // matrix): a 60x20 control client already on `target`, default one-line
     // status and `window-size largest`, watches a brand-new 101x41 PTY client
     // attach. The window grows 60x20 -> 101x40 and the control client receives
@@ -974,22 +1065,24 @@ async fn attaching_client_notifies_the_destination_session_layout_change_like_tm
     let target_layout_prefix = format!("%layout-change @{target_window_id} ");
     settle_control_notifications(&mut control_events).await;
 
-    let response = handler
-        .handle(Request::AttachSessionExt2(Box::new(
-            rmux_proto::request::AttachSessionExt2Request {
-                target: Some(target.clone()),
-                target_spec: None,
-                detach_other_clients: false,
-                kill_other_clients: false,
-                read_only: false,
-                skip_environment_update: true,
-                flags: None,
-                working_directory: None,
-                client_terminal: rmux_proto::ClientTerminalContext::default(),
-                client_size: Some(arriving_size),
-            },
-        )))
-        .await;
+    // Drive registration too: dispatch alone only prepares the native upgrade.
+    let (response, attached) = crate::listener::attach_geometry_test_support::attach(
+        &handler,
+        Request::AttachSessionExt2(Box::new(rmux_proto::request::AttachSessionExt2Request {
+            target: Some(target.clone()),
+            target_spec: None,
+            detach_other_clients: false,
+            kill_other_clients: false,
+            read_only: false,
+            skip_environment_update: true,
+            flags: None,
+            working_directory: None,
+            client_terminal: rmux_proto::ClientTerminalContext::default(),
+            client_size: Some(arriving_size),
+        })),
+    )
+    .await
+    .expect("native attach completes");
     assert!(
         matches!(response, Response::AttachSession(_)),
         "{response:?}"
@@ -1027,6 +1120,128 @@ async fn attaching_client_notifies_the_destination_session_layout_change_like_tm
     assert!(
         session_changed_index < layout_index,
         "tmux 3.7b reports the PTY attach before the layout it causes: {lines:?}"
+    );
+    attached.finish().await.expect("attached peer exits");
+}
+
+#[tokio::test]
+async fn abandoned_attach_after_session_rename_publishes_its_resize() {
+    let handler = RequestHandler::new();
+    let before = session_name("review-before");
+    let after = session_name("review-after");
+    create_session(&handler, before.clone(), TARGET_SIZE).await;
+    set_window_size_policy(&handler, &before, "largest").await;
+    let window_id = active_window_id(&handler, &before).await;
+    let (_, mut events) =
+        register_control_client_with_id(&handler, std::process::id().wrapping_add(6), &before)
+            .await;
+    settle_control_notifications(&mut events).await;
+    let outcome = handler
+        .dispatch(
+            std::process::id(),
+            Request::AttachSessionExt2(Box::new(rmux_proto::request::AttachSessionExt2Request {
+                target: Some(before.clone()),
+                target_spec: None,
+                detach_other_clients: false,
+                kill_other_clients: false,
+                read_only: false,
+                skip_environment_update: true,
+                flags: None,
+                working_directory: None,
+                client_terminal: Default::default(),
+                client_size: Some(TerminalSize {
+                    cols: 101,
+                    rows: 41,
+                }),
+            })),
+        )
+        .await;
+    assert!(matches!(outcome.response, Response::AttachSession(_)));
+    assert!(outcome.attach.is_some());
+    assert!(matches!(
+        handler
+            .handle(Request::RenameSession(rmux_proto::RenameSessionRequest {
+                target: before,
+                new_name: after.clone(),
+            }))
+            .await,
+        Response::RenameSession(_)
+    ));
+    assert_eq!(active_window_id(&handler, &after).await, window_id);
+    drop(outcome);
+    let prefix = format!("%layout-change @{window_id} ");
+    let lines = collect_control_notifications_through(&mut events, &prefix).await;
+    let layouts = lines
+        .iter()
+        .filter(|line| line.starts_with(&prefix))
+        .collect::<Vec<_>>();
+    assert_eq!(layouts.len(), 1, "{lines:?}");
+    assert!(layouts[0].contains(",101x40,"), "{lines:?}");
+    assert!(
+        !lines
+            .iter()
+            .any(|line| line.starts_with("%client-session-changed ")),
+        "{lines:?}"
+    );
+}
+
+#[tokio::test]
+async fn abandoned_attach_publishes_its_resize_without_announcing_a_client() {
+    let handler = RequestHandler::new();
+    let target = session_name("abandoned-attach-geometry");
+    create_session(&handler, target.clone(), TARGET_SIZE).await;
+    set_window_size_policy(&handler, &target, "largest").await;
+    let (_, mut events) =
+        register_control_client_with_id(&handler, std::process::id().wrapping_add(6), &target)
+            .await;
+    settle_control_notifications(&mut events).await;
+    let outcome = handler
+        .dispatch(
+            std::process::id(),
+            Request::AttachSessionExt2(Box::new(rmux_proto::request::AttachSessionExt2Request {
+                target: Some(target.clone()),
+                target_spec: None,
+                detach_other_clients: false,
+                kill_other_clients: false,
+                read_only: false,
+                skip_environment_update: true,
+                flags: None,
+                working_directory: None,
+                client_terminal: Default::default(),
+                client_size: Some(TerminalSize {
+                    cols: 101,
+                    rows: 41,
+                }),
+            })),
+        )
+        .await;
+    assert!(matches!(outcome.response, Response::AttachSession(_)));
+    assert!(outcome.attach.is_some());
+    let before = settle_control_notifications(&mut events).await;
+    assert!(
+        !before
+            .iter()
+            .any(|line| line.starts_with("%layout-change ")),
+        "{before:?}"
+    );
+    drop(outcome);
+    let prefix = format!(
+        "%layout-change @{} ",
+        active_window_id(&handler, &target).await
+    );
+    let after = collect_control_notifications_through(&mut events, &prefix).await;
+    assert_eq!(
+        after
+            .iter()
+            .filter(|line| line.starts_with(&prefix))
+            .count(),
+        1
+    );
+    assert!(
+        !after
+            .iter()
+            .any(|line| line.starts_with("%client-session-changed ")),
+        "{after:?}"
     );
 }
 
@@ -1296,7 +1511,7 @@ async fn destroyed_control_session_rehome_reconciles_target_geometry_like_tmux37
 #[tokio::test]
 async fn destroyed_session_rehome_notifies_the_attached_destination_layout_change_like_tmux37() {
     // Frozen tmux 3.7b oracle, measured 2026-07-25
-    // (`.rmux-audit/oracle/scenario_destroy_rehome_destination.py`): `doomed`
+    // (`oracle/scenario_destroy_rehome_destination.py`): `doomed`
     // holds a 101x41 PTY client with `detach-on-destroy off`, `keep` holds a
     // 60x20 control client, `window-size largest`. Killing `doomed` rehomes the
     // PTY client onto `keep`, whose default-status window grows
@@ -1711,7 +1926,7 @@ async fn create_session(handler: &RequestHandler, session: SessionName, size: Te
             environment: None,
         }))
         .await;
-    assert!(matches!(response, Response::NewSession(_)), "{response:?}");
+    crate::session_fixture::assert_new_session(&response);
 }
 
 async fn set_window_size_policy(handler: &RequestHandler, session: &SessionName, policy: &str) {
@@ -1880,7 +2095,7 @@ async fn window_ids(handler: &RequestHandler, session: &SessionName) -> Vec<u32>
         .session(session)
         .expect("session remains present")
         .windows()
-        .values()
+        .map(|(_, window)| window)
         .map(|window| window.id().as_u32())
         .collect()
 }
@@ -1897,7 +2112,7 @@ async fn session_window_sizes(
         .session(session)
         .expect("session remains present")
         .windows()
-        .values()
+        .map(|(_, window)| window)
         .map(|window| window.size())
         .collect()
 }
@@ -1962,3 +2177,23 @@ async fn settle_control_notifications(
     }
     lines
 }
+
+#[path = "window_sizes_tests.rs"]
+mod window_sizes;
+
+#[path = "detach_event_tests.rs"]
+mod detach_event_tests;
+
+mod detach_order;
+
+#[path = "control_geometry_ignore_size_tests.rs"]
+mod ignore_size_tests;
+
+#[path = "control_read_only_tests.rs"]
+mod read_only_tests;
+
+#[path = "control_send_keys_target_tests.rs"]
+mod send_keys_target_tests;
+
+#[path = "control_flag_change_tests.rs"]
+mod flag_change_tests;

@@ -1,4 +1,4 @@
-use rmux_core::Screen;
+use rmux_core::{Screen, ScreenLineView};
 use rmux_proto::RmuxError;
 
 use super::args::parse_single_argument;
@@ -191,5 +191,76 @@ impl CopyModeState {
                 y: position.y,
             },
         }
+    }
+
+    /// The text of a row-local word range, read across soft wraps as tmux's
+    /// `format_grid_word` reads it: a word that reaches the first owner cell of
+    /// its row starts earlier when the row above soft-wraps into it, and a word
+    /// that reaches the last owner cell of a soft-wrapped row continues on the
+    /// next. A hard newline, a space or a separator still ends it, and a wide
+    /// owner is emitted once.
+    pub(super) fn soft_wrapped_word_text(&self, range: CopyRange) -> String {
+        let start = self.soft_wrapped_word_start(range.start);
+        let end = self.soft_wrapped_word_end(range.end);
+        let mut text = String::new();
+        for y in start.y..=end.y {
+            let line = self.line(y);
+            let from = if y == start.y { start.x } else { 0 };
+            let to = if y == end.y {
+                end.x
+            } else {
+                self.cols().saturating_sub(1)
+            };
+            text.push_str(&self.extract_line_range(&line, from, to, false));
+        }
+        text
+    }
+
+    fn soft_wrapped_word_start(&self, mut start: CopyPosition) -> CopyPosition {
+        while start.y > 0 {
+            let row = self.line(start.y);
+            let above = self.line(start.y - 1);
+            if !above.wrapped() || owner_positions(&row).first() != Some(&start.x) {
+                break;
+            }
+            let owners = owner_positions(&above);
+            let Some(x) = owners
+                .iter()
+                .rev()
+                .take_while(|x| self.is_word_cell(&above, **x))
+                .last()
+            else {
+                break;
+            };
+            start = CopyPosition {
+                x: *x,
+                y: start.y - 1,
+            };
+        }
+        start
+    }
+
+    fn soft_wrapped_word_end(&self, mut end: CopyPosition) -> CopyPosition {
+        while end.y + 1 < self.total_lines() {
+            let line = self.line(end.y);
+            if !line.wrapped() || owner_positions(&line).last() != Some(&end.x) {
+                break;
+            }
+            let below = self.line(end.y + 1);
+            let Some(x) = owner_positions(&below)
+                .into_iter()
+                .take_while(|x| self.is_word_cell(&below, *x))
+                .last()
+            else {
+                break;
+            };
+            end = CopyPosition { x, y: end.y + 1 };
+        }
+        end
+    }
+
+    fn is_word_cell(&self, line: &ScreenLineView, x: u32) -> bool {
+        line_char(line, x).map(|ch| classify_word_char(ch, &self.word_separators, false))
+            == Some(WordClass::Word)
     }
 }

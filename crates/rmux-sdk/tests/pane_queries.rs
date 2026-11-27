@@ -2,7 +2,11 @@
 
 mod common;
 
+#[path = "pane_queries/frozen_options.rs"]
+mod frozen_options;
+
 use std::error::Error;
+use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -93,9 +97,9 @@ async fn pane_id_info_and_snapshot_resolve_through_daemon_for_live_and_stale_slo
         matches!(
             &stale_events_error,
             RmuxError::Protocol {
-                source: rmux_proto::RmuxError::InvalidTarget { .. },
+                source,
                 ..
-            }
+            } if source.invalid_target().is_some()
         ),
         "a stale slot must fail closed before subscribing: {stale_events_error}"
     );
@@ -238,8 +242,16 @@ async fn pane_id_resolves_to_same_identity_through_linked_window_views() -> Test
 
     let owner = session_name("sdkpanelinkown");
     let viewer = session_name("sdkpanelinkview");
+    let marker = "linked-pane-ready";
     let owner_session = EnsureSession::named(owner.clone())
         .create_only()
+        // Sequential snapshots can only be equal once the pane stops writing.
+        // An interactive shell may still print its startup banner or prompt.
+        .process(ProcessSpec::argv([
+            "/bin/sh",
+            "-c",
+            &format!("printf '{marker}'; read -r unused"),
+        ]))
         .ensure(&rmux)
         .await?;
     EnsureSession::named(viewer.clone())
@@ -249,6 +261,9 @@ async fn pane_id_resolves_to_same_identity_through_linked_window_views() -> Test
     raw_link_window(harness.socket_path(), owner.clone(), 0, viewer.clone(), 1).await?;
 
     let owner_pane = owner_session.pane(0, 0);
+    // The marker is the child's entire output: after it, read blocks without
+    // printing a prompt. Observe it before comparing the two linked views.
+    wait_for_revision_change(&owner_pane, 0, marker).await?;
     let owner_id = owner_pane.id().await?.expect("owner pane is listed");
 
     let viewer_pane = rmux.pane(PaneRef::new(viewer.clone(), 1, 0)).await?;
@@ -590,6 +605,10 @@ async fn read_response(stream: &mut UnixStream) -> TestResult<Response> {
 }
 
 struct Harness {
+    // `Rmux::cmd` spawns a child process resolved from "RMUX_SDK_DAEMON_BINARY",
+    // falling back to the bare name `rmux` on PATH. Held for the whole harness
+    // lifetime so commands run the same source binary as this daemon.
+    _binary_env: EnvGuard,
     _root: TestRoot,
     socket_path: PathBuf,
     child: Option<Child>,
@@ -599,7 +618,9 @@ impl Harness {
     async fn start(label: &str) -> TestResult<Self> {
         let root = TestRoot::new(label);
         let socket_path = root.path().join("daemon.sock");
-        let mut child = Command::new(rmux_binary()?)
+        let binary = rmux_binary()?;
+        let binary_env = EnvGuard::set("RMUX_SDK_DAEMON_BINARY", binary.as_os_str());
+        let mut child = Command::new(binary)
             .arg("--__internal-daemon")
             .arg(&socket_path)
             .stdin(Stdio::null())
@@ -609,6 +630,7 @@ impl Harness {
         wait_for_daemon_ready(&socket_path, &mut child).await?;
 
         Ok(Self {
+            _binary_env: binary_env,
             _root: root,
             socket_path,
             child: Some(child),
@@ -761,6 +783,28 @@ fn workspace_root() -> PathBuf {
         .and_then(Path::parent)
         .expect("rmux-sdk manifest lives under crates/rmux-sdk")
         .to_path_buf()
+}
+
+struct EnvGuard {
+    key: &'static str,
+    previous: Option<OsString>,
+}
+
+impl EnvGuard {
+    fn set(key: &'static str, value: &std::ffi::OsStr) -> Self {
+        let previous = std::env::var_os(key);
+        std::env::set_var(key, value);
+        Self { key, previous }
+    }
+}
+
+impl Drop for EnvGuard {
+    fn drop(&mut self) {
+        match &self.previous {
+            Some(value) => std::env::set_var(self.key, value),
+            None => std::env::remove_var(self.key),
+        }
+    }
 }
 
 struct TestRoot {
@@ -1004,9 +1048,9 @@ async fn issue_94_slot_handles_resolve_visible_indexes_under_base_index_one() ->
         matches!(
             &raw_events_error,
             RmuxError::Protocol {
-                source: rmux_proto::RmuxError::InvalidTarget { .. },
+                source,
                 ..
-            }
+            } if source.invalid_target().is_some()
         ),
         "an invisible raw slot must fail closed before subscribing: {raw_events_error}"
     );
@@ -1022,6 +1066,47 @@ async fn issue_94_slot_handles_resolve_visible_indexes_under_base_index_one() ->
         "close must resolve the visible slot identity without killing another pane"
     );
 
+    harness.finish().await
+}
+
+#[tokio::test]
+async fn real_pane_exit_status_reaches_state_subscribers() -> TestResult {
+    use rmux_sdk::PaneStateClosedReason::{DiedKept, Exited};
+
+    let _lock = LIVE_DAEMON_LOCK.lock().await;
+    let harness = Harness::start("pane-exit-status").await?;
+    let rmux = harness.rmux();
+    // Keep the daemon alive while the observed session loses its last pane.
+    EnsureSession::named(session_name("anchor"))
+        .create_only()
+        .ensure(&rmux)
+        .await?;
+    for (remain, reason) in [("off", Exited), ("on", DiedKept)] {
+        let session = EnsureSession::named(session_name(remain))
+            .create_only()
+            .ensure(&rmux)
+            .await?;
+        let pane = session.pane(0, 0);
+        pane.set_option("remain-on-exit", remain).await?;
+        let mut events = pane.state_events(PaneStateEventsOptions::default()).await?;
+        assert!(matches!(
+            events.next().await?,
+            Some(PaneStateEvent::Snapshot { .. })
+        ));
+        pane.send_text("exit 37\n").await?;
+        tokio::time::timeout(Duration::from_secs(30), async {
+            let event = events.next().await?;
+            assert!(
+                matches!(event, Some(PaneStateEvent::Exited {
+                reason: actual, exit_status: Some(37), ..
+            }) if actual == reason),
+                "remain-on-exit={remain}: {event:?}"
+            );
+            assert!(events.next().await?.is_none());
+            Ok::<_, RmuxError>(())
+        })
+        .await??;
+    }
     harness.finish().await
 }
 

@@ -1,43 +1,66 @@
 //! Hidden daemon auto-start support for tmux `CMD_STARTSERVER` commands.
 
-use std::env;
-use std::fmt;
-use std::io;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
-use std::time::{Duration, Instant};
-#[cfg(target_os = "linux")]
-use std::{fs::File, io::Read, os::fd::AsRawFd};
+use std::process::Command;
 
-#[cfg(windows)]
-use rmux_proto::DaemonStatusResponse;
-use rmux_proto::{Response, RmuxError};
 #[cfg(unix)]
-use rmux_sdk::bootstrap::startup_unix::{
-    connect_or_start_with, StartupError, StartupOutcome, DEFAULT_STARTUP_DEADLINE,
+use rmux_bootstrap::startup_unix::{
+    StartupOutcome, DEFAULT_STARTUP_DEADLINE, STARTUP_POLL_INTERVAL,
+};
+#[cfg(windows)]
+use rmux_bootstrap::startup_windows::{
+    connect_or_start_blocking_selected_with, StartupOutcome, DEFAULT_STARTUP_DEADLINE,
     STARTUP_POLL_INTERVAL,
 };
-#[cfg(windows)]
-use rmux_sdk::bootstrap::startup_windows::{
-    connect_or_start_blocking_selected_with, StartupError, StartupOutcome,
-    DEFAULT_STARTUP_DEADLINE, STARTUP_POLL_INTERVAL,
-};
 
-use crate::shell_quote::shell_quote_path;
+#[cfg(unix)]
+use crate::ClientError;
+use crate::Connection;
+
+mod error;
+mod launch;
 #[cfg(any(all(test, unix), not(any(unix, windows))))]
-use crate::ConnectResult;
-use crate::{default_socket_path, upgrade, ClientError, Connection};
-
+mod polling;
+mod readiness;
+#[cfg(unix)]
+mod startup_owner;
 mod upgrade_restart;
 
-#[cfg(target_os = "linux")]
-const STARTUP_READY_EVENT_TIMEOUT: Duration = Duration::from_millis(20);
+#[cfg(any(unix, windows))]
+use error::auto_start_error_from_startup;
+#[cfg(all(test, unix))]
+use error::incompatible_daemon_kill_server_command;
+pub use error::AutoStartError;
+#[cfg(all(test, unix, not(target_os = "linux")))]
+use launch::hidden_daemon_command;
+#[cfg(any(unix, test))]
+use launch::hidden_daemon_command_base;
+#[cfg(all(test, target_os = "linux"))]
+use launch::hidden_daemon_command_preserving_fd;
+#[cfg(not(any(unix, windows)))]
+use launch::launch_hidden_daemon;
+#[cfg(any(unix, windows))]
+use launch::rmux_binary_path;
+#[cfg(unix)]
+use launch::spawn_hidden_daemon;
+#[cfg(not(unix))]
+use launch::spawn_hidden_daemon_for;
+#[cfg(all(test, unix))]
+use launch::{
+    hidden_daemon_binary_path, hidden_daemon_binary_path_for_config,
+    hidden_daemon_binary_path_for_executable_paths,
+};
+#[cfg(not(any(unix, windows)))]
+use polling::ensure_server_running_polling;
+#[cfg(all(test, unix))]
+use polling::ensure_server_running_with_probe;
 #[cfg(windows)]
-const STARTUP_READY_EVENT_TIMEOUT: Duration = Duration::from_secs(2);
+use readiness::probe_connected_server_windows;
 #[cfg(not(any(unix, windows)))]
-const AUTO_START_TIMEOUT: Duration = Duration::from_secs(5);
-#[cfg(not(any(unix, windows)))]
-const POLL_INTERVAL: Duration = Duration::from_millis(50);
+use readiness::probe_server_readiness;
+#[cfg(test)]
+use readiness::startup_readiness_poll_sleep;
+use readiness::{is_transient_connect_error, probe_connected_server};
 
 /// The undocumented CLI flag that switches `rmux` into hidden daemon mode.
 ///
@@ -45,8 +68,6 @@ const POLL_INTERVAL: Duration = Duration::from_millis(50);
 /// protocol stay in sync.
 pub const INTERNAL_DAEMON_FLAG: &str = "--__internal-daemon";
 
-const BINARY_OVERRIDE_ENV: &str = "RMUX_INTERNAL_BINARY_PATH";
-const BINARY_OVERRIDE_TEST_OPT_IN_ENV: &str = "RMUX_ALLOW_INTERNAL_BINARY_OVERRIDE";
 /// Config loading policy to pass to a newly auto-started hidden daemon.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AutoStartConfig {
@@ -139,30 +160,21 @@ impl AutoStartConfig {
     }
 
     fn append_hidden_daemon_args(&self, command: &mut Command) {
-        match &self.selection {
-            AutoStartConfigSelection::Disabled => {}
-            AutoStartConfigSelection::Default => {
-                command.arg("--config-default");
-            }
-            AutoStartConfigSelection::Files(files) => {
-                for file in files {
-                    command.arg("--config-file").arg(file);
-                }
-            }
-        }
+        use rmux_bootstrap::hidden_daemon::{append_config_args, ConfigSelection};
 
-        if self.quiet {
-            command.arg("--config-quiet");
-        }
-        if let Some(cwd) = &self.cwd {
-            command.arg("--config-cwd").arg(cwd);
-        }
-        if let Some(port) = self.web_port {
-            command.arg("--web-port").arg(port.to_string());
-        }
-        if let Some(frontend) = &self.web_frontend {
-            command.arg("--frontend-url").arg(frontend);
-        }
+        let selection = match &self.selection {
+            AutoStartConfigSelection::Disabled => ConfigSelection::Disabled,
+            AutoStartConfigSelection::Default => ConfigSelection::Default,
+            AutoStartConfigSelection::Files(files) => ConfigSelection::Files(files.as_slice()),
+        };
+        append_config_args(
+            command,
+            selection,
+            self.quiet,
+            self.cwd.as_deref(),
+            self.web_port,
+            self.web_frontend.as_deref(),
+        );
     }
 }
 
@@ -296,39 +308,29 @@ fn ensure_server_running_unix(
     config: AutoStartConfig,
 ) -> Result<EnsuredServerConnection, AutoStartError> {
     let binary_path = rmux_binary_path(&config).map_err(AutoStartError::BinaryPath)?;
-    let launcher_binary_path = binary_path.clone();
-    let launcher_socket_path = socket_path.to_path_buf();
-    let launcher_config = config.clone();
-
-    let runtime = tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-        .map_err(|error| AutoStartError::Client(ClientError::Io(error)))?;
-    let outcome = runtime.block_on(connect_or_start_with(
-        socket_path,
-        move || async move {
-            spawn_hidden_daemon_for(
-                &launcher_binary_path,
-                &launcher_socket_path,
-                &launcher_config,
+    let (provenance, connection, startup_owner) = startup_owner::connect_ready(
+        || {
+            startup_owner::connect_or_start(
+                socket_path,
+                &binary_path,
+                |binary| rmux_os::build_identity::resolve(binary.as_os_str()),
+                |verified| startup_owner::launch_verified(verified, socket_path, &config),
+                DEFAULT_STARTUP_DEADLINE,
             )
         },
+        |connection| probe_connected_server(connection, &config, socket_path),
         DEFAULT_STARTUP_DEADLINE,
-        STARTUP_POLL_INTERVAL,
-    ));
+    )?;
 
-    let outcome =
-        outcome.map_err(|error| auto_start_error_from_startup(error, &binary_path, socket_path))?;
-    let provenance = startup_outcome_provenance(&outcome);
-    let connection = startup_outcome_into_connection(outcome)?;
-
-    let connection = probe_connected_server(connection, &config, socket_path)?;
     let connected = upgrade_restart::ensure_daemon_fresh_or_restart(
         connection,
         socket_path,
         &binary_path,
         &config,
     )?;
+    if let Some(owner) = startup_owner {
+        owner.release();
+    }
     Ok(EnsuredServerConnection::new(
         connected.connection,
         provenance,
@@ -403,728 +405,6 @@ fn startup_outcome_into_connection(outcome: StartupOutcome) -> Result<Connection
     Connection::new(outcome.into_stream()).map_err(AutoStartError::Client)
 }
 
-#[cfg(windows)]
-fn probe_connected_server_windows(
-    mut connection: Connection,
-    _config: &AutoStartConfig,
-    socket_path: &Path,
-) -> Result<(Connection, Option<DaemonStatusResponse>), AutoStartError> {
-    let deadline = Instant::now() + DEFAULT_STARTUP_DEADLINE;
-    let mut poll_attempt = 0_u32;
-    loop {
-        match probe_server_readiness_status(&mut connection) {
-            Ok(status) => return Ok((connection, status)),
-            Err(ClientError::Protocol(RmuxError::UnsupportedWireVersion { got, .. })) => {
-                return Err(AutoStartError::IncompatibleDaemon {
-                    socket_path: socket_path.to_path_buf(),
-                    message: upgrade::incompatible_daemon_message(&upgrade::IncompatibleDaemon {
-                        daemon_version: None,
-                        daemon_wire_version: Some(got),
-                    }),
-                });
-            }
-            Err(error) if is_transient_connect_error(&error) && Instant::now() < deadline => {
-                let remaining = deadline.saturating_duration_since(Instant::now());
-                std::thread::sleep(startup_readiness_poll_sleep(&mut poll_attempt, remaining));
-            }
-            Err(error) => return Err(AutoStartError::Client(error)),
-        }
-    }
-}
-
-#[cfg(windows)]
-fn probe_server_readiness_status(
-    connection: &mut Connection,
-) -> Result<Option<DaemonStatusResponse>, ClientError> {
-    let response = connection.daemon_status()?;
-    match response {
-        Response::DaemonStatus(status) if status.config_loading => {
-            Err(ClientError::Io(io::Error::new(
-                io::ErrorKind::WouldBlock,
-                "daemon is still loading startup config",
-            )))
-        }
-        Response::DaemonStatus(status) => Ok(Some(status)),
-        Response::Error(_) => Ok(None),
-        other => Err(ClientError::Protocol(rmux_proto::RmuxError::Server(
-            format!("unexpected readiness response: {other:?}"),
-        ))),
-    }
-}
-
-fn probe_connected_server(
-    mut connection: Connection,
-    _config: &AutoStartConfig,
-    socket_path: &Path,
-) -> Result<Connection, AutoStartError> {
-    let deadline = Instant::now() + DEFAULT_STARTUP_DEADLINE;
-    let mut poll_attempt = 0_u32;
-    loop {
-        match probe_server_readiness(&mut connection) {
-            Ok(()) => return Ok(connection),
-            Err(ClientError::Protocol(RmuxError::UnsupportedWireVersion { got, .. })) => {
-                return Err(AutoStartError::IncompatibleDaemon {
-                    socket_path: socket_path.to_path_buf(),
-                    message: upgrade::incompatible_daemon_message(&upgrade::IncompatibleDaemon {
-                        daemon_version: None,
-                        daemon_wire_version: Some(got),
-                    }),
-                });
-            }
-            Err(error) if is_transient_connect_error(&error) && Instant::now() < deadline => {
-                let remaining = deadline.saturating_duration_since(Instant::now());
-                std::thread::sleep(startup_readiness_poll_sleep(&mut poll_attempt, remaining));
-            }
-            Err(error) => return Err(AutoStartError::Client(error)),
-        }
-    }
-}
-
-fn startup_readiness_poll_sleep(poll_attempt: &mut u32, remaining: Duration) -> Duration {
-    #[cfg(windows)]
-    {
-        const INITIAL_POLL_MILLIS: u64 = 1;
-
-        let shift = (*poll_attempt).min(6);
-        *poll_attempt = (*poll_attempt).saturating_add(1);
-        let millis = INITIAL_POLL_MILLIS
-            .checked_shl(shift)
-            .unwrap_or(u64::MAX)
-            .min(STARTUP_POLL_INTERVAL.as_millis() as u64);
-        Duration::from_millis(millis).min(remaining)
-    }
-
-    #[cfg(not(windows))]
-    {
-        const INITIAL_POLL_MILLIS: u64 = 1;
-
-        let shift = (*poll_attempt).min(6);
-        *poll_attempt = (*poll_attempt).saturating_add(1);
-        let millis = INITIAL_POLL_MILLIS
-            .checked_shl(shift)
-            .unwrap_or(u64::MAX)
-            .min(STARTUP_POLL_INTERVAL.as_millis() as u64);
-        Duration::from_millis(millis).min(remaining)
-    }
-}
-
-#[cfg(unix)]
-fn auto_start_error_from_startup(
-    error: StartupError,
-    binary_path: &Path,
-    socket_path: &Path,
-) -> AutoStartError {
-    match error {
-        StartupError::Launcher { source } => AutoStartError::Launch {
-            path: binary_path.to_path_buf(),
-            error: source,
-        },
-        StartupError::StartupTimeout { waited, .. } => AutoStartError::TimedOut {
-            socket_path: socket_path.to_path_buf(),
-            waited,
-        },
-        error => AutoStartError::Client(ClientError::Io(io::Error::new(
-            startup_error_kind(&error),
-            error.to_string(),
-        ))),
-    }
-}
-
-#[cfg(windows)]
-fn auto_start_error_from_startup(
-    error: StartupError,
-    binary_path: &Path,
-    socket_path: &Path,
-) -> AutoStartError {
-    match error {
-        StartupError::Launcher { source } => AutoStartError::Launch {
-            path: binary_path.to_path_buf(),
-            error: source,
-        },
-        StartupError::StartupTimeout { waited, .. } => AutoStartError::TimedOut {
-            socket_path: socket_path.to_path_buf(),
-            waited,
-        },
-        error => AutoStartError::Client(ClientError::Io(io::Error::new(
-            startup_error_kind(&error),
-            error.to_string(),
-        ))),
-    }
-}
-
-#[cfg(unix)]
-fn startup_error_kind(error: &StartupError) -> io::ErrorKind {
-    match error {
-        StartupError::InvalidPath { .. } | StartupError::SymlinkRejected { .. } => {
-            io::ErrorKind::InvalidInput
-        }
-        StartupError::UnsafeOwner { .. }
-        | StartupError::UnsafePermissions { .. }
-        | StartupError::PeerCredentialMismatch { .. } => io::ErrorKind::PermissionDenied,
-        StartupError::Lock { source, .. } | StartupError::Filesystem { source, .. } => {
-            source.kind()
-        }
-        StartupError::Launcher { source } => source.kind(),
-        StartupError::StartupTimeout { .. } => io::ErrorKind::TimedOut,
-    }
-}
-
-#[cfg(windows)]
-fn startup_error_kind(error: &StartupError) -> io::ErrorKind {
-    match error {
-        StartupError::InvalidPipeName { .. } | StartupError::InvalidMutexName { .. } => {
-            io::ErrorKind::InvalidInput
-        }
-        StartupError::MutexAccessDenied { .. } | StartupError::PipeAccessDenied { .. } => {
-            io::ErrorKind::PermissionDenied
-        }
-        StartupError::MutexTimeout { .. }
-        | StartupError::PipeBusy { .. }
-        | StartupError::StartupTimeout { .. } => io::ErrorKind::TimedOut,
-        StartupError::PipeNotFound { .. } | StartupError::PipeNoData { .. } => {
-            io::ErrorKind::NotFound
-        }
-        StartupError::Mutex { source, .. } | StartupError::PipeIo { source, .. } => source.kind(),
-        StartupError::Launcher { source } => source.kind(),
-    }
-}
-
-#[cfg(not(any(unix, windows)))]
-fn ensure_server_running_polling(
-    socket_path: &Path,
-    config: AutoStartConfig,
-) -> Result<EnsuredServerConnection, AutoStartError> {
-    if config.loads_startup_config() {
-        return ensure_server_running_with_probe_outcome(
-            socket_path,
-            AUTO_START_TIMEOUT,
-            POLL_INTERVAL,
-            || crate::connect_or_absent(socket_path),
-            || launch_hidden_daemon(socket_path, &config),
-            |_| Ok(()),
-        );
-    }
-
-    ensure_server_running_with_probe_outcome(
-        socket_path,
-        AUTO_START_TIMEOUT,
-        POLL_INTERVAL,
-        || crate::connect_or_absent(socket_path),
-        || launch_hidden_daemon(socket_path, &config),
-        probe_server_readiness,
-    )
-}
-
-/// Errors raised while auto-starting or connecting to the RMUX server.
-#[derive(Debug)]
-pub enum AutoStartError {
-    /// The client transport failed before or during readiness polling.
-    Client(ClientError),
-    /// Resolving the `rmux` binary path failed.
-    BinaryPath(io::Error),
-    /// Re-executing the hidden daemon process failed.
-    Launch {
-        /// The binary path that failed to spawn.
-        path: PathBuf,
-        /// The underlying process-spawn error.
-        error: io::Error,
-    },
-    /// A running daemon speaks an incompatible protocol version.
-    IncompatibleDaemon {
-        /// The socket path hosting the incompatible daemon.
-        socket_path: PathBuf,
-        /// Human-readable protocol mismatch detail.
-        message: String,
-    },
-    /// The socket never became reachable before the readiness deadline.
-    TimedOut {
-        /// The socket path that never became reachable.
-        socket_path: PathBuf,
-        /// The amount of time spent polling.
-        waited: Duration,
-    },
-}
-
-impl fmt::Display for AutoStartError {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::Client(error) => write!(formatter, "{error}"),
-            Self::BinaryPath(error) => {
-                write!(formatter, "failed to resolve rmux binary path: {error}")
-            }
-            Self::Launch { path, error } => {
-                write!(
-                    formatter,
-                    "failed to launch hidden rmux daemon '{}': {error}",
-                    path.display()
-                )
-            }
-            Self::IncompatibleDaemon {
-                socket_path,
-                message,
-            } => write!(
-                formatter,
-                "rmux: {message} on '{}'.\nrmux: run `{}` to stop it, then retry.",
-                socket_path.display(),
-                incompatible_daemon_kill_server_command(socket_path)
-            ),
-            Self::TimedOut {
-                socket_path,
-                waited,
-            } => write!(
-                formatter,
-                "timed out after {}s waiting for rmux server socket '{}'. \
-                 The hidden daemon may have exited before creating the socket; run `{}` to surface startup errors.",
-                waited.as_secs(),
-                socket_path.display(),
-                diagnostic_start_server_command(socket_path)
-            ),
-        }
-    }
-}
-
-impl std::error::Error for AutoStartError {
-    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
-        match self {
-            Self::Client(error) => Some(error),
-            Self::BinaryPath(error) => Some(error),
-            Self::Launch { error, .. } => Some(error),
-            Self::IncompatibleDaemon { .. } => None,
-            Self::TimedOut { .. } => None,
-        }
-    }
-}
-
-impl From<ClientError> for AutoStartError {
-    fn from(error: ClientError) -> Self {
-        Self::Client(error)
-    }
-}
-
-#[cfg(not(any(unix, windows)))]
-fn ensure_server_running_with<ConnectFn, LaunchFn>(
-    socket_path: &Path,
-    timeout: Duration,
-    poll_interval: Duration,
-    connect: ConnectFn,
-    launch: LaunchFn,
-) -> Result<Connection, AutoStartError>
-where
-    ConnectFn: FnMut() -> Result<ConnectResult, ClientError>,
-    LaunchFn: FnMut() -> Result<(), AutoStartError>,
-{
-    ensure_server_running_with_probe(
-        socket_path,
-        timeout,
-        poll_interval,
-        connect,
-        launch,
-        probe_server_readiness,
-    )
-}
-
-#[cfg(any(all(test, unix), not(any(unix, windows))))]
-fn ensure_server_running_with_probe<ConnectFn, LaunchFn, ProbeFn>(
-    socket_path: &Path,
-    timeout: Duration,
-    poll_interval: Duration,
-    connect: ConnectFn,
-    launch: LaunchFn,
-    probe: ProbeFn,
-) -> Result<Connection, AutoStartError>
-where
-    ConnectFn: FnMut() -> Result<ConnectResult, ClientError>,
-    LaunchFn: FnMut() -> Result<(), AutoStartError>,
-    ProbeFn: FnMut(&mut Connection) -> Result<(), ClientError>,
-{
-    ensure_server_running_with_probe_outcome(
-        socket_path,
-        timeout,
-        poll_interval,
-        connect,
-        launch,
-        probe,
-    )
-    .map(EnsuredServerConnection::into_connection)
-}
-
-#[cfg(any(all(test, unix), not(any(unix, windows))))]
-fn ensure_server_running_with_probe_outcome<ConnectFn, LaunchFn, ProbeFn>(
-    socket_path: &Path,
-    timeout: Duration,
-    poll_interval: Duration,
-    mut connect: ConnectFn,
-    mut launch: LaunchFn,
-    mut probe: ProbeFn,
-) -> Result<EnsuredServerConnection, AutoStartError>
-where
-    ConnectFn: FnMut() -> Result<ConnectResult, ClientError>,
-    LaunchFn: FnMut() -> Result<(), AutoStartError>,
-    ProbeFn: FnMut(&mut Connection) -> Result<(), ClientError>,
-{
-    match connect().map_err(AutoStartError::Client)? {
-        ConnectResult::Connected(mut connection) => {
-            probe(&mut connection).map_err(AutoStartError::Client)?;
-            return Ok(EnsuredServerConnection::new(
-                connection,
-                ServerConnectionProvenance::JoinedExisting,
-                socket_path.to_path_buf(),
-            ));
-        }
-        ConnectResult::Absent => {}
-    }
-
-    launch()?;
-    let connection = wait_for_server(
-        socket_path,
-        timeout,
-        poll_interval,
-        &mut connect,
-        &mut probe,
-    )?;
-    Ok(EnsuredServerConnection::new(
-        connection,
-        ServerConnectionProvenance::StartedByCaller,
-        socket_path.to_path_buf(),
-    ))
-}
-
-#[cfg(any(all(test, unix), not(any(unix, windows))))]
-fn wait_for_server<ConnectFn, ProbeFn>(
-    socket_path: &Path,
-    timeout: Duration,
-    poll_interval: Duration,
-    connect: &mut ConnectFn,
-    probe: &mut ProbeFn,
-) -> Result<Connection, AutoStartError>
-where
-    ConnectFn: FnMut() -> Result<ConnectResult, ClientError>,
-    ProbeFn: FnMut(&mut Connection) -> Result<(), ClientError>,
-{
-    let start = Instant::now();
-    let deadline = start + timeout;
-
-    loop {
-        match connect() {
-            Ok(crate::ConnectResult::Connected(mut connection)) => match probe(&mut connection) {
-                Ok(()) => return Ok(connection),
-                Err(error) if is_transient_connect_error(&error) => {}
-                Err(error) => return Err(AutoStartError::Client(error)),
-            },
-            Ok(crate::ConnectResult::Absent) => {}
-            Err(error) if is_transient_connect_error(&error) => {}
-            Err(error) => return Err(AutoStartError::Client(error)),
-        }
-
-        let now = Instant::now();
-        if now >= deadline {
-            return Err(AutoStartError::TimedOut {
-                socket_path: socket_path.to_path_buf(),
-                waited: timeout,
-            });
-        }
-
-        std::thread::sleep(poll_interval.min(deadline.saturating_duration_since(now)));
-    }
-}
-
-fn is_transient_connect_error(error: &ClientError) -> bool {
-    matches!(
-        error,
-        ClientError::Io(io_error)
-            if matches!(
-                io_error.kind(),
-                io::ErrorKind::WouldBlock
-                    | io::ErrorKind::Interrupted
-                    | io::ErrorKind::TimedOut
-            )
-    )
-}
-
-fn incompatible_daemon_kill_server_command(socket_path: &Path) -> String {
-    if default_socket_path()
-        .ok()
-        .as_deref()
-        .is_some_and(|default_path| default_path == socket_path)
-    {
-        return "rmux kill-server".to_owned();
-    }
-
-    format!("rmux -S {} kill-server", shell_quote_path(socket_path))
-}
-
-fn diagnostic_start_server_command(socket_path: &Path) -> String {
-    if default_socket_path()
-        .ok()
-        .as_deref()
-        .is_some_and(|default_path| default_path == socket_path)
-    {
-        return "rmux start-server".to_owned();
-    }
-
-    format!("rmux -S {} start-server", shell_quote_path(socket_path))
-}
-
-fn probe_server_readiness(connection: &mut Connection) -> Result<(), ClientError> {
-    let response = connection.daemon_status()?;
-    match response {
-        Response::DaemonStatus(status) if status.config_loading => {
-            Err(ClientError::Io(io::Error::new(
-                io::ErrorKind::WouldBlock,
-                "daemon is still loading startup config",
-            )))
-        }
-        Response::DaemonStatus(_) => Ok(()),
-        Response::Error(_) => Ok(()),
-        other => Err(ClientError::Protocol(rmux_proto::RmuxError::Server(
-            format!("unexpected readiness response: {other:?}"),
-        ))),
-    }
-}
-
-#[cfg(not(any(unix, windows)))]
-fn launch_hidden_daemon(
-    socket_path: &Path,
-    config: &AutoStartConfig,
-) -> Result<(), AutoStartError> {
-    let binary_path = rmux_binary_path(config).map_err(AutoStartError::BinaryPath)?;
-    spawn_hidden_daemon_for(&binary_path, socket_path, config).map_err(|error| {
-        AutoStartError::Launch {
-            path: binary_path,
-            error,
-        }
-    })
-}
-
-fn spawn_hidden_daemon_for(
-    binary_path: &Path,
-    socket_path: &Path,
-    config: &AutoStartConfig,
-) -> io::Result<()> {
-    #[cfg(target_os = "linux")]
-    {
-        spawn_hidden_daemon_for_linux(binary_path, socket_path, config)
-    }
-
-    #[cfg(not(target_os = "linux"))]
-    {
-        spawn_hidden_daemon_for_polling(binary_path, socket_path, config)
-    }
-}
-
-#[cfg(not(target_os = "linux"))]
-fn spawn_hidden_daemon_for_polling(
-    binary_path: &Path,
-    socket_path: &Path,
-    config: &AutoStartConfig,
-) -> io::Result<()> {
-    #[cfg(windows)]
-    {
-        spawn_hidden_daemon_for_windows(binary_path, socket_path, config)
-    }
-
-    #[cfg(not(windows))]
-    {
-        let command = hidden_daemon_command(binary_path, socket_path, config, true);
-        spawn_hidden_daemon(command)
-    }
-}
-
-#[cfg(windows)]
-fn spawn_hidden_daemon_for_windows(
-    binary_path: &Path,
-    socket_path: &Path,
-    config: &AutoStartConfig,
-) -> io::Result<()> {
-    let ready = rmux_os::daemon::StartupReadyEvent::new()?;
-    let mut command = hidden_daemon_command(binary_path, socket_path, config, true);
-    append_startup_ready_event(&mut command, &ready);
-    spawn_hidden_daemon(command)?;
-    let _ = ready.wait(STARTUP_READY_EVENT_TIMEOUT);
-    Ok(())
-}
-
-#[cfg(windows)]
-fn append_startup_ready_event(command: &mut Command, ready: &rmux_os::daemon::StartupReadyEvent) {
-    command.arg("--startup-ready-event").arg(ready.name());
-}
-
-#[cfg(target_os = "linux")]
-fn spawn_hidden_daemon_for_linux(
-    binary_path: &Path,
-    socket_path: &Path,
-    config: &AutoStartConfig,
-) -> io::Result<()> {
-    let mut ready = StartupReadyEvent::new()?;
-    let mut command =
-        hidden_daemon_command_preserving_fd(binary_path, socket_path, config, true, ready.raw_fd());
-    ready.append_hidden_daemon_args(&mut command);
-    spawn_hidden_daemon(command)?;
-    ready.wait_for_signal(STARTUP_READY_EVENT_TIMEOUT);
-    Ok(())
-}
-
-#[cfg(target_os = "linux")]
-struct StartupReadyEvent {
-    file: File,
-}
-
-#[cfg(target_os = "linux")]
-impl StartupReadyEvent {
-    fn new() -> io::Result<Self> {
-        let fd = rustix::event::eventfd(
-            0,
-            rustix::event::EventfdFlags::NONBLOCK | rustix::event::EventfdFlags::CLOEXEC,
-        )
-        .map_err(io::Error::from)?;
-        Ok(Self { file: fd.into() })
-    }
-
-    fn append_hidden_daemon_args(&self, command: &mut Command) {
-        command
-            .arg("--startup-ready-fd")
-            .arg(self.file.as_raw_fd().to_string());
-    }
-
-    fn raw_fd(&self) -> i32 {
-        self.file.as_raw_fd()
-    }
-
-    fn wait_for_signal(&mut self, timeout: Duration) {
-        let deadline = Instant::now() + timeout;
-        let mut bytes = [0_u8; 8];
-        loop {
-            match self.file.read_exact(&mut bytes) {
-                Ok(()) => return,
-                Err(error)
-                    if matches!(
-                        error.kind(),
-                        io::ErrorKind::WouldBlock | io::ErrorKind::Interrupted
-                    ) && Instant::now() < deadline =>
-                {
-                    std::thread::sleep(Duration::from_millis(1));
-                }
-                Err(_) => return,
-            }
-        }
-    }
-}
-
-#[cfg(target_os = "linux")]
-fn hidden_daemon_command_preserving_fd(
-    binary_path: &Path,
-    socket_path: &Path,
-    config: &AutoStartConfig,
-    allow_job_breakaway: bool,
-    preserved_fd: i32,
-) -> Command {
-    let mut command = hidden_daemon_command_base(binary_path, socket_path, config);
-    rmux_os::daemon::configure_hidden_daemon_command_preserving_fds(
-        &mut command,
-        allow_job_breakaway,
-        &[preserved_fd],
-    );
-    command
-}
-
-#[cfg(not(target_os = "linux"))]
-fn hidden_daemon_command(
-    binary_path: &Path,
-    socket_path: &Path,
-    config: &AutoStartConfig,
-    allow_job_breakaway: bool,
-) -> Command {
-    let mut command = hidden_daemon_command_base(binary_path, socket_path, config);
-    rmux_os::daemon::configure_hidden_daemon_command(&mut command, allow_job_breakaway);
-    command
-}
-
-fn hidden_daemon_command_base(
-    binary_path: &Path,
-    socket_path: &Path,
-    config: &AutoStartConfig,
-) -> Command {
-    let mut command = Command::new(binary_path);
-    command
-        .arg(INTERNAL_DAEMON_FLAG)
-        .arg(socket_path)
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null());
-    config.append_hidden_daemon_args(&mut command);
-    command
-}
-
-fn spawn_hidden_daemon(mut command: Command) -> io::Result<()> {
-    let child = rmux_os::daemon::spawn_hidden_daemon_command_requiring_job_breakaway(&mut command)?;
-    // Intentionally drop without `wait()`: the daemon must outlive the
-    // short-lived client process that launched it.
-    drop(child);
-    Ok(())
-}
-
-fn rmux_binary_path(config: &AutoStartConfig) -> io::Result<PathBuf> {
-    if let Some(path) = &config.binary_override {
-        return Ok(path.clone());
-    }
-
-    let current_exe = env::current_exe()?;
-    let resolved_exe = std::fs::canonicalize(&current_exe).ok();
-    match env::var_os(BINARY_OVERRIDE_ENV).filter(|_| binary_override_enabled_for_tests()) {
-        Some(path) => Ok(PathBuf::from(path)),
-        None => Ok(hidden_daemon_binary_path_for_executable_paths(
-            &current_exe,
-            resolved_exe.as_deref(),
-            config,
-        )
-        .unwrap_or(current_exe)),
-    }
-}
-
-fn binary_override_enabled_for_tests() -> bool {
-    cfg!(debug_assertions)
-        && env::var_os(BINARY_OVERRIDE_TEST_OPT_IN_ENV).is_some_and(|value| value == "1")
-}
-
-#[cfg(all(test, unix))]
-fn hidden_daemon_binary_path(current_exe: &Path) -> Option<PathBuf> {
-    hidden_daemon_binary_path_for_executable_paths(current_exe, None, &AutoStartConfig::disabled())
-}
-
-fn hidden_daemon_binary_path_for_executable_paths(
-    current_exe: &Path,
-    resolved_exe: Option<&Path>,
-    config: &AutoStartConfig,
-) -> Option<PathBuf> {
-    hidden_daemon_binary_path_for_config(current_exe, config).or_else(|| {
-        resolved_exe.and_then(|path| hidden_daemon_binary_path_for_config(path, config))
-    })
-}
-
-fn hidden_daemon_binary_path_for_config(
-    current_exe: &Path,
-    config: &AutoStartConfig,
-) -> Option<PathBuf> {
-    if config.web_required {
-        return None;
-    }
-    let file_stem = current_exe.file_stem()?.to_str()?;
-    if file_stem == "rmux-daemon" {
-        return None;
-    }
-
-    let mut candidate = current_exe.to_path_buf();
-    let daemon_file_name = match current_exe
-        .extension()
-        .and_then(|extension| extension.to_str())
-    {
-        Some(extension) if !extension.is_empty() => format!("rmux-daemon.{extension}"),
-        _ => "rmux-daemon".to_owned(),
-    };
-    candidate.set_file_name(daemon_file_name);
-    candidate.is_file().then_some(candidate)
-}
-
 #[cfg(all(test, unix))]
 #[path = "auto_start/tests.rs"]
 mod tests;
@@ -1167,5 +447,64 @@ mod windows_tests {
             startup_readiness_poll_sleep(&mut attempt, Duration::from_millis(7)),
             Duration::from_millis(7)
         );
+    }
+}
+
+#[cfg(test)]
+mod argv_tests {
+    use super::*;
+    use std::ffi::OsString;
+
+    #[test]
+    fn hidden_daemon_config_argv_preserves_selection_and_order() {
+        #[cfg(unix)]
+        let raw = {
+            use std::os::unix::ffi::OsStringExt;
+            OsString::from_vec(vec![b'x', 255])
+        };
+        #[cfg(windows)]
+        let raw = {
+            use std::os::windows::ffi::OsStringExt;
+            OsString::from_wide(&[120, 0xd800])
+        };
+        for (config, selection) in [
+            (AutoStartConfig::disabled(), vec![]),
+            (
+                AutoStartConfig::default_files(true, None),
+                vec![OsString::from("--config-default")],
+            ),
+            (AutoStartConfig::custom_files(vec![], true, None), vec![]),
+            (
+                AutoStartConfig::custom_files(
+                    vec![PathBuf::from(&raw), PathBuf::from("two")],
+                    true,
+                    None,
+                ),
+                vec![
+                    "--config-file".into(),
+                    raw.clone(),
+                    "--config-file".into(),
+                    "two".into(),
+                ],
+            ),
+        ] {
+            let mut config = config
+                .with_web_port(1)
+                .with_web_frontend("frontend".to_owned());
+            config.cwd = Some(PathBuf::from(&raw));
+            let command = hidden_daemon_command_base(Path::new("unused"), Path::new(&raw), &config);
+            let mut expected = vec![OsString::from("--__internal-daemon"), raw.clone()];
+            expected.extend(selection);
+            expected.extend([
+                "--config-quiet".into(),
+                "--config-cwd".into(),
+                raw.clone(),
+                "--web-port".into(),
+                "1".into(),
+                "--frontend-url".into(),
+                "frontend".into(),
+            ]);
+            assert_eq!(command.get_args().collect::<Vec<_>>(), expected);
+        }
     }
 }

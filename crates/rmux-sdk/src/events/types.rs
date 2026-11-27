@@ -210,16 +210,17 @@ pub enum PaneDisconnectReason {
 /// Structured reason carried by [`PaneEvent::Exit`].
 ///
 /// `Bare` denotes the canonical `%exit\n` form emitted on EOF / empty
-/// input. `WithReason` carries the trailing reason text from
-/// `%exit <reason>\n`; the daemon uses this for graceful operator-driven
-/// closes (e.g. `%exit server shutting down`). Externally tagged for
+/// input and on server shutdown. `WithReason` carries the trailing reason
+/// text from `%exit <reason>\n`; the daemon uses this when it ends a client
+/// for a reason of its own (e.g. `%exit too far behind`). Externally tagged for
 /// serde, so the encoding round-trips through both `serde_json` and
 /// `bincode`.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 #[non_exhaustive]
 pub enum PaneExitReason {
-    /// Bare `%exit\n` line. Emitted on EOF and on empty-input close.
+    /// Bare `%exit\n` line. Emitted on EOF, on empty-input close and on
+    /// server shutdown.
     Bare,
     /// `%exit <reason>\n` line carrying daemon-supplied reason text.
     WithReason {

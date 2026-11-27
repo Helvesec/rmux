@@ -6,7 +6,6 @@
 //! exercises the same calls on a throwaway companion session so the
 //! recorded fixture stays intact.
 
-#[path = "sdk_demo_helpers/mod.rs"]
 mod sdk_demo_helpers;
 
 #[tokio::main]

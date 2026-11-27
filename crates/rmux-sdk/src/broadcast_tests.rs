@@ -26,6 +26,106 @@ fn cloned_fallback_text_shares_its_allocation() {
     assert!(Arc::ptr_eq(&original, &cloned));
 }
 
+#[tokio::test]
+async fn daemon_partial_broadcast_preserves_order_typed_failures_and_sources() {
+    use std::error::Error;
+    let (stream, mut peer) = tokio::io::duplex(4096);
+    let transport = TransportClient::spawn(stream);
+    transport
+        .cache_capabilities(vec![
+            CAPABILITY_HANDSHAKE.into(),
+            CAPABILITY_SDK_PANE_BY_ID.into(),
+            CAPABILITY_SDK_PANE_BROADCAST.into(),
+        ])
+        .await;
+    let name = SessionName::new("alpha").unwrap();
+    let panes = (0..3)
+        .map(|index| {
+            Pane::new(
+                PaneRef::new(name.clone(), 0, index),
+                RmuxEndpoint::Default,
+                None,
+                transport.clone(),
+            )
+        })
+        .collect::<Vec<_>>();
+    let server = async {
+        for _ in 0..3 {
+            assert!(matches!(
+                read_request(&mut peer).await,
+                Request::ListPanes(_)
+            ));
+            write_response(
+                &mut peer,
+                Response::ListPanes(ListPanesResponse {
+                    output: CommandOutput::from_stdout("0:0:%1\n0:1:%2\n0:2:%3\n"),
+                }),
+            )
+            .await;
+        }
+        let Request::PaneBroadcastInput(request) = read_request(&mut peer).await else {
+            panic!("broadcast")
+        };
+        assert_eq!(request.targets.len(), 3);
+        write_response(
+            &mut peer,
+            Response::PaneBroadcastInput(PaneBroadcastInputResponse {
+                key_count: 1,
+                successes: vec![PaneBroadcastInputSuccess {
+                    target_index: 1,
+                    target: PaneTarget::with_window(name.clone(), 0, 1),
+                    pane_id: Some(PaneId::new(2)),
+                }],
+                failures: vec![
+                    rmux_proto::PaneBroadcastInputFailure {
+                        target_index: 2,
+                        target: request.targets[2].clone(),
+                        error: rmux_proto::RmuxError::SessionNotFound("alpha".into()),
+                    },
+                    rmux_proto::PaneBroadcastInputFailure {
+                        target_index: 0,
+                        target: request.targets[0].clone(),
+                        error: rmux_proto::RmuxError::pane_not_found(name.clone(), PaneId::new(1)),
+                    },
+                ],
+            }),
+        )
+        .await;
+    };
+    let (result, ()) = tokio::join!(broadcast(&panes, Input::Text("hello")), server);
+    let error = result.unwrap_err();
+    assert!(error
+        .source()
+        .unwrap()
+        .is::<crate::PartialBroadcastFailure>());
+    let RmuxError::PartialBroadcast { source } = &error else {
+        panic!("partial broadcast")
+    };
+    assert_eq!(source.successes()[0].target(), panes[1].target());
+    assert_eq!(source.successes()[0].pane_id(), Some(PaneId::new(2)));
+    assert_eq!(source.failures().len(), 2);
+    assert_eq!(source.failures()[0].target(), panes[0].target());
+    assert_eq!(source.failures()[1].target(), panes[2].target());
+    assert!(
+        matches!(source.failures()[0].error(), RmuxError::PaneNotFound { session_name, pane_id }
+        if session_name == &name && *pane_id == PaneId::new(1))
+    );
+    let RmuxError::Protocol { source: diagnostic } = source.failures()[1].error() else {
+        panic!("protocol")
+    };
+    assert_eq!(diagnostic.session_not_found(), Some("alpha"));
+    assert!(source.failures()[1]
+        .error()
+        .source()
+        .unwrap()
+        .is::<crate::ProtocolError>());
+    let rendered = error.to_string();
+    assert!(
+        rendered.find("pane id %1").unwrap() < rendered.find("session not found: alpha").unwrap()
+    );
+    assert_eq!(crate::protocol_diagnostic(&error).message(), rendered);
+}
+
 #[test]
 fn fallback_broadcast_bounds_concurrent_payload_materialization() {
     assert_eq!(client_broadcast_initial_batch_size(0), 0);

@@ -26,6 +26,7 @@ from perf_artifact import (
     load_payload,
     sha256_file,
     validate_current_identity,
+    validate_release_layout,
 )
 
 
@@ -65,8 +66,10 @@ class MetricDiff:
     status: str
 
 
-def load_artifact(path: Path) -> Artifact:
+def load_artifact(path: Path, *, verify_layout: bool = False) -> Artifact:
     _, source, identity = load_payload(path)
+    if verify_layout:
+        validate_release_layout(source)
     metrics = source.get("metrics")
     if not isinstance(metrics, list):
         raise ValueError(f"{path}: missing metrics array")
@@ -533,7 +536,7 @@ def main(argv: list[str]) -> int:
         raise SystemExit("--regression-pct must be non-negative")
 
     baseline = load_artifact(args.baseline)
-    current = load_artifact(args.current)
+    current = load_artifact(args.current, verify_layout=True)
     required_identity_args = {
         "--expected-current-commit": args.expected_current_commit,
         "--expected-current-platform": args.expected_current_platform,

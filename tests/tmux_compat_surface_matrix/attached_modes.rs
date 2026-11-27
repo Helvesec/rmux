@@ -1,5 +1,11 @@
 use super::support::*;
 
+mod copy_viewport;
+use copy_viewport::{wait_for_viewports, CopyViewport, ViewportPhase};
+
+mod late_prompt;
+mod shell_absent;
+
 #[test]
 fn tmux_compat_nested_attach_session_inside_tmux_uses_switch_client_surface(
 ) -> Result<(), Box<dyn Error>> {
@@ -424,6 +430,14 @@ fn copy_mode_escape_exit_matches_attached_client_surface_when_frozen_tmux_is_ava
     let mut rmux_attach = spawn_rmux_attached_input_client(&harness, "alpha")?;
     let mut tmux_attach = spawn_tmux_attached_input_client(&harness, &tmux_binary, "alpha")?;
     wait_for_attached_clients(&harness, &tmux_binary, config.clone(), &deadline)?;
+    let mut observed = [CopyViewport::new()?, CopyViewport::new()?];
+    wait_for_viewports(
+        rmux_attach.master_mut(),
+        tmux_attach.master_mut(),
+        &mut observed,
+        ViewportPhase::CopyBottom,
+        TMUX_COMPAT_TIMEOUT.min(deadline.remaining()?),
+    )?;
 
     let before = wait_for_attached_pair(
         &harness,
@@ -445,8 +459,16 @@ fn copy_mode_escape_exit_matches_attached_client_surface_when_frozen_tmux_is_ava
     assert_eq!(before.rmux.stdout_string(), "1|copy-mode\n");
     assert_eq!(before.tmux.stdout_string(), "1|copy-mode\n");
 
-    write_attached_keys(&mut rmux_attach, b"\x1b", &deadline)?;
-    write_attached_keys(&mut tmux_attach, b"\x1b", &deadline)?;
+    deadline.check()?;
+    rmux_attach.master_mut().write_all(b"\x1b")?;
+    tmux_attach.master_mut().write_all(b"\x1b")?;
+    wait_for_viewports(
+        rmux_attach.master_mut(),
+        tmux_attach.master_mut(),
+        &mut observed,
+        ViewportPhase::Live,
+        TMUX_COMPAT_TIMEOUT.min(deadline.remaining()?),
+    )?;
     let after = wait_for_attached_pair(
         &harness,
         &tmux_binary,
@@ -487,8 +509,14 @@ fn copy_mode_u_render_matches_attached_client_surface_when_frozen_tmux_is_availa
     let mut rmux_attach = spawn_rmux_attached_input_client(&harness, "alpha")?;
     let mut tmux_attach = spawn_tmux_attached_input_client(&harness, &tmux_binary, "alpha")?;
     wait_for_attached_clients(&harness, &tmux_binary, config.clone(), &deadline)?;
-    let _ = drain_pty(&mut rmux_attach)?;
-    let _ = drain_pty(&mut tmux_attach)?;
+    let mut observed = [CopyViewport::new()?, CopyViewport::new()?];
+    wait_for_viewports(
+        rmux_attach.master_mut(),
+        tmux_attach.master_mut(),
+        &mut observed,
+        ViewportPhase::Live,
+        TMUX_COMPAT_TIMEOUT.min(deadline.remaining()?),
+    )?;
 
     let copy_mode_u = harness.run_pair_with(
         &tmux_binary,
@@ -496,10 +524,15 @@ fn copy_mode_u_render_matches_attached_client_surface_when_frozen_tmux_is_availa
         config.clone(),
     )?;
     assert_quiet_success(&copy_mode_u);
-    std::thread::sleep(Duration::from_millis(250));
-    deadline.check()?;
-    let rmux_render = render_cells(&drain_pty(&mut rmux_attach)?, 80, 24).join("\n");
-    let tmux_render = render_cells(&drain_pty(&mut tmux_attach)?, 80, 24).join("\n");
+    wait_for_viewports(
+        rmux_attach.master_mut(),
+        tmux_attach.master_mut(),
+        &mut observed,
+        ViewportPhase::CopyTop,
+        TMUX_COMPAT_TIMEOUT.min(deadline.remaining()?),
+    )?;
+    let rmux_render = observed[0].rows().join("\n");
+    let tmux_render = observed[1].rows().join("\n");
     let capture = attached_capture_pair(
         &harness,
         &tmux_binary,

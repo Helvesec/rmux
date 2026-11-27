@@ -107,26 +107,21 @@ trap 'rm -rf "$tmpdir"' EXIT
   rpm2cpio "$archive_abs" | cpio -idmu --quiet
 )
 
-for required in \
-  usr/bin/rmux \
-  usr/libexec/rmux/rmux \
-  usr/bin/rmux-daemon \
-  usr/share/doc/rmux/README.md \
-  usr/share/doc/rmux/LICENSE-APACHE \
-  usr/share/doc/rmux/LICENSE-MIT \
-  usr/share/rmux/artifact-metadata.json
-do
-  [ -e "$tmpdir/$required" ] || die "missing package file: $required"
-done
-[ -e "$tmpdir/usr/share/man/man1/rmux.1" ] || [ -e "$tmpdir/usr/share/man/man1/rmux.1.gz" ] || \
-  die "missing package file: usr/share/man/man1/rmux.1"
-[ -x "$tmpdir/usr/bin/rmux" ] || die "packaged rmux is not executable"
-[ -x "$tmpdir/usr/libexec/rmux/rmux" ] || die "packaged private helper is not executable"
-[ -x "$tmpdir/usr/bin/rmux-daemon" ] || die "packaged rmux-daemon is not executable"
+# Share the 1.0 SDK disposition with canonical archive/crate acceptance.
+case "$version_field" in
+  1.0.*) python3 "$script_dir/release/sdk_distribution_policy.py" \
+    --root "$tmpdir" --layout rpm --version "$version_field" ;;
+esac
+
+"$script_dir/packaging/layout" --for-package "$tmpdir" check-tree --variant rpm --root "$tmpdir" ||
+  die "package layout does not match the descriptor"
 
 metadata="$tmpdir/usr/share/rmux/artifact-metadata.json"
 grep -q '"artifact_kind"[[:space:]]*:[[:space:]]*"rpm-package-binary"' "$metadata" || die "metadata artifact_kind is not rpm-package-binary"
-grep -q '"package_layout"[[:space:]]*:[[:space:]]*"rmux-rpm-package-v2"' "$metadata" || die "metadata package_layout is not rmux-rpm-package-v2"
+package_layout_id="$("$script_dir/packaging/layout" --for-package "$tmpdir" layout-id --variant rpm)" ||
+  die "could not project the package layout identity"
+grep -q "\"package_layout\"[[:space:]]*:[[:space:]]*\"$package_layout_id\"" "$metadata" ||
+  die "metadata package_layout is not $package_layout_id"
 if [ "$require_release_artifact" -eq 1 ]; then
   grep -q '"release_artifact"[[:space:]]*:[[:space:]]*true' "$metadata" || die "metadata release_artifact is not true"
   grep -q '"configuration"[[:space:]]*:[[:space:]]*"release"' "$metadata" || die "release artifact metadata configuration is not release"
@@ -145,10 +140,10 @@ packaged_daemon_hash="$(sha256_file "$tmpdir/usr/bin/rmux-daemon")"
 [ "$metadata_daemon_hash" = "$packaged_daemon_hash" ] || die "metadata daemon_binary_sha256 does not match packaged daemon binary"
 
 glibc_floor_script="$script_dir/glibc-symbol-floor.sh"
-binary_glibc_min="$($glibc_floor_script "$tmpdir/usr/bin/rmux")"
-helper_binary_glibc_min="$($glibc_floor_script "$tmpdir/usr/libexec/rmux/rmux")"
-daemon_binary_glibc_min="$($glibc_floor_script "$tmpdir/usr/bin/rmux-daemon")"
-required_glibc_min="$($glibc_floor_script \
+binary_glibc_min="$("$glibc_floor_script" "$tmpdir/usr/bin/rmux")"
+helper_binary_glibc_min="$("$glibc_floor_script" "$tmpdir/usr/libexec/rmux/rmux")"
+daemon_binary_glibc_min="$("$glibc_floor_script" "$tmpdir/usr/bin/rmux-daemon")"
+required_glibc_min="$("$glibc_floor_script" \
   "$tmpdir/usr/bin/rmux" \
   "$tmpdir/usr/libexec/rmux/rmux" \
   "$tmpdir/usr/bin/rmux-daemon")"

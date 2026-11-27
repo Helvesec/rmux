@@ -644,7 +644,9 @@ impl Drop for StartupHarness {
 }
 
 fn rmux_binary() -> &'static Path {
-    Path::new(env!("CARGO_BIN_EXE_rmux"))
+    Path::new(rmux_os::build_identity::cargo_binary(env!(
+        "CARGO_BIN_EXE_rmux"
+    )))
 }
 
 fn shell_single_quote(path: &Path) -> String {

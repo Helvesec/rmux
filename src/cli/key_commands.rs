@@ -17,7 +17,11 @@ use super::{
 };
 use crate::cli_args::{BindKeyArgs, ListKeysArgs, SendKeysArgs, SendPrefixArgs, UnbindKeyArgs};
 
-pub(super) fn run_send_keys(args: SendKeysArgs, socket_path: &Path) -> Result<i32, ExitFailure> {
+pub(super) fn run_send_keys(
+    args: SendKeysArgs,
+    socket_path: &Path,
+    deadline: Option<rmux_bootstrap::deadline::StartupDeadline>,
+) -> Result<i32, ExitFailure> {
     if args.unsupported_prefix {
         return Err(ExitFailure::new(1, "command send-keys: unknown flag -p"));
     }
@@ -25,7 +29,7 @@ pub(super) fn run_send_keys(args: SendKeysArgs, socket_path: &Path) -> Result<i3
         return Err(ExitFailure::new(1, "repeat count too small"));
     }
     if args.has_wait() {
-        return super::automation::run_send_keys_with_wait(args, socket_path);
+        return super::automation::run_send_keys_with_wait(args, socket_path, deadline);
     }
 
     if send_keys_uses_legacy_path(&args) {

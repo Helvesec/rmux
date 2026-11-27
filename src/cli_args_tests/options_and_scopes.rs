@@ -339,10 +339,11 @@ fn set_hook_unknown_hook_uses_tmux_error_text() {
 #[test]
 fn detach_client_rejects_trailing_arguments() {
     let error = parse_args(&["detach-client", "unexpected"]).unwrap_err();
-    assert!(matches!(
-        error.kind(),
-        clap::error::ErrorKind::UnknownArgument
-    ));
+    assert_eq!(error.kind(), clap::error::ErrorKind::TooManyValues);
+    assert_eq!(
+        error.to_string(),
+        "error: command detach-client: too many arguments (need at most 0)"
+    );
 }
 
 #[test]

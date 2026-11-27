@@ -11,8 +11,9 @@ use std::thread;
 use std::time::Duration;
 
 use rmux_proto::{
-    encode_frame, ErrorResponse, FrameDecoder, HandshakeRequest, HandshakeResponse,
-    HasSessionRequest, HasSessionResponse, Request, Response, RmuxError, RMUX_FRAME_MAGIC,
+    encode_frame, AttachSessionResponse, ControlMode, ControlModeResponse, ErrorResponse,
+    FrameDecoder, HandshakeRequest, HandshakeResponse, HasSessionRequest, HasSessionResponse,
+    Request, Response, RmuxError, SessionName, RMUX_FRAME_MAGIC,
 };
 
 use super::{is_absent_error, socket_path_from_parts, ClientError};
@@ -340,6 +341,22 @@ fn connect_to_nonexistent_path_errors() {
 }
 
 #[test]
+fn unique_socket_path_fits_unix_limit_with_long_temp_root() {
+    let root = unique_temp_root("long-socket-root");
+    let long_root = root.join("x".repeat(104));
+    fs::create_dir_all(&long_root).expect("create long temporary root");
+    let socket_path = unique_socket_path_in(&long_root, "long-tmpdir");
+    let parent = socket_path.parent().expect("socket parent");
+    fs::create_dir_all(parent).expect("create socket directory");
+
+    let result = UnixListener::bind(&socket_path).map(drop);
+    let _ = fs::remove_file(&socket_path);
+    let _ = fs::remove_dir_all(parent);
+    let _ = fs::remove_dir_all(&root);
+    result.expect("socket fixture must bind even with a long temporary root");
+}
+
+#[test]
 fn stale_socket_is_treated_as_absent() {
     let socket_path = unique_socket_path("stale");
     let parent = socket_path.parent().expect("socket parent");
@@ -386,39 +403,186 @@ fn connect_or_absent_preserves_timeout_errors() {
 }
 
 #[test]
-fn completed_response_survives_darwin_timeout_restore_einval() {
-    let response = Response::HasSession(HasSessionResponse { exists: false });
-    let result = super::finish_unbounded_roundtrip(
-        Ok(response.clone()),
-        Err(ClientError::Io(io::Error::from(
-            io::ErrorKind::InvalidInput,
-        ))),
-    );
+fn timeout_change_after_peer_disconnect_is_moot() {
+    let (client_stream, server_stream) = UnixStream::pair().expect("create stream pair");
+    drop(server_stream);
 
-    if cfg!(target_os = "macos") {
-        assert_eq!(result.expect("completed response remains valid"), response);
-    } else {
-        assert!(matches!(
-            result,
-            Err(ClientError::Io(error)) if error.kind() == io::ErrorKind::InvalidInput
+    super::set_read_timeout(&client_stream, Some(Duration::from_secs(1)))
+        .expect("read deadline on a disconnected socket");
+    super::set_write_timeout(&client_stream, None)
+        .expect("write deadline on a disconnected socket");
+}
+
+#[test]
+fn only_the_kernel_einval_counts_as_a_peer_disconnect() {
+    let kernel_einval = io::Error::from_raw_os_error(libc::EINVAL);
+    assert_eq!(
+        super::timeout_change_rejected_after_peer_disconnect(&kernel_einval),
+        cfg!(target_os = "macos")
+    );
+    for other in [
+        io::Error::from(io::ErrorKind::InvalidInput),
+        io::Error::from_raw_os_error(libc::EPERM),
+    ] {
+        assert!(!super::timeout_change_rejected_after_peer_disconnect(
+            &other
         ));
     }
 }
 
 #[test]
-fn completed_response_does_not_hide_other_timeout_restore_errors() {
-    let result = super::finish_unbounded_roundtrip(
-        Ok(Response::HasSession(HasSessionResponse { exists: false })),
-        Err(ClientError::Io(io::Error::from(
-            io::ErrorKind::PermissionDenied,
-        ))),
+fn bounded_read_restores_the_rpc_deadline_while_the_peer_is_connected() {
+    let response = Response::HasSession(HasSessionResponse { exists: true });
+    let (client_stream, server_stream) = UnixStream::pair().expect("create stream pair");
+    let mut connection = super::Connection::new(client_stream).expect("connection with timeout");
+    let mut server_stream = server_stream;
+    server_stream
+        .write_all(&encode_frame(&response).expect("encode response"))
+        .expect("write response frame");
+
+    let received = connection
+        .read_response_with_read_timeout(Duration::from_secs(2))
+        .expect("bounded read");
+
+    assert_eq!(received, response);
+    assert_eq!(
+        connection.stream.read_timeout().expect("read timeout"),
+        Some(super::SOCKET_RESPONSE_TIMEOUT)
+    );
+}
+
+#[test]
+fn control_upgrade_keeps_output_the_server_sent_before_closing() {
+    // A control client whose initial command fails is ended by the server
+    // (`%begin`, `%error`, `%exit`, as in tmux 3.7b), which can close the
+    // socket before the client clears its RPC deadlines. On Darwin that
+    // option change fails with EINVAL; the upgrade must still deliver output.
+    const CONTROL_OUTPUT: &[u8] =
+        b"%begin 1 1 0\ncan't find session: missing\n%error 1 1 0\n%exit\n";
+    let (client_stream, server_stream) = UnixStream::pair().expect("create stream pair");
+    let connection = super::Connection::new(client_stream).expect("connection with timeout");
+    write_bytes_and_close(server_stream, CONTROL_OUTPUT);
+
+    let upgrade = connection
+        .into_control_upgrade(ControlModeResponse {
+            mode: ControlMode::Plain,
+        })
+        .expect("a closed peer does not hide the control output");
+
+    assert_eq!(read_to_end(upgrade.into_stream()), CONTROL_OUTPUT);
+}
+
+#[test]
+fn attach_upgrade_keeps_output_the_server_sent_before_closing() {
+    const ATTACH_OUTPUT: &[u8] = b"attach bytes before close";
+    let (client_stream, server_stream) = UnixStream::pair().expect("create stream pair");
+    let connection = super::Connection::new(client_stream).expect("connection with timeout");
+    write_bytes_and_close(server_stream, ATTACH_OUTPUT);
+
+    let upgrade = connection
+        .into_attach_upgrade(AttachSessionResponse {
+            session_name: SessionName::new("alpha").expect("valid session"),
+        })
+        .expect("a closed peer does not hide the attach output");
+    let (stream, initial_bytes) = upgrade.into_parts();
+
+    assert!(initial_bytes.is_empty());
+    assert_eq!(read_to_end(stream), ATTACH_OUTPUT);
+}
+
+#[test]
+fn upgrade_clears_rpc_deadlines_while_the_peer_is_connected() {
+    let (client_stream, _server_stream) = UnixStream::pair().expect("create stream pair");
+    let connection = super::Connection::new(client_stream).expect("connection with timeout");
+
+    let stream = connection
+        .into_control_upgrade(ControlModeResponse {
+            mode: ControlMode::Plain,
+        })
+        .expect("control upgrade")
+        .into_stream();
+
+    assert_eq!(stream.read_timeout().expect("read timeout"), None);
+    assert_eq!(stream.write_timeout().expect("write timeout"), None);
+}
+
+#[test]
+fn bounded_read_returns_the_response_the_server_sent_before_closing() {
+    // A server may answer and close before the client changes its read
+    // deadline. Darwin rejects that option change with EINVAL; the complete
+    // response must still be delivered and the disconnect seen afterwards.
+    let response = Response::HasSession(HasSessionResponse { exists: true });
+    let mut connection = connection_after_server_answered_and_closed(&response);
+
+    let received = connection
+        .read_response_with_read_timeout(Duration::from_secs(2))
+        .expect("a closed peer does not hide its complete response");
+
+    assert_eq!(received, response);
+    assert!(matches!(
+        connection.read_response(),
+        Err(ClientError::UnexpectedEof)
+    ));
+}
+
+#[test]
+fn unbounded_read_returns_the_response_the_server_sent_before_closing() {
+    let response = Response::HasSession(HasSessionResponse { exists: true });
+    let mut connection = connection_after_server_answered_and_closed(&response);
+
+    let received = connection
+        .read_response_without_read_timeout()
+        .expect("a closed peer does not hide its complete response");
+
+    assert_eq!(received, response);
+    assert!(matches!(
+        connection.read_response(),
+        Err(ClientError::UnexpectedEof)
+    ));
+}
+
+#[test]
+fn deadline_read_returns_the_response_the_server_sent_before_closing() {
+    let response = Response::HasSession(HasSessionResponse { exists: true });
+    let socket_path = unique_socket_path("deadline-closed-peer");
+    fs::create_dir_all(socket_path.parent().expect("socket parent")).expect("socket dir");
+    let listener = UnixListener::bind(&socket_path).expect("bind listener");
+    let mut connection = super::connect_with_deadline(
+        &socket_path,
+        rmux_bootstrap::deadline::StartupDeadline::from_timeout(Some(Duration::from_secs(5))),
     )
-    .expect_err("other restore errors must remain visible");
+    .expect("connect with deadline");
+    let (server_stream, _) = listener.accept().expect("accept client");
+    write_response(server_stream, response.clone());
+
+    let received = connection
+        .read_response()
+        .expect("a closed peer does not hide its complete response");
+
+    assert_eq!(received, response);
+    fs::remove_file(&socket_path).expect("remove socket");
+}
+
+#[test]
+fn bounded_read_still_rejects_a_zero_timeout_after_the_peer_closed() {
+    let response = Response::HasSession(HasSessionResponse { exists: true });
+    let mut connection = connection_after_server_answered_and_closed(&response);
+
+    let error = connection
+        .read_response_with_read_timeout(Duration::ZERO)
+        .expect_err("a zero timeout is an invalid argument, not a disconnect");
 
     assert!(matches!(
-        result,
-        ClientError::Io(error) if error.kind() == io::ErrorKind::PermissionDenied
+        error,
+        ClientError::Io(error) if error.kind() == io::ErrorKind::InvalidInput
     ));
+}
+
+fn connection_after_server_answered_and_closed(response: &Response) -> super::Connection {
+    let (client_stream, server_stream) = UnixStream::pair().expect("create stream pair");
+    let connection = super::Connection::new(client_stream).expect("connection with timeout");
+    write_response(server_stream, response.clone());
+    connection
 }
 
 #[test]
@@ -488,6 +652,62 @@ fn supports_capability_reads_handshake_capabilities() {
     );
 
     server.join().expect("server thread joins");
+}
+
+#[test]
+fn window_snapshot_client_refuses_export_without_capability() {
+    assert_window_snapshot_capability_guard(false);
+}
+
+#[test]
+fn window_snapshot_client_refuses_restore_without_capability() {
+    assert_window_snapshot_capability_guard(true);
+}
+
+fn assert_window_snapshot_capability_guard(restore: bool) {
+    let Response::ExportWindowSnapshot(export) = rmux_proto::decode_frame::<Response>(
+        include_bytes!("../../../../tests/wire-fixtures/ledger-v1-current-wire/export_window_snapshot_response.bin"),
+    ).expect("snapshot fixture") else {
+        panic!("export fixture");
+    };
+    for cached in [false, true] {
+        let (client, mut peer) = UnixStream::pair().unwrap();
+        let server = thread::spawn(move || {
+            peer = expect_request(peer, Request::Handshake(HandshakeRequest::current()));
+            let response = Response::Handshake(HandshakeResponse {
+                wire_version: rmux_proto::RMUX_WIRE_VERSION,
+                capabilities: vec![],
+            });
+            peer.write_all(&encode_frame(&response).unwrap()).unwrap();
+            peer.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+            let mut byte = [0];
+            peer.read(&mut byte).unwrap_or(0)
+        });
+        let mut connection = super::Connection::new(client).unwrap();
+        if cached {
+            assert!(!connection
+                .supports_capability(rmux_proto::CAPABILITY_RMUX_WINDOW_SNAPSHOT_V1)
+                .unwrap());
+        }
+        let result = if restore {
+            connection.restore_window_snapshot(
+                export.snapshot.target.clone(),
+                export.snapshot.clone(),
+            )
+        } else {
+            connection.export_window_snapshot(export.snapshot.target.clone())
+        };
+        drop(connection);
+        let sent = server.join().unwrap();
+        assert_eq!(
+            sent, 0,
+            "snapshot request sent despite absent capability, restore={restore}"
+        );
+        assert!(matches!(
+            result,
+            Err(ClientError::Protocol(RmuxError::UnsupportedCapability { .. }))
+        ));
+    }
 }
 
 #[test]
@@ -681,6 +901,19 @@ fn send_fragmented_response(stream: UnixStream, response: Response, chunk_length
     }
 }
 
+fn write_bytes_and_close(mut stream: UnixStream, bytes: &[u8]) {
+    stream.write_all(bytes).expect("write upgrade output");
+    drop(stream);
+}
+
+fn read_to_end(mut stream: UnixStream) -> Vec<u8> {
+    let mut output = Vec::new();
+    stream
+        .read_to_end(&mut output)
+        .expect("read upgrade output");
+    output
+}
+
 fn write_response(stream: UnixStream, response: Response) {
     let frame = encode_frame(&response).expect("encode response");
     let mut stream = stream;
@@ -688,10 +921,21 @@ fn write_response(stream: UnixStream, response: Response) {
 }
 
 fn unique_socket_path(label: &str) -> PathBuf {
+    unique_socket_path_in(&std::env::temp_dir(), label)
+}
+
+fn unique_socket_path_in(root: &Path, label: &str) -> PathBuf {
     let unique_id = UNIQUE_ID.fetch_add(1, Ordering::Relaxed);
-    std::env::temp_dir()
+    let socket_path = root
         .join(format!("rmux-client-connection-tests-{label}"))
-        .join(format!("{}-{unique_id}.sock", std::process::id()))
+        .join(format!("{}-{unique_id}.sock", std::process::id()));
+    // macOS has 104 bytes in sun_path, including the terminating NUL.
+    if socket_path.as_os_str().len() < 104 {
+        return socket_path;
+    }
+    Path::new("/tmp")
+        .join(format!("rmux-client-{}-{unique_id}", std::process::id()))
+        .join("socket")
 }
 
 fn unique_temp_root(label: &str) -> PathBuf {

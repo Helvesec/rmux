@@ -1,12 +1,12 @@
 use super::*;
 
 use crate::handler::scripting_support::parse_request_from_parts;
-use rmux_core::{OptionStore, SessionStore};
+use rmux_core::{ManagedSessionStore, OptionStore};
 use rmux_proto::RmuxError;
 
-fn parser_fixture() -> (SessionStore, TargetFindContext) {
+fn parser_fixture() -> (ManagedSessionStore, TargetFindContext) {
     let alpha = session_name("alpha");
-    let mut sessions = SessionStore::new();
+    let mut sessions = ManagedSessionStore::new();
     sessions
         .create_session(alpha.clone(), TerminalSize { cols: 80, rows: 24 })
         .expect("parser fixture session");
@@ -18,7 +18,7 @@ fn parser_fixture() -> (SessionStore, TargetFindContext) {
 fn parse_server_request(
     command: &str,
     arguments: &[&str],
-    sessions: &SessionStore,
+    sessions: &ManagedSessionStore,
     find_context: &TargetFindContext,
 ) -> Result<Request, RmuxError> {
     parse_request_from_parts(

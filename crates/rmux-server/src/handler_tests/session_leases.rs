@@ -15,7 +15,7 @@ async fn session_lease_rejects_too_short_ttl() {
             environment: None,
         }))
         .await;
-    assert!(matches!(created, Response::NewSession(_)));
+    crate::session_fixture::assert_new_session(&created);
 
     let created_lease = handler
         .handle(Request::CreateSessionLease(
@@ -48,7 +48,7 @@ async fn session_lease_reaper_kills_unrenewed_session() {
             environment: None,
         }))
         .await;
-    assert!(matches!(created, Response::NewSession(_)));
+    crate::session_fixture::assert_new_session(&created);
 
     let created_lease = handler
         .handle(Request::CreateSessionLease(
@@ -86,7 +86,7 @@ async fn session_lease_renew_and_release_preserves_session() {
             environment: None,
         }))
         .await;
-    assert!(matches!(created, Response::NewSession(_)));
+    crate::session_fixture::assert_new_session(&created);
 
     let created_lease = handler
         .handle(Request::CreateSessionLease(
@@ -154,7 +154,7 @@ async fn renamed_session_lease_retains_its_initial_wire_address() {
             environment: None,
         }))
         .await;
-    assert!(matches!(created, Response::NewSession(_)));
+    crate::session_fixture::assert_new_session(&created);
 
     let created_lease = handler
         .handle(Request::CreateSessionLease(
@@ -237,7 +237,7 @@ async fn renamed_session_lease_expiration_kills_the_renamed_session() {
             environment: None,
         }))
         .await;
-    assert!(matches!(created, Response::NewSession(_)));
+    crate::session_fixture::assert_new_session(&created);
 
     let created_lease = handler
         .handle(Request::CreateSessionLease(
@@ -276,7 +276,7 @@ async fn expired_session_lease_reaper_follows_rename_after_expiration_extraction
             environment: None,
         }))
         .await;
-    assert!(matches!(created, Response::NewSession(_)), "{created:?}");
+    crate::session_fixture::assert_new_session(&created);
     let session_id = handler
         .state
         .lock()
@@ -329,7 +329,7 @@ async fn expired_session_lease_reaper_preserves_recreated_and_renewed_ownership(
             environment: None,
         }))
         .await;
-    assert!(matches!(created, Response::NewSession(_)), "{created:?}");
+    crate::session_fixture::assert_new_session(&created);
     let session_id = handler
         .state
         .lock()
@@ -424,7 +424,7 @@ async fn session_destroyed_by_last_pane_kill_clears_stale_lease() {
             environment: None,
         }))
         .await;
-    assert!(matches!(created, Response::NewSession(_)));
+    crate::session_fixture::assert_new_session(&created);
 
     let created_lease = handler
         .handle(Request::CreateSessionLease(
@@ -489,7 +489,7 @@ async fn session_destroyed_by_last_pane_exit_clears_stale_lease() {
             environment: None,
         }))
         .await;
-    assert!(matches!(created, Response::NewSession(_)));
+    crate::session_fixture::assert_new_session(&created);
 
     let created_lease = handler
         .handle(Request::CreateSessionLease(
@@ -538,8 +538,8 @@ async fn literal_dollar_name_lease_reaper_never_kills_the_colliding_session_id()
     let handler = RequestHandler::new();
     let victim_name = session_name("lease-literal-victim");
     let literal_name = session_name("$0");
-    assert!(matches!(
-        handler
+    crate::session_fixture::assert_new_session(
+        &handler
             .handle(Request::NewSession(NewSessionRequest {
                 session_name: victim_name.clone(),
                 detached: true,
@@ -547,10 +547,9 @@ async fn literal_dollar_name_lease_reaper_never_kills_the_colliding_session_id()
                 environment: None,
             }))
             .await,
-        Response::NewSession(_)
-    ));
-    assert!(matches!(
-        handler
+    );
+    crate::session_fixture::assert_new_session(
+        &handler
             .handle(Request::NewSession(NewSessionRequest {
                 session_name: literal_name.clone(),
                 detached: true,
@@ -558,8 +557,7 @@ async fn literal_dollar_name_lease_reaper_never_kills_the_colliding_session_id()
                 environment: None,
             }))
             .await,
-        Response::NewSession(_)
-    ));
+    );
     {
         let state = handler.state.lock().await;
         assert_eq!(
@@ -601,8 +599,8 @@ async fn renamed_lease_and_new_homonym_are_correlated_by_wire_name_and_token() {
     let handler = RequestHandler::new();
     let wire_name = session_name("lease-wire-reused");
     let renamed = session_name("lease-wire-renamed");
-    assert!(matches!(
-        handler
+    crate::session_fixture::assert_new_session(
+        &handler
             .handle(Request::NewSession(NewSessionRequest {
                 session_name: wire_name.clone(),
                 detached: true,
@@ -610,8 +608,7 @@ async fn renamed_lease_and_new_homonym_are_correlated_by_wire_name_and_token() {
                 environment: None,
             }))
             .await,
-        Response::NewSession(_)
-    ));
+    );
     let Response::CreateSessionLease(original_lease) = handler
         .handle(Request::CreateSessionLease(
             rmux_proto::CreateSessionLeaseRequest {
@@ -632,8 +629,8 @@ async fn renamed_lease_and_new_homonym_are_correlated_by_wire_name_and_token() {
             .await,
         Response::RenameSession(_)
     ));
-    assert!(matches!(
-        handler
+    crate::session_fixture::assert_new_session(
+        &handler
             .handle(Request::NewSession(NewSessionRequest {
                 session_name: wire_name.clone(),
                 detached: true,
@@ -641,8 +638,7 @@ async fn renamed_lease_and_new_homonym_are_correlated_by_wire_name_and_token() {
                 environment: None,
             }))
             .await,
-        Response::NewSession(_)
-    ));
+    );
     let Response::CreateSessionLease(homonym_lease) = handler
         .handle(Request::CreateSessionLease(
             rmux_proto::CreateSessionLeaseRequest {

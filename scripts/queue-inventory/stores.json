@@ -1,0 +1,22 @@
+[
+  {"name": "paste-buffer-store", "path": "crates/rmux-core/src/buffers.rs", "anchor": "buffers: BTreeMap<String, BufferEntry>,"},
+  {"name": "attach-decoder-buffer", "path": "crates/rmux-proto/src/attach.rs", "anchor": "buffer: Vec<u8>,"},
+  {"name": "detached-decoder-buffer", "path": "crates/rmux-proto/src/codec.rs", "anchor": "buffer: Vec<u8>,"},
+  {"name": "conpty-startup-vector", "path": "crates/rmux-pty/src/backend/windows/startup.rs", "anchor": "let mut bytes = Vec::new();"},
+  {"name": "sdk-line-buffer", "path": "crates/rmux-sdk/src/events/streams.rs", "anchor": "line_buffer: Vec<u8>,"},
+  {"name": "sdk-transport-outgoing-frames", "path": "crates/rmux-sdk/src/transport/actor.rs", "anchor": "frames: VecDeque<Vec<u8>>,"},
+  {"name": "post-commit-semaphore", "path": "crates/rmux-server/src/handler/post_commit_sequencer.rs", "anchor": "slots: Arc::new(Semaphore::new(capacity)),"},
+  {"name": "pane-alert-coalescer", "path": "crates/rmux-server/src/handler/alert_support/pane_alert_coalescer.rs", "anchor": "pending: HashMap<PaneAlertKey, PaneAlertEvent>,"},
+  {"name": "prompt-history", "path": "crates/rmux-server/src/handler/prompt_support/history.rs", "anchor": "items: [Vec<String>; 4],"},
+  {"name": "popup-overlay-option", "path": "crates/rmux-server/src/pane_io/attach_control/coalesce.rs", "anchor": "overlay: Option<OverlayFrame>,"},
+  {"name": "deferred-passthrough-vec", "path": "crates/rmux-server/src/pane_io/deferred_passthrough/queue.rs", "anchor": "entries: Vec<DeferredPassthrough>,"},
+  {"name": "applied-window-resize", "path": "crates/rmux-server/src/pane_terminals/applied_window_resize.rs", "anchor": "pending: Vec<AppliedWindowResize>,"},
+  {"name": "starting-input-default", "path": "crates/rmux-server/src/pane_terminals/deferred_initial.rs", "anchor": "queued_input: Default::default(),"},
+  {"name": "web-latest-keyframe", "path": "crates/rmux-server/src/web/outbound.rs", "anchor": "latest_keyframe: Arc<Mutex<Option<KeyframeCmd>>>,\n    keyframe_wakeup_pending: Arc<AtomicBool>,\n    writer_task:"},
+  {"name": "web-osc-buffer", "path": "crates/rmux-server/src/web/stream_sanitizer.rs", "anchor": "Osc {\n        bytes: Vec<u8>,"},
+  {"name": "provider-line-builder", "path": "crates/rmux-server/src/web/tunnel/output.rs", "anchor": "let mut line = Vec::with_capacity(MAX_PROVIDER_LINE_BYTES);"},
+  {"name": "cli-line-buffer", "path": "src/cli/automation/stream.rs", "anchor": "let mut line_buffer = Vec::new();"},
+  {"name": "control-format-registry", "path": "crates/rmux-server/src/control/format_subscriptions.rs", "anchor": "entries: Vec<ControlFormatSubscription>,"},
+  {"name": "control-format-retained-values", "path": "crates/rmux-server/src/control/format_subscriptions.rs", "anchor": "last_value: Option<String>,"},
+  {"name": "control-format-notifications", "path": "crates/rmux-server/src/control/format_subscriptions/bounds.rs", "anchor": "notifications: Vec<ControlFormatNotification>,"}
+]

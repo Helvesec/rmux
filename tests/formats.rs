@@ -2,6 +2,9 @@
 
 mod common;
 
+#[path = "formats/pane_xyz.rs"]
+mod pane_xyz;
+
 use std::time::Duration;
 
 use common::{
@@ -477,9 +480,10 @@ fn tmux_format_table_names_sorted_invariant() {
             pair[1]
         );
     }
-    assert_eq!(TMUX_FORMAT_TABLE_NAMES.len(), 192);
+    assert_eq!(TMUX_FORMAT_TABLE_NAMES.len(), 195);
 }
 
+// Keep this historical name for continuity with the reference registry (195 entries now).
 #[test]
 fn is_known_covers_all_192_table_entries() {
     use rmux_core::formats::TMUX_FORMAT_TABLE_NAMES;
@@ -489,6 +493,54 @@ fn is_known_covers_all_192_table_entries() {
             "table entry {name:?} not recognized"
         );
     }
+}
+
+/// `#{sixel_support}` is advertised by `TMUX_FORMAT_TABLE_NAMES`, by the
+/// `capabilities --json` conformance inventory, and by `list-commands -F`'s
+/// shared expander. Every one of those has to agree with the runtime, since a
+/// token that expands to nothing is indistinguishable from an unknown name.
+///
+/// tmux 3.7b oracle (pinned binary, private socket, `-f /dev/null`):
+/// `display-message -p`, `list-sessions/-windows/-panes/-buffers/-keys/
+/// -commands -F`, `#{S:}`/`#{W:}`/`#{P:}` and `#{E:}` all print the same single
+/// digit, attached or detached, with or without `-T sixel`. That digit is `0`
+/// on the oracle and on this build: RMUX forwards a bare-`q` DCS transiently to
+/// one capable attached client behind `allow-passthrough`, but retains no
+/// image, redraws none, drops every DCS on the web transport, and answers the
+/// non-SIXEL primary DA — so it has no server-side SIXEL capability to claim.
+#[test]
+fn sixel_support_is_advertised_and_resolved_by_every_shared_entry_path() {
+    use rmux_core::formats::TMUX_FORMAT_TABLE_NAMES;
+    use rmux_core::SIXEL_SUPPORT;
+
+    let expected = "0";
+    assert_eq!(SIXEL_SUPPORT, expected == "1");
+
+    assert!(TMUX_FORMAT_TABLE_NAMES.contains(&"sixel_support"));
+    assert!(is_known_format_variable_name("sixel_support"));
+    assert!(
+        include_str!("conformance/format_tokens.txt")
+            .lines()
+            .any(|line| line == "sixel_support"),
+        "conformance inventory no longer advertises sixel_support"
+    );
+
+    // Bare context: no session, window, pane, client, or runtime state.
+    assert_eq!(
+        render_template("#{sixel_support}", &FormatContext::new()),
+        expected
+    );
+
+    // `list-commands -F` renders through the same expander with its own
+    // context, and is the route a client takes with no server running.
+    assert_eq!(
+        rmux_core::command_inventory::render_list_commands_line(
+            Some("#{command_list_name} #{sixel_support}"),
+            "new-session",
+            None,
+        ),
+        format!("new-session {expected}")
+    );
 }
 
 #[test]

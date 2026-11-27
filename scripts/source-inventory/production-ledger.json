@@ -1,0 +1,2314 @@
+{
+  "entries": [
+    {
+      "after": "ea435dddd3fba0e2c9e8e7c8d97150b0712ed21b",
+      "after_production": 343521,
+      "before": "92d4e12d66ee19eb776b07615c4cdfcf60424e1e",
+      "before_production": 343521,
+      "delta": 0,
+      "lot": "INT145",
+      "mandate": {
+        "production_growth_envelope": 0
+      }
+    },
+    {
+      "after": "9557a5414dc9218bd2b4294febfbd50a1f182a28",
+      "after_production": 343521,
+      "before": "ea435dddd3fba0e2c9e8e7c8d97150b0712ed21b",
+      "before_production": 343521,
+      "delta": 0,
+      "lot": "S3-L014-D65-BLACKLIST-PRODUCTION-RATCHET-090",
+      "mandate": {
+        "production_growth_envelope": 0
+      }
+    },
+    {
+      "after": "c8f6198bfaa799693cba4f8ab0108e407deb27f9",
+      "after_production": 343521,
+      "before": "9557a5414dc9218bd2b4294febfbd50a1f182a28",
+      "before_production": 343521,
+      "delta": 0,
+      "lot": "S3-L014-R1283-F1-LOT-ENVELOPE-CORRECTION-091",
+      "mandate": {
+        "production_growth_envelope": 0
+      }
+    },
+    {
+      "after": "1cc979c2cf5293dadb1971e7f8a50d34218bf9b1",
+      "after_production": 343521,
+      "before": "c8f6198bfaa799693cba4f8ab0108e407deb27f9",
+      "before_production": 343521,
+      "delta": 0,
+      "lot": "S3-L014-INT148-COVERAGE-GAP-CORRECTION-092",
+      "mandate": {
+        "production_growth_envelope": 0
+      }
+    },
+    {
+      "after": "927f7a8c2b51a6806faa8f191f37ebfc83e7209c",
+      "after_production": 343521,
+      "before": "05f405c869ea66271d3eba6d717a9eb62ebf3558",
+      "before_production": 343521,
+      "delta": 0,
+      "lot": "S1-L081-FIRST-MISSING-OPTION-EFFECT-CODE-096",
+      "mandate": {
+        "production_growth_envelope": 0
+      }
+    },
+    {
+      "after": "f6463451d7db3eaa7a00d7e3fd2acbfb10edbbb8",
+      "after_production": 344137,
+      "before": "76e4cdbdb6afe33ade10533ed8cd9d001f7de83d",
+      "before_production": 343521,
+      "delta": 616,
+      "lot": "INT-D67-S5074-PASS287-UNIX-TRAIN-157",
+      "mandate": {
+        "production_growth_envelope": 650,
+        "production_growth_justification": "D65: +609 retained output, +7 necessary module separation; envelope650 explicitly assigned; debt offset before freeze"
+      }
+    },
+    {
+      "after": "2166fb14ca13e8324d8e872e55282a7179a9094a",
+      "after_production": 343529,
+      "before": "76e4cdbdb6afe33ade10533ed8cd9d001f7de83d",
+      "before_production": 343521,
+      "delta": 8,
+      "lot": "S3-L081-INT156-CONFLICT-CORRECTION-095",
+      "mandate": {
+        "production_growth_envelope": 400,
+        "production_growth_justification": "Mandat S3-095: conserver les deux effets PASS293 et le reset Unix \u00e9tabli par S3-094; recomposition sur INT153."
+      }
+    },
+    {
+      "after": "89f17e38d523bdc3890d8515855e4166cc458bc3",
+      "after_production": 344445,
+      "before": "c0272d4b5a9e59d8109e7d4b5ec09f5d4312e200",
+      "before_production": 344399,
+      "delta": 46,
+      "lot": "S4-L198-R1348-F1-F2-SIZE-ENVELOPE-CORRECTION-105",
+      "mandate": {
+        "production_growth_envelope": 48,
+        "production_growth_justification": "Validation et enqueue atomiques des quatre voies de livraison Web, delta net mesur\u00e9 par R1-348 ; lot 104+105 contre c0272d4b, sans croissance des fichiers hors taille."
+      }
+    },
+    {
+      "after": "c622f6c085f95d22f3d6404d2ae38a9b13b6b70c",
+      "after_production": 344262,
+      "before": "ce3e629b21dd90c0ff72af9f363b12e4f9e9e8ec",
+      "before_production": 344262,
+      "delta": 0,
+      "lot": "S5-L141-L142-L143-INT170-CONFLICT-RECOMPOSITION-086",
+      "mandate": {
+        "production_growth_envelope": 0
+      }
+    },
+    {
+      "after": "fa000c644113f717bf7c7065a96704260e759b99",
+      "after_production": 343521,
+      "before": "76e4cdbdb6afe33ade10533ed8cd9d001f7de83d",
+      "before_production": 343521,
+      "delta": 0,
+      "lot": "S3-L144-D79-INDEPENDENT-BUILD-COMPARISON-CODE-106",
+      "mandate": {
+        "production_growth_envelope": 600,
+        "production_growth_justification": "D79 mandate: executable comparison and provenance binding for independent clean critical-binary builds, source SHA, toolchain/options, exact binary set and archive/manifest boundaries; authorized envelope 600. Release-only tooling is declared separately; no product growth is expected."
+      }
+    },
+    {
+      "after": "abd34236d818ca92d89812c91bca982358802319",
+      "after_production": 343521,
+      "before": "cfc10630e8b4d6129860cffc280f39300ea0fd0c",
+      "before_production": 343521,
+      "delta": 0,
+      "lot": "S1-L144-R1383-CANONICAL-INDEPENDENCE-STALE-GREEN-CORRECTION-109",
+      "mandate": {
+        "production_growth_envelope": 600,
+        "production_growth_justification": "Mandat S1 R1-383: canonical payload with stable embedded source commit, private cold-target provenance without variable binary injection, and fail-closed comparison output invalidation; authorized net production envelope 600."
+      }
+    },
+    {
+      "after": "74ce50cc706e6f88eb0ffff54b9a7a8c13db7b66",
+      "after_production": 343521,
+      "before": "fe5b76f1d15ecaef4c31a91a99787423256e415a",
+      "before_production": 343521,
+      "delta": 0,
+      "lot": "S1-L144-R1390-NEIGHBOR-STALE-GREEN-CORRECTION-110",
+      "mandate": {
+        "production_growth_envelope": 600,
+        "production_growth_justification": "Mandat S1 R1-390: invalidate safe neighboring comparison reports before unreadable receipt refusal; exact-path scan exclusion and evidence aliases preserved; authorized envelope 600."
+      }
+    },
+    {
+      "after": "92652381325c31a48a07564dcec82039318a17b4",
+      "after_production": 344693,
+      "before": "6058943249c9ebb40653fa6576e6da4db08d7842",
+      "before_production": 344693,
+      "delta": 0,
+      "lot": "S2-INT210-POPUP-SOURCE-SHUTDOWN-CORRECTION-085",
+      "mandate": {}
+    },
+    {
+      "lot": "S5-INT213-ATTACH-CONFLICT-RECOMPOSITION-097",
+      "before": "92652381325c31a48a07564dcec82039318a17b4",
+      "after": "e2b9ce02f5abed9cef33ffe429a90ecb2f798b67",
+      "before_production": 344693,
+      "after_production": 344705,
+      "delta": 12,
+      "mandate": {
+        "production_growth_envelope": 600,
+        "production_growth_justification": "Original S5-095/096 envelope 600 retained by S5-097 and R1-405; exact INT216 composition +12. No retrospective envelope or historical-debt credit."
+      }
+    },
+    {
+      "after": "c7b1747c4e705c2c6d963553c9e80491b0b44610",
+      "after_production": 343541,
+      "before": "76e4cdbdb6afe33ade10533ed8cd9d001f7de83d",
+      "before_production": 343521,
+      "delta": 20,
+      "lot": "S1-L064-D79-INSTALLED-JOB-OBJECT-CODE-107",
+      "mandate": {
+        "production_growth_envelope": 600,
+        "production_growth_justification": "D79 mandate: targeted Windows Job Object/lifecycle correction and installed consumer; 600-line maximum production envelope."
+      }
+    },
+    {
+      "after": "924d55f196aa99c4b1ec59be33671fa815d45b6d",
+      "after_production": 343541,
+      "before": "ab79971ff11a28eb9984edd8cb3e76fdbf8e479f",
+      "before_production": 343541,
+      "delta": 0,
+      "lot": "S1-L064-R1380-COLLECTOR-F1-F2-F3-CORRECTION-108",
+      "mandate": {
+        "production_growth_envelope": 600,
+        "production_growth_justification": "Corrige seulement F1/P1,F2/P2,F3/P2 de results/R1-S1-107-D79-P1-DIFF-REVIEW-380/REVUE.md. Pars ab79971ff11a28eb9984edd8cb3e76fdbf8e479f dans WT durable neuf $HOME/Projects/rmux-s1-l064-r1380-108; originaux intacts. Premier geste: tests causaux gel\u00e9s committ\u00e9s rouges<10min, puis correctifs. F1 scripts/installed_job_objects.py: aucun lancement CLI au rejet marqueur/signature; cleanup seulement apr\u00e8s qualification compl\u00e8te et tentative de lancement, couvrir tous rejets. F2: Python,-c,code en argv distincts pour default-shell PowerShell et chemin \u00e0 espaces. F3: provenance RC h\u00e9berg\u00e9e re\u00e7ue li\u00e9e SHA/digest; absence reste non-jou\u00e9, aucune publication. NR collecteur/paquets/install\u00e9/cleanup voisins avant-apr\u00e8s: python3 tests/installed_consumers_spec.py et python3 tests/installed_consumer_diagnostics_spec.py. C\u0153ur Win32 PASS conserv\u00e9; aucun fix bounded_write revendiqu\u00e9. D69/D71/D79/D41/D42/D65/D90/D92/D93/D95. R1 relira seuls F1-F3 et voisins. Pr\u00e9-vol seuls tests du diff M/L/W11 si libre sinon PR\u00caT pr\u00e9-vol non jou\u00e9; qualification exacte h\u00f4te/SHA/outils/slot avant toute preuve native. Linux SSD work directory, CARGO_HOME offline existant,D73; r\u00e9servation D92 avant lourd. Cible priv\u00e9e SHA/OS et identit\u00e9 chemin/hash/commit=HEAD. Co\u00fbt cibl\u00e96Gio admis Mac49\u221230 etLinux3567\u221240; df arr\u00eat35/45; the Windows host pr\u00e9vol frais50/arr\u00eat55 sinon pasbuild. Fichiers<600,enveloppe600,D65 nonaffaibli. Sidney Sissaoui sans trailer. Aucun FF/STATE/GitHub/operator/W10/identifiants/purge/autrer\u00f4le. 6hmax; results/S1-L064-R1380-COLLECTOR-F1-F2-F3-CORRECTION-108/REMISE.md\u22641500car/30l. PR\u00caT ou BLOQU\u00c9,puis arr\u00eate-toi."
+      }
+    }
+  ],
+  "historical_settlements": [
+    {
+      "schema": "rmux-production-historical-settlement/1",
+      "authority": "COORDINATION-20261003.md D100 (2026-10-09T23:25Z), D65(b); D101 (2026-10-09T23:55Z)",
+      "status": "READY_FOR_R1_REVIEW",
+      "settlement_ready": true,
+      "author_base": "e0b88cb466527d900c4a9c6cc54829c305728a38",
+      "before": "ea435dddd3fba0e2c9e8e7c8d97150b0712ed21b",
+      "after": "6058943249c9ebb40653fa6576e6da4db08d7842",
+      "delta": 502,
+      "families": [
+        {
+          "family": "CLI",
+          "delta": -18,
+          "paths": {
+            "src/cli_args.rs": -12,
+            "src/cli_args/queue.rs": -18,
+            "src/cli_args/schema.rs": 12
+          },
+          "commits": [
+            {
+              "before": "dba6270d290f740fbdb2a426f9b538b11fe9ae72",
+              "after": "160a72c1c3924d9f922766ee4785dae08e6400c7",
+              "subject": "fix(cli): derive parser help and tiny option policies from the typed schema",
+              "before_production": 344137,
+              "after_production": 344119,
+              "delta": -18,
+              "qualified": true,
+              "inventory_errors": {
+                "after": [],
+                "before": []
+              },
+              "inventory_before": {
+                "path": "sha256:114dd04df615e698e924c8fe8724ca34bc999e247a32da84f56c97b1ca96cb7e",
+                "sha256": "114dd04df615e698e924c8fe8724ca34bc999e247a32da84f56c97b1ca96cb7e",
+                "declarations_sha256": "d85b671f6dafac15006272fbebe1856f6a1fa6a1fd8db741e76270d66239b8cc"
+              },
+              "inventory_after": {
+                "path": "sha256:07b962b1a0f9afe3b7be7493736ba783b711b963fbfb8696a8fc553fa098eafc",
+                "sha256": "07b962b1a0f9afe3b7be7493736ba783b711b963fbfb8696a8fc553fa098eafc",
+                "declarations_sha256": "d85b671f6dafac15006272fbebe1856f6a1fa6a1fd8db741e76270d66239b8cc"
+              },
+              "paths": {
+                "src/cli_args.rs": -12,
+                "src/cli_args/queue.rs": -18,
+                "src/cli_args/schema.rs": 12
+              },
+              "historical_binding_used": false,
+              "git_evidence_key": "160a72c1c3924d9f922766ee4785dae08e6400c7",
+              "patch_sha256": "577207dbe0d8eb1cbb0b9eec02a27c997a3bf8e1f1524d0bbd0099df64d5d7fc"
+            }
+          ],
+          "per_commit_complete": true,
+          "family_before_inventory": {
+            "declarations_sha256": "d85b671f6dafac15006272fbebe1856f6a1fa6a1fd8db741e76270d66239b8cc",
+            "errors": [],
+            "path": "sha256:114dd04df615e698e924c8fe8724ca34bc999e247a32da84f56c97b1ca96cb7e",
+            "production": 344137,
+            "reused": {
+              "equivalence": "Exact source commit/tree, parser inputs, lock, tool inputs and declarations; same qualified parser/compiler/features; no native product-test credit.",
+              "path": "sha256:114dd04df615e698e924c8fe8724ca34bc999e247a32da84f56c97b1ca96cb7e",
+              "sha256": "114dd04df615e698e924c8fe8724ca34bc999e247a32da84f56c97b1ca96cb7e"
+            },
+            "revision": "dba6270d290f740fbdb2a426f9b538b11fe9ae72",
+            "seconds": 0.520957576984074,
+            "sha256": "114dd04df615e698e924c8fe8724ca34bc999e247a32da84f56c97b1ca96cb7e",
+            "status": "MEASURED",
+            "tree": "d7e6dde1af650611d4470fc3a825d43f1e25bf71"
+          },
+          "family_after_inventory": {
+            "declarations_sha256": "d85b671f6dafac15006272fbebe1856f6a1fa6a1fd8db741e76270d66239b8cc",
+            "errors": [],
+            "path": "sha256:07b962b1a0f9afe3b7be7493736ba783b711b963fbfb8696a8fc553fa098eafc",
+            "production": 344119,
+            "reused": {
+              "equivalence": "Exact source commit/tree, parser inputs, lock, tool inputs and declarations; same qualified parser/compiler/features; no native product-test credit.",
+              "path": "sha256:07b962b1a0f9afe3b7be7493736ba783b711b963fbfb8696a8fc553fa098eafc",
+              "sha256": "07b962b1a0f9afe3b7be7493736ba783b711b963fbfb8696a8fc553fa098eafc"
+            },
+            "revision": "160a72c1c3924d9f922766ee4785dae08e6400c7",
+            "seconds": 0.4932969539659098,
+            "sha256": "07b962b1a0f9afe3b7be7493736ba783b711b963fbfb8696a8fc553fa098eafc",
+            "status": "MEASURED",
+            "tree": "e048ac6fde8702bec73d63bd195c5b5cd2e72652"
+          }
+        },
+        {
+          "family": "EOF",
+          "delta": 144,
+          "paths": {
+            "crates/rmux-server/src/pane_io.rs": -199,
+            "crates/rmux-server/src/pane_io/attach_eof.rs": 91,
+            "crates/rmux-server/src/pane_io/attach_input_dispatch.rs": 252
+          },
+          "commits": [
+            {
+              "before": "84b8387e359fbea5d02d495b97d085fd5e41bdf5",
+              "after": "f8ac7bd065bc8dada2afd20fc21f757afabd71d2",
+              "subject": "fix(server): deliver decoded attach input before EOF stop",
+              "before_production": 344119,
+              "after_production": 344243,
+              "delta": 124,
+              "qualified": true,
+              "inventory_errors": {
+                "after": [],
+                "before": []
+              },
+              "inventory_before": {
+                "path": "sha256:98fd74d7cebfe5f488fe45e3c832155369b82bab124d3e4f84d9a27af1f49da8",
+                "sha256": "98fd74d7cebfe5f488fe45e3c832155369b82bab124d3e4f84d9a27af1f49da8",
+                "declarations_sha256": "d85b671f6dafac15006272fbebe1856f6a1fa6a1fd8db741e76270d66239b8cc"
+              },
+              "inventory_after": {
+                "path": "sha256:4959e928abaf5dd3b62df9f3e9a9d778c9ac20f73ca26c27a8b00552e166bb70",
+                "sha256": "4959e928abaf5dd3b62df9f3e9a9d778c9ac20f73ca26c27a8b00552e166bb70",
+                "declarations_sha256": "d85b671f6dafac15006272fbebe1856f6a1fa6a1fd8db741e76270d66239b8cc"
+              },
+              "paths": {
+                "crates/rmux-server/src/pane_io.rs": 39,
+                "crates/rmux-server/src/pane_io/attach_eof.rs": 85
+              },
+              "historical_binding_used": false,
+              "git_evidence_key": "f8ac7bd065bc8dada2afd20fc21f757afabd71d2",
+              "patch_sha256": "1c24b36e0a0542723a6b88f85fa9f88d4ea2e216a1ca4fe48b7058b66868feb7"
+            },
+            {
+              "before": "c6e0184c327be759e32f1f529b459ed9c357c967",
+              "after": "d05d7d9be353845593c00765c3de43791630b6c9",
+              "subject": "fix(server): drain retained EOF suffixes and extract attach dispatch",
+              "before_production": 344243,
+              "after_production": 344263,
+              "delta": 20,
+              "qualified": true,
+              "inventory_errors": {
+                "after": [],
+                "before": []
+              },
+              "inventory_before": {
+                "path": "sha256:42509a573efd1c78f089293c3dcbf735648801a7e8211d76ec31d873c96232b7",
+                "sha256": "42509a573efd1c78f089293c3dcbf735648801a7e8211d76ec31d873c96232b7",
+                "declarations_sha256": "d85b671f6dafac15006272fbebe1856f6a1fa6a1fd8db741e76270d66239b8cc"
+              },
+              "inventory_after": {
+                "path": "sha256:691e641785f4499a7decea0473143e6fc5e350458a865645b81827731baff0ed",
+                "sha256": "691e641785f4499a7decea0473143e6fc5e350458a865645b81827731baff0ed",
+                "declarations_sha256": "d85b671f6dafac15006272fbebe1856f6a1fa6a1fd8db741e76270d66239b8cc"
+              },
+              "paths": {
+                "crates/rmux-server/src/pane_io.rs": -238,
+                "crates/rmux-server/src/pane_io/attach_eof.rs": 6,
+                "crates/rmux-server/src/pane_io/attach_input_dispatch.rs": 252
+              },
+              "historical_binding_used": false,
+              "git_evidence_key": "d05d7d9be353845593c00765c3de43791630b6c9",
+              "patch_sha256": "c282404ebc013a2dc5f2dc720e934097b37521a333d477c02e0879694f52796f"
+            }
+          ],
+          "per_commit_complete": true,
+          "family_before_inventory": {
+            "declarations_sha256": "d85b671f6dafac15006272fbebe1856f6a1fa6a1fd8db741e76270d66239b8cc",
+            "errors": [],
+            "path": "sha256:98fd74d7cebfe5f488fe45e3c832155369b82bab124d3e4f84d9a27af1f49da8",
+            "production": 344119,
+            "reused": {
+              "equivalence": "Exact source commit/tree, parser inputs, lock, tool inputs and declarations; same qualified parser/compiler/features; no native product-test credit.",
+              "path": "sha256:98fd74d7cebfe5f488fe45e3c832155369b82bab124d3e4f84d9a27af1f49da8",
+              "sha256": "98fd74d7cebfe5f488fe45e3c832155369b82bab124d3e4f84d9a27af1f49da8"
+            },
+            "revision": "84b8387e359fbea5d02d495b97d085fd5e41bdf5",
+            "seconds": 0.5603401970001869,
+            "sha256": "98fd74d7cebfe5f488fe45e3c832155369b82bab124d3e4f84d9a27af1f49da8",
+            "status": "MEASURED",
+            "tree": "3fb70321db583caaa88c4f553c451eff93ece137"
+          },
+          "family_after_inventory": {
+            "declarations_sha256": "d85b671f6dafac15006272fbebe1856f6a1fa6a1fd8db741e76270d66239b8cc",
+            "errors": [],
+            "path": "sha256:691e641785f4499a7decea0473143e6fc5e350458a865645b81827731baff0ed",
+            "production": 344263,
+            "reused": {
+              "equivalence": "Exact source commit/tree, parser inputs, lock, tool inputs and declarations; same qualified parser/compiler/features; no native product-test credit.",
+              "path": "sha256:691e641785f4499a7decea0473143e6fc5e350458a865645b81827731baff0ed",
+              "sha256": "691e641785f4499a7decea0473143e6fc5e350458a865645b81827731baff0ed"
+            },
+            "revision": "d05d7d9be353845593c00765c3de43791630b6c9",
+            "seconds": 0.5449663790059276,
+            "sha256": "691e641785f4499a7decea0473143e6fc5e350458a865645b81827731baff0ed",
+            "status": "MEASURED",
+            "tree": "4e4a33b055d9120df04272d0d42da44b9b136149"
+          }
+        },
+        {
+          "family": "Kitty",
+          "delta": -1,
+          "paths": {
+            "crates/rmux-core/src/screen.rs": -1
+          },
+          "commits": [
+            {
+              "before": "fcbab36d5d5b1d36ffa1b188d53e39956cb7b9bd",
+              "after": "53bd66b021984b3eb9615f40014d3ab7f9e5b5f6",
+              "subject": "fix(core): require explicit Kitty keyboard opt-in",
+              "before_production": 344263,
+              "after_production": 344262,
+              "delta": -1,
+              "qualified": true,
+              "inventory_errors": {
+                "after": [],
+                "before": []
+              },
+              "inventory_before": {
+                "path": "sha256:9290bdf4b572c305ea60e9b332b0ec16874f5da887c27d305bf66977a445222b",
+                "sha256": "9290bdf4b572c305ea60e9b332b0ec16874f5da887c27d305bf66977a445222b",
+                "declarations_sha256": "d85b671f6dafac15006272fbebe1856f6a1fa6a1fd8db741e76270d66239b8cc"
+              },
+              "inventory_after": {
+                "path": "sha256:dd19abebc410fb3d308e7c3ceab90b2cae054bd084c1cbd19514af3369e81f66",
+                "sha256": "dd19abebc410fb3d308e7c3ceab90b2cae054bd084c1cbd19514af3369e81f66",
+                "declarations_sha256": "d85b671f6dafac15006272fbebe1856f6a1fa6a1fd8db741e76270d66239b8cc"
+              },
+              "paths": {
+                "crates/rmux-core/src/screen.rs": -1
+              },
+              "historical_binding_used": false,
+              "git_evidence_key": "53bd66b021984b3eb9615f40014d3ab7f9e5b5f6",
+              "patch_sha256": "7a6209c8edea034f84867e84df000f0cde8585154e9fd625d43cb3329bdd73b2"
+            }
+          ],
+          "per_commit_complete": true,
+          "family_before_inventory": {
+            "declarations_sha256": "d85b671f6dafac15006272fbebe1856f6a1fa6a1fd8db741e76270d66239b8cc",
+            "errors": [],
+            "path": "sha256:9290bdf4b572c305ea60e9b332b0ec16874f5da887c27d305bf66977a445222b",
+            "production": 344263,
+            "reused": {
+              "equivalence": "Exact source commit/tree, parser inputs, lock, tool inputs and declarations; same qualified parser/compiler/features; no native product-test credit.",
+              "path": "sha256:9290bdf4b572c305ea60e9b332b0ec16874f5da887c27d305bf66977a445222b",
+              "sha256": "9290bdf4b572c305ea60e9b332b0ec16874f5da887c27d305bf66977a445222b"
+            },
+            "revision": "fcbab36d5d5b1d36ffa1b188d53e39956cb7b9bd",
+            "seconds": 0.5481538869789802,
+            "sha256": "9290bdf4b572c305ea60e9b332b0ec16874f5da887c27d305bf66977a445222b",
+            "status": "MEASURED",
+            "tree": "ccbc2159b190362c16d4e3f3cf40910997ea73d0"
+          },
+          "family_after_inventory": {
+            "declarations_sha256": "d85b671f6dafac15006272fbebe1856f6a1fa6a1fd8db741e76270d66239b8cc",
+            "errors": [],
+            "path": "sha256:dd19abebc410fb3d308e7c3ceab90b2cae054bd084c1cbd19514af3369e81f66",
+            "production": 344262,
+            "reused": {
+              "equivalence": "Exact source commit/tree, parser inputs, lock, tool inputs and declarations; same qualified parser/compiler/features; no native product-test credit.",
+              "path": "sha256:dd19abebc410fb3d308e7c3ceab90b2cae054bd084c1cbd19514af3369e81f66",
+              "sha256": "dd19abebc410fb3d308e7c3ceab90b2cae054bd084c1cbd19514af3369e81f66"
+            },
+            "revision": "53bd66b021984b3eb9615f40014d3ab7f9e5b5f6",
+            "seconds": 0.7574863740010187,
+            "sha256": "dd19abebc410fb3d308e7c3ceab90b2cae054bd084c1cbd19514af3369e81f66",
+            "status": "MEASURED",
+            "tree": "16adb0e1ed1c33525ceaa2cef01894642f677c4d"
+          }
+        },
+        {
+          "family": "messages",
+          "delta": 48,
+          "paths": {
+            "crates/rmux-server/src/handler_alerts/show_messages.rs": 48
+          },
+          "commits": [
+            {
+              "before": "f5ce314f49d3637b6aa6846fd3e5e6f2f7354ed4",
+              "after": "63e6ed0365c13e293b2cb9c491b577cc9669b719",
+              "subject": "fix(server): log show-messages observers before reading",
+              "before_production": 344270,
+              "after_production": 344318,
+              "delta": 48,
+              "qualified": true,
+              "inventory_errors": {
+                "after": [],
+                "before": []
+              },
+              "inventory_before": {
+                "path": "sha256:c00fe2ea4ca1329edf893ce91f834a37859147c911f91da0dbf3505160851dbe",
+                "sha256": "c00fe2ea4ca1329edf893ce91f834a37859147c911f91da0dbf3505160851dbe",
+                "declarations_sha256": "10584315035189665cb441ef814f872648980a0c5f6db7f8da8a4d540e173a9a"
+              },
+              "inventory_after": {
+                "path": "sha256:9b1510cd293dc5326fcb322d3a70ace50a92cf45c4495b31355a854acaf08faa",
+                "sha256": "9b1510cd293dc5326fcb322d3a70ace50a92cf45c4495b31355a854acaf08faa",
+                "declarations_sha256": "10584315035189665cb441ef814f872648980a0c5f6db7f8da8a4d540e173a9a"
+              },
+              "paths": {
+                "crates/rmux-server/src/handler_alerts/show_messages.rs": 48
+              },
+              "historical_binding_used": true,
+              "git_evidence_key": "63e6ed0365c13e293b2cb9c491b577cc9669b719",
+              "patch_sha256": "377713a30333b1307d78badfe580d013737eedaf127a8e3a6ede9fbaf2b41cdc"
+            }
+          ],
+          "per_commit_complete": true,
+          "family_before_inventory": {
+            "declarations_sha256": "10584315035189665cb441ef814f872648980a0c5f6db7f8da8a4d540e173a9a",
+            "errors": [],
+            "path": "sha256:c00fe2ea4ca1329edf893ce91f834a37859147c911f91da0dbf3505160851dbe",
+            "production": 344270,
+            "reused": null,
+            "revision": "f5ce314f49d3637b6aa6846fd3e5e6f2f7354ed4",
+            "seconds": 21.429322085983586,
+            "sha256": "c00fe2ea4ca1329edf893ce91f834a37859147c911f91da0dbf3505160851dbe",
+            "status": "MEASURED",
+            "tree": "e89739c40b93e0b97900df6ed3f617b555494e91"
+          },
+          "family_after_inventory": {
+            "declarations_sha256": "10584315035189665cb441ef814f872648980a0c5f6db7f8da8a4d540e173a9a",
+            "errors": [],
+            "path": "sha256:9b1510cd293dc5326fcb322d3a70ace50a92cf45c4495b31355a854acaf08faa",
+            "production": 344318,
+            "reused": null,
+            "revision": "63e6ed0365c13e293b2cb9c491b577cc9669b719",
+            "seconds": 21.546720326994546,
+            "sha256": "9b1510cd293dc5326fcb322d3a70ace50a92cf45c4495b31355a854acaf08faa",
+            "status": "MEASURED",
+            "tree": "2046dc55995f7795d80922dd5e0ba56a346224b1"
+          }
+        },
+        {
+          "family": "geometry",
+          "delta": 81,
+          "paths": {
+            "crates/rmux-server/src/format_runtime/geometry.rs": 92,
+            "crates/rmux-server/src/format_runtime/variables.rs": -11,
+            "crates/rmux-server/src/pane_terminals/pane_geometry.rs": 10,
+            "crates/rmux-server/src/pane_terminals/pane_lifecycle/split.rs": -10
+          },
+          "commits": [
+            {
+              "before": "63e6ed0365c13e293b2cb9c491b577cc9669b719",
+              "after": "42d71bab3424a95acf35f65736801cd739d0afe2",
+              "subject": "test(format): freeze scrollbar option content geometry",
+              "before_production": 344318,
+              "after_production": 344318,
+              "delta": 0,
+              "qualified": true,
+              "inventory_errors": {
+                "after": [],
+                "before": []
+              },
+              "inventory_before": {
+                "path": "sha256:9b1510cd293dc5326fcb322d3a70ace50a92cf45c4495b31355a854acaf08faa",
+                "sha256": "9b1510cd293dc5326fcb322d3a70ace50a92cf45c4495b31355a854acaf08faa",
+                "declarations_sha256": "10584315035189665cb441ef814f872648980a0c5f6db7f8da8a4d540e173a9a"
+              },
+              "inventory_after": {
+                "path": "sha256:d035dc5efdd21d50f0f44282bca9110f3387b1372b4649e27f342916955fa983",
+                "sha256": "d035dc5efdd21d50f0f44282bca9110f3387b1372b4649e27f342916955fa983",
+                "declarations_sha256": "10584315035189665cb441ef814f872648980a0c5f6db7f8da8a4d540e173a9a"
+              },
+              "paths": {},
+              "historical_binding_used": true,
+              "git_evidence_key": "42d71bab3424a95acf35f65736801cd739d0afe2",
+              "patch_sha256": "0beff2edff26ed6494c48dfdb32e60fe41011ece19a713d7654834cce9af2483"
+            },
+            {
+              "before": "42d71bab3424a95acf35f65736801cd739d0afe2",
+              "after": "ca1722f7902d67fee43d0e689aafc1b32ae1ca2e",
+              "subject": "fix(format): resolve scrollbar geometry from the native pane viewport",
+              "before_production": 344318,
+              "after_production": 344333,
+              "delta": 15,
+              "qualified": true,
+              "inventory_errors": {
+                "after": [],
+                "before": []
+              },
+              "inventory_before": {
+                "path": "sha256:d035dc5efdd21d50f0f44282bca9110f3387b1372b4649e27f342916955fa983",
+                "sha256": "d035dc5efdd21d50f0f44282bca9110f3387b1372b4649e27f342916955fa983",
+                "declarations_sha256": "10584315035189665cb441ef814f872648980a0c5f6db7f8da8a4d540e173a9a"
+              },
+              "inventory_after": {
+                "path": "sha256:600c6aeed66d0baeadfd615feb34dc8dca266ca70bf6586de65392cf30d4e708",
+                "sha256": "600c6aeed66d0baeadfd615feb34dc8dca266ca70bf6586de65392cf30d4e708",
+                "declarations_sha256": "10584315035189665cb441ef814f872648980a0c5f6db7f8da8a4d540e173a9a"
+              },
+              "paths": {
+                "crates/rmux-server/src/format_runtime/geometry.rs": 26,
+                "crates/rmux-server/src/format_runtime/variables.rs": -11
+              },
+              "historical_binding_used": true,
+              "git_evidence_key": "ca1722f7902d67fee43d0e689aafc1b32ae1ca2e",
+              "patch_sha256": "e0d8b218122fe38f1e6c5c9f8b3a631ab2e887ce5395326debca6ea89d076db8"
+            },
+            {
+              "before": "9649c73d31a92fcaac34c5a4b94a2c366903e7c1",
+              "after": "79c104de659bc7a05bec35285b684886e98f96e1",
+              "subject": "fix(format): project floating scrollbar content and signed edges",
+              "before_production": 344333,
+              "after_production": 344396,
+              "delta": 63,
+              "qualified": true,
+              "inventory_errors": {
+                "after": [],
+                "before": []
+              },
+              "inventory_before": {
+                "path": "sha256:76b0d1cc729bb5156c033ae7b06b9712a511707a5bf2b428f119f254c8151250",
+                "sha256": "76b0d1cc729bb5156c033ae7b06b9712a511707a5bf2b428f119f254c8151250",
+                "declarations_sha256": "d85b671f6dafac15006272fbebe1856f6a1fa6a1fd8db741e76270d66239b8cc"
+              },
+              "inventory_after": {
+                "path": "sha256:8f9438d3b646d94f24226e936e809f10e269b6457bf7b482116457e619e001cb",
+                "sha256": "8f9438d3b646d94f24226e936e809f10e269b6457bf7b482116457e619e001cb",
+                "declarations_sha256": "d85b671f6dafac15006272fbebe1856f6a1fa6a1fd8db741e76270d66239b8cc"
+              },
+              "paths": {
+                "crates/rmux-server/src/format_runtime/geometry.rs": 63
+              },
+              "historical_binding_used": false,
+              "git_evidence_key": "79c104de659bc7a05bec35285b684886e98f96e1",
+              "patch_sha256": "84d5e98a7697e142e906034bc57e19734006bc0f715a6467540cd68aa6bf3c21"
+            },
+            {
+              "before": "1313491b9529c14a25ec7e914607d7c7b2e59616",
+              "after": "48496c07e3abeca28c8e4f4de5cf09d5e32620db",
+              "subject": "test(options): freeze floating pane native content rows",
+              "before_production": 344396,
+              "after_production": 344396,
+              "delta": 0,
+              "qualified": true,
+              "inventory_errors": {
+                "after": [],
+                "before": []
+              },
+              "inventory_before": {
+                "path": "sha256:2f9078e1591cb27a91c801f830c8bd827a66438baee9c08346573809f6a73417",
+                "sha256": "2f9078e1591cb27a91c801f830c8bd827a66438baee9c08346573809f6a73417",
+                "declarations_sha256": "d85b671f6dafac15006272fbebe1856f6a1fa6a1fd8db741e76270d66239b8cc"
+              },
+              "inventory_after": {
+                "path": "sha256:e134a15e840c317ae8a9f03df89e918e8922d461632374beb1b65f109983714d",
+                "sha256": "e134a15e840c317ae8a9f03df89e918e8922d461632374beb1b65f109983714d",
+                "declarations_sha256": "d85b671f6dafac15006272fbebe1856f6a1fa6a1fd8db741e76270d66239b8cc"
+              },
+              "paths": {},
+              "historical_binding_used": false,
+              "git_evidence_key": "48496c07e3abeca28c8e4f4de5cf09d5e32620db",
+              "patch_sha256": "af41a24214708c076e73f0843f9e7f1a9cfab04134371ead78528fbd206428cc"
+            },
+            {
+              "before": "48496c07e3abeca28c8e4f4de5cf09d5e32620db",
+              "after": "231d04ecfa092c554028f8d538eb875f71b89f90",
+              "subject": "fix(options): preserve floating PTY height across border and scrollbar changes",
+              "before_production": 344396,
+              "after_production": 344406,
+              "delta": 10,
+              "qualified": true,
+              "inventory_errors": {
+                "after": [],
+                "before": []
+              },
+              "inventory_before": {
+                "path": "sha256:e134a15e840c317ae8a9f03df89e918e8922d461632374beb1b65f109983714d",
+                "sha256": "e134a15e840c317ae8a9f03df89e918e8922d461632374beb1b65f109983714d",
+                "declarations_sha256": "d85b671f6dafac15006272fbebe1856f6a1fa6a1fd8db741e76270d66239b8cc"
+              },
+              "inventory_after": {
+                "path": "sha256:5a1114342d1c36db1241f894d662e2bb08eb6e5b29aaea86ddd2223eff3fad38",
+                "sha256": "5a1114342d1c36db1241f894d662e2bb08eb6e5b29aaea86ddd2223eff3fad38",
+                "declarations_sha256": "d85b671f6dafac15006272fbebe1856f6a1fa6a1fd8db741e76270d66239b8cc"
+              },
+              "paths": {
+                "crates/rmux-server/src/pane_terminals/pane_geometry.rs": 10
+              },
+              "historical_binding_used": false,
+              "git_evidence_key": "231d04ecfa092c554028f8d538eb875f71b89f90",
+              "patch_sha256": "49359b2f4c71fb0a09c2ef6d19cf37f29a763fc8d14d37308596967d38cdfb31"
+            },
+            {
+              "before": "e6afbedd797ed9377d33b6f34d161ecfd2d310d1",
+              "after": "57568040d42d3b47fe4a497547e517931f3d13a2",
+              "subject": "fix(format): require a pane target for floating coordinates and edge flags",
+              "before_production": 344406,
+              "after_production": 344409,
+              "delta": 3,
+              "qualified": true,
+              "inventory_errors": {
+                "after": [],
+                "before": []
+              },
+              "inventory_before": {
+                "path": "sha256:e780bc1fd5a9701b43ab991db843623d91b19a3bc947de30ceffbd6668d90684",
+                "sha256": "e780bc1fd5a9701b43ab991db843623d91b19a3bc947de30ceffbd6668d90684",
+                "declarations_sha256": "d85b671f6dafac15006272fbebe1856f6a1fa6a1fd8db741e76270d66239b8cc"
+              },
+              "inventory_after": {
+                "path": "sha256:c8f392df1aa7d15072c090b4362df9ea3e6f6d8fc9b334e1b9a22f545bd5ed4c",
+                "sha256": "c8f392df1aa7d15072c090b4362df9ea3e6f6d8fc9b334e1b9a22f545bd5ed4c",
+                "declarations_sha256": "d85b671f6dafac15006272fbebe1856f6a1fa6a1fd8db741e76270d66239b8cc"
+              },
+              "paths": {
+                "crates/rmux-server/src/format_runtime/geometry.rs": 3
+              },
+              "historical_binding_used": false,
+              "git_evidence_key": "57568040d42d3b47fe4a497547e517931f3d13a2",
+              "patch_sha256": "e31caa3cd0058ff112b33bbf288299ab1fcc4732ab86acd4dba5d7afc18e30f7"
+            },
+            {
+              "before": "ef81ca6fee9c8816f1f93031d939b5452994ab04",
+              "after": "357402b7b5e3dc2b3eb2f1978093eaae94ee8010",
+              "subject": "fix(options): apply content geometry to initial floating PTY spawn",
+              "before_production": 344409,
+              "after_production": 344399,
+              "delta": -10,
+              "qualified": true,
+              "inventory_errors": {
+                "after": [],
+                "before": []
+              },
+              "inventory_before": {
+                "path": "sha256:73b65b980a3c424eeec67a7aaef9aef939303cd32a30d4b1ee8287ca816ae745",
+                "sha256": "73b65b980a3c424eeec67a7aaef9aef939303cd32a30d4b1ee8287ca816ae745",
+                "declarations_sha256": "d85b671f6dafac15006272fbebe1856f6a1fa6a1fd8db741e76270d66239b8cc"
+              },
+              "inventory_after": {
+                "path": "sha256:ab5cdcd490d07a4ca9a94affbaef3c2c47f27c903b9071586dce5c334bcd8d9e",
+                "sha256": "ab5cdcd490d07a4ca9a94affbaef3c2c47f27c903b9071586dce5c334bcd8d9e",
+                "declarations_sha256": "d85b671f6dafac15006272fbebe1856f6a1fa6a1fd8db741e76270d66239b8cc"
+              },
+              "paths": {
+                "crates/rmux-server/src/pane_terminals/pane_lifecycle/split.rs": -10
+              },
+              "historical_binding_used": false,
+              "git_evidence_key": "357402b7b5e3dc2b3eb2f1978093eaae94ee8010",
+              "patch_sha256": "ef0ea16e43c5f95947cfda846577e1d86654ff3b3827195449473378f010f0ff"
+            }
+          ],
+          "per_commit_complete": true,
+          "family_before_inventory": {
+            "declarations_sha256": "10584315035189665cb441ef814f872648980a0c5f6db7f8da8a4d540e173a9a",
+            "errors": [],
+            "path": "sha256:9b1510cd293dc5326fcb322d3a70ace50a92cf45c4495b31355a854acaf08faa",
+            "production": 344318,
+            "reused": null,
+            "revision": "63e6ed0365c13e293b2cb9c491b577cc9669b719",
+            "seconds": 21.546720326994546,
+            "sha256": "9b1510cd293dc5326fcb322d3a70ace50a92cf45c4495b31355a854acaf08faa",
+            "status": "MEASURED",
+            "tree": "2046dc55995f7795d80922dd5e0ba56a346224b1"
+          },
+          "family_after_inventory": {
+            "declarations_sha256": "d85b671f6dafac15006272fbebe1856f6a1fa6a1fd8db741e76270d66239b8cc",
+            "errors": [],
+            "path": "sha256:ab5cdcd490d07a4ca9a94affbaef3c2c47f27c903b9071586dce5c334bcd8d9e",
+            "production": 344399,
+            "reused": {
+              "equivalence": "Exact source commit/tree, parser inputs, lock, tool inputs and declarations; same qualified parser/compiler/features; no native product-test credit.",
+              "path": "sha256:ab5cdcd490d07a4ca9a94affbaef3c2c47f27c903b9071586dce5c334bcd8d9e",
+              "sha256": "ab5cdcd490d07a4ca9a94affbaef3c2c47f27c903b9071586dce5c334bcd8d9e"
+            },
+            "revision": "357402b7b5e3dc2b3eb2f1978093eaae94ee8010",
+            "seconds": 0.5539699459914118,
+            "sha256": "ab5cdcd490d07a4ca9a94affbaef3c2c47f27c903b9071586dce5c334bcd8d9e",
+            "status": "MEASURED",
+            "tree": "4d5afb58a4f39386700eb35a1ab58b1f2a099eb2"
+          }
+        },
+        {
+          "family": "stack",
+          "delta": -1,
+          "paths": {
+            "crates/rmux-server/src/commands.rs": 496,
+            "crates/rmux-server/src/future.rs": 10,
+            "crates/rmux-server/src/handler_dispatch.rs": -509,
+            "crates/rmux-server/src/lib.rs": 2
+          },
+          "commits": [
+            {
+              "before": "5862291c9c6404f4bab27eece93e7d6ec354a8a1",
+              "after": "9ef2b03ca6947fbfb9ed848c0d385416a4fc3c95",
+              "subject": "fix(server): bound dispatcher future construction frames",
+              "before_production": 344399,
+              "after_production": 344399,
+              "delta": 0,
+              "qualified": true,
+              "inventory_errors": {
+                "after": [],
+                "before": []
+              },
+              "inventory_before": {
+                "path": "sha256:bc1cef745eb8a2e2335d9a2db5441e0449b4d8192648f715a76606b45a350d8a",
+                "sha256": "bc1cef745eb8a2e2335d9a2db5441e0449b4d8192648f715a76606b45a350d8a",
+                "declarations_sha256": "d85b671f6dafac15006272fbebe1856f6a1fa6a1fd8db741e76270d66239b8cc"
+              },
+              "inventory_after": {
+                "path": "sha256:7ebe27885433ce6f22861528b7e2a1980be3dbddfb1cd7db9ab7a7de77cc86bc",
+                "sha256": "7ebe27885433ce6f22861528b7e2a1980be3dbddfb1cd7db9ab7a7de77cc86bc",
+                "declarations_sha256": "d85b671f6dafac15006272fbebe1856f6a1fa6a1fd8db741e76270d66239b8cc"
+              },
+              "paths": {
+                "crates/rmux-server/src/future.rs": 10,
+                "crates/rmux-server/src/handler_dispatch.rs": -508,
+                "crates/rmux-server/src/handler_dispatch/commands.rs": 496,
+                "crates/rmux-server/src/lib.rs": 2
+              },
+              "historical_binding_used": false,
+              "git_evidence_key": "9ef2b03ca6947fbfb9ed848c0d385416a4fc3c95",
+              "patch_sha256": "84fca2e444c5f52452a7513437e7b2b0a8f3f1cfa49b39a2e2796e18a783f89e"
+            },
+            {
+              "before": "9ef2b03ca6947fbfb9ed848c0d385416a4fc3c95",
+              "after": "c332ee2577dac77a943254b9afe66483f2dc2e86",
+              "subject": "fix(server): remove imports moved into command dispatch",
+              "before_production": 344399,
+              "after_production": 344399,
+              "delta": 0,
+              "qualified": true,
+              "inventory_errors": {
+                "after": [],
+                "before": []
+              },
+              "inventory_before": {
+                "path": "sha256:7ebe27885433ce6f22861528b7e2a1980be3dbddfb1cd7db9ab7a7de77cc86bc",
+                "sha256": "7ebe27885433ce6f22861528b7e2a1980be3dbddfb1cd7db9ab7a7de77cc86bc",
+                "declarations_sha256": "d85b671f6dafac15006272fbebe1856f6a1fa6a1fd8db741e76270d66239b8cc"
+              },
+              "inventory_after": {
+                "path": "sha256:ed255cad6193abfdd806aca50ad8793af49cfd971a03a48a282adb148689343a",
+                "sha256": "ed255cad6193abfdd806aca50ad8793af49cfd971a03a48a282adb148689343a",
+                "declarations_sha256": "d85b671f6dafac15006272fbebe1856f6a1fa6a1fd8db741e76270d66239b8cc"
+              },
+              "paths": {},
+              "historical_binding_used": false,
+              "git_evidence_key": "c332ee2577dac77a943254b9afe66483f2dc2e86",
+              "patch_sha256": "e1af349f56a5bb385ad667528292d140e2696481519243c81b35bc46422881bd"
+            },
+            {
+              "before": "2d6ae199426311d5023ae84cd58d509965b96fa2",
+              "after": "d87919839db3d24b47492f9f64c21b9e0a254c4f",
+              "subject": "fix(server): use default dispatcher and witness module paths",
+              "before_production": 344399,
+              "after_production": 343902,
+              "delta": null,
+              "qualified": false,
+              "inventory_errors": {
+                "after": [
+                  "crates/rmux-server/src/handler_attach_tests.rs: unresolved/ambiguous module ['crates/rmux-server/src/poll_frames.rs', 'crates/rmux-server/src/poll_frames/mod.rs']",
+                  "crates/rmux-server/src/handler_dispatch.rs: unresolved/ambiguous module ['crates/rmux-server/src/commands.rs', 'crates/rmux-server/src/commands/mod.rs']",
+                  "unclassified Rust: crates/rmux-server/src/handler_attach_tests/attach_explicit_target.rs",
+                  "unclassified Rust: crates/rmux-server/src/handler_attach_tests/attach_mutations.rs",
+                  "unclassified Rust: crates/rmux-server/src/handler_attach_tests/attach_render.rs",
+                  "unclassified Rust: crates/rmux-server/src/handler_attach_tests/attached_count_identity.rs",
+                  "unclassified Rust: crates/rmux-server/src/handler_attach_tests/attached_help.rs",
+                  "unclassified Rust: crates/rmux-server/src/handler_attach_tests/attached_help_close.rs",
+                  "unclassified Rust: crates/rmux-server/src/handler_attach_tests/attached_prefix_lifecycle.rs",
+                  "unclassified Rust: crates/rmux-server/src/handler_attach_tests/attaching_identity.rs",
+                  "unclassified Rust: crates/rmux-server/src/handler_attach_tests/cleanup_identity.rs",
+                  "unclassified Rust: crates/rmux-server/src/handler_attach_tests/client_name_lifecycle.rs",
+                  "unclassified Rust: crates/rmux-server/src/handler_attach_tests/client_security.rs",
+                  "unclassified Rust: crates/rmux-server/src/handler_attach_tests/combined_registration_recency.rs",
+                  "unclassified Rust: crates/rmux-server/src/handler_attach_tests/combined_switch_recency.rs",
+                  "unclassified Rust: crates/rmux-server/src/handler_attach_tests/copy_mode_keys.rs",
+                  "unclassified Rust: crates/rmux-server/src/handler_attach_tests/copy_mode_motion.rs",
+                  "unclassified Rust: crates/rmux-server/src/handler_attach_tests/copy_mode_render.rs",
+                  "unclassified Rust: crates/rmux-server/src/handler_attach_tests/copy_mode_search.rs",
+                  "unclassified Rust: crates/rmux-server/src/handler_attach_tests/copy_mode_selection_yank.rs",
+                  "unclassified Rust: crates/rmux-server/src/handler_attach_tests/display_panes.rs",
+                  "unclassified Rust: crates/rmux-server/src/handler_attach_tests/display_panes_identity.rs",
+                  "unclassified Rust: crates/rmux-server/src/handler_attach_tests/empty_attach.rs",
+                  "unclassified Rust: crates/rmux-server/src/handler_attach_tests/key_table_identity_regressions.rs",
+                  "unclassified Rust: crates/rmux-server/src/handler_attach_tests/key_table_timer_shutdown.rs",
+                  "unclassified Rust: crates/rmux-server/src/handler_attach_tests/lifecycle.rs",
+                  "unclassified Rust: crates/rmux-server/src/handler_attach_tests/lock_identity_regressions.rs",
+                  "unclassified Rust: crates/rmux-server/src/handler_attach_tests/mode_tree_clock.rs",
+                  "unclassified Rust: crates/rmux-server/src/handler_attach_tests/multi_client.rs",
+                  "unclassified Rust: crates/rmux-server/src/handler_attach_tests/poll_frames.rs",
+                  "unclassified Rust: crates/rmux-server/src/handler_attach_tests/prefix_navigation.rs",
+                  "unclassified Rust: crates/rmux-server/src/handler_attach_tests/resize_selection_race.rs",
+                  "unclassified Rust: crates/rmux-server/src/handler_attach_tests/server_lifecycle.rs",
+                  "unclassified Rust: crates/rmux-server/src/handler_attach_tests/session_recency.rs",
+                  "unclassified Rust: crates/rmux-server/src/handler_attach_tests/session_recency_input.rs",
+                  "unclassified Rust: crates/rmux-server/src/handler_attach_tests/set_titles.rs",
+                  "unclassified Rust: crates/rmux-server/src/handler_attach_tests/set_titles_client_context.rs",
+                  "unclassified Rust: crates/rmux-server/src/handler_attach_tests/set_titles_generation.rs",
+                  "unclassified Rust: crates/rmux-server/src/handler_attach_tests/set_titles_overlay.rs",
+                  "unclassified Rust: crates/rmux-server/src/handler_attach_tests/set_titles_path.rs",
+                  "unclassified Rust: crates/rmux-server/src/handler_attach_tests/set_titles_support.rs",
+                  "unclassified Rust: crates/rmux-server/src/handler_attach_tests/set_titles_switch.rs",
+                  "unclassified Rust: crates/rmux-server/src/handler_attach_tests/sizeless_geometry.rs",
+                  "unclassified Rust: crates/rmux-server/src/handler_attach_tests/switch_frame_geometry.rs",
+                  "unclassified Rust: crates/rmux-server/src/handler_attach_tests/switch_latest_recency.rs",
+                  "unclassified Rust: crates/rmux-server/src/handler_attach_tests/utf8_locale.rs",
+                  "unclassified Rust: crates/rmux-server/src/handler_attach_tests/window_geometry.rs",
+                  "unclassified Rust: crates/rmux-server/src/handler_dispatch/commands.rs"
+                ],
+                "before": []
+              },
+              "inventory_before": {
+                "path": "sha256:b708bccad93331518533421c1fbad9f39ff7000aa755c1195e73c21906ff169b",
+                "sha256": "b708bccad93331518533421c1fbad9f39ff7000aa755c1195e73c21906ff169b",
+                "declarations_sha256": "8551bc328b3eff5c680dfe43331eed141e648da3d116930d5f8e6eab139c742e"
+              },
+              "inventory_after": {
+                "path": "sha256:a831fd253c348d2978f8fc0acc15ce57717d8815ca8f8ee296b1e239f61732b9",
+                "sha256": "a831fd253c348d2978f8fc0acc15ce57717d8815ca8f8ee296b1e239f61732b9",
+                "declarations_sha256": "8551bc328b3eff5c680dfe43331eed141e648da3d116930d5f8e6eab139c742e"
+              },
+              "paths": {},
+              "historical_binding_used": false,
+              "git_evidence_key": "d87919839db3d24b47492f9f64c21b9e0a254c4f",
+              "patch_sha256": "3e61d4bf0fd9c24559b5f48ae843af58c5f628003ee1338880ee270df844b17e",
+              "measurement_kind": "atomic_transition_member",
+              "covered_by_atomic_transition": "2d6ae199426311d5023ae84cd58d509965b96fa2..1e948e1ff67fee15c22caded8790ee75aabdf6e1",
+              "inventory_credit": "Only the D101 transition endpoints; existing per-commit error reports remain diagnostic and receive no credit."
+            },
+            {
+              "before": "d87919839db3d24b47492f9f64c21b9e0a254c4f",
+              "after": "1e948e1ff67fee15c22caded8790ee75aabdf6e1",
+              "subject": "fix(server): place extracted modules at their default lookup paths",
+              "before_production": 343902,
+              "after_production": 344398,
+              "delta": null,
+              "qualified": false,
+              "inventory_errors": {
+                "after": [],
+                "before": [
+                  "crates/rmux-server/src/handler_attach_tests.rs: unresolved/ambiguous module ['crates/rmux-server/src/poll_frames.rs', 'crates/rmux-server/src/poll_frames/mod.rs']",
+                  "crates/rmux-server/src/handler_dispatch.rs: unresolved/ambiguous module ['crates/rmux-server/src/commands.rs', 'crates/rmux-server/src/commands/mod.rs']",
+                  "unclassified Rust: crates/rmux-server/src/handler_attach_tests/attach_explicit_target.rs",
+                  "unclassified Rust: crates/rmux-server/src/handler_attach_tests/attach_mutations.rs",
+                  "unclassified Rust: crates/rmux-server/src/handler_attach_tests/attach_render.rs",
+                  "unclassified Rust: crates/rmux-server/src/handler_attach_tests/attached_count_identity.rs",
+                  "unclassified Rust: crates/rmux-server/src/handler_attach_tests/attached_help.rs",
+                  "unclassified Rust: crates/rmux-server/src/handler_attach_tests/attached_help_close.rs",
+                  "unclassified Rust: crates/rmux-server/src/handler_attach_tests/attached_prefix_lifecycle.rs",
+                  "unclassified Rust: crates/rmux-server/src/handler_attach_tests/attaching_identity.rs",
+                  "unclassified Rust: crates/rmux-server/src/handler_attach_tests/cleanup_identity.rs",
+                  "unclassified Rust: crates/rmux-server/src/handler_attach_tests/client_name_lifecycle.rs",
+                  "unclassified Rust: crates/rmux-server/src/handler_attach_tests/client_security.rs",
+                  "unclassified Rust: crates/rmux-server/src/handler_attach_tests/combined_registration_recency.rs",
+                  "unclassified Rust: crates/rmux-server/src/handler_attach_tests/combined_switch_recency.rs",
+                  "unclassified Rust: crates/rmux-server/src/handler_attach_tests/copy_mode_keys.rs",
+                  "unclassified Rust: crates/rmux-server/src/handler_attach_tests/copy_mode_motion.rs",
+                  "unclassified Rust: crates/rmux-server/src/handler_attach_tests/copy_mode_render.rs",
+                  "unclassified Rust: crates/rmux-server/src/handler_attach_tests/copy_mode_search.rs",
+                  "unclassified Rust: crates/rmux-server/src/handler_attach_tests/copy_mode_selection_yank.rs",
+                  "unclassified Rust: crates/rmux-server/src/handler_attach_tests/display_panes.rs",
+                  "unclassified Rust: crates/rmux-server/src/handler_attach_tests/display_panes_identity.rs",
+                  "unclassified Rust: crates/rmux-server/src/handler_attach_tests/empty_attach.rs",
+                  "unclassified Rust: crates/rmux-server/src/handler_attach_tests/key_table_identity_regressions.rs",
+                  "unclassified Rust: crates/rmux-server/src/handler_attach_tests/key_table_timer_shutdown.rs",
+                  "unclassified Rust: crates/rmux-server/src/handler_attach_tests/lifecycle.rs",
+                  "unclassified Rust: crates/rmux-server/src/handler_attach_tests/lock_identity_regressions.rs",
+                  "unclassified Rust: crates/rmux-server/src/handler_attach_tests/mode_tree_clock.rs",
+                  "unclassified Rust: crates/rmux-server/src/handler_attach_tests/multi_client.rs",
+                  "unclassified Rust: crates/rmux-server/src/handler_attach_tests/poll_frames.rs",
+                  "unclassified Rust: crates/rmux-server/src/handler_attach_tests/prefix_navigation.rs",
+                  "unclassified Rust: crates/rmux-server/src/handler_attach_tests/resize_selection_race.rs",
+                  "unclassified Rust: crates/rmux-server/src/handler_attach_tests/server_lifecycle.rs",
+                  "unclassified Rust: crates/rmux-server/src/handler_attach_tests/session_recency.rs",
+                  "unclassified Rust: crates/rmux-server/src/handler_attach_tests/session_recency_input.rs",
+                  "unclassified Rust: crates/rmux-server/src/handler_attach_tests/set_titles.rs",
+                  "unclassified Rust: crates/rmux-server/src/handler_attach_tests/set_titles_client_context.rs",
+                  "unclassified Rust: crates/rmux-server/src/handler_attach_tests/set_titles_generation.rs",
+                  "unclassified Rust: crates/rmux-server/src/handler_attach_tests/set_titles_overlay.rs",
+                  "unclassified Rust: crates/rmux-server/src/handler_attach_tests/set_titles_path.rs",
+                  "unclassified Rust: crates/rmux-server/src/handler_attach_tests/set_titles_support.rs",
+                  "unclassified Rust: crates/rmux-server/src/handler_attach_tests/set_titles_switch.rs",
+                  "unclassified Rust: crates/rmux-server/src/handler_attach_tests/sizeless_geometry.rs",
+                  "unclassified Rust: crates/rmux-server/src/handler_attach_tests/switch_frame_geometry.rs",
+                  "unclassified Rust: crates/rmux-server/src/handler_attach_tests/switch_latest_recency.rs",
+                  "unclassified Rust: crates/rmux-server/src/handler_attach_tests/utf8_locale.rs",
+                  "unclassified Rust: crates/rmux-server/src/handler_attach_tests/window_geometry.rs",
+                  "unclassified Rust: crates/rmux-server/src/handler_dispatch/commands.rs"
+                ]
+              },
+              "inventory_before": {
+                "path": "sha256:a831fd253c348d2978f8fc0acc15ce57717d8815ca8f8ee296b1e239f61732b9",
+                "sha256": "a831fd253c348d2978f8fc0acc15ce57717d8815ca8f8ee296b1e239f61732b9",
+                "declarations_sha256": "8551bc328b3eff5c680dfe43331eed141e648da3d116930d5f8e6eab139c742e"
+              },
+              "inventory_after": {
+                "path": "sha256:444e1acf1ed0792a0a779ab8668dbc4079091be4aada0b73dd4d98dd47f3de69",
+                "sha256": "444e1acf1ed0792a0a779ab8668dbc4079091be4aada0b73dd4d98dd47f3de69",
+                "declarations_sha256": "8551bc328b3eff5c680dfe43331eed141e648da3d116930d5f8e6eab139c742e"
+              },
+              "paths": {},
+              "historical_binding_used": false,
+              "git_evidence_key": "1e948e1ff67fee15c22caded8790ee75aabdf6e1",
+              "patch_sha256": "e802fa099bb41c7e33aa32655122785de7937a9103f942d19348ae8c8cf09089",
+              "measurement_kind": "atomic_transition_member",
+              "covered_by_atomic_transition": "2d6ae199426311d5023ae84cd58d509965b96fa2..1e948e1ff67fee15c22caded8790ee75aabdf6e1",
+              "inventory_credit": "Only the D101 transition endpoints; existing per-commit error reports remain diagnostic and receive no credit."
+            }
+          ],
+          "per_commit_complete": false,
+          "family_before_inventory": {
+            "declarations_sha256": "d85b671f6dafac15006272fbebe1856f6a1fa6a1fd8db741e76270d66239b8cc",
+            "errors": [],
+            "path": "sha256:bc1cef745eb8a2e2335d9a2db5441e0449b4d8192648f715a76606b45a350d8a",
+            "production": 344399,
+            "reused": {
+              "equivalence": "Exact source commit/tree, parser inputs, lock, tool inputs and declarations; same qualified parser/compiler/features; no native product-test credit.",
+              "path": "sha256:bc1cef745eb8a2e2335d9a2db5441e0449b4d8192648f715a76606b45a350d8a",
+              "sha256": "bc1cef745eb8a2e2335d9a2db5441e0449b4d8192648f715a76606b45a350d8a"
+            },
+            "revision": "5862291c9c6404f4bab27eece93e7d6ec354a8a1",
+            "seconds": 0.5392303640255705,
+            "sha256": "bc1cef745eb8a2e2335d9a2db5441e0449b4d8192648f715a76606b45a350d8a",
+            "status": "MEASURED",
+            "tree": "b27c365257c47f9680dbc39c0a37a74adb43ee60"
+          },
+          "family_after_inventory": {
+            "declarations_sha256": "8551bc328b3eff5c680dfe43331eed141e648da3d116930d5f8e6eab139c742e",
+            "errors": [],
+            "path": "sha256:444e1acf1ed0792a0a779ab8668dbc4079091be4aada0b73dd4d98dd47f3de69",
+            "production": 344398,
+            "reused": null,
+            "revision": "1e948e1ff67fee15c22caded8790ee75aabdf6e1",
+            "seconds": 27.500472878979053,
+            "sha256": "444e1acf1ed0792a0a779ab8668dbc4079091be4aada0b73dd4d98dd47f3de69",
+            "status": "MEASURED",
+            "tree": "6301eb197ba046dd4d3ce059e4b300aae41279a6"
+          },
+          "measurement_complete": true,
+          "atomic_transition": "2d6ae199426311d5023ae84cd58d509965b96fa2..1e948e1ff67fee15c22caded8790ee75aabdf6e1"
+        },
+        {
+          "family": "Escape",
+          "delta": 31,
+          "paths": {
+            "crates/rmux-client/src/attach_windows/input.rs": -14,
+            "crates/rmux-client/src/attach_windows/input_events.rs": 2,
+            "crates/rmux-client/src/attach_windows/input_trace.rs": 43
+          },
+          "commits": [
+            {
+              "before": "390e6b99c6aca066c79231458abc38e524ee7818",
+              "after": "ab27a8a953f2cde9a7c0d716a7ef3ca76fa1535b",
+              "subject": "fix(windows): trace raw Escape records before input classification",
+              "before_production": 344444,
+              "after_production": 344475,
+              "delta": 31,
+              "qualified": true,
+              "inventory_errors": {
+                "after": [],
+                "before": []
+              },
+              "inventory_before": {
+                "path": "sha256:b9592e445d8e9c2ee6ac8eba3798541a34e97e338bf943af15f323b4f47acc09",
+                "sha256": "b9592e445d8e9c2ee6ac8eba3798541a34e97e338bf943af15f323b4f47acc09",
+                "declarations_sha256": "d85b671f6dafac15006272fbebe1856f6a1fa6a1fd8db741e76270d66239b8cc"
+              },
+              "inventory_after": {
+                "path": "sha256:20692c97d4fa9fe28d68cd886cdbb8760ad08bbe81ee2746ac18b35817e83758",
+                "sha256": "20692c97d4fa9fe28d68cd886cdbb8760ad08bbe81ee2746ac18b35817e83758",
+                "declarations_sha256": "d85b671f6dafac15006272fbebe1856f6a1fa6a1fd8db741e76270d66239b8cc"
+              },
+              "paths": {
+                "crates/rmux-client/src/attach_windows/input.rs": -14,
+                "crates/rmux-client/src/attach_windows/input_events.rs": 2,
+                "crates/rmux-client/src/attach_windows/input_trace.rs": 43
+              },
+              "historical_binding_used": false,
+              "git_evidence_key": "ab27a8a953f2cde9a7c0d716a7ef3ca76fa1535b",
+              "patch_sha256": "ea5f6080e0d865be5e1dc9f35f2e7393bed36a8ea4c02e550a317e54ea38b58d"
+            }
+          ],
+          "per_commit_complete": true,
+          "family_before_inventory": {
+            "declarations_sha256": "d85b671f6dafac15006272fbebe1856f6a1fa6a1fd8db741e76270d66239b8cc",
+            "errors": [],
+            "path": "sha256:b9592e445d8e9c2ee6ac8eba3798541a34e97e338bf943af15f323b4f47acc09",
+            "production": 344444,
+            "reused": null,
+            "revision": "390e6b99c6aca066c79231458abc38e524ee7818",
+            "seconds": 25.456987739016768,
+            "sha256": "b9592e445d8e9c2ee6ac8eba3798541a34e97e338bf943af15f323b4f47acc09",
+            "status": "MEASURED",
+            "tree": "5c8da3582763c3e9ebd4af8afa45caa1d48a19ab"
+          },
+          "family_after_inventory": {
+            "declarations_sha256": "d85b671f6dafac15006272fbebe1856f6a1fa6a1fd8db741e76270d66239b8cc",
+            "errors": [],
+            "path": "sha256:20692c97d4fa9fe28d68cd886cdbb8760ad08bbe81ee2746ac18b35817e83758",
+            "production": 344475,
+            "reused": {
+              "equivalence": "Exact source commit/tree, parser inputs, lock, tool inputs and declarations; same qualified parser/compiler/features; no native product-test credit.",
+              "path": "sha256:20692c97d4fa9fe28d68cd886cdbb8760ad08bbe81ee2746ac18b35817e83758",
+              "sha256": "20692c97d4fa9fe28d68cd886cdbb8760ad08bbe81ee2746ac18b35817e83758"
+            },
+            "revision": "ab27a8a953f2cde9a7c0d716a7ef3ca76fa1535b",
+            "seconds": 0.22462692600674927,
+            "sha256": "20692c97d4fa9fe28d68cd886cdbb8760ad08bbe81ee2746ac18b35817e83758",
+            "status": "MEASURED",
+            "tree": "cc3c07274c0300bffe238bb4637fb428b81c96da"
+          }
+        },
+        {
+          "family": "config-discovery",
+          "delta": 141,
+          "paths": {
+            "crates/rmux-server/src/config_paths.rs": 95,
+            "crates/rmux-server/src/handler_scripting/source_files.rs": -23,
+            "crates/rmux-server/src/handler_scripting/source_runtime.rs": -1,
+            "src/cli/diagnose/configuration.rs": 66,
+            "src/cli/diagnose/mod.rs": 4
+          },
+          "commits": [
+            {
+              "before": "6b5ca8f208b3a3fdb9bdfade164cf4206a0fccb6",
+              "after": "8944636b86476fcd4b27f6f45d4d5c007e053560",
+              "subject": "fix(config): share typed discovery and inspect startup glob matches",
+              "before_production": 344475,
+              "after_production": 344616,
+              "delta": 141,
+              "qualified": true,
+              "inventory_errors": {
+                "after": [],
+                "before": []
+              },
+              "inventory_before": {
+                "path": "sha256:9b82c02be8029ea1ad5b5b777c79403d740759613367182854c877c5431075a1",
+                "sha256": "9b82c02be8029ea1ad5b5b777c79403d740759613367182854c877c5431075a1",
+                "declarations_sha256": "d85b671f6dafac15006272fbebe1856f6a1fa6a1fd8db741e76270d66239b8cc"
+              },
+              "inventory_after": {
+                "path": "sha256:9496ccfa141ddf7ad4362316f8ee2cebd2983420e4748461e98e8dfba75ae99c",
+                "sha256": "9496ccfa141ddf7ad4362316f8ee2cebd2983420e4748461e98e8dfba75ae99c",
+                "declarations_sha256": "d85b671f6dafac15006272fbebe1856f6a1fa6a1fd8db741e76270d66239b8cc"
+              },
+              "paths": {
+                "crates/rmux-server/src/config_paths.rs": 95,
+                "crates/rmux-server/src/handler_scripting/source_files.rs": -23,
+                "crates/rmux-server/src/handler_scripting/source_runtime.rs": -1,
+                "src/cli/diagnose/configuration.rs": 66,
+                "src/cli/diagnose/mod.rs": 4
+              },
+              "historical_binding_used": false,
+              "git_evidence_key": "8944636b86476fcd4b27f6f45d4d5c007e053560",
+              "patch_sha256": "d10f85487672003d365e18edf62c24ede771cd1bf46d6147fd895f1f5bee14d0"
+            },
+            {
+              "before": "8944636b86476fcd4b27f6f45d4d5c007e053560",
+              "after": "f154c0cf55d86953c906f454134998c504d015c4",
+              "subject": "fix(config): classify diagnostic parse errors as load errors",
+              "before_production": 344616,
+              "after_production": 344616,
+              "delta": 0,
+              "qualified": true,
+              "inventory_errors": {
+                "after": [],
+                "before": []
+              },
+              "inventory_before": {
+                "path": "sha256:9496ccfa141ddf7ad4362316f8ee2cebd2983420e4748461e98e8dfba75ae99c",
+                "sha256": "9496ccfa141ddf7ad4362316f8ee2cebd2983420e4748461e98e8dfba75ae99c",
+                "declarations_sha256": "d85b671f6dafac15006272fbebe1856f6a1fa6a1fd8db741e76270d66239b8cc"
+              },
+              "inventory_after": {
+                "path": "sha256:d4ce68d600019031e616a935bd0dc1b9398efc1c1243f73f2acf74645366ac66",
+                "sha256": "d4ce68d600019031e616a935bd0dc1b9398efc1c1243f73f2acf74645366ac66",
+                "declarations_sha256": "d85b671f6dafac15006272fbebe1856f6a1fa6a1fd8db741e76270d66239b8cc"
+              },
+              "paths": {},
+              "historical_binding_used": false,
+              "git_evidence_key": "f154c0cf55d86953c906f454134998c504d015c4",
+              "patch_sha256": "00c6a9998752a20d8431ac6753823a8f4068105f6972e1146589969141e4baa4"
+            }
+          ],
+          "per_commit_complete": true,
+          "family_before_inventory": {
+            "declarations_sha256": "d85b671f6dafac15006272fbebe1856f6a1fa6a1fd8db741e76270d66239b8cc",
+            "errors": [],
+            "path": "sha256:9b82c02be8029ea1ad5b5b777c79403d740759613367182854c877c5431075a1",
+            "production": 344475,
+            "reused": null,
+            "revision": "6b5ca8f208b3a3fdb9bdfade164cf4206a0fccb6",
+            "seconds": 26.18241697800113,
+            "sha256": "9b82c02be8029ea1ad5b5b777c79403d740759613367182854c877c5431075a1",
+            "status": "MEASURED",
+            "tree": "bd8c09b16d4fd11c04102d0df669adc03b504163"
+          },
+          "family_after_inventory": {
+            "declarations_sha256": "d85b671f6dafac15006272fbebe1856f6a1fa6a1fd8db741e76270d66239b8cc",
+            "errors": [],
+            "path": "sha256:d4ce68d600019031e616a935bd0dc1b9398efc1c1243f73f2acf74645366ac66",
+            "production": 344616,
+            "reused": {
+              "equivalence": "Exact source commit/tree, parser inputs, lock, tool inputs and declarations; same qualified parser/compiler/features; no native product-test credit.",
+              "path": "sha256:d4ce68d600019031e616a935bd0dc1b9398efc1c1243f73f2acf74645366ac66",
+              "sha256": "d4ce68d600019031e616a935bd0dc1b9398efc1c1243f73f2acf74645366ac66"
+            },
+            "revision": "f154c0cf55d86953c906f454134998c504d015c4",
+            "seconds": 0.22719107597367838,
+            "sha256": "d4ce68d600019031e616a935bd0dc1b9398efc1c1243f73f2acf74645366ac66",
+            "status": "MEASURED",
+            "tree": "211915522e54d89d1fc9ac00d5af7428e39d09b5"
+          }
+        },
+        {
+          "family": "config-cumulative-limit",
+          "delta": 73,
+          "paths": {
+            "crates/rmux-server/src/config_paths.rs": 52,
+            "crates/rmux-server/src/handler_scripting/source_files.rs": 11,
+            "crates/rmux-server/src/handler_scripting/source_runtime.rs": -1,
+            "src/cli/diagnose/configuration.rs": 11
+          },
+          "commits": [
+            {
+              "before": "57581a010f70685beda392be3d5d3d1350bbf032",
+              "after": "adb0ba67ae2ec38b0d5244a69fcfd08f5976cfac",
+              "subject": "fix(config): share cumulative match budget and stop overflowing selections",
+              "before_production": 344616,
+              "after_production": 344689,
+              "delta": 73,
+              "qualified": true,
+              "inventory_errors": {
+                "after": [],
+                "before": []
+              },
+              "inventory_before": {
+                "path": "sha256:9cc086dd377d5e4bbf67b4e73da96011c84c4e0ff015a950cb5d6c7011a8af0a",
+                "sha256": "9cc086dd377d5e4bbf67b4e73da96011c84c4e0ff015a950cb5d6c7011a8af0a",
+                "declarations_sha256": "d85b671f6dafac15006272fbebe1856f6a1fa6a1fd8db741e76270d66239b8cc"
+              },
+              "inventory_after": {
+                "path": "sha256:6fed156599b7e34e945ecf6671e62f266007abb46b7ceaf36862c19cfa9415b1",
+                "sha256": "6fed156599b7e34e945ecf6671e62f266007abb46b7ceaf36862c19cfa9415b1",
+                "declarations_sha256": "d85b671f6dafac15006272fbebe1856f6a1fa6a1fd8db741e76270d66239b8cc"
+              },
+              "paths": {
+                "crates/rmux-server/src/config_paths.rs": 52,
+                "crates/rmux-server/src/handler_scripting/source_files.rs": 11,
+                "crates/rmux-server/src/handler_scripting/source_runtime.rs": -1,
+                "src/cli/diagnose/configuration.rs": 11
+              },
+              "historical_binding_used": false,
+              "git_evidence_key": "adb0ba67ae2ec38b0d5244a69fcfd08f5976cfac",
+              "patch_sha256": "d50d68c3822acb5a68a163f89bb547d40d743990ba4013e5ef29d6d8e5f6b2d0"
+            }
+          ],
+          "per_commit_complete": true,
+          "family_before_inventory": {
+            "declarations_sha256": "d85b671f6dafac15006272fbebe1856f6a1fa6a1fd8db741e76270d66239b8cc",
+            "errors": [],
+            "path": "sha256:9cc086dd377d5e4bbf67b4e73da96011c84c4e0ff015a950cb5d6c7011a8af0a",
+            "production": 344616,
+            "reused": null,
+            "revision": "57581a010f70685beda392be3d5d3d1350bbf032",
+            "seconds": 24.02623433904955,
+            "sha256": "9cc086dd377d5e4bbf67b4e73da96011c84c4e0ff015a950cb5d6c7011a8af0a",
+            "status": "MEASURED",
+            "tree": "c03314400b234345c6280827ae0952a671aca812"
+          },
+          "family_after_inventory": {
+            "declarations_sha256": "d85b671f6dafac15006272fbebe1856f6a1fa6a1fd8db741e76270d66239b8cc",
+            "errors": [],
+            "path": "sha256:6fed156599b7e34e945ecf6671e62f266007abb46b7ceaf36862c19cfa9415b1",
+            "production": 344689,
+            "reused": {
+              "equivalence": "Exact source commit/tree, parser inputs, lock, tool inputs and declarations; same qualified parser/compiler/features; no native product-test credit.",
+              "path": "sha256:6fed156599b7e34e945ecf6671e62f266007abb46b7ceaf36862c19cfa9415b1",
+              "sha256": "6fed156599b7e34e945ecf6671e62f266007abb46b7ceaf36862c19cfa9415b1"
+            },
+            "revision": "adb0ba67ae2ec38b0d5244a69fcfd08f5976cfac",
+            "seconds": 0.21176154701970518,
+            "sha256": "6fed156599b7e34e945ecf6671e62f266007abb46b7ceaf36862c19cfa9415b1",
+            "status": "MEASURED",
+            "tree": "22336218fe6dfaa0130d5ebb921d0506655e776f"
+          }
+        },
+        {
+          "family": "config-direct-reject",
+          "delta": 4,
+          "paths": {
+            "crates/rmux-server/src/config_paths.rs": 91,
+            "crates/rmux-server/src/handler_scripting/source_files.rs": -87
+          },
+          "commits": [
+            {
+              "before": "4d7aa4cd50aa61fb34e4f4315a6ccc91d2fe0131",
+              "after": "29bbbe8920ee52b9b23b10bc0b5acb9130858c30",
+              "subject": "fix(config): charge direct paths only after shared strict admission",
+              "before_production": 344689,
+              "after_production": 344693,
+              "delta": 4,
+              "qualified": true,
+              "inventory_errors": {
+                "after": [],
+                "before": []
+              },
+              "inventory_before": {
+                "path": "sha256:94922a5e23b10475c5048c44c4d4c7d7561048b0d1cafcff3293d7455beae4d0",
+                "sha256": "94922a5e23b10475c5048c44c4d4c7d7561048b0d1cafcff3293d7455beae4d0",
+                "declarations_sha256": "d85b671f6dafac15006272fbebe1856f6a1fa6a1fd8db741e76270d66239b8cc"
+              },
+              "inventory_after": {
+                "path": "sha256:3f8c42c8983989418eac69a1507e90b72cec65a5a888d92c53904bebdb7fd19c",
+                "sha256": "3f8c42c8983989418eac69a1507e90b72cec65a5a888d92c53904bebdb7fd19c",
+                "declarations_sha256": "d85b671f6dafac15006272fbebe1856f6a1fa6a1fd8db741e76270d66239b8cc"
+              },
+              "paths": {
+                "crates/rmux-server/src/config_paths.rs": 91,
+                "crates/rmux-server/src/handler_scripting/source_files.rs": -87
+              },
+              "historical_binding_used": false,
+              "git_evidence_key": "29bbbe8920ee52b9b23b10bc0b5acb9130858c30",
+              "patch_sha256": "e822841636a20e35c6f022bf38b884214ebd0642f8d4c3fe637eaf6be6ae35f1"
+            }
+          ],
+          "per_commit_complete": true,
+          "family_before_inventory": {
+            "declarations_sha256": "d85b671f6dafac15006272fbebe1856f6a1fa6a1fd8db741e76270d66239b8cc",
+            "errors": [],
+            "path": "sha256:94922a5e23b10475c5048c44c4d4c7d7561048b0d1cafcff3293d7455beae4d0",
+            "production": 344689,
+            "reused": null,
+            "revision": "4d7aa4cd50aa61fb34e4f4315a6ccc91d2fe0131",
+            "seconds": 20.84706112497952,
+            "sha256": "94922a5e23b10475c5048c44c4d4c7d7561048b0d1cafcff3293d7455beae4d0",
+            "status": "MEASURED",
+            "tree": "94eef8446e7dfc165cec86c22e6d551b29cfc9fa"
+          },
+          "family_after_inventory": {
+            "declarations_sha256": "d85b671f6dafac15006272fbebe1856f6a1fa6a1fd8db741e76270d66239b8cc",
+            "errors": [],
+            "path": "sha256:3f8c42c8983989418eac69a1507e90b72cec65a5a888d92c53904bebdb7fd19c",
+            "production": 344693,
+            "reused": null,
+            "revision": "29bbbe8920ee52b9b23b10bc0b5acb9130858c30",
+            "seconds": 23.10988417599583,
+            "sha256": "3f8c42c8983989418eac69a1507e90b72cec65a5a888d92c53904bebdb7fd19c",
+            "status": "MEASURED",
+            "tree": "a9489ceb87ff001ee2996e4832f2d6cff72e161f"
+          }
+        }
+      ],
+      "arithmetic": {
+        "reference_production": 343521,
+        "measured_production": 344693,
+        "production_growth": 1172,
+        "existing_12_balance": 670,
+        "current_S2_085_delta": 0,
+        "historical_settlement_delta": 502,
+        "reconciled_growth": 1172,
+        "unexplained_excess": 0,
+        "family_sum": "-18 + 144 - 1 + 48 + 81 - 1 + 31 + 141 + 73 + 4 = 502"
+      },
+      "current_lot": {
+        "lot": "S2-INT210-POPUP-SOURCE-SHUTDOWN-CORRECTION-085",
+        "before": "6058943249c9ebb40653fa6576e6da4db08d7842",
+        "after": "92652381325c31a48a07564dcec82039318a17b4",
+        "delta": 0,
+        "historical_debt_attributed": 0,
+        "mandate_unchanged": true
+      },
+      "preservation": {
+        "original_12_entries_sha256": "05b87aca42b2e1ef5b28d33db536f35e1cbc181643366e6555fe8cfd07a1e1e5",
+        "ordinary_13_entries_sha256": "c75427ab22d05f42a4886c118e88a94eb58a56bfe7a8899baf36973b627768e8",
+        "original_12_unchanged": true,
+        "ordinary_13_unchanged": true,
+        "reference_sha256": "53dad1ec4a8d40e3102fa57be6016f4d78ca28c93929d54fa15215b22a7008ab",
+        "reference_production": 343521,
+        "ordinary_lot_envelopes_changed": false,
+        "tools_changed": false,
+        "test_expectations_changed": false
+      },
+      "measurement": {
+        "tool": "inventory.py; unchanged qualified D57 parser",
+        "local_evidence_mirror": "ledger-origin:/historical_settlements/0/measurement/local_evidence_mirror",
+        "overall_before": {
+          "path": "sha256:ffca64ba9f628fcec35eab70d85f0d7fb709844966828a2cb8de9878a68a573d",
+          "production": 343521,
+          "sha256": "ffca64ba9f628fcec35eab70d85f0d7fb709844966828a2cb8de9878a68a573d"
+        },
+        "overall_after": {
+          "path": "sha256:482d4f09d0e5a8e40bee3d8bd7b5ec1325097b76aa099c9d174d5bcbd99ebe7a",
+          "production": 344693,
+          "sha256": "482d4f09d0e5a8e40bee3d8bd7b5ec1325097b76aa099c9d174d5bcbd99ebe7a"
+        },
+        "existing_12_sources": [
+          {
+            "path": "sha256:ffca64ba9f628fcec35eab70d85f0d7fb709844966828a2cb8de9878a68a573d",
+            "production": 343521,
+            "sha256": "ffca64ba9f628fcec35eab70d85f0d7fb709844966828a2cb8de9878a68a573d"
+          },
+          {
+            "path": "sha256:482d4f09d0e5a8e40bee3d8bd7b5ec1325097b76aa099c9d174d5bcbd99ebe7a",
+            "production": 344693,
+            "sha256": "482d4f09d0e5a8e40bee3d8bd7b5ec1325097b76aa099c9d174d5bcbd99ebe7a"
+          },
+          {
+            "path": "sha256:883bc7a759f6878b0002900493e5d755dcc9d8169463bc6d9f73b0b6b5cd1dc7",
+            "production": 343521,
+            "sha256": "883bc7a759f6878b0002900493e5d755dcc9d8169463bc6d9f73b0b6b5cd1dc7"
+          },
+          {
+            "path": "sha256:e1d379b6954aa823faa09fbf4ff08aa22c65ca13e60fc33708d580922d8c52e0",
+            "production": 343521,
+            "sha256": "e1d379b6954aa823faa09fbf4ff08aa22c65ca13e60fc33708d580922d8c52e0"
+          },
+          {
+            "path": "sha256:fc1365b9fdd40c12bb13687147c4521541baa5348114e8e6b4bda5452c14e767",
+            "production": 343521,
+            "sha256": "fc1365b9fdd40c12bb13687147c4521541baa5348114e8e6b4bda5452c14e767"
+          },
+          {
+            "path": "sha256:132372fcbd82840648243b17a84d42b26b718f890b626c671d4abaab1b5be200",
+            "production": 343521,
+            "sha256": "132372fcbd82840648243b17a84d42b26b718f890b626c671d4abaab1b5be200"
+          },
+          {
+            "path": "sha256:1de2adb24e77eec67491226ea35e92d7b90aaa5327bc780cdaab3c4512d6b166",
+            "production": 343521,
+            "sha256": "1de2adb24e77eec67491226ea35e92d7b90aaa5327bc780cdaab3c4512d6b166"
+          },
+          {
+            "path": "sha256:19c0933d823da6544a926286595dfff33490024013202576c8385bdf47aa9af4",
+            "production": 343521,
+            "sha256": "19c0933d823da6544a926286595dfff33490024013202576c8385bdf47aa9af4"
+          },
+          {
+            "path": "sha256:325430ba6ef78ebe780033eb2cc7d993b1c2f9a55e129b9b28eb22653f0e9b67",
+            "production": 343521,
+            "sha256": "325430ba6ef78ebe780033eb2cc7d993b1c2f9a55e129b9b28eb22653f0e9b67"
+          },
+          {
+            "path": "sha256:03fc6bbc9fe998d0a98e02b4c3a9c7b7ecb3bda0d1ea1f44c899b7bd12395e29",
+            "production": 344137,
+            "sha256": "03fc6bbc9fe998d0a98e02b4c3a9c7b7ecb3bda0d1ea1f44c899b7bd12395e29"
+          },
+          {
+            "path": "sha256:f208c1db0ce93a1d2c05ea502caa94f9e1e0a5e410203964d87705452413a604",
+            "production": 343529,
+            "sha256": "f208c1db0ce93a1d2c05ea502caa94f9e1e0a5e410203964d87705452413a604"
+          },
+          {
+            "path": "sha256:8891840391687cafd3848af2c296e24a800428e121cf2b70646a8ca6b2052016",
+            "production": 344399,
+            "sha256": "8891840391687cafd3848af2c296e24a800428e121cf2b70646a8ca6b2052016"
+          },
+          {
+            "path": "sha256:96c542242292e82860665cc1a626a75480fcc1c1688971d51e53c532bc896d14",
+            "production": 344445,
+            "sha256": "96c542242292e82860665cc1a626a75480fcc1c1688971d51e53c532bc896d14"
+          },
+          {
+            "path": "sha256:ea3c782b0648dd7ec14765008c4b67c717880757eeaa9dd1f3d500f9062daae8",
+            "production": 344262,
+            "sha256": "ea3c782b0648dd7ec14765008c4b67c717880757eeaa9dd1f3d500f9062daae8"
+          },
+          {
+            "path": "sha256:363371a592ee2f173805f7b3de98cb88c11389aae1118e1e213ebe1c2b45fe31",
+            "production": 344262,
+            "sha256": "363371a592ee2f173805f7b3de98cb88c11389aae1118e1e213ebe1c2b45fe31"
+          },
+          {
+            "path": "sha256:e0ec9bf1db1bcfd9a133440462071d3b81f8cfac3ff858a909bdfa9817b5f15a",
+            "production": 343521,
+            "sha256": "e0ec9bf1db1bcfd9a133440462071d3b81f8cfac3ff858a909bdfa9817b5f15a"
+          },
+          {
+            "path": "sha256:b587a26dc885749c2adcd0f15adf15fd090497b658a80933874c70228e9f58a4",
+            "production": 343521,
+            "sha256": "b587a26dc885749c2adcd0f15adf15fd090497b658a80933874c70228e9f58a4"
+          },
+          {
+            "path": "sha256:4548b7b6ddfb59393ae6dbb2d44b28aa81040fe169da104f27ee574c866d78e7",
+            "production": 343521,
+            "sha256": "4548b7b6ddfb59393ae6dbb2d44b28aa81040fe169da104f27ee574c866d78e7"
+          },
+          {
+            "path": "sha256:a73863fb8553dd09c78b96ec4008a6fbe5a7fb1a5901327098bf38459551bfd7",
+            "production": 343521,
+            "sha256": "a73863fb8553dd09c78b96ec4008a6fbe5a7fb1a5901327098bf38459551bfd7"
+          },
+          {
+            "path": "sha256:a98ea34bfd15df1c9aae3366132aac1740e10309aebbe3f519fefe53e69ef102",
+            "production": 343521,
+            "sha256": "a98ea34bfd15df1c9aae3366132aac1740e10309aebbe3f519fefe53e69ef102"
+          }
+        ],
+        "parser_origin": {
+          "build": "sha256:a1f67543600d09f7575ef95a084da7b932d391bd464e197ada73c3bd2a411eb5",
+          "commit": "92652381325c31a48a07564dcec82039318a17b4",
+          "os": "linux",
+          "path": "sha256:d03e4bb2ab1aaaad872db62e88a7b8a4146dc00b51cad6690845ae78e5d51928",
+          "sha256": "d03e4bb2ab1aaaad872db62e88a7b8a4146dc00b51cad6690845ae78e5d51928",
+          "source": "ledger-origin:/historical_settlements/0/measurement/parser_origin/source",
+          "target": "ledger-origin:/historical_settlements/0/measurement/parser_origin/target",
+          "unit": {
+            "graph_sha256": "e64961b60de086a039882d1b967e146a1fc0b90c9a95b71653943deb4b6e046e",
+            "kind": "bin",
+            "path": "sha256:d03e4bb2ab1aaaad872db62e88a7b8a4146dc00b51cad6690845ae78e5d51928",
+            "receipt": "sha256:fd07b435eb7386e13073e79c0004869318d7dd92df70aeb0fcfc69100da321d5",
+            "receipt_sha256": "fd07b435eb7386e13073e79c0004869318d7dd92df70aeb0fcfc69100da321d5",
+            "sha256": "d03e4bb2ab1aaaad872db62e88a7b8a4146dc00b51cad6690845ae78e5d51928"
+          }
+        },
+        "parser_retained_path": "ledger-origin:/historical_settlements/0/measurement/parser_retained_path",
+        "parser_sha256": "d03e4bb2ab1aaaad872db62e88a7b8a4146dc00b51cad6690845ae78e5d51928",
+        "standalone_manifest": "ledger-origin:/historical_settlements/0/measurement/standalone_manifest",
+        "standalone_lock_sha256": "b3c949e38a361c1bcc703e3cead5fef6217ff20cb0be9f7f0ff043bec309bd01",
+        "compiler": "ledger-origin:/historical_settlements/0/measurement/compiler",
+        "compiler_sha256": "4a84e05991ad6f2a84c1361c29b52b38c390365bd1fc269b1936c88d482a8928",
+        "D4_scope": "Same retained parser, compiler/features, parser crate tree and Cargo.lock; exact inventory inputs verified for each reused report. No native product-test credit on another SHA.",
+        "historical_binding": {
+          "source": "scripts/source-inventory/declarations.json",
+          "source_revision": "e0b88cb466527d900c4a9c6cc54829c305728a38",
+          "source_sha256": "d85b671f6dafac15006272fbebe1856f6a1fa6a1fd8db741e76270d66239b8cc",
+          "historical_path": "tests/options_bank_linux.py",
+          "historical_blob": "a53034ac2d51a413ffc2c6bbb32aecb30a101036",
+          "added_binding_only": true,
+          "role_owners_consumers_unchanged": true,
+          "classification_unchanged": true,
+          "audit_input_sha256": "10584315035189665cb441ef814f872648980a0c5f6db7f8da8a4d540e173a9a",
+          "rationale": "Exact historical document blob for the D100 per-commit measurement; same maintained test-adapter responsibility and classification. No repository declaration/tool/test/envelope changed; no native credit."
+        },
+        "historical_test_classification": {
+          "source_revision": "e0b88cb466527d900c4a9c6cc54829c305728a38",
+          "source_path": "scripts/source-inventory/declarations.json",
+          "source_sha256": "d85b671f6dafac15006272fbebe1856f6a1fa6a1fd8db741e76270d66239b8cc",
+          "audit_input_sha256": "8551bc328b3eff5c680dfe43331eed141e648da3d116930d5f8e6eab139c742e",
+          "historical_path": "scripts/source-inventory/test_dispatch_metadata.py",
+          "declared_role": "tests",
+          "historical_blob": "16f1592212f16b6047f8bf4300ff0d38751051c5",
+          "moved_into": "scripts/source-inventory/test_inventory.py",
+          "move_commit": "0c78f8aeb7a61aef5165272ad03be320992f7fdb",
+          "move_patch": {
+            "path": "sha256:d9312b543b1d1d85e5b3c57b6dd2b3ec80baa58cc7c362f17c1ac68758c8d350",
+            "sha256": "d9312b543b1d1d85e5b3c57b6dd2b3ec80baa58cc7c362f17c1ac68758c8d350"
+          },
+          "scope": "Exact historical test path only; all existing role assignments, documents, parser sources, tool code, expectations and ordinary envelopes unchanged. Unittest class is retained in the already-declared maintained test suite.",
+          "review_required": true
+        },
+        "binding_equivalence_state": [
+          "ca1722f7902d67fee43d0e689aafc1b32ae1ca2e"
+        ],
+        "atomic_transitions": [
+          {
+            "key": "2d6ae199426311d5023ae84cd58d509965b96fa2..1e948e1ff67fee15c22caded8790ee75aabdf6e1",
+            "authority": "D101",
+            "measurement_kind": "atomic_transition",
+            "before": "2d6ae199426311d5023ae84cd58d509965b96fa2",
+            "after": "1e948e1ff67fee15c22caded8790ee75aabdf6e1",
+            "members": [
+              "d87919839db3d24b47492f9f64c21b9e0a254c4f",
+              "1e948e1ff67fee15c22caded8790ee75aabdf6e1"
+            ],
+            "before_production": 344399,
+            "after_production": 344398,
+            "delta": -1,
+            "expected_sum": -1,
+            "paths": {
+              "crates/rmux-server/src/commands.rs": 496,
+              "crates/rmux-server/src/handler_dispatch.rs": -1,
+              "crates/rmux-server/src/handler_dispatch/commands.rs": -496
+            },
+            "inventory_before": {
+              "path": "sha256:b708bccad93331518533421c1fbad9f39ff7000aa755c1195e73c21906ff169b",
+              "sha256": "b708bccad93331518533421c1fbad9f39ff7000aa755c1195e73c21906ff169b",
+              "revision": "2d6ae199426311d5023ae84cd58d509965b96fa2"
+            },
+            "inventory_after": {
+              "path": "sha256:444e1acf1ed0792a0a779ab8668dbc4079091be4aada0b73dd4d98dd47f3de69",
+              "sha256": "444e1acf1ed0792a0a779ab8668dbc4079091be4aada0b73dd4d98dd47f3de69",
+              "revision": "1e948e1ff67fee15c22caded8790ee75aabdf6e1"
+            },
+            "declarations_sha256": "8551bc328b3eff5c680dfe43331eed141e648da3d116930d5f8e6eab139c742e",
+            "scan_commands": {
+              "path": "sha256:bec37cea8cba8e4e46f9c8793f9ed9281bafe2b4d8806d65616b93324b9d89ea",
+              "sha256": "bec37cea8cba8e4e46f9c8793f9ed9281bafe2b4d8806d65616b93324b9d89ea"
+            },
+            "git_log": {
+              "path": "sha256:c8c4948e5286a7b704571d17ff564cfc071e3b0e4d21aaf8b4765b46b22f9e95",
+              "sha256": "c8c4948e5286a7b704571d17ff564cfc071e3b0e4d21aaf8b4765b46b22f9e95"
+            },
+            "git_patch": {
+              "path": "sha256:bcb7fdf86cff19783b95c02b87fbb50a306af5f7684438508b2952a241248793",
+              "sha256": "bcb7fdf86cff19783b95c02b87fbb50a306af5f7684438508b2952a241248793"
+            },
+            "D4_D41_equivalence": {
+              "path": "sha256:ff9f4e3c0229911646bdb40aa5443daf45bcb89bb9682c81b23fc1841998b85b",
+              "sha256": "ff9f4e3c0229911646bdb40aa5443daf45bcb89bb9682c81b23fc1841998b85b"
+            },
+            "native_evidence": {
+              "path": "sha256:02a98a366bcb8e801fa5c04bc54f9c1785360efe7684340d85d3d5be6722c502",
+              "sha256": "02a98a366bcb8e801fa5c04bc54f9c1785360efe7684340d85d3d5be6722c502"
+            },
+            "per_commit_measurements_claimed": false,
+            "intermediate_scan_performed": false
+          }
+        ],
+        "coverage": {
+          "preserved_qualified_per_commit_comparisons": 19,
+          "atomic_transition_measurements": 1,
+          "atomic_transition_member_bindings": 2,
+          "total_commit_bindings": 21,
+          "qualified_measurements": 20,
+          "all_bindings_covered": true,
+          "note": "19 original qualified comparisons plus one D101 transition covering two bindings; never 21 qualified per-commit comparisons."
+        }
+      },
+      "freeze_obligation": {
+        "kind": "historical_debt",
+        "historical_delta": 502,
+        "total_production_debt": 1172,
+        "production_ceiling": 343521,
+        "rule": "Historical debt is justified or offset at freeze under D100/D65(b); the D65(b) production ceiling remains 343521.",
+        "retrospective_envelope": false,
+        "exemption": false,
+        "outside_bounds": "Any unexplained excess beyond +670 +502 remains blocking; this record covers only the ten named families within its exact bounds."
+      },
+      "consumption": {
+        "independent_reviewer": "R1",
+        "independent_review_completed": false,
+        "campaign_consumed": false,
+        "product_verdict": null,
+        "closed_lines": [],
+        "S6_089_status": "BLOCKED_PRESERVED",
+        "INT215_status": "BLOCKED_PRESERVED",
+        "Mac_passes_preserved": 35,
+        "Linux_passes_preserved": 35,
+        "R1_403": "PASS campaign delta preserved; closure FAIL unchanged",
+        "note": "D101 data complete, independent R1 review pending on new data, arithmetic and bindings only. Original 089/090 and INT215 remain BLOCKED; no green production gate, campaign consumption or line closure is claimed.",
+        "S6_090_status": "BLOCKED_PRESERVED"
+      },
+      "sources": [
+        {
+          "path": "sha256:19d4e7944eb839024e41ac39077c27fecd2b18c45f632fe450d7ca310193c277",
+          "sha256": "19d4e7944eb839024e41ac39077c27fecd2b18c45f632fe450d7ca310193c277"
+        },
+        {
+          "path": "sha256:dabdf0bbf252821525c4aa3a26d8a033e22f87e11a83090d75c52ed7d778440e",
+          "sha256": "dabdf0bbf252821525c4aa3a26d8a033e22f87e11a83090d75c52ed7d778440e"
+        },
+        {
+          "path": "sha256:c1124e6444be53c23db8663ecbfffe465b3e865a01a806c821e85e6622b9ec03",
+          "sha256": "c1124e6444be53c23db8663ecbfffe465b3e865a01a806c821e85e6622b9ec03"
+        },
+        {
+          "path": "sha256:09423bd295b6a377ec08a19ccb2263bcdaefe5ed125b04abec0609e8b1d18cf9",
+          "sha256": "09423bd295b6a377ec08a19ccb2263bcdaefe5ed125b04abec0609e8b1d18cf9"
+        },
+        {
+          "path": "sha256:6bad047b2b095c261254039079e122a146aa3d8e63e1678e24e56d1e6ee6b931",
+          "sha256": "6bad047b2b095c261254039079e122a146aa3d8e63e1678e24e56d1e6ee6b931"
+        },
+        {
+          "path": "sha256:629e84860b9a07b1ce343c9309e6a7499f718910a9edc108db2fb01c7754e857",
+          "sha256": "629e84860b9a07b1ce343c9309e6a7499f718910a9edc108db2fb01c7754e857"
+        },
+        {
+          "path": "sha256:72860d4312c9103263aba92264f4359e895aca0f13726d04fa5e541f6673b121",
+          "sha256": "72860d4312c9103263aba92264f4359e895aca0f13726d04fa5e541f6673b121"
+        },
+        {
+          "path": "sha256:e0ab1fd08ce4353f316f9781854564465c9125dd1e53e74d2ba88e76b0835c7e",
+          "sha256": "e0ab1fd08ce4353f316f9781854564465c9125dd1e53e74d2ba88e76b0835c7e"
+        },
+        {
+          "path": "sha256:c5a29bb1b231f44a60f6863cc2c59ac333499376fbb0516204ef11f773c69aa9",
+          "sha256": "c5a29bb1b231f44a60f6863cc2c59ac333499376fbb0516204ef11f773c69aa9"
+        },
+        {
+          "path": "sha256:fbcb227d37eb4364b8d1a33f3318a662f88f58f0123d7d0e814152e4bda9002e",
+          "sha256": "fbcb227d37eb4364b8d1a33f3318a662f88f58f0123d7d0e814152e4bda9002e"
+        },
+        {
+          "path": "sha256:6ee9d1df219cdc7a05a1419b9b8168067af27d8ab21115e5332bca012c0558f4",
+          "sha256": "6ee9d1df219cdc7a05a1419b9b8168067af27d8ab21115e5332bca012c0558f4"
+        },
+        {
+          "path": "sha256:a1f67543600d09f7575ef95a084da7b932d391bd464e197ada73c3bd2a411eb5",
+          "sha256": "a1f67543600d09f7575ef95a084da7b932d391bd464e197ada73c3bd2a411eb5"
+        },
+        {
+          "path": "sha256:10584315035189665cb441ef814f872648980a0c5f6db7f8da8a4d540e173a9a",
+          "sha256": "10584315035189665cb441ef814f872648980a0c5f6db7f8da8a4d540e173a9a"
+        },
+        {
+          "path": "sha256:598dda390521c9daba6ee62bfd7da8d466b8386e243e239bb136c276c2686aef",
+          "sha256": "598dda390521c9daba6ee62bfd7da8d466b8386e243e239bb136c276c2686aef"
+        },
+        {
+          "path": "sha256:49d7a65ef9752348a22674b4b2e2042ab8923a8e2efafc395f77c20264228aee",
+          "sha256": "49d7a65ef9752348a22674b4b2e2042ab8923a8e2efafc395f77c20264228aee"
+        },
+        {
+          "path": "sha256:9c2741a7b75cb6eb3bec0ad7e07aaa0df64947e08b83ba9a641d9c7bfed3086a",
+          "sha256": "9c2741a7b75cb6eb3bec0ad7e07aaa0df64947e08b83ba9a641d9c7bfed3086a"
+        },
+        {
+          "path": "sha256:92e0aa7a71fa9eae5f6e6965ee4ed32d536c0a728dba76e1e585db258faca3ea",
+          "sha256": "92e0aa7a71fa9eae5f6e6965ee4ed32d536c0a728dba76e1e585db258faca3ea"
+        },
+        {
+          "path": "sha256:9736f0a783770136b344180d0ad1dedc2a0c1c4d8131660736ca4f942953b582",
+          "sha256": "9736f0a783770136b344180d0ad1dedc2a0c1c4d8131660736ca4f942953b582"
+        },
+        {
+          "path": "sha256:e8cb44edf30f4fb3ce2512b84ba70b4bc78082c28697c825408b62a476e68421",
+          "sha256": "e8cb44edf30f4fb3ce2512b84ba70b4bc78082c28697c825408b62a476e68421"
+        },
+        {
+          "path": "sha256:8551bc328b3eff5c680dfe43331eed141e648da3d116930d5f8e6eab139c742e",
+          "sha256": "8551bc328b3eff5c680dfe43331eed141e648da3d116930d5f8e6eab139c742e"
+        },
+        {
+          "path": "sha256:b2835f26463b97fca9567341a4c4d906ed4e54387f777967deacaef8c4830899",
+          "sha256": "b2835f26463b97fca9567341a4c4d906ed4e54387f777967deacaef8c4830899"
+        },
+        {
+          "path": "sha256:d9312b543b1d1d85e5b3c57b6dd2b3ec80baa58cc7c362f17c1ac68758c8d350",
+          "sha256": "d9312b543b1d1d85e5b3c57b6dd2b3ec80baa58cc7c362f17c1ac68758c8d350"
+        },
+        {
+          "path": "sha256:e576f686215a3e53c3d824d274c08447ed29e65126fc898a2a65d037e3a7543f",
+          "sha256": "e576f686215a3e53c3d824d274c08447ed29e65126fc898a2a65d037e3a7543f"
+        },
+        {
+          "path": "sha256:02a98a366bcb8e801fa5c04bc54f9c1785360efe7684340d85d3d5be6722c502",
+          "sha256": "02a98a366bcb8e801fa5c04bc54f9c1785360efe7684340d85d3d5be6722c502"
+        },
+        {
+          "path": "sha256:ff9f4e3c0229911646bdb40aa5443daf45bcb89bb9682c81b23fc1841998b85b",
+          "sha256": "ff9f4e3c0229911646bdb40aa5443daf45bcb89bb9682c81b23fc1841998b85b"
+        },
+        {
+          "path": "sha256:bec37cea8cba8e4e46f9c8793f9ed9281bafe2b4d8806d65616b93324b9d89ea",
+          "sha256": "bec37cea8cba8e4e46f9c8793f9ed9281bafe2b4d8806d65616b93324b9d89ea"
+        },
+        {
+          "path": "sha256:c8c4948e5286a7b704571d17ff564cfc071e3b0e4d21aaf8b4765b46b22f9e95",
+          "sha256": "c8c4948e5286a7b704571d17ff564cfc071e3b0e4d21aaf8b4765b46b22f9e95"
+        },
+        {
+          "path": "sha256:bcb7fdf86cff19783b95c02b87fbb50a306af5f7684438508b2952a241248793",
+          "sha256": "bcb7fdf86cff19783b95c02b87fbb50a306af5f7684438508b2952a241248793"
+        },
+        {
+          "path": "sha256:4406297ffaae4606ee74686fd769541a5e9bbb151e18f7e2a93041d1a57154d6",
+          "sha256": "4406297ffaae4606ee74686fd769541a5e9bbb151e18f7e2a93041d1a57154d6"
+        },
+        {
+          "path": "sha256:e868c2a0c25cce74922549cbe95bc3b7363bab2705714caa1658694d7e4f85e8",
+          "sha256": "e868c2a0c25cce74922549cbe95bc3b7363bab2705714caa1658694d7e4f85e8"
+        },
+        {
+          "path": "sha256:4f74d8377f795fa61a61c5100e38419f006d3674466803ad7d3d8777b3e861b6",
+          "sha256": "4f74d8377f795fa61a61c5100e38419f006d3674466803ad7d3d8777b3e861b6"
+        },
+        {
+          "path": "sha256:81402aa05b4b24c1baf55065bcfb2372531f709afb0b789313f56cbc9768a524",
+          "sha256": "81402aa05b4b24c1baf55065bcfb2372531f709afb0b789313f56cbc9768a524"
+        }
+      ],
+      "completion_base": "9872ed8a18ce5e62fa0ce34e5d788487e8c75cdb",
+      "measurement_resolution": {
+        "authority": "D101",
+        "previous_blocker_commit": "d87919839db3d24b47492f9f64c21b9e0a254c4f",
+        "previous_blocker_source": {
+          "path": "sha256:e576f686215a3e53c3d824d274c08447ed29e65126fc898a2a65d037e3a7543f",
+          "sha256": "e576f686215a3e53c3d824d274c08447ed29e65126fc898a2a65d037e3a7543f"
+        },
+        "original_blocked_register": "9872ed8a18ce5e62fa0ce34e5d788487e8c75cdb:scripts/source-inventory/production-ledger.json",
+        "disposition": "The two previously unqualified comparisons are covered together by one qualified atomic transition; no per-commit delta is claimed for either member.",
+        "independent_review_pending": true
+      }
+    }
+  ],
+  "schema": 1,
+  "evidence_origin": {
+    "schema": "rmux-git-provenance/1",
+    "git_blob": "a50cc1cbcdc32879912c4d9a26f9172bf401c13c",
+    "sha256": "52edafcaffc7bbbd26083948c5e265a0d934538c30cadd304e89ce5c628fe1df",
+    "bytes": 99355
+  },
+  "coverage_witnesses": {
+    "INT148": {
+      "before": "ea435dddd3fba0e2c9e8e7c8d97150b0712ed21b",
+      "after": "05f405c869ea66271d3eba6d717a9eb62ebf3558",
+      "lots": [
+        "S3-L014-D65-BLACKLIST-PRODUCTION-RATCHET-090",
+        "S3-L014-R1283-F1-LOT-ENVELOPE-CORRECTION-091",
+        "S3-L014-INT148-COVERAGE-GAP-CORRECTION-092"
+      ],
+      "scope": "historical exact composition; no cumulative campaign credit",
+      "bounds": "sha256:eb9d7d49e535fc687aad6b82754afae510fcd4f0aa45f9429a167ec9bb27f0fa",
+      "review": "sha256:46043295810fbb4b461e5db845cb158063cb1c856ddce00fec32888bb8ee3aca",
+      "mandates": [
+        "sha256:d54e71f70a461e458e8dcd101e1dd52d647d23e565df8d7f481e9dec17e63a8d",
+        "sha256:a026d29f0223fcdc8c55607cae5069f07e2dee6e7974ce85d995ce51ae2b5c3d",
+        "sha256:1c9b334389b0da6fe383acf76191380217ece8a4300ef5e908de0745f4b59def"
+      ]
+    }
+  },
+  "reviewed_ranges": [
+    {
+      "lot": "S3-L014-D65-BLACKLIST-PRODUCTION-RATCHET-090",
+      "before": "ea435dddd3fba0e2c9e8e7c8d97150b0712ed21b",
+      "after": "9557a5414dc9218bd2b4294febfbd50a1f182a28",
+      "mandate": "sha256:d54e71f70a461e458e8dcd101e1dd52d647d23e565df8d7f481e9dec17e63a8d",
+      "review": "sha256:17218b77364b30dd83650f1fa2506f579b44a42dce8b8f49058ef0a6c1935e36",
+      "scope": "Original measured closed-lot range; review scope is retained in exact receipt. No rebase or campaign coverage inferred."
+    },
+    {
+      "lot": "S3-L014-R1283-F1-LOT-ENVELOPE-CORRECTION-091",
+      "before": "9557a5414dc9218bd2b4294febfbd50a1f182a28",
+      "after": "c8f6198bfaa799693cba4f8ab0108e407deb27f9",
+      "mandate": "sha256:a026d29f0223fcdc8c55607cae5069f07e2dee6e7974ce85d995ce51ae2b5c3d",
+      "review": "sha256:7a545ae87e57591c99d0e5f5b7843b13c5bfbd34d5fa39f19734e65a9a6456d3",
+      "scope": "Original measured closed-lot range; review scope is retained in exact receipt. No rebase or campaign coverage inferred."
+    },
+    {
+      "lot": "S3-L014-INT148-COVERAGE-GAP-CORRECTION-092",
+      "before": "c8f6198bfaa799693cba4f8ab0108e407deb27f9",
+      "after": "1cc979c2cf5293dadb1971e7f8a50d34218bf9b1",
+      "mandate": "sha256:1c9b334389b0da6fe383acf76191380217ece8a4300ef5e908de0745f4b59def",
+      "review": "sha256:46043295810fbb4b461e5db845cb158063cb1c856ddce00fec32888bb8ee3aca",
+      "scope": "Original measured closed-lot range; review scope is retained in exact receipt. No rebase or campaign coverage inferred."
+    },
+    {
+      "lot": "S1-L081-FIRST-MISSING-OPTION-EFFECT-CODE-096",
+      "before": "05f405c869ea66271d3eba6d717a9eb62ebf3558",
+      "after": "927f7a8c2b51a6806faa8f191f37ebfc83e7209c",
+      "mandate": "sha256:be5cb3e3f4b4fb69d3394e149f7fbcaabf936b881959613b6e8589d72873a89e",
+      "review": "sha256:ccbc22230232addb2c71ef899371e2df4bb28d3f079bd913c51f9ea2965c3d46",
+      "scope": "Original measured closed-lot range; review scope is retained in exact receipt. No rebase or campaign coverage inferred."
+    },
+    {
+      "lot": "INT-D67-S5074-PASS287-UNIX-TRAIN-157",
+      "before": "76e4cdbdb6afe33ade10533ed8cd9d001f7de83d",
+      "after": "f6463451d7db3eaa7a00d7e3fd2acbfb10edbbb8",
+      "mandate": "sha256:149c423bd7f82d37950739ce2cc02afc99324cbe88bd8b25d0d4924eae8d2996",
+      "review": "sha256:fe2dfecc3188afb037aaee7a126470258638f32685766b75d2e4c241e407efb4",
+      "scope": "Original measured closed-lot range; review scope is retained in exact receipt. No rebase or campaign coverage inferred."
+    },
+    {
+      "lot": "S3-L081-INT156-CONFLICT-CORRECTION-095",
+      "before": "76e4cdbdb6afe33ade10533ed8cd9d001f7de83d",
+      "after": "2166fb14ca13e8324d8e872e55282a7179a9094a",
+      "mandate": "sha256:f7d8654f5d31055c4697e44a0bc1c73dc8c35d647456fec8a0cacdeda0320b8d",
+      "review": "sha256:01b54660f0570d44c348dc7a04e14c1a9b9b541e3a15acb83fb7b8eb81229fc6",
+      "scope": "Original measured closed-lot range; review scope is retained in exact receipt. No rebase or campaign coverage inferred."
+    },
+    {
+      "lot": "S4-L198-R1348-F1-F2-SIZE-ENVELOPE-CORRECTION-105",
+      "before": "c0272d4b5a9e59d8109e7d4b5ec09f5d4312e200",
+      "after": "89f17e38d523bdc3890d8515855e4166cc458bc3",
+      "mandate": "sha256:2eaccdac8261c753158085055bab35cfc8a61bf1c793346a0ed09648e4fe2ade",
+      "review": "sha256:5e1056028ed80ea61be9ede8dc4d03994a30346b57f11e4ca6a8c719ef9b0983",
+      "scope": "Original measured closed-lot range; review scope is retained in exact receipt. No rebase or campaign coverage inferred."
+    },
+    {
+      "lot": "S5-L141-L142-L143-INT170-CONFLICT-RECOMPOSITION-086",
+      "before": "ce3e629b21dd90c0ff72af9f363b12e4f9e9e8ec",
+      "after": "c622f6c085f95d22f3d6404d2ae38a9b13b6b70c",
+      "mandate": "sha256:74914aa117bb82bfab7ae7f446de9b5e6431b65297ee67511f21e9f75be31b22",
+      "review": "sha256:29cd55c703000cc51089b74adcc4c44cc951f39fb07bbcc3694d8e26a499f4ef",
+      "scope": "Original measured closed-lot range; review scope is retained in exact receipt. No rebase or campaign coverage inferred."
+    },
+    {
+      "lot": "S3-L144-D79-INDEPENDENT-BUILD-COMPARISON-CODE-106",
+      "before": "76e4cdbdb6afe33ade10533ed8cd9d001f7de83d",
+      "after": "fa000c644113f717bf7c7065a96704260e759b99",
+      "mandate": "sha256:2ad913773e5cf4f2afd938c86bd5c6c7dd5f1bc6c19c97518e01291094b34cb4",
+      "review": "sha256:c76b802293809fab499a9b4aeb96ff7439d4cfca28d3316ac280ae8da59f4028",
+      "scope": "Original measured closed-lot range; review scope is retained in exact receipt. No rebase or campaign coverage inferred."
+    },
+    {
+      "lot": "S1-L144-R1383-CANONICAL-INDEPENDENCE-STALE-GREEN-CORRECTION-109",
+      "before": "cfc10630e8b4d6129860cffc280f39300ea0fd0c",
+      "after": "abd34236d818ca92d89812c91bca982358802319",
+      "mandate": "sha256:d68acc59ac90d44db4720efa50956cacfde3516a33d574870d304ff35da8c012",
+      "review": "sha256:60011cf2c1b0cb64f7931c6e05a85eb5f2dc485f6bfc453d1227fad182618228",
+      "scope": "Original measured closed-lot range; review scope is retained in exact receipt. No rebase or campaign coverage inferred."
+    },
+    {
+      "lot": "S1-L144-R1390-NEIGHBOR-STALE-GREEN-CORRECTION-110",
+      "before": "fe5b76f1d15ecaef4c31a91a99787423256e415a",
+      "after": "74ce50cc706e6f88eb0ffff54b9a7a8c13db7b66",
+      "mandate": "sha256:764aa62d5d096d27fc258be495128a5d857ae7e40b5e6a557871eda2938a8955",
+      "review": "sha256:8fa8c7fb48616c023ad220463a80d0e2a09e134e9069bd322238b1391ab9f889",
+      "scope": "Original measured closed-lot range; review scope is retained in exact receipt. No rebase or campaign coverage inferred."
+    },
+    {
+      "lot": "S2-INT210-POPUP-SOURCE-SHUTDOWN-CORRECTION-085",
+      "before": "6058943249c9ebb40653fa6576e6da4db08d7842",
+      "after": "92652381325c31a48a07564dcec82039318a17b4",
+      "mandate": "sha256:1f604c75b688b5c5279c8b5058cceb36c5e288c8ccb0b7bbb9d3a63a40e0f1c3",
+      "review": "sha256:e53285766cb81fe8eaea9f16c5d26229d7b7a1763d65f27b23a50024cf2ab94e",
+      "scope": "Original measured closed-lot range; review scope is retained in exact receipt. No rebase or campaign coverage inferred."
+    },
+    {
+      "lot": "S5-INT213-ATTACH-CONFLICT-RECOMPOSITION-097",
+      "before": "92652381325c31a48a07564dcec82039318a17b4",
+      "after": "e2b9ce02f5abed9cef33ffe429a90ecb2f798b67",
+      "mandate": "sha256:ac3df666aa6fb3553532f69ebc637fd06ea583436650e72e01d0c97546a2f44b",
+      "review": "sha256:9868cbc1c7db688d712884c0ff25762c19953d4130a92fd89fbed5be5a15a28d",
+      "scope": "Exact reviewed INT216 composition; inherited envelope 600; +12 only, no historical 502 or later +913 consumption.",
+      "inherited_mandate": "sha256:d09aced3d6cbd95b8792aacf647279f274d583b98838bd12d1bd7daa18e1b39b"
+    },
+    {
+      "lot": "S1-L064-D79-INSTALLED-JOB-OBJECT-CODE-107",
+      "before": "76e4cdbdb6afe33ade10533ed8cd9d001f7de83d",
+      "after": "c7b1747c4e705c2c6d963553c9e80491b0b44610",
+      "mandate": "sha256:172296bad523a38052490ada6c0fa8b853acdbae217c177aff8e059336109527",
+      "review": "sha256:396e443871e0bbefd911a026d2001c4f3476a1a155ca68b1c9ed75d50b70c26a",
+      "scope": "Original measured closed-lot range; review scope is retained in exact receipt. No rebase or campaign coverage inferred."
+    },
+    {
+      "lot": "S1-L064-R1380-COLLECTOR-F1-F2-F3-CORRECTION-108",
+      "before": "ab79971ff11a28eb9984edd8cb3e76fdbf8e479f",
+      "after": "924d55f196aa99c4b1ec59be33671fa815d45b6d",
+      "mandate": "sha256:3f151e049f690b068131f2be6dcfb6dab7395c9260f4b908c60922c50a8ad09b",
+      "review": "sha256:c8e7186c13547637e7e7a2aafd1ce91af723ff84efe30245fed6979d2cbfbe27",
+      "scope": "Original measured closed-lot range; review scope is retained in exact receipt. No rebase or campaign coverage inferred.",
+      "inherited_mandate": "sha256:172296bad523a38052490ada6c0fa8b853acdbae217c177aff8e059336109527"
+    }
+  ],
+  "composed_growth": {
+    "schema": 1,
+    "authority": "D124",
+    "before": "f54ae83954c368c5c4e3706806690e0388c5414e",
+    "after": "7a63d529d7e6213f2e1410266734531e0b7555b8",
+    "total": 913,
+    "status": "OUVERT",
+    "independent_review_pending": true,
+    "campaign_consumed": false,
+    "attachments": [
+      {
+        "owner": "S4",
+        "lane": "S4-R1406-F1-CONTROL-INSERTION-ERROR-CORRECTION-117",
+        "composition_lane": "S4-117",
+        "mandate": "sha256:799657bb773697043b232f42fced1ca367e70f242d4d520a630dcf896cd7ad14",
+        "before": "f54ae83954c368c5c4e3706806690e0388c5414e",
+        "after": "6b11dca191f84122ade90dfd39a4d3edf8ad8f43",
+        "reviewed_composition": "a8d6716f091ea8ac6a17ce47876b967744f02eb7",
+        "review_id": "R1-413",
+        "review": "sha256:0da47ecb8b97b006cdad40e96a5c951562a553476b4da0b8dc4386bd51c035ed",
+        "composition": "sha256:bd93716aaac8be1db7957010f8c36c6c238175e11993e5bd9c1d4edd6799ef4d",
+        "status": "PASS",
+        "delta": -23,
+        "paths": {
+          "crates/rmux-server/src/control/event_state.rs": 13,
+          "crates/rmux-server/src/control/response_events.rs": -24,
+          "crates/rmux-server/src/control/server_events.rs": -26,
+          "crates/rmux-server/src/control/transport.rs": -20,
+          "crates/rmux-server/src/control/transport_commands.rs": -19,
+          "crates/rmux-server/src/control/transport_completion.rs": -12,
+          "crates/rmux-server/src/control_response_stream.rs": 36,
+          "crates/rmux-server/src/handler_control.rs": -25,
+          "crates/rmux-server/src/handler_control/layout_notifications.rs": -65,
+          "crates/rmux-server/src/handler_scripting.rs": 1,
+          "crates/rmux-server/src/handler_scripting/command_execution.rs": 23,
+          "crates/rmux-server/src/handler_scripting/queue_execution.rs": -17,
+          "crates/rmux-server/src/window_notifications.rs": 112
+        },
+        "inventory_before": "sha256:9a2218cb54383e8a50f31a20820f3c89e02cdafe8765eced4e5ccde6e59f151b",
+        "inventory_after": "sha256:0c460f1e4605762a305945c4b69c2c0374f60d12bdfae6fc6438c5912802a2e8",
+        "scope": "D124 attribution only; no closed settlement, envelope, campaign or native product-test credit."
+      },
+      {
+        "owner": "S1",
+        "lane": "S1-D99-PAUSE-AGE-INDEPENDENT-PRODUCT-CORRECTION-112",
+        "composition_lane": "S1-112",
+        "mandate": "sha256:35d7d5f6cfd55999b422c29a1cf87966220f38bacdc083140988dccc566f749c",
+        "before": "6b11dca191f84122ade90dfd39a4d3edf8ad8f43",
+        "after": "2bf8cee2846086524c62198fa2495dada1731b20",
+        "reviewed_composition": "a8d6716f091ea8ac6a17ce47876b967744f02eb7",
+        "review_id": "R1-413",
+        "review": "sha256:0da47ecb8b97b006cdad40e96a5c951562a553476b4da0b8dc4386bd51c035ed",
+        "composition": "sha256:bd93716aaac8be1db7957010f8c36c6c238175e11993e5bd9c1d4edd6799ef4d",
+        "status": "PASS",
+        "delta": 0,
+        "paths": {
+          "crates/rmux-server/src/control/output_queue.rs": 5,
+          "crates/rmux-server/src/control/pane_event_delivery.rs": 19,
+          "crates/rmux-server/src/control/subscriptions.rs": -24
+        },
+        "inventory_before": "sha256:0c460f1e4605762a305945c4b69c2c0374f60d12bdfae6fc6438c5912802a2e8",
+        "inventory_after": "sha256:9cff5ba9ac965d9eea0f372fab53bed18cd121ad66737eba9529a792dcc2c740",
+        "scope": "D124 attribution only; no closed settlement, envelope, campaign or native product-test credit."
+      },
+      {
+        "owner": "S3",
+        "lane": "S3-R1404-USERN-ENCODER-D86-CAUSAL-CORRECTION-123",
+        "composition_lane": "S3-123",
+        "mandate": "sha256:af682e10034dbaa4746e9a4797ab7df42f0e4c0a3e5bcf8df954b069cc63cbeb",
+        "before": "2bf8cee2846086524c62198fa2495dada1731b20",
+        "after": "a8d6716f091ea8ac6a17ce47876b967744f02eb7",
+        "reviewed_composition": "a8d6716f091ea8ac6a17ce47876b967744f02eb7",
+        "review_id": "R1-413",
+        "review": "sha256:0da47ecb8b97b006cdad40e96a5c951562a553476b4da0b8dc4386bd51c035ed",
+        "composition": "sha256:bd93716aaac8be1db7957010f8c36c6c238175e11993e5bd9c1d4edd6799ef4d",
+        "status": "PASS",
+        "delta": 962,
+        "paths": {
+          "crates/rmux-core/src/buffers.rs": 17,
+          "crates/rmux-core/src/formats.rs": -2,
+          "crates/rmux-core/src/formats/colour.rs": -68,
+          "crates/rmux-core/src/input/dispatch.rs": 9,
+          "crates/rmux-core/src/input/extended_keys.rs": 23,
+          "crates/rmux-core/src/input/mod.rs": 5,
+          "crates/rmux-core/src/input/rgb.rs": 70,
+          "crates/rmux-core/src/input/writer.rs": 5,
+          "crates/rmux-core/src/options/access.rs": -40,
+          "crates/rmux-core/src/options/render.rs": 12,
+          "crates/rmux-core/src/options/scope.rs": 16,
+          "crates/rmux-core/src/options/show.rs": -54,
+          "crates/rmux-core/src/options/storage.rs": -9,
+          "crates/rmux-core/src/screen.rs": 7,
+          "crates/rmux-core/src/screen/style_overlay.rs": 37,
+          "crates/rmux-core/src/screen/writer.rs": 4,
+          "crates/rmux-server/src/buffer_editor.rs": 127,
+          "crates/rmux-server/src/handler.rs": 1,
+          "crates/rmux-server/src/handler_attach.rs": 3,
+          "crates/rmux-server/src/handler_attach/refresh.rs": 3,
+          "crates/rmux-server/src/handler_attach/registration.rs": 4,
+          "crates/rmux-server/src/handler_attach/state.rs": 2,
+          "crates/rmux-server/src/handler_client_runtime.rs": 1,
+          "crates/rmux-server/src/handler_control.rs": 1,
+          "crates/rmux-server/src/handler_lock.rs": 37,
+          "crates/rmux-server/src/handler_mode_tree.rs": 2,
+          "crates/rmux-server/src/handler_mode_tree/input.rs": 7,
+          "crates/rmux-server/src/handler_mode_tree/preview.rs": 22,
+          "crates/rmux-server/src/handler_mode_tree/runtime.rs": 5,
+          "crates/rmux-server/src/handler_mode_tree/runtime_identity.rs": 27,
+          "crates/rmux-server/src/handler_options.rs": 22,
+          "crates/rmux-server/src/handler_overlay.rs": 2,
+          "crates/rmux-server/src/handler_overlay/commands.rs": -63,
+          "crates/rmux-server/src/handler_overlay/identity.rs": 4,
+          "crates/rmux-server/src/handler_pane/assumed_paste.rs": 77,
+          "crates/rmux-server/src/handler_pane/attached_input.rs": 7,
+          "crates/rmux-server/src/handler_pane/attached_input/live.rs": -76,
+          "crates/rmux-server/src/handler_pane/attached_input/live/read_only_client_action.rs": 6,
+          "crates/rmux-server/src/handler_pane/live_key_decode.rs": 141,
+          "crates/rmux-server/src/handler_pane/send_keys/key_tokens.rs": 11,
+          "crates/rmux-server/src/handler_pane/user_key_input.rs": 50,
+          "crates/rmux-server/src/handler_session.rs": -23,
+          "crates/rmux-server/src/handler_shutdown.rs": -71,
+          "crates/rmux-server/src/input_keys.rs": -1,
+          "crates/rmux-server/src/mode_tree_buffer_editor.rs": 159,
+          "crates/rmux-server/src/outer_terminal.rs": 4,
+          "crates/rmux-server/src/outer_terminal/colours.rs": -65,
+          "crates/rmux-server/src/outer_terminal/features.rs": 18,
+          "crates/rmux-server/src/pane_terminals.rs": 1,
+          "crates/rmux-server/src/pane_terminals/allow_rename.rs": -16,
+          "crates/rmux-server/src/pane_terminals/cursor_style.rs": -16,
+          "crates/rmux-server/src/pane_terminals/pane_option_targets.rs": 33,
+          "crates/rmux-server/src/pane_terminals/pane_outputs/spawn.rs": 1,
+          "crates/rmux-server/src/pane_terminals/pane_transcripts.rs": -29,
+          "crates/rmux-server/src/pane_terminals/scroll_on_clear.rs": -16,
+          "crates/rmux-server/src/pane_transcript.rs": 6,
+          "crates/rmux-server/src/popup_install.rs": 95,
+          "crates/rmux-server/src/renderer.rs": 1,
+          "crates/rmux-server/src/renderer/display_panes.rs": 7,
+          "crates/rmux-server/src/renderer/pane_delta.rs": 7,
+          "crates/rmux-server/src/renderer/pane_palette.rs": 35,
+          "crates/rmux-server/src/renderer/pane_screen.rs": 3,
+          "crates/rmux-server/src/renderer/status.rs": -9,
+          "crates/rmux-server/src/renderer/status/prompt.rs": 21,
+          "crates/rmux-server/src/session_lock_timer.rs": 149,
+          "crates/rmux-server/src/shutdown_idle_policy.rs": 147,
+          "crates/rmux-server/src/terminal.rs": 4,
+          "crates/rmux-server/src/terminal/shell_spec.rs": 16,
+          "src/cli/command_runner.rs": 8,
+          "src/cli/dispatch.rs": 16,
+          "src/cli/session_commands.rs": 17,
+          "src/cli/startup.rs": 5
+        },
+        "inventory_before": "sha256:9cff5ba9ac965d9eea0f372fab53bed18cd121ad66737eba9529a792dcc2c740",
+        "inventory_after": "sha256:c633ddd06edf127d050174a8efb366aa85204acab10e4e58e396f4ba5ace3b21",
+        "scope": "D124 attribution only; no closed settlement, envelope, campaign or native product-test credit.",
+        "growth_authority": "sha256:a89b63cead927891ac21cba6d05e441f59984ba9f8137be75de9c98a7c2aadad"
+      },
+      {
+        "owner": "S4",
+        "lane": "S4-INT220-FLOATING-RESIZE-NATIVE-RED-CORRECTION-118",
+        "mandate": "sha256:78cc2491e54f9126c1911302c6bc472d40e08cf80d2a877c7ca097d8a2bf6a30",
+        "before": "d80e7475b0a0ae2ee5aa8de5ff9a2fc3ec32d936",
+        "after": "91e20b87c584792699b298234a87059f7fe7b115",
+        "reviewed_composition": "91e20b87c584792699b298234a87059f7fe7b115",
+        "review_id": "R1-420",
+        "review": "sha256:f74b54539cc4dd886d9b28feb6de8caede92910a07686c03b5eb619346b43fb6",
+        "composition": "sha256:ca4f4a74fb2c45a656f0fc63b2cc2062cd059596e2826250fcbb6b8e421bde47",
+        "status": "PASS",
+        "delta": -2,
+        "paths": {
+          "crates/rmux-core/src/layout/resize.rs": -15,
+          "crates/rmux-core/src/session/layout_cycle.rs": -119,
+          "crates/rmux-core/src/session/layout_cycle/resize.rs": 128,
+          "crates/rmux-core/src/window/resize_topology.rs": 4
+        },
+        "inventory_before": "sha256:03963cf41877e9980a3a99f7976dbaa64cc6452f4f1480a3b9fe80f253b2c806",
+        "inventory_after": "sha256:5b8b1b4d5b31e4d897c6e76bb3d2fe79d069e6131ec79ced6c0cf63356824c67",
+        "scope": "D124 attribution only; no closed settlement, envelope, campaign or native product-test credit."
+      },
+      {
+        "owner": "S1",
+        "lane": "S1-D106-LOADED-PAUSE-AGE-CAUSAL-CORRECTION-114",
+        "mandate": "sha256:1be77ff198ce08719bcc3d08729f448b6d03c4769d3637790a5cc05302f9af9b",
+        "before": "91e20b87c584792699b298234a87059f7fe7b115",
+        "after": "eadb520760d147d7bd43c16f8630fa5b24ab19d1",
+        "source_commits": [
+          "42d31e0ba5068907eddd4961c84c1f223d2aa57c",
+          "2ead0972c0c026003095c2df66762d000df0d8ce",
+          "8f1cd694cb8eedf3cf03172a125f05a1afc6c809",
+          "ba19c50e9bb9e5382738107ccd4867ba06b328b4",
+          "8c18cfb4471d45506cdbe76a786ef7619cb21391",
+          "5f8b00639ce2a49f914d9b4affdf3c109e5068af",
+          "1e987ddb2a72d6acc9110746018c2e1fa7445879"
+        ],
+        "source_before": "d80e7475b0a0ae2ee5aa8de5ff9a2fc3ec32d936",
+        "reviewed_composition": "62070a9d4f829bbb4587b2c140165883794000c1",
+        "review_id": "R1-435",
+        "review": "sha256:de890ddcfc6efc508c8f90fda941e422f1fa212038d72b1684898ec6ac6c61e5",
+        "composition": "sha256:a6327f77b490063d6e424bdea0b9ddef3c065626a05a5098ad389cc17bafb483",
+        "status": "PASS",
+        "delta": -19,
+        "paths": {
+          "crates/rmux-proto/src/control.rs": -2,
+          "crates/rmux-server/src/pane_io/reader.rs": -17
+        },
+        "inventory_before": "sha256:5b8b1b4d5b31e4d897c6e76bb3d2fe79d069e6131ec79ced6c0cf63356824c67",
+        "inventory_after": "sha256:b37e794feecaa87125083361107cf6d945c6390b3a8b453e6ae14de6369e0456",
+        "scope": "D124 attribution only; no closed settlement, envelope, campaign or native product-test credit."
+      },
+      {
+        "owner": "S3",
+        "lane": "S3-S1121-PAUSE-AGE-CAUSAL-APPROACH-CHANGE-124",
+        "mandate": "sha256:699a38cf3e16af6e6a4cffd6ccb2f384e2509605beacc21db65720a1c0a21eaf",
+        "before": "eadb520760d147d7bd43c16f8630fa5b24ab19d1",
+        "after": "2056cd392c07d062ea932e38b90c7837f1e9eca5",
+        "source_commits": [
+          "eda1fdc3b6f9357a5a2bf2af5a7c7a7275e73dee"
+        ],
+        "source_before": "1e987ddb2a72d6acc9110746018c2e1fa7445879",
+        "reviewed_composition": "62070a9d4f829bbb4587b2c140165883794000c1",
+        "review_id": "R1-435",
+        "review": "sha256:de890ddcfc6efc508c8f90fda941e422f1fa212038d72b1684898ec6ac6c61e5",
+        "composition": "sha256:a6327f77b490063d6e424bdea0b9ddef3c065626a05a5098ad389cc17bafb483",
+        "status": "PASS",
+        "delta": 0,
+        "paths": {},
+        "inventory_before": "sha256:b37e794feecaa87125083361107cf6d945c6390b3a8b453e6ae14de6369e0456",
+        "inventory_after": "sha256:77602b06211e1e460e8c983df092dba12f163db99252104321102cd13c9cdf55",
+        "scope": "D124 attribution only; no closed settlement, envelope, campaign or native product-test credit."
+      },
+      {
+        "owner": "S4",
+        "lane": "S4-S3124-PAUSE-AGE-ADMISSION-DRAIN-CAUSAL-CORRECTION-121",
+        "mandate": "sha256:b19b517f3719796c944290fb5101a8b1943536b8d41c2a5827d4a81ed0d7a848",
+        "before": "2056cd392c07d062ea932e38b90c7837f1e9eca5",
+        "after": "b7bdf74701991445ec4163fefb030676fb7bed61",
+        "source_commits": [
+          "cc2a52d142f79d59957b21e896f92d70d283ab51",
+          "b999b420ba7e5071228fe6ba629f6d6f374c235c",
+          "518c23e140d9847515fb98ffe5b1be0ac258d2ff",
+          "3b65257fe1a0de6e14f1bbde6665cb1363ea670e",
+          "f549a4d5ed4e02b36fb9e91bc2a7b3b9960877ed"
+        ],
+        "source_before": "eda1fdc3b6f9357a5a2bf2af5a7c7a7275e73dee",
+        "reviewed_composition": "62070a9d4f829bbb4587b2c140165883794000c1",
+        "review_id": "R1-435",
+        "review": "sha256:de890ddcfc6efc508c8f90fda941e422f1fa212038d72b1684898ec6ac6c61e5",
+        "composition": "sha256:a6327f77b490063d6e424bdea0b9ddef3c065626a05a5098ad389cc17bafb483",
+        "status": "PASS",
+        "delta": 0,
+        "paths": {
+          "crates/rmux-server/src/control/event_state.rs": 2,
+          "crates/rmux-server/src/control/output_queue.rs": 27,
+          "crates/rmux-server/src/control/pane_event_delivery.rs": -21,
+          "crates/rmux-server/src/control/subscriptions.rs": -1,
+          "crates/rmux-server/src/control/transport.rs": 2,
+          "crates/rmux-server/src/pane_io/types/control_cursor.rs": -9
+        },
+        "inventory_before": "sha256:77602b06211e1e460e8c983df092dba12f163db99252104321102cd13c9cdf55",
+        "inventory_after": "sha256:626c6b5ed47eea140c7eeb2b0629e173cc0fefacb33b9329ba00fda9737080e9",
+        "scope": "D124 attribution only; no closed settlement, envelope, campaign or native product-test credit."
+      },
+      {
+        "owner": "S2",
+        "lane": "S2-S4121-PAUSE-AGE-RESIDUAL-DRAIN-CORRECTION-091",
+        "mandate": "sha256:57345a5e4e542ed2a36435dea00d5680ab63bdd562e7f92821cce472305b704a",
+        "before": "b7bdf74701991445ec4163fefb030676fb7bed61",
+        "after": "4fd228ac81a87dc5a57104b4a2df9fb8fb059ce3",
+        "source_commits": [
+          "88e9ae49f74abee1190e985c6573427ec37ddaa7",
+          "04c48499a5dc71d6be4cb44a0ceb9eed61dbed03",
+          "197fce48f4ca253b36af9f057e560f793751b111"
+        ],
+        "source_before": "f549a4d5ed4e02b36fb9e91bc2a7b3b9960877ed",
+        "reviewed_composition": "62070a9d4f829bbb4587b2c140165883794000c1",
+        "review_id": "R1-435",
+        "review": "sha256:de890ddcfc6efc508c8f90fda941e422f1fa212038d72b1684898ec6ac6c61e5",
+        "composition": "sha256:a6327f77b490063d6e424bdea0b9ddef3c065626a05a5098ad389cc17bafb483",
+        "status": "PASS",
+        "delta": 0,
+        "paths": {},
+        "inventory_before": "sha256:626c6b5ed47eea140c7eeb2b0629e173cc0fefacb33b9329ba00fda9737080e9",
+        "inventory_after": "sha256:bf7653f698122773eab3a58d1c425c58ba8e66574195718a88bedf90e2d88b6b",
+        "scope": "D124 attribution only; no closed settlement, envelope, campaign or native product-test credit."
+      },
+      {
+        "owner": "S6",
+        "lane": "S6-DRAIN-FIFO-SNAPSHOT-CORRECTION-092",
+        "mandate": "sha256:190c8085db2e59fbeef4991b2e72b39df3a01f462acd5ac9f41e2d9f1b540f90",
+        "before": "4fd228ac81a87dc5a57104b4a2df9fb8fb059ce3",
+        "after": "62070a9d4f829bbb4587b2c140165883794000c1",
+        "source_commits": [
+          "43ea712b8fade6aa7ecd86496050665eb89743a0",
+          "eefd61da006098647a455d2418d91ed991e39010",
+          "cc8735156e4f416ebd8b413b257fd074b1855875",
+          "e379e4d348caeb7cab38745fb63c179588a54190",
+          "9442fa9b455f22720b8c87e2f7e761b9466c1800",
+          "91d320795ecbf3baf4e02cc8aa15a36a456485f9",
+          "9a84e3ebf92ed9ec5447e43d9bae39611eea4a4e",
+          "d01e1c48b2ded67e3e0766af82d96e8deb05e5ff",
+          "9fdb177e6f491357b3b54773e12f924d8c74cc6f",
+          "4e27fd01e1c2bb6b43b56664c0d7bc390dd6533c",
+          "9c3da53bd40d836dd0ffa3d4140018964e5c8d22"
+        ],
+        "source_before": "197fce48f4ca253b36af9f057e560f793751b111",
+        "reviewed_composition": "62070a9d4f829bbb4587b2c140165883794000c1",
+        "review_id": "R1-435",
+        "review": "sha256:de890ddcfc6efc508c8f90fda941e422f1fa212038d72b1684898ec6ac6c61e5",
+        "composition": "sha256:a6327f77b490063d6e424bdea0b9ddef3c065626a05a5098ad389cc17bafb483",
+        "status": "PASS",
+        "delta": -5,
+        "paths": {
+          "crates/rmux-server/src/control/output_queue.rs": 15,
+          "crates/rmux-server/src/control/server_events.rs": -4,
+          "crates/rmux-server/src/control/subscriptions.rs": -3,
+          "crates/rmux-server/src/control/transport.rs": -10,
+          "crates/rmux-server/src/control/transport_commands.rs": -3
+        },
+        "inventory_before": "sha256:bf7653f698122773eab3a58d1c425c58ba8e66574195718a88bedf90e2d88b6b",
+        "inventory_after": "sha256:56bdb4ea9bb7a8df59b028986339ac0236174f90659ef3c2bbd67f72d8ce6a22",
+        "scope": "D124 attribution only; no closed settlement, envelope, campaign or native product-test credit."
+      }
+    ],
+    "open_remainder": 0,
+    "open_ranges": [],
+    "historical_outside_ancestry": [
+      {
+        "lot": "S3-L081-INT156-CONFLICT-CORRECTION-095",
+        "after": "2166fb14ca13e8324d8e872e55282a7179a9094a",
+        "review": "sha256:01b54660f0570d44c348dc7a04e14c1a9b9b541e3a15acb83fb7b8eb81229fc6",
+        "status": "HISTORIQUE_HORS_ASCENDANCE",
+        "counted_in_913": false
+      },
+      {
+        "lot": "S4-L198-R1348-F1-F2-SIZE-ENVELOPE-CORRECTION-105",
+        "after": "89f17e38d523bdc3890d8515855e4166cc458bc3",
+        "review": "sha256:5e1056028ed80ea61be9ede8dc4d03994a30346b57f11e4ca6a8c719ef9b0983",
+        "status": "HISTORIQUE_HORS_ASCENDANCE",
+        "counted_in_913": false
+      },
+      {
+        "lot": "S5-L141-L142-L143-INT170-CONFLICT-RECOMPOSITION-086",
+        "after": "c622f6c085f95d22f3d6404d2ae38a9b13b6b70c",
+        "review": "sha256:29cd55c703000cc51089b74adcc4c44cc951f39fb07bbcc3694d8e26a499f4ef",
+        "status": "HISTORIQUE_HORS_ASCENDANCE",
+        "counted_in_913": false
+      },
+      {
+        "lot": "S3-L144-D79-INDEPENDENT-BUILD-COMPARISON-CODE-106",
+        "after": "fa000c644113f717bf7c7065a96704260e759b99",
+        "review": "sha256:c76b802293809fab499a9b4aeb96ff7439d4cfca28d3316ac280ae8da59f4028",
+        "status": "HISTORIQUE_HORS_ASCENDANCE",
+        "counted_in_913": false
+      },
+      {
+        "lot": "S1-L144-R1383-CANONICAL-INDEPENDENCE-STALE-GREEN-CORRECTION-109",
+        "after": "abd34236d818ca92d89812c91bca982358802319",
+        "review": "sha256:60011cf2c1b0cb64f7931c6e05a85eb5f2dc485f6bfc453d1227fad182618228",
+        "status": "HISTORIQUE_HORS_ASCENDANCE",
+        "counted_in_913": false
+      },
+      {
+        "lot": "S1-L144-R1390-NEIGHBOR-STALE-GREEN-CORRECTION-110",
+        "after": "74ce50cc706e6f88eb0ffff54b9a7a8c13db7b66",
+        "review": "sha256:8fa8c7fb48616c023ad220463a80d0e2a09e134e9069bd322238b1391ab9f889",
+        "status": "HISTORIQUE_HORS_ASCENDANCE",
+        "counted_in_913": false
+      },
+      {
+        "lot": "S1-L064-D79-INSTALLED-JOB-OBJECT-CODE-107",
+        "after": "c7b1747c4e705c2c6d963553c9e80491b0b44610",
+        "review": "sha256:396e443871e0bbefd911a026d2001c4f3476a1a155ca68b1c9ed75d50b70c26a",
+        "status": "HISTORIQUE_HORS_ASCENDANCE",
+        "counted_in_913": false
+      },
+      {
+        "lot": "S1-L064-R1380-COLLECTOR-F1-F2-F3-CORRECTION-108",
+        "after": "924d55f196aa99c4b1ec59be33671fa815d45b6d",
+        "review": "sha256:c8e7186c13547637e7e7a2aafd1ce91af723ff84efe30245fed6979d2cbfbe27",
+        "status": "HISTORIQUE_HORS_ASCENDANCE",
+        "counted_in_913": false
+      }
+    ],
+    "inventory_before": "sha256:9a2218cb54383e8a50f31a20820f3c89e02cdafe8765eced4e5ccde6e59f151b",
+    "inventory_after": "sha256:e4a32f96a5463a92d572e2e547a0555d66d30b2c5ca93d5c6003d16583dee90f",
+    "measurement_identity": "sha256:f30f6c37b0f9c654dc38b634e56c547d9a788cf20f1f06e78429ccefcafc7525",
+    "zero_unsettled_ranges": [
+      {
+        "before": "a8d6716f091ea8ac6a17ce47876b967744f02eb7",
+        "after": "d80e7475b0a0ae2ee5aa8de5ff9a2fc3ec32d936",
+        "delta": 0,
+        "status": "OUVERT",
+        "inventory_before": "sha256:c633ddd06edf127d050174a8efb366aa85204acab10e4e58e396f4ba5ace3b21",
+        "inventory_after": "sha256:03963cf41877e9980a3a99f7976dbaa64cc6452f4f1480a3b9fe80f253b2c806"
+      },
+      {
+        "before": "62070a9d4f829bbb4587b2c140165883794000c1",
+        "after": "7a63d529d7e6213f2e1410266734531e0b7555b8",
+        "delta": 0,
+        "status": "OUVERT",
+        "inventory_before": "sha256:56bdb4ea9bb7a8df59b028986339ac0236174f90659ef3c2bbd67f72d8ce6a22",
+        "inventory_after": "sha256:e4a32f96a5463a92d572e2e547a0555d66d30b2c5ca93d5c6003d16583dee90f"
+      }
+    ],
+    "scope": "913 attributed on reviewed compositions; O6/campaign/line closure remains OPEN. Existing 12 inscriptions, +502, envelopes and later +12 settlement unchanged."
+  }
+}

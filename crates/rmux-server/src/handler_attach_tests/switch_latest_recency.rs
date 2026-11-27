@@ -33,7 +33,7 @@
 //! on: `before=100x40`, `settled=120x50` across all three aliases, so tmux's
 //! assignment is unconditional and is not a side effect of changing session.
 //!
-//! Probe and log: `.rmux-audit/m9-latest/oracle_latest_switch.py`,
+//! Probe and log: `m9-latest/oracle_latest_switch.py`,
 //! `oracle-latest-switch.log`.
 
 use super::*;
@@ -480,8 +480,8 @@ async fn grouped_alias_session(
     set_session_status(handler, &grouped, STATUS_OFF).await;
     assert_eq!(
         active_window_index(handler, &grouped).await,
-        TARGET_WINDOW_INDEX,
-        "the grouped alias must be showing the linked window"
+        0,
+        "the grouped alias must start on its own first window"
     );
     grouped
 }

@@ -3,6 +3,10 @@ use crate::{PaneId, Result, RmuxError, SessionId, WindowId};
 use super::super::target::parse_error;
 use super::{ListedPane, ListedSession, LiveDetails, PaneInfoLocation, PaneInfoParentIdentity};
 
+#[cfg(test)]
+#[path = "parse_tests.rs"]
+mod canonical_inventory_tests;
+
 pub(crate) fn parse_details_line(line: &str) -> Result<LiveDetails> {
     if line.is_empty() {
         return Ok(LiveDetails::default());
@@ -51,7 +55,7 @@ pub(super) fn parse_session_line(line: &str) -> Result<ListedSession> {
         return Err(parse_error("session info line had trailing fields"));
     }
     Ok(ListedSession {
-        name: rmux_proto::SessionName::new(name).map_err(RmuxError::protocol)?,
+        name: rmux_proto::SessionName::from_canonical(name).map_err(RmuxError::from)?,
         id: parse_session_id(id)?,
     })
 }

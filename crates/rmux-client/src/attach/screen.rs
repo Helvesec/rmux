@@ -1,4 +1,8 @@
-use std::sync::atomic::{AtomicU64, Ordering};
+#[cfg(not(target_has_atomic = "64"))]
+use portable_atomic::AtomicU64;
+#[cfg(target_has_atomic = "64")]
+use std::sync::atomic::AtomicU64;
+use std::sync::atomic::Ordering;
 use std::sync::Arc;
 
 use rmux_core::alternate_screen_exit_sequence;
@@ -176,6 +180,22 @@ pub(super) fn contains_stop_marker_start(bytes: &[u8]) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn atomic64_stop_generation_keeps_high_bits_and_saturates() {
+        let tracker = AttachScreenTracker::default();
+        let high = u64::from(u32::MAX) + 1;
+        tracker.state.store(high, Ordering::SeqCst);
+        let generation = tracker.mark_stopped();
+        assert_eq!(generation, AttachStopGeneration(high + 3));
+        assert!(tracker.rearm_if_current(generation));
+        assert_eq!(tracker.state.load(Ordering::SeqCst), high + 2);
+        tracker.state.store(u64::MAX - 2, Ordering::SeqCst);
+        let exhausted = tracker.mark_stopped();
+        assert_eq!(exhausted, AttachStopGeneration(u64::MAX));
+        assert!(!tracker.rearm_if_current(exhausted));
+        assert!(tracker.was_stopped());
+    }
 
     #[test]
     fn tail_len_covers_all_stop_markers() {

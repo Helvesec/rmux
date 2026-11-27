@@ -23,7 +23,7 @@ async fn split_window_before_inserts_new_pane_on_the_leading_edge() {
             environment: None,
         }))
         .await;
-    assert!(matches!(created, Response::NewSession(_)));
+    crate::session_fixture::assert_new_session(&created);
 
     let split = handler
         .handle(Request::SplitWindow(SplitWindowRequest {

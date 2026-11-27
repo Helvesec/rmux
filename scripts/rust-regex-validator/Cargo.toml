@@ -1,0 +1,13 @@
+[package]
+name = "rmux-regex-validator"
+version = "0.0.0"
+edition = "2021"
+rust-version = "1.88.0"
+publish = false
+
+# Keep this small release tool independent of the daemon build. Its lockfile
+# closure is checked against the daemon's Cargo.lock before validating presets.
+[workspace]
+
+[dependencies]
+regex = "=1.12.4"

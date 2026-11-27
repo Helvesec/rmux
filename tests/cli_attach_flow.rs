@@ -772,6 +772,49 @@ fn attach_session_detach_emits_a_single_attach_stop_sequence() -> Result<(), Box
 }
 
 #[test]
+fn attached_client_reports_server_exit_when_another_client_kills_the_server(
+) -> Result<(), Box<dyn Error>> {
+    let harness = CliHarness::new("attach-flow-kill-server")?;
+    let mut daemon = harness.start_hidden_daemon()?;
+
+    assert_success(&harness.run(&["new-session", "-d", "-s", "alpha"])?);
+
+    let mut attach = AttachedSession::spawn(&harness, "alpha", TerminalSize::new(80, 24))?;
+    attach.wait_for_raw_mode(IO_TIMEOUT)?;
+    let _ = read_until_contains(attach.master_mut(), "[alpha]", IO_TIMEOUT)?;
+
+    assert_success(&harness.run(&["kill-server"])?);
+    let (status, output) = attach.wait_for_exit_with_output(IO_TIMEOUT)?;
+    // tmux 3.7b: `[server exited]` and exit status 1 (client.c, MSG_SHUTDOWN).
+    assert_eq!(
+        status.code(),
+        Some(1),
+        "an attached client whose server was killed must not exit as if detached, got: {:?}",
+        String::from_utf8_lossy(&output)
+    );
+    attach.assert_restored()?;
+    assert!(
+        output
+            .windows(b"[server exited]\r\n".len())
+            .any(|window| window == b"[server exited]\r\n"),
+        "kill-server output should contain the server-exited banner, got: {:?}",
+        String::from_utf8_lossy(&output)
+    );
+    assert_eq!(
+        output
+            .windows(b"\x1b[?1049l".len())
+            .filter(|window| *window == b"\x1b[?1049l")
+            .count(),
+        1,
+        "kill-server output should contain exactly one alternate-screen exit, got: {:?}",
+        String::from_utf8_lossy(&output)
+    );
+
+    terminate_child(daemon.child_mut())?;
+    Ok(())
+}
+
+#[test]
 fn inactive_pane_output_refreshes_the_real_attached_client() -> Result<(), Box<dyn Error>> {
     let harness = CliHarness::new("attach-flow-inactive-pane-output")?;
     let mut daemon = harness.start_hidden_daemon()?;
@@ -1710,6 +1753,12 @@ fn prefix_w_then_prefix_q_timeout_restores_choose_tree_overlay() -> Result<(), B
     assert_success(&harness.run(&["split-window", "-h", "-t", "alpha:0.0"])?);
     assert_success(&harness.run(&["split-window", "-v", "-t", "alpha:0.0"])?);
     assert_success(&harness.run(&["set", "-g", "display-panes-time", "200"])?);
+    assert_success(&harness.run(&[
+        "set",
+        "-g",
+        "tree-mode-preview-format",
+        "#{?pane_format,#{pane_index},#{window_index}}",
+    ])?);
 
     let mut attach = AttachedSession::spawn(&harness, "alpha", TerminalSize::new(100, 30))?;
     attach.wait_for_raw_mode(IO_TIMEOUT)?;

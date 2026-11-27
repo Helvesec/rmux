@@ -37,6 +37,8 @@ impl fmt::Debug for PrivatePaneEnvironment {
 pub(crate) enum PaneLifecycleProcessState {
     #[default]
     Unknown,
+    /// A live pane with output state but no child process or terminal.
+    Empty,
     #[cfg(windows)]
     Starting,
     Running {
@@ -64,6 +66,9 @@ impl From<PaneExitMetadata> for PaneLifecycleExitState {
 
 #[derive(Clone, PartialEq, Eq)]
 pub(crate) struct PaneLifecycleState {
+    /// A birth identity survives transfers/checkpoints, but never runtime replacement.
+    /// Entropy failure leaves snapshots unavailable rather than weakening admission.
+    incarnation: Option<[u8; 32]>,
     pub(crate) session_id: SessionId,
     pub(crate) window_id: WindowId,
     pub(crate) pane_id: PaneId,
@@ -104,6 +109,14 @@ impl fmt::Debug for PaneLifecycleState {
 }
 
 impl PaneLifecycleState {
+    pub(crate) fn snapshot_incarnation(&self) -> Option<[u8; 32]> {
+        match self.process {
+            PaneLifecycleProcessState::Running { .. } | PaneLifecycleProcessState::Empty => {
+                self.incarnation
+            }
+            _ => None,
+        }
+    }
     #[cfg(test)]
     pub(crate) fn command(&self) -> Option<&[String]> {
         self.command.as_deref()
@@ -203,6 +216,24 @@ impl HandlerState {
         self.record_pane_lifecycle_with_process(spawn, PaneLifecycleProcessState::Running { pid });
     }
 
+    pub(in crate::pane_terminals) fn record_pane_lifecycle_empty(
+        &mut self,
+        spawn: PaneLifecycleSpawn,
+    ) {
+        self.record_pane_lifecycle_with_process(spawn, PaneLifecycleProcessState::Empty);
+    }
+
+    pub(crate) fn pane_is_empty(&self, pane_id: PaneId) -> bool {
+        self.pane_lifecycle
+            .get(&pane_id)
+            .is_some_and(|state| state.process == PaneLifecycleProcessState::Empty)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn forget_pane_lifecycle_for_test(&mut self, pane_id: PaneId) {
+        self.pane_lifecycle.remove(&pane_id);
+    }
+
     fn record_pane_lifecycle_with_process(
         &mut self,
         spawn: PaneLifecycleSpawn,
@@ -237,6 +268,10 @@ impl HandlerState {
         self.pane_lifecycle.insert(
             pane_id,
             PaneLifecycleState {
+                incarnation: {
+                    let mut bytes = [0; 32];
+                    getrandom::fill(&mut bytes).ok().map(|()| bytes)
+                },
                 session_id,
                 window_id,
                 pane_id,
@@ -331,7 +366,7 @@ impl HandlerState {
         let session_id = session.id();
         let updates = session
             .windows()
-            .values()
+            .map(|(_, window)| window)
             .flat_map(|window| {
                 window.panes().iter().map(move |pane| {
                     (

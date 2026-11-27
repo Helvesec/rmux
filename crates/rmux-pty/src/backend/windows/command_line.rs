@@ -1,8 +1,8 @@
 use std::collections::BTreeMap;
-use std::ffi::{OsStr, OsString};
+use std::ffi::{CString, OsStr, OsString};
 use std::os::windows::ffi::OsStrExt;
 
-use crate::ChildCommand;
+use crate::{ChildCommand, PtyError};
 
 const BACKSLASH: u16 = b'\\' as u16;
 const DOUBLE_QUOTE: u16 = b'"' as u16;
@@ -33,9 +33,9 @@ pub(super) fn command_line(command: &ChildCommand) -> Vec<u16> {
     line
 }
 
-pub(super) fn environment_block(command: &ChildCommand) -> Option<Vec<u16>> {
+pub(super) fn environment_block(command: &ChildCommand) -> Result<Option<Vec<u16>>, PtyError> {
     if !command.clear_env && command.env.is_empty() {
-        return None;
+        return Ok(None);
     }
 
     let mut env = BTreeMap::<NormalizedEnvKey, (OsString, OsString)>::new();
@@ -51,8 +51,20 @@ pub(super) fn environment_block(command: &ChildCommand) -> Option<Vec<u16>> {
         );
     }
 
+    // An environment block separates its entries with NUL, so an interior NUL
+    // would end that entry early and hand CreateProcessW a silently truncated
+    // variable the child then accepts. Unix refuses the same configuration when
+    // std spawns the child; refuse it here too, at the same boundary, so the
+    // spawn fails and its rollback runs.
+    //
+    // The check is on the resolved entries, not on the caller's raw list.
+    // `ChildCommand::env` sets *or overrides*, and the map above applies the
+    // last write with the case-insensitive key Windows uses, so a value that is
+    // replaced never reaches the block and must not fail the spawn.
     let mut block = Vec::new();
     for (_normalized, (key, value)) in env {
+        reject_interior_nul(&key)?;
+        reject_interior_nul(&value)?;
         block.extend(key.encode_wide());
         block.push(EQUALS);
         block.extend(value.encode_wide());
@@ -62,7 +74,25 @@ pub(super) fn environment_block(command: &ChildCommand) -> Option<Vec<u16>> {
         block.push(0);
     }
     block.push(0);
-    Some(block)
+    Ok(Some(block))
+}
+
+/// Rejects an interior NUL with the typed error the crate already documents.
+///
+/// `NulError` is only constructible through `CString`, so an equivalent byte
+/// sequence of the same length carries the offending index. That index counts
+/// UTF-16 units of the rejected value and the bytes are filler: it locates the
+/// NUL for a reader, it is not the standard byte offset of the original value
+/// and no caller should present it as one.
+fn reject_interior_nul(value: &OsStr) -> Result<(), PtyError> {
+    let Some(position) = value.encode_wide().position(|unit| unit == 0) else {
+        return Ok(());
+    };
+    let mut bytes = vec![b'_'; position + 1];
+    bytes[position] = 0;
+    Err(PtyError::Nul(
+        CString::new(bytes).expect_err("the sequence contains an interior NUL"),
+    ))
 }
 
 pub(super) fn wide_null(value: &OsStr) -> Vec<u16> {
@@ -159,11 +189,128 @@ mod tests {
         );
     }
 
+    fn nul_error(result: Result<Option<Vec<u16>>, PtyError>) -> std::ffi::NulError {
+        match result {
+            Err(PtyError::Nul(error)) => error,
+            other => panic!("expected an interior-NUL rejection, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn environment_block_rejects_an_interior_nul_in_a_value() {
+        // The gate2 case: -e FNP_FAIL=\0 must fail the spawn, not become an
+        // accepted variable truncated at the NUL.
+        let command = ChildCommand::new("prog.exe")
+            .clear_env()
+            .env("FNP_FAIL", OsString::from_wide(&[0]));
+
+        assert_eq!(nul_error(environment_block(&command)).nul_position(), 0);
+    }
+
+    #[test]
+    fn environment_block_rejects_an_interior_nul_wherever_it_sits() {
+        for (label, units) in [
+            ("leading", vec![0, b'v' as u16, b'l' as u16]),
+            ("middle", vec![b'v' as u16, 0, b'l' as u16]),
+            ("trailing", vec![b'v' as u16, b'l' as u16, 0]),
+        ] {
+            let expected = units.iter().position(|unit| *unit == 0).unwrap();
+            let command = ChildCommand::new("prog.exe")
+                .clear_env()
+                .env("K", OsString::from_wide(&units));
+
+            assert_eq!(
+                nul_error(environment_block(&command)).nul_position(),
+                expected,
+                "{label}"
+            );
+        }
+    }
+
+    #[test]
+    fn environment_block_rejects_an_interior_nul_in_a_name() {
+        let command = ChildCommand::new("prog.exe")
+            .clear_env()
+            .env(OsString::from_wide(&[b'K' as u16, 0, b'2' as u16]), "value");
+
+        assert_eq!(nul_error(environment_block(&command)).nul_position(), 1);
+    }
+
+    #[test]
+    fn environment_block_accepts_a_valid_value_that_overrides_an_earlier_nul() {
+        // ChildCommand::env sets *or overrides*. A replaced value never reaches
+        // the block, so it must not fail the spawn.
+        let command = ChildCommand::new("prog.exe")
+            .clear_env()
+            .env("K", OsString::from_wide(&[b'b' as u16, 0, b'd' as u16]))
+            .env("K", "valid");
+        let block = environment_block(&command)
+            .expect("the last override is valid")
+            .expect("environment block present");
+
+        assert_eq!(block, "K=valid\0\0".encode_utf16().collect::<Vec<u16>>());
+    }
+
+    #[test]
+    fn environment_block_accepts_a_case_variant_override_of_an_earlier_nul() {
+        // Windows resolves environment names case-insensitively, so the later
+        // lower-case key wins and carries its own spelling into the block.
+        let command = ChildCommand::new("prog.exe")
+            .clear_env()
+            .env("K", OsString::from_wide(&[b'b' as u16, 0, b'd' as u16]))
+            .env("k", "valid");
+        let block = environment_block(&command)
+            .expect("the last override is valid")
+            .expect("environment block present");
+
+        assert_eq!(block, "k=valid\0\0".encode_utf16().collect::<Vec<u16>>());
+    }
+
+    #[test]
+    fn environment_block_still_rejects_a_nul_that_wins_the_override() {
+        // The mirror case: when the NUL is the value that survives resolution,
+        // the spawn must still fail.
+        let command = ChildCommand::new("prog.exe")
+            .clear_env()
+            .env("K", "valid")
+            .env("K", OsString::from_wide(&[b'b' as u16, 0, b'd' as u16]));
+
+        assert_eq!(nul_error(environment_block(&command)).nul_position(), 1);
+    }
+
+    #[test]
+    fn environment_block_keeps_valid_values_including_equals_and_raw_units() {
+        // A value may legitimately contain '=' and non-Unicode wide units, and
+        // a Windows drive entry legitimately starts with '='. None of these is
+        // an interior NUL and none may be rejected.
+        let raw = OsString::from_wide(&[0xD800]);
+        let command = ChildCommand::new("prog.exe")
+            .clear_env()
+            .env("WITH_EQUALS", "a=b=c")
+            .env("RAW", raw)
+            .env("=C:", r"C:\dir");
+        let block = environment_block(&command)
+            .expect("valid environment builds")
+            .expect("environment block present");
+
+        assert!(block.contains(&0xD800));
+        let rendered = String::from_utf16_lossy(&block);
+        assert!(rendered.contains("WITH_EQUALS=a=b=c"), "{rendered:?}");
+        assert!(rendered.contains("=C:="), "{rendered:?}");
+    }
+
+    #[test]
+    fn environment_block_without_overrides_inherits_and_is_not_rejected() {
+        let command = ChildCommand::new("prog.exe");
+
+        assert_eq!(environment_block(&command).unwrap(), None);
+    }
+
     #[test]
     fn empty_environment_block_is_double_nul_terminated() {
         let command = ChildCommand::new("prog.exe").clear_env();
 
-        assert_eq!(environment_block(&command), Some(vec![0, 0]));
+        assert_eq!(environment_block(&command).unwrap(), Some(vec![0, 0]));
     }
 
     #[test]
@@ -172,7 +319,9 @@ mod tests {
             .clear_env()
             .env("Path", "first")
             .env("PATH", "second");
-        let block = environment_block(&command).expect("environment block");
+        let block = environment_block(&command)
+            .expect("environment block builds")
+            .expect("environment block present");
 
         assert_eq!(env_entries(&block), vec!["PATH=second"]);
         assert_eq!(&block[block.len() - 2..], &[0, 0]);

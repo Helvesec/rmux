@@ -5,7 +5,7 @@ use std::path::PathBuf;
 
 fn web_snapshot_source() -> String {
     let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..");
-    fs::read_to_string(root.join("crates/rmux-server/src/handler_web_snapshot.rs"))
+    fs::read_to_string(root.join("crates/rmux-server/src/handler/web_support/snapshot.rs"))
         .expect("web snapshot source is readable")
 }
 

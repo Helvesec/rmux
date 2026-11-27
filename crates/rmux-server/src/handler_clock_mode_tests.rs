@@ -50,7 +50,7 @@ pub(super) async fn create_session(
             skip_environment_update: false,
         })))
         .await;
-    assert!(matches!(response, Response::NewSession(_)));
+    crate::session_fixture::assert_new_session(&response);
     let target = PaneTarget::with_window(session_name, 0, 0);
     wait_for_transcript_containing(
         handler,
@@ -88,7 +88,7 @@ fn quiet_clock_command(marker: &str) -> Vec<String> {
     ]
 }
 
-async fn wait_for_transcript_containing(
+pub(super) async fn wait_for_transcript_containing(
     handler: &RequestHandler,
     target: &PaneTarget,
     needle: &str,
@@ -109,7 +109,7 @@ async fn wait_for_transcript_containing(
     }
 }
 
-async fn capture_transcript(handler: &RequestHandler, target: &PaneTarget) -> String {
+pub(super) async fn capture_transcript(handler: &RequestHandler, target: &PaneTarget) -> String {
     let transcript = {
         let state = handler.state.lock().await;
         state
@@ -118,7 +118,6 @@ async fn capture_transcript(handler: &RequestHandler, target: &PaneTarget) -> St
     };
     let capture = transcript
         .lock()
-        .expect("pane transcript mutex must not be poisoned")
         .capture_main(ScreenCaptureRange::default(), GridRenderOptions::default());
     String::from_utf8_lossy(&capture).into_owned()
 }
@@ -135,17 +134,11 @@ async fn replace_transcript_contents(
             .transcript_handle(target)
             .expect("pane transcript exists")
     };
-    let history_limit = transcript
-        .lock()
-        .expect("pane transcript mutex must not be poisoned")
-        .history_limit();
+    let history_limit = transcript.lock().history_limit();
     let mut screen = Screen::new(size, history_limit);
     let mut parser = InputParser::new();
     parser.parse(content, &mut screen);
-    transcript
-        .lock()
-        .expect("pane transcript mutex must not be poisoned")
-        .set_screen_for_test(screen);
+    transcript.lock().set_screen_for_test(screen);
 }
 
 async fn dispatch_as(handler: &RequestHandler, requester_pid: u32, request: Request) -> Response {
@@ -209,6 +202,8 @@ fn drain_control_notifications(rx: &mut mpsc::Receiver<ControlServerEvent>) -> V
             Ok(
                 ControlServerEvent::SessionChanged(_)
                 | ControlServerEvent::SessionChangedAt { .. }
+                | ControlServerEvent::FormatSubscriptions(_)
+                | ControlServerEvent::PaneOutputActions(_)
                 | ControlServerEvent::Refresh,
             ) => {}
             Ok(ControlServerEvent::Exit(reason)) => {
@@ -234,7 +229,11 @@ async fn pane_id(handler: &RequestHandler, target: &PaneTarget) -> u32 {
         .as_u32()
 }
 
-async fn list_panes_text(handler: &RequestHandler, target: &PaneTarget, format: &str) -> String {
+pub(super) async fn list_panes_text(
+    handler: &RequestHandler,
+    target: &PaneTarget,
+    format: &str,
+) -> String {
     let response = handler
         .handle(Request::ListPanes(Box::new(ListPanesRequest {
             target: target.session_name().clone(),
@@ -258,6 +257,7 @@ async fn next_overlay(
         match control_rx.recv().await {
             Some(AttachControl::Overlay(frame)) if frame.frame.is_empty() => {}
             Some(AttachControl::Overlay(frame)) => return frame,
+            Some(AttachControl::CoalescedPopupOverlay(_)) => panic!("unexpected popup overlay"),
             Some(AttachControl::AdvancePersistentOverlayState(_)) => {}
             Some(AttachControl::Switch(_)) => {}
             Some(AttachControl::Refresh) => {}
@@ -534,9 +534,7 @@ async fn clock_mode_exit_restores_underlying_hidden_cursor_state() {
         let transcript = state
             .transcript_handle(&target)
             .expect("pane transcript exists");
-        let mut transcript = transcript
-            .lock()
-            .expect("pane transcript mutex must not be poisoned");
+        let mut transcript = transcript.lock();
         transcript.append_bytes(b"\x1b[?25l");
     }
     {
@@ -595,9 +593,7 @@ async fn clock_mode_exit_restores_visible_line_content() {
         let transcript = state
             .transcript_handle(&target)
             .expect("pane transcript exists");
-        let mut transcript = transcript
-            .lock()
-            .expect("pane transcript mutex must not be poisoned");
+        let mut transcript = transcript.lock();
         transcript.append_bytes(b"\x1b[31mred\r\nmore");
     }
 

@@ -531,3 +531,333 @@ fn widget_render_clips_wide_glyph_at_right_edge() {
         "clipped wide glyph must not suppress the adjacent widget update"
     );
 }
+
+mod scene_projection {
+    use ratatui_core::{buffer::Buffer, layout::Rect, widgets::Widget};
+    use ratatui_rmux::{PaneState, SceneWidget};
+    use rmux_sdk::*;
+    #[test]
+    fn resolved_spans_clip_wide_cells_and_hide_occluded_cursor() {
+        let rect = SceneRect {
+            x: -1,
+            y: 0,
+            cols: 3,
+            rows: 1,
+        };
+        let pane = ScenePane {
+            id: PaneId::new(4),
+            index: 9,
+            floating: true,
+            layer: 1,
+            focused: true,
+            visible: true,
+            content: rect.clone(),
+            frame: rect.clone(),
+            content_clip: rect.clone(),
+            frame_clip: rect,
+            hit_regions: vec![],
+            spans: vec![SceneSpan {
+                x: 0,
+                y: 0,
+                source_row: 0,
+                source_col: 1,
+                cols: 1,
+            }],
+        };
+        let scene = SceneSnapshot {
+            schema: 1,
+            session_id: SessionId::new(1),
+            window_id: WindowId::new(2),
+            window_index: 0,
+            revision: "test".into(),
+            cols: 3,
+            rows: 1,
+            content_y_offset: 0,
+            active_pane_id: Some(pane.id),
+            panes: vec![pane],
+            borders: vec![],
+        };
+        let cell = |text: &str, width| PaneCell {
+            glyph: PaneGlyph::new(text, width),
+            attributes: PaneAttributes::EMPTY,
+            foreground: PaneColor::Default,
+            background: PaneColor::Default,
+            underline: PaneColor::Default,
+        };
+        let snapshot = PaneSnapshot::new(
+            3,
+            1,
+            vec![cell("A", 1), cell("界", 2), cell("", 0)],
+            PaneCursor::new(0, 0, true, 0),
+        )
+        .unwrap();
+        let mut panes = vec![(PaneId::new(4), PaneState::from_snapshot(snapshot))];
+        let area = Rect::new(1, 1, 3, 1);
+        let mut buffer = Buffer::empty(Rect::new(0, 0, 5, 3));
+        buffer.cell_mut((4, 1)).unwrap().set_symbol("Z");
+        SceneWidget::new(&scene, &panes).render(area, &mut buffer);
+        assert_eq!(buffer.cell((1, 1)).unwrap().symbol(), " ");
+        assert_eq!(buffer.cell((4, 1)).unwrap().symbol(), "Z");
+        assert_eq!(SceneWidget::new(&scene, &panes).cursor(area), None);
+        panes[0].1.snapshot.cursor.col = 1;
+        assert_eq!(SceneWidget::new(&scene, &panes).cursor(area), Some((1, 1)));
+        // Same slot with wrong stable identity cannot contribute pixels or cursor.
+        panes[0].0 = PaneId::new(5);
+        assert_eq!(SceneWidget::new(&scene, &panes).cursor(area), None);
+    }
+}
+
+// R3632 M1: the incoming Buffer must not contribute text attributes.
+mod buffer_modifiers {
+    use super::*;
+    use ratatui_rmux::SceneWidget;
+    use rmux_sdk::{
+        SceneBorder, ScenePane, SceneRect, SceneSnapshot, SceneSpan, SessionId, WindowId,
+    };
+
+    fn state(attributes: PaneAttributes) -> PaneState {
+        let mut cell = PaneCell::new(PaneGlyph::new("X", 1));
+        cell.attributes = attributes;
+        PaneState::from_snapshot(
+            PaneSnapshot::new(1, 1, vec![cell], PaneCursor::default()).unwrap(),
+        )
+    }
+
+    fn scene(cols: u16, rows: u16) -> SceneSnapshot {
+        let rect = SceneRect {
+            x: 0,
+            y: 0,
+            cols: i32::from(cols),
+            rows: i32::from(rows),
+        };
+        SceneSnapshot {
+            schema: 1,
+            session_id: SessionId::new(0),
+            window_id: WindowId::new(0),
+            window_index: 0,
+            revision: String::new(),
+            cols,
+            rows,
+            content_y_offset: 0,
+            active_pane_id: Some(PaneId::new(0)),
+            borders: vec![],
+            panes: vec![ScenePane {
+                id: PaneId::new(0),
+                index: 0,
+                floating: false,
+                layer: 0,
+                focused: true,
+                visible: true,
+                content: rect.clone(),
+                frame: rect.clone(),
+                content_clip: rect.clone(),
+                frame_clip: rect,
+                hit_regions: vec![],
+                spans: (0..rows)
+                    .map(|y| SceneSpan {
+                        x: 0,
+                        y,
+                        source_row: usize::from(y),
+                        source_col: 0,
+                        cols,
+                    })
+                    .collect(),
+            }],
+        }
+    }
+
+    fn assert_clean_render(area: Rect, render: impl Fn(&mut Buffer)) -> Buffer {
+        // Offset buffer, neighboring host cells, and an area allowed to extend
+        // beyond the buffer exercise the same clearing boundary as painting.
+        let mut host = Buffer::empty(Rect::new(1, 1, 6, 3));
+        for cell in &mut host.content {
+            cell.set_symbol("@")
+                .set_style(Style::new().add_modifier(Modifier::all()));
+        }
+        let mut fresh = host.clone();
+        for y in area.top()..area.bottom() {
+            for x in area.left()..area.right() {
+                if let Some(cell) = fresh.cell_mut((x, y)) {
+                    cell.reset();
+                }
+            }
+        }
+        let mut expected = fresh.clone();
+        render(&mut expected);
+        for prior in Modifier::all().iter().chain([Modifier::all()]) {
+            let mut reused = fresh.clone();
+            for y in area.top()..area.bottom() {
+                for x in area.left()..area.right() {
+                    if let Some(cell) = reused.cell_mut((x, y)) {
+                        cell.set_style(Style::new().add_modifier(prior));
+                    }
+                }
+            }
+            render(&mut reused);
+            assert_eq!(reused, expected, "prior modifiers: {prior:?}");
+            render(&mut reused);
+            assert_eq!(reused, expected, "repeat with prior modifiers: {prior:?}");
+        }
+        for y in host.area.top()..host.area.bottom() {
+            for x in host.area.left()..host.area.right() {
+                if !area.contains((x, y).into()) {
+                    assert_eq!(expected[(x, y)], host[(x, y)], "outside render area");
+                }
+            }
+        }
+        expected
+    }
+
+    #[test]
+    fn pane_repaint_removes_previous_snapshot_attributes() {
+        let area = Rect::new(0, 0, 1, 1);
+        let plain = state(PaneAttributes::EMPTY);
+        let mut fresh = Buffer::empty(area);
+        PaneWidget::new(&plain).render(area, &mut fresh);
+        let mut reused = Buffer::empty(area);
+        PaneWidget::new(&state(PaneAttributes::HIDDEN | PaneAttributes::BOLD))
+            .render(area, &mut reused);
+        PaneWidget::new(&plain).render(area, &mut reused);
+        assert_eq!(fresh[(0, 0)].modifier, Modifier::empty());
+        assert_eq!(reused, fresh);
+    }
+
+    #[test]
+    fn scene_repaint_removes_previous_snapshot_attributes() {
+        let area = Rect::new(0, 0, 1, 1);
+        let scene = scene(1, 1);
+        let plain = [(PaneId::new(0), state(PaneAttributes::EMPTY))];
+        let hidden = [(
+            PaneId::new(0),
+            state(PaneAttributes::HIDDEN | PaneAttributes::BOLD),
+        )];
+        let mut fresh = Buffer::empty(area);
+        SceneWidget::new(&scene, &plain).render(area, &mut fresh);
+        let mut reused = Buffer::empty(area);
+        SceneWidget::new(&scene, &hidden).render(area, &mut reused);
+        SceneWidget::new(&scene, &plain).render(area, &mut reused);
+        assert_eq!(fresh[(0, 0)].modifier, Modifier::empty());
+        assert_eq!(reused, fresh);
+    }
+
+    #[test]
+    fn pane_host_attributes_are_replaced_with_base_and_snapshot_attributes() {
+        let area = Rect::new(2, 2, 3, 2);
+        for attrs in [
+            PaneAttributes::EMPTY,
+            PaneAttributes::HIDDEN | PaneAttributes::BOLD,
+        ] {
+            let state = state(attrs);
+            for base in [
+                Style::new(),
+                Style::new()
+                    .add_modifier(Modifier::ITALIC)
+                    .remove_modifier(Modifier::BOLD | Modifier::HIDDEN),
+            ] {
+                let actual = assert_clean_render(area, |buf| {
+                    PaneWidget::new(&state).base_style(base).render(area, buf);
+                });
+                assert_eq!(actual[(2, 2)].modifier, base.add_modifier | modifier(attrs));
+                assert_eq!(actual[(3, 2)].modifier, base.add_modifier);
+                assert_eq!(actual[(2, 3)].modifier, base.add_modifier);
+            }
+        }
+    }
+
+    #[test]
+    fn scene_host_attributes_are_replaced_in_content_background_and_borders() {
+        let area = Rect::new(2, 2, 3, 2);
+        let mut scene = scene(3, 2);
+        scene.borders.push(SceneBorder {
+            x: 2,
+            y: 0,
+            glyph: '│',
+            pane_id: PaneId::new(0),
+            active: true,
+        });
+        for attrs in [
+            PaneAttributes::EMPTY,
+            PaneAttributes::HIDDEN | PaneAttributes::BOLD,
+        ] {
+            let panes = [(PaneId::new(0), state(attrs))];
+            let actual = assert_clean_render(area, |buf| {
+                SceneWidget::new(&scene, &panes).render(area, buf)
+            });
+            assert_eq!(actual[(2, 2)].modifier, modifier(attrs));
+            assert_eq!(actual[(3, 2)].modifier, Modifier::empty());
+            assert_eq!(actual[(4, 2)].symbol(), "│");
+            assert_eq!(actual[(4, 2)].modifier, Modifier::empty());
+        }
+    }
+
+    #[test]
+    fn pane_empty_and_malformed_snapshots_clear_host_attributes() {
+        let area = Rect::new(2, 2, 3, 2);
+        let mut malformed = state(PaneAttributes::EMPTY);
+        malformed.snapshot.cols = 2;
+        for state in [PaneState::default(), malformed] {
+            let actual = assert_clean_render(area, |buf| PaneWidget::new(&state).render(area, buf));
+            assert_eq!(actual[(2, 2)].modifier, Modifier::empty());
+        }
+    }
+
+    #[test]
+    fn scene_empty_missing_and_malformed_snapshots_clear_host_attributes() {
+        let area = Rect::new(2, 2, 3, 2);
+        let scene = scene(3, 2);
+        let mut malformed = state(PaneAttributes::EMPTY);
+        malformed.snapshot.cols = 2;
+        for panes in [
+            vec![],
+            vec![(PaneId::new(0), PaneState::default())],
+            vec![(PaneId::new(0), malformed)],
+        ] {
+            let actual = assert_clean_render(area, |buf| {
+                SceneWidget::new(&scene, &panes).render(area, buf)
+            });
+            assert_eq!(actual[(2, 2)].modifier, Modifier::empty());
+        }
+    }
+
+    fn wide_state() -> PaneState {
+        PaneState::from_snapshot(
+            PaneSnapshot::new(
+                4,
+                1,
+                vec![
+                    PaneCell::new(PaneGlyph::new("界", 2)),
+                    PaneCell::padding(),
+                    PaneCell::new(PaneGlyph::new("界", 2)),
+                    PaneCell::padding(),
+                ],
+                PaneCursor::default(),
+            )
+            .unwrap(),
+        )
+    }
+
+    #[test]
+    fn pane_padding_and_clipped_wide_cells_clear_host_attributes() {
+        let state = wide_state();
+        for area in [Rect::new(2, 2, 3, 1), Rect::new(4, 2, 4, 1)] {
+            let actual = assert_clean_render(area, |buf| PaneWidget::new(&state).render(area, buf));
+            assert_eq!(actual[(area.x, 2)].symbol(), "界");
+            assert_eq!(actual[(area.x + 1, 2)].symbol(), " ");
+            assert_eq!(actual[(area.x + 2, 2)].symbol(), " ");
+        }
+    }
+
+    #[test]
+    fn scene_padding_and_clipped_wide_cells_clear_host_attributes() {
+        let scene = scene(4, 1);
+        let panes = [(PaneId::new(0), wide_state())];
+        for area in [Rect::new(2, 2, 3, 1), Rect::new(4, 2, 4, 1)] {
+            let actual = assert_clean_render(area, |buf| {
+                SceneWidget::new(&scene, &panes).render(area, buf)
+            });
+            assert_eq!(actual[(area.x, 2)].symbol(), "界");
+            assert_eq!(actual[(area.x + 1, 2)].symbol(), " ");
+            assert_eq!(actual[(area.x + 2, 2)].symbol(), " ");
+        }
+    }
+}

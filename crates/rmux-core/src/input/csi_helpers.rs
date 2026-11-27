@@ -68,11 +68,14 @@ pub(super) fn dispatch_sm_private<W: ScreenWriter + ?Sized>(
             1004 => writer.mode_set(mode::MODE_FOCUSON),
             1005 => writer.mode_set(mode::MODE_MOUSE_UTF8),
             1006 => writer.mode_set(mode::MODE_MOUSE_SGR),
-            47 | 1047 => writer.alternate_on(bg, false),
-            1049 => writer.alternate_on(bg, true),
+            47 | 1047 => writer.alternate_on_with_rendition(&parser.cell, false),
+            1049 => writer.alternate_on_with_rendition(&parser.cell, true),
             2004 => writer.mode_set(mode::MODE_BRACKETPASTE),
             2026 => writer.start_sync(),
-            2031 => writer.mode_set(mode::MODE_THEME_UPDATES),
+            2031 => {
+                writer.mode_set(mode::MODE_THEME_UPDATES);
+                parser.theme_event(super::ThemeAction::Subscribe(true));
+            }
             WIN32_CONSOLE_INPUT_MODE => {}
             _ => {}
         }
@@ -110,11 +113,14 @@ pub(super) fn dispatch_rm_private<W: ScreenWriter + ?Sized>(
             1004 => writer.mode_clear(mode::MODE_FOCUSON),
             1005 => writer.mode_clear(mode::MODE_MOUSE_UTF8),
             1006 => writer.mode_clear(mode::MODE_MOUSE_SGR),
-            47 | 1047 => writer.alternate_off(bg, false),
-            1049 => writer.alternate_off(bg, true),
+            47 | 1047 => writer.alternate_off_with_rendition(&mut parser.cell, false),
+            1049 => writer.alternate_off_with_rendition(&mut parser.cell, true),
             2004 => writer.mode_clear(mode::MODE_BRACKETPASTE),
             2026 => writer.stop_sync(),
-            2031 => writer.mode_clear(mode::MODE_THEME_UPDATES),
+            2031 => {
+                writer.mode_clear(mode::MODE_THEME_UPDATES);
+                parser.theme_event(super::ThemeAction::Subscribe(false));
+            }
             WIN32_CONSOLE_INPUT_MODE => {}
             _ => {}
         }
@@ -148,6 +154,15 @@ pub(super) fn dispatch_winops<W: ScreenWriter + ?Sized>(parser: &mut InputParser
                 if parser.param_list.get(m, 0, -1) == -1 {
                     return;
                 }
+            }
+            14 | 16 => {
+                let pixels = writer
+                    .cell_pixels()
+                    .unwrap_or(rmux_types::TerminalPixels::new(16, 32));
+                let (kind, rows, cols) = if n == 14 { (4, sy, sx) } else { (6, 1, 1) };
+                let height = u64::from(rows) * u64::from(pixels.height);
+                let width = u64::from(cols) * u64::from(pixels.width);
+                parser.reply(&format!("\x1b[{kind};{height};{width}t"));
             }
             18 => {
                 let reply = format!("\x1b[8;{sy};{sx}t");

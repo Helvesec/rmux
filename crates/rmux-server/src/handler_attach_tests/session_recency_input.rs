@@ -22,6 +22,8 @@
 //! instead of erasing it.
 
 use super::*;
+#[cfg(test)]
+use crate::session_fixture::SessionSetupExt as _;
 use rmux_core::{TargetFindContext, TargetFindFlags, TargetFindType, UnresolvedTarget};
 
 /// One arbitrary but fixed second shared by every session in a fixture.
@@ -53,19 +55,20 @@ async fn pin_public_seconds_to(handler: &RequestHandler, seconds: i64) {
     let names = state
         .sessions
         .iter()
+        .map(|session| (session.name(), session))
         .map(|(name, _)| name.clone())
         .collect::<Vec<_>>();
     for name in names {
         state
             .sessions
-            .session_mut(&name)
+            .session_setup(&name)
             .expect("listed session exists")
             .pin_public_times_for_tests(seconds);
     }
     assert!(
         state
             .sessions
-            .iter()
+            .iter().map(|session| (session.name(), session))
             .all(|(_, session)| session.created_at() == seconds
                 && session.activity_at() == seconds),
         "the fixture must leave no public second able to order the sessions"
@@ -320,7 +323,7 @@ async fn input_must_not_advance_a_same_name_session_recreated_under_the_client()
     // longer exists and must not be credited to the new one.
     {
         let mut state = handler.state.lock().await;
-        state
+        let _ = state
             .sessions
             .remove_session(&session_name(USED))
             .expect("session removal succeeds");
@@ -403,7 +406,7 @@ async fn attach_registration_must_not_credit_a_same_name_replacement_session() {
     // make the rival the most recent session again.
     {
         let mut state = handler.state.lock().await;
-        state
+        let _ = state
             .sessions
             .remove_session(&session_name(USED))
             .expect("session removal succeeds");
@@ -576,7 +579,7 @@ async fn accepted_input_advances_the_rendered_session_activity() {
         .await
         .expect("plain pane input succeeds");
 
-    // tmux 3.7b measured (`.rmux-audit/m39-oracle/probe3-out.txt`, probes 12,
+    // tmux 3.7b measured (`m39-oracle/probe3-out.txt`, probes 12,
     // 13 and 16): a key from an attached client advances `session_activity`.
     // The recency token is internal, but this second is not — it is the
     // payload `list-sessions` and `#{session_activity}` publish, so admitting
@@ -655,7 +658,7 @@ async fn touch_spare(handler: &RequestHandler) {
         .lock()
         .await
         .sessions
-        .session_mut(&session_name(SPARE))
+        .session_setup(&session_name(SPARE))
         .expect("spare session exists")
         .touch_attached();
 }

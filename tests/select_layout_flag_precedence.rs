@@ -100,7 +100,7 @@ fn cli_select_layout_en_uses_tmux_priority_and_preserves_queue_semantics(
     ])?;
     assert_eq!(rejected.status.code(), Some(1), "{rejected:?}");
     assert!(
-        stderr(&rejected).contains("unexpected argument '-x'"),
+        stderr(&rejected).contains("command select-layout: unknown flag -x"),
         "unexpected clustered unknown-option error: {rejected:?}"
     );
     assert_eq!(

@@ -53,7 +53,7 @@ async fn attach_stream_forwards_bytes_resize_and_client_eof() -> Result<(), Box<
         }),
     )
     .await?;
-    assert!(matches!(created, Response::NewSession(_)));
+    crate::common::assert_new_session(&created);
     let (response, mut attach_stream) = ClientConnection::connect(&socket_path)
         .await?
         .begin_attach(AttachSessionRequest {
@@ -125,7 +125,7 @@ async fn attach_stream_emits_border_frames_for_multi_pane_sessions() -> Result<(
         }),
     )
     .await?;
-    assert!(matches!(created, Response::NewSession(_)));
+    crate::common::assert_new_session(&created);
 
     let split_main = crate::common::send_request(
         &socket_path,
@@ -250,7 +250,7 @@ async fn attach_stream_preserves_bytes_sent_with_the_upgrade_request() -> Result
         }),
     )
     .await?;
-    assert!(matches!(created, Response::NewSession(_)));
+    crate::common::assert_new_session(&created);
 
     let mut stream = tokio::net::UnixStream::connect(&socket_path).await?;
     let mut bytes = encode_frame(&Request::AttachSession(AttachSessionRequest {
@@ -306,7 +306,7 @@ async fn attach_stream_terminates_when_the_session_is_killed() -> Result<(), Box
         }),
     )
     .await?;
-    assert!(matches!(created, Response::NewSession(_)));
+    crate::common::assert_new_session(&created);
 
     let (_, mut attach_stream) = ClientConnection::connect(&socket_path)
         .await?
@@ -354,7 +354,7 @@ async fn detach_client_closes_the_attach_stream() -> Result<(), Box<dyn Error>> 
         }),
     )
     .await?;
-    assert!(matches!(created, Response::NewSession(_)));
+    crate::common::assert_new_session(&created);
 
     let (_, mut attach_stream) = ClientConnection::connect(&socket_path)
         .await?
@@ -416,7 +416,7 @@ async fn attached_prefix_d_emits_detached_message_and_closes_stream() -> Result<
         }),
     )
     .await?;
-    assert!(matches!(created, Response::NewSession(_)));
+    crate::common::assert_new_session(&created);
 
     let (_, mut attach_stream) = ClientConnection::connect(&socket_path)
         .await?
@@ -471,7 +471,7 @@ async fn pane_exit_emits_bracketed_exited_and_closes_attach_stream() -> Result<(
         }),
     )
     .await?;
-    assert!(matches!(created, Response::NewSession(_)));
+    crate::common::assert_new_session(&created);
 
     let (_, mut attach_stream) = ClientConnection::connect(&socket_path)
         .await?
@@ -507,7 +507,7 @@ async fn detach_client_clears_the_active_attach_state() -> Result<(), Box<dyn Er
         }),
     )
     .await?;
-    assert!(matches!(created, Response::NewSession(_)));
+    crate::common::assert_new_session(&created);
 
     let (_, mut attach_stream) = ClientConnection::connect(&socket_path)
         .await?

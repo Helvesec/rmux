@@ -31,7 +31,7 @@
 //!
 //! The source status never reaches the result and the policy never changes it:
 //! one client owns one vote, and it is cast under the target's status. Probe and
-//! log: `.rmux-audit/m9-switch-frame/oracle_switch_frame.py`,
+//! log: `m9-switch-frame/oracle_switch_frame.py`,
 //! `oracle-switch-frame.log`.
 
 use super::*;
@@ -693,14 +693,32 @@ pub(super) async fn linked_alias_sessions(
     (alpha, beta)
 }
 
+/// Both aliases run a pane that never writes. A login shell prints its prompt
+/// whenever it gets the CPU; in `beta:0`, an inactive window, that output is
+/// coalesced into a pane-output refresh which frames every client attached to
+/// `beta` with a render `Switch`. Under load it lands after a row has drained
+/// its receiver and is read as the frame the row forbids.
 async fn create_session(handler: &RequestHandler, session: &SessionName) {
     let created = handler
-        .handle(Request::NewSession(NewSessionRequest {
-            session_name: session.clone(),
+        .handle(Request::NewSessionExt(Box::new(NewSessionExtRequest {
+            session_name: Some(session.clone()),
+            working_directory: None,
             detached: true,
             size: Some(CLIENT_SIZE),
             environment: None,
-        }))
+            group_target: None,
+            attach_if_exists: false,
+            detach_other_clients: false,
+            kill_other_clients: false,
+            flags: None,
+            window_name: None,
+            print_session_info: false,
+            print_format: None,
+            command: Some(super::quiet_attached_command()),
+            process_command: None,
+            client_environment: None,
+            skip_environment_update: false,
+        })))
         .await;
     assert!(
         matches!(created, Response::NewSession(_)),

@@ -291,7 +291,13 @@ mod tests {
     }
 
     fn fixture_command(mode: &str, heartbeat: Option<&Path>) -> Command {
-        let mut command = Command::new(env::current_exe().expect("resolve test executable"));
+        let executable = rmux_os::build_identity::resolve(
+            env::current_exe()
+                .expect("resolve test executable")
+                .as_os_str(),
+        )
+        .expect("verify SDK fixture child before spawn");
+        let mut command = Command::new(executable);
         command
             .args(["--exact", FIXTURE_TEST_NAME, "--nocapture"])
             .env(FIXTURE_MODE_ENV, mode)
@@ -371,7 +377,11 @@ mod tests {
     }
 
     fn monotonic_suffix() -> u64 {
-        use std::sync::atomic::{AtomicU64, Ordering};
+        #[cfg(not(target_has_atomic = "64"))]
+        use portable_atomic::AtomicU64;
+        #[cfg(target_has_atomic = "64")]
+        use std::sync::atomic::AtomicU64;
+        use std::sync::atomic::Ordering;
 
         static NEXT: AtomicU64 = AtomicU64::new(0);
         NEXT.fetch_add(1, Ordering::Relaxed)

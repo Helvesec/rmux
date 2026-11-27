@@ -66,7 +66,7 @@ impl AttachedSession {
         Self::spawn_command_configured(harness, &args, size, configure)
     }
 
-    fn spawn_command_configured<F>(
+    pub(crate) fn spawn_command_configured<F>(
         harness: &CliHarness,
         args: &[&str],
         size: TerminalSize,

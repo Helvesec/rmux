@@ -1,0 +1,3561 @@
+{
+  "format": "rmux-closed-shape",
+  "version": 1,
+  "definitions": {
+    "subject": {
+      "type": "object",
+      "properties": {
+        "name": {
+          "type": "string"
+        },
+        "bytes": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "sha256": {
+          "type": "string",
+          "pattern": "[0-9a-f]{64}"
+        }
+      }
+    },
+    "source": {
+      "type": "object",
+      "properties": {
+        "commit": {
+          "type": "string",
+          "pattern": "[0-9a-f]{40}"
+        },
+        "tree": {
+          "type": "string",
+          "pattern": "[0-9a-f]{40}"
+        }
+      }
+    },
+    "context": {
+      "type": "object",
+      "properties": {
+        "role": {
+          "type": "string",
+          "enum": [
+            "cli",
+            "helper",
+            "daemon"
+          ]
+        },
+        "target": {
+          "type": "string"
+        },
+        "configuration": {
+          "type": "string"
+        },
+        "features": {
+          "type": "array",
+          "item": {
+            "type": "string"
+          }
+        },
+        "lock_sha256": {
+          "type": "string",
+          "pattern": "[0-9a-f]{64}"
+        },
+        "rustflags": {
+          "type": "array",
+          "item": {
+            "type": "string"
+          }
+        }
+      }
+    },
+    "file": {
+      "type": "object",
+      "properties": {
+        "path": {
+          "type": "string"
+        },
+        "bytes": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "sha256": {
+          "type": "string",
+          "pattern": "[0-9a-f]{64}"
+        },
+        "mode": {
+          "type": "integer",
+          "minimum": 0
+        }
+      }
+    },
+    "package": {
+      "type": "object",
+      "properties": {
+        "id": {
+          "type": "string"
+        },
+        "name": {
+          "type": "string"
+        },
+        "version": {
+          "type": "string"
+        },
+        "source": {
+          "type": "string"
+        },
+        "license": {
+          "type": "nullable",
+          "item": {
+            "type": "string"
+          }
+        },
+        "checksum": {
+          "type": "nullable",
+          "item": {
+            "type": "string",
+            "pattern": "[0-9a-f]{64}"
+          }
+        },
+        "manifest_sha256": {
+          "type": "nullable",
+          "item": {
+            "type": "string",
+            "pattern": "[0-9a-f]{64}"
+          }
+        }
+      }
+    },
+    "unit": {
+      "type": "object",
+      "properties": {
+        "id": {
+          "type": "string"
+        },
+        "package": {
+          "type": "string"
+        },
+        "kind": {
+          "type": "string"
+        },
+        "context": {
+          "type": "string",
+          "enum": [
+            "host",
+            "target"
+          ]
+        },
+        "target": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "profile": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "features": {
+          "type": "array",
+          "item": {
+            "type": "string"
+          }
+        },
+        "rustflags": {
+          "type": "array",
+          "item": {
+            "type": "string"
+          }
+        },
+        "compile_kind": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "fingerprint": {
+          "type": "string",
+          "pattern": "[0-9a-f]{16}"
+        },
+        "historical_record_sha256": {
+          "type": "string",
+          "pattern": "[0-9a-f]{64}"
+        }
+      }
+    },
+    "root": {
+      "type": "object",
+      "properties": {
+        "role": {
+          "type": "string"
+        },
+        "path": {
+          "type": "string"
+        },
+        "sha256": {
+          "type": "string",
+          "pattern": "[0-9a-f]{64}"
+        },
+        "bytes": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "unit": {
+          "type": "string"
+        },
+        "reachable_units": {
+          "type": "integer",
+          "minimum": 0
+        }
+      }
+    },
+    "relation": {
+      "type": "object",
+      "properties": {
+        "kind": {
+          "type": "string",
+          "enum": [
+            "depends_on",
+            "instance_of",
+            "contains",
+            "built_from"
+          ]
+        },
+        "source": {
+          "type": "string"
+        },
+        "target": {
+          "type": "string"
+        },
+        "name": {
+          "type": "string"
+        }
+      }
+    },
+    "evidence": {
+      "type": "object",
+      "properties": {
+        "name": {
+          "type": "string"
+        },
+        "sha256": {
+          "type": "string",
+          "pattern": "[0-9a-f]{64}"
+        },
+        "bytes": {
+          "type": "integer",
+          "minimum": 0
+        }
+      }
+    },
+    "runtime": {
+      "type": "object",
+      "properties": {
+        "role": {
+          "type": "string"
+        },
+        "needed": {
+          "type": "array",
+          "item": {
+            "type": "string"
+          }
+        },
+        "glibc_max": {
+          "type": "string"
+        }
+      }
+    },
+    "pins": {
+      "type": "object",
+      "properties": {
+        "generator": {
+          "type": "string",
+          "pattern": "[0-9a-f]{64}"
+        },
+        "validator": {
+          "type": "string",
+          "pattern": "[0-9a-f]{64}"
+        },
+        "layout": {
+          "type": "string",
+          "pattern": "[0-9a-f]{64}"
+        },
+        "schema": {
+          "type": "string",
+          "pattern": "[0-9a-f]{64}"
+        },
+        "interpreter": {
+          "type": "string",
+          "pattern": "[0-9a-f]{64}"
+        },
+        "descriptor": {
+          "type": "string",
+          "pattern": "[0-9a-f]{64}"
+        }
+      }
+    }
+  },
+  "root": {
+    "type": "object",
+    "properties": {
+      "format": {
+        "type": "string",
+        "enum": [
+          "rmux-sbom-json"
+        ]
+      },
+      "version": {
+        "type": "integer",
+        "enum": [
+          1
+        ]
+      },
+      "profile": {
+        "type": "string",
+        "enum": [
+          "linux-archive-cargo-build-closure-v1"
+        ]
+      },
+      "subject": {
+        "ref": "subject"
+      },
+      "payload_source": {
+        "ref": "source"
+      },
+      "resolution_contexts": {
+        "type": "array",
+        "item": {
+          "ref": "context"
+        }
+      },
+      "files": {
+        "type": "array",
+        "item": {
+          "ref": "file"
+        }
+      },
+      "packages": {
+        "type": "array",
+        "item": {
+          "ref": "package"
+        }
+      },
+      "build_units": {
+        "type": "array",
+        "item": {
+          "ref": "unit"
+        }
+      },
+      "binary_roots": {
+        "type": "array",
+        "item": {
+          "ref": "root"
+        }
+      },
+      "relationships": {
+        "type": "array",
+        "item": {
+          "ref": "relation"
+        }
+      },
+      "recipe_evidence": {
+        "type": "array",
+        "item": {
+          "ref": "evidence"
+        }
+      },
+      "external_runtime_requirements": {
+        "type": "array",
+        "item": {
+          "ref": "runtime"
+        }
+      },
+      "tool_pins": {
+        "ref": "pins"
+      },
+      "closure_sha256": {
+        "type": "string",
+        "pattern": "[0-9a-f]{64}"
+      }
+    }
+  },
+  "rpm_root": {
+    "type": "object",
+    "properties": {
+      "format": {
+        "type": "string",
+        "enum": [
+          "rmux-sbom-json"
+        ]
+      },
+      "version": {
+        "type": "integer",
+        "enum": [
+          1
+        ]
+      },
+      "profile": {
+        "type": "string",
+        "enum": [
+          "linux-rpm-cargo-build-closure-v1"
+        ]
+      },
+      "subject": {
+        "ref": "subject"
+      },
+      "payload_source": {
+        "ref": "source"
+      },
+      "resolution_contexts": {
+        "type": "array",
+        "item": {
+          "ref": "context"
+        }
+      },
+      "files": {
+        "type": "array",
+        "item": {
+          "ref": "file"
+        }
+      },
+      "packages": {
+        "type": "array",
+        "item": {
+          "ref": "package"
+        }
+      },
+      "build_units": {
+        "type": "array",
+        "item": {
+          "ref": "unit"
+        }
+      },
+      "binary_roots": {
+        "type": "array",
+        "item": {
+          "ref": "root"
+        }
+      },
+      "relationships": {
+        "type": "array",
+        "item": {
+          "ref": "relation"
+        }
+      },
+      "recipe_evidence": {
+        "type": "array",
+        "item": {
+          "ref": "evidence"
+        }
+      },
+      "external_runtime_requirements": {
+        "type": "array",
+        "item": {
+          "ref": "runtime"
+        }
+      },
+      "tool_pins": {
+        "ref": "pins"
+      },
+      "closure_sha256": {
+        "type": "string",
+        "pattern": "[0-9a-f]{64}"
+      },
+      "rpm_binding": {
+        "type": "object",
+        "properties": {
+          "identity": {
+            "type": "object",
+            "properties": {
+              "name": {
+                "type": "string"
+              },
+              "version": {
+                "type": "string"
+              },
+              "release": {
+                "type": "string"
+              },
+              "arch": {
+                "type": "string"
+              }
+            }
+          },
+          "sections": {
+            "type": "array",
+            "item": {
+              "type": "object",
+              "properties": {
+                "name": {
+                  "type": "string"
+                },
+                "offset": {
+                  "type": "integer",
+                  "minimum": 0
+                },
+                "bytes": {
+                  "type": "integer",
+                  "minimum": 0
+                },
+                "sha256": {
+                  "type": "string",
+                  "pattern": "[0-9a-f]{64}"
+                }
+              }
+            }
+          },
+          "regular_single_link_files_only": {
+            "type": "boolean",
+            "enum": [
+              true
+            ]
+          },
+          "native_reader_sha256": {
+            "type": "string",
+            "pattern": "[0-9a-f]{64}"
+          },
+          "native_reader_version": {
+            "type": "string"
+          }
+        }
+      },
+      "reuse_evidence": {
+        "type": "object",
+        "properties": {
+          "rule": {
+            "type": "string",
+            "enum": [
+              "identical-binaries-and-complete-cargo-closure-v1"
+            ]
+          },
+          "parent_sbom_sha256": {
+            "type": "string",
+            "pattern": "[0-9a-f]{64}"
+          },
+          "parent_subject_sha256": {
+            "type": "string",
+            "pattern": "[0-9a-f]{64}"
+          },
+          "parent_closure_sha256": {
+            "type": "string",
+            "pattern": "[0-9a-f]{64}"
+          },
+          "review_sha256": {
+            "type": "string",
+            "pattern": "[0-9a-f]{64}"
+          },
+          "cargo_closure_sha256": {
+            "type": "string",
+            "pattern": "[0-9a-f]{64}"
+          },
+          "binaries": {
+            "type": "array",
+            "item": {
+              "type": "object",
+              "properties": {
+                "role": {
+                  "type": "string"
+                },
+                "tar_path": {
+                  "type": "string"
+                },
+                "rpm_path": {
+                  "type": "string"
+                },
+                "bytes": {
+                  "type": "integer",
+                  "minimum": 0
+                },
+                "sha256": {
+                  "type": "string",
+                  "pattern": "[0-9a-f]{64}"
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+  },
+  "deb_root": {
+    "type": "object",
+    "properties": {
+      "format": {
+        "type": "string",
+        "enum": [
+          "rmux-sbom-json"
+        ]
+      },
+      "version": {
+        "type": "integer",
+        "enum": [
+          1
+        ]
+      },
+      "profile": {
+        "type": "string",
+        "enum": [
+          "linux-deb-cargo-build-closure-v1"
+        ]
+      },
+      "subject": {
+        "ref": "subject"
+      },
+      "payload_source": {
+        "ref": "source"
+      },
+      "resolution_contexts": {
+        "type": "array",
+        "item": {
+          "ref": "context"
+        }
+      },
+      "files": {
+        "type": "array",
+        "item": {
+          "ref": "file"
+        }
+      },
+      "packages": {
+        "type": "array",
+        "item": {
+          "ref": "package"
+        }
+      },
+      "build_units": {
+        "type": "array",
+        "item": {
+          "ref": "unit"
+        }
+      },
+      "binary_roots": {
+        "type": "array",
+        "item": {
+          "ref": "root"
+        }
+      },
+      "relationships": {
+        "type": "array",
+        "item": {
+          "ref": "relation"
+        }
+      },
+      "recipe_evidence": {
+        "type": "array",
+        "item": {
+          "ref": "evidence"
+        }
+      },
+      "external_runtime_requirements": {
+        "type": "array",
+        "item": {
+          "ref": "runtime"
+        }
+      },
+      "tool_pins": {
+        "ref": "pins"
+      },
+      "closure_sha256": {
+        "type": "string",
+        "pattern": "[0-9a-f]{64}"
+      },
+      "deb_binding": {
+        "type": "object",
+        "properties": {
+          "identity": {
+            "type": "object",
+            "properties": {
+              "package": {
+                "type": "string"
+              },
+              "version": {
+                "type": "string"
+              },
+              "architecture": {
+                "type": "string"
+              }
+            }
+          },
+          "package_name": {
+            "type": "string"
+          },
+          "ar_members": {
+            "type": "array",
+            "item": {
+              "type": "object",
+              "properties": {
+                "name": {
+                  "type": "string"
+                },
+                "header_offset": {
+                  "type": "integer",
+                  "minimum": 0
+                },
+                "header_sha256": {
+                  "type": "string",
+                  "pattern": "[0-9a-f]{64}"
+                },
+                "offset": {
+                  "type": "integer",
+                  "minimum": 0
+                },
+                "bytes": {
+                  "type": "integer",
+                  "minimum": 0
+                },
+                "sha256": {
+                  "type": "string",
+                  "pattern": "[0-9a-f]{64}"
+                }
+              }
+            }
+          },
+          "control_files": {
+            "type": "array",
+            "item": {
+              "ref": "file"
+            }
+          },
+          "control_directories": {
+            "type": "array",
+            "item": {
+              "type": "object",
+              "properties": {
+                "path": {
+                  "type": "string"
+                },
+                "mode": {
+                  "type": "integer",
+                  "minimum": 0
+                }
+              }
+            }
+          },
+          "data_directories": {
+            "type": "array",
+            "item": {
+              "type": "object",
+              "properties": {
+                "path": {
+                  "type": "string"
+                },
+                "mode": {
+                  "type": "integer",
+                  "minimum": 0
+                }
+              }
+            }
+          },
+          "control_fields": {
+            "type": "array",
+            "item": {
+              "type": "object",
+              "properties": {
+                "field": {
+                  "type": "string"
+                },
+                "value": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "all_entries_root_owned": {
+            "type": "boolean",
+            "enum": [
+              true
+            ]
+          },
+          "links_allowed": {
+            "type": "boolean",
+            "enum": [
+              false
+            ]
+          },
+          "native_reader_sha256": {
+            "type": "string",
+            "pattern": "[0-9a-f]{64}"
+          },
+          "native_reader_version": {
+            "type": "string"
+          }
+        }
+      },
+      "reuse_evidence": {
+        "type": "object",
+        "properties": {
+          "rule": {
+            "type": "string",
+            "enum": [
+              "identical-binaries-and-complete-cargo-closure-v1"
+            ]
+          },
+          "parent_sbom_sha256": {
+            "type": "string",
+            "pattern": "[0-9a-f]{64}"
+          },
+          "parent_subject_sha256": {
+            "type": "string",
+            "pattern": "[0-9a-f]{64}"
+          },
+          "parent_closure_sha256": {
+            "type": "string",
+            "pattern": "[0-9a-f]{64}"
+          },
+          "review_sha256": {
+            "type": "string",
+            "pattern": "[0-9a-f]{64}"
+          },
+          "cargo_closure_sha256": {
+            "type": "string",
+            "pattern": "[0-9a-f]{64}"
+          },
+          "binaries": {
+            "type": "array",
+            "item": {
+              "type": "object",
+              "properties": {
+                "role": {
+                  "type": "string"
+                },
+                "tar_path": {
+                  "type": "string"
+                },
+                "bytes": {
+                  "type": "integer",
+                  "minimum": 0
+                },
+                "sha256": {
+                  "type": "string",
+                  "pattern": "[0-9a-f]{64}"
+                },
+                "deb_path": {
+                  "type": "string"
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+  },
+  "repro_roots": {
+    "linux-tar-repro-cargo-build-closure-v1": {
+      "type": "object",
+      "properties": {
+        "format": {
+          "type": "string",
+          "enum": [
+            "rmux-sbom-json"
+          ]
+        },
+        "version": {
+          "type": "integer",
+          "enum": [
+            1
+          ]
+        },
+        "profile": {
+          "type": "string",
+          "enum": [
+            "linux-tar-repro-cargo-build-closure-v1"
+          ]
+        },
+        "subject": {
+          "ref": "subject"
+        },
+        "payload_source": {
+          "ref": "source"
+        },
+        "resolution_contexts": {
+          "type": "array",
+          "item": {
+            "ref": "context"
+          }
+        },
+        "files": {
+          "type": "array",
+          "item": {
+            "ref": "file"
+          }
+        },
+        "packages": {
+          "type": "array",
+          "item": {
+            "ref": "package"
+          }
+        },
+        "build_units": {
+          "type": "array",
+          "item": {
+            "ref": "unit"
+          }
+        },
+        "binary_roots": {
+          "type": "array",
+          "item": {
+            "ref": "root"
+          }
+        },
+        "relationships": {
+          "type": "array",
+          "item": {
+            "ref": "relation"
+          }
+        },
+        "recipe_evidence": {
+          "type": "array",
+          "item": {
+            "ref": "evidence"
+          }
+        },
+        "external_runtime_requirements": {
+          "type": "array",
+          "item": {
+            "ref": "runtime"
+          }
+        },
+        "tool_pins": {
+          "ref": "pins"
+        },
+        "closure_sha256": {
+          "type": "string",
+          "pattern": "[0-9a-f]{64}"
+        },
+        "repro_binding": {
+          "type": "object",
+          "properties": {
+            "receipt": {
+              "type": "object",
+              "properties": {
+                "path": {
+                  "type": "string"
+                },
+                "bytes": {
+                  "type": "integer"
+                },
+                "sha256": {
+                  "type": "string",
+                  "pattern": "[0-9a-f]{64}"
+                }
+              }
+            },
+            "freeze": {
+              "type": "object",
+              "properties": {
+                "path": {
+                  "type": "string"
+                },
+                "bytes": {
+                  "type": "integer"
+                },
+                "sha256": {
+                  "type": "string",
+                  "pattern": "[0-9a-f]{64}"
+                }
+              }
+            },
+            "contract": {
+              "type": "object",
+              "properties": {
+                "path": {
+                  "type": "string"
+                },
+                "bytes": {
+                  "type": "integer"
+                },
+                "sha256": {
+                  "type": "string",
+                  "pattern": "[0-9a-f]{64}"
+                }
+              }
+            },
+            "archives": {
+              "type": "array",
+              "item": {
+                "type": "object",
+                "properties": {
+                  "path": {
+                    "type": "string"
+                  },
+                  "bytes": {
+                    "type": "integer"
+                  },
+                  "sha256": {
+                    "type": "string",
+                    "pattern": "[0-9a-f]{64}"
+                  }
+                }
+              }
+            },
+            "packager_source": {
+              "ref": "source"
+            },
+            "packager_script": {
+              "type": "object",
+              "properties": {
+                "path": {
+                  "type": "string"
+                },
+                "bytes": {
+                  "type": "integer"
+                },
+                "sha256": {
+                  "type": "string",
+                  "pattern": "[0-9a-f]{64}"
+                }
+              }
+            },
+            "historical_tools": {
+              "type": "array",
+              "item": {
+                "type": "object",
+                "properties": {
+                  "path": {
+                    "type": "string"
+                  },
+                  "bytes": {
+                    "type": "integer"
+                  },
+                  "sha256": {
+                    "type": "string",
+                    "pattern": "[0-9a-f]{64}"
+                  }
+                }
+              }
+            },
+            "source_date_epoch": {
+              "type": "integer",
+              "enum": [
+                1790347419
+              ]
+            },
+            "pair": {
+              "type": "integer"
+            },
+            "review_scope": {
+              "type": "string",
+              "enum": [
+                "accepted-integrated-before-mandate",
+                "author-proof-review-pending-at-mandate"
+              ]
+            },
+            "signature_status": {
+              "type": "string",
+              "enum": [
+                "unsigned"
+              ]
+            },
+            "provenance_kind": {
+              "type": "string",
+              "enum": [
+                "local-historical-build-and-fixed-assembly-not-ci-or-signed"
+              ]
+            },
+            "parent_sbom": {
+              "type": "object",
+              "properties": {
+                "path": {
+                  "type": "string"
+                },
+                "bytes": {
+                  "type": "integer"
+                },
+                "sha256": {
+                  "type": "string",
+                  "pattern": "[0-9a-f]{64}"
+                }
+              }
+            },
+            "parent_subject": {
+              "ref": "subject"
+            },
+            "parent_closure_sha256": {
+              "type": "string",
+              "pattern": "[0-9a-f]{64}"
+            },
+            "cargo_closure_sha256": {
+              "type": "string",
+              "pattern": "[0-9a-f]{64}"
+            },
+            "historical_profile": {
+              "type": "string"
+            },
+            "reuse_scope": {
+              "type": "string",
+              "enum": [
+                "complete-cargo-closure-and-identical-files-only"
+              ]
+            }
+          }
+        }
+      }
+    },
+    "linux-deb-repro-cargo-build-closure-v1": {
+      "type": "object",
+      "properties": {
+        "format": {
+          "type": "string",
+          "enum": [
+            "rmux-sbom-json"
+          ]
+        },
+        "version": {
+          "type": "integer",
+          "enum": [
+            1
+          ]
+        },
+        "profile": {
+          "type": "string",
+          "enum": [
+            "linux-deb-repro-cargo-build-closure-v1"
+          ]
+        },
+        "subject": {
+          "ref": "subject"
+        },
+        "payload_source": {
+          "ref": "source"
+        },
+        "resolution_contexts": {
+          "type": "array",
+          "item": {
+            "ref": "context"
+          }
+        },
+        "files": {
+          "type": "array",
+          "item": {
+            "ref": "file"
+          }
+        },
+        "packages": {
+          "type": "array",
+          "item": {
+            "ref": "package"
+          }
+        },
+        "build_units": {
+          "type": "array",
+          "item": {
+            "ref": "unit"
+          }
+        },
+        "binary_roots": {
+          "type": "array",
+          "item": {
+            "ref": "root"
+          }
+        },
+        "relationships": {
+          "type": "array",
+          "item": {
+            "ref": "relation"
+          }
+        },
+        "recipe_evidence": {
+          "type": "array",
+          "item": {
+            "ref": "evidence"
+          }
+        },
+        "external_runtime_requirements": {
+          "type": "array",
+          "item": {
+            "ref": "runtime"
+          }
+        },
+        "tool_pins": {
+          "ref": "pins"
+        },
+        "closure_sha256": {
+          "type": "string",
+          "pattern": "[0-9a-f]{64}"
+        },
+        "repro_binding": {
+          "type": "object",
+          "properties": {
+            "receipt": {
+              "type": "object",
+              "properties": {
+                "path": {
+                  "type": "string"
+                },
+                "bytes": {
+                  "type": "integer"
+                },
+                "sha256": {
+                  "type": "string",
+                  "pattern": "[0-9a-f]{64}"
+                }
+              }
+            },
+            "freeze": {
+              "type": "object",
+              "properties": {
+                "path": {
+                  "type": "string"
+                },
+                "bytes": {
+                  "type": "integer"
+                },
+                "sha256": {
+                  "type": "string",
+                  "pattern": "[0-9a-f]{64}"
+                }
+              }
+            },
+            "contract": {
+              "type": "object",
+              "properties": {
+                "path": {
+                  "type": "string"
+                },
+                "bytes": {
+                  "type": "integer"
+                },
+                "sha256": {
+                  "type": "string",
+                  "pattern": "[0-9a-f]{64}"
+                }
+              }
+            },
+            "archives": {
+              "type": "array",
+              "item": {
+                "type": "object",
+                "properties": {
+                  "path": {
+                    "type": "string"
+                  },
+                  "bytes": {
+                    "type": "integer"
+                  },
+                  "sha256": {
+                    "type": "string",
+                    "pattern": "[0-9a-f]{64}"
+                  }
+                }
+              }
+            },
+            "packager_source": {
+              "ref": "source"
+            },
+            "packager_script": {
+              "type": "object",
+              "properties": {
+                "path": {
+                  "type": "string"
+                },
+                "bytes": {
+                  "type": "integer"
+                },
+                "sha256": {
+                  "type": "string",
+                  "pattern": "[0-9a-f]{64}"
+                }
+              }
+            },
+            "historical_tools": {
+              "type": "array",
+              "item": {
+                "type": "object",
+                "properties": {
+                  "path": {
+                    "type": "string"
+                  },
+                  "bytes": {
+                    "type": "integer"
+                  },
+                  "sha256": {
+                    "type": "string",
+                    "pattern": "[0-9a-f]{64}"
+                  }
+                }
+              }
+            },
+            "source_date_epoch": {
+              "type": "integer",
+              "enum": [
+                1790347419
+              ]
+            },
+            "pair": {
+              "type": "integer"
+            },
+            "review_scope": {
+              "type": "string",
+              "enum": [
+                "accepted-integrated-before-mandate",
+                "author-proof-review-pending-at-mandate"
+              ]
+            },
+            "signature_status": {
+              "type": "string",
+              "enum": [
+                "unsigned"
+              ]
+            },
+            "provenance_kind": {
+              "type": "string",
+              "enum": [
+                "local-historical-build-and-fixed-assembly-not-ci-or-signed"
+              ]
+            },
+            "parent_sbom": {
+              "type": "object",
+              "properties": {
+                "path": {
+                  "type": "string"
+                },
+                "bytes": {
+                  "type": "integer"
+                },
+                "sha256": {
+                  "type": "string",
+                  "pattern": "[0-9a-f]{64}"
+                }
+              }
+            },
+            "parent_subject": {
+              "ref": "subject"
+            },
+            "parent_closure_sha256": {
+              "type": "string",
+              "pattern": "[0-9a-f]{64}"
+            },
+            "cargo_closure_sha256": {
+              "type": "string",
+              "pattern": "[0-9a-f]{64}"
+            },
+            "historical_profile": {
+              "type": "string"
+            },
+            "reuse_scope": {
+              "type": "string",
+              "enum": [
+                "complete-cargo-closure-and-identical-files-only"
+              ]
+            }
+          }
+        },
+        "deb_binding": {
+          "type": "object",
+          "properties": {
+            "identity": {
+              "type": "object",
+              "properties": {
+                "package": {
+                  "type": "string"
+                },
+                "version": {
+                  "type": "string"
+                },
+                "architecture": {
+                  "type": "string"
+                }
+              }
+            },
+            "package_name": {
+              "type": "string"
+            },
+            "ar_members": {
+              "type": "array",
+              "item": {
+                "type": "object",
+                "properties": {
+                  "name": {
+                    "type": "string"
+                  },
+                  "header_offset": {
+                    "type": "integer",
+                    "minimum": 0
+                  },
+                  "header_sha256": {
+                    "type": "string",
+                    "pattern": "[0-9a-f]{64}"
+                  },
+                  "offset": {
+                    "type": "integer",
+                    "minimum": 0
+                  },
+                  "bytes": {
+                    "type": "integer",
+                    "minimum": 0
+                  },
+                  "sha256": {
+                    "type": "string",
+                    "pattern": "[0-9a-f]{64}"
+                  }
+                }
+              }
+            },
+            "control_files": {
+              "type": "array",
+              "item": {
+                "ref": "file"
+              }
+            },
+            "control_directories": {
+              "type": "array",
+              "item": {
+                "type": "object",
+                "properties": {
+                  "path": {
+                    "type": "string"
+                  },
+                  "mode": {
+                    "type": "integer",
+                    "minimum": 0
+                  }
+                }
+              }
+            },
+            "data_directories": {
+              "type": "array",
+              "item": {
+                "type": "object",
+                "properties": {
+                  "path": {
+                    "type": "string"
+                  },
+                  "mode": {
+                    "type": "integer",
+                    "minimum": 0
+                  }
+                }
+              }
+            },
+            "control_fields": {
+              "type": "array",
+              "item": {
+                "type": "object",
+                "properties": {
+                  "field": {
+                    "type": "string"
+                  },
+                  "value": {
+                    "type": "string"
+                  }
+                }
+              }
+            },
+            "all_entries_root_owned": {
+              "type": "boolean",
+              "enum": [
+                true
+              ]
+            },
+            "links_allowed": {
+              "type": "boolean",
+              "enum": [
+                false
+              ]
+            },
+            "native_reader_sha256": {
+              "type": "string",
+              "pattern": "[0-9a-f]{64}"
+            },
+            "native_reader_version": {
+              "type": "string"
+            }
+          }
+        }
+      }
+    },
+    "linux-rpm-repro-cargo-build-closure-v1": {
+      "type": "object",
+      "properties": {
+        "format": {
+          "type": "string",
+          "enum": [
+            "rmux-sbom-json"
+          ]
+        },
+        "version": {
+          "type": "integer",
+          "enum": [
+            1
+          ]
+        },
+        "profile": {
+          "type": "string",
+          "enum": [
+            "linux-rpm-repro-cargo-build-closure-v1"
+          ]
+        },
+        "subject": {
+          "ref": "subject"
+        },
+        "payload_source": {
+          "ref": "source"
+        },
+        "resolution_contexts": {
+          "type": "array",
+          "item": {
+            "ref": "context"
+          }
+        },
+        "files": {
+          "type": "array",
+          "item": {
+            "ref": "file"
+          }
+        },
+        "packages": {
+          "type": "array",
+          "item": {
+            "ref": "package"
+          }
+        },
+        "build_units": {
+          "type": "array",
+          "item": {
+            "ref": "unit"
+          }
+        },
+        "binary_roots": {
+          "type": "array",
+          "item": {
+            "ref": "root"
+          }
+        },
+        "relationships": {
+          "type": "array",
+          "item": {
+            "ref": "relation"
+          }
+        },
+        "recipe_evidence": {
+          "type": "array",
+          "item": {
+            "ref": "evidence"
+          }
+        },
+        "external_runtime_requirements": {
+          "type": "array",
+          "item": {
+            "ref": "runtime"
+          }
+        },
+        "tool_pins": {
+          "ref": "pins"
+        },
+        "closure_sha256": {
+          "type": "string",
+          "pattern": "[0-9a-f]{64}"
+        },
+        "repro_binding": {
+          "type": "object",
+          "properties": {
+            "receipt": {
+              "type": "object",
+              "properties": {
+                "path": {
+                  "type": "string"
+                },
+                "bytes": {
+                  "type": "integer"
+                },
+                "sha256": {
+                  "type": "string",
+                  "pattern": "[0-9a-f]{64}"
+                }
+              }
+            },
+            "freeze": {
+              "type": "object",
+              "properties": {
+                "path": {
+                  "type": "string"
+                },
+                "bytes": {
+                  "type": "integer"
+                },
+                "sha256": {
+                  "type": "string",
+                  "pattern": "[0-9a-f]{64}"
+                }
+              }
+            },
+            "contract": {
+              "type": "object",
+              "properties": {
+                "path": {
+                  "type": "string"
+                },
+                "bytes": {
+                  "type": "integer"
+                },
+                "sha256": {
+                  "type": "string",
+                  "pattern": "[0-9a-f]{64}"
+                }
+              }
+            },
+            "archives": {
+              "type": "array",
+              "item": {
+                "type": "object",
+                "properties": {
+                  "path": {
+                    "type": "string"
+                  },
+                  "bytes": {
+                    "type": "integer"
+                  },
+                  "sha256": {
+                    "type": "string",
+                    "pattern": "[0-9a-f]{64}"
+                  }
+                }
+              }
+            },
+            "packager_source": {
+              "ref": "source"
+            },
+            "packager_script": {
+              "type": "object",
+              "properties": {
+                "path": {
+                  "type": "string"
+                },
+                "bytes": {
+                  "type": "integer"
+                },
+                "sha256": {
+                  "type": "string",
+                  "pattern": "[0-9a-f]{64}"
+                }
+              }
+            },
+            "historical_tools": {
+              "type": "array",
+              "item": {
+                "type": "object",
+                "properties": {
+                  "path": {
+                    "type": "string"
+                  },
+                  "bytes": {
+                    "type": "integer"
+                  },
+                  "sha256": {
+                    "type": "string",
+                    "pattern": "[0-9a-f]{64}"
+                  }
+                }
+              }
+            },
+            "source_date_epoch": {
+              "type": "integer",
+              "enum": [
+                1790347419
+              ]
+            },
+            "pair": {
+              "type": "integer"
+            },
+            "review_scope": {
+              "type": "string",
+              "enum": [
+                "accepted-integrated-before-mandate",
+                "author-proof-review-pending-at-mandate"
+              ]
+            },
+            "signature_status": {
+              "type": "string",
+              "enum": [
+                "unsigned"
+              ]
+            },
+            "provenance_kind": {
+              "type": "string",
+              "enum": [
+                "local-historical-build-and-fixed-assembly-not-ci-or-signed"
+              ]
+            },
+            "parent_sbom": {
+              "type": "object",
+              "properties": {
+                "path": {
+                  "type": "string"
+                },
+                "bytes": {
+                  "type": "integer"
+                },
+                "sha256": {
+                  "type": "string",
+                  "pattern": "[0-9a-f]{64}"
+                }
+              }
+            },
+            "parent_subject": {
+              "ref": "subject"
+            },
+            "parent_closure_sha256": {
+              "type": "string",
+              "pattern": "[0-9a-f]{64}"
+            },
+            "cargo_closure_sha256": {
+              "type": "string",
+              "pattern": "[0-9a-f]{64}"
+            },
+            "historical_profile": {
+              "type": "string"
+            },
+            "reuse_scope": {
+              "type": "string",
+              "enum": [
+                "complete-cargo-closure-and-identical-files-only"
+              ]
+            }
+          }
+        },
+        "rpm_binding": {
+          "type": "object",
+          "properties": {
+            "identity": {
+              "type": "object",
+              "properties": {
+                "name": {
+                  "type": "string"
+                },
+                "version": {
+                  "type": "string"
+                },
+                "release": {
+                  "type": "string"
+                },
+                "arch": {
+                  "type": "string"
+                }
+              }
+            },
+            "sections": {
+              "type": "array",
+              "item": {
+                "type": "object",
+                "properties": {
+                  "name": {
+                    "type": "string"
+                  },
+                  "offset": {
+                    "type": "integer",
+                    "minimum": 0
+                  },
+                  "bytes": {
+                    "type": "integer",
+                    "minimum": 0
+                  },
+                  "sha256": {
+                    "type": "string",
+                    "pattern": "[0-9a-f]{64}"
+                  }
+                }
+              }
+            },
+            "regular_single_link_files_only": {
+              "type": "boolean",
+              "enum": [
+                true
+              ]
+            },
+            "native_reader_sha256": {
+              "type": "string",
+              "pattern": "[0-9a-f]{64}"
+            },
+            "native_reader_version": {
+              "type": "string"
+            }
+          }
+        }
+      }
+    },
+    "linux-rpm-full-repro-cargo-build-closure-v1": {
+      "type": "object",
+      "properties": {
+        "format": {
+          "type": "string",
+          "enum": [
+            "rmux-sbom-json"
+          ]
+        },
+        "version": {
+          "type": "integer",
+          "enum": [
+            1
+          ]
+        },
+        "profile": {
+          "type": "string",
+          "enum": [
+            "linux-rpm-full-repro-cargo-build-closure-v1"
+          ]
+        },
+        "subject": {
+          "ref": "subject"
+        },
+        "payload_source": {
+          "ref": "source"
+        },
+        "resolution_contexts": {
+          "type": "array",
+          "item": {
+            "ref": "context"
+          }
+        },
+        "files": {
+          "type": "array",
+          "item": {
+            "ref": "file"
+          }
+        },
+        "packages": {
+          "type": "array",
+          "item": {
+            "ref": "package"
+          }
+        },
+        "build_units": {
+          "type": "array",
+          "item": {
+            "ref": "unit"
+          }
+        },
+        "binary_roots": {
+          "type": "array",
+          "item": {
+            "ref": "root"
+          }
+        },
+        "relationships": {
+          "type": "array",
+          "item": {
+            "ref": "relation"
+          }
+        },
+        "recipe_evidence": {
+          "type": "array",
+          "item": {
+            "ref": "evidence"
+          }
+        },
+        "external_runtime_requirements": {
+          "type": "array",
+          "item": {
+            "ref": "runtime"
+          }
+        },
+        "tool_pins": {
+          "ref": "pins"
+        },
+        "closure_sha256": {
+          "type": "string",
+          "pattern": "[0-9a-f]{64}"
+        },
+        "repro_binding": {
+          "type": "object",
+          "properties": {
+            "receipt": {
+              "type": "object",
+              "properties": {
+                "path": {
+                  "type": "string"
+                },
+                "bytes": {
+                  "type": "integer"
+                },
+                "sha256": {
+                  "type": "string",
+                  "pattern": "[0-9a-f]{64}"
+                }
+              }
+            },
+            "freeze": {
+              "type": "object",
+              "properties": {
+                "path": {
+                  "type": "string"
+                },
+                "bytes": {
+                  "type": "integer"
+                },
+                "sha256": {
+                  "type": "string",
+                  "pattern": "[0-9a-f]{64}"
+                }
+              }
+            },
+            "contract": {
+              "type": "object",
+              "properties": {
+                "path": {
+                  "type": "string"
+                },
+                "bytes": {
+                  "type": "integer"
+                },
+                "sha256": {
+                  "type": "string",
+                  "pattern": "[0-9a-f]{64}"
+                }
+              }
+            },
+            "archives": {
+              "type": "array",
+              "item": {
+                "type": "object",
+                "properties": {
+                  "path": {
+                    "type": "string"
+                  },
+                  "bytes": {
+                    "type": "integer"
+                  },
+                  "sha256": {
+                    "type": "string",
+                    "pattern": "[0-9a-f]{64}"
+                  }
+                }
+              }
+            },
+            "packager_source": {
+              "ref": "source"
+            },
+            "packager_script": {
+              "type": "object",
+              "properties": {
+                "path": {
+                  "type": "string"
+                },
+                "bytes": {
+                  "type": "integer"
+                },
+                "sha256": {
+                  "type": "string",
+                  "pattern": "[0-9a-f]{64}"
+                }
+              }
+            },
+            "historical_tools": {
+              "type": "array",
+              "item": {
+                "type": "object",
+                "properties": {
+                  "path": {
+                    "type": "string"
+                  },
+                  "bytes": {
+                    "type": "integer"
+                  },
+                  "sha256": {
+                    "type": "string",
+                    "pattern": "[0-9a-f]{64}"
+                  }
+                }
+              }
+            },
+            "source_date_epoch": {
+              "type": "integer",
+              "enum": [
+                1790347419
+              ]
+            },
+            "pair": {
+              "type": "integer"
+            },
+            "review_scope": {
+              "type": "string",
+              "enum": [
+                "author-proof-review-pending-at-mandate"
+              ]
+            },
+            "signature_status": {
+              "type": "string",
+              "enum": [
+                "unsigned"
+              ]
+            },
+            "provenance_kind": {
+              "type": "string",
+              "enum": [
+                "local-historical-build-and-full-packaging-not-ci-or-signed"
+              ]
+            },
+            "parent_sbom": {
+              "type": "object",
+              "properties": {
+                "path": {
+                  "type": "string"
+                },
+                "bytes": {
+                  "type": "integer"
+                },
+                "sha256": {
+                  "type": "string",
+                  "pattern": "[0-9a-f]{64}"
+                }
+              }
+            },
+            "parent_subject": {
+              "ref": "subject"
+            },
+            "parent_closure_sha256": {
+              "type": "string",
+              "pattern": "[0-9a-f]{64}"
+            },
+            "cargo_closure_sha256": {
+              "type": "string",
+              "pattern": "[0-9a-f]{64}"
+            },
+            "historical_profile": {
+              "type": "string"
+            },
+            "reuse_scope": {
+              "type": "string",
+              "enum": [
+                "complete-cargo-closure-after-identical-binaries-only"
+              ]
+            }
+          }
+        },
+        "rpm_binding": {
+          "type": "object",
+          "properties": {
+            "identity": {
+              "type": "object",
+              "properties": {
+                "name": {
+                  "type": "string"
+                },
+                "version": {
+                  "type": "string"
+                },
+                "release": {
+                  "type": "string"
+                },
+                "arch": {
+                  "type": "string"
+                }
+              }
+            },
+            "sections": {
+              "type": "array",
+              "item": {
+                "type": "object",
+                "properties": {
+                  "name": {
+                    "type": "string"
+                  },
+                  "offset": {
+                    "type": "integer",
+                    "minimum": 0
+                  },
+                  "bytes": {
+                    "type": "integer",
+                    "minimum": 0
+                  },
+                  "sha256": {
+                    "type": "string",
+                    "pattern": "[0-9a-f]{64}"
+                  }
+                }
+              }
+            },
+            "regular_single_link_files_only": {
+              "type": "boolean",
+              "enum": [
+                true
+              ]
+            },
+            "native_reader_sha256": {
+              "type": "string",
+              "pattern": "[0-9a-f]{64}"
+            },
+            "native_reader_version": {
+              "type": "string"
+            }
+          }
+        },
+        "full_rpm_binding": {
+          "type": "object",
+          "properties": {
+            "metadata": {
+              "type": "object",
+              "properties": {
+                "path": {
+                  "type": "string"
+                },
+                "bytes": {
+                  "type": "integer"
+                },
+                "sha256": {
+                  "type": "string",
+                  "pattern": "[0-9a-f]{64}"
+                }
+              }
+            },
+            "prospective_metadata": {
+              "type": "object",
+              "properties": {
+                "path": {
+                  "type": "string"
+                },
+                "bytes": {
+                  "type": "integer"
+                },
+                "sha256": {
+                  "type": "string",
+                  "pattern": "[0-9a-f]{64}"
+                }
+              }
+            },
+            "captures": {
+              "type": "array",
+              "item": {
+                "type": "object",
+                "properties": {
+                  "label": {
+                    "type": "string",
+                    "enum": [
+                      "A",
+                      "B"
+                    ]
+                  },
+                  "spec": {
+                    "type": "object",
+                    "properties": {
+                      "path": {
+                        "type": "string"
+                      },
+                      "bytes": {
+                        "type": "integer"
+                      },
+                      "sha256": {
+                        "type": "string",
+                        "pattern": "[0-9a-f]{64}"
+                      }
+                    }
+                  },
+                  "metadata": {
+                    "type": "object",
+                    "properties": {
+                      "path": {
+                        "type": "string"
+                      },
+                      "bytes": {
+                        "type": "integer"
+                      },
+                      "sha256": {
+                        "type": "string",
+                        "pattern": "[0-9a-f]{64}"
+                      }
+                    }
+                  },
+                  "sources": {
+                    "type": "object",
+                    "properties": {
+                      "path": {
+                        "type": "string"
+                      },
+                      "bytes": {
+                        "type": "integer"
+                      },
+                      "sha256": {
+                        "type": "string",
+                        "pattern": "[0-9a-f]{64}"
+                      }
+                    }
+                  },
+                  "rpm_call": {
+                    "type": "object",
+                    "properties": {
+                      "path": {
+                        "type": "string"
+                      },
+                      "bytes": {
+                        "type": "integer"
+                      },
+                      "sha256": {
+                        "type": "string",
+                        "pattern": "[0-9a-f]{64}"
+                      }
+                    }
+                  }
+                }
+              }
+            },
+            "declaration": {
+              "type": "object",
+              "properties": {
+                "path": {
+                  "type": "string"
+                },
+                "bytes": {
+                  "type": "integer"
+                },
+                "sha256": {
+                  "type": "string",
+                  "pattern": "[0-9a-f]{64}"
+                }
+              }
+            },
+            "historical_tools_receipt": {
+              "type": "object",
+              "properties": {
+                "path": {
+                  "type": "string"
+                },
+                "bytes": {
+                  "type": "integer"
+                },
+                "sha256": {
+                  "type": "string",
+                  "pattern": "[0-9a-f]{64}"
+                }
+              }
+            },
+            "source_files": {
+              "type": "array",
+              "item": {
+                "type": "object",
+                "properties": {
+                  "path": {
+                    "type": "string"
+                  },
+                  "source": {
+                    "type": "object",
+                    "properties": {
+                      "path": {
+                        "type": "string"
+                      },
+                      "bytes": {
+                        "type": "integer"
+                      },
+                      "sha256": {
+                        "type": "string",
+                        "pattern": "[0-9a-f]{64}"
+                      }
+                    }
+                  }
+                }
+              }
+            },
+            "generated_at_utc": {
+              "type": "string"
+            },
+            "release_artifact": {
+              "type": "boolean",
+              "enum": [
+                false
+              ]
+            },
+            "skip_build": {
+              "type": "boolean",
+              "enum": [
+                true
+              ]
+            }
+          }
+        }
+      }
+    },
+    "linux-deb-full-repro-cargo-build-closure-v1": {
+      "type": "object",
+      "properties": {
+        "format": {
+          "type": "string",
+          "enum": [
+            "rmux-sbom-json"
+          ]
+        },
+        "version": {
+          "type": "integer",
+          "enum": [
+            1
+          ]
+        },
+        "profile": {
+          "type": "string",
+          "enum": [
+            "linux-deb-full-repro-cargo-build-closure-v1"
+          ]
+        },
+        "subject": {
+          "ref": "subject"
+        },
+        "payload_source": {
+          "ref": "source"
+        },
+        "resolution_contexts": {
+          "type": "array",
+          "item": {
+            "ref": "context"
+          }
+        },
+        "files": {
+          "type": "array",
+          "item": {
+            "ref": "file"
+          }
+        },
+        "packages": {
+          "type": "array",
+          "item": {
+            "ref": "package"
+          }
+        },
+        "build_units": {
+          "type": "array",
+          "item": {
+            "ref": "unit"
+          }
+        },
+        "binary_roots": {
+          "type": "array",
+          "item": {
+            "ref": "root"
+          }
+        },
+        "relationships": {
+          "type": "array",
+          "item": {
+            "ref": "relation"
+          }
+        },
+        "recipe_evidence": {
+          "type": "array",
+          "item": {
+            "ref": "evidence"
+          }
+        },
+        "external_runtime_requirements": {
+          "type": "array",
+          "item": {
+            "ref": "runtime"
+          }
+        },
+        "tool_pins": {
+          "ref": "pins"
+        },
+        "closure_sha256": {
+          "type": "string",
+          "pattern": "[0-9a-f]{64}"
+        },
+        "repro_binding": {
+          "type": "object",
+          "properties": {
+            "receipt": {
+              "type": "object",
+              "properties": {
+                "path": {
+                  "type": "string"
+                },
+                "bytes": {
+                  "type": "integer"
+                },
+                "sha256": {
+                  "type": "string",
+                  "pattern": "[0-9a-f]{64}"
+                }
+              }
+            },
+            "freeze": {
+              "type": "object",
+              "properties": {
+                "path": {
+                  "type": "string"
+                },
+                "bytes": {
+                  "type": "integer"
+                },
+                "sha256": {
+                  "type": "string",
+                  "pattern": "[0-9a-f]{64}"
+                }
+              }
+            },
+            "contract": {
+              "type": "object",
+              "properties": {
+                "path": {
+                  "type": "string"
+                },
+                "bytes": {
+                  "type": "integer"
+                },
+                "sha256": {
+                  "type": "string",
+                  "pattern": "[0-9a-f]{64}"
+                }
+              }
+            },
+            "archives": {
+              "type": "array",
+              "item": {
+                "type": "object",
+                "properties": {
+                  "path": {
+                    "type": "string"
+                  },
+                  "bytes": {
+                    "type": "integer"
+                  },
+                  "sha256": {
+                    "type": "string",
+                    "pattern": "[0-9a-f]{64}"
+                  }
+                }
+              }
+            },
+            "packager_source": {
+              "ref": "source"
+            },
+            "packager_script": {
+              "type": "object",
+              "properties": {
+                "path": {
+                  "type": "string"
+                },
+                "bytes": {
+                  "type": "integer"
+                },
+                "sha256": {
+                  "type": "string",
+                  "pattern": "[0-9a-f]{64}"
+                }
+              }
+            },
+            "historical_tools": {
+              "type": "array",
+              "item": {
+                "type": "object",
+                "properties": {
+                  "path": {
+                    "type": "string"
+                  },
+                  "bytes": {
+                    "type": "integer"
+                  },
+                  "sha256": {
+                    "type": "string",
+                    "pattern": "[0-9a-f]{64}"
+                  }
+                }
+              }
+            },
+            "source_date_epoch": {
+              "type": "integer",
+              "enum": [
+                1790347419
+              ]
+            },
+            "pair": {
+              "type": "integer"
+            },
+            "review_scope": {
+              "type": "string",
+              "enum": [
+                "author-proof-review-pending-at-mandate"
+              ]
+            },
+            "signature_status": {
+              "type": "string",
+              "enum": [
+                "unsigned"
+              ]
+            },
+            "provenance_kind": {
+              "type": "string",
+              "enum": [
+                "local-historical-build-and-full-packaging-not-ci-or-signed"
+              ]
+            },
+            "parent_sbom": {
+              "type": "object",
+              "properties": {
+                "path": {
+                  "type": "string"
+                },
+                "bytes": {
+                  "type": "integer"
+                },
+                "sha256": {
+                  "type": "string",
+                  "pattern": "[0-9a-f]{64}"
+                }
+              }
+            },
+            "parent_subject": {
+              "ref": "subject"
+            },
+            "parent_closure_sha256": {
+              "type": "string",
+              "pattern": "[0-9a-f]{64}"
+            },
+            "cargo_closure_sha256": {
+              "type": "string",
+              "pattern": "[0-9a-f]{64}"
+            },
+            "historical_profile": {
+              "type": "string"
+            },
+            "reuse_scope": {
+              "type": "string",
+              "enum": [
+                "complete-cargo-closure-after-identical-binaries-only"
+              ]
+            }
+          }
+        },
+        "deb_binding": {
+          "type": "object",
+          "properties": {
+            "identity": {
+              "type": "object",
+              "properties": {
+                "package": {
+                  "type": "string"
+                },
+                "version": {
+                  "type": "string"
+                },
+                "architecture": {
+                  "type": "string"
+                }
+              }
+            },
+            "package_name": {
+              "type": "string"
+            },
+            "ar_members": {
+              "type": "array",
+              "item": {
+                "type": "object",
+                "properties": {
+                  "name": {
+                    "type": "string"
+                  },
+                  "header_offset": {
+                    "type": "integer",
+                    "minimum": 0
+                  },
+                  "header_sha256": {
+                    "type": "string",
+                    "pattern": "[0-9a-f]{64}"
+                  },
+                  "offset": {
+                    "type": "integer",
+                    "minimum": 0
+                  },
+                  "bytes": {
+                    "type": "integer",
+                    "minimum": 0
+                  },
+                  "sha256": {
+                    "type": "string",
+                    "pattern": "[0-9a-f]{64}"
+                  }
+                }
+              }
+            },
+            "control_files": {
+              "type": "array",
+              "item": {
+                "ref": "file"
+              }
+            },
+            "control_directories": {
+              "type": "array",
+              "item": {
+                "type": "object",
+                "properties": {
+                  "path": {
+                    "type": "string"
+                  },
+                  "mode": {
+                    "type": "integer",
+                    "minimum": 0
+                  }
+                }
+              }
+            },
+            "data_directories": {
+              "type": "array",
+              "item": {
+                "type": "object",
+                "properties": {
+                  "path": {
+                    "type": "string"
+                  },
+                  "mode": {
+                    "type": "integer",
+                    "minimum": 0
+                  }
+                }
+              }
+            },
+            "control_fields": {
+              "type": "array",
+              "item": {
+                "type": "object",
+                "properties": {
+                  "field": {
+                    "type": "string"
+                  },
+                  "value": {
+                    "type": "string"
+                  }
+                }
+              }
+            },
+            "all_entries_root_owned": {
+              "type": "boolean",
+              "enum": [
+                true
+              ]
+            },
+            "links_allowed": {
+              "type": "boolean",
+              "enum": [
+                false
+              ]
+            },
+            "native_reader_sha256": {
+              "type": "string",
+              "pattern": "[0-9a-f]{64}"
+            },
+            "native_reader_version": {
+              "type": "string"
+            }
+          }
+        },
+        "full_deb_binding": {
+          "type": "object",
+          "properties": {
+            "metadata": {
+              "type": "object",
+              "properties": {
+                "path": {
+                  "type": "string"
+                },
+                "bytes": {
+                  "type": "integer"
+                },
+                "sha256": {
+                  "type": "string",
+                  "pattern": "[0-9a-f]{64}"
+                }
+              }
+            },
+            "control": {
+              "type": "object",
+              "properties": {
+                "path": {
+                  "type": "string"
+                },
+                "bytes": {
+                  "type": "integer"
+                },
+                "sha256": {
+                  "type": "string",
+                  "pattern": "[0-9a-f]{64}"
+                }
+              }
+            },
+            "copyright": {
+              "type": "object",
+              "properties": {
+                "path": {
+                  "type": "string"
+                },
+                "bytes": {
+                  "type": "integer"
+                },
+                "sha256": {
+                  "type": "string",
+                  "pattern": "[0-9a-f]{64}"
+                }
+              }
+            },
+            "prospective_metadata": {
+              "type": "object",
+              "properties": {
+                "path": {
+                  "type": "string"
+                },
+                "bytes": {
+                  "type": "integer"
+                },
+                "sha256": {
+                  "type": "string",
+                  "pattern": "[0-9a-f]{64}"
+                }
+              }
+            },
+            "prospective_control": {
+              "type": "object",
+              "properties": {
+                "path": {
+                  "type": "string"
+                },
+                "bytes": {
+                  "type": "integer"
+                },
+                "sha256": {
+                  "type": "string",
+                  "pattern": "[0-9a-f]{64}"
+                }
+              }
+            },
+            "prospective_copyright": {
+              "type": "object",
+              "properties": {
+                "path": {
+                  "type": "string"
+                },
+                "bytes": {
+                  "type": "integer"
+                },
+                "sha256": {
+                  "type": "string",
+                  "pattern": "[0-9a-f]{64}"
+                }
+              }
+            },
+            "declaration": {
+              "type": "object",
+              "properties": {
+                "path": {
+                  "type": "string"
+                },
+                "bytes": {
+                  "type": "integer"
+                },
+                "sha256": {
+                  "type": "string",
+                  "pattern": "[0-9a-f]{64}"
+                }
+              }
+            },
+            "historical_tools_receipt": {
+              "type": "object",
+              "properties": {
+                "path": {
+                  "type": "string"
+                },
+                "bytes": {
+                  "type": "integer"
+                },
+                "sha256": {
+                  "type": "string",
+                  "pattern": "[0-9a-f]{64}"
+                }
+              }
+            },
+            "entry_scripts": {
+              "type": "array",
+              "item": {
+                "type": "object",
+                "properties": {
+                  "path": {
+                    "type": "string"
+                  },
+                  "bytes": {
+                    "type": "integer"
+                  },
+                  "sha256": {
+                    "type": "string",
+                    "pattern": "[0-9a-f]{64}"
+                  }
+                }
+              }
+            },
+            "observations": {
+              "type": "array",
+              "item": {
+                "type": "object",
+                "properties": {
+                  "label": {
+                    "type": "string",
+                    "enum": [
+                      "A",
+                      "B"
+                    ]
+                  },
+                  "entry": {
+                    "type": "object",
+                    "properties": {
+                      "path": {
+                        "type": "string"
+                      },
+                      "bytes": {
+                        "type": "integer"
+                      },
+                      "sha256": {
+                        "type": "string",
+                        "pattern": "[0-9a-f]{64}"
+                      }
+                    }
+                  },
+                  "dpkg": {
+                    "type": "object",
+                    "properties": {
+                      "path": {
+                        "type": "string"
+                      },
+                      "bytes": {
+                        "type": "integer"
+                      },
+                      "sha256": {
+                        "type": "string",
+                        "pattern": "[0-9a-f]{64}"
+                      }
+                    }
+                  },
+                  "stage": {
+                    "type": "object",
+                    "properties": {
+                      "path": {
+                        "type": "string"
+                      },
+                      "bytes": {
+                        "type": "integer"
+                      },
+                      "sha256": {
+                        "type": "string",
+                        "pattern": "[0-9a-f]{64}"
+                      }
+                    }
+                  },
+                  "metadata": {
+                    "type": "object",
+                    "properties": {
+                      "path": {
+                        "type": "string"
+                      },
+                      "bytes": {
+                        "type": "integer"
+                      },
+                      "sha256": {
+                        "type": "string",
+                        "pattern": "[0-9a-f]{64}"
+                      }
+                    }
+                  },
+                  "control": {
+                    "type": "object",
+                    "properties": {
+                      "path": {
+                        "type": "string"
+                      },
+                      "bytes": {
+                        "type": "integer"
+                      },
+                      "sha256": {
+                        "type": "string",
+                        "pattern": "[0-9a-f]{64}"
+                      }
+                    }
+                  },
+                  "inventory": {
+                    "type": "object",
+                    "properties": {
+                      "path": {
+                        "type": "string"
+                      },
+                      "bytes": {
+                        "type": "integer"
+                      },
+                      "sha256": {
+                        "type": "string",
+                        "pattern": "[0-9a-f]{64}"
+                      }
+                    }
+                  }
+                }
+              }
+            },
+            "source_files": {
+              "type": "array",
+              "item": {
+                "type": "object",
+                "properties": {
+                  "path": {
+                    "type": "string"
+                  },
+                  "source": {
+                    "type": "object",
+                    "properties": {
+                      "path": {
+                        "type": "string"
+                      },
+                      "bytes": {
+                        "type": "integer"
+                      },
+                      "sha256": {
+                        "type": "string",
+                        "pattern": "[0-9a-f]{64}"
+                      }
+                    }
+                  },
+                  "transform": {
+                    "type": "string",
+                    "enum": [
+                      "copy",
+                      "gzip"
+                    ]
+                  }
+                }
+              }
+            },
+            "generated_at_utc": {
+              "type": "string",
+              "enum": [
+                "2026-09-27T06:37:01+02:00"
+              ]
+            },
+            "release_artifact": {
+              "type": "boolean",
+              "enum": [
+                false
+              ]
+            },
+            "skip_build": {
+              "type": "boolean",
+              "enum": [
+                true
+              ]
+            },
+            "reuse_release_binary": {
+              "type": "boolean",
+              "enum": [
+                false
+              ]
+            }
+          }
+        }
+      }
+    },
+    "linux-tar-full-repro-cargo-build-closure-v1": {
+      "type": "object",
+      "properties": {
+        "format": {
+          "type": "string",
+          "enum": [
+            "rmux-sbom-json"
+          ]
+        },
+        "version": {
+          "type": "integer",
+          "enum": [
+            1
+          ]
+        },
+        "profile": {
+          "type": "string",
+          "enum": [
+            "linux-tar-full-repro-cargo-build-closure-v1"
+          ]
+        },
+        "subject": {
+          "ref": "subject"
+        },
+        "payload_source": {
+          "ref": "source"
+        },
+        "resolution_contexts": {
+          "type": "array",
+          "item": {
+            "ref": "context"
+          }
+        },
+        "files": {
+          "type": "array",
+          "item": {
+            "ref": "file"
+          }
+        },
+        "packages": {
+          "type": "array",
+          "item": {
+            "ref": "package"
+          }
+        },
+        "build_units": {
+          "type": "array",
+          "item": {
+            "ref": "unit"
+          }
+        },
+        "binary_roots": {
+          "type": "array",
+          "item": {
+            "ref": "root"
+          }
+        },
+        "relationships": {
+          "type": "array",
+          "item": {
+            "ref": "relation"
+          }
+        },
+        "recipe_evidence": {
+          "type": "array",
+          "item": {
+            "ref": "evidence"
+          }
+        },
+        "external_runtime_requirements": {
+          "type": "array",
+          "item": {
+            "ref": "runtime"
+          }
+        },
+        "tool_pins": {
+          "ref": "pins"
+        },
+        "closure_sha256": {
+          "type": "string",
+          "pattern": "[0-9a-f]{64}"
+        },
+        "repro_binding": {
+          "type": "object",
+          "properties": {
+            "receipt": {
+              "type": "object",
+              "properties": {
+                "path": {
+                  "type": "string"
+                },
+                "bytes": {
+                  "type": "integer"
+                },
+                "sha256": {
+                  "type": "string",
+                  "pattern": "[0-9a-f]{64}"
+                }
+              }
+            },
+            "freeze": {
+              "type": "object",
+              "properties": {
+                "path": {
+                  "type": "string"
+                },
+                "bytes": {
+                  "type": "integer"
+                },
+                "sha256": {
+                  "type": "string",
+                  "pattern": "[0-9a-f]{64}"
+                }
+              }
+            },
+            "contract": {
+              "type": "object",
+              "properties": {
+                "path": {
+                  "type": "string"
+                },
+                "bytes": {
+                  "type": "integer"
+                },
+                "sha256": {
+                  "type": "string",
+                  "pattern": "[0-9a-f]{64}"
+                }
+              }
+            },
+            "archives": {
+              "type": "array",
+              "item": {
+                "type": "object",
+                "properties": {
+                  "path": {
+                    "type": "string"
+                  },
+                  "bytes": {
+                    "type": "integer"
+                  },
+                  "sha256": {
+                    "type": "string",
+                    "pattern": "[0-9a-f]{64}"
+                  }
+                }
+              }
+            },
+            "packager_source": {
+              "ref": "source"
+            },
+            "packager_script": {
+              "type": "object",
+              "properties": {
+                "path": {
+                  "type": "string"
+                },
+                "bytes": {
+                  "type": "integer"
+                },
+                "sha256": {
+                  "type": "string",
+                  "pattern": "[0-9a-f]{64}"
+                }
+              }
+            },
+            "historical_tools": {
+              "type": "array",
+              "item": {
+                "type": "object",
+                "properties": {
+                  "path": {
+                    "type": "string"
+                  },
+                  "bytes": {
+                    "type": "integer"
+                  },
+                  "sha256": {
+                    "type": "string",
+                    "pattern": "[0-9a-f]{64}"
+                  }
+                }
+              }
+            },
+            "source_date_epoch": {
+              "type": "integer",
+              "enum": [
+                1790347419
+              ]
+            },
+            "pair": {
+              "type": "integer"
+            },
+            "review_scope": {
+              "type": "string",
+              "enum": [
+                "author-proof-review-pending-at-mandate"
+              ]
+            },
+            "signature_status": {
+              "type": "string",
+              "enum": [
+                "unsigned"
+              ]
+            },
+            "provenance_kind": {
+              "type": "string",
+              "enum": [
+                "local-historical-build-and-full-packaging-not-ci-or-signed"
+              ]
+            },
+            "parent_sbom": {
+              "type": "object",
+              "properties": {
+                "path": {
+                  "type": "string"
+                },
+                "bytes": {
+                  "type": "integer"
+                },
+                "sha256": {
+                  "type": "string",
+                  "pattern": "[0-9a-f]{64}"
+                }
+              }
+            },
+            "parent_subject": {
+              "ref": "subject"
+            },
+            "parent_closure_sha256": {
+              "type": "string",
+              "pattern": "[0-9a-f]{64}"
+            },
+            "cargo_closure_sha256": {
+              "type": "string",
+              "pattern": "[0-9a-f]{64}"
+            },
+            "historical_profile": {
+              "type": "string"
+            },
+            "reuse_scope": {
+              "type": "string",
+              "enum": [
+                "complete-cargo-closure-after-identical-binaries-only"
+              ]
+            }
+          }
+        },
+        "tar_binding": {
+          "type": "object",
+          "properties": {
+            "gzip_header_hex": {
+              "type": "string",
+              "enum": [
+                "1f8b0800000000000003"
+              ]
+            },
+            "members": {
+              "type": "array",
+              "item": {
+                "type": "object",
+                "properties": {
+                  "path": {
+                    "type": "string"
+                  },
+                  "kind": {
+                    "type": "string",
+                    "enum": [
+                      "file",
+                      "directory"
+                    ]
+                  },
+                  "mode": {
+                    "type": "integer"
+                  },
+                  "bytes": {
+                    "type": "integer"
+                  },
+                  "uid": {
+                    "type": "integer"
+                  },
+                  "gid": {
+                    "type": "integer"
+                  },
+                  "uname": {
+                    "type": "string"
+                  },
+                  "gname": {
+                    "type": "string"
+                  },
+                  "mtime": {
+                    "type": "integer"
+                  },
+                  "header_sha256": {
+                    "type": "string",
+                    "pattern": "[0-9a-f]{64}"
+                  },
+                  "header_magic": {
+                    "type": "string"
+                  }
+                }
+              }
+            }
+          }
+        },
+        "full_tar_binding": {
+          "type": "object",
+          "properties": {
+            "metadata": {
+              "type": "object",
+              "properties": {
+                "path": {
+                  "type": "string"
+                },
+                "bytes": {
+                  "type": "integer"
+                },
+                "sha256": {
+                  "type": "string",
+                  "pattern": "[0-9a-f]{64}"
+                }
+              }
+            },
+            "manifest": {
+              "type": "object",
+              "properties": {
+                "path": {
+                  "type": "string"
+                },
+                "bytes": {
+                  "type": "integer"
+                },
+                "sha256": {
+                  "type": "string",
+                  "pattern": "[0-9a-f]{64}"
+                }
+              }
+            },
+            "checksums": {
+              "type": "object",
+              "properties": {
+                "path": {
+                  "type": "string"
+                },
+                "bytes": {
+                  "type": "integer"
+                },
+                "sha256": {
+                  "type": "string",
+                  "pattern": "[0-9a-f]{64}"
+                }
+              }
+            },
+            "prospective_metadata": {
+              "type": "object",
+              "properties": {
+                "path": {
+                  "type": "string"
+                },
+                "bytes": {
+                  "type": "integer"
+                },
+                "sha256": {
+                  "type": "string",
+                  "pattern": "[0-9a-f]{64}"
+                }
+              }
+            },
+            "prospective_manifest": {
+              "type": "object",
+              "properties": {
+                "path": {
+                  "type": "string"
+                },
+                "bytes": {
+                  "type": "integer"
+                },
+                "sha256": {
+                  "type": "string",
+                  "pattern": "[0-9a-f]{64}"
+                }
+              }
+            },
+            "prospective_checksums": {
+              "type": "object",
+              "properties": {
+                "path": {
+                  "type": "string"
+                },
+                "bytes": {
+                  "type": "integer"
+                },
+                "sha256": {
+                  "type": "string",
+                  "pattern": "[0-9a-f]{64}"
+                }
+              }
+            },
+            "declaration": {
+              "type": "object",
+              "properties": {
+                "path": {
+                  "type": "string"
+                },
+                "bytes": {
+                  "type": "integer"
+                },
+                "sha256": {
+                  "type": "string",
+                  "pattern": "[0-9a-f]{64}"
+                }
+              }
+            },
+            "historical_tools_receipt": {
+              "type": "object",
+              "properties": {
+                "path": {
+                  "type": "string"
+                },
+                "bytes": {
+                  "type": "integer"
+                },
+                "sha256": {
+                  "type": "string",
+                  "pattern": "[0-9a-f]{64}"
+                }
+              }
+            },
+            "entry_scripts": {
+              "type": "array",
+              "item": {
+                "type": "object",
+                "properties": {
+                  "path": {
+                    "type": "string"
+                  },
+                  "bytes": {
+                    "type": "integer"
+                  },
+                  "sha256": {
+                    "type": "string",
+                    "pattern": "[0-9a-f]{64}"
+                  }
+                }
+              }
+            },
+            "observations": {
+              "type": "array",
+              "item": {
+                "type": "object",
+                "properties": {
+                  "label": {
+                    "type": "string"
+                  },
+                  "entry": {
+                    "type": "object",
+                    "properties": {
+                      "path": {
+                        "type": "string"
+                      },
+                      "bytes": {
+                        "type": "integer"
+                      },
+                      "sha256": {
+                        "type": "string",
+                        "pattern": "[0-9a-f]{64}"
+                      }
+                    }
+                  },
+                  "tar": {
+                    "type": "object",
+                    "properties": {
+                      "path": {
+                        "type": "string"
+                      },
+                      "bytes": {
+                        "type": "integer"
+                      },
+                      "sha256": {
+                        "type": "string",
+                        "pattern": "[0-9a-f]{64}"
+                      }
+                    }
+                  },
+                  "gzip": {
+                    "type": "object",
+                    "properties": {
+                      "path": {
+                        "type": "string"
+                      },
+                      "bytes": {
+                        "type": "integer"
+                      },
+                      "sha256": {
+                        "type": "string",
+                        "pattern": "[0-9a-f]{64}"
+                      }
+                    }
+                  },
+                  "stage": {
+                    "type": "object",
+                    "properties": {
+                      "path": {
+                        "type": "string"
+                      },
+                      "bytes": {
+                        "type": "integer"
+                      },
+                      "sha256": {
+                        "type": "string",
+                        "pattern": "[0-9a-f]{64}"
+                      }
+                    }
+                  },
+                  "metadata": {
+                    "type": "object",
+                    "properties": {
+                      "path": {
+                        "type": "string"
+                      },
+                      "bytes": {
+                        "type": "integer"
+                      },
+                      "sha256": {
+                        "type": "string",
+                        "pattern": "[0-9a-f]{64}"
+                      }
+                    }
+                  },
+                  "manifest": {
+                    "type": "object",
+                    "properties": {
+                      "path": {
+                        "type": "string"
+                      },
+                      "bytes": {
+                        "type": "integer"
+                      },
+                      "sha256": {
+                        "type": "string",
+                        "pattern": "[0-9a-f]{64}"
+                      }
+                    }
+                  },
+                  "checksums": {
+                    "type": "object",
+                    "properties": {
+                      "path": {
+                        "type": "string"
+                      },
+                      "bytes": {
+                        "type": "integer"
+                      },
+                      "sha256": {
+                        "type": "string",
+                        "pattern": "[0-9a-f]{64}"
+                      }
+                    }
+                  },
+                  "inventory": {
+                    "type": "object",
+                    "properties": {
+                      "path": {
+                        "type": "string"
+                      },
+                      "bytes": {
+                        "type": "integer"
+                      },
+                      "sha256": {
+                        "type": "string",
+                        "pattern": "[0-9a-f]{64}"
+                      }
+                    }
+                  }
+                }
+              }
+            },
+            "source_files": {
+              "type": "array",
+              "item": {
+                "type": "object",
+                "properties": {
+                  "path": {
+                    "type": "string"
+                  },
+                  "source": {
+                    "type": "object",
+                    "properties": {
+                      "path": {
+                        "type": "string"
+                      },
+                      "bytes": {
+                        "type": "integer"
+                      },
+                      "sha256": {
+                        "type": "string",
+                        "pattern": "[0-9a-f]{64}"
+                      }
+                    }
+                  }
+                }
+              }
+            },
+            "generated_at_utc": {
+              "type": "string",
+              "enum": [
+                "2026-09-27T07:58:11+02:00"
+              ]
+            },
+            "release_artifact": {
+              "type": "boolean",
+              "enum": [
+                false
+              ]
+            },
+            "skip_build": {
+              "type": "boolean",
+              "enum": [
+                true
+              ]
+            }
+          }
+        }
+      }
+    }
+  }
+}

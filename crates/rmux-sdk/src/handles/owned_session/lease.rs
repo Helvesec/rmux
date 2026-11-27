@@ -54,7 +54,7 @@ impl OwnedSessionLease {
             }))
             .await?;
         let Response::CreateSessionLease(response) = response else {
-            return Err(RmuxError::protocol(rmux_proto::RmuxError::Server(
+            return Err(RmuxError::from_proto(rmux_proto::RmuxError::Server(
                 "daemon returned unexpected response for session lease create".to_owned(),
             )));
         };
@@ -135,7 +135,7 @@ impl OwnedSessionLease {
             }))
             .await?;
         let Response::ReleaseSessionLease(response) = response else {
-            return Err(RmuxError::protocol(rmux_proto::RmuxError::Server(
+            return Err(RmuxError::from_proto(rmux_proto::RmuxError::Server(
                 "daemon returned unexpected response for session lease release".to_owned(),
             )));
         };
@@ -150,7 +150,7 @@ impl OwnedSessionLease {
     }
 
     fn lost_error(&self) -> RmuxError {
-        RmuxError::from(rmux_proto::RmuxError::owned_session_lease_lost(
+        RmuxError::from_proto(rmux_proto::RmuxError::owned_session_lease_lost(
             self.display_name.clone(),
         ))
     }
@@ -253,10 +253,12 @@ async fn renew_lease_once(
         .await?
     {
         Response::RenewSessionLease(response) => Ok(response.renewed),
-        response => Err(RmuxError::protocol(rmux_proto::RmuxError::Server(format!(
-            "daemon returned `{}` response for session lease renew",
-            response.command_name()
-        )))),
+        response => Err(RmuxError::from_proto(rmux_proto::RmuxError::Server(
+            format!(
+                "daemon returned `{}` response for session lease renew",
+                response.command_name()
+            ),
+        ))),
     }
 }
 
@@ -269,7 +271,7 @@ impl Drop for OwnedSessionLease {
 fn ttl_millis(ttl: Duration) -> Result<u64> {
     validate_lease_ttl(ttl)?;
     let millis = u64::try_from(ttl.as_millis()).map_err(|_| {
-        RmuxError::protocol(rmux_proto::RmuxError::Server(
+        RmuxError::from_proto(rmux_proto::RmuxError::Server(
             "owned session lease ttl is too large".to_owned(),
         ))
     })?;
@@ -278,20 +280,22 @@ fn ttl_millis(ttl: Duration) -> Result<u64> {
 
 pub(super) fn validate_lease_ttl(ttl: Duration) -> Result<()> {
     let millis = u64::try_from(ttl.as_millis()).map_err(|_| {
-        RmuxError::protocol(rmux_proto::RmuxError::Server(
+        RmuxError::from_proto(rmux_proto::RmuxError::Server(
             "owned session lease ttl is too large".to_owned(),
         ))
     })?;
     if millis == 0 {
-        return Err(RmuxError::protocol(rmux_proto::RmuxError::Server(
+        return Err(RmuxError::from_proto(rmux_proto::RmuxError::Server(
             "owned session lease ttl must be greater than zero".to_owned(),
         )));
     }
     if millis < rmux_proto::MIN_SESSION_LEASE_TTL_MILLIS {
-        return Err(RmuxError::protocol(rmux_proto::RmuxError::Server(format!(
-            "owned session lease ttl must be at least {}ms",
-            rmux_proto::MIN_SESSION_LEASE_TTL_MILLIS
-        ))));
+        return Err(RmuxError::from_proto(rmux_proto::RmuxError::Server(
+            format!(
+                "owned session lease ttl must be at least {}ms",
+                rmux_proto::MIN_SESSION_LEASE_TTL_MILLIS
+            ),
+        )));
     }
     Ok(())
 }

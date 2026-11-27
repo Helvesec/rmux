@@ -144,7 +144,10 @@ async fn assert_renumbered_survivor(
         .session(session_name)
         .expect("source session survives");
     assert_eq!(
-        session.windows().keys().copied().collect::<Vec<_>>(),
+        session
+            .windows()
+            .map(|(index, _)| index)
+            .collect::<Vec<_>>(),
         vec![0, 1],
         "{session_name} must be contiguous after the source window disappears"
     );

@@ -270,7 +270,7 @@ impl OwnedSession {
     /// cleanup action before ownership is released.
     pub fn install_default_signal_handlers(&self) -> Result<OwnedSessionSignalHandlers> {
         let Some(session) = self.session.as_ref() else {
-            return Err(RmuxError::protocol(rmux_proto::RmuxError::Server(
+            return Err(RmuxError::from_proto(rmux_proto::RmuxError::Server(
                 "owned session no longer active".to_owned(),
             )));
         };
@@ -279,7 +279,7 @@ impl OwnedSession {
                 session_identity_kill_request(self.session_id)
             }
             CleanupPolicy::Preserve => {
-                return Err(RmuxError::protocol(rmux_proto::RmuxError::Server(
+                return Err(RmuxError::from_proto(rmux_proto::RmuxError::Server(
                     "owned session ownership has already been released".to_owned(),
                 )));
             }
@@ -383,10 +383,12 @@ async fn kill_session_identity_on_transport(
         .await?
     {
         Response::KillSession(response) => Ok(response.existed),
-        response => Err(RmuxError::protocol(rmux_proto::RmuxError::Server(format!(
-            "daemon returned `{}` response for owned-session cleanup",
-            response.command_name()
-        )))),
+        response => Err(RmuxError::from_proto(rmux_proto::RmuxError::Server(
+            format!(
+                "daemon returned `{}` response for owned-session cleanup",
+                response.command_name()
+            ),
+        ))),
     }
 }
 

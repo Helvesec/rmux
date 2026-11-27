@@ -1,5 +1,76 @@
 use super::*;
 
+#[tokio::test(start_paused = true)]
+async fn popup_write_timeout_finishes_attach_without_a_second_stalled_write() {
+    let handler = Arc::new(RequestHandler::new());
+    let session_name = SessionName::new("popup-write-timeout").expect("session name");
+    let (server, mut peer) = tokio::io::duplex(1024);
+    let (_shutdown_tx, shutdown_rx) = watch::channel(());
+    let (control_tx, control_rx) = mpsc::unbounded_channel();
+    let backlog = Arc::new(AtomicUsize::new(0));
+    let closing = Arc::new(AtomicBool::new(false));
+    let sender =
+        AttachControlSender::new(control_tx, Arc::clone(&backlog), 64, Arc::clone(&closing));
+    let mut target = test_attach_target(&session_name, b"READY035", None);
+    target.active_pane_geometry = PaneGeometry::new(0, 0, 225, 54);
+    let live_input = LiveAttachInputContext::unregistered_for_test(handler, std::process::id());
+    let mut attach = tokio::spawn(forward_attach(
+        AttachTransport::from_io(server),
+        target,
+        Vec::new(),
+        shutdown_rx,
+        control_rx,
+        Arc::clone(&backlog),
+        closing,
+        Arc::new(AtomicU64::new(0)),
+        live_input,
+        false,
+    ));
+    let mut initial = Vec::new();
+    let mut buffer = [0_u8; 512];
+    while !initial.windows(8).any(|bytes| bytes == b"READY035") {
+        let n = peer.read(&mut buffer).await.expect("drain attach startup");
+        assert!(n > 0);
+        initial.extend_from_slice(&buffer[..n]);
+        assert!(initial.len() < 4096);
+    }
+    sender
+        .send_popup_overlay(7, OverlayFrame::persistent(vec![b'Q'; 31_244], 0, 1))
+        .expect("send bounded popup repaint");
+    let mut prefix = Vec::new();
+    while !prefix.windows(32).any(|bytes| bytes == [b'Q'; 32]) {
+        let n = peer
+            .read(&mut buffer)
+            .await
+            .expect("observe actual popup write");
+        assert!(n > 0);
+        prefix.extend_from_slice(&buffer[..n]);
+        assert!(prefix.len() < 4096);
+    }
+    // Less than4096 bytes consumed and a1024-byte pipe cannot hold this frame.
+    // The real forwarder is inside its nonempty transport write now.
+    tokio::task::yield_now().await;
+    tokio::time::advance(Duration::from_secs(4)).await;
+    assert!(
+        !attach.is_finished(),
+        "the five-second timer must not fire early"
+    );
+    assert_eq!(backlog.load(Ordering::Acquire), 1);
+    tokio::time::advance(Duration::from_secs(1)).await;
+    let completed = tokio::time::timeout(Duration::from_millis(10), &mut attach).await;
+    assert!(
+        completed.is_ok(),
+        "an expired popup write must release the attach without a second stalled stop write"
+    );
+    let error = completed
+        .unwrap()
+        .expect("forwarder joins")
+        .expect_err("write times out");
+    assert_eq!(error.kind(), std::io::ErrorKind::TimedOut);
+    assert_eq!(backlog.load(Ordering::Acquire), 0);
+    assert!(sender.is_closed());
+}
+
 #[tokio::test]
 async fn forward_attach_clears_persistent_overlay_with_fresh_switch_frame() {
     let handler = Arc::new(RequestHandler::new());

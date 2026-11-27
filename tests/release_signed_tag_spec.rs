@@ -1,7 +1,9 @@
 #[cfg(unix)]
-use std::fs;
+#[path = "support/executable_fixture.rs"]
+mod executable_fixture;
+
 #[cfg(unix)]
-use std::os::unix::fs::PermissionsExt;
+use std::fs;
 #[cfg(unix)]
 use std::path::{Path, PathBuf};
 #[cfg(unix)]
@@ -47,13 +49,6 @@ fn stderr(output: &Output) -> String {
 }
 
 #[cfg(unix)]
-fn make_executable(path: &Path) {
-    let mut permissions = fs::metadata(path).expect("script metadata").permissions();
-    permissions.set_mode(0o755);
-    fs::set_permissions(path, permissions).expect("make script executable");
-}
-
-#[cfg(unix)]
 struct Fixture {
     root: PathBuf,
     repository: PathBuf,
@@ -79,6 +74,8 @@ fn activated_fixture(label: &str) -> Fixture {
     fs::create_dir_all(&policy_dir).expect("create fixture policy");
 
     for name in [
+        "candidate_route.py",
+        "notice_assets.py",
         "release_evidence.py",
         "release_tag_policy.py",
         "release-tag-message.py",
@@ -88,8 +85,9 @@ fn activated_fixture(label: &str) -> Fixture {
     ] {
         let source = repo_root().join("scripts/release").join(name);
         let destination = scripts.join(name);
-        fs::copy(source, &destination).expect("copy release tag script");
-        make_executable(&destination);
+        let script = fs::read(source).expect("read release tag script");
+        executable_fixture::write_executable(&destination, script, 0o755)
+            .expect("copy release tag script");
     }
 
     let signing_key = root.join("release-signing-key");
@@ -194,6 +192,18 @@ fn identity_arguments(source_sha: &str) -> Vec<String> {
     .into_iter()
     .flat_map(|(key, value)| [key.to_owned(), value.to_owned()])
     .collect()
+}
+
+#[test]
+#[cfg(unix)]
+fn signed_tag_proof_imports_in_isolated_fixture() {
+    let fixture = activated_fixture("proof-import");
+    let imported = run(Command::new("python3")
+        .args(["-I", "-c"])
+        .arg("import runpy, sys; sys.path.insert(0, sys.argv[1]); import release_evidence; runpy.run_path(sys.argv[2], run_name='signed_tag_proof')")
+        .arg(&fixture.scripts)
+        .arg(fixture.scripts.join("signed-tag-proof.py")));
+    assert!(imported.status.success(), "{}", stderr(&imported));
 }
 
 #[test]
@@ -471,7 +481,7 @@ fn github_idempotence_proof_binds_ref_object_payload_and_signature() {
     let fake_bin = fixture.root.join("fake-bin");
     fs::create_dir_all(&fake_bin).expect("create fake bin");
     let fake_gh = fake_bin.join("gh");
-    fs::write(
+    executable_fixture::write_executable(
         &fake_gh,
         r#"#!/usr/bin/env bash
 set -euo pipefail
@@ -485,9 +495,9 @@ esac
 printf 'HTTP/2.0 200 OK\nContent-Type: application/json\n\n'
 cat "$body"
 "#,
+        0o755,
     )
     .expect("write fake gh");
-    make_executable(&fake_gh);
     let mut driver_args = vec![
         "--repository".to_owned(),
         "Helvesec/rmux".to_owned(),
@@ -574,8 +584,8 @@ fn tag_driver_is_local_only_in_dry_run_and_fails_without_app_authority() {
     let authority_bin = fixture.root.join("authority-bin");
     fs::create_dir_all(&authority_bin).expect("create authority bin");
     let inert_gh = authority_bin.join("gh");
-    fs::write(&inert_gh, "#!/bin/sh\nexit 99\n").expect("write inert gh");
-    make_executable(&inert_gh);
+    executable_fixture::write_executable(&inert_gh, "#!/bin/sh\nexit 99\n", 0o755)
+        .expect("write inert gh");
     let authority_path = format!(
         "{}:{}",
         authority_bin.display(),
@@ -604,7 +614,7 @@ fn tag_driver_is_local_only_in_dry_run_and_fails_without_app_authority() {
     let ref_json = fixture.root.join("created-ref.json");
     let tag_json = fixture.root.join("created-tag.json");
     let fake_gh = fake_bin.join("gh");
-    fs::write(
+    executable_fixture::write_executable(
         &fake_gh,
         r#"#!/usr/bin/env bash
 set -euo pipefail
@@ -633,11 +643,11 @@ fi
 printf 'HTTP/2.0 200 OK\nContent-Type: application/json\n\n'
 cat "$body"
 "#,
+        0o755,
     )
     .expect("write fake gh");
-    make_executable(&fake_gh);
     let fake_git = fake_bin.join("git");
-    fs::write(
+    executable_fixture::write_executable(
         &fake_git,
         r#"#!/usr/bin/env bash
 set -euo pipefail
@@ -676,9 +686,9 @@ PY
 fi
 exec "$REAL_GIT" "$@"
 "#,
+        0o755,
     )
     .expect("write fake git");
-    make_executable(&fake_git);
     let path = format!(
         "{}:{}",
         fake_bin.display(),

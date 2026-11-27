@@ -13,31 +13,38 @@ use std::thread;
 use std::os::unix::process::CommandExt;
 
 const FULL_HELPER_OVERRIDE_ENV: &str = "RMUX_FULL_BINARY_PATH";
-const PUBLIC_BINARY_OVERRIDE_ENV: &str = "RMUX_INTERNAL_PUBLIC_BINARY_PATH";
 #[cfg(windows)]
 const INTERNAL_CLIENT_SHELL_ENV: &str = "RMUX_INTERNAL_CLIENT_SHELL";
-#[cfg(windows)]
-const TMUX_COMPAT_OVERRIDE_ENV: &str = "RMUX_INTERNAL_INVOKED_AS_TMUX";
 
 pub(super) fn exec_full_helper(args: &[OsString]) -> Result<i32, String> {
     let helper = full_helper_path()?;
+    let helper =
+        rmux_os::build_identity::resolve(helper.as_os_str()).map_err(|error| error.to_string())?;
     let mut command = Command::new(&helper);
+    #[cfg(unix)]
+    command
+        .arg0(env::current_exe().map_err(|error| error.to_string())?)
+        .arg(crate::helper_handoff::FULL_HELPER)
+        .args(args);
+    #[cfg(not(unix))]
     command.args(args.iter().skip(1));
-    if let Ok(current) = env::current_exe() {
-        command.env(PUBLIC_BINARY_OVERRIDE_ENV, current);
-    }
     #[cfg(windows)]
-    set_windows_client_shell_handoff(&mut command, super::parse::invoking_client_shell());
-    #[cfg(windows)]
-    if invoked_as_tmux(args) {
-        command.env(TMUX_COMPAT_OVERRIDE_ENV, "1");
+    {
+        command.env(
+            "RMUX_INTERNAL_PUBLIC_BINARY_PATH",
+            env::current_exe().map_err(|error| error.to_string())?,
+        );
+        set_windows_client_shell_handoff(
+            &mut command,
+            crate::windows_shell::invoking_client_shell(),
+        );
+        if invoked_as_tmux(args) {
+            command.env("RMUX_INTERNAL_INVOKED_AS_TMUX", "1");
+        }
     }
 
     #[cfg(unix)]
     {
-        if let Some(argv0) = args.first() {
-            command.arg0(argv0);
-        }
         let error = command.exec();
         Err(format!(
             "failed to exec private rmux helper '{}': {error}",
@@ -51,12 +58,14 @@ pub(super) fn exec_full_helper(args: &[OsString]) -> Result<i32, String> {
         if output_pipes.any() {
             return run_full_helper_with_piped_output(command, output_pipes);
         }
-        let status = command.status().map_err(|error| {
-            format!(
-                "failed to run private rmux helper '{}': {error}",
-                helper.display()
-            )
-        })?;
+        let status = rmux_os::daemon::spawn_daemon_launcher_command(&mut command)
+            .and_then(|mut child| child.wait())
+            .map_err(|error| {
+                format!(
+                    "failed to run private rmux helper '{}': {error}",
+                    helper.display()
+                )
+            })?;
         Ok(status.code().unwrap_or(1))
     }
 }
@@ -117,12 +126,13 @@ fn run_full_helper_with_piped_output(
     if output_pipes.stderr {
         command.stderr(Stdio::piped());
     }
-    let mut child = command.spawn().map_err(|error| {
-        format!(
-            "failed to run private rmux helper '{}': {error}",
-            command.get_program().to_string_lossy()
-        )
-    })?;
+    let mut child =
+        rmux_os::daemon::spawn_daemon_launcher_command(&mut command).map_err(|error| {
+            format!(
+                "failed to run private rmux helper '{}': {error}",
+                command.get_program().to_string_lossy()
+            )
+        })?;
     let stdout = child.stdout.take();
     let stderr = child.stderr.take();
 

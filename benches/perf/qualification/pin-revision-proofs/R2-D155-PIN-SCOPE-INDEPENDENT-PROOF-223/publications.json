@@ -1,0 +1,46 @@
+{
+  "schema": "rmux-r2-proof-publications/1",
+  "entries": [
+    {
+      "id": "D161-INT331-portable-publication",
+      "decision": "D161",
+      "source_attribution": "R2-D155-PIN-SCOPE-INDEPENDENT-PROOF-223",
+      "publisher": "S1",
+      "source_commit": "52464c10c163cde491cb9f6d223baec4f1a3889b",
+      "previous_sha256": "d4c0da9884cd019d4d6d35c258c8f74d726b399cadd5f7725febae50f7f72fee",
+      "artifacts": [
+        {
+          "path": "benches/perf/qualification/pin-revision-proofs/R2-D155-PIN-SCOPE-INDEPENDENT-PROOF-223/PROOF.json",
+          "source": {
+            "schema": "rmux-git-provenance/1",
+            "git_blob": "a2ed116d9db37916b957539f4c53a07bc9f5da2d",
+            "bytes": 19716,
+            "sha256": "d4c0da9884cd019d4d6d35c258c8f74d726b399cadd5f7725febae50f7f72fee"
+          },
+          "publication_sha256": "ecd9441e7d27338482826272d1688c8243e4e6de67bb5bb5f3f9f1b8a5b58dd0"
+        },
+        {
+          "path": "benches/perf/qualification/pin-revision-proofs/R2-D155-PIN-SCOPE-INDEPENDENT-PROOF-223/PREUVE.md",
+          "source": {
+            "schema": "rmux-git-provenance/1",
+            "git_blob": "72bcf138bef9ad128b7a437e2ae984e1497ec396",
+            "bytes": 10719,
+            "sha256": "b6a92e42d68c71a15f42c073e65df7443ec2d3c79eb3478d26825e3e68474301"
+          },
+          "publication_sha256": "fef5f7c99415a81fa17a8e61a609832662dc5a7f40e224f799d6edf55cf62d84"
+        },
+        {
+          "path": "benches/perf/qualification/pin-revision-proofs/R2-D155-PIN-SCOPE-INDEPENDENT-PROOF-223/REVUE.md",
+          "source": {
+            "schema": "rmux-git-provenance/1",
+            "git_blob": "ca86c222c65d9a631c8bb02528ec1b1f9ba88918",
+            "bytes": 1326,
+            "sha256": "92f297ffcf9d696776f47a1e4b4bf87f0c42e1235f3ae19cf122b2fde63208da"
+          },
+          "publication_sha256": "f736ba25f72424323f011767ed55479d679cce077ab6e21592b88b9fe9e636b4"
+        }
+      ],
+      "sha256": "6333b35254bd2347189e1d98751ba1837d1f0455c5f2986e0ed118945a41d6b6"
+    }
+  ]
+}

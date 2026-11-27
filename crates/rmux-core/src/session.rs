@@ -5,31 +5,36 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use rmux_proto::{RmuxError, SessionName, SplitDirection, TerminalSize};
 
-use crate::{AlertFlags, Pane, PaneGeometry, PaneId, SessionId, Window, WindowId};
+use crate::{AlertFlags, Pane, PaneId, SessionId, Window, WindowId};
 
-#[path = "session/accessors.rs"]
 mod accessors;
-#[path = "session/layout_cycle.rs"]
+mod managed;
+mod pane_operations;
+pub use managed::{
+    ManagedGroupNavigation, ManagedIndexChange, ManagedPaneBreak, ManagedPaneCreation,
+    ManagedPaneRemoval, ManagedPaneSplit, ManagedPaneTransfer, ManagedSessionIndexChange,
+    ManagedSessionPresentation, ManagedSessionRemoval, ManagedSessionStore, ManagedSessionView,
+    ManagedStructureCheckpoint, ManagedWindowCheckpoint, ManagedWindowCreation,
+    ManagedWindowNameChange, ManagedWindowRemoval,
+};
+mod attached_window_geometry;
 mod layout_cycle;
-#[path = "session/pane_transfer.rs"]
 mod pane_transfer;
-#[path = "session/pane_transfer_cross.rs"]
+mod pane_transfer_borrowed;
 mod pane_transfer_cross;
-#[path = "session/pane_transfer_shared.rs"]
+mod pane_transfer_join;
 mod pane_transfer_shared;
-#[path = "session/recency.rs"]
 mod recency;
-#[path = "session/resize.rs"]
 mod resize;
-#[path = "session/store.rs"]
 mod store;
-#[path = "session/target_error.rs"]
 mod target_error;
-#[path = "session/types.rs"]
 mod types;
-#[path = "session/window_ops.rs"]
 mod window_ops;
+mod window_selection;
+mod window_switch;
 
+pub use attached_window_geometry::AttachedWindowGeometry;
+pub use layout_cycle::WindowLayoutContext;
 pub use recency::SessionRecency;
 pub use store::SessionStore;
 use target_error::{invalid_pane_target, invalid_window_target};
@@ -37,6 +42,10 @@ pub(crate) use types::WindowIdAllocator;
 pub use types::{
     BreakPaneOptions, KillPaneOutcome, PaneJoinOptions, PaneSwapOptions, SessionPaneTarget,
 };
+pub use window_selection::WindowSelection;
+mod visit_history;
+
+pub use window_switch::WindowSwitch;
 
 /// A single detached RMUX session.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -49,6 +58,9 @@ pub struct Session {
     winlink_alert_flags: BTreeMap<u32, AlertFlags>,
     active_window: u32,
     last_window: Option<u32>,
+    /// Windows this session really visited, most recent first, never holding
+    /// the active one. tmux keeps exactly this per session as `s->lastw`.
+    window_stack: Vec<u32>,
     /// First grouped-peer winlink by stable identity, retained until real local navigation.
     group_initial_window_id: Option<WindowId>,
     next_pane_id: u32,
@@ -91,6 +103,7 @@ impl Session {
             winlink_alert_flags: BTreeMap::from([(window_index, AlertFlags::empty())]),
             active_window: window_index,
             last_window: None,
+            window_stack: Vec::new(),
             group_initial_window_id: None,
             next_pane_id: pane_id.as_u32().saturating_add(1),
             next_window_id: WindowIdAllocator::new(window_id.as_u32().saturating_add(1)),
@@ -221,26 +234,8 @@ impl Session {
         before: bool,
         detached: bool,
     ) -> Result<u32, RmuxError> {
-        let window = self
-            .window_at(window_index)
-            .ok_or_else(|| invalid_window_target(&self.name, window_index))?;
-        let position = window.pane_position(pane_index).ok_or_else(|| {
-            invalid_pane_target(
-                &self.name,
-                window_index,
-                pane_index,
-                "pane index does not exist in session",
-            )
-        })?;
-        if !window.can_split_pane(pane_index, direction) {
-            return Err(RmuxError::Message("no space for new pane".to_owned()));
-        }
-        Ok(self
-            .window_at_mut(window_index)
-            .expect("addressed session window must exist")
-            .split_at_position_with_id_and_direction_detached(
-                position, pane_id, direction, before, detached,
-            ))
+        self.pane_operations(window_index)?
+            .split(pane_index, pane_id, direction, before, detached)
     }
 
     /// Splits the full addressed window root and returns the new pane index.
@@ -273,55 +268,8 @@ impl Session {
         before: bool,
         detached: bool,
     ) -> Result<u32, RmuxError> {
-        let window = self
-            .window_at(window_index)
-            .ok_or_else(|| invalid_window_target(&self.name, window_index))?;
-        if window.pane(pane_index).is_none() {
-            return Err(invalid_pane_target(
-                &self.name,
-                window_index,
-                pane_index,
-                "pane index does not exist in session",
-            ));
-        }
-
-        let window = self
-            .window_at_mut(window_index)
-            .expect("addressed session window must exist");
-        let previous_active_pane_id = window.active_pane().map(Pane::id);
-        let previous_last_pane_id = window
-            .last_pane_index()
-            .and_then(|pane_index| window.pane(pane_index))
-            .map(Pane::id);
-        let new_index = window
-            .panes()
-            .iter()
-            .map(Pane::index)
-            .max()
-            .unwrap_or(0)
-            .saturating_add(1);
-        window.insert_pane_full_size(
-            Pane::new_with_id(pane_id, new_index, PaneGeometry::new(0, 0, 0, 0)),
-            direction,
-            before,
-        )?;
-        window.commit_split_renumber(
-            pane_id,
-            previous_active_pane_id,
-            previous_last_pane_id,
-            detached,
-        );
-        window
-            .panes()
-            .iter()
-            .find(|pane| pane.id() == pane_id)
-            .map(Pane::index)
-            .ok_or_else(|| {
-                RmuxError::Server(format!(
-                    "pane id {} disappeared after full-size split",
-                    pane_id.as_u32()
-                ))
-            })
+        self.pane_operations(window_index)?
+            .split_full_size(pane_index, pane_id, direction, before, detached)
     }
 
     /// Removes the addressed pane in the active window.
@@ -335,32 +283,18 @@ impl Session {
         window_index: u32,
         pane_index: u32,
     ) -> Result<KillPaneOutcome, RmuxError> {
-        let window = self
-            .window_at(window_index)
-            .ok_or_else(|| invalid_window_target(&self.name, window_index))?;
-        let pane_id = window.pane_id(pane_index).ok_or_else(|| {
-            invalid_pane_target(
-                &self.name,
-                window_index,
-                pane_index,
-                "pane index does not exist in session",
-            )
-        })?;
-
-        if window.pane_count() == 1 {
-            let removed_window = self.remove_window(window_index)?;
-            let removed_pane_ids = removed_window.panes().iter().map(Pane::id).collect();
-            return Ok(KillPaneOutcome::new(removed_pane_ids, true));
+        match self.pane_operations(window_index)?.kill(pane_index)? {
+            pane_operations::PaneRemoval::LastPane => {
+                let removed = self.remove_window(window_index)?;
+                Ok(KillPaneOutcome::new(
+                    removed.panes().iter().map(Pane::id).collect(),
+                    true,
+                ))
+            }
+            pane_operations::PaneRemoval::Pane(pane) => {
+                Ok(KillPaneOutcome::new(vec![pane.id()], false))
+            }
         }
-
-        let removed_pane = self
-            .window_at_mut(window_index)
-            .expect("addressed session window must exist")
-            .remove_pane(pane_index)
-            .expect("prevalidated pane removal must succeed");
-        debug_assert_eq!(removed_pane.id(), pane_id);
-
-        Ok(KillPaneOutcome::new(vec![removed_pane.id()], false))
     }
 
     /// Removes every pane except the addressed pane, matching `kill-pane -a`.
@@ -369,25 +303,10 @@ impl Session {
         window_index: u32,
         pane_index: u32,
     ) -> Result<KillPaneOutcome, RmuxError> {
-        let window = self
-            .window_at(window_index)
-            .ok_or_else(|| invalid_window_target(&self.name, window_index))?;
-        if window.pane(pane_index).is_none() {
-            return Err(invalid_pane_target(
-                &self.name,
-                window_index,
-                pane_index,
-                "pane index does not exist in session",
-            ));
-        }
-
-        let removed_pane_ids = self
-            .window_at_mut(window_index)
-            .expect("addressed session window must exist")
-            .remove_other_panes(pane_index)
-            .expect("prevalidated pane removal must succeed");
-
-        Ok(KillPaneOutcome::new(removed_pane_ids, false))
+        let removed = self
+            .pane_operations(window_index)?
+            .kill_others(pane_index)?;
+        Ok(KillPaneOutcome::new(removed, false))
     }
 
     /// Selects the active pane for the session.
@@ -411,36 +330,13 @@ impl Session {
         pane_index: u32,
         preserve_zoom: bool,
     ) -> Result<(), RmuxError> {
-        if self.window_at(window_index).is_none() {
-            return Err(invalid_window_target(&self.name, window_index));
-        }
-
-        if self
-            .window_at(window_index)
-            .expect("addressed session window must exist")
-            .pane(pane_index)
-            .is_none()
-        {
-            return Err(invalid_pane_target(
-                &self.name,
-                window_index,
-                pane_index,
-                "pane index does not exist in session",
-            ));
-        }
-
         let window = self
-            .window_at_mut(window_index)
-            .expect("addressed session window must exist");
-        if preserve_zoom {
-            let _ = window.push_zoom(true);
-        }
-        let selected = window.select_pane(pane_index);
-        if preserve_zoom {
-            window.pop_zoom();
-        }
-        debug_assert!(selected, "validated pane target must be selectable");
-        Ok(())
+            .windows
+            .get_mut(&window_index)
+            .ok_or_else(|| invalid_window_target(&self.name, window_index))?;
+        WindowSelection::new(&self.name, window_index, window)
+            .select(pane_index, preserve_zoom)
+            .map(|_| ())
     }
 
     /// Selects the pane adjacent to the addressed pane in the requested direction.
@@ -461,40 +357,15 @@ impl Session {
         direction: rmux_proto::SelectPaneDirection,
         preserve_zoom: bool,
     ) -> Result<u32, RmuxError> {
-        if self.window_at(window_index).is_none() {
-            return Err(invalid_window_target(&self.name, window_index));
-        }
-
-        if self
-            .window_at(window_index)
-            .expect("addressed session window must exist")
-            .pane(pane_index)
-            .is_none()
-        {
-            return Err(invalid_pane_target(
-                &self.name,
-                window_index,
-                pane_index,
-                "pane index does not exist in session",
-            ));
-        }
-
         let window = self
-            .window_at_mut(window_index)
-            .expect("addressed session window must exist");
-        let was_zoomed = window.is_zoomed();
-        let original_active_pane = window.active_pane_index();
-        if was_zoomed {
-            let _ = window.push_zoom(false);
-        }
-        let selected = window
-            .select_adjacent_pane(pane_index, direction)
-            .expect("validated adjacent pane anchor must be selectable");
-        let moved = selected != original_active_pane;
-        if was_zoomed && (preserve_zoom || !moved) {
-            let _ = window.toggle_zoom(window.active_pane_index());
-        }
-        Ok(selected)
+            .windows
+            .get_mut(&window_index)
+            .ok_or_else(|| invalid_window_target(&self.name, window_index))?;
+        WindowSelection::new(&self.name, window_index, window).select_adjacent(
+            pane_index,
+            direction,
+            preserve_zoom,
+        )
     }
 
     /// Updates the terminal and content sizes together for all windows.
@@ -505,7 +376,7 @@ impl Session {
     pub fn resize_terminal(&mut self, size: TerminalSize) {
         self.terminal_size = size;
         for window in self.windows.values_mut() {
-            window.set_size(size);
+            window.set_explicit_size(size);
         }
     }
 
@@ -674,3 +545,6 @@ mod zoom_tests;
 #[cfg(test)]
 #[path = "session/layout_tests.rs"]
 mod layout_tests;
+
+#[cfg(any(test, feature = "test-seams"))]
+pub use managed::ManagedSessionTestSnapshot;

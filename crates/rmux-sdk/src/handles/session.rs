@@ -220,7 +220,7 @@ impl Session {
 }
 
 fn pane_not_found(session_name: &SessionName, pane_id: PaneId) -> RmuxError {
-    RmuxError::protocol(rmux_proto::RmuxError::pane_not_found(
+    RmuxError::from_proto(rmux_proto::RmuxError::pane_not_found(
         session_name.clone(),
         pane_id,
     ))
@@ -238,8 +238,11 @@ impl fmt::Debug for Session {
 }
 
 pub(crate) async fn has_session(client: &TransportClient, name: SessionName) -> Result<bool> {
+    let Some(target) = exact_session_target(&name) else {
+        return Ok(list_session_names(client).await?.contains(&name));
+    };
     match client
-        .request(Request::HasSession(HasSessionRequest { target: name }))
+        .request(Request::HasSession(HasSessionRequest { target }))
         .await?
     {
         Response::HasSession(response) => Ok(response.exists),
@@ -248,18 +251,101 @@ pub(crate) async fn has_session(client: &TransportClient, name: SessionName) -> 
 }
 
 pub(crate) async fn kill_session(client: &TransportClient, name: SessionName) -> Result<bool> {
+    let target = match exact_session_target(&name) {
+        Some(target) => target,
+        None => session_id_target_named(client, &name)
+            .await?
+            .ok_or_else(|| session_not_found(&name))?,
+    };
     match client
         .request(Request::KillSession(KillSessionRequest {
-            target: name,
+            target: target.clone(),
             kill_all_except_target: false,
             clear_alerts: false,
             kill_group: false,
         }))
-        .await?
+        .await
+        .map_err(|error| restore_requested_name(error, &target, &name))?
     {
         Response::KillSession(response) => Ok(response.existed),
         response => Err(unexpected_response("kill-session", response)),
     }
+}
+
+/// Returns the daemon target that selects exactly the session called `name`.
+///
+/// A bare name is a tmux target: the daemon falls back to a unique prefix or
+/// pattern, and names such as `~` or `{current}` select other sessions. The
+/// `=` form disables every fallback, and a literal leading `=` survives
+/// because the daemon strips only one.
+///
+/// Two kinds of names have no exact target form, so the callers resolve them
+/// by listing instead:
+/// - a name that starts with `$` remains a session-id target even after `=`;
+/// - a canonical name that contains `\` (a literal backslash, or the escape of
+///   a tab, control or bidi character) cannot be named by any target, because
+///   the daemon escapes every backslash of the target again before its exact
+///   comparison, so `=a\\b` looks for `a\\\\b`.
+fn exact_session_target(name: &SessionName) -> Option<SessionName> {
+    if name.as_str().starts_with('$') || name.as_str().contains('\\') {
+        return None;
+    }
+    let target = SessionName::from_canonical(format!("={}", name.as_str()))
+        .expect("a prefixed canonical session name is non-empty");
+    debug_assert_eq!(&target.as_str()[1..], name.as_str());
+    Some(target)
+}
+
+/// Resolves the `$N` identity of the session called exactly `name`.
+///
+/// Session ids are never reused by a daemon, so killing through the id cannot
+/// reach a session created after the listing.
+async fn session_id_target_named(
+    client: &TransportClient,
+    name: &SessionName,
+) -> Result<Option<SessionName>> {
+    let response = client
+        .request(Request::ListSessions(ListSessionsRequest {
+            format: Some("#{session_id} #{session_name}".to_owned()),
+            filter: None,
+            sort_order: None,
+            reversed: false,
+        }))
+        .await?;
+    let output = match response {
+        Response::ListSessions(response) => response.output.stdout,
+        response => return Err(unexpected_response("list-sessions", response)),
+    };
+
+    for line in String::from_utf8_lossy(&output).lines() {
+        let Some((id, rendered_name)) = line.split_once(' ') else {
+            continue;
+        };
+        let is_session_id = id
+            .strip_prefix('$')
+            .is_some_and(|digits| !digits.is_empty() && digits.bytes().all(|b| b.is_ascii_digit()));
+        if is_session_id
+            && SessionName::from_canonical(rendered_name).is_ok_and(|listed| &listed == name)
+        {
+            return Ok(Some(SessionName::from_canonical(id)?));
+        }
+    }
+    Ok(None)
+}
+
+/// Reports a missing session under the name the caller asked for, not under
+/// the exact target the SDK sent for it.
+fn restore_requested_name(error: RmuxError, target: &SessionName, name: &SessionName) -> RmuxError {
+    match error.protocol_source() {
+        Some(rmux_proto::RmuxError::SessionNotFound(missing)) if missing == target.as_str() => {
+            session_not_found(name)
+        }
+        _ => error,
+    }
+}
+
+fn session_not_found(name: &SessionName) -> RmuxError {
+    RmuxError::from_proto(rmux_proto::RmuxError::SessionNotFound(name.to_string()))
 }
 
 pub(crate) async fn list_session_names(client: &TransportClient) -> Result<Vec<SessionName>> {
@@ -279,14 +365,52 @@ pub(crate) async fn list_session_names(client: &TransportClient) -> Result<Vec<S
 
     String::from_utf8_lossy(&output)
         .lines()
-        .map(SessionName::new)
+        .map(SessionName::from_canonical)
         .collect::<core::result::Result<Vec<_>, _>>()
-        .map_err(RmuxError::protocol)
+        .map_err(RmuxError::from)
 }
 
 pub(crate) fn unexpected_response(expected: &'static str, response: Response) -> RmuxError {
-    RmuxError::protocol(rmux_proto::RmuxError::Server(format!(
+    RmuxError::from_proto(rmux_proto::RmuxError::Server(format!(
         "rmux daemon sent `{}` response for `{expected}` request",
         response.command_name()
     )))
+}
+
+#[cfg(test)]
+mod exact_target_tests {
+    use super::{exact_session_target, SessionName};
+
+    #[test]
+    fn exact_target_adds_one_equals_sign_to_the_canonical_name() {
+        for raw in ["work", "=work", "a=b", "~", "{current}"] {
+            let name = SessionName::new(raw).expect("valid session name");
+            let target =
+                exact_session_target(&name).expect("only $ and backslash names lack a target");
+            assert_eq!(target.as_str(), format!("={}", name.as_str()));
+        }
+    }
+
+    #[test]
+    fn dollar_names_have_no_exact_target_form() {
+        for raw in ["$0", "$x", "$"] {
+            let name = SessionName::new(raw).expect("valid session name");
+            assert_eq!(exact_session_target(&name), None);
+        }
+    }
+
+    #[test]
+    fn backslash_names_have_no_exact_target_form() {
+        for raw in [
+            "back\\slash",
+            "tab\there",
+            "ctl\u{1}x",
+            "bidi\u{202e}x",
+            "\\",
+        ] {
+            let name = SessionName::new(raw).expect("valid session name");
+            assert!(name.as_str().contains('\\'), "{raw:?} has a backslash");
+            assert_eq!(exact_session_target(&name), None, "{raw:?}");
+        }
+    }
 }

@@ -372,20 +372,24 @@ impl CopyModeState {
         for y in start.y..=end.y {
             let line = self.line(y);
             let range_start = if y == start.y { start.x } else { 0 };
-            let range_end = if y == end.y {
-                end.x
+            // A hard line ends after its content, not after the screen's
+            // padding cells. In vi, selecting that boundary includes its LF.
+            // Wrapped rows have no LF and retain their full physical width.
+            let length = if line.wrapped() {
+                line.width()
             } else {
-                self.line_end_x(y)
+                self.line_length(y)
             };
-            if range_end >= range_start {
+            let range_end = if y == end.y { end.x } else { length };
+            if range_start < length {
                 text.push_str(&self.extract_line_range(
                     &line,
                     range_start,
-                    range_end,
-                    y != start.y || y != end.y,
+                    range_end.min(length - 1),
+                    false,
                 ));
             }
-            if y != end.y && !line.wrapped() {
+            if !line.wrapped() && (y != end.y || range_end >= length) {
                 text.push('\n');
             }
         }

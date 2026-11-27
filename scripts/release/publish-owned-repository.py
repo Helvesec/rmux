@@ -12,8 +12,8 @@ from pathlib import Path
 
 from downstream_channels import target_for_channel, write_object
 from downstream_result import validate_target_evidence
-from github_repository_writer import GitHubApi, publish, repository_identity
-from owned_repository_payload import repository_updates
+from github_repository_writer import GitHubApi, file_at, publish, repository_identity
+from owned_repository_payload import refuse_replacing_published, repository_updates
 from web_share_live import wait_for_live
 
 SOURCE_SHA = re.compile(r"[0-9a-f]{40}")
@@ -56,6 +56,11 @@ def execute(args: argparse.Namespace) -> None:
         branch="main",
         updates=updates,
         message=f"release: publish rmux {args.release_ref}",
+        admit_base=lambda base_commit: refuse_replacing_published(
+            args.channel,
+            version,
+            lambda path: file_at(api, full_name, path, base_commit),
+        ),
     )
     target_url = f"https://github.com/{full_name}/commit/{outcome.commit_sha}"
     if args.channel == "web_share":

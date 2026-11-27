@@ -1,20 +1,25 @@
 #![cfg(unix)]
 
+#[path = "../../../tests/support/executable_fixture.rs"]
+mod executable_fixture;
+
 mod common;
+#[path = "smoke_v1/config_fixture.rs"]
+mod config_fixture;
 
 use std::error::Error;
 use std::ffi::OsString;
 use std::fs;
-use std::os::unix::fs::{FileTypeExt, PermissionsExt};
+use std::os::unix::fs::FileTypeExt;
 use std::path::{Component, Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::OnceLock;
 use std::time::Duration;
 
 use rmux_sdk::{
-    bootstrap::discovery::SDK_DAEMON_BINARY_ENV, EnsureSession, EnsureSessionPolicy, PaneInfo,
-    PaneOutputChunk, PaneOutputStart, PaneOutputStream, PaneProcessState, PaneRecoveryEvent,
-    PaneRecoveryStream, PaneSurfaceEvent, PaneSurfaceStream, RmuxBuilder, SessionName,
+    EnsureSession, EnsureSessionPolicy, PaneInfo, PaneOutputChunk, PaneOutputStart,
+    PaneOutputStream, PaneProcessState, PaneRecoveryEvent, PaneRecoveryStream, PaneSurfaceEvent,
+    PaneSurfaceStream, RmuxBuilder, SessionName,
 };
 use tokio::time::{sleep, timeout, Instant};
 
@@ -36,7 +41,7 @@ async fn daemon_backed_sdk_happy_path_cleans_tmp_socket_lock_daemon_and_child() 
     let session_name = SessionName::new("sdksmokev1")?;
     let cleanup = Cleanup::new(root.clone(), socket_path.clone());
     let daemon_binary = rmux_binary()?.to_path_buf();
-    let _daemon_binary_env = EnvGuard::set(SDK_DAEMON_BINARY_ENV, daemon_binary.as_os_str());
+    let _daemon_binary_env = EnvGuard::set("RMUX_SDK_DAEMON_BINARY", daemon_binary.as_os_str());
 
     if let Some(parent) = socket_path.parent() {
         let _ = fs::remove_dir_all(parent);
@@ -130,14 +135,18 @@ async fn sdk_autostart_loads_the_default_rmux_config_before_serving_clients() ->
         &relative_config_path,
         b"set-environment -g SDK_CONFIG_SENTINEL loaded\n",
     )?;
-    fs::write(
+    config_fixture::preserve(&root, &[&config_path, &relative_config_path])?;
+    let config_evidence =
+        config_fixture::assert_retained(&root, &[&config_path, &relative_config_path])?;
+    executable_fixture::write_executable(
         &wrapper_path,
         b"#!/bin/sh\ncd / || exit 1\nexec \"$RMUX_SDK_REAL_DAEMON\" \"$@\"\n",
+        0o700,
     )?;
-    fs::set_permissions(&wrapper_path, fs::Permissions::from_mode(0o700))?;
+    rmux_os::build_identity::bind_test_launcher(&wrapper_path, "sdk")?;
 
     let daemon_binary = rmux_binary()?.to_path_buf();
-    let _daemon_binary_env = EnvGuard::set(SDK_DAEMON_BINARY_ENV, wrapper_path.as_os_str());
+    let _daemon_binary_env = EnvGuard::set("RMUX_SDK_DAEMON_BINARY", wrapper_path.as_os_str());
     let _real_daemon_env = EnvGuard::set("RMUX_SDK_REAL_DAEMON", daemon_binary.as_os_str());
     let _home_env = EnvGuard::set("HOME", home.as_os_str());
     let _xdg_env = EnvGuard::set("XDG_CONFIG_HOME", config_home.as_os_str());
@@ -169,6 +178,7 @@ async fn sdk_autostart_loads_the_default_rmux_config_before_serving_clients() ->
     wait_for_daemon_absent(&socket_path, daemon_pid).await?;
     wait_for_path_absent(&socket_path).await?;
     fs::remove_dir_all(&root)?;
+    config_fixture::assert_survived(&config_evidence)?;
     cleanup.disarm();
     Ok(())
 }
@@ -437,7 +447,10 @@ fn is_tmp_smoke_root(root: &Path) -> bool {
 fn rmux_binary() -> TestResult<&'static Path> {
     static RMUX_BINARY: OnceLock<Result<PathBuf, String>> = OnceLock::new();
     match RMUX_BINARY.get_or_init(|| resolve_rmux_binary().map_err(|error| error.to_string())) {
-        Ok(path) => Ok(path.as_path()),
+        Ok(path) => {
+            rmux_os::build_identity::resolve(path.as_os_str())?;
+            Ok(path.as_path())
+        }
         Err(error) => Err(std::io::Error::other(error.clone()).into()),
     }
 }
@@ -524,14 +537,17 @@ impl Drop for Cleanup {
             return;
         }
         if self.socket_path.exists() {
-            let _ = Command::new(rmux_binary().unwrap_or_else(|_| Path::new("rmux")))
-                .arg("-S")
-                .arg(&self.socket_path)
-                .arg("kill-server")
-                .stdin(Stdio::null())
-                .stdout(Stdio::null())
-                .stderr(Stdio::null())
-                .status();
+            let selected = rmux_binary().unwrap_or_else(|_| Path::new("rmux"));
+            if let Ok(binary) = rmux_os::build_identity::resolve(selected.as_os_str()) {
+                let _ = Command::new(binary)
+                    .arg("-S")
+                    .arg(&self.socket_path)
+                    .arg("kill-server")
+                    .stdin(Stdio::null())
+                    .stdout(Stdio::null())
+                    .stderr(Stdio::null())
+                    .status();
+            }
         }
         let _ = fs::remove_dir_all(&self.root);
     }

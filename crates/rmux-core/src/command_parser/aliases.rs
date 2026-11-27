@@ -8,6 +8,7 @@ impl CommandAlias {
     pub(super) fn builtin() -> impl Iterator<Item = Self> {
         DEFAULT_COMMAND_ALIASES
             .iter()
+            .chain(crate::command_schema::metadata::EXPANSION_ALIASES.iter())
             .map(|(name, value)| Self::from_parts(name, value))
     }
 
@@ -41,6 +42,4 @@ const DEFAULT_COMMAND_ALIASES: &[(&str, &str)] = &[
     ("splitp", "split-window"),
     ("server-info", "show-messages -JT"),
     ("info", "show-messages -JT"),
-    ("choose-window", "choose-tree -w"),
-    ("choose-session", "choose-tree -s"),
 ];

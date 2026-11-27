@@ -268,6 +268,11 @@ pub(crate) static CSI_TABLE: &[TableEntry<CsiCommand>] = &[
     },
     TableEntry {
         ch: b'p',
+        interm: b"$",
+        cmd: CsiCommand::Query,
+    },
+    TableEntry {
+        ch: b'p',
         interm: b"?$",
         cmd: CsiCommand::QueryPrivate,
     },

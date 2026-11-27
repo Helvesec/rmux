@@ -198,6 +198,18 @@ impl ServerAccessStore {
         self.entries.contains_key(&UserIdentity::Uid(uid))
     }
 
+    /// Whether this ACL grants some identity more than `previous` did: an
+    /// entry that `previous` lacked, or a read-only entry raised to write.
+    #[must_use]
+    pub(crate) fn grants_beyond(&self, previous: &Self) -> bool {
+        self.entries
+            .iter()
+            .any(|(identity, entry)| match previous.entries.get(identity) {
+                None => true,
+                Some(before) => entry.mode.can_write() && !before.mode.can_write(),
+            })
+    }
+
     #[must_use]
     pub(crate) fn has_delegated_users(&self) -> bool {
         self.entries.keys().any(|identity| {

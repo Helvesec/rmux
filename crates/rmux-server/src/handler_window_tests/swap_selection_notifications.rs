@@ -1,3 +1,5 @@
+#[cfg(test)]
+use crate::session_fixture::SessionSetupExt as _;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
@@ -92,7 +94,7 @@ async fn select_window(handler: &RequestHandler, session_name: &SessionName, win
     let mut state = handler.state.lock().await;
     state
         .sessions
-        .session_mut(session_name)
+        .session_setup(session_name)
         .expect("swap test session exists")
         .select_window(window_index)
         .expect("swap test window selection succeeds");
@@ -111,8 +113,7 @@ async fn session_window_ids(
         session.id().to_string(),
         session
             .windows()
-            .iter()
-            .map(|(index, window)| (*index, window.id().to_string()))
+            .map(|(index, window)| (index, window.id().to_string()))
             .collect(),
     )
 }

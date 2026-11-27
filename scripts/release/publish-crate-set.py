@@ -51,34 +51,40 @@ def prepare_target_dir(path: Path) -> None:
     path.mkdir(parents=True)
 
 
-def git_output(source_dir: Path, *arguments: str) -> str:
+def git_output(
+    source_dir: Path, *arguments: str, environment: dict[str, str] | None = None
+) -> str:
     completed = subprocess.run(
         ["git", "-C", str(source_dir), *arguments],
         check=False,
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
         text=True,
+        env=environment,
     )
     if completed.returncode != 0:
         raise ValueError(f"release source Git check failed: {completed.stderr.strip()}")
     return completed.stdout.strip()
 
 
-def validate_source_checkout(path: Path, source_sha: str) -> Path:
+def validate_source_checkout(
+    path: Path, source_sha: str, *, environment: dict[str, str] | None = None
+) -> Path:
     if path.is_symlink() or not path.is_dir():
         raise ValueError("release source checkout is missing or symbolic")
     source_dir = path.resolve(strict=True)
-    root_text = git_output(source_dir, "rev-parse", "--show-toplevel")
+    root_text = git_output(source_dir, "rev-parse", "--show-toplevel", environment=environment)
     root = Path(root_text).resolve(strict=True)
     if root != source_dir:
         raise ValueError("release source checkout root differs")
-    if git_output(source_dir, "rev-parse", "--verify", "HEAD^{commit}") != source_sha:
+    if git_output(source_dir, "rev-parse", "--verify", "HEAD^{commit}", environment=environment) != source_sha:
         raise ValueError("release source checkout SHA differs")
     if git_output(
         source_dir,
         "status",
         "--porcelain=v1",
         "--untracked-files=all",
+        environment=environment,
     ):
         raise ValueError("release source checkout is dirty")
     return source_dir
@@ -159,6 +165,11 @@ def run_cargo(
         raise ValueError(f"cargo {' '.join(args[:2])} failed: {detail}")
 
 
+def publish_arguments(name: str, *, dry_run: bool) -> list[str]:
+    """Keep rehearsal and publication package selection identical."""
+    return ["publish", *(["--dry-run"] if dry_run else []), "--locked", "--package", name]
+
+
 def generated_package_paths(target_dir: Path, filename: str) -> tuple[Path, Path]:
     package_dir = target_dir / "package"
     return package_dir / filename, package_dir / "tmp-crate" / filename
@@ -193,6 +204,21 @@ def wait_for_exact(name: str, version: str, expected: Path) -> None:
     raise ValueError(f"published crate did not become visible: {name}")
 
 
+def verify_first_publication(packages: list[dict], version: str) -> None:
+    # The OIDC writer cannot create this new name. Check before publishing any
+    # dependencies, rather than discovering it halfway through an immutable set.
+    if version != "0.11.0":
+        return
+    bootstrap = next((p for p in packages if p["name"] == "rmux-bootstrap"), None)
+    if bootstrap is None:
+        raise ValueError("canonical crate set is missing rmux-bootstrap")
+    existing = registry_bytes("rmux-bootstrap", version)
+    if existing is None:
+        raise ValueError("first publication of rmux-bootstrap requires approved onboarding; no crates uploaded")
+    if hashlib.sha256(existing).hexdigest() != bootstrap["sha256"]:
+        raise ValueError("existing crates.io bytes differ: rmux-bootstrap")
+
+
 def execute(args: argparse.Namespace) -> None:
     if (
         SOURCE_SHA.fullmatch(args.source_sha) is None
@@ -211,6 +237,7 @@ def execute(args: argparse.Namespace) -> None:
     packages = validate(
         manifest, extracted, source_sha=args.source_sha, version=version
     )
+    verify_first_publication(packages, version)
     cargo_target = args.target_dir / "cargo"
     mutated = False
     for package in packages:
@@ -223,7 +250,7 @@ def execute(args: argparse.Namespace) -> None:
             continue
         remove_generated_package(cargo_target, package["file"])
         run_cargo(
-            ["publish", "--dry-run", "--locked", "--package", name],
+            publish_arguments(name, dry_run=True),
             token=token,
             target_dir=cargo_target,
             source_dir=source_dir,
@@ -234,7 +261,7 @@ def execute(args: argparse.Namespace) -> None:
             raise ValueError(f"Cargo package bytes differ from the candidate: {name}")
         remove_generated_package(cargo_target, package["file"])
         run_cargo(
-            ["publish", "--locked", "--package", name],
+            publish_arguments(name, dry_run=False),
             token=token,
             target_dir=cargo_target,
             source_dir=source_dir,

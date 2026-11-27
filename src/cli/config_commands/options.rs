@@ -2,7 +2,6 @@ use rmux_client::Connection;
 use rmux_proto::types::OptionScopeSelector;
 use rmux_proto::{PaneTarget, ResolveTargetType, SessionName, SetOptionMode, Target, WindowTarget};
 
-#[path = "options/show_scope.rs"]
 mod show_scope;
 
 use crate::cli::ExitFailure;

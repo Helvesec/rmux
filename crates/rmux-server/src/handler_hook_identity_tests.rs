@@ -75,17 +75,17 @@ async fn pane_target_for_id(
         .sessions
         .session(session_name)
         .expect("session exists");
-    session
+    let result = session
         .windows()
-        .iter()
         .find_map(|(window_index, window)| {
             window.panes().iter().find_map(|pane| {
                 (pane.id() == pane_id).then(|| {
-                    PaneTarget::with_window(session_name.clone(), *window_index, pane.index())
+                    PaneTarget::with_window(session_name.clone(), window_index, pane.index())
                 })
             })
         })
-        .expect("pane identity remains reachable")
+        .expect("pane identity remains reachable");
+    result
 }
 
 #[tokio::test]

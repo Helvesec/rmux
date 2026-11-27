@@ -1,25 +1,31 @@
+use std::io::{IsTerminal, Read, Write};
 use std::path::Path;
 
-#[path = "config_commands/hooks.rs"]
 mod hooks;
-#[path = "config_commands/options.rs"]
 mod options;
+
+mod quiet_only_if_unset;
 
 use rmux_client::{connect, ClientError};
 use rmux_proto::{
     ErrorResponse, Request, Response, RmuxError, ScopeSelector, SetEnvironmentMode,
-    SetOptionByNameRequest,
+    SetOptionByNameRequest, INTERNAL_PARSE_TIME_ASSIGNMENTS_PATH,
 };
 
-use crate::cli::target_resolution::resolve_session_target_spec;
+use crate::cli::command_runner::inherited_pane_target;
+use crate::cli::target_resolution::resolve_canfail_pane_target_spec;
 use crate::cli::{
-    expect_command_output, expect_command_success, resolve_current_session_target,
+    connect_with_startserver, expect_command_output, expect_command_success,
+    finish_command_success, resolve_current_session_target, resolve_session_target_spec,
     run_command_resolved, run_payload_command_resolved, write_command_output, ExitFailure,
+    StartupOptions,
 };
 use crate::cli_args::{
     SetEnvironmentArgs, SetOptionArgs, SetOptionCommandKind, ShowEnvironmentArgs, ShowOptionsArgs,
     ShowOptionsCommandKind, TargetSpec,
 };
+use crate::cli_response::tmux_cli_error_message;
+use crate::tmux_error_surface::source_file_error_uses_stdout;
 pub(crate) use hooks::{run_set_hook, run_show_hooks};
 use options::{resolve_set_option_args, resolve_show_options_scope, ResolvedSetOptionCommand};
 
@@ -31,6 +37,15 @@ pub(crate) fn run_set_option(
     let quiet = args.quiet;
     let mut connection = connect(socket_path)
         .map_err(|error| ExitFailure::from_client_connect(socket_path, error))?;
+    if quiet && args.only_if_unset {
+        return super::command_runner::run_queued_server_command_with_connection(
+            &mut connection,
+            socket_path,
+            command.command_name(),
+            quiet_only_if_unset::command_arguments(command, &args)?,
+        )
+        .map_err(|error| quiet_only_if_unset::command_error(command, error));
+    }
     let request = match resolve_set_option_args(&mut connection, command, args) {
         Ok(ResolvedSetOptionCommand::NoOp) => return Ok(0),
         Ok(ResolvedSetOptionCommand::Request(request)) => request,
@@ -232,6 +247,114 @@ fn resolve_set_environment_mode(
     }
 
     Ok(mode)
+}
+
+pub(crate) fn run_apply_parse_time_assignments(
+    socket_path: &Path,
+    assignments: String,
+) -> Result<i32, ExitFailure> {
+    let mut connection = connect(socket_path)
+        .map_err(|error| ExitFailure::from_client_connect(socket_path, error))?;
+    let response = connection
+        .source_file(
+            vec![INTERNAL_PARSE_TIME_ASSIGNMENTS_PATH.to_owned()],
+            false,
+            false,
+            false,
+            false,
+            None,
+            Some(assignments),
+        )
+        .map_err(ExitFailure::from_client)?;
+    finish_command_success(response, "source-file")
+}
+
+pub(crate) fn run_source_file(
+    args: crate::cli_args::SourceFileArgs,
+    socket_path: &Path,
+    startup: StartupOptions,
+) -> Result<i32, ExitFailure> {
+    let stdin = if args.paths.iter().any(|path| path == "-") {
+        let mut buffer = String::new();
+        std::io::stdin()
+            .read_to_string(&mut buffer)
+            .map_err(|error| ExitFailure::new(1, format!("failed to read stdin: {error}")))?;
+        Some(buffer)
+    } else {
+        None
+    };
+
+    let mut connection = connect_with_startserver(socket_path, startup)?;
+    if stdin.is_none()
+        && !args.parse_only
+        && !std::io::stdin().is_terminal()
+        && connection
+            .supports_capability(rmux_proto::CAPABILITY_SOURCE_FILE_INPUT_V1)
+            .map_err(ExitFailure::from_client)?
+    {
+        let mut arguments = vec!["source-file".to_owned()];
+        for (enabled, flag) in [
+            (args.quiet, "-q"),
+            (args.parse_only, "-n"),
+            (args.verbose, "-v"),
+            (args.expand_paths, "-F"),
+        ] {
+            if enabled {
+                arguments.push(flag.to_owned());
+            }
+        }
+        if let Some(target) = args.target.as_ref() {
+            arguments.extend(["-t".to_owned(), target.to_string()]);
+        }
+        arguments.push("--".to_owned());
+        arguments.extend(args.paths);
+        return super::alias_fallback::source_file_input::execute(
+            &mut connection,
+            socket_path,
+            arguments,
+        );
+    }
+    let target = match args.target.as_ref() {
+        Some(target) => resolve_canfail_pane_target_spec(&mut connection, target)?,
+        None => inherited_pane_target(&mut connection, socket_path)?,
+    };
+    let response = connection
+        .source_file(
+            args.paths,
+            args.quiet,
+            args.parse_only,
+            args.verbose,
+            args.expand_paths,
+            target,
+            stdin,
+        )
+        .map_err(ExitFailure::from_client)?;
+    finish_source_file_response(response)
+}
+
+pub(super) fn finish_source_file_response(response: Response) -> Result<i32, ExitFailure> {
+    if let Response::Error(ErrorResponse { error }) = &response {
+        if source_file_error_uses_stdout(error) {
+            return Err(ExitFailure::new_stdout(
+                1,
+                tmux_cli_error_message("source-file", error),
+            ));
+        }
+    }
+    if let Response::SourceFile(response) = &response {
+        if let Some(output) = response.command_output() {
+            write_command_output(output)?;
+        }
+        if !response.stderr().is_empty() {
+            std::io::stderr()
+                .write_all(response.stderr())
+                .map_err(|error| {
+                    ExitFailure::new(1, format!("failed to write source-file stderr: {error}"))
+                })?;
+        }
+        return Ok(response.exit_status().unwrap_or(0));
+    }
+    finish_command_success(response, "source-file")
 }
 
 #[cfg(test)]
@@ -510,6 +633,45 @@ mod tests {
             .expect("set-option -g plus scope flag resolves");
 
             assert_eq!(resolved.scope, OptionScopeSelector::SessionGlobal);
+        }
+    }
+
+    #[test]
+    fn named_frozen_options_keep_natural_global_and_explicit_cli_scope_routing() {
+        for name in [
+            "tree-mode-preview-format",
+            "tree-mode-preview-style",
+            "window-pane-status-format",
+            "window-pane-current-status-format",
+        ] {
+            let value = if name.ends_with("style") {
+                "fg=red"
+            } else {
+                ""
+            };
+            let global = resolve_set_option_args(
+                SetOptionCommandKind::SetOption,
+                global_set_args(name, value),
+            )
+            .unwrap();
+            assert_eq!(global.scope, OptionScopeSelector::WindowGlobal);
+            let local = resolve_set_option_args(
+                SetOptionCommandKind::SetOption,
+                SetOptionArgs {
+                    global: false,
+                    pane: true,
+                    target: Some(target_spec("alpha:0.1")),
+                    ..global_set_args(name, value)
+                },
+            )
+            .unwrap();
+            let session = SessionName::new("alpha").unwrap();
+            let expected = if name == "tree-mode-preview-format" {
+                OptionScopeSelector::Pane(PaneTarget::with_window(session, 0, 1))
+            } else {
+                OptionScopeSelector::Window(WindowTarget::with_window(session, 0))
+            };
+            assert_eq!(local.scope, expected);
         }
     }
 

@@ -23,7 +23,9 @@ const SETUP_TIMEOUT: Duration = Duration::from_secs(6);
 #[test]
 #[ignore = "slow Windows ConPTY comparison fuzz test"]
 fn windows_timeout_key_behavior_matches_direct_console() -> Result<(), Box<dyn Error>> {
-    let binary = PathBuf::from(env!("CARGO_BIN_EXE_rmux"));
+    let binary = PathBuf::from(rmux_os::build_identity::cargo_binary(env!(
+        "CARGO_BIN_EXE_rmux"
+    )));
     let seed = std::env::var("RMUX_WINDOWS_ATTACH_FUZZ_SEED")
         .ok()
         .and_then(|value| u64::from_str_radix(value.trim_start_matches("0x"), 16).ok())

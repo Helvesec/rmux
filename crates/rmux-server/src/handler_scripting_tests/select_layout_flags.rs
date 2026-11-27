@@ -178,10 +178,10 @@ async fn control_select_layout_cluster_body() {
             .execute_control_commands(requester_pid, parsed)
             .await;
         assert_eq!(result.error, None, "{command}: {:?}", result.error);
-        assert_eq!(
-            result.execution_error, None,
+        assert!(
+            result.execution_errors.is_empty(),
             "{command}: {:?}",
-            result.execution_error
+            result.execution_errors
         );
         assert_oracle_layout(&handler, &session, application).await;
         assert_buffer(&handler, buffer).await;
@@ -215,7 +215,10 @@ async fn source_file_select_layout_cluster_body() {
         let relative = format!("select-layout-{index}.conf");
         write_config(&root.join(&relative), &format!("{command}\n"));
         let response = handler
-            .handle(source_file_request(vec![relative], Some(root.clone())))
+            .handle(source_file_request(
+                vec![relative],
+                Some(root.to_path_buf()),
+            ))
             .await;
         let Response::SourceFile(response) = response else {
             panic!("{command} should return a source-file response");
@@ -245,7 +248,7 @@ async fn startup_select_layout_cluster_body() {
     let config = crate::DaemonConfig::new(root.join("rmux.sock")).with_config_files(
         vec![relative.clone()],
         false,
-        Some(root.clone()),
+        Some(root.to_path_buf()),
     );
 
     for (command, buffer, application) in [

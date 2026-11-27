@@ -1,5 +1,6 @@
 use rmux_proto::TerminalSize;
 
+use super::variable::FormatVariable;
 use super::{bool_value, window_raw_flags};
 use crate::{Pane, PaneId, Session, Window, WindowId};
 
@@ -34,348 +35,6 @@ pub const DEFAULT_LIST_PANES_FORMAT: &str = DEFAULT_LIST_PANES_ALL_FORMAT;
 pub const DEFAULT_DISPLAY_MESSAGE_FORMAT: &str =
     "[#{session_name}] #{window_index}:#{window_name}, current pane #{pane_index} - (%H:%M %d-%b-%y)";
 
-/// The frozen tmux `format_table[]` variable inventory from the reference source.
-pub const TMUX_FORMAT_TABLE_NAMES: [&str; 192] = [
-    "active_window_index",
-    "alternate_on",
-    "alternate_saved_x",
-    "alternate_saved_y",
-    "bracket_paste_flag",
-    "buffer_created",
-    "buffer_full",
-    "buffer_mode_format",
-    "buffer_name",
-    "buffer_sample",
-    "buffer_size",
-    "client_activity",
-    "client_cell_height",
-    "client_cell_width",
-    "client_control_mode",
-    "client_created",
-    "client_discarded",
-    "client_flags",
-    "client_height",
-    "client_key_table",
-    "client_last_session",
-    "client_mode_format",
-    "client_name",
-    "client_pid",
-    "client_prefix",
-    "client_readonly",
-    "client_session",
-    "client_termfeatures",
-    "client_termname",
-    "client_termtype",
-    "client_theme",
-    "client_tty",
-    "client_uid",
-    "client_user",
-    "client_utf8",
-    "client_width",
-    "client_written",
-    "config_files",
-    "cursor_blinking",
-    "cursor_character",
-    "cursor_colour",
-    "cursor_flag",
-    "cursor_shape",
-    "cursor_very_visible",
-    "cursor_x",
-    "cursor_y",
-    "history_all_bytes",
-    "history_bytes",
-    "history_limit",
-    "history_size",
-    "host",
-    "host_short",
-    "insert_flag",
-    "keypad_cursor_flag",
-    "keypad_flag",
-    "last_window_index",
-    "loop_last_flag",
-    "mouse_all_flag",
-    "mouse_any_flag",
-    "mouse_button_flag",
-    "mouse_hyperlink",
-    "mouse_line",
-    "mouse_pane",
-    "mouse_sgr_flag",
-    "mouse_standard_flag",
-    "mouse_status_line",
-    "mouse_status_range",
-    "mouse_utf8_flag",
-    "mouse_word",
-    "mouse_x",
-    "mouse_y",
-    "next_session_id",
-    "origin_flag",
-    "pane_active",
-    "pane_at_bottom",
-    "pane_at_left",
-    "pane_at_right",
-    "pane_at_top",
-    "pane_bg",
-    "pane_bottom",
-    "pane_current_command",
-    "pane_current_path",
-    "pane_dead",
-    "pane_dead_signal",
-    "pane_dead_status",
-    "pane_dead_time",
-    "pane_fg",
-    "pane_flags",
-    "pane_floating_flag",
-    "pane_format",
-    "pane_height",
-    "pane_id",
-    "pane_in_mode",
-    "pane_index",
-    "pane_input_off",
-    "pane_key_mode",
-    "pane_last",
-    "pane_left",
-    "pane_marked",
-    "pane_marked_set",
-    "pane_mode",
-    "pane_path",
-    "pane_pb_progress",
-    "pane_pb_state",
-    "pane_pid",
-    "pane_pipe",
-    "pane_pipe_pid",
-    "pane_right",
-    "pane_search_string",
-    "pane_start_command",
-    "pane_start_path",
-    "pane_synchronized",
-    "pane_tabs",
-    "pane_title",
-    "pane_top",
-    "pane_tty",
-    "pane_unseen_changes",
-    "pane_width",
-    "pane_zoomed_flag",
-    "pid",
-    "scroll_region_lower",
-    "scroll_region_upper",
-    "server_sessions",
-    "session_active",
-    "session_activity",
-    "session_activity_flag",
-    "session_alert",
-    "session_alerts",
-    "session_attached",
-    "session_attached_list",
-    "session_bell_flag",
-    "session_created",
-    "session_format",
-    "session_group",
-    "session_group_attached",
-    "session_group_attached_list",
-    "session_group_list",
-    "session_group_many_attached",
-    "session_group_size",
-    "session_grouped",
-    "session_id",
-    "session_last_attached",
-    "session_many_attached",
-    "session_marked",
-    "session_name",
-    "session_path",
-    "session_silence_flag",
-    "session_stack",
-    "session_windows",
-    "sixel_support",
-    "socket_path",
-    "start_time",
-    "synchronized_output_flag",
-    "tree_mode_format",
-    "uid",
-    "user",
-    "version",
-    "window_active",
-    "window_active_clients",
-    "window_active_clients_list",
-    "window_active_sessions",
-    "window_active_sessions_list",
-    "window_activity",
-    "window_activity_flag",
-    "window_bell_flag",
-    "window_bigger",
-    "window_cell_height",
-    "window_cell_width",
-    "window_end_flag",
-    "window_flags",
-    "window_format",
-    "window_height",
-    "window_id",
-    "window_index",
-    "window_last_flag",
-    "window_layout",
-    "window_linked",
-    "window_linked_sessions",
-    "window_linked_sessions_list",
-    "window_marked_flag",
-    "window_name",
-    "window_offset_x",
-    "window_offset_y",
-    "window_panes",
-    "window_raw_flags",
-    "window_silence_flag",
-    "window_stack_index",
-    "window_start_flag",
-    "window_visible_layout",
-    "window_width",
-    "window_zoomed_flag",
-    "wrap_flag",
-];
-
-/// Frozen tmux `FORMAT_TABLE_TIME` variable names.
-pub const TMUX_TIME_FORMAT_VARIABLE_NAMES: [&str; 9] = [
-    "buffer_created",
-    "client_activity",
-    "client_created",
-    "pane_dead_time",
-    "session_activity",
-    "session_created",
-    "session_last_attached",
-    "start_time",
-    "window_activity",
-];
-
-/// The closed set of format variables supported by RMUX.
-pub const FORMAT_VARIABLES: [FormatVariable; 20] = [
-    FormatVariable::SessionName,
-    FormatVariable::SessionWindows,
-    FormatVariable::SessionAttached,
-    FormatVariable::SessionWidth,
-    FormatVariable::SessionHeight,
-    FormatVariable::WindowIndex,
-    FormatVariable::WindowId,
-    FormatVariable::WindowName,
-    FormatVariable::WindowRawFlags,
-    FormatVariable::WindowPanes,
-    FormatVariable::WindowWidth,
-    FormatVariable::WindowHeight,
-    FormatVariable::WindowLayout,
-    FormatVariable::WindowActive,
-    FormatVariable::WindowLastFlag,
-    FormatVariable::PaneIndex,
-    FormatVariable::PaneId,
-    FormatVariable::PaneActive,
-    FormatVariable::PaneWidth,
-    FormatVariable::PaneHeight,
-];
-
-/// A supported format variable name.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub enum FormatVariable {
-    /// The session name.
-    SessionName,
-    /// The number of windows in the session.
-    SessionWindows,
-    /// The number of clients attached to the session.
-    SessionAttached,
-    /// The session width in columns.
-    SessionWidth,
-    /// The session height in rows.
-    SessionHeight,
-    /// The window index within the session.
-    WindowIndex,
-    /// The stable window identifier, rendered with an `@` prefix.
-    WindowId,
-    /// The window name, or an empty string when unnamed.
-    WindowName,
-    /// The derived active or last-window marker.
-    WindowRawFlags,
-    /// The number of panes in the window.
-    WindowPanes,
-    /// The window width in columns.
-    WindowWidth,
-    /// The window height in rows.
-    WindowHeight,
-    /// The window layout name.
-    WindowLayout,
-    /// Whether the window is active, rendered as `1` or `0`.
-    WindowActive,
-    /// Whether the window is the last window, rendered as `1` or `0`.
-    WindowLastFlag,
-    /// The pane index within the window.
-    PaneIndex,
-    /// The stable pane identifier, rendered with a `%` prefix.
-    PaneId,
-    /// Whether the pane is active, rendered as `1` or `0`.
-    PaneActive,
-    /// The pane width in columns.
-    PaneWidth,
-    /// The pane height in rows.
-    PaneHeight,
-}
-
-impl FormatVariable {
-    /// Parses a supported format variable name.
-    #[must_use]
-    pub fn from_name(name: &str) -> Option<Self> {
-        Some(match name {
-            "session_name" => Self::SessionName,
-            "session_windows" => Self::SessionWindows,
-            "session_attached" => Self::SessionAttached,
-            "session_width" => Self::SessionWidth,
-            "session_height" => Self::SessionHeight,
-            "window_index" => Self::WindowIndex,
-            "window_id" => Self::WindowId,
-            "window_name" => Self::WindowName,
-            "window_raw_flags" => Self::WindowRawFlags,
-            "window_panes" => Self::WindowPanes,
-            "window_width" => Self::WindowWidth,
-            "window_height" => Self::WindowHeight,
-            "window_layout" => Self::WindowLayout,
-            "window_active" => Self::WindowActive,
-            "window_last_flag" => Self::WindowLastFlag,
-            "pane_index" => Self::PaneIndex,
-            "pane_id" => Self::PaneId,
-            "pane_active" => Self::PaneActive,
-            "pane_width" => Self::PaneWidth,
-            "pane_height" => Self::PaneHeight,
-            _ => return None,
-        })
-    }
-
-    /// Returns the canonical supported variable name.
-    #[must_use]
-    pub const fn name(self) -> &'static str {
-        match self {
-            Self::SessionName => "session_name",
-            Self::SessionWindows => "session_windows",
-            Self::SessionAttached => "session_attached",
-            Self::SessionWidth => "session_width",
-            Self::SessionHeight => "session_height",
-            Self::WindowIndex => "window_index",
-            Self::WindowId => "window_id",
-            Self::WindowName => "window_name",
-            Self::WindowRawFlags => "window_raw_flags",
-            Self::WindowPanes => "window_panes",
-            Self::WindowWidth => "window_width",
-            Self::WindowHeight => "window_height",
-            Self::WindowLayout => "window_layout",
-            Self::WindowActive => "window_active",
-            Self::WindowLastFlag => "window_last_flag",
-            Self::PaneIndex => "pane_index",
-            Self::PaneId => "pane_id",
-            Self::PaneActive => "pane_active",
-            Self::PaneWidth => "pane_width",
-            Self::PaneHeight => "pane_height",
-        }
-    }
-}
-
-/// Returns whether a variable name is part of the supported format inventory.
-#[must_use]
-pub fn is_known_format_variable_name(name: &str) -> bool {
-    FormatVariable::from_name(name).is_some()
-        || TMUX_FORMAT_TABLE_NAMES.binary_search(&name).is_ok()
-}
-
 /// A source of values for supported format variables.
 pub trait FormatVariables {
     /// Resolves a supported format variable to its rendered value.
@@ -388,6 +47,36 @@ pub trait FormatVariables {
     /// dynamic variable inventory.
     fn format_value_by_name(&self, name: &str) -> Option<String> {
         FormatVariable::from_name(name).and_then(|v| self.format_value(v))
+    }
+
+    /// Reads a program title or message and whether OSC 7501 supplied the value.
+    fn format_status_field(&self, name: &str) -> (String, bool) {
+        (self.format_value_by_name(name).unwrap_or_default(), false)
+    }
+
+    /// Resolves an arbitrary string-keyed variable name for a path modifier,
+    /// keeping absence apart from a value that is present and empty.
+    ///
+    /// `#{b:…}` and `#{d:…}` need that difference: the engine measured keeps an
+    /// absent value absent and returns before either modifier runs, while a
+    /// value that is really there - even one holding nothing - goes through
+    /// them, which is why an option set to the empty string answers `.` and an
+    /// option that is not set answers nothing at all. Everything else in this
+    /// crate keeps reading [`Self::format_value_by_name`], whose rendering of a
+    /// legacy empty value is unchanged.
+    ///
+    /// The default delegates to that same lookup, so an implementor that has no
+    /// such distinction to make behaves exactly as it did. A runtime that does -
+    /// one whose registry answers a known name with a historical empty value -
+    /// overrides this to report only what it really found.
+    fn format_path_value_by_name(&self, name: &str) -> Option<String> {
+        self.format_value_by_name(name)
+    }
+
+    /// Reads or starts a nonblocking runtime job. Commands are already expanded
+    /// in the current evaluation context; the default has no execution authority.
+    fn format_job(&self, _source: &str, _command: &str) -> Option<String> {
+        None
     }
 
     /// Checks whether a window or session name exists for the `N:` modifier.
@@ -416,6 +105,40 @@ pub trait FormatVariables {
         _count_only: bool,
     ) -> Option<String> {
         None
+    }
+
+    /// Expands a runtime loop modifier, preserving the modifier arguments.
+    ///
+    /// Existing implementors that do not care about loop sort arguments can
+    /// keep overriding [`Self::format_loop`].
+    fn format_loop_with_args(
+        &self,
+        scope: char,
+        _arguments: &[String],
+        body: &str,
+        current_body: Option<&str>,
+        count_only: bool,
+    ) -> Option<String> {
+        self.format_loop(scope, body, current_body, count_only)
+    }
+
+    /// Expands a runtime loop while allowing the loop implementation to render
+    /// each body through the caller's active expansion state.
+    ///
+    /// The default keeps existing loop implementations unchanged. Runtime
+    /// implementations that need a distinct variable context per item can
+    /// invoke `expand` with that context; doing so preserves recursion limits
+    /// across nested loop bodies.
+    fn format_loop_with_args_and_expand(
+        &self,
+        scope: char,
+        arguments: &[String],
+        body: &str,
+        current_body: Option<&str>,
+        count_only: bool,
+        _expand: &mut dyn FnMut(&str, &dyn FormatVariables) -> String,
+    ) -> Option<String> {
+        self.format_loop_with_args(scope, arguments, body, current_body, count_only)
     }
 }
 
@@ -459,6 +182,15 @@ impl FormatContext {
     pub fn with_session(mut self, session: &Session) -> Self {
         self.session_name = Some(session.name().to_string());
         self.session_windows = Some(session.windows().len());
+        self.session_size = Some(session.window().size());
+        self
+    }
+
+    /// Populates session variables through a borrowed canonical session view.
+    #[must_use]
+    pub fn with_managed_session(mut self, session: crate::ManagedSessionView<'_>) -> Self {
+        self.session_name = Some(session.name().to_string());
+        self.session_windows = Some(session.windows().count());
         self.session_size = Some(session.window().size());
         self
     }

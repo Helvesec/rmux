@@ -1,0 +1,8 @@
+{
+  "schema": 1,
+  "paths": {
+    "docs/release/0.11.0.md": "D77",
+    "docs/migration/0.10-to-0.11.md": "D77",
+    "docs/release/publication-runbook.md": "D81"
+  }
+}

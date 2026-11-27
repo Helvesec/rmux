@@ -15,6 +15,9 @@ use tokio::time::{timeout, Duration};
 
 use super::Pane;
 
+#[path = "state_values_tests.rs"]
+mod values;
+
 fn alpha() -> SessionName {
     SessionName::new("alpha").expect("valid session name")
 }
@@ -174,6 +177,17 @@ async fn next_keeps_waiting_after_empty_long_poll_response() {
 
 #[tokio::test]
 async fn closed_event_discards_trailing_same_batch_events() {
+    for report_exit in [false, true] {
+        assert_terminal_event_ends_stream(report_exit).await;
+    }
+}
+
+async fn assert_terminal_event_ends_stream(report_exit: bool) {
+    let mut supported = state_event_capabilities();
+    if report_exit {
+        supported.push(rmux_proto::CAPABILITY_SDK_PANE_STATE_EXIT_EVENTS.to_owned());
+    }
+    let advertised = supported.clone();
     let (client_stream, mut server_stream) = tokio::io::duplex(4096);
     let (cursor_client_stream, mut cursor_server_stream) = tokio::io::duplex(4096);
     let transport = TransportClient::spawn(client_stream);
@@ -188,11 +202,26 @@ async fn closed_event_discards_trailing_same_batch_events() {
     let subscription_id = PaneStateSubscriptionId::new(7);
 
     let server = tokio::spawn(async move {
-        answer_handshake(&mut server_stream, state_event_capabilities()).await;
+        answer_handshake(&mut server_stream, advertised).await;
     });
 
     let cursor_server = tokio::spawn(async move {
-        answer_handshake(&mut cursor_server_stream, state_event_capabilities()).await;
+        let Request::Handshake(handshake) = read_request(&mut cursor_server_stream).await else {
+            panic!("cursor must negotiate before subscribing");
+        };
+        assert_eq!(
+            handshake
+                .enables_connection_capability(rmux_proto::CAPABILITY_SDK_PANE_STATE_EXIT_EVENTS),
+            report_exit
+        );
+        write_response(
+            &mut cursor_server_stream,
+            Response::Handshake(HandshakeResponse {
+                wire_version: RMUX_WIRE_VERSION,
+                capabilities: supported,
+            }),
+        )
+        .await;
 
         assert!(matches!(
             read_request(&mut cursor_server_stream).await,
@@ -222,10 +251,20 @@ async fn closed_event_discards_trailing_same_batch_events() {
             Response::PaneStateCursor(PaneStateCursorResponse {
                 subscription_id,
                 events: vec![
-                    PaneStateEventDto::Closed {
-                        revision: 1,
-                        pane_id,
-                        reason: PaneStateClosedReason::Killed,
+                    if report_exit {
+                        PaneStateEventDto::Exited {
+                            revision: 1,
+                            pane_id,
+                            reason: PaneStateClosedReason::DiedKept,
+                            exit_status: Some(3),
+                            exit_signal: None,
+                        }
+                    } else {
+                        PaneStateEventDto::Closed {
+                            revision: 1,
+                            pane_id,
+                            reason: PaneStateClosedReason::Killed,
+                        }
                     },
                     PaneStateEventDto::TitleChanged {
                         revision: 2,
@@ -251,10 +290,24 @@ async fn closed_event_discards_trailing_same_batch_events() {
         stream.next().await.expect("snapshot succeeds"),
         Some(PaneStateEvent::Snapshot { revision: 0, .. })
     ));
-    assert!(matches!(
-        stream.next().await.expect("closed event succeeds"),
-        Some(PaneStateEvent::Closed { revision: 1, .. })
-    ));
+    let terminal = stream.next().await.expect("terminal event");
+    if report_exit {
+        assert!(matches!(
+            terminal,
+            Some(PaneStateEvent::Exited {
+                revision: 1,
+                reason: super::state_events::PaneStateClosedReason::DiedKept,
+                exit_status: Some(3),
+                exit_signal: None,
+                ..
+            })
+        ));
+    } else {
+        assert!(matches!(
+            terminal,
+            Some(PaneStateEvent::Closed { revision: 1, .. })
+        ));
+    }
     assert!(stream
         .next()
         .await

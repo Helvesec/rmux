@@ -11,9 +11,7 @@ use rmux_pty::PtyMaster;
 use crate::pane_terminal_lookup::{missing_pane_terminal, pane_id_for_target};
 use crate::terminal::TerminalProfile;
 
-use super::{
-    pane_terminal_geometry_for_session, session_not_found, HandlerState, PaneExitMetadata,
-};
+use super::{session_not_found, HandlerState, PaneExitMetadata, PaneWindowGeometry};
 
 impl HandlerState {
     pub(crate) fn pane_ids_no_longer_referenced(
@@ -28,6 +26,7 @@ impl HandlerState {
                 !self
                     .sessions
                     .iter()
+                    .map(|session| (session.name(), session))
                     .any(|(_, session)| session.window_index_for_pane_id(*pane_id).is_some())
             })
             .collect()
@@ -74,6 +73,7 @@ impl HandlerState {
         let mut sessions = self
             .sessions
             .iter()
+            .map(|session| (session.name(), session))
             .map(|(session_name, _)| session_name.clone())
             .collect::<Vec<_>>();
         sessions.sort_by(|left, right| left.as_str().cmp(right.as_str()));
@@ -137,12 +137,13 @@ impl HandlerState {
         let mut candidates = self
             .sessions
             .iter()
+            .map(|session| (session.name(), session))
             .flat_map(|(session_name, session)| {
                 session
                     .windows()
-                    .keys()
+                    .map(|(index, _)| index)
                     .map(|window_index| {
-                        self.runtime_session_name_for_window(session_name, *window_index)
+                        self.runtime_session_name_for_window(session_name, window_index)
                     })
                     .collect::<Vec<_>>()
             })
@@ -179,26 +180,25 @@ impl HandlerState {
         let mut panes_by_runtime = HashMap::new();
         for (window_index, window) in session.windows() {
             let runtime_session_name =
-                self.runtime_session_name_for_window(session_name, *window_index);
+                self.runtime_session_name_for_window(session_name, window_index);
             let panes = panes_by_runtime
                 .entry(runtime_session_name)
                 .or_insert_with(Vec::new);
             panes.extend(window.panes().iter().map(|pane| {
                 let (alternate_on, copy_mode_active) =
-                    self.pane_viewport_state(session_name, *window_index, pane.id());
+                    self.resized_pane_viewport_state(session_name, window_index, pane.id());
                 crate::pane_terminal_lookup::SessionPane {
                     id: pane.id(),
-                    window_index: *window_index,
+                    window_index,
                     index: pane.index(),
-                    geometry: pane_terminal_geometry_for_session(
-                        session,
-                        &self.options,
-                        *window_index,
-                        pane.index(),
-                        pane.geometry(),
-                        alternate_on,
-                        copy_mode_active,
-                    ),
+                    geometry: PaneWindowGeometry::new(session.name(), window_index, window)
+                        .content_geometry(
+                            &self.options,
+                            pane.index(),
+                            pane.geometry(),
+                            alternate_on,
+                            copy_mode_active,
+                        ),
                     window_size: window.size(),
                 }
             }));
@@ -207,7 +207,7 @@ impl HandlerState {
         Ok(panes_by_runtime)
     }
 
-    pub(in crate::pane_terminals) fn pane_viewport_state(
+    pub(crate) fn pane_viewport_state(
         &self,
         session_name: &SessionName,
         window_index: u32,
@@ -221,9 +221,7 @@ impl HandlerState {
         else {
             return (false, false);
         };
-        let transcript = transcript
-            .lock()
-            .expect("pane transcript mutex must not be poisoned");
+        let transcript = transcript.lock();
         (
             transcript.is_alternate(),
             transcript.copy_mode_state().is_some(),
@@ -364,38 +362,76 @@ impl HandlerState {
             .clone_pane_master(&runtime_session_name, pane_id, window_index, pane_index)
     }
 
-    #[cfg(test)]
-    pub(crate) fn start_pane_input_capture_for_test(&self, target: &PaneTarget) {
-        self.pane_input_captures
-            .lock()
-            .expect("pane input capture mutex")
-            .insert(target.to_string(), Vec::new());
-    }
-
-    #[cfg(test)]
-    pub(crate) fn append_pane_input_capture_for_test(
+    /// Whether entering or leaving a consultation on this pane can change any
+    /// terminal geometry a resize of this session would apply.
+    ///
+    /// A pane's endpoint is sized to `content_geometry`, and the only term in
+    /// it that reads the consultation is the modal scrollbar reserve
+    /// (`pane_scrollbar.rs:85-94`): `Off` never reserves, `On` always does, and
+    /// the alternate screen suppresses both. So the question is asked, not
+    /// assumed - the two geometries are computed and compared, which also
+    /// covers a reserve configured to nothing.
+    ///
+    /// It is asked for every window of this session that links the pane, since
+    /// an alias resolves its own options: the same pane can reserve through one
+    /// window and not through another, and the resize walks them all. Anything
+    /// that cannot be resolved answers "yes" and keeps the existing path.
+    pub(crate) fn copy_mode_transition_changes_terminal_geometry(
         &self,
         target: &PaneTarget,
-        bytes: &[u8],
     ) -> bool {
-        let mut captures = self
-            .pane_input_captures
-            .lock()
-            .expect("pane input capture mutex");
-        let Some(captured) = captures.get_mut(&target.to_string()) else {
-            return false;
+        let Some(session) = self.sessions.session(target.session_name()) else {
+            return true;
         };
-        captured.extend_from_slice(bytes);
-        true
+        let Ok(pane_id) = pane_id_for_target(
+            &self.sessions,
+            target.session_name(),
+            target.window_index(),
+            target.pane_index(),
+        ) else {
+            return true;
+        };
+        for (window_index, window) in session.windows() {
+            for pane in window.panes() {
+                if pane.id() != pane_id {
+                    continue;
+                }
+                let (alternate_on, _) =
+                    self.pane_viewport_state(target.session_name(), window_index, pane.id());
+                let geometry = PaneWindowGeometry::new(session.name(), window_index, window);
+                let masked = geometry.content_geometry(
+                    &self.options,
+                    pane.index(),
+                    pane.geometry(),
+                    alternate_on,
+                    false,
+                );
+                let consulted = geometry.content_geometry(
+                    &self.options,
+                    pane.index(),
+                    pane.geometry(),
+                    alternate_on,
+                    true,
+                );
+                if masked != consulted {
+                    return true;
+                }
+            }
+        }
+        false
     }
 
+    /// How many native resizes this pane's endpoint has really been asked for.
     #[cfg(test)]
-    pub(crate) fn pane_input_capture_for_test(&self, target: &PaneTarget) -> Option<Vec<u8>> {
-        self.pane_input_captures
-            .lock()
-            .expect("pane input capture mutex")
-            .get(&target.to_string())
-            .cloned()
+    pub(crate) fn pane_native_resize_calls_for_test(&self, target: &PaneTarget) -> u64 {
+        let pane_id = pane_id_for_target(
+            &self.sessions,
+            target.session_name(),
+            target.window_index(),
+            target.pane_index(),
+        )
+        .expect("the pane exists");
+        self.terminals.resize_calls(pane_id)
     }
 
     pub(crate) fn pane_pid_in_window(
@@ -443,7 +479,7 @@ impl HandlerState {
         self.dead_panes
             .get(&runtime_session_name)
             .and_then(|panes| panes.get(&pane_id))
-            .copied()
+            .and_then(|exit| exit.published_metadata())
     }
 
     pub(crate) fn pane_is_dead(&self, session_name: &SessionName, pane_id: PaneId) -> bool {

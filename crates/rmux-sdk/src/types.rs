@@ -1,17 +1,17 @@
 //! SDK type vocabulary.
 //!
-//! Identity newtypes are defined exactly once in `rmux-proto`. This module
+//! Identity newtypes are defined exactly once in `rmux-types`. This module
 //! re-exports the four authoritative identity types (`SessionName`,
 //! `SessionId`, `WindowId`, `PaneId`) so SDK users never have to depend on
 //! `rmux-core`, `rmux-server`, `rmux-client`, or `rmux-pty` to obtain
-//! them. The SDK does not redeclare these newtypes; `rmux-proto` is the
+//! them. The SDK does not redeclare these newtypes; `rmux-types` is the
 //! single public home for the identity vocabulary.
 
-use std::path::PathBuf;
+use std::{fmt, path::PathBuf};
 
 use serde::{Deserialize, Serialize};
 
-pub use rmux_proto::{PaneId, SessionId, SessionName, WindowId};
+pub use rmux_types::{PaneId, SessionId, SessionName, SessionNameError, WindowId};
 
 /// Selects the daemon endpoint resolution strategy used by the SDK.
 ///
@@ -49,6 +49,7 @@ impl RmuxEndpoint {
 ///
 /// This is an inert DTO. Converting it to the protocol type does not inspect
 /// the caller's terminal or normalize zero dimensions.
+/// Transport conversions are crate-private; construct SDK sizes with [`Self::new`].
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct TerminalSizeSpec {
     /// Requested terminal columns.
@@ -63,10 +64,15 @@ impl TerminalSizeSpec {
     pub const fn new(cols: u16, rows: u16) -> Self {
         Self { cols, rows }
     }
-}
 
-impl From<TerminalSizeSpec> for rmux_proto::TerminalSize {
-    fn from(value: TerminalSizeSpec) -> Self {
+    pub(crate) fn into_proto(self) -> rmux_proto::TerminalSize {
+        rmux_proto::TerminalSize {
+            cols: self.cols,
+            rows: self.rows,
+        }
+    }
+
+    pub(crate) fn from_proto(value: rmux_proto::TerminalSize) -> Self {
         Self {
             cols: value.cols,
             rows: value.rows,
@@ -74,19 +80,19 @@ impl From<TerminalSizeSpec> for rmux_proto::TerminalSize {
     }
 }
 
-impl From<rmux_proto::TerminalSize> for TerminalSizeSpec {
-    fn from(value: rmux_proto::TerminalSize) -> Self {
-        Self {
-            cols: value.cols,
-            rows: value.rows,
-        }
-    }
-}
+#[cfg(test)]
+#[path = "types/size_tests.rs"]
+mod size_tests;
+
+#[cfg(test)]
+#[path = "types/target_tests.rs"]
+mod target_tests;
 
 /// Exact window selector used by SDK DTOs.
 ///
 /// This type stores already-structured target components. It deliberately
 /// performs no tmux target parsing or server-side lookup.
+/// Display uses `session:window`; transport conversions are SDK-private.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct WindowRef {
     /// Exact session name component.
@@ -111,21 +117,15 @@ impl WindowRef {
         Self::new(session_name, 0)
     }
 
-    /// Converts this selector to the matching protocol target DTO.
-    #[must_use]
-    pub fn to_proto(&self) -> rmux_proto::WindowTarget {
-        rmux_proto::WindowTarget::with_window(self.session_name.clone(), self.window_index)
+    pub(crate) fn to_proto(&self) -> rmux_proto::WindowTarget {
+        self.clone().into_proto()
     }
-}
 
-impl From<WindowRef> for rmux_proto::WindowTarget {
-    fn from(value: WindowRef) -> Self {
-        Self::with_window(value.session_name, value.window_index)
+    pub(crate) fn into_proto(self) -> rmux_proto::WindowTarget {
+        rmux_proto::WindowTarget::with_window(self.session_name, self.window_index)
     }
-}
 
-impl From<rmux_proto::WindowTarget> for WindowRef {
-    fn from(value: rmux_proto::WindowTarget) -> Self {
+    pub(crate) fn from_proto(value: rmux_proto::WindowTarget) -> Self {
         Self {
             session_name: value.session_name().clone(),
             window_index: value.window_index(),
@@ -133,9 +133,9 @@ impl From<rmux_proto::WindowTarget> for WindowRef {
     }
 }
 
-impl From<&WindowRef> for rmux_proto::WindowTarget {
-    fn from(value: &WindowRef) -> Self {
-        value.to_proto()
+impl fmt::Display for WindowRef {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(formatter, "{}:{}", self.session_name, self.window_index)
     }
 }
 
@@ -143,6 +143,7 @@ impl From<&WindowRef> for rmux_proto::WindowTarget {
 ///
 /// This type stores already-structured target components. It deliberately
 /// performs no tmux target parsing or server-side lookup.
+/// Display uses `session:window.pane`; transport conversions are SDK-private.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct PaneRef {
     /// Exact session name component.
@@ -170,25 +171,15 @@ impl PaneRef {
         Self::new(session_name, 0, pane_index)
     }
 
-    /// Converts this selector to the matching protocol target DTO.
-    #[must_use]
-    pub fn to_proto(&self) -> rmux_proto::PaneTarget {
-        rmux_proto::PaneTarget::with_window(
-            self.session_name.clone(),
-            self.window_index,
-            self.pane_index,
-        )
+    pub(crate) fn to_proto(&self) -> rmux_proto::PaneTarget {
+        self.clone().into_proto()
     }
-}
 
-impl From<PaneRef> for rmux_proto::PaneTarget {
-    fn from(value: PaneRef) -> Self {
-        Self::with_window(value.session_name, value.window_index, value.pane_index)
+    pub(crate) fn into_proto(self) -> rmux_proto::PaneTarget {
+        rmux_proto::PaneTarget::with_window(self.session_name, self.window_index, self.pane_index)
     }
-}
 
-impl From<rmux_proto::PaneTarget> for PaneRef {
-    fn from(value: rmux_proto::PaneTarget) -> Self {
+    pub(crate) fn from_proto(value: rmux_proto::PaneTarget) -> Self {
         Self {
             session_name: value.session_name().clone(),
             window_index: value.window_index(),
@@ -197,9 +188,13 @@ impl From<rmux_proto::PaneTarget> for PaneRef {
     }
 }
 
-impl From<&PaneRef> for rmux_proto::PaneTarget {
-    fn from(value: &PaneRef) -> Self {
-        value.to_proto()
+impl fmt::Display for PaneRef {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            formatter,
+            "{}:{}.{}",
+            self.session_name, self.window_index, self.pane_index
+        )
     }
 }
 
@@ -207,6 +202,7 @@ impl From<&PaneRef> for rmux_proto::PaneTarget {
 ///
 /// The enum stores structured components only; it does not parse tmux target
 /// strings or resolve ambiguous targets.
+/// Display uses `session`, `session:window` or `session:window.pane`.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum TargetRef {
     /// Exact session target.
@@ -217,32 +213,12 @@ pub enum TargetRef {
     Pane(PaneRef),
 }
 
-impl From<TargetRef> for rmux_proto::Target {
-    fn from(value: TargetRef) -> Self {
-        match value {
-            TargetRef::Session(session_name) => Self::Session(session_name),
-            TargetRef::Window(target) => Self::Window(target.into()),
-            TargetRef::Pane(target) => Self::Pane(target.into()),
-        }
-    }
-}
-
-impl From<rmux_proto::Target> for TargetRef {
-    fn from(value: rmux_proto::Target) -> Self {
-        match value {
-            rmux_proto::Target::Session(session_name) => Self::Session(session_name),
-            rmux_proto::Target::Window(target) => Self::Window(target.into()),
-            rmux_proto::Target::Pane(target) => Self::Pane(target.into()),
-        }
-    }
-}
-
-impl From<&TargetRef> for rmux_proto::Target {
-    fn from(value: &TargetRef) -> Self {
-        match value {
-            TargetRef::Session(session_name) => Self::Session(session_name.clone()),
-            TargetRef::Window(target) => Self::Window(target.into()),
-            TargetRef::Pane(target) => Self::Pane(target.into()),
+impl fmt::Display for TargetRef {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Session(session_name) => session_name.fmt(formatter),
+            Self::Window(target) => target.fmt(formatter),
+            Self::Pane(target) => target.fmt(formatter),
         }
     }
 }

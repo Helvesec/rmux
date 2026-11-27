@@ -1,5 +1,4 @@
 use std::io;
-use std::os::unix::fs::PermissionsExt as _;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -22,14 +21,14 @@ async fn client_disconnect_cancels_web_share_tunnel_start() -> io::Result<()> {
     let fixture = TestDirectory::new("rmux-web-share-disconnect")?;
     let marker = fixture.path().join("provider.pid");
     let provider = fixture.path().join("provider.sh");
-    std::fs::write(
+    crate::test_env::executable_fixture::write_executable(
         &provider,
         format!(
             "#!/bin/sh\nprintf '%s' \"$$\" >'{}'\nexec sleep 30\n",
             marker.display()
         ),
+        0o700,
     )?;
-    std::fs::set_permissions(&provider, std::fs::Permissions::from_mode(0o700))?;
     std::fs::write(
         fixture.path().join("slow.toml"),
         format!(
@@ -176,8 +175,8 @@ async fn list_web_shares(handler: &RequestHandler) -> Vec<rmux_proto::WebShareSu
 
 async fn create_session(handler: &RequestHandler, name: &str) -> SessionName {
     let session_name = SessionName::new(name).expect("valid session name");
-    assert!(matches!(
-        handler
+    crate::session_fixture::assert_new_session(
+        &handler
             .handle(Request::NewSession(NewSessionRequest {
                 session_name: session_name.clone(),
                 detached: true,
@@ -185,8 +184,7 @@ async fn create_session(handler: &RequestHandler, name: &str) -> SessionName {
                 environment: None,
             }))
             .await,
-        Response::NewSession(_)
-    ));
+    );
     session_name
 }
 

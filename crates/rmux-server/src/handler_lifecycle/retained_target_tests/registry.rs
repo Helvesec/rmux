@@ -11,7 +11,7 @@ async fn moved_pane_stays_live_while_its_destroyed_source_window_retires() {
         .expect("create session");
     state
         .sessions
-        .session_mut(&session_name)
+        .session_setup(&session_name)
         .expect("session exists")
         .create_window(terminal_size())
         .expect("create destination window");
@@ -32,9 +32,9 @@ async fn moved_pane_stays_live_while_its_destroyed_source_window_retires() {
         .expect("source pane exists")
         .id();
 
-    state
+    let _ = state
         .sessions
-        .session_mut(&session_name)
+        .session_setup(&session_name)
         .expect("session exists")
         .join_pane(
             SessionPaneTarget::new(0, 0),
@@ -270,9 +270,9 @@ async fn same_transaction_slot_replacement_invalidates_instead_of_retargeting() 
         .capture_retained_window_lifecycle_target(&target)
         .expect("capture window lease");
 
-    let session = state
+    let mut session = state
         .sessions
-        .session_mut(&session_name)
+        .session_setup(&session_name)
         .expect("session exists");
     session
         .remove_window_allowing_empty(0)
@@ -302,7 +302,7 @@ async fn retired_window_never_reacquires_a_later_numeric_slot_reuse() {
 
     state
         .sessions
-        .session_mut(&session_name)
+        .session_setup(&session_name)
         .expect("session exists")
         .remove_window_allowing_empty(0)
         .expect("remove original window");
@@ -311,7 +311,7 @@ async fn retired_window_never_reacquires_a_later_numeric_slot_reuse() {
 
     state
         .sessions
-        .session_mut(&session_name)
+        .session_setup(&session_name)
         .expect("session exists")
         .insert_window_with_initial_pane(0, terminal_size())
         .expect("reuse old numeric slot later");

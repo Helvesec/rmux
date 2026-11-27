@@ -21,6 +21,11 @@
 //! capability were never observed, the aware proof could not reach bracketed
 //! mode; if it were assumed rather than observed, the unaware child would
 //! receive delimiters it never advertised.
+//!
+//! Input goes through [`AttachedFinalSinkClient`], which owns the control
+//! receiver under a pid only it knows; dropping it, including through
+//! `let _ =`, which the deny below rejects, leaves no attach to send to.
+#![deny(let_underscore_drop)]
 
 use std::time::{Duration, Instant};
 
@@ -29,7 +34,8 @@ use rmux_proto::{PaneTarget, SessionName};
 use tokio::time::sleep;
 
 use crate::test_shell::final_sink::{
-    create_final_sink_session, describe_missing_bracketed_mode, observe_pane_output, FinalSinkSlot,
+    create_final_sink_session, describe_missing_bracketed_mode, observe_pane_output,
+    AttachedFinalSinkClient, FinalSinkSlot,
 };
 
 use super::super::RequestHandler;
@@ -105,15 +111,6 @@ async fn await_child_bracketed_announcement(handler: &RequestHandler, session: &
     }
 }
 
-async fn attach(handler: &RequestHandler, session: &SessionName) -> u32 {
-    let requester_pid = std::process::id();
-    let (control_tx, _control_rx) = tokio::sync::mpsc::unbounded_channel();
-    let _attach_id = handler
-        .register_attach(requester_pid, session.clone(), control_tx)
-        .await;
-    requester_pid
-}
-
 /// The gate is keyed by runtime session name. A freshly created session owns
 /// its own runtime, so the two coincide; this fails loudly if that stops
 /// holding rather than silently never gating.
@@ -142,9 +139,9 @@ fn deferred_bracketed_paste_reaches_a_child_that_announced_the_capability_itself
         // the capability below is published by actual pane output.
         await_child_bracketed_announcement(&handler, &session).await;
 
-        let requester_pid = attach(&handler, &session).await;
-        handler
-            .handle_attached_live_input_for_test(requester_pid, &expected)
+        let client = AttachedFinalSinkClient::register(&handler, &session).await;
+        client
+            .send(&handler, &expected)
             .await
             .expect("bracketed paste is accepted while the pane starts");
 
@@ -191,9 +188,9 @@ fn deferred_bracketed_paste_to_a_child_that_never_announced_arrives_unwrapped() 
             "a child that never announced ESC[?2004h must not be treated as aware"
         );
 
-        let requester_pid = attach(&handler, &session).await;
-        handler
-            .handle_attached_live_input_for_test(requester_pid, &wrapped(body))
+        let client = AttachedFinalSinkClient::register(&handler, &session).await;
+        client
+            .send(&handler, &wrapped(body))
             .await
             .expect("bracketed paste is accepted while the pane starts");
 

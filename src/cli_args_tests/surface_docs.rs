@@ -1,6 +1,86 @@
 use super::*;
 
 #[test]
+fn full_and_tiny_command_schema_preserves_parser_value_boundaries() {
+    let completion = super::super::completion_command();
+    let mut checked = 0;
+    macro_rules! check_schema {
+        (
+            commands { $(($name:literal, $alias:expr, $kind:ident, $order:literal,
+                $usage:literal, $variant:ident($($args:ty)?), $help:ty, [$($policy:tt)*]);)* }
+            delegated { $($delegated:tt)* }
+            local { $($local:tt)* }
+            aliases { $($aliases:tt)* }
+        ) => {
+            $(
+                let tiny = <super::super::schema::$variant as
+                    super::super::schema::CommandSpec>::help();
+                let full = super::super::schema::command_help($name).unwrap();
+                let completed = completion.find_subcommand($name).unwrap();
+                for command in [&tiny, &full, completed] {
+                    assert!(command.is_args_override_self(),
+                        "{} must share the parser's repeated-option policy", $name);
+                    for argument in command.get_arguments().filter(|argument|
+                        super::super::argument_requires_value(argument)
+                        && (argument.get_short().is_some() || argument.get_long().is_some())) {
+                        assert!(argument.is_allow_hyphen_values_set(),
+                            "{} {} must consume an option-shaped value", $name, argument.get_id());
+                    }
+                }
+                checked += 1;
+            )*
+        };
+    }
+    rmux_core::command_schema!(check_schema);
+    assert_eq!(
+        checked, 105,
+        "every typed command, including tiny fallback commands"
+    );
+}
+
+#[test]
+fn full_and_tiny_required_values_do_not_become_help_requests() {
+    let mut checked = 0;
+    macro_rules! check_schema {
+        (
+            commands { $(($name:literal, $alias:expr, $kind:ident, $order:literal,
+                $usage:literal, $variant:ident($($args:ty)?), $help:ty, [$($policy:tt)*]);)* }
+            delegated { $($delegated:tt)* }
+            local { $($local:tt)* }
+            aliases { $($aliases:tt)* }
+        ) => {
+            $(
+                let schema = <super::super::schema::$variant as
+                    super::super::schema::CommandSpec>::help();
+                for argument in schema.get_arguments().filter(|argument|
+                    super::super::argument_requires_value(argument)) {
+                    let flag = argument.get_short().map(|short| format!("-{short}"))
+                        .or_else(|| argument.get_long().map(|long| format!("--{long}")));
+                    let Some(flag) = flag else { continue };
+                    let argv = vec![flag, "--help".to_owned()];
+                    let full = <super::super::schema::$variant as
+                        super::super::schema::CommandSpec>::parse(argv.clone(), String::new());
+                    let tiny = schema.clone().try_get_matches_from(argv.clone());
+                    assert_eq!(
+                        full.as_ref().err().is_some_and(|error| error.kind() ==
+                            clap::error::ErrorKind::DisplayHelp),
+                        tiny.as_ref().err().is_some_and(|error| error.kind() ==
+                            clap::error::ErrorKind::DisplayHelp),
+                        "{} {:?}: option value boundary differs", $name, argv);
+                    checked += 1;
+                }
+            )*
+        };
+    }
+    rmux_core::command_schema!(check_schema);
+    assert!(
+        checked > 100,
+        "all required options need a value-boundary probe"
+    );
+    println!("PASS: {checked} required option value boundaries");
+}
+
+#[test]
 fn top_level_help_footer_tracks_supported_surface_and_aliases() {
     let error = parse_args(&["--help"]).unwrap_err();
     let rendered = error.to_string();
@@ -63,17 +143,75 @@ fn synthetic_completion_tree_tracks_public_command_surface() {
         .get_subcommands()
         .map(|command| command.get_name().to_owned())
         .collect::<BTreeSet<_>>();
-    let mut expected = super::super::implemented_command_surface()
+    // The public completion contract includes 111 registry commands, two
+    // expansion aliases, and the CLI-only diagnose command.
+    let registry = super::super::implemented_command_surface();
+    assert_eq!(registry.len(), 111);
+    let mut expected = registry
         .iter()
         .map(|entry| entry.name.to_owned())
         .collect::<BTreeSet<_>>();
+    assert!(
+        !expected.contains("diagnose"),
+        "diagnose must remain CLI-only, outside the runtime command registry"
+    );
     expected.extend(
         super::super::documented_cli_aliases()
             .iter()
             .map(|alias| alias.alias.to_owned()),
     );
+    assert!(expected.insert("diagnose".to_owned()));
+    assert_eq!(expected.len(), 114);
 
     assert_eq!(actual, expected);
+
+    let mut covered = BTreeSet::new();
+    let mut missing = Vec::new();
+    for entry in registry {
+        assert!(
+            covered.insert(entry.name),
+            "duplicate command: {}",
+            entry.name
+        );
+        let help = super::super::schema::command_help(entry.name).expect("registered schema");
+        let subcommand = completion
+            .find_subcommand(entry.name)
+            .expect("completion projection");
+        let arguments = |command: &clap::Command| {
+            command
+                .get_arguments()
+                .map(|arg| format!("{arg:?}"))
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(arguments(&help), arguments(subcommand), "{}", entry.name);
+        let options = rmux_core::command_inventory::command_short_option_spec(entry.name)
+            .expect("published option signature");
+        for flag in ('A'..='Z').chain('a'..='z').chain('0'..='9') {
+            if (options.is_boolean(flag) || options.takes_value(flag))
+                && !help
+                    .get_arguments()
+                    .any(|arg| arg.get_short() == Some(flag))
+            {
+                missing.push(format!("{} -{flag}", entry.name));
+            }
+        }
+        for name in std::iter::once(entry.name).chain(entry.alias) {
+            for tail in [vec![], vec!["--help"], vec!["--schema-invalid"]] {
+                let parse_command =
+                    |name| parse(["rmux", name].into_iter().chain(tail.iter().copied()));
+                assert_eq!(
+                    format!("{:?}", parse_command(entry.name)),
+                    format!("{:?}", parse_command(name)),
+                    "{name} {tail:?}"
+                );
+            }
+        }
+    }
+    assert_eq!(covered.len(), registry.len());
+    assert!(
+        missing.is_empty(),
+        "published flags missing from help/completion: {missing:?}"
+    );
 
     let split_window = completion
         .get_subcommands()
@@ -202,24 +340,38 @@ fn split_window_percentage_is_public_and_value_taking_everywhere() {
 }
 
 #[test]
-fn refresh_client_unsupported_fields_are_absent_from_cli_help_and_completion() {
+fn refresh_client_pan_precedes_control_size_validation() {
+    for pan in ["-c", "-D", "-L", "-R", "-U"] {
+        super::parse_args(&["refresh-client", "-C", "bad", pan])
+            .expect("panning ignores an unused size");
+    }
+    super::parse_args(&["refresh-client", "-RCbad", "2"])
+        .expect("compact panning has the same priority");
+    let error = super::parse_args(&["refresh-client", "-C", "bad"])
+        .expect_err("a plain C refresh still validates its size");
+    assert_eq!(error.kind(), clap::error::ErrorKind::ValueValidation);
+}
+
+#[test]
+fn refresh_client_surface_matches_supported_and_unsupported_fields() {
+    let error =
+        super::parse_args(&["refresh-client", "-Z"]).expect_err("unsupported field must not parse");
+    assert_eq!(error.kind(), clap::error::ErrorKind::UnknownArgument);
+
     for arguments in [
-        &["refresh-client", "-A", "%0:on"][..],
-        &["refresh-client", "-B", "name:%0:#{pane_id}"][..],
-        &["refresh-client", "-r", "%0:rgb"][..],
+        &["refresh-client", "-r", "%0:\x1b]10;#123456\x07"][..],
         &["refresh-client", "-c"][..],
         &["refresh-client", "-D"][..],
         &["refresh-client", "-L"][..],
         &["refresh-client", "-R"][..],
         &["refresh-client", "-U"][..],
         &["refresh-client", "10"][..],
-    ] {
-        let error = super::parse_args(arguments).expect_err("unsupported field must not parse");
-        assert_eq!(error.kind(), clap::error::ErrorKind::UnknownArgument);
-    }
-
-    for arguments in [
+        &["refresh-client", "-A", "%0:on"][..],
+        &["refresh-client", "-B", "name:%0:#{pane_id}"][..],
         &["refresh-client", "-C", "80x24"][..],
+        &["refresh-client", "-C", "80,24"][..],
+        &["refresh-client", "-C", "@42:80x24"][..],
+        &["refresh-client", "-C", "@42:"][..],
         &["refresh-client", "-f", "active-pane"][..],
         &["refresh-client", "-F", "active-pane"][..],
         &["refresh-client", "-l"][..],
@@ -229,22 +381,29 @@ fn refresh_client_unsupported_fields_are_absent_from_cli_help_and_completion() {
         super::parse_args(arguments).expect("supported refresh-client field parses");
     }
 
+    for size in [
+        "@42:bad",
+        "@42:80,24",
+        "@4294967296:",
+        "@42:65536x1",
+        "80x0",
+    ] {
+        super::parse_args(&["refresh-client", "-C", size])
+            .expect_err("malformed size must fail in public CLI");
+    }
+
     let help =
         super::parse_args(&["refresh-client", "--help"]).expect_err("--help renders command help");
     assert_eq!(help.kind(), clap::error::ErrorKind::DisplayHelp);
     let help = help.to_string();
     assert!(
-        !help.contains("adjustment"),
-        "refresh-client help advertised unsupported adjustment: {help}"
+        help.contains("adjustment"),
+        "refresh-client help must advertise adjustment: {help}"
     );
-    for unsupported in ["-A", "-B", "-r", "-c", "-D", "-L", "-R", "-U"] {
-        assert!(
-            !help
-                .lines()
-                .any(|line| line.trim_start().starts_with(unsupported)),
-            "refresh-client help advertised reserved flag {unsupported}: {help}"
-        );
-    }
+    assert!(
+        help.lines().any(|line| line.trim_start().starts_with("-r")),
+        "refresh-client help must advertise -r: {help}"
+    );
 
     let completion = super::super::completion_command();
     let refresh = completion
@@ -258,13 +417,12 @@ fn refresh_client_unsupported_fields_are_absent_from_cli_help_and_completion() {
     assert!(
         refresh
             .get_arguments()
-            .all(|argument| argument.get_id() != "adjustment"),
-        "refresh-client completion advertised unsupported adjustment"
+            .any(|argument| argument.get_id() == "adjustment"),
+        "refresh-client completion must advertise adjustment"
     );
-    for unsupported in ['A', 'B', 'D', 'L', 'R', 'U', 'c', 'r'] {
-        assert!(!shorts.contains(&unsupported));
-    }
-    for supported in ['C', 'F', 'S', 'f', 'l', 't'] {
+    for supported in [
+        'A', 'B', 'C', 'F', 'S', 'f', 'l', 'r', 't', 'c', 'D', 'L', 'R', 'U',
+    ] {
         assert!(
             shorts.contains(&supported),
             "missing supported -{supported}"
@@ -277,7 +435,7 @@ fn refresh_client_unsupported_fields_are_absent_from_cli_help_and_completion() {
             "refresh-client",
             Some("refresh"),
         ),
-        "refresh-client (refresh) [-lS] [-C XxY] [-f flags] [-F flags] [-t target-client]"
+        "refresh-client (refresh) [-cDLRUlS] [-A pane:state] [-B name:what:format] [-C size] [-f flags] [-F flags] [-r pane:report] [-t target-client] [adjustment]"
     );
 }
 
@@ -412,15 +570,44 @@ fn manpage_surface_matches_implemented_commands_and_aliases() {
         expected_entries.len()
     )));
 
-    let alias_section = troff_section(&manpage, ".SH BUILT-IN COMMAND ALIASES", ".SH NOTES");
-    for alias in super::super::documented_cli_aliases() {
-        assert!(alias_section.contains(&format!(".B {}", alias.alias)));
-        assert!(alias_section.contains(&format!(".BR \"{}\" .", alias.expansion)));
-    }
+    let aliases = troff_literal_block(
+        &manpage,
+        ".SH BUILT-IN COMMAND ALIASES",
+        ".SH COMMAND REFERENCE",
+    )
+    .iter()
+    .map(|line| line.replace("\\-", "-").replace("\\e", "\\"))
+    .collect::<Vec<_>>();
+    let expected_aliases = super::super::documented_cli_aliases()
+        .iter()
+        .map(|alias| format!("{} => {}", alias.alias, alias.expansion))
+        .collect::<Vec<_>>();
+    assert_eq!(aliases, expected_aliases);
+
+    let synopsis = troff_literal_block(&manpage, ".SH SYNOPSIS", ".SH IMPLEMENTED COMMAND SURFACE")
+        .iter()
+        .map(|line| {
+            line.replace("\\-", "-")
+                .replace("\\e", "\\")
+                .replace("\\&", "")
+                .trim()
+                .to_owned()
+        })
+        .filter(|line| !line.is_empty())
+        .collect::<Vec<_>>();
+    let expected_synopsis = super::super::completion_command()
+        .render_long_help()
+        .to_string()
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .map(ToOwned::to_owned)
+        .collect::<Vec<_>>();
+    assert_eq!(synopsis, expected_synopsis);
 
     assert!(manpage.contains(".B -Vh"));
     assert!(manpage.contains(&format!("\"RMUX {}\"", env!("CARGO_PKG_VERSION"))));
-    assert!(manpage.contains(".RB [ -2CDhlNuVv ]"));
+    assert!(manpage.contains(".SH NOTES\n"));
     assert!(manpage.contains(".BR \"rmux <command> --help\" ."));
     assert!(manpage.contains(".BR \"rmux split-window -h\" ."));
 }

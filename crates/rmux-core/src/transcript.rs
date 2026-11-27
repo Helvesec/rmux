@@ -153,6 +153,22 @@ pub fn capture_screen_lines<'a>(
     output
 }
 
+/// Reads one `capture-pane -S` or `-E` value after format expansion.
+///
+/// tmux 3.7b reads the value with `strtonum(value, INT_MIN, SHRT_MAX)`, which
+/// defers to `strtoll`: leading C blanks and one sign are accepted, a trailing
+/// byte is not. Any failure, including an out-of-range value, falls back to the
+/// default bound instead of failing the command (`cmd-capture-pane.c`), which
+/// `None` already means here. The `-` sentinel is the caller's to recognise.
+#[must_use]
+pub fn parse_capture_bound(value: &str) -> Option<i64> {
+    let digits = value.trim_start_matches([' ', '\t', '\n', '\u{b}', '\u{c}', '\r']);
+    let bound = digits.parse::<i64>().ok()?;
+    (i64::from(i32::MIN)..=i64::from(i16::MAX))
+        .contains(&bound)
+        .then_some(bound)
+}
+
 /// Resolves a tmux-compatible screen capture range.
 #[must_use]
 pub fn resolve_screen_capture_range(
@@ -244,7 +260,8 @@ fn resolve_relative_bound(bound: Option<i64>, len: usize, default: usize) -> Opt
 #[cfg(test)]
 mod tests {
     use super::{
-        capture_screen_lines, resolve_screen_capture_range, ScreenCaptureRange, Transcript,
+        capture_screen_lines, parse_capture_bound, resolve_screen_capture_range,
+        ScreenCaptureRange, Transcript,
     };
 
     #[test]
@@ -338,6 +355,30 @@ mod tests {
         let range = resolve_screen_capture_range(ScreenCaptureRange::new(Some(1), Some(-1)), 2, 4)
             .expect("range exists");
         assert_eq!(range, 1..=3);
+    }
+
+    #[test]
+    fn capture_bound_follows_tmux_strtonum_range_and_lexis() {
+        // Measured on tmux 3.7b: these values select a bound...
+        assert_eq!(parse_capture_bound("-10"), Some(-10));
+        assert_eq!(parse_capture_bound(" 3"), Some(3));
+        assert_eq!(parse_capture_bound("+3"), Some(3));
+        assert_eq!(parse_capture_bound("32767"), Some(32_767));
+        assert_eq!(parse_capture_bound("-2147483648"), Some(-2_147_483_648));
+        // ...and these fall back to the visible default instead of failing.
+        for value in [
+            "abc",
+            "",
+            "#",
+            "%H",
+            "3x",
+            "32768",
+            "99999",
+            "-2147483649",
+            "+-3",
+        ] {
+            assert_eq!(parse_capture_bound(value), None, "value {value:?}");
+        }
     }
 
     fn transcript(lines: impl IntoIterator<Item = &'static str>) -> Transcript {

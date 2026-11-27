@@ -21,7 +21,7 @@ async fn swap_window_preserves_group_peer_selection_by_winlink_index() {
             let mut state = handler.state.lock().await;
             state
                 .sessions
-                .session_mut(&peer)
+                .session_setup(&peer)
                 .expect("group peer exists")
                 .select_window(1)
                 .expect("peer window selection succeeds");
@@ -53,9 +53,9 @@ async fn swap_window_permutes_group_peer_duplicate_alias_alerts_without_selectio
     create_grouped_session(&handler, peer.as_str(), &owner).await;
     {
         let mut state = handler.state.lock().await;
-        let peer_session = state
+        let mut peer_session = state
             .sessions
-            .session_mut(&peer)
+            .session_setup(&peer)
             .expect("group peer exists");
         peer_session
             .select_window(1)
@@ -303,12 +303,12 @@ async fn swap_window_across_sessions_moves_silence_alert_and_expired_timer_with_
         let mut state = handler.state.lock().await;
         let _ = state
             .sessions
-            .session_mut(&alpha)
+            .session_setup(&alpha)
             .expect("alpha exists")
             .clear_all_winlink_alert_flags(source.window_index());
         let _ = state
             .sessions
-            .session_mut(&beta)
+            .session_setup(&beta)
             .expect("beta exists")
             .clear_all_winlink_alert_flags(target.window_index());
     }

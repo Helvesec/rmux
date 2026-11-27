@@ -503,7 +503,7 @@ async fn create_session_with_status_two(handler: &RequestHandler, session: &Sess
             environment: None,
         }))
         .await;
-    assert!(matches!(created, Response::NewSession(_)), "{created:?}");
+    crate::session_fixture::assert_new_session(&created);
     set_session_status(handler, session, "2").await;
 }
 

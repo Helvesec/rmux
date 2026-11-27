@@ -13,21 +13,28 @@
 
 #[cfg(any(not(feature = "tiny-cli"), debug_assertions))]
 mod cli;
-#[cfg(any(not(feature = "tiny-cli"), debug_assertions))]
 mod cli_args;
 #[cfg(any(not(feature = "tiny-cli"), debug_assertions))]
 mod cli_response;
+#[cfg(all(test, any(not(feature = "tiny-cli"), debug_assertions)))]
+mod cli_test_inventory_tests;
+mod cli_top_level;
 mod client_terminal;
 mod command_alias_snapshot;
 #[cfg(any(not(feature = "tiny-cli"), debug_assertions))]
 mod empty_server_lifecycle;
-#[cfg(any(not(feature = "tiny-cli"), debug_assertions))]
+mod helper_handoff;
 mod os_string;
 #[cfg(any(not(feature = "tiny-cli"), debug_assertions))]
 mod process_locale;
+#[cfg(test)]
+mod publication_dry_run_tests;
 mod runtime_command_expansion;
 #[cfg(any(not(feature = "tiny-cli"), debug_assertions))]
 mod server_runtime;
+#[cfg(all(test, unix))]
+mod session_inventory_tests;
+mod source_stdin;
 #[cfg(all(feature = "tiny-cli", any(not(debug_assertions), test)))]
 mod tiny_main;
 mod tmux_error_surface;
@@ -37,18 +44,21 @@ mod windows_shell;
 mod windows_terminal;
 
 #[cfg(any(not(feature = "tiny-cli"), debug_assertions))]
-use std::env;
-#[cfg(any(not(feature = "tiny-cli"), debug_assertions))]
 use std::ffi::OsString;
 #[cfg(any(not(feature = "tiny-cli"), debug_assertions))]
 use std::io::{self, ErrorKind, Write};
-#[cfg(any(not(feature = "tiny-cli"), debug_assertions))]
+#[cfg(all(test, any(not(feature = "tiny-cli"), debug_assertions)))]
 use std::path::PathBuf;
 
 #[cfg(any(not(feature = "tiny-cli"), debug_assertions))]
+use rmux_bootstrap::hidden_daemon::{
+    ConfigSelection as ServerConfigFileSelection, FlagSyntax,
+    HiddenDaemonArgs as InternalDaemonArgs,
+};
+#[cfg(any(not(feature = "tiny-cli"), debug_assertions))]
 use rmux_client::INTERNAL_DAEMON_FLAG;
 #[cfg(any(not(feature = "tiny-cli"), debug_assertions))]
-use rmux_server::{ConfigFileSelection as ServerConfigFileSelection, DaemonConfig, ServerDaemon};
+use rmux_server::{DaemonConfig, ServerDaemon};
 
 #[cfg(all(feature = "tiny-cli", not(debug_assertions)))]
 fn main() {
@@ -58,15 +68,19 @@ fn main() {
 #[cfg(any(not(feature = "tiny-cli"), debug_assertions))]
 fn main() {
     #[cfg(unix)]
+    let args = helper_handoff::invocation_args();
+    #[cfg(not(unix))]
+    let args = std::env::args_os();
+    #[cfg(unix)]
     if let Some(exit_code) =
-        rmux_server::run_internal_fifo_reader_helper(std::env::args_os().skip(1))
+        rmux_server::run_internal_fifo_reader_helper(args.iter().skip(1).cloned())
     {
         std::process::exit(exit_code);
     }
 
     match process_locale::initialize_process_locale()
         .map_err(|error| cli::ExitFailure::new(1, error))
-        .and_then(|()| try_main(env::args_os()))
+        .and_then(|()| try_main(args))
     {
         Ok(code) => std::process::exit(code),
         Err(error) => {
@@ -120,6 +134,9 @@ where
     I: IntoIterator<Item = OsString>,
 {
     let args: Vec<OsString> = args.into_iter().collect();
+    if let Some(code) = source_stdin::reader_exit_code(&args) {
+        return Ok(code);
+    }
 
     match args.get(1) {
         Some(argument) if argument == INTERNAL_DAEMON_FLAG => {
@@ -135,19 +152,6 @@ where
 }
 
 #[cfg(any(not(feature = "tiny-cli"), debug_assertions))]
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct InternalDaemonArgs {
-    socket_path: Option<PathBuf>,
-    config_selection: ServerConfigFileSelection,
-    config_quiet: bool,
-    config_cwd: Option<PathBuf>,
-    web_frontend: Option<String>,
-    web_port: Option<u16>,
-    startup_ready_fd: Option<i32>,
-    startup_ready_event: Option<OsString>,
-}
-
-#[cfg(any(not(feature = "tiny-cli"), debug_assertions))]
 #[cfg(test)]
 fn parse_internal_socket_path<I>(args: I) -> Result<Option<PathBuf>, String>
 where
@@ -157,165 +161,25 @@ where
 }
 
 #[cfg(any(not(feature = "tiny-cli"), debug_assertions))]
-fn parse_internal_daemon_args<I>(mut args: I) -> Result<InternalDaemonArgs, String>
+fn parse_internal_daemon_args<I>(args: I) -> Result<InternalDaemonArgs, String>
 where
     I: Iterator<Item = OsString>,
 {
-    let mut socket_path = None;
-    let mut config_selection = ServerConfigFileSelection::Disabled;
-    let mut config_quiet = false;
-    let mut config_cwd = None;
-    let mut web_frontend = None;
-    let mut web_port = None;
-    let mut startup_ready_fd = None;
-    let mut startup_ready_event = None;
-
-    if let Some(first) = args.next() {
-        if os_string::os_str_bytes(first.as_os_str()).starts_with(b"--") {
-            parse_internal_flag(
-                first,
-                &mut args,
-                &mut config_selection,
-                &mut config_quiet,
-                &mut config_cwd,
-                &mut web_frontend,
-                &mut web_port,
-                &mut startup_ready_fd,
-                &mut startup_ready_event,
-            )?;
-        } else {
-            socket_path = Some(PathBuf::from(first));
-        }
-    }
-
-    while let Some(argument) = args.next() {
-        if !os_string::os_str_bytes(argument.as_os_str()).starts_with(b"--") {
-            return Err("unexpected extra arguments for hidden daemon mode".to_owned());
-        }
-        parse_internal_flag(
-            argument,
-            &mut args,
-            &mut config_selection,
-            &mut config_quiet,
-            &mut config_cwd,
-            &mut web_frontend,
-            &mut web_port,
-            &mut startup_ready_fd,
-            &mut startup_ready_event,
-        )?;
-    }
-
-    Ok(InternalDaemonArgs {
-        socket_path,
-        config_selection,
-        config_quiet,
-        config_cwd,
-        web_frontend,
-        web_port,
-        startup_ready_fd,
-        startup_ready_event,
-    })
-}
-
-#[cfg(any(not(feature = "tiny-cli"), debug_assertions))]
-#[allow(clippy::too_many_arguments)]
-fn parse_internal_flag<I>(
-    argument: OsString,
-    args: &mut I,
-    config_selection: &mut ServerConfigFileSelection,
-    config_quiet: &mut bool,
-    config_cwd: &mut Option<PathBuf>,
-    web_frontend: &mut Option<String>,
-    web_port: &mut Option<u16>,
-    startup_ready_fd: &mut Option<i32>,
-    startup_ready_event: &mut Option<OsString>,
-) -> Result<(), String>
-where
-    I: Iterator<Item = OsString>,
-{
-    match argument.to_str() {
-        Some("--config-default") => {
-            if !matches!(config_selection, ServerConfigFileSelection::Disabled) {
-                return Err("duplicate hidden daemon config selection".to_owned());
-            }
-            *config_selection = ServerConfigFileSelection::Default;
-        }
-        Some("--config-file") => {
-            let file = args
-                .next()
-                .ok_or_else(|| "--config-file requires a path".to_owned())?;
-            match config_selection {
-                ServerConfigFileSelection::Disabled => {
-                    *config_selection = ServerConfigFileSelection::Files(vec![PathBuf::from(file)]);
-                }
-                ServerConfigFileSelection::Files(files) => files.push(PathBuf::from(file)),
-                ServerConfigFileSelection::Default => {
-                    return Err("--config-file conflicts with --config-default".to_owned());
-                }
-            }
-        }
-        Some("--config-quiet") => *config_quiet = true,
-        Some("--config-cwd") => {
-            let cwd = args
-                .next()
-                .ok_or_else(|| "--config-cwd requires a path".to_owned())?;
-            *config_cwd = Some(PathBuf::from(cwd));
-        }
-        Some("--web-port") => {
-            let port = args
-                .next()
-                .ok_or_else(|| "--web-port requires a port".to_owned())?;
-            let port = port
-                .to_str()
-                .ok_or_else(|| "invalid UTF-8 in --web-port".to_owned())?
-                .parse::<u16>()
-                .map_err(|_| "--web-port requires an integer port".to_owned())?;
-            if port == 0 {
-                return Err("--web-port must be between 1 and 65535".to_owned());
-            }
-            *web_port = Some(port);
-        }
-        Some("--frontend-url" | "--web-frontend") => {
-            let frontend = args
-                .next()
-                .ok_or_else(|| "--frontend-url requires a URL".to_owned())?;
-            let frontend = frontend
-                .to_str()
-                .ok_or_else(|| "invalid UTF-8 in --frontend-url".to_owned())?;
-            *web_frontend = Some(frontend.to_owned());
-        }
-        Some("--startup-ready-fd") => {
-            let fd = args
-                .next()
-                .ok_or_else(|| "--startup-ready-fd requires a file descriptor".to_owned())?;
-            let fd = fd
-                .to_str()
-                .ok_or_else(|| "invalid UTF-8 in --startup-ready-fd".to_owned())?
-                .parse::<i32>()
-                .map_err(|_| "--startup-ready-fd requires an integer file descriptor".to_owned())?;
-            if fd < 0 {
-                return Err("--startup-ready-fd requires a non-negative file descriptor".to_owned());
-            }
-            *startup_ready_fd = Some(fd);
-        }
-        Some("--startup-ready-event") => {
-            let event = args
-                .next()
-                .ok_or_else(|| "--startup-ready-event requires an event name".to_owned())?;
-            *startup_ready_event = Some(event);
-        }
-        Some(other) => {
-            return Err(format!("unexpected hidden daemon argument '{other}'"));
-        }
-        None => return Err("invalid UTF-8 in hidden daemon flag".to_owned()),
-    }
-
-    Ok(())
+    InternalDaemonArgs::parse(args, FlagSyntax::NativePrefix)
 }
 
 #[cfg(any(not(feature = "tiny-cli"), debug_assertions))]
 fn run_hidden_daemon(args: InternalDaemonArgs) -> io::Result<()> {
     reject_unsupported_web_args(&args)?;
+    #[cfg(unix)]
+    let startup_owner = args
+        .startup_owner_fd
+        .map(|fd| {
+            // SAFETY: hidden daemon argv transfers this inherited descriptor;
+            // no runtime or other owner has been constructed yet.
+            unsafe { rmux_os::daemon::take_startup_owner(fd) }
+        })
+        .transpose()?;
 
     let mut config = match args.socket_path {
         Some(socket_path) => DaemonConfig::new(socket_path),
@@ -348,6 +212,11 @@ fn run_hidden_daemon(args: InternalDaemonArgs) -> io::Result<()> {
     let runtime = server_runtime::build_daemon_runtime()?;
 
     runtime.block_on(async move {
+        #[cfg(unix)]
+        let server = ServerDaemon::new(config)
+            .bind_with_startup_owner(startup_owner)
+            .await?;
+        #[cfg(not(unix))]
         let server = ServerDaemon::new(config).bind().await?;
         server.wait().await
     })
@@ -372,17 +241,28 @@ fn reject_unsupported_web_args(args: &InternalDaemonArgs) -> io::Result<()> {
 }
 
 #[cfg(all(test, any(not(feature = "tiny-cli"), debug_assertions)))]
+mod hidden_daemon_cases;
+
+#[cfg(all(test, any(not(feature = "tiny-cli"), debug_assertions)))]
 mod tests {
     use super::{
         parse_internal_daemon_args, parse_internal_socket_path, try_main, write_exit_message_to,
     };
     use crate::cli::ExitMessageTermination;
+    use rmux_bootstrap::hidden_daemon::ConfigSelection as ConfigFileSelection;
     use rmux_client::INTERNAL_DAEMON_FLAG;
-    use rmux_server::ConfigFileSelection;
     use std::ffi::OsString;
     use std::path::PathBuf;
 
     const EXPECTED_BINARY_NAME: &str = "rmux";
+
+    #[test]
+    fn hidden_daemon_contract() {
+        crate::hidden_daemon_cases::check(
+            |args| parse_internal_daemon_args(args.into_iter()),
+            false,
+        );
+    }
 
     #[test]
     fn exit_message_writer_distinguishes_lines_from_exact_protocol_bytes() {

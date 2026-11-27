@@ -316,3 +316,9 @@ mod extended_timers_utf8;
 
 #[path = "tests/winops_and_resets.rs"]
 mod winops_and_resets;
+
+mod rqm;
+mod rqss;
+
+mod dcs_opaque;
+mod dcs_opaque_neighbors;

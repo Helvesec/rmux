@@ -4,7 +4,7 @@ use rmux_client::connect;
 use rmux_client::{detect_context, detect_parent, ClientContext, ClientContextParent};
 use rmux_proto::request::{AttachSessionExt2Request, SwitchClientExt3Request};
 use rmux_proto::request::{KillSessionRequest, ListSessionsRequest, NewSessionExtRequest};
-use rmux_proto::{ClientTerminalContext, ErrorResponse, Response};
+use rmux_proto::{ClientTerminalContext, ErrorResponse, ProcessCommand, Response};
 
 use super::json_output::{list_sessions_json_format, write_list_sessions_json};
 use super::{
@@ -12,13 +12,14 @@ use super::{
     run_switch_client_on_connection,
 };
 use super::{
-    build_terminal_size, connect_with_startserver, expect_command_success, optional_client_flags,
-    resolve_current_session_target, resolve_session_target_or_current, resolve_session_target_spec,
-    run_command_resolved, run_payload_command, unexpected_response, write_command_output,
-    ExitFailure, StartupOptions,
+    build_terminal_size, connect_with_startserver, expect_command_success, list_session_names,
+    optional_client_flags, resolve_current_session_target, resolve_session_target_or_current,
+    resolve_session_target_spec, run_command_resolved, run_payload_command, unexpected_response,
+    write_command_output, ExitFailure, StartupOptions,
 };
 use crate::cli_args::{
-    KillSessionArgs, ListSessionsArgs, NewSessionArgs, RenameSessionArgs, SessionTargetArgs,
+    parse_target_spec, HasSessionArgs, KillSessionArgs, ListSessionsArgs, NewSessionArgs,
+    RenameSessionArgs,
 };
 
 pub(super) fn run_new_session(
@@ -43,6 +44,27 @@ pub(super) fn run_new_session(
         require_attach_terminal()?;
     }
 
+    let client_size = if !args.detached && client_context == ClientContext::Outside {
+        current_terminal_size()
+    } else {
+        None
+    };
+    let status = if client_size.is_some() {
+        let response = connection
+            .show_options(
+                rmux_proto::OptionScopeSelector::SessionGlobal,
+                Some("status".to_owned()),
+                true,
+                false,
+                false,
+            )
+            .map_err(ExitFailure::from_client)?;
+        let output = super::expect_command_output(&response, "show-options")?;
+        String::from_utf8_lossy(output.stdout()).trim().to_owned()
+    } else {
+        String::new()
+    };
+    let size = new_session_initial_size(args.cols, args.rows, client_size, &status);
     let client_flags = optional_client_flags(args.flags.clone());
     let working_directory = args
         .working_directory
@@ -51,7 +73,7 @@ pub(super) fn run_new_session(
         .new_session_extended(NewSessionExtRequest {
             session_name: args.session_name.clone(),
             detached: args.detached,
-            size: build_terminal_size(args.cols, args.rows),
+            size,
             environment: (!args.environment.is_empty()).then_some(args.environment),
             group_target: args.group_target,
             working_directory,
@@ -62,8 +84,8 @@ pub(super) fn run_new_session(
             window_name: args.window_name,
             print_session_info: args.print_session_info,
             print_format: args.print_format,
+            process_command: ProcessCommand::from_legacy_command(Some(&args.command)),
             command: (!args.command.is_empty()).then_some(args.command),
-            process_command: None,
             client_environment: invoking_client_environment(),
             skip_environment_update: args.skip_environment_update,
         })
@@ -144,6 +166,27 @@ fn reject_existing_session_before_attach_preflight(
     }
 }
 
+fn new_session_initial_size(
+    cols: Option<u16>,
+    rows: Option<u16>,
+    client_size: Option<rmux_proto::TerminalSize>,
+    status: &str,
+) -> Option<rmux_proto::TerminalSize> {
+    let Some(mut size) = client_size else {
+        return build_terminal_size(cols, rows);
+    };
+    // NewSessionExt.size is pane geometry. Reserve the new session's status
+    // before the first PTY/shell is created, not during the later attach.
+    // Like tmux, an outside attached client takes precedence over -x/-y.
+    let status_rows = if status == "off" {
+        0
+    } else {
+        status.parse::<u16>().unwrap_or(1).max(1)
+    };
+    size.rows = size.rows.saturating_sub(status_rows).max(1);
+    Some(size)
+}
+
 fn validate_new_session_size(cols: Option<u16>, rows: Option<u16>) -> Result<(), ExitFailure> {
     if cols == Some(0) {
         return Err(ExitFailure::new(1, "width too small"));
@@ -159,88 +202,17 @@ fn current_working_directory_string() -> Option<String> {
 }
 
 #[cfg(windows)]
-const RMUX_CLIENT_SHELL_ENV: &str = "RMUX_CLIENT_SHELL";
-#[cfg(windows)]
-const INTERNAL_CLIENT_SHELL_ENV: &str = "RMUX_INTERNAL_CLIENT_SHELL";
-#[cfg(windows)]
-const PUBLIC_BINARY_OVERRIDE_ENV: &str = "RMUX_INTERNAL_PUBLIC_BINARY_PATH";
-#[cfg(windows)]
-const INTERNAL_TMUX_COMPAT_ENV: &str = "RMUX_INTERNAL_INVOKED_AS_TMUX";
-
-#[cfg(windows)]
 fn invoking_client_environment() -> Option<Vec<String>> {
-    let shell = invoking_client_shell().or_else(internal_client_shell_handoff);
-    Some(windows_invoking_client_environment(
+    let shell = crate::windows_shell::invoking_client_shell().or_else(|| {
+        crate::helper_handoff::launcher_path()?;
+        std::env::var("RMUX_INTERNAL_CLIENT_SHELL")
+            .ok()
+            .filter(|shell| !shell.is_empty())
+    });
+    Some(crate::windows_shell::invoking_client_environment(
         std::env::vars_os(),
         shell,
     ))
-}
-
-#[cfg(windows)]
-fn windows_invoking_client_environment<I>(vars: I, shell: Option<String>) -> Vec<String>
-where
-    I: IntoIterator<Item = (std::ffi::OsString, std::ffi::OsString)>,
-{
-    let mut environment = vars
-        .into_iter()
-        .map(|(name, value)| {
-            (
-                name.to_string_lossy().into_owned(),
-                value.to_string_lossy().into_owned(),
-            )
-        })
-        .filter(|(name, _)| !name.starts_with('='))
-        .filter(|(name, _)| !name.eq_ignore_ascii_case(RMUX_CLIENT_SHELL_ENV))
-        .filter(|(name, _)| !name.eq_ignore_ascii_case(INTERNAL_CLIENT_SHELL_ENV))
-        .filter(|(name, _)| !name.eq_ignore_ascii_case(INTERNAL_TMUX_COMPAT_ENV))
-        .map(|(name, value)| format!("{name}={value}"))
-        .collect::<Vec<_>>();
-
-    if let Some(shell) = shell {
-        environment.push(format!("{RMUX_CLIENT_SHELL_ENV}={shell}"));
-    }
-
-    environment
-}
-
-#[cfg(windows)]
-fn invoking_client_shell() -> Option<String> {
-    let parent_pid = rmux_os::process::parent_pid(std::process::id())?;
-    let parent_name = rmux_os::process::command_name(parent_pid)?;
-    let environment = crate::windows_shell::WindowsShellEnvironment::current();
-    windows_client_shell_for_parent_name(&parent_name, &environment)
-}
-
-#[cfg(windows)]
-fn internal_client_shell_handoff() -> Option<String> {
-    internal_client_shell_handoff_from_vars(std::env::vars_os())
-}
-
-#[cfg(windows)]
-fn internal_client_shell_handoff_from_vars<I>(vars: I) -> Option<String>
-where
-    I: IntoIterator<Item = (std::ffi::OsString, std::ffi::OsString)>,
-{
-    let mut public_binary_seen = false;
-    let mut shell = None;
-
-    for (name, value) in vars {
-        if name.eq_ignore_ascii_case(PUBLIC_BINARY_OVERRIDE_ENV) && !value.is_empty() {
-            public_binary_seen = true;
-        } else if name.eq_ignore_ascii_case(INTERNAL_CLIENT_SHELL_ENV) && !value.is_empty() {
-            shell = Some(value.to_string_lossy().into_owned());
-        }
-    }
-
-    public_binary_seen.then_some(shell).flatten()
-}
-
-#[cfg(windows)]
-fn windows_client_shell_for_parent_name(
-    parent_name: &str,
-    environment: &crate::windows_shell::WindowsShellEnvironment,
-) -> Option<String> {
-    crate::windows_shell::client_shell_for_parent_name(parent_name, environment)
 }
 
 #[cfg(not(windows))]
@@ -253,21 +225,34 @@ fn current_working_directory() -> Option<PathBuf> {
 }
 
 pub(super) fn run_has_session(
-    args: SessionTargetArgs,
+    args: HasSessionArgs,
     socket_path: &Path,
 ) -> Result<i32, ExitFailure> {
     let mut connection = connect(socket_path)
         .map_err(|error| ExitFailure::from_client_connect(socket_path, error))?;
+    // tmux requires a current target before resolving even an explicit
+    // session target. Command options have already been validated by the CLI.
+    if list_session_names(&mut connection)?.is_empty() {
+        return Err(ExitFailure::new(1, "no current target"));
+    }
     let missing_message = args
         .target
         .as_ref()
         .map(|target| format!("can't find session: {target}"))
         .unwrap_or_else(|| "can't find session".to_owned());
-    let target = match args.target.as_ref() {
-        Some(target) => resolve_session_target_spec(&mut connection, target, false)
-            .map_err(|error| map_has_session_lookup_error(error, target.raw()))?,
-        None => resolve_current_session_target(&mut connection)?,
-    };
+    let target = match args.target.as_deref() {
+        None | Some("") => resolve_current_session_target(&mut connection),
+        Some(raw_target) => {
+            let target = parse_target_spec(raw_target).map_err(|message| {
+                ExitFailure::from_clap(clap::Error::raw(
+                    clap::error::ErrorKind::ValueValidation,
+                    message,
+                ))
+            })?;
+            resolve_session_target_spec(&mut connection, &target, false)
+        }
+    }
+    .map_err(|error| map_has_session_lookup_error(error, args.target.as_deref().unwrap_or("")))?;
     let response = connection
         .has_session(target)
         .map_err(ExitFailure::from_client)?;
@@ -286,6 +271,9 @@ pub(super) fn run_has_session(
 }
 
 fn map_has_session_lookup_error(error: ExitFailure, raw_target: &str) -> ExitFailure {
+    if error.message() == "server error: no current target" {
+        return ExitFailure::new(1, "no current target");
+    }
     if error.message().contains("ambiguous session match") {
         return ExitFailure::new(1, format!("can't find session: {raw_target}"));
     }
@@ -369,127 +357,50 @@ pub(super) fn run_list_sessions(
     })
 }
 
-#[cfg(test)]
-mod tests {
-    #[cfg(windows)]
-    use std::ffi::OsString;
-
-    #[cfg(windows)]
-    use super::{
-        internal_client_shell_handoff_from_vars, windows_client_shell_for_parent_name,
-        windows_invoking_client_environment, INTERNAL_CLIENT_SHELL_ENV, INTERNAL_TMUX_COMPAT_ENV,
-        PUBLIC_BINARY_OVERRIDE_ENV, RMUX_CLIENT_SHELL_ENV,
-    };
-    #[cfg(windows)]
-    use crate::windows_shell::WindowsShellEnvironment;
-
-    #[cfg(windows)]
-    fn env_pair(name: &str, value: &str) -> (OsString, OsString) {
-        (OsString::from(name), OsString::from(value))
-    }
-
-    #[cfg(windows)]
-    #[test]
-    fn windows_full_cli_uses_trusted_tiny_client_shell_handoff() {
-        let vars = [
-            env_pair("Path", r"C:\bin"),
-            env_pair(PUBLIC_BINARY_OVERRIDE_ENV, r"C:\rmux\rmux.exe"),
-            env_pair(INTERNAL_CLIENT_SHELL_ENV, "pwsh.exe"),
-        ];
-
-        assert_eq!(
-            internal_client_shell_handoff_from_vars(vars).as_deref(),
-            Some("pwsh.exe")
-        );
-    }
-
-    #[cfg(windows)]
-    #[test]
-    fn windows_full_cli_ignores_untrusted_client_shell_handoff() {
-        let vars = [
-            env_pair("Path", r"C:\bin"),
-            env_pair(INTERNAL_CLIENT_SHELL_ENV, "pwsh.exe"),
-        ];
-
-        assert_eq!(internal_client_shell_handoff_from_vars(vars), None);
-    }
-
-    #[cfg(windows)]
-    #[test]
-    fn windows_full_cli_filters_internal_handoff_environment() {
-        let environment = windows_invoking_client_environment(
-            [
-                env_pair("Path", r"C:\bin"),
-                env_pair(RMUX_CLIENT_SHELL_ENV, "stale.exe"),
-                env_pair(INTERNAL_CLIENT_SHELL_ENV, "pwsh.exe"),
-                env_pair(INTERNAL_TMUX_COMPAT_ENV, "1"),
-            ],
-            Some("pwsh.exe".to_owned()),
-        );
-
-        assert!(environment.iter().any(|entry| entry == r"Path=C:\bin"));
-        assert!(environment
-            .iter()
-            .any(|entry| entry == "RMUX_CLIENT_SHELL=pwsh.exe"));
-        assert!(!environment
-            .iter()
-            .any(|entry| entry == "RMUX_CLIENT_SHELL=stale.exe"));
-        assert!(!environment
-            .iter()
-            .any(|entry| entry.starts_with("RMUX_INTERNAL_CLIENT_SHELL=")));
-        assert!(!environment
-            .iter()
-            .any(|entry| entry.starts_with("RMUX_INTERNAL_INVOKED_AS_TMUX=")));
-    }
-
-    #[cfg(windows)]
-    #[test]
-    fn windows_full_cli_shell_mapping_skips_alias_and_uses_real_pwsh() {
-        let root =
-            std::env::temp_dir().join(format!("rmux-full-shell-hint-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&root);
-        let alias_dir = root.join("Microsoft").join("WindowsApps");
-        let regular_dir = root.join("PowerShell").join("7");
-        let powershell = root
-            .join("System32")
-            .join("WindowsPowerShell")
-            .join("v1.0")
-            .join("powershell.exe");
-        let cmd = root.join("System32").join("cmd.exe");
-        std::fs::create_dir_all(&alias_dir).expect("WindowsApps fixture directory");
-        std::fs::create_dir_all(&regular_dir).expect("regular shell fixture directory");
-        std::fs::create_dir_all(powershell.parent().expect("PowerShell fixture parent"))
-            .expect("PowerShell fixture directory");
-        std::fs::create_dir_all(cmd.parent().expect("cmd fixture parent"))
-            .expect("cmd fixture directory");
-        std::fs::write(alias_dir.join("pwsh.exe"), b"").expect("alias pwsh fixture");
-        std::fs::write(regular_dir.join("pwsh.exe"), b"").expect("regular pwsh fixture");
-        std::fs::write(&powershell, b"").expect("Windows PowerShell fixture");
-        std::fs::write(&cmd, b"").expect("cmd fixture");
-
-        let real_path = std::env::join_paths([alias_dir.as_os_str(), regular_dir.as_os_str()])
-            .expect("PATH with real pwsh");
-        let real_environment = WindowsShellEnvironment::for_test(
-            Some(real_path),
-            Some(root.clone().into_os_string()),
-            Some(cmd.clone().into_os_string()),
-        );
-        assert_eq!(
-            windows_client_shell_for_parent_name("powershell.exe", &real_environment).as_deref(),
-            Some("pwsh.exe")
-        );
-
-        let alias_path = std::env::join_paths([alias_dir.as_os_str()]).expect("alias-only PATH");
-        let alias_environment = WindowsShellEnvironment::for_test(
-            Some(alias_path),
-            Some(root.clone().into_os_string()),
-            Some(cmd.into_os_string()),
-        );
-        assert_eq!(
-            windows_client_shell_for_parent_name("pwsh.exe", &alias_environment).as_deref(),
-            Some("powershell.exe")
-        );
-
-        std::fs::remove_dir_all(root).expect("remove full shell fixture");
-    }
+pub(super) fn configured_default_client_commands(
+    connection: &mut rmux_client::Connection,
+) -> Result<Vec<crate::cli_args::Command>, ExitFailure> {
+    let response = connection
+        .show_options(
+            rmux_proto::OptionScopeSelector::ServerGlobal,
+            Some("default-client-command".into()),
+            true,
+            false,
+            false,
+        )
+        .map_err(ExitFailure::from_client)?;
+    let output = super::expect_command_output(&response, "show-options")?;
+    let text = std::str::from_utf8(output.stdout())
+        .map_err(|error| ExitFailure::new(1, error.to_string()))?;
+    let aliases = super::alias_fallback::server_command_alias_definitions(connection)?;
+    default_client_commands_from_value(text.trim_end_matches('\n'), aliases)
 }
+
+fn default_client_commands_from_value(
+    value: &str,
+    aliases: Vec<String>,
+) -> Result<Vec<crate::cli_args::Command>, ExitFailure> {
+    let parsed = rmux_core::command_parser::CommandParser::new()
+        .with_command_aliases(aliases)
+        .parse(value)
+        .map_err(|error| ExitFailure::new(1, error.to_string()))?;
+    crate::cli_args::parse_with_runtime_command_groups(
+        ["rmux"],
+        &[crate::cli_args::RuntimeCommandGroup::Canonical(
+            parsed.to_tmux_reparse_string(),
+        )],
+    )
+    .map(crate::cli_args::Cli::into_command_queue)
+    .map_err(ExitFailure::from_clap)
+}
+
+#[cfg(test)]
+pub(super) fn default_client_command() -> crate::cli_args::Command {
+    default_client_commands_from_value("new-session", Vec::new())
+        .unwrap()
+        .remove(0)
+}
+
+#[cfg(test)]
+#[path = "session_commands/tests.rs"]
+mod tests;

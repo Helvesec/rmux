@@ -1,3 +1,5 @@
+use std::borrow::Cow;
+
 use crate::utf8::Utf8Config;
 
 use super::regex_cache::cached_regex;
@@ -58,7 +60,11 @@ pub(super) fn format_unescape(s: &str) -> String {
     out
 }
 
-pub(super) fn apply_substitution(value: &str, modifier: &FormatModifier) -> String {
+pub(super) fn apply_substitution(
+    value: &str,
+    modifier: &FormatModifier,
+    literal_hashes: bool,
+) -> String {
     let Some(pattern) = modifier.argv.first() else {
         return value.to_owned();
     };
@@ -88,13 +94,32 @@ pub(super) fn apply_substitution(value: &str, modifier: &FormatModifier) -> Stri
         .get(2)
         .is_some_and(|flags| flags.contains('i'));
 
+    // Match real characters, but copy text and captures from the marked source.
+    // NUL and '#' are both one byte, so every regex offset still addresses the
+    // original source, preserving both literal hashes and configured styles.
+    let matching_value = if literal_hashes && value.contains('\0') {
+        Cow::Owned(value.replace('\0', "#"))
+    } else {
+        Cow::Borrowed(value)
+    };
     match cached_regex(pattern, case_insensitive) {
-        Ok(regex) => substitute_regex(value, &regex, replacement),
-        Err(_) => value.replace(pattern, replacement),
+        Ok(regex) => substitute_regex(value, &matching_value, &regex, replacement),
+        // A pattern that will not compile substitutes nothing: tmux's regsub
+        // returns NULL when regcomp fails (regsub.c:69-74) and the format takes
+        // the original text back (format.c:4516-4527), so the value of this
+        // step survives and the modifiers after it still run. Replacing the
+        // pattern literally would edit the text on exactly the input the
+        // expression failed to describe.
+        Err(_) => value.to_owned(),
     }
 }
 
-fn substitute_regex(value: &str, regex: &regex::Regex, replacement: &str) -> String {
+fn substitute_regex(
+    value: &str,
+    matching_value: &str,
+    regex: &regex::Regex,
+    replacement: &str,
+) -> String {
     let mut output = String::with_capacity(value.len());
     let mut offset = 0;
 
@@ -108,7 +133,7 @@ fn substitute_regex(value: &str, regex: &regex::Regex, replacement: &str) -> Str
         }
 
         let suffix = &value[offset..];
-        let Some(suffix_captures) = regex.captures(suffix) else {
+        let Some(suffix_captures) = regex.captures(&matching_value[offset..]) else {
             output.push_str(&value[offset..]);
             return output;
         };
@@ -122,21 +147,21 @@ fn substitute_regex(value: &str, regex: &regex::Regex, replacement: &str) -> Str
             output.push_str(&value[offset..match_start]);
 
             if match_start >= value.len() {
-                push_tmux_replacement(&suffix_captures, replacement, &mut output);
+                push_tmux_replacement(&suffix_captures, suffix, replacement, &mut output);
                 offset = value.len();
                 continue;
             }
             let byte = value.as_bytes()[match_start];
             push_tmux_byte(byte, &mut output);
             let next_offset = match_start + 1;
-            if !has_non_empty_match_at(regex, value, next_offset) {
-                push_tmux_replacement(&suffix_captures, replacement, &mut output);
+            if !has_non_empty_match_at(regex, matching_value, next_offset) {
+                push_tmux_replacement(&suffix_captures, suffix, replacement, &mut output);
             }
             offset = next_offset;
             continue;
         }
 
-        let Some(captures) = regex.captures_at(value, offset) else {
+        let Some(captures) = regex.captures_at(matching_value, offset) else {
             output.push_str(suffix);
             return output;
         };
@@ -149,7 +174,7 @@ fn substitute_regex(value: &str, regex: &regex::Regex, replacement: &str) -> Str
         let match_end = match_.end();
         output.push_str(&value[offset..match_start]);
 
-        push_tmux_replacement(&captures, replacement, &mut output);
+        push_tmux_replacement(&captures, value, replacement, &mut output);
         offset = match_end;
     }
 
@@ -170,7 +195,12 @@ fn has_non_empty_match_at(regex: &regex::Regex, value: &str, offset: usize) -> b
         .is_some_and(|match_| match_.start() == 0 && !match_.is_empty())
 }
 
-fn push_tmux_replacement(captures: &regex::Captures<'_>, replacement: &str, output: &mut String) {
+fn push_tmux_replacement(
+    captures: &regex::Captures<'_>,
+    source: &str,
+    replacement: &str,
+    output: &mut String,
+) {
     let mut chars = replacement.chars().peekable();
 
     while let Some(character) = chars.next() {
@@ -180,7 +210,7 @@ fn push_tmux_replacement(captures: &regex::Captures<'_>, replacement: &str, outp
                 let capture_index = digit.to_digit(10).expect("ascii digit") as usize;
                 match captures.get(capture_index) {
                     Some(capture) if !capture.as_str().is_empty() => {
-                        output.push_str(capture.as_str())
+                        output.push_str(&source[capture.range()])
                     }
                     _ => output.push(digit),
                 }

@@ -15,7 +15,7 @@ async fn source_file_lookup_parse_errors_skip_bad_file_and_continue_other_paths(
     let response = handler
         .handle(source_file_request(
             vec!["bad.conf".to_owned(), "good.conf".to_owned()],
-            Some(root),
+            Some(root.to_path_buf()),
         ))
         .await;
 
@@ -63,7 +63,7 @@ async fn source_file_lookup_error_inside_block_stops_file_without_brace_noise() 
     let response = handler
         .handle(source_file_request(
             vec!["block.conf".to_owned()],
-            Some(root),
+            Some(root.to_path_buf()),
         ))
         .await;
 
@@ -123,7 +123,7 @@ async fn nested_source_file_lookup_parse_error_skips_child_but_outer_continues()
     let response = handler
         .handle(source_file_request(
             vec!["outer.conf".to_owned()],
-            Some(root),
+            Some(root.to_path_buf()),
         ))
         .await;
 
@@ -172,7 +172,7 @@ async fn nested_source_file_skips_child_after_command_syntax_error() {
     let response = handler
         .handle(source_file_request(
             vec!["outer.conf".to_owned()],
-            Some(root),
+            Some(root.to_path_buf()),
         ))
         .await;
 
@@ -213,7 +213,10 @@ async fn source_file_continuation_inside_single_quoted_string() {
     write_config(&root.join("sq.conf"), "set-buffer -b sq 'hello\\\nworld'\n");
 
     let response = handler
-        .handle(source_file_request(vec!["sq.conf".to_owned()], Some(root)))
+        .handle(source_file_request(
+            vec!["sq.conf".to_owned()],
+            Some(root.to_path_buf()),
+        ))
         .await;
 
     assert_eq!(
@@ -248,7 +251,7 @@ async fn source_file_nested_if_elif_else_endif_branches() {
     let response = handler
         .handle(source_file_request(
             vec!["branches.conf".to_owned()],
-            Some(root),
+            Some(root.to_path_buf()),
         ))
         .await;
 
@@ -280,7 +283,10 @@ async fn source_file_if_with_format_expression_condition() {
     );
 
     let response = handler
-        .handle(source_file_request(vec!["fmt.conf".to_owned()], Some(root)))
+        .handle(source_file_request(
+            vec!["fmt.conf".to_owned()],
+            Some(root.to_path_buf()),
+        ))
         .await;
 
     assert_eq!(
@@ -314,7 +320,7 @@ async fn source_file_stdin_dash_without_stdin_returns_error() {
             verbose: false,
             expand_paths: false,
             target: None,
-            caller_cwd: Some(root),
+            caller_cwd: Some(root.to_path_buf()),
             stdin: None,
         })))
         .await;
@@ -338,8 +344,8 @@ async fn source_file_ignores_server_scope_for_non_server_options_like_tmux() {
     let root = temp_root("set-option-server-scope");
     fs::create_dir_all(&root).expect("create temp root");
     let alpha = session_name("alpha");
-    assert!(matches!(
-        handler
+    crate::session_fixture::assert_new_session(
+        &handler
             .handle(Request::NewSession(NewSessionRequest {
                 session_name: alpha.clone(),
                 detached: true,
@@ -347,8 +353,7 @@ async fn source_file_ignores_server_scope_for_non_server_options_like_tmux() {
                 environment: None,
             }))
             .await,
-        Response::NewSession(_)
-    ));
+    );
 
     let response = handler
         .handle(Request::SourceFile(Box::new(SourceFileRequest {
@@ -358,7 +363,7 @@ async fn source_file_ignores_server_scope_for_non_server_options_like_tmux() {
             verbose: false,
             expand_paths: false,
             target: Some(PaneTarget::with_window(alpha, 0, 0)),
-            caller_cwd: Some(root),
+            caller_cwd: Some(root.to_path_buf()),
             stdin: Some("set-option -s status off\n".to_owned()),
         })))
         .await;
@@ -389,8 +394,8 @@ async fn source_file_routes_window_show_commands_and_global_show_scope_compatibi
     let root = temp_root("show-options-compat");
     fs::create_dir_all(&root).expect("create temp root");
     let alpha = session_name("alpha");
-    assert!(matches!(
-        handler
+    crate::session_fixture::assert_new_session(
+        &handler
             .handle(Request::NewSession(NewSessionRequest {
                 session_name: alpha.clone(),
                 detached: true,
@@ -398,8 +403,7 @@ async fn source_file_routes_window_show_commands_and_global_show_scope_compatibi
                 environment: None,
             }))
             .await,
-        Response::NewSession(_)
-    ));
+    );
 
     let response = handler
         .handle(Request::SourceFile(Box::new(SourceFileRequest {
@@ -409,13 +413,14 @@ async fn source_file_routes_window_show_commands_and_global_show_scope_compatibi
             verbose: false,
             expand_paths: false,
             target: Some(PaneTarget::with_window(alpha, 0, 0)),
-            caller_cwd: Some(root),
+            caller_cwd: Some(root.to_path_buf()),
             stdin: Some(
                 "set-option -s message-limit 77\n\
 set -gq status off\n\
 set -gw pane-border-style fg=colour3\n\
 set-window-option -g pane-active-border-style fg=colour5\n\
 set -gw copy-mode-selection-style bg=cyan,fg=black\n\
+set -g copy-mode-selection-style bg=yellow,fg=black\n\
 set-option -ag status-left append\n\
 	show-options -gqsv -t alpha message-limit\n\
 show-options -gqv status\n\
@@ -432,7 +437,7 @@ show-window-options -g -v copy-mode-selection-style\n"
             .command_output()
             .unwrap_or_else(|| panic!("queued show-options output, got {response:?}"))
             .stdout(),
-        b"77\noff\nfg=colour3\nfg=colour5\nbg=cyan,fg=black\n"
+        b"77\noff\nfg=colour3\nfg=colour5\nbg=yellow,fg=black\n"
     );
 }
 
@@ -442,8 +447,8 @@ async fn source_file_show_options_quiet_suppresses_missing_options_with_current_
     let root = temp_root("show-options-quiet-missing");
     fs::create_dir_all(&root).expect("create temp root");
     let alpha = session_name("alpha");
-    assert!(matches!(
-        handler
+    crate::session_fixture::assert_new_session(
+        &handler
             .handle(Request::NewSession(NewSessionRequest {
                 session_name: alpha.clone(),
                 detached: true,
@@ -451,8 +456,7 @@ async fn source_file_show_options_quiet_suppresses_missing_options_with_current_
                 environment: None,
             }))
             .await,
-        Response::NewSession(_)
-    ));
+    );
 
     let response = handler
         .handle(Request::SourceFile(Box::new(SourceFileRequest {
@@ -462,7 +466,7 @@ async fn source_file_show_options_quiet_suppresses_missing_options_with_current_
             verbose: false,
             expand_paths: false,
             target: Some(PaneTarget::with_window(alpha, 0, 0)),
-            caller_cwd: Some(root),
+            caller_cwd: Some(root.to_path_buf()),
             stdin: Some(
                 "show-options -q @missing\n\
 show-options -wq @missing\n\
@@ -485,8 +489,8 @@ async fn source_file_set_option_p_preserves_explicit_pane_target() {
     let root = temp_root("set-option-pane-target");
     fs::create_dir_all(&root).expect("create temp root");
     let alpha = session_name("alpha");
-    assert!(matches!(
-        handler
+    crate::session_fixture::assert_new_session(
+        &handler
             .handle(Request::NewSession(NewSessionRequest {
                 session_name: alpha.clone(),
                 detached: true,
@@ -494,8 +498,7 @@ async fn source_file_set_option_p_preserves_explicit_pane_target() {
                 environment: None,
             }))
             .await,
-        Response::NewSession(_)
-    ));
+    );
 
     let response = handler
         .handle(Request::SourceFile(Box::new(SourceFileRequest {
@@ -505,7 +508,7 @@ async fn source_file_set_option_p_preserves_explicit_pane_target() {
             verbose: false,
             expand_paths: false,
             target: None,
-            caller_cwd: Some(root),
+            caller_cwd: Some(root.to_path_buf()),
             stdin: Some(
                 "set-option -p -t alpha:0.0 pane-border-style fg=blue\n\
 show-options -pqv -t alpha:0.0 pane-border-style\n"
@@ -529,8 +532,8 @@ async fn source_file_set_option_format_expands_value_before_storage() {
     let root = temp_root("set-option-format");
     fs::create_dir_all(&root).expect("create temp root");
     let alpha = session_name("alpha");
-    assert!(matches!(
-        handler
+    crate::session_fixture::assert_new_session(
+        &handler
             .handle(Request::NewSession(NewSessionRequest {
                 session_name: alpha.clone(),
                 detached: true,
@@ -538,8 +541,7 @@ async fn source_file_set_option_format_expands_value_before_storage() {
                 environment: None,
             }))
             .await,
-        Response::NewSession(_)
-    ));
+    );
 
     let response = handler
         .handle(Request::SourceFile(Box::new(SourceFileRequest {
@@ -549,7 +551,7 @@ async fn source_file_set_option_format_expands_value_before_storage() {
             verbose: false,
             expand_paths: false,
             target: Some(PaneTarget::with_window(alpha, 0, 0)),
-            caller_cwd: Some(root),
+            caller_cwd: Some(root.to_path_buf()),
             stdin: Some(
                 "set-option -gF @probe '#{session_name}-#{window_index}'\n\
 show-options -gqv @probe\n"
@@ -574,8 +576,8 @@ async fn source_file_set_option_format_expands_socket_path() {
     let root = temp_root("set-option-socket-path");
     fs::create_dir_all(&root).expect("create temp root");
     let alpha = session_name("alpha");
-    assert!(matches!(
-        handler
+    crate::session_fixture::assert_new_session(
+        &handler
             .handle(Request::NewSession(NewSessionRequest {
                 session_name: alpha.clone(),
                 detached: true,
@@ -583,8 +585,7 @@ async fn source_file_set_option_format_expands_socket_path() {
                 environment: None,
             }))
             .await,
-        Response::NewSession(_)
-    ));
+    );
 
     let response = handler
         .handle(Request::SourceFile(Box::new(SourceFileRequest {
@@ -594,7 +595,7 @@ async fn source_file_set_option_format_expands_socket_path() {
             verbose: false,
             expand_paths: false,
             target: Some(PaneTarget::with_window(alpha, 0, 0)),
-            caller_cwd: Some(root),
+            caller_cwd: Some(root.to_path_buf()),
             stdin: Some(
                 "set-option -gF @probe '#{socket_path}'\n\
 show-options -gqv @probe\n"
@@ -626,7 +627,7 @@ async fn source_file_set_option_format_sees_earlier_global_user_option_without_t
             verbose: false,
             expand_paths: false,
             target: None,
-            caller_cwd: Some(root),
+            caller_cwd: Some(root.to_path_buf()),
             stdin: Some(
                 "set-option -g @fmt '#{session_name}'\n\
 set-option -gF @expanded '#{@fmt}'\n\
@@ -659,7 +660,7 @@ async fn source_file_accepts_oh_my_tmux_extended_keys_format_value() {
             verbose: false,
             expand_paths: false,
             target: None,
-            caller_cwd: Some(root),
+            caller_cwd: Some(root.to_path_buf()),
             stdin: Some(
                 "set-environment -g TERM_PROGRAM iTerm\n\
 set -g extended-keys #{?#{||:#{m/ri:mintty|iTerm,#{TERM_PROGRAM}},#{!=:#{XTERM_VERSION},}},on,off}\n\
@@ -692,7 +693,7 @@ async fn source_file_preserves_option_like_set_option_values_after_the_option_na
             verbose: false,
             expand_paths: false,
             target: None,
-            caller_cwd: Some(root),
+            caller_cwd: Some(root.to_path_buf()),
             stdin: Some("set-option -g @compact -tfoo\nshow-options -gqv @compact\n".to_owned()),
         })))
         .await;
@@ -720,7 +721,7 @@ async fn source_file_without_target_routes_append_to_default_global_scope() {
             verbose: false,
             expand_paths: false,
             target: None,
-            caller_cwd: Some(root),
+            caller_cwd: Some(root.to_path_buf()),
             stdin: Some("set-option -ag status-left append\n".to_owned()),
         })))
         .await;
@@ -742,8 +743,8 @@ async fn source_file_without_target_uses_preferred_session_for_parse_time_format
     let root = temp_root("source-file-implicit-target");
     fs::create_dir_all(&root).expect("create temp root");
     let alpha = session_name("alpha");
-    assert!(matches!(
-        handler
+    crate::session_fixture::assert_new_session(
+        &handler
             .handle(Request::NewSession(NewSessionRequest {
                 session_name: alpha,
                 detached: true,
@@ -751,8 +752,7 @@ async fn source_file_without_target_uses_preferred_session_for_parse_time_format
                 environment: None,
             }))
             .await,
-        Response::NewSession(_)
-    ));
+    );
 
     let response = handler
         .handle(Request::SourceFile(Box::new(SourceFileRequest {
@@ -762,7 +762,7 @@ async fn source_file_without_target_uses_preferred_session_for_parse_time_format
             verbose: false,
             expand_paths: false,
             target: None,
-            caller_cwd: Some(root),
+            caller_cwd: Some(root.to_path_buf()),
             stdin: Some(
                 "%if #{==:#{session_name},alpha}\n\
 set-buffer -b implicit yes\n\
@@ -801,7 +801,7 @@ async fn source_file_comment_after_command_is_ignored() {
     let response = handler
         .handle(source_file_request(
             vec!["commented.conf".to_owned()],
-            Some(root),
+            Some(root.to_path_buf()),
         ))
         .await;
 
@@ -830,7 +830,10 @@ async fn source_file_glob_expands_matching_files() {
     write_config(&root.join("b.conf"), "set-buffer -b glob-b yes\n");
 
     let response = handler
-        .handle(source_file_request(vec!["*.conf".to_owned()], Some(root)))
+        .handle(source_file_request(
+            vec!["*.conf".to_owned()],
+            Some(root.to_path_buf()),
+        ))
         .await;
 
     assert_eq!(
@@ -875,7 +878,7 @@ async fn source_file_sets_user_and_known_non_resize_options_through_named_guard(
             verbose: false,
             expand_paths: false,
             target: None,
-            caller_cwd: Some(root),
+            caller_cwd: Some(root.to_path_buf()),
             stdin: Some(
                 "set-option -g @capture-guard first\n\
 set-option -g status-left second\n\

@@ -14,12 +14,18 @@ use rustix::event::{poll, PollFd, PollFlags, Timespec};
 use rustix::fs::{Mode, OFlags};
 use tokio::task::JoinHandle;
 
+#[cfg(test)]
+use super::limit::MAX_BUFFER_FILE_BYTES;
+use super::ReadLimit;
+
 #[cfg(target_os = "macos")]
-#[path = "darwin_fifo_reader.rs"]
-mod fifo_reader;
+mod darwin_fifo_reader;
+#[cfg(target_os = "macos")]
+use darwin_fifo_reader as fifo_reader;
 #[cfg(not(target_os = "macos"))]
-#[path = "fifo_reader_fallback.rs"]
-mod fifo_reader;
+mod fifo_reader_fallback;
+#[cfg(not(target_os = "macos"))]
+use fifo_reader_fallback as fifo_reader;
 
 const PHASE_PENDING: u8 = 0;
 const PHASE_OPENING: u8 = 1;
@@ -75,6 +81,7 @@ struct CancellationState {
     special: SpecialFile,
     cancelled: AtomicBool,
     phase: AtomicU8,
+    read_limit: ReadLimit,
 }
 
 impl CancellationState {
@@ -84,6 +91,7 @@ impl CancellationState {
             special,
             cancelled: AtomicBool::new(false),
             phase: AtomicU8::new(PHASE_PENDING),
+            read_limit: ReadLimit::Buffer,
         }
     }
 
@@ -162,50 +170,28 @@ pub(super) fn special_path(path: &Path) -> io::Result<Option<SpecialFile>> {
 }
 
 pub(super) async fn read(path: PathBuf) -> io::Result<Vec<u8>> {
+    read_with_limit(path, ReadLimit::Buffer).await
+}
+
+pub(super) async fn read_with_limit(path: PathBuf, limit: ReadLimit) -> io::Result<Vec<u8>> {
     // Preserve the macOS helper's blocking-open handshake for paths that are
     // already FIFOs. If this observation becomes stale, every later open is
     // still O_NONBLOCK and descriptor-classified before any read.
     if let Some(special) = special_path(&path)? {
-        return start_read(path, special, None).await;
+        return start_read(path, special, None, limit).await;
     }
 
     match open_read_target(&path)? {
-        ReadTarget::Ordinary(mut file) => tokio::task::spawn_blocking(move || {
-            let mut content = Vec::new();
-            file.read_to_end(&mut content)?;
-            Ok(content)
-        })
-        .await
-        .map_err(|error| io::Error::other(format!("buffer file reader failed: {error}")))?,
+        ReadTarget::Ordinary(file) => {
+            tokio::task::spawn_blocking(move || limit.read_regular_file(file))
+                .await
+                .map_err(|error| io::Error::other(format!("buffer file reader failed: {error}")))?
+        }
         ReadTarget::Special(file, special) => {
-            read_special_discovered_after_classification(path, file, special).await
+            fifo_reader::read_special_discovered_after_classification(path, file, special, limit)
+                .await
         }
     }
-}
-
-#[cfg(not(target_os = "macos"))]
-async fn read_special_discovered_after_classification(
-    path: PathBuf,
-    file: File,
-    special: SpecialFile,
-) -> io::Result<Vec<u8>> {
-    start_read(path, special, Some(file)).await
-}
-
-#[cfg(target_os = "macos")]
-async fn read_special_discovered_after_classification(
-    _path: PathBuf,
-    _file: File,
-    _special: SpecialFile,
-) -> io::Result<Vec<u8>> {
-    // A nonblocking FIFO descriptor counts as a reader on macOS. Handing the
-    // path to the blocking helper after this point can lose an instantaneous
-    // writer's bytes between the two opens. Fail the raced operation instead;
-    // a path observed as a FIFO initially still uses the helper above.
-    Err(io::Error::new(
-        io::ErrorKind::InvalidInput,
-        "buffer path changed to a special file during open",
-    ))
 }
 
 pub(super) async fn write(path: PathBuf, content: Vec<u8>, append: bool) -> io::Result<()> {
@@ -224,8 +210,15 @@ pub(super) async fn write(path: PathBuf, content: Vec<u8>, append: bool) -> io::
     }
 }
 
-fn start_read(path: PathBuf, special: SpecialFile, file: Option<File>) -> FifoOperation<Vec<u8>> {
-    let state = Arc::new(CancellationState::new(path, special));
+fn start_read(
+    path: PathBuf,
+    special: SpecialFile,
+    file: Option<File>,
+    limit: ReadLimit,
+) -> FifoOperation<Vec<u8>> {
+    let mut state = CancellationState::new(path, special);
+    state.read_limit = limit;
+    let state = Arc::new(state);
     let worker_state = Arc::clone(&state);
     let task = tokio::task::spawn_blocking(move || read_special(worker_state, file));
     FifoOperation {
@@ -292,7 +285,7 @@ fn read_special(state: Arc<CancellationState>, file: Option<File>) -> io::Result
             Ok(0) => return Ok(content),
             Ok(length) => {
                 observed_fifo_writer = true;
-                content.extend_from_slice(&buffer[..length]);
+                state.read_limit.append(&mut content, &buffer[..length])?;
             }
             Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
                 if state.special.kind == SpecialFileKind::Fifo {
@@ -540,16 +533,28 @@ fn errno_to_io(error: rustix::io::Errno) -> io::Error {
 }
 
 #[cfg(test)]
+mod size_limit_tests;
+
+#[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::atomic::{AtomicU64, Ordering};
+    #[cfg(not(target_has_atomic = "64"))]
+    use portable_atomic::AtomicU64;
+    #[cfg(target_has_atomic = "64")]
+    use std::sync::atomic::AtomicU64;
+    use std::sync::atomic::Ordering;
 
     static TEST_ID: AtomicU64 = AtomicU64::new(0);
 
     #[tokio::test]
     async fn cancelling_fifo_read_unblocks_the_open_worker() {
         let path = test_fifo("cancel-read");
-        let operation = start_read(path.clone(), classify_special(&path), None);
+        let operation = start_read(
+            path.clone(),
+            classify_special(&path),
+            None,
+            ReadLimit::Buffer,
+        );
         let state = Arc::clone(&operation.cancellation.state);
         wait_for_phase(&state, PHASE_OPENED).await;
 
@@ -581,7 +586,12 @@ mod tests {
     #[tokio::test]
     async fn nonblocking_fifo_read_waits_for_a_writer_and_drains_to_eof() {
         let path = test_fifo("successful-read");
-        let operation = start_read(path.clone(), classify_special(&path), None);
+        let operation = start_read(
+            path.clone(),
+            classify_special(&path),
+            None,
+            ReadLimit::Buffer,
+        );
         let writer_path = path.clone();
         let writer = tokio::task::spawn_blocking(move || std::fs::write(writer_path, b"payload"));
 
@@ -603,7 +613,12 @@ mod tests {
     #[tokio::test]
     async fn nonblocking_fifo_read_observes_an_instantaneous_empty_writer_then_eof() {
         let path = test_fifo("empty-read");
-        let operation = start_read(path.clone(), classify_special(&path), None);
+        let operation = start_read(
+            path.clone(),
+            classify_special(&path),
+            None,
+            ReadLimit::Buffer,
+        );
         let writer_path = path.clone();
         let writer = tokio::task::spawn_blocking(move || {
             drop(
@@ -680,7 +695,12 @@ mod tests {
     async fn cancelling_an_open_fifo_read_uses_its_original_inode() {
         let path = test_fifo("cancel-replaced-read");
         let original = path.with_extension("original");
-        let operation = start_read(path.clone(), classify_special(&path), None);
+        let operation = start_read(
+            path.clone(),
+            classify_special(&path),
+            None,
+            ReadLimit::Buffer,
+        );
         let state = Arc::clone(&operation.cancellation.state);
         wait_for_phase(&state, PHASE_OPENED).await;
 
@@ -792,16 +812,21 @@ mod tests {
 
         #[cfg(target_os = "macos")]
         {
-            let error = read_special_discovered_after_classification(path.clone(), file, special)
-                .await
-                .expect_err("a raced macOS FIFO read must fail without reopening the path");
+            let error = fifo_reader::read_special_discovered_after_classification(
+                path.clone(),
+                file,
+                special,
+                ReadLimit::Buffer,
+            )
+            .await
+            .expect_err("a raced macOS FIFO read must fail without reopening the path");
             assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
             std::fs::remove_file(path).expect("remove replacement FIFO");
         }
 
         #[cfg(not(target_os = "macos"))]
         {
-            let operation = start_read(path.clone(), special, Some(file));
+            let operation = start_read(path.clone(), special, Some(file), ReadLimit::Buffer);
             let state = Arc::clone(&operation.cancellation.state);
             wait_for_phase(&state, PHASE_OPENED).await;
 
