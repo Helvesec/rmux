@@ -11,7 +11,7 @@ async fn create_session(handler: &RequestHandler, session: &SessionName) {
             environment: None,
         }))
         .await;
-    assert!(matches!(response, Response::NewSession(_)), "{response:?}");
+    crate::session_fixture::assert_new_session(&response);
 }
 
 async fn set_lock_command(handler: &RequestHandler) {

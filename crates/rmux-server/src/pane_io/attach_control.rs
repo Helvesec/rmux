@@ -5,6 +5,13 @@ use tokio::sync::mpsc;
 
 use super::types::{AttachTarget, OverlayFrame};
 
+mod coalesce;
+
+use coalesce::{
+    CoalescedAttachTarget, CoalescedAttachTargetReplace, CoalescedPopupOverlay,
+    CoalescedPopupOverlayReplace, PendingDeepSwitchReservation, PopupOverlayKey,
+};
+
 #[derive(Debug)]
 pub(crate) enum AttachControl {
     Detach,
@@ -16,6 +23,7 @@ pub(crate) enum AttachControl {
     Switch(QueuedAttachTarget),
     AdvancePersistentOverlayState(u64),
     Overlay(OverlayFrame),
+    CoalescedPopupOverlay(Arc<CoalescedPopupOverlay>),
     Write(Vec<u8>),
     ClipboardWrite {
         bytes: Vec<u8>,
@@ -68,6 +76,7 @@ impl AttachControl {
             // retained in one sender-side slot below.
             Self::Switch(target) => target.retained_render_frame_len(),
             Self::Overlay(overlay) => overlay.frame.len(),
+            Self::CoalescedPopupOverlay(slot) => slot.retained_frame_len(),
             Self::Write(bytes) | Self::ClipboardWrite { bytes, .. } => bytes.len(),
         });
         retained_bytes.div_ceil(Self::BACKLOG_UNIT_BYTES).max(1)
@@ -92,12 +101,28 @@ impl AttachControl {
                 reservation: Some(_),
                 ..
             } => 0,
+            Self::Overlay(OverlayFrame {
+                backlog_reservation: Some(_),
+                ..
+            }) => 0,
             // Deep switch reservations remain live while a target sits in a
             // deferred queue, and release on materialization or drop.
             Self::Switch(
                 QueuedAttachTarget::Coalesced(_) | QueuedAttachTarget::RetainedDeep { .. },
-            ) => 0,
+            )
+            | Self::CoalescedPopupOverlay(_) => 0,
             _ => self.backlog_units(),
+        }
+    }
+
+    /// Converts sender-side queue markers before any dispatch or deferral.
+    pub(crate) fn materialize_received(self) -> Self {
+        match self {
+            Self::CoalescedPopupOverlay(slot) => Self::Overlay(
+                slot.take()
+                    .expect("a queued popup overlay must be consumed exactly once"),
+            ),
+            other => other,
         }
     }
 }
@@ -122,13 +147,7 @@ impl QueuedAttachTarget {
     pub(crate) fn with_target<T>(&self, inspect: impl FnOnce(&AttachTarget) -> T) -> Option<T> {
         match self {
             Self::Direct(target) => Some(inspect(target)),
-            Self::Coalesced(slot) => {
-                let state = slot
-                    .state
-                    .lock()
-                    .expect("coalesced attach target mutex must not be poisoned");
-                state.target.as_deref().map(inspect)
-            }
+            Self::Coalesced(slot) => slot.with_target(inspect),
             Self::RetainedDeep { target, .. } => Some(inspect(target)),
         }
     }
@@ -151,148 +170,6 @@ impl QueuedAttachTarget {
     fn retained_render_frame_len(&self) -> usize {
         self.with_target(|target| target.render_frame.len())
             .unwrap_or_default()
-    }
-}
-
-#[derive(Debug)]
-pub(crate) struct PendingDeepSwitchReservation {
-    count: Arc<AtomicUsize>,
-}
-
-impl Drop for PendingDeepSwitchReservation {
-    fn drop(&mut self) {
-        let _ = self
-            .count
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |current| {
-                current.checked_sub(1)
-            });
-    }
-}
-
-#[derive(Debug)]
-pub(crate) struct CoalescedAttachTarget {
-    state: Mutex<CoalescedAttachTargetState>,
-    backlog: Arc<AtomicUsize>,
-    deep_count: Arc<AtomicUsize>,
-}
-
-#[derive(Debug)]
-struct CoalescedAttachTargetState {
-    target: Option<Box<AttachTarget>>,
-    units: usize,
-    switch_count: u64,
-    deep_reservation: Option<PendingDeepSwitchReservation>,
-}
-
-enum CoalescedAttachTargetReplace {
-    Replaced,
-    Consumed(Box<AttachTarget>),
-    Full(Box<AttachTarget>),
-}
-
-impl CoalescedAttachTarget {
-    fn new(
-        target: Box<AttachTarget>,
-        units: usize,
-        backlog: Arc<AtomicUsize>,
-        deep_count: Arc<AtomicUsize>,
-        deep_reservation: Option<PendingDeepSwitchReservation>,
-    ) -> Self {
-        Self {
-            state: Mutex::new(CoalescedAttachTargetState {
-                target: Some(target),
-                units,
-                switch_count: 1,
-                deep_reservation,
-            }),
-            backlog,
-            deep_count,
-        }
-    }
-
-    fn replace(
-        &self,
-        target: Box<AttachTarget>,
-        units: usize,
-        backlog_limit: usize,
-    ) -> CoalescedAttachTargetReplace {
-        let mut state = self
-            .state
-            .lock()
-            .expect("coalesced attach target mutex must not be poisoned");
-        if state.target.is_none() {
-            return CoalescedAttachTargetReplace::Consumed(target);
-        }
-
-        let needs_deep_reservation = target.live_pane.is_some();
-        let added_deep_reservation = if needs_deep_reservation && state.deep_reservation.is_none() {
-            if !reserve_pending_deep_switch(&self.deep_count) {
-                return CoalescedAttachTargetReplace::Full(target);
-            }
-            Some(PendingDeepSwitchReservation {
-                count: Arc::clone(&self.deep_count),
-            })
-        } else {
-            None
-        };
-        let previous_units = state.units;
-        if units > previous_units
-            && !reserve_attach_control_backlog(
-                &self.backlog,
-                units.saturating_sub(previous_units),
-                backlog_limit,
-            )
-        {
-            drop(added_deep_reservation);
-            return CoalescedAttachTargetReplace::Full(target);
-        }
-
-        let previous_target = state.target.replace(target);
-        state.units = units;
-        state.switch_count = state.switch_count.saturating_add(1);
-        let released_deep_reservation = if needs_deep_reservation {
-            if state.deep_reservation.is_none() {
-                state.deep_reservation = added_deep_reservation;
-            }
-            None
-        } else {
-            state.deep_reservation.take()
-        };
-        drop(state);
-        if previous_units > units {
-            release_attach_control_backlog(&self.backlog, previous_units - units);
-        }
-        drop(previous_target);
-        drop(released_deep_reservation);
-        CoalescedAttachTargetReplace::Replaced
-    }
-
-    fn take(&self) -> Option<(Box<AttachTarget>, u64)> {
-        let (target, units, switch_count, deep_reservation) = {
-            let mut state = self
-                .state
-                .lock()
-                .expect("coalesced attach target mutex must not be poisoned");
-            (
-                state.target.take(),
-                std::mem::take(&mut state.units),
-                std::mem::take(&mut state.switch_count),
-                state.deep_reservation.take(),
-            )
-        };
-        release_attach_control_backlog(&self.backlog, units);
-        drop(deep_reservation);
-        target.map(|target| (target, switch_count))
-    }
-}
-
-impl Drop for CoalescedAttachTarget {
-    fn drop(&mut self) {
-        let state = self
-            .state
-            .get_mut()
-            .expect("coalesced attach target mutex must not be poisoned");
-        release_attach_control_backlog(&self.backlog, std::mem::take(&mut state.units));
     }
 }
 
@@ -326,6 +203,14 @@ pub(crate) struct AttachControlSender {
 #[derive(Debug, Default)]
 struct AttachControlSendState {
     open_coalesced_switch: Option<Weak<CoalescedAttachTarget>>,
+    open_coalesced_popup_overlay: Option<Weak<CoalescedPopupOverlay>>,
+}
+
+impl AttachControlSendState {
+    fn close_slots(&mut self) {
+        self.open_coalesced_switch = None;
+        self.open_coalesced_popup_overlay = None;
+    }
 }
 
 #[derive(Debug)]
@@ -363,10 +248,83 @@ impl AttachControlSender {
         }
     }
 
+    pub(crate) fn send_popup_overlay(
+        &self,
+        popup_id: u64,
+        overlay: OverlayFrame,
+    ) -> Result<(), AttachControlSendError> {
+        // Only complete, state-free persistent repaints are latest-value
+        // payloads. Clears and state-carrying overlays remain FIFO controls.
+        if !overlay.persistent || overlay.frame.is_empty() || overlay.persistent_state_id.is_some()
+        {
+            return self.send(AttachControl::Overlay(overlay));
+        }
+        let key = PopupOverlayKey::new(popup_id, overlay.render_generation);
+        let mut send_state = self
+            .send_state
+            .lock()
+            .expect("attach control send-state mutex must not be poisoned");
+        if self.closing.load(Ordering::SeqCst) {
+            return Err(AttachControlSendError::Closed);
+        }
+        if self.inner.is_closed() {
+            self.mark_receiver_closed(&mut send_state);
+            return Err(AttachControlSendError::Closed);
+        }
+
+        send_state.open_coalesced_switch = None;
+        let overlay = if let Some(slot) = send_state
+            .open_coalesced_popup_overlay
+            .as_ref()
+            .and_then(Weak::upgrade)
+            .filter(|slot| slot.matches(key))
+        {
+            let units = attach_overlay_backlog_units(&overlay);
+            match slot.replace(overlay, units, self.backlog_limit) {
+                CoalescedPopupOverlayReplace::Replaced
+                | CoalescedPopupOverlayReplace::IgnoredOlder => {
+                    return self.finish_replacement(&mut send_state);
+                }
+                CoalescedPopupOverlayReplace::Consumed(overlay) => {
+                    send_state.open_coalesced_popup_overlay = None;
+                    overlay
+                }
+                CoalescedPopupOverlayReplace::Full(overlay) => {
+                    send_state.open_coalesced_popup_overlay = None;
+                    drop(overlay);
+                    self.close_overloaded_attach();
+                    return Err(AttachControlSendError::Full);
+                }
+            }
+        } else {
+            send_state.open_coalesced_popup_overlay = None;
+            overlay
+        };
+        let units = attach_overlay_backlog_units(&overlay);
+        if !reserve_attach_control_backlog(&self.backlog, units, self.backlog_limit) {
+            self.close_overloaded_attach();
+            return Err(AttachControlSendError::Full);
+        }
+
+        let slot = Arc::new(CoalescedPopupOverlay::new(
+            key,
+            overlay,
+            units,
+            Arc::clone(&self.backlog),
+        ));
+        send_state.open_coalesced_popup_overlay = Some(Arc::downgrade(&slot));
+        if let Err(error) = self.inner.send(AttachControl::CoalescedPopupOverlay(slot)) {
+            self.mark_receiver_closed(&mut send_state);
+            drop(error);
+            return Err(AttachControlSendError::Closed);
+        }
+        Ok(())
+    }
+
     pub(crate) fn send(&self, control: AttachControl) -> Result<(), AttachControlSendError> {
         // Tokio preserves sender-local ordering, but attached controls have
         // many cloned producers. Serializing the short enqueue section gives
-        // coalesced switch slots an explicit cross-producer ordering boundary.
+        // replacement slots an explicit cross-producer ordering boundary.
         let mut send_state = self
             .send_state
             .lock()
@@ -377,12 +335,12 @@ impl AttachControlSender {
         if self.inner.is_closed() {
             // Closing the receiver drops every queued control at once. No
             // reservation can still correspond to retained queue memory.
-            self.closing.store(true, Ordering::SeqCst);
-            self.backlog.store(0, Ordering::Release);
-            send_state.open_coalesced_switch = None;
+            self.mark_receiver_closed(&mut send_state);
             return Err(AttachControlSendError::Closed);
         }
 
+        // Every ordinary control is a delivery boundary for popup repaints.
+        send_state.open_coalesced_popup_overlay = None;
         let control = match control {
             AttachControl::Switch(QueuedAttachTarget::Direct(target))
                 if target.is_coalescible_render_refresh() =>
@@ -395,17 +353,7 @@ impl AttachControlSender {
                     let units = attach_switch_backlog_units(&target);
                     match slot.replace(target, units, self.backlog_limit) {
                         CoalescedAttachTargetReplace::Replaced => {
-                            // The receiver can close after the optimistic
-                            // check while this sender still keeps the slot Arc
-                            // alive. Do not report a replacement into that
-                            // orphaned slot as delivered.
-                            if self.inner.is_closed() {
-                                self.closing.store(true, Ordering::SeqCst);
-                                self.backlog.store(0, Ordering::Release);
-                                send_state.open_coalesced_switch = None;
-                                return Err(AttachControlSendError::Closed);
-                            }
-                            return Ok(());
+                            return self.finish_replacement(&mut send_state);
                         }
                         CoalescedAttachTargetReplace::Consumed(target) => {
                             send_state.open_coalesced_switch = None;
@@ -444,9 +392,9 @@ impl AttachControlSender {
                         self.close_overloaded_attach();
                         return Err(AttachControlSendError::Full);
                     }
-                    Some(PendingDeepSwitchReservation {
-                        count: Arc::clone(&self.pending_deep_switches),
-                    })
+                    Some(PendingDeepSwitchReservation::new(Arc::clone(
+                        &self.pending_deep_switches,
+                    )))
                 } else {
                     None
                 };
@@ -470,9 +418,9 @@ impl AttachControlSender {
                 }
                 AttachControl::Switch(QueuedAttachTarget::RetainedDeep {
                     target,
-                    _deep_reservation: PendingDeepSwitchReservation {
-                        count: Arc::clone(&self.pending_deep_switches),
-                    },
+                    _deep_reservation: PendingDeepSwitchReservation::new(Arc::clone(
+                        &self.pending_deep_switches,
+                    )),
                     _backlog_reservation: AttachControlBacklogReservation {
                         backlog: Arc::clone(&self.backlog),
                         units,
@@ -485,13 +433,32 @@ impl AttachControlSender {
             // The receiver closed between the optimistic check and send. Its
             // queue has been dropped in full, so clear all reservations rather
             // than releasing only this attempted control.
-            self.closing.store(true, Ordering::SeqCst);
-            self.backlog.store(0, Ordering::Release);
-            send_state.open_coalesced_switch = None;
+            self.mark_receiver_closed(&mut send_state);
             drop(error);
             return Err(AttachControlSendError::Closed);
         }
         Ok(())
+    }
+
+    fn finish_replacement(
+        &self,
+        send_state: &mut AttachControlSendState,
+    ) -> Result<(), AttachControlSendError> {
+        // The receiver can close after the optimistic check while this sender
+        // still keeps the slot Arc alive. Do not report a replacement into an
+        // orphaned slot as delivered.
+        if self.inner.is_closed() {
+            self.mark_receiver_closed(send_state);
+            Err(AttachControlSendError::Closed)
+        } else {
+            Ok(())
+        }
+    }
+
+    fn mark_receiver_closed(&self, send_state: &mut AttachControlSendState) {
+        self.closing.store(true, Ordering::SeqCst);
+        self.backlog.store(0, Ordering::Release);
+        send_state.close_slots();
     }
 
     pub(crate) fn is_closed(&self) -> bool {
@@ -526,6 +493,13 @@ impl AttachControlSender {
 fn attach_switch_backlog_units(target: &AttachTarget) -> usize {
     std::mem::size_of::<AttachControl>()
         .saturating_add(target.render_frame.len())
+        .div_ceil(AttachControl::BACKLOG_UNIT_BYTES)
+        .max(1)
+}
+
+fn attach_overlay_backlog_units(overlay: &OverlayFrame) -> usize {
+    std::mem::size_of::<AttachControl>()
+        .saturating_add(overlay.frame.len())
         .div_ceil(AttachControl::BACKLOG_UNIT_BYTES)
         .max(1)
 }
@@ -565,3 +539,6 @@ pub(crate) fn release_attach_control_backlog(backlog: &AtomicUsize, units: usize
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+mod popup_lifetime_tests;

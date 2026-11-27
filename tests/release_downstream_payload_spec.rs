@@ -196,7 +196,7 @@ fn exact_payload_and_subject_round_trip() {
     assert_fixture(&format!(
         "{PRELUDE}\n{}",
         r#"
-with tempfile.TemporaryDirectory(dir=pathlib.Path.cwd()) as directory:
+with tempfile.TemporaryDirectory(dir=pathlib.Path.cwd().parent) as directory:
     value = fixture(directory)
     created = run_cli(['create', *value['common'], '--output', str(value['document']), '--subject-output', str(value['subject'])])
     if created.returncode != 0:
@@ -216,7 +216,7 @@ fn payload_rejects_producer_receipt_and_expiry_drift() {
     assert_fixture(&format!(
         "{PRELUDE}\n{}",
         r#"
-with tempfile.TemporaryDirectory(dir=pathlib.Path.cwd()) as directory:
+with tempfile.TemporaryDirectory(dir=pathlib.Path.cwd().parent) as directory:
     value = fixture(directory)
     created = run_cli(['create', *value['common'], '--output', str(value['document']), '--subject-output', str(value['subject'])])
     if created.returncode != 0:
@@ -254,7 +254,7 @@ fn payload_root_rejects_symlinks_and_unlisted_files() {
     assert_fixture(&format!(
         "{PRELUDE}\n{}",
         r#"
-with tempfile.TemporaryDirectory(dir=pathlib.Path.cwd()) as directory:
+with tempfile.TemporaryDirectory(dir=pathlib.Path.cwd().parent) as directory:
     value = fixture(directory)
     (value['payload_dir'] / 'extra').symlink_to(value['payload_dir'] / 'rmux.rb')
     rejected = run_cli(['create', *value['common'], '--output', str(value['document']), '--subject-output', str(value['subject'])])
@@ -269,7 +269,7 @@ fn payload_collection_supports_multiarch_roles_and_rejects_duplicate_names() {
     assert_fixture(&format!(
         "{PRELUDE}\n{}",
         r#"
-with tempfile.TemporaryDirectory(dir=pathlib.Path.cwd()) as directory:
+with tempfile.TemporaryDirectory(dir=pathlib.Path.cwd().parent) as directory:
     root = pathlib.Path(directory)
     names = [
         'rmux_0.9.0_amd64.deb',

@@ -387,7 +387,7 @@ async fn delegated_read_only_attach_still_rejects_content_and_mutating_bindings(
             .session(&alpha)
             .expect("session remains")
             .windows()
-            .len(),
+            .count(),
         1,
         "read-only prefix c must not create a window"
     );
@@ -432,7 +432,7 @@ async fn delegated_read_only_attach_rejects_chained_detach_binding_product_diver
             .session(&alpha)
             .expect("session remains")
             .windows()
-            .len(),
+            .count(),
         1,
         "the chained new-window command must not execute"
     );

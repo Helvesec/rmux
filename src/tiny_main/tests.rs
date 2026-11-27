@@ -1,14 +1,17 @@
 use super::*;
 #[cfg(windows)]
 use crate::windows_shell::WindowsShellEnvironment;
+#[cfg(windows)]
+use crate::windows_shell::{
+    client_shell_for_parent_name as windows_client_shell_for_parent_name,
+    invoking_client_environment as windows_invoking_client_environment,
+};
 use parse::{
     has_queue_separator, parse_display_message, parse_has_session, parse_join_pane,
     parse_kill_pane, parse_kill_session, parse_list_panes, parse_list_windows, parse_new_session,
     parse_new_window, parse_rename_window, parse_resize_pane, parse_select_window, parse_send_keys,
     parse_set_option, parse_show_options, parse_source_file, parse_split_window,
 };
-#[cfg(windows)]
-use parse::{windows_client_shell_for_parent_name, windows_invoking_client_environment};
 use rmux_proto::{
     ErrorResponse, ResizePaneAdjustment, Response, RmuxError, SourceFileResponse, SplitDirection,
     Target,
@@ -16,6 +19,35 @@ use rmux_proto::{
 
 fn os_args(args: &[&str]) -> Vec<OsString> {
     args.iter().map(OsString::from).collect()
+}
+
+#[test]
+fn split_window_full_and_direct_tiny_share_direction_precedence() {
+    for flags in [["-h", "-v"], ["-v", "-h"]] {
+        let argv = [
+            "rmux",
+            "split-window",
+            "-d",
+            "-t",
+            "schema:0.0",
+            flags[0],
+            flags[1],
+        ];
+        let full = crate::cli_args::parse(argv).expect("canonical split-window");
+        let crate::cli_args::Command::SplitWindow(full) = full.command.unwrap() else {
+            panic!("expected full split-window");
+        };
+        let TinyInvocation::Direct(tiny) = TinyInvocation::parse(&os_args(&argv)) else {
+            panic!("expected direct tiny split-window");
+        };
+        let TinyCommand::SplitWindow { request, .. } = *tiny else {
+            panic!("expected tiny split-window request");
+        };
+        assert_eq!(full.direction(), SplitDirection::Horizontal, "{argv:?}");
+        assert_eq!(request.direction, full.direction(), "{argv:?}");
+        assert_eq!(request.target.as_deref(), Some("schema:0.0"));
+        assert!(request.detached);
+    }
 }
 
 fn assert_tiny_direct(args: &[&str], command: &str) {
@@ -115,6 +147,65 @@ fn tiny_start_server_inventory_covers_every_cold_alias_entry_path() {
 }
 
 #[test]
+fn tiny_startup_alias_inventory_is_independent_of_nested_context() {
+    const CHILD_CONTEXT: &str = "RMUX_TEST_TINY_STARTUP_CONTEXT";
+    if env::var_os(CHILD_CONTEXT).is_none() {
+        let executable = rmux_os::build_identity::resolve(
+            env::current_exe().expect("test executable").as_os_str(),
+        )
+        .expect("test executable identity");
+        for context in ["outside", "RMUX", "TMUX"] {
+            let mut child = std::process::Command::new(&executable);
+            child
+                .args([
+                    "--exact",
+                    "tiny_main::tests::tiny_startup_alias_inventory_is_independent_of_nested_context",
+                    "--nocapture",
+                ])
+                .env(CHILD_CONTEXT, context)
+                .env_remove("RMUX")
+                .env_remove("TMUX")
+                .env_remove("RMUX_DISABLE_TINY_CLI");
+            if context != "outside" {
+                child.env(context, "outer-session,123,0");
+            }
+            let output = child.output().expect("isolated startup inventory");
+            assert!(
+                output.status.success(),
+                "{context}: {:?}\n{}\n{}",
+                output.status,
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr),
+            );
+        }
+        return;
+    }
+
+    for (canonical, names, tail) in [
+        (
+            "start-server",
+            ["start-server", "start", "start-s"],
+            &[][..],
+        ),
+        ("new-session", ["new-session", "new", "new-s"], &["-d"][..]),
+        (
+            "attach-session",
+            ["attach-session", "attach", "att"],
+            &[][..],
+        ),
+    ] {
+        for name in names {
+            for binary in ["rmux", "tmux"] {
+                let mut args = vec![binary, name];
+                args.extend_from_slice(tail);
+                assert_tiny_direct(&args, canonical);
+                assert_tiny_starts_server(&args, true);
+            }
+        }
+    }
+}
+
+#[test]
 fn reusable_tiny_connection_is_scoped_to_one_matching_socket() {
     let socket_path = Path::new("/tmp/rmux-tiny-live.sock");
     let other_socket_path = Path::new("/tmp/rmux-tiny-other.sock");
@@ -126,8 +217,66 @@ fn reusable_tiny_connection_is_scoped_to_one_matching_socket() {
 }
 
 #[test]
-fn long_version_stays_on_full_helper_path_for_tmux_compatibility() {
-    assert_tiny_fallback(&["rmux", "--version"]);
+fn native_long_version_product_divergence_uses_shared_decision() {
+    for tail in [
+        vec!["--version"],
+        vec!["--version", "-x"],
+        vec!["-vVx"],
+        vec!["-u", "--version"],
+        vec!["-vL", "--version", "-V"],
+    ] {
+        let args = std::iter::once("rmux")
+            .chain(tail)
+            .map(OsString::from)
+            .collect::<Vec<_>>();
+        assert!(
+            matches!(TinyInvocation::parse(&args), TinyInvocation::Version),
+            "{args:?}"
+        );
+    }
+    for args in [
+        &["tmux", "--version"][..],
+        &["rmux", "--version=x"][..],
+        &["rmux", "-h", "--version"][..],
+        &["rmux", "--help", "--version"][..],
+        &["rmux", "-x", "--version"][..],
+        &["rmux", "--", "--version"][..],
+        &["rmux", "-vL", "--version"][..],
+        &["rmux", "-vf", "--version"][..],
+    ] {
+        assert_tiny_fallback(args);
+    }
+}
+
+#[test]
+fn missing_top_level_arguments_stay_on_full_helper_path() {
+    for personality in ["rmux", "tmux"] {
+        for flag in ['L', 'S', 'f', 'T', 'c'] {
+            for option in [format!("-{flag}"), format!("-uv{flag}")] {
+                assert_tiny_fallback(&[personality, &option]);
+            }
+        }
+    }
+}
+
+#[test]
+fn long_help_stays_on_full_helper_path() {
+    for personality in ["rmux", "tmux"] {
+        for args in [
+            vec![personality, "--help"],
+            vec![personality, "-2CNu", "--help"],
+            vec![personality, "--help", "-V"],
+            vec![personality, "--help", "--version"],
+            vec![personality, "--nope", "--help"],
+            vec![personality, "-h", "--help"],
+            vec![personality, "-vL", "value", "--help"],
+            vec![personality, "-S", "--help", "-x"],
+            vec![personality, "--", "--help"],
+            vec![personality, "list-commands", "--help"],
+        ] {
+            assert_tiny_fallback(&args);
+        }
+    }
 }
 
 #[test]
@@ -296,9 +445,7 @@ fn send_keys_should_use_tiny(args: &[OsString]) -> bool {
                 let Some(value) = args.get(index).and_then(|arg| arg.to_str()) else {
                     return false;
                 };
-                if !exact_pane_target(value) {
-                    return false;
-                }
+                let _ = value;
                 target = true;
             }
             "-F" | "-H" | "-l" | "-K" | "-M" | "-p" | "-R" | "-X" | "-N" | "-c" => {
@@ -335,1120 +482,12 @@ fn source_file_should_use_tiny(args: &[OsString]) -> bool {
             .all(|path| path.to_str().is_some_and(|path| path != "-"))
 }
 
-#[test]
-fn split_window_with_command_is_tiny_parseable() {
-    let args = os_args(&["-h", "-t", "0", "sleep", "1"]);
-
-    let request = parse_split_window(&args).expect("split-window command fast path");
-    assert!(matches!(request.direction, SplitDirection::Horizontal));
-    assert_eq!(request.target.as_deref(), Some("0"));
-    assert_eq!(
-        request.command.as_deref(),
-        Some(&["sleep".into(), "1".into()][..])
-    );
-}
-
-#[test]
-fn split_window_simple_form_is_tiny_parseable() {
-    let args = os_args(&["-h", "-d", "-t", "0"]);
-
-    let request = parse_split_window(&args).expect("simple split-window fast path");
-    assert!(matches!(request.direction, SplitDirection::Horizontal));
-    assert!(request.detached);
-    assert_eq!(request.target.as_deref(), Some("0"));
-    assert!(request.command.is_none());
-    assert!(request.process_command.is_none());
-}
-
-#[test]
-fn split_window_keep_alive_form_is_tiny_parseable() {
-    let args = os_args(&["-d", "-k", "-t", "0", "exit 7"]);
-
-    let request = parse_split_window(&args).expect("split-window -k fast path");
-    assert!(request.detached);
-    assert_eq!(request.keep_alive_on_exit, Some(true));
-    assert_eq!(request.command.as_deref(), Some(&["exit 7".into()][..]));
-}
-
-#[test]
-fn new_session_detached_simple_form_is_tiny_parseable() {
-    let args = os_args(&["-d", "-s", "bench", "sleep", "1"]);
-
-    let request = parse_new_session(&args).expect("new-session detached fast path");
-    assert!(request.detached);
-    assert_eq!(
-        request
-            .session_name
-            .as_ref()
-            .map(ToString::to_string)
-            .as_deref(),
-        Some("bench")
-    );
-    assert_eq!(
-        request.command.as_deref(),
-        Some(&["sleep".into(), "1".into()][..])
-    );
-}
-
-#[test]
-fn new_window_detached_simple_form_is_tiny_parseable() {
-    let args = os_args(&["-d", "-n", "bench-window", "-t", "bench", "sleep", "1"]);
-
-    let request = parse_new_window(&args).expect("new-window detached fast path");
-    assert!(request.detached);
-    assert_eq!(request.target.to_string(), "bench");
-    assert_eq!(request.name.as_deref(), Some("bench-window"));
-    assert_eq!(
-        request.command.as_deref(),
-        Some(&["sleep".into(), "1".into()][..])
-    );
-}
-
-#[test]
-fn new_window_complex_forms_stay_on_full_helper_path() {
-    for args in [
-        ["-P", "-d", "-t", "bench"].as_slice(),
-        ["-d", "-t", "bench:1"].as_slice(),
-        ["-d", "-t", "%1"].as_slice(),
-    ] {
-        assert!(parse_new_window(&os_args(args)).is_none());
-    }
-}
-
-#[test]
-fn kill_session_simple_form_is_tiny_parseable() {
-    let args = os_args(&["-t", "bench"]);
-
-    let request = parse_kill_session(&args).expect("kill-session fast path");
-    assert_eq!(request.target.to_string(), "bench");
-}
-
-#[test]
-fn kill_session_complex_forms_stay_on_full_helper_path() {
-    for args in [
-        ["-a", "-t", "bench"].as_slice(),
-        ["-t", "$bench"].as_slice(),
-    ] {
-        assert!(parse_kill_session(&os_args(args)).is_none());
-    }
-}
-
-#[test]
-fn show_options_global_simple_forms_are_tiny_parseable() {
-    assert!(parse_show_options(&os_args(&["-g"]), false).is_some());
-    assert!(parse_show_options(&os_args(&["-g"]), true).is_some());
-}
-
-#[test]
-fn show_options_complex_forms_stay_on_full_helper_path() {
-    for args in [
-        [].as_slice(),
-        ["-g", "status"].as_slice(),
-        ["-g", "-v"].as_slice(),
-        ["-gH"].as_slice(),
-        ["-w"].as_slice(),
-    ] {
-        assert!(parse_show_options(&os_args(args), false).is_none());
-    }
-}
-
-#[test]
-fn window_mutation_simple_forms_are_tiny_parseable() {
-    let rename = parse_rename_window(&os_args(&["-t", "bench:0", "renamed"]))
-        .expect("rename-window fast path");
-    assert_eq!(rename.target.to_string(), "bench:0");
-    assert_eq!(rename.name, "renamed");
-
-    let select =
-        parse_select_window(&os_args(&["-t", "bench:1"])).expect("select-window fast path");
-    assert_eq!(select.target.to_string(), "bench:1");
-}
-
-#[test]
-fn window_mutation_complex_forms_stay_on_full_helper_path() {
-    for args in [
-        ["-t", "bench", "renamed"].as_slice(),
-        ["-t", "%1", "renamed"].as_slice(),
-        ["-t", "bench:0", "renamed", "extra"].as_slice(),
-    ] {
-        assert!(parse_rename_window(&os_args(args)).is_none());
-    }
-
-    for args in [
-        ["-n"].as_slice(),
-        ["-t", "bench"].as_slice(),
-        ["-t", "%1"].as_slice(),
-    ] {
-        assert!(parse_select_window(&os_args(args)).is_none());
-    }
-}
-
-#[test]
-fn kill_pane_simple_form_is_tiny_parseable() {
-    let request = parse_kill_pane(&os_args(&["-t", "bench:0.1"])).expect("kill-pane fast path");
-    assert_eq!(request.target.to_string(), "bench:0.1");
-}
-
-#[test]
-fn kill_pane_complex_forms_stay_on_full_helper_path() {
-    for args in [
-        ["-a", "-t", "bench:0.1"].as_slice(),
-        ["-t", "bench:0"].as_slice(),
-        ["-t", "%1"].as_slice(),
-    ] {
-        assert!(parse_kill_pane(&os_args(args)).is_none());
-    }
-}
-
-#[test]
-fn join_pane_simple_form_is_tiny_parseable() {
-    let request = parse_join_pane(&os_args(&["-d", "-s", "bench:1.0", "-t", "bench:0.0"]))
-        .expect("join-pane fast path");
-    assert!(request.detached);
-    assert_eq!(request.source.to_string(), "bench:1.0");
-    assert_eq!(request.target.to_string(), "bench:0.0");
-}
-
-#[test]
-fn join_pane_complex_forms_stay_on_full_helper_path() {
-    for args in [
-        ["-h", "-d", "-s", "bench:1.0", "-t", "bench:0.0"].as_slice(),
-        ["-d", "-s", "bench:1", "-t", "bench:0.0"].as_slice(),
-        ["-d", "-s", "%1", "-t", "bench:0.0"].as_slice(),
-    ] {
-        assert!(parse_join_pane(&os_args(args)).is_none());
-    }
-}
-
-#[test]
-fn set_option_simple_global_forms_are_tiny_parseable() {
-    let session =
-        parse_set_option(&os_args(&["-g", "status", "on"]), false).expect("set-option fast path");
-    assert_eq!(session.option, "status");
-    assert_eq!(session.value, "on");
-
-    let window = parse_set_option(&os_args(&["-g", "automatic-rename", "off"]), true)
-        .expect("set-window-option fast path");
-    assert_eq!(window.option, "automatic-rename");
-    assert_eq!(window.value, "off");
-}
-
-#[test]
-fn set_option_complex_forms_stay_on_full_helper_path() {
-    for args in [
-        ["status", "on"].as_slice(),
-        ["-g", "status"].as_slice(),
-        ["-g", "-q", "status", "on"].as_slice(),
-        ["-t", "bench", "status", "on"].as_slice(),
-    ] {
-        assert!(parse_set_option(&os_args(args), false).is_none());
-    }
-}
-
-#[test]
-fn tiny_tmux_invocation_is_case_insensitive() {
-    assert!(invoked_as_tmux_from(
-        &os_args(&["Tmux", "list-sessions"]),
-        None,
-    ));
-    assert!(invoked_as_tmux_from(
-        &os_args(&["TMUX", "list-sessions"]),
-        None,
-    ));
-}
-
-#[test]
-fn tiny_tmux_invocation_honors_internal_override() {
-    assert!(invoked_as_tmux_from(
-        &os_args(&["rmux", "list-sessions"]),
-        Some(OsStr::new("1")),
-    ));
-    for value in ["", "0", "true", "yes"] {
-        assert!(
-            !invoked_as_tmux_from(
-                &os_args(&["rmux", "list-sessions"]),
-                Some(OsStr::new(value))
-            ),
-            "internal tmux override should require exactly 1, got {value:?}"
-        );
-    }
-}
-
+mod commands;
+mod fuzz;
+mod responses;
+mod routing;
+#[cfg(unix)]
+mod runtime_alias_perf;
+mod targets;
 #[cfg(windows)]
-#[test]
-fn new_session_tiny_windows_replaces_inherited_client_shell_hint() {
-    let environment = windows_invoking_client_environment(
-        [
-            (OsString::from("Path"), OsString::from("C:\\bin")),
-            (
-                OsString::from("RMUX_CLIENT_SHELL"),
-                OsString::from("stale.exe"),
-            ),
-            (
-                OsString::from("RMUX_INTERNAL_INVOKED_AS_TMUX"),
-                OsString::from("1"),
-            ),
-            (
-                OsString::from("RMUX_INTERNAL_CLIENT_SHELL"),
-                OsString::from("stale-internal.exe"),
-            ),
-            (
-                OsString::from("USERPROFILE"),
-                OsString::from("C:\\Users\\RMUXUser"),
-            ),
-        ],
-        Some("pwsh.exe".to_owned()),
-    );
-
-    assert!(environment.iter().any(|entry| entry == "Path=C:\\bin"));
-    assert!(environment
-        .iter()
-        .any(|entry| entry == "USERPROFILE=C:\\Users\\RMUXUser"));
-    assert!(environment
-        .iter()
-        .any(|entry| entry == "RMUX_CLIENT_SHELL=pwsh.exe"));
-    assert!(!environment
-        .iter()
-        .any(|entry| entry == "RMUX_CLIENT_SHELL=stale.exe"));
-    assert!(!environment
-        .iter()
-        .any(|entry| entry.starts_with("RMUX_INTERNAL_CLIENT_SHELL=")));
-    assert!(!environment
-        .iter()
-        .any(|entry| entry.starts_with("RMUX_INTERNAL_INVOKED_AS_TMUX=")));
-}
-
-#[cfg(windows)]
-#[test]
-fn tiny_windows_client_shell_mapping_matches_full_cli_surface() {
-    let root = std::env::temp_dir().join(format!("rmux-tiny-shell-hint-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&root);
-    let alias_dir = root.join("Microsoft").join("WindowsApps");
-    let regular_dir = root.join("PowerShell").join("7");
-    let cmd = root.join("System32").join("cmd.exe");
-    std::fs::create_dir_all(&alias_dir).expect("WindowsApps fixture directory");
-    std::fs::create_dir_all(&regular_dir).expect("regular shell fixture directory");
-    std::fs::create_dir_all(cmd.parent().expect("cmd fixture parent"))
-        .expect("cmd fixture directory");
-    std::fs::write(alias_dir.join("pwsh.exe"), b"").expect("alias pwsh fixture");
-    std::fs::write(regular_dir.join("pwsh.exe"), b"").expect("regular pwsh fixture");
-    std::fs::write(&cmd, b"").expect("cmd fixture");
-
-    let alias_path = std::env::join_paths([alias_dir.as_os_str()]).expect("alias-only PATH");
-    let alias_environment = WindowsShellEnvironment::for_test(
-        Some(alias_path),
-        Some(root.clone().into_os_string()),
-        Some(cmd.clone().into_os_string()),
-    );
-    let expected_cmd = cmd.to_string_lossy().into_owned();
-    assert_eq!(
-        windows_client_shell_for_parent_name("pwsh.exe", &alias_environment).as_deref(),
-        Some(expected_cmd.as_str())
-    );
-
-    let real_path = std::env::join_paths([alias_dir.as_os_str(), regular_dir.as_os_str()])
-        .expect("PATH with real pwsh");
-    let real_environment = WindowsShellEnvironment::for_test(
-        Some(real_path),
-        Some(root.clone().into_os_string()),
-        Some(cmd.clone().into_os_string()),
-    );
-    assert_eq!(
-        windows_client_shell_for_parent_name("powershell.exe", &real_environment).as_deref(),
-        Some("pwsh.exe")
-    );
-    assert_eq!(
-        windows_client_shell_for_parent_name("bash.exe", &real_environment).as_deref(),
-        Some("bash.exe")
-    );
-    assert_eq!(
-        windows_client_shell_for_parent_name("unknown.exe", &real_environment),
-        None
-    );
-
-    std::fs::remove_dir_all(root).expect("remove tiny shell fixture");
-}
-
-#[test]
-fn new_session_attached_stays_on_full_helper_path() {
-    let args = os_args(&["-s", "bench"]);
-
-    assert!(parse_new_session(&args).is_none());
-}
-
-#[test]
-fn has_session_exact_target_is_tiny_parseable() {
-    let args = os_args(&["-t", "bench"]);
-
-    let request = parse_has_session(&args).expect("has-session fast path");
-    assert_eq!(request.target.to_string(), "bench");
-}
-
-#[test]
-fn has_session_complex_forms_fall_back_to_helper() {
-    for args in [
-        [].as_slice(),
-        ["-t", "bench", "-t", "other"].as_slice(),
-        ["-t", "bench:0"].as_slice(),
-        ["-t", "$1"].as_slice(),
-        ["-t", "bench", ";", "list-sessions"].as_slice(),
-    ] {
-        assert!(
-            parse_has_session(&os_args(args)).is_none(),
-            "{args:?} should stay on the canonical helper path"
-        );
-    }
-}
-
-#[test]
-fn list_windows_exact_session_target_is_tiny_parseable() {
-    let args = os_args(&["-t", "bench"]);
-
-    let request = parse_list_windows(&args).expect("list-windows fast path");
-    assert_eq!(request.target.to_string(), "bench");
-}
-
-#[test]
-fn list_windows_complex_forms_fall_back_to_helper() {
-    for args in [
-        [].as_slice(),
-        ["-a"].as_slice(),
-        ["-t", "bench", "-t", "other"].as_slice(),
-        ["-t", "bench:0"].as_slice(),
-        ["-t", "bench", "-F", "#{window_id}"].as_slice(),
-        ["-t", "bench", "--json"].as_slice(),
-        ["-t", "bench", ";", "list-sessions"].as_slice(),
-    ] {
-        assert!(
-            parse_list_windows(&os_args(args)).is_none(),
-            "{args:?} should stay on the canonical helper path"
-        );
-    }
-}
-
-#[test]
-fn list_panes_exact_targets_are_tiny_parseable() {
-    let session =
-        parse_list_panes(&os_args(&["-t", "bench"])).expect("list-panes session fast path");
-    match session {
-        TinyListPanes::Target {
-            target,
-            target_window_index,
-        } => {
-            assert_eq!(target.to_string(), "bench");
-            assert_eq!(target_window_index, None);
-        }
-        TinyListPanes::AllSessions => panic!("expected targeted list-panes"),
-    }
-
-    let window =
-        parse_list_panes(&os_args(&["-t", "bench:2"])).expect("list-panes window fast path");
-    match window {
-        TinyListPanes::Target {
-            target,
-            target_window_index,
-        } => {
-            assert_eq!(target.to_string(), "bench");
-            assert_eq!(target_window_index, Some(2));
-        }
-        TinyListPanes::AllSessions => panic!("expected targeted list-panes"),
-    }
-
-    let pane = parse_list_panes(&os_args(&["-t", "bench:3.4"])).expect("list-panes pane fast path");
-    match pane {
-        TinyListPanes::Target {
-            target,
-            target_window_index,
-        } => {
-            assert_eq!(target.to_string(), "bench");
-            assert_eq!(target_window_index, Some(3));
-        }
-        TinyListPanes::AllSessions => panic!("expected targeted list-panes"),
-    }
-}
-
-#[test]
-fn list_panes_all_sessions_is_tiny_parseable() {
-    assert!(matches!(
-        parse_list_panes(&os_args(&["-a"])),
-        Some(TinyListPanes::AllSessions)
-    ));
-}
-
-#[test]
-fn list_panes_complex_forms_fall_back_to_helper() {
-    for args in [
-        [].as_slice(),
-        ["-a", "-t", "bench"].as_slice(),
-        ["-s", "-t", "bench"].as_slice(),
-        ["-t", "bench", "-t", "other"].as_slice(),
-        ["-t", "$1"].as_slice(),
-        ["-t", "bench", "-F", "#{pane_id}"].as_slice(),
-        ["-t", "bench", "--json"].as_slice(),
-        ["-t", "bench", ";", "list-sessions"].as_slice(),
-    ] {
-        assert!(
-            parse_list_panes(&os_args(args)).is_none(),
-            "{args:?} should stay on the canonical helper path"
-        );
-    }
-}
-
-#[test]
-fn resize_pane_relative_numeric_delta_is_tiny_parseable() {
-    let args = os_args(&["-t", "0", "-R", "10"]);
-
-    let request = parse_resize_pane(&args).expect("resize-pane relative delta fast path");
-    assert_eq!(request.target.as_deref(), Some("0"));
-    assert!(matches!(
-        request.adjustment,
-        ResizePaneAdjustment::Right { cells: 10 }
-    ));
-}
-
-#[test]
-fn resize_pane_conflicting_adjustments_fall_back_to_helper() {
-    for args in [["-R", "10", "-t", "0"].as_slice(), ["-R", "0"].as_slice()] {
-        assert!(
-            parse_resize_pane(&os_args(args)).is_none(),
-            "{args:?} should stay on the canonical helper path"
-        );
-    }
-}
-
-#[test]
-fn resize_pane_composed_adjustments_stay_tiny_parseable() {
-    let relative = parse_resize_pane(&os_args(&["-R", "-L", "-t", "0"]))
-        .expect("priority-collapsed relative resize");
-    assert!(matches!(
-        relative.adjustment,
-        ResizePaneAdjustment::Left { cells: 1 }
-    ));
-
-    let composed = parse_resize_pane(&os_args(&["-x", "80", "-R", "-t", "0"]))
-        .expect("absolute plus relative resize");
-    assert!(matches!(
-        composed.adjustment,
-        ResizePaneAdjustment::Composite {
-            columns: Some(80),
-            rows: None,
-            relative: Some(rmux_proto::ResizePaneRelativeDirection::Right),
-            cells: 1
-        }
-    ));
-
-    let zoom =
-        parse_resize_pane(&os_args(&["-Z", "-R", "-t", "0"])).expect("zoom with extra adjustment");
-    assert_eq!(zoom.adjustment, ResizePaneAdjustment::Zoom);
-}
-
-#[test]
-fn resize_pane_absolute_size_remains_tiny_parseable() {
-    let args = os_args(&["-x", "100", "-y", "30", "-t", "0"]);
-
-    let request = parse_resize_pane(&args).expect("resize-pane absolute size fast path");
-    assert_eq!(request.target.as_deref(), Some("0"));
-    assert!(matches!(
-        request.adjustment,
-        ResizePaneAdjustment::AbsoluteSize {
-            columns: 100,
-            rows: 30
-        }
-    ));
-}
-
-#[test]
-fn display_message_print_exact_target_is_tiny_parseable() {
-    let args = os_args(&["-p", "-t", "bench", "#{session_name}"]);
-
-    let request = parse_display_message(&args).expect("display-message print fast path");
-    assert!(matches!(request.target, Some(Target::Session(_))));
-    assert_eq!(request.message.as_deref(), Some("#{session_name}"));
-}
-
-#[test]
-fn display_message_complex_forms_fall_back_to_helper() {
-    for args in [
-        ["-t", "bench:0.0", "#{pane_id}"].as_slice(),
-        ["-p", "-t", "bench:0", "#{session_name}"].as_slice(),
-        ["-p", "-t", "bench:0.0", "#{session_name}"].as_slice(),
-        ["-p", "-c", "client", "#{pane_id}"].as_slice(),
-        ["-p", "-v", "#{pane_id}"].as_slice(),
-        ["-p", "--json", "#{pane_id}"].as_slice(),
-        ["--json", "-a"].as_slice(),
-        ["--json", "-I"].as_slice(),
-        ["--json", "-l", "#{pane_id}"].as_slice(),
-        ["--json", "-v", "#{pane_id}"].as_slice(),
-        ["-p", "-F", "#{pane_id}", "#{pane_id}"].as_slice(),
-        ["-p", "-t", "%1", "#{pane_id}"].as_slice(),
-        ["-p", "#{pane_id}", ";", "list-sessions"].as_slice(),
-        ["-p", "echo;", "list-sessions"].as_slice(),
-        ["-p", "one", "two"].as_slice(),
-        ["-p", "--", "one", "two"].as_slice(),
-    ] {
-        assert!(
-            parse_display_message(&os_args(args)).is_none(),
-            "{args:?} should stay on the canonical helper path"
-        );
-    }
-}
-
-#[test]
-fn send_keys_exact_pane_target_is_tiny_parseable() {
-    let args = os_args(&["-t", "bench:0.0", "true", "Enter"]);
-
-    let request = parse_send_keys(&args).expect("send-keys fast path");
-    assert_eq!(request.raw_target, "bench:0.0");
-    assert_eq!(request.keys, ["true".to_owned(), "Enter".to_owned()]);
-}
-
-#[test]
-fn send_keys_resolution_forwards_errors_before_any_mutation() {
-    let target = match Target::parse("bench:0.0").expect("exact pane target") {
-        Target::Pane(target) => target,
-        other => panic!("expected pane target, got {other:?}"),
-    };
-    let resolved = Response::ResolveTarget(rmux_proto::ResolveTargetResponse {
-        target: Target::Pane(target.clone()),
-    });
-    assert_eq!(send_keys_resolved_target(resolved), Ok(target));
-
-    let error = Response::Error(ErrorResponse {
-        error: RmuxError::SessionNotFound("missing".to_owned()),
-    });
-    assert_eq!(
-        send_keys_resolved_target(error),
-        Err("session not found: missing".to_owned())
-    );
-
-    let wrong_target = Response::ResolveTarget(rmux_proto::ResolveTargetResponse {
-        target: Target::Session(rmux_proto::SessionName::new("bench").expect("session name")),
-    });
-    assert_eq!(
-        send_keys_resolved_target(wrong_target),
-        Err("protocol error: resolve-target returned a non-pane target for send-keys".to_owned())
-    );
-}
-
-#[test]
-fn send_keys_complex_forms_fall_back_to_helper() {
-    for args in [
-        ["true", "Enter"].as_slice(),
-        ["-t", "bench", "true", "Enter"].as_slice(),
-        ["-t", "bench:0", "true", "Enter"].as_slice(),
-        ["-t", "bench:0.0", "-l", "abc"].as_slice(),
-        ["-t", "bench:0.0", "-X", "copy-selection"].as_slice(),
-        ["-c", "client", "-t", "bench:0.0", "Enter"].as_slice(),
-        ["-t", "bench:0.0", "Enter", ";", "list-sessions"].as_slice(),
-        ["-t", "bench:0.0", "echo;", "list-sessions"].as_slice(),
-    ] {
-        assert!(
-            parse_send_keys(&os_args(args)).is_none(),
-            "{args:?} should stay on the canonical helper path"
-        );
-    }
-}
-
-#[test]
-fn source_file_plain_paths_follow_nested_context_policy() {
-    let args = os_args(&["/tmp/rmux-source-a.conf", "/tmp/rmux-source-b.conf"]);
-
-    if source_file_should_use_tiny(&args) {
-        let request = parse_source_file(&args).expect("source-file fast path");
-        assert_eq!(
-            request.paths,
-            [
-                "/tmp/rmux-source-a.conf".to_owned(),
-                "/tmp/rmux-source-b.conf".to_owned()
-            ]
-        );
-    } else {
-        assert!(parse_source_file(&args).is_none());
-    }
-}
-
-#[test]
-fn source_file_complex_forms_fall_back_to_helper() {
-    for args in [
-        ["-"].as_slice(),
-        ["-q", "/tmp/rmux-source.conf"].as_slice(),
-        ["-F", "/tmp/#{session_name}.conf"].as_slice(),
-        ["-t", "bench:0.0", "/tmp/rmux-source.conf"].as_slice(),
-        ["--", "-"].as_slice(),
-        ["/tmp/rmux-source.conf", ";", "list-sessions"].as_slice(),
-        ["/tmp/rmux-source.conf;", "list-sessions"].as_slice(),
-    ] {
-        assert!(
-            parse_source_file(&os_args(args)).is_none(),
-            "{args:?} should stay on the canonical helper path"
-        );
-    }
-}
-
-#[test]
-fn display_message_tiny_parser_fuzz_stays_on_allowlist() {
-    let pool = [
-        "-p",
-        "-t",
-        "bench",
-        "bench:0",
-        "bench:0.0",
-        "%1",
-        "-F",
-        "#{pane_id}",
-        "#{session_name}:#{window_index}.#{pane_index}",
-        "literal",
-        "-c",
-        "client",
-        "-d",
-        "10",
-        "-a",
-        "-I",
-        "-l",
-        "-N",
-        "-v",
-        "--json",
-        "--",
-        ";",
-        "-hyphen-message",
-    ];
-    let mut rng = FuzzRng::new(0xD15F_1A7E_2026_0700);
-
-    for _ in 0..10_000 {
-        let args = fuzz_args(&mut rng, &pool, 8);
-        assert_eq!(
-            parse_display_message(&args).is_some(),
-            display_message_should_use_tiny(&args),
-            "unexpected display-message tiny classification for {args:?}"
-        );
-    }
-}
-
-#[test]
-fn send_keys_tiny_parser_fuzz_stays_on_allowlist() {
-    let pool = [
-        "-t",
-        "bench",
-        "bench:0",
-        "bench:0.0",
-        "%1",
-        "true",
-        "Enter",
-        "C-c",
-        "--",
-        "-literal-key",
-        "-F",
-        "-H",
-        "-l",
-        "-K",
-        "-M",
-        "-p",
-        "-R",
-        "-X",
-        "-N",
-        "2",
-        "-c",
-        "client",
-        ";",
-    ];
-    let mut rng = FuzzRng::new(0x5EED_5EAD_2026_0700);
-
-    for _ in 0..10_000 {
-        let args = fuzz_args(&mut rng, &pool, 8);
-        assert_eq!(
-            parse_send_keys(&args).is_some(),
-            send_keys_should_use_tiny(&args),
-            "unexpected send-keys tiny classification for {args:?}"
-        );
-    }
-}
-
-#[test]
-fn source_file_tiny_parser_fuzz_stays_on_allowlist() {
-    let pool = [
-        "/tmp/rmux-a.conf",
-        "/tmp/rmux-b.conf",
-        "relative.conf",
-        "/tmp/#{session_name}.conf",
-        "-",
-        "-q",
-        "-F",
-        "-n",
-        "-v",
-        "-t",
-        "bench:0.0",
-        "--",
-        "-dash.conf",
-        ";",
-    ];
-    let mut rng = FuzzRng::new(0x50C0_2026_0700);
-
-    for _ in 0..10_000 {
-        let args = fuzz_args(&mut rng, &pool, 8);
-        assert_eq!(
-            parse_source_file(&args).is_some(),
-            source_file_should_use_tiny(&args),
-            "unexpected source-file tiny classification for {args:?}"
-        );
-    }
-}
-
-#[test]
-fn automation_extensions_stay_on_full_helper_path() {
-    for command in [
-        "wait-pane",
-        "pane-snapshot",
-        "stream-pane",
-        "collect-pane-output",
-        "locator",
-        "expect-pane",
-        "find-panes",
-        "find-sessions",
-        "broadcast-keys",
-        "with-session",
-    ] {
-        assert_tiny_fallback(&["rmux", command, "--help"]);
-    }
-}
-
-#[test]
-fn send_keys_wait_extensions_stay_on_full_helper_path() {
-    for args in [
-        [
-            "rmux",
-            "send-keys",
-            "-t",
-            "bench:0.0",
-            "--wait",
-            "quiet",
-            "--",
-            "true",
-            "Enter",
-        ]
-        .as_slice(),
-        [
-            "rmux",
-            "send-keys",
-            "-t",
-            "bench:0.0",
-            "--wait-next-text",
-            "done",
-            "--",
-            "true",
-            "Enter",
-        ]
-        .as_slice(),
-        [
-            "rmux",
-            "send-keys",
-            "-t",
-            "bench:0.0",
-            "--wait-pane-exit",
-            "--",
-            "exit",
-            "Enter",
-        ]
-        .as_slice(),
-    ] {
-        assert_tiny_fallback(args);
-    }
-}
-
-#[test]
-fn benchmark_shapes_stay_direct_with_socket_selectors() {
-    let explicit_socket_path = explicit_socket_path();
-    let direct_shapes = [
-        vec!["rmux", "-L", "benchsock", "start-server"],
-        vec!["rmux", "-L", "benchsock", "list-sessions"],
-        vec!["rmux", "-S", explicit_socket_path.as_str(), "list-sessions"],
-        vec!["rmux", "-L", "benchsock", "has-session", "-t", "bench"],
-        vec!["rmux", "-L", "benchsock", "list-windows", "-t", "bench"],
-        vec!["rmux", "-L", "benchsock", "list-panes", "-t", "bench"],
-        vec!["rmux", "-L", "benchsock", "list-panes", "-a"],
-        vec!["rmux", "-L", "benchsock", "kill-server"],
-        vec!["rmux", "-L", "benchsock", "capture-pane", "-p"],
-        vec![
-            "rmux",
-            "-L",
-            "benchsock",
-            "display-message",
-            "-p",
-            "#{pane_id}",
-        ],
-        vec![
-            "rmux",
-            "-S",
-            explicit_socket_path.as_str(),
-            "send-keys",
-            "-t",
-            "bench:0.0",
-            "true",
-            "Enter",
-        ],
-        vec![
-            "rmux",
-            "-L",
-            "benchsock",
-            "source-file",
-            "/tmp/rmux-source.conf",
-        ],
-    ];
-
-    for shape in direct_shapes {
-        let command = shape
-            .iter()
-            .find(|arg| {
-                matches!(
-                    **arg,
-                    "start-server"
-                        | "list-sessions"
-                        | "has-session"
-                        | "list-windows"
-                        | "list-panes"
-                        | "kill-server"
-                        | "capture-pane"
-                        | "display-message"
-                        | "send-keys"
-                        | "source-file"
-                )
-            })
-            .expect("shape contains command");
-        if *command == "source-file" {
-            assert_source_file_dispatch(&shape);
-        } else {
-            assert_tiny_direct(&shape, command);
-        }
-    }
-}
-
-#[test]
-fn unsupported_top_level_flags_keep_benchmark_shapes_on_helper_path() {
-    for args in [
-        [
-            "rmux",
-            "-f",
-            "/tmp/rmux.conf",
-            "display-message",
-            "-p",
-            "#{pane_id}",
-        ]
-        .as_slice(),
-        ["rmux", "-2", "send-keys", "-t", "bench:0.0", "Enter"].as_slice(),
-        ["rmux", "-u", "source-file", "/tmp/rmux-source.conf"].as_slice(),
-    ] {
-        assert_tiny_fallback(args);
-    }
-}
-
-#[test]
-fn repeated_idempotent_top_level_flags_keep_tiny_on_helper_path() {
-    for args in [
-        ["rmux", "-2", "-2", "list-sessions"].as_slice(),
-        ["rmux", "-22", "--", "list-sessions"].as_slice(),
-        ["rmux", "-D", "-D"].as_slice(),
-        ["rmux", "-DD", "--"].as_slice(),
-        ["rmux", "-l", "-l", "list-sessions"].as_slice(),
-        ["rmux", "-ll", "--", "list-sessions"].as_slice(),
-        ["rmux", "-N", "-N", "list-sessions"].as_slice(),
-        ["rmux", "-NN", "--", "list-sessions"].as_slice(),
-        ["rmux", "-u", "-u", "list-sessions"].as_slice(),
-        ["rmux", "-uu", "--", "list-sessions"].as_slice(),
-        ["rmux", "-u2lN", "-Nlu2", "--", "list-sessions"].as_slice(),
-        ["rmux", "-DD", "-uu", "-22", "-ll", "--"].as_slice(),
-    ] {
-        assert_tiny_fallback(args);
-    }
-}
-
-#[test]
-fn readme_benchmark_shapes_stay_on_tiny_direct_paths() {
-    assert_tiny_direct(&["rmux", "start-server"], "start-server");
-    assert_tiny_direct(&["rmux", "list-sessions"], "list-sessions");
-    assert_tiny_direct(&["rmux", "has-session", "-t", "bench"], "has-session");
-    assert_tiny_direct(&["rmux", "list-windows", "-t", "bench"], "list-windows");
-    assert_tiny_direct(&["rmux", "list-panes", "-t", "bench"], "list-panes");
-    assert_tiny_direct(&["rmux", "list-panes", "-a"], "list-panes");
-    assert_tiny_direct(&["rmux", "kill-server"], "kill-server");
-    assert_tiny_direct(&["rmux", "capture-pane", "-p"], "capture-pane");
-    assert_tiny_direct(&["rmux", "new-session", "-d", "-s", "bench"], "new-session");
-    assert_tiny_direct(
-        &["rmux", "split-window", "-h", "-d", "-t", "bench"],
-        "split-window",
-    );
-    assert_tiny_direct(&["rmux", "new-window", "-d", "-t", "bench"], "new-window");
-    assert_tiny_direct(
-        &[
-            "rmux",
-            "new-window",
-            "-d",
-            "-n",
-            "bench-window",
-            "-t",
-            "bench",
-        ],
-        "new-window",
-    );
-    assert_tiny_direct(
-        &["rmux", "resize-pane", "-t", "bench", "-R", "10"],
-        "resize-pane",
-    );
-    assert_tiny_direct(&["rmux", "kill-session", "-t", "bench"], "kill-session");
-    assert_tiny_direct(&["rmux", "show-options", "-g"], "show-options");
-    assert_tiny_direct(
-        &["rmux", "show-window-options", "-g"],
-        "show-window-options",
-    );
-    assert_tiny_direct(
-        &["rmux", "rename-window", "-t", "bench:0", "renamed"],
-        "rename-window",
-    );
-    assert_tiny_direct(&["rmux", "select-window", "-t", "bench:1"], "select-window");
-    assert_tiny_direct(&["rmux", "kill-pane", "-t", "bench:0.1"], "kill-pane");
-    assert_tiny_direct(
-        &[
-            "rmux",
-            "join-pane",
-            "-d",
-            "-s",
-            "bench:1.0",
-            "-t",
-            "bench:0.0",
-        ],
-        "join-pane",
-    );
-    assert_tiny_direct(&["rmux", "set-option", "-g", "status", "on"], "set-option");
-    assert_tiny_direct(
-        &["rmux", "set-window-option", "-g", "automatic-rename", "off"],
-        "set-window-option",
-    );
-    assert_tiny_direct(
-        &["rmux", "display-message", "-p", "#{session_name}"],
-        "display-message",
-    );
-    assert_tiny_direct(
-        &["rmux", "send-keys", "-t", "bench:0.0", "true", "Enter"],
-        "send-keys",
-    );
-    assert_source_file_dispatch(&["rmux", "source-file", "/tmp/rmux-source.conf"]);
-    if std::env::var_os("RMUX").is_none() && std::env::var_os("TMUX").is_none() {
-        assert_tiny_direct(&["rmux", "attach-session", "-t", "bench"], "attach-session");
-    }
-}
-
-#[test]
-fn queue_suffix_terminator_keeps_tiny_on_helper_path() {
-    for args in [
-        ["-h", "-t", "0", "echo;", "list-sessions"].as_slice(),
-        [
-            "-d",
-            "-s",
-            "bench",
-            "sleep",
-            "1;",
-            "display-message",
-            "-p",
-            "hi",
-        ]
-        .as_slice(),
-        ["-p", "-t", "bench:0.0", "echo\\;"].as_slice(),
-    ] {
-        let os_args = os_args(args);
-        if args.iter().any(|arg| arg.ends_with("\\;")) {
-            assert!(
-                !has_queue_separator(&os_args),
-                "{args:?} escaped semicolon should remain a command argument"
-            );
-        } else {
-            assert!(
-                has_queue_separator(&os_args),
-                "{args:?} should be recognized as a queued command"
-            );
-        }
-    }
-
-    assert!(parse_split_window(&os_args(&["-h", "-t", "0", "echo;", "list-sessions"])).is_none());
-    assert!(parse_new_session(&os_args(&[
-        "-d",
-        "-s",
-        "bench",
-        "sleep",
-        "1;",
-        "display-message",
-        "-p",
-        "hi"
-    ]))
-    .is_none());
-}
-
-#[test]
-fn tiny_response_errors_use_tmux_cli_error_surface() {
-    let response = Response::Error(ErrorResponse {
-        error: RmuxError::InvalidTarget {
-            value: "s:0.99".to_owned(),
-            reason: "can't find pane: 99".to_owned(),
-        },
-    });
-
-    assert_eq!(
-        write_response_output_or_error(response, "split-window").unwrap_err(),
-        "can't find pane: 99"
-    );
-}
-
-#[test]
-fn tiny_target_resolution_errors_require_canonical_helper_retry() {
-    let invalid_target = Response::Error(ErrorResponse {
-        error: RmuxError::InvalidTarget {
-            value: "s:0.99".to_owned(),
-            reason: "can't find pane: 99".to_owned(),
-        },
-    });
-    let missing_session = Response::Error(ErrorResponse {
-        error: RmuxError::SessionNotFound("bogus".to_owned()),
-    });
-
-    assert!(response_needs_session_resolution_retry(&invalid_target));
-    assert!(response_needs_session_resolution_retry(&missing_session));
-}
-
-#[test]
-fn source_file_tiny_response_preserves_exit_status() {
-    let response = Response::SourceFile(SourceFileResponse::no_output().with_exit_status(Some(1)));
-
-    assert_eq!(
-        write_source_file_response(response).expect("source response"),
-        1
-    );
-}
-
-#[test]
-fn source_file_tiny_line_errors_use_stdout_exit_status() {
-    let response = Response::Error(ErrorResponse {
-        error: RmuxError::Server("/tmp/rmux.conf:12: unknown command: bad".to_owned()),
-    });
-
-    assert_eq!(
-        write_source_file_response(response).expect("source response"),
-        1
-    );
-}
-
-#[test]
-fn custom_startup_config_keeps_new_session_on_full_helper_path() {
-    assert_tiny_fallback(&[
-        "rmux",
-        "-f",
-        "/tmp/rmux-test.conf",
-        "new-session",
-        "-d",
-        "-s",
-        "bench",
-    ]);
-}
-
-#[test]
-fn explicit_terminal_context_flags_keep_attach_on_full_helper_path() {
-    assert_tiny_fallback(&["rmux", "-2", "attach-session"]);
-    assert_tiny_fallback(&["rmux", "-T", "RGB", "attach-session"]);
-    assert_tiny_fallback(&["rmux", "-u", "attach-session"]);
-}
+mod windows;

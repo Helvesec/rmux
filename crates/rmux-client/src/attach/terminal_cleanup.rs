@@ -21,12 +21,15 @@ pub(super) fn fallback_attach_stop_sequence(term: &str) -> Vec<u8> {
     bytes.extend_from_slice(DISABLE_BRACKETED_PASTE_FALLBACK);
     bytes.extend_from_slice(b"\x1b[0m\x1b[H\x1b[2J");
     bytes.extend_from_slice(alternate_screen_exit_sequence(term));
+    // The shell-facing cursor must be visible after alternate-screen state is restored.
+    bytes.extend_from_slice(b"\x1b[?25h");
     bytes
 }
 
 #[cfg(test)]
 mod tests {
     use super::fallback_attach_stop_sequence;
+    use rmux_core::alternate_screen_exit_sequence;
 
     #[test]
     fn fallback_stop_disables_all_supported_mouse_protocols() {
@@ -49,6 +52,20 @@ mod tests {
         assert!(contains(&stop, b"\x1b[?69l"));
         assert!(contains(&stop, b"\x1b[?2004l"));
         assert!(contains(&stop, b"\x1b[?1049l"));
+    }
+
+    #[test]
+    fn fallback_stop_restores_outer_cursor_after_alternate_screen_exit() {
+        const TERM: &str = "xterm-256color";
+
+        let stop = fallback_attach_stop_sequence(TERM);
+        let mut expected_suffix = alternate_screen_exit_sequence(TERM).to_vec();
+        expected_suffix.extend_from_slice(b"\x1b[?25h");
+
+        assert!(
+            stop.ends_with(&expected_suffix),
+            "fallback stop must exit the alternate screen before its final outer-terminal cursor show: {stop:?}"
+        );
     }
 
     fn contains(haystack: &[u8], needle: &[u8]) -> bool {

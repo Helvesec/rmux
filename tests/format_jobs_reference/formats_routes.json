@@ -1,0 +1,85 @@
+{
+  "schema": 1,
+  "name": "formats-rest-routes-v1",
+  "startup": "set-option -g default-shell /bin/bash\nset-option -s exit-empty off\nset-option -g status off\nset-option -g automatic-rename off\nset-option -g mode-keys vi\nnew-session -d -s alpha -n zeta -x 40 -y 16 /bin/bash --noprofile --norc -c 'printf '\"'\"'%s\\n'\"'\"' \"$$\" > @ROOT@/main.pid; IFS= read -r first; printf '\"'\"'\\033[H\\033[2J'\"'\"'; printf '\"'\"'%b'\"'\"' '\"'\"'T\\tTAB tail\\r\\nababa tail\\r\\nxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxEND\\r\\nNEXT tail\\r\\nwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwWRAPEND tail\\r\\nREADY038\\r\\n'\"'\"'; printf '\"'\"'RX:%s\\n'\"'\"' \"$first\"; while IFS= read -r line; do printf '\"'\"'RX:%s\\n'\"'\"' \"$line\"; done'\nsend-keys -F -t alpha:0.0 'startup:#{session_name}:#{pane_index}' Enter\n",
+  "startup_helpers": [
+    "main"
+  ],
+  "steps": [
+    {
+      "kind": "delivery",
+      "id": "route-startup",
+      "line": "RX:startup:alpha:0",
+      "prefix": "RX:startup:",
+      "target": "alpha:0.0",
+      "success": {
+        "exit": 0,
+        "stderr": ""
+      }
+    },
+    {
+      "kind": "attach",
+      "session": "alpha"
+    },
+    {
+      "kind": "command",
+      "argv": [
+        "bind-key",
+        "x",
+        "send-keys",
+        "-F",
+        "-t",
+        "alpha:0.0",
+        "binding:#{session_name}:#{pane_index}",
+        "Enter"
+      ]
+    },
+    {
+      "kind": "key",
+      "id": "binding-key",
+      "hex": "0278"
+    },
+    {
+      "kind": "delivery",
+      "id": "route-binding",
+      "line": "RX:binding:alpha:0",
+      "prefix": "RX:binding:",
+      "target": "alpha:0.0",
+      "success": {
+        "exit": 0,
+        "stderr": ""
+      }
+    },
+    {
+      "kind": "status-job",
+      "id": "job-cold-warm",
+      "helper": "job",
+      "token": "JOB038",
+      "release": "release",
+      "format": "LEFT#(printf \"$$\\n\" > @ROOT@/job.pid; while [ ! -f @ROOT@/release ]; do if [ \"$SECONDS\" -ge 4 ]; then exit 77; fi; done; printf 'first\\nJOB038\\n')RIGHT",
+      "success": {
+        "exit": 0,
+        "stderr": ""
+      }
+    },
+    {
+      "kind": "observe",
+      "id": "hash-trailing-attached",
+      "argv": [
+        "display-message",
+        "-p",
+        "-t",
+        "alpha:0.0",
+        "before#"
+      ],
+      "success": {
+        "exit": 0,
+        "stderr": ""
+      }
+    }
+  ],
+  "limits": "one pane+one attached client+one builtin shell job perphase; output and owned process closure retained",
+  "expected": "Independent tmux actual delivery and cold/warm status effect; required expansion failures retained",
+  "qualification": "Marker corrected to avoid statusstrftime percent expansion; this corrected job scenario is NOT_EXECUTED in038 and retains missing native evidence.",
+  "prospective_semantics": "Ordinary send-keys -F must deliver literal arguments; copy-mode -F -X expands search context. Existing case lines are historical expansion witnesses, never rewritten or recredited; product and future route coverage remain pending."
+}

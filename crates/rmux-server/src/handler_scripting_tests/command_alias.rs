@@ -63,7 +63,7 @@ async fn runtime_command_alias_option_drives_source_file_parser() {
         handler
             .handle(source_file_request(
                 vec!["main.conf".to_owned()],
-                Some(root)
+                Some(root.to_path_buf())
             ))
             .await,
         Response::SourceFile(rmux_proto::SourceFileResponse::no_output())
@@ -113,8 +113,8 @@ async fn internal_canonical_execution_does_not_expand_aliases_again() {
 async fn internal_canonical_execution_accepts_explicit_target_context() {
     let handler = RequestHandler::new();
     let alpha = session_name("canonical-target");
-    assert!(matches!(
-        handler
+    crate::session_fixture::assert_new_session(
+        &handler
             .handle(Request::NewSession(NewSessionRequest {
                 session_name: alpha.clone(),
                 detached: true,
@@ -122,8 +122,7 @@ async fn internal_canonical_execution_accepts_explicit_target_context() {
                 environment: None,
             }))
             .await,
-        Response::NewSession(_)
-    ));
+    );
 
     let response = handler
         .handle(Request::SourceFile(Box::new(SourceFileRequest {
@@ -256,7 +255,7 @@ async fn runtime_command_alias_option_drives_hook_registration_parser() {
         handler
             .handle(source_file_request(
                 vec!["hook.conf".to_owned()],
-                Some(root)
+                Some(root.to_path_buf())
             ))
             .await,
         Response::SourceFile(rmux_proto::SourceFileResponse::no_output())
@@ -346,7 +345,7 @@ async fn runtime_command_alias_option_drives_binding_payload_parsers() {
         handler
             .handle(source_file_request(
                 vec!["main.conf".to_owned()],
-                Some(root)
+                Some(root.to_path_buf())
             ))
             .await,
         Response::SourceFile(rmux_proto::SourceFileResponse::no_output())

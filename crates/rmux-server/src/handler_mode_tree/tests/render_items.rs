@@ -1,4 +1,6 @@
 use super::*;
+#[cfg(test)]
+use crate::session_fixture::SessionSetupExt as _;
 
 #[test]
 fn choose_tree_uses_window_local_visible_pane_indices_in_rows_and_previews() {
@@ -10,7 +12,7 @@ fn choose_tree_uses_window_local_visible_pane_indices_in_rows_and_previews() {
         .expect("session creation succeeds");
     state
         .sessions
-        .session_mut(&session_name)
+        .session_setup(&session_name)
         .expect("session exists")
         .split_active_pane()
         .expect("split succeeds");
@@ -65,11 +67,11 @@ fn choose_tree_uses_window_local_visible_pane_indices_in_rows_and_previews() {
     };
     let preview = mode_tree_preview_lines(&state, &mode, &item, 60, 7, &Utf8Config::default());
     assert!(
-        preview.iter().any(|line| line.contains(" 10 ")),
+        preview.iter().any(|line| line.contains("10:")),
         "choose-tree preview should label the first pane 10, got {preview:?}"
     );
     assert!(
-        preview.iter().any(|line| line.contains(" 11 ")),
+        preview.iter().any(|line| line.contains("11:")),
         "choose-tree preview should label the second pane 11, got {preview:?}"
     );
 }

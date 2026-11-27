@@ -1,4 +1,5 @@
 use super::*;
+use crate::handler::prompt_support::PromptInputEvent;
 
 #[test]
 fn collapse_or_parent_moves_to_parent_when_already_collapsed() {
@@ -226,9 +227,9 @@ fn parse_choose_tree_preserves_quoted_source_template_for_runtime_reparse() {
 }
 
 #[test]
-fn parse_choose_tree_zw_preserves_trailing_direct_command_arguments_from_argv() {
+fn parse_choose_tree_zw_preserves_single_template_argument_from_argv() {
     let parsed = CommandParser::new()
-        .parse_arguments(["choose-tree", "-Zw", "set-buffer", "-b", "chosen", "%%"])
+        .parse_arguments(["choose-tree", "-Zw", "set-buffer -b chosen \"%%\""])
         .expect("parses");
     let mode = RequestHandler::parse_mode_tree_queue_command(parsed.commands()[0].clone())
         .expect("ok")
@@ -259,4 +260,521 @@ fn customize_mode_rejects_extra_argument() {
         .expect("parses");
     let err = RequestHandler::parse_mode_tree_queue_command(parsed.commands()[0].clone());
     assert!(err.is_err());
+}
+
+async fn attached_choose_tree(
+    label: &str,
+    attach_pid_offset: u32,
+    windows: u32,
+) -> (
+    RequestHandler,
+    u32,
+    mpsc::UnboundedReceiver<crate::pane_io::AttachControl>,
+) {
+    let handler = RequestHandler::new();
+    let session_name = SessionName::new(label).expect("valid session");
+    crate::session_fixture::assert_new_session(
+        &handler
+            .handle(Request::NewSession(NewSessionRequest {
+                session_name: session_name.clone(),
+                detached: true,
+                size: Some(TerminalSize {
+                    cols: 100,
+                    rows: 30,
+                }),
+                environment: None,
+            }))
+            .await,
+    );
+    for window_index in 1..windows {
+        assert!(matches!(
+            handler
+                .handle(Request::NewWindow(Box::new(rmux_proto::NewWindowRequest {
+                    target: session_name.clone(),
+                    name: None,
+                    detached: true,
+                    environment: None,
+                    command: None,
+                    process_command: None,
+                    start_directory: None,
+                    target_window_index: Some(window_index),
+                    insert_at_target: false,
+                })))
+                .await,
+            Response::NewWindow(_)
+        ));
+    }
+    let attach_pid = std::process::id().saturating_add(attach_pid_offset);
+    let (control_tx, control_rx) = mpsc::unbounded_channel();
+    handler
+        .register_attach(attach_pid, session_name, control_tx)
+        .await;
+    let parsed = CommandParser::new()
+        .parse_arguments(["choose-tree"])
+        .expect("choose-tree parses");
+    let command = RequestHandler::parse_mode_tree_queue_command(parsed.commands()[0].clone())
+        .expect("mode-tree command parses")
+        .expect("mode-tree command recognized");
+    handler
+        .execute_queued_mode_tree(
+            attach_pid,
+            command,
+            &QueueExecutionContext::without_caller_cwd(),
+        )
+        .await
+        .expect("choose-tree opens");
+    (handler, attach_pid, control_rx)
+}
+
+/// R3509 M1: tree-mode ignores a key it does not bind, as tmux 3.7b's
+/// `mode_tree_key` does; only Escape (and q) closes it.
+#[tokio::test]
+async fn choose_tree_ignores_unbound_special_and_modified_keys() {
+    let (handler, attach_pid, _control_rx) =
+        attached_choose_tree("tree-unbound-keys", 2395, 1).await;
+    for bytes in [
+        &b"\x1b[5~"[..],
+        b"\x1b[6~",
+        b"\x1b[2~",
+        b"\x1b[15~",
+        b"\x1b[24~",
+        b"\x1b[H",
+        b"\x1b[6;2~",
+        b"\x1b[3;5~",
+        b"\x1b[15;2~",
+        b"\x1b[15;3~",
+        b"\x1b[1;2P",
+        b"\x1b[3~",
+        b"\x1b[B",
+        b"\x1b[1;5A",
+        b"\x1b[1;5H",
+        b"\x1bOP",
+    ] {
+        handler
+            .handle_attached_live_input_for_test(attach_pid, bytes)
+            .await
+            .expect("tree-mode input is handled");
+        assert!(
+            handler.mode_tree_active(attach_pid).await,
+            "{:?} must leave choose-tree open",
+            String::from_utf8_lossy(bytes)
+        );
+    }
+
+    let (handler, attach_pid, _control_rx) =
+        attached_choose_tree("tree-lone-escape", 2397, 1).await;
+    let mut pending_input = Vec::new();
+    handler
+        .handle_attached_live_input(attach_pid, &mut pending_input, b"\x1b")
+        .await
+        .expect("lone Escape is retained");
+    handler
+        .flush_attached_pending_escape_input(attach_pid, &mut pending_input)
+        .await
+        .expect("escape-time flush");
+    assert!(
+        !handler.mode_tree_active(attach_pid).await,
+        "a lone Escape still closes choose-tree"
+    );
+}
+
+/// S2485: send-prefix gives the prefix key to tree-mode, as tmux 3.7b's
+/// `cmd_send_keys_inject_key()` does, whether C-b (send-prefix) is typed after
+/// the prefix or the command comes from a client. The prefix is PPage, which
+/// tree-mode binds: the selection goes back up a page and the pane reads
+/// nothing.
+#[tokio::test]
+async fn choose_tree_reads_send_prefix_as_the_prefix_key() {
+    let mut failures = Vec::new();
+    for (offset, route) in (2485..).zip(["typed", "command"]) {
+        let label = format!("tree-send-prefix-{offset}");
+        let (handler, attach_pid, _control_rx) = attached_choose_tree(&label, offset, 40).await;
+        let session = SessionName::new(&label).expect("session");
+        let pane = PaneTarget::new(session.clone(), 0);
+        let response = handler
+            .handle(Request::SetOption(SetOptionRequest {
+                scope: ScopeSelector::Session(session),
+                option: OptionName::Prefix,
+                value: "PPage".to_owned(),
+                mode: SetOptionMode::Replace,
+            }))
+            .await;
+        assert!(matches!(response, Response::SetOption(_)), "{response:?}");
+        handler
+            .handle_attached_live_input_for_test(attach_pid, b"\x1b[6~")
+            .await
+            .expect("PgDn is handled");
+        let (paged, rows, _) = selected_tree_position(&handler, attach_pid).await;
+        assert!(rows > 1 && paged >= rows, "paged {paged}, rows {rows}");
+        handler
+            .state
+            .lock()
+            .await
+            .start_pane_input_capture_for_test(&pane);
+
+        if route == "typed" {
+            for read in [&b"\x1b[5~"[..], b"\x02"] {
+                handler
+                    .handle_attached_live_input_for_test(attach_pid, read)
+                    .await
+                    .expect("prefix and send-prefix are handled");
+            }
+        } else {
+            let response = handler
+                .handle(Request::SendPrefix(rmux_proto::SendPrefixRequest {
+                    target: Some(pane.clone()),
+                    secondary: false,
+                }))
+                .await;
+            assert!(matches!(response, Response::SendPrefix(_)), "{response:?}");
+        }
+
+        let position = selected_tree_position(&handler, attach_pid).await.0;
+        let pane_input = handler
+            .state
+            .lock()
+            .await
+            .pane_input_capture_for_test(&pane);
+        if position != paged - rows
+            || !handler.mode_tree_active(attach_pid).await
+            || pane_input != Some(Vec::new())
+        {
+            failures.push(format!(
+                "{route}: selection {position} instead of {}, pane read {pane_input:?}",
+                paged - rows
+            ));
+        }
+    }
+    assert!(failures.is_empty(), "{failures:#?}");
+}
+
+/// R3530 (1): the escape time does not make an Escape of input that only
+/// starts with one. tmux 3.7b reads `ESC [` as M-[ and `ESC O` as M-O, which
+/// tree-mode does not bind, so choose-tree stays open.
+#[tokio::test]
+async fn choose_tree_keeps_an_unfinished_escape_key_open_at_the_escape_time() {
+    for (offset, retained) in [(2442, &b"\x1b["[..]), (2443, b"\x1bO")] {
+        let (handler, attach_pid, _control_rx) =
+            attached_choose_tree("tree-expired-escape", offset, 1).await;
+        let mut pending_input = Vec::new();
+        handler
+            .handle_attached_live_input(attach_pid, &mut pending_input, retained)
+            .await
+            .expect("unfinished key input");
+        assert_eq!(pending_input, retained, "the unfinished key waits");
+        handler
+            .flush_attached_pending_escape_input(attach_pid, &mut pending_input)
+            .await
+            .expect("escape-time flush");
+        assert!(pending_input.is_empty(), "the escape time empties it");
+        assert!(
+            handler.mode_tree_active(attach_pid).await,
+            "{:?} must leave choose-tree open",
+            String::from_utf8_lossy(retained)
+        );
+    }
+}
+
+/// S2452: Escape typed twice in one read is M-Escape for tmux 3.7b, which
+/// tree-mode does not bind; with `[` after it, the escape time makes it
+/// M-Escape and `[`. choose-tree stays open either way.
+#[tokio::test]
+async fn choose_tree_reads_escape_escape_in_one_read_as_meta_escape() {
+    for (offset, read) in [(2452, &b"\x1b\x1b"[..]), (2453, b"\x1b\x1b[")] {
+        let (handler, attach_pid, _control_rx) =
+            attached_choose_tree("tree-escape-escape", offset, 1).await;
+        let mut pending_input = Vec::new();
+        handler
+            .handle_attached_live_input(attach_pid, &mut pending_input, read)
+            .await
+            .expect("escape input");
+        handler
+            .flush_attached_pending_escape_input(attach_pid, &mut pending_input)
+            .await
+            .expect("escape-time flush");
+        assert!(pending_input.is_empty(), "the escape time empties it");
+        assert!(
+            handler.mode_tree_active(attach_pid).await,
+            "{read:?} must leave choose-tree open"
+        );
+    }
+}
+
+/// S2484: a control letter reaches tree-mode as tmux 3.7b's one key code
+/// `'n'|KEYC_CTRL` whichever way it arrives. send-keys `C-n` and the xterm
+/// modifyOtherKeys form decode to a key code named `C-n`; the terminal's C0
+/// byte, and a CSI u frame that admission re-encodes to it, decode to
+/// `Ctrl('n')`. C-n, C-n, C-p, C-n moves two items down on each.
+#[tokio::test]
+async fn choose_tree_reads_control_letters_from_every_route_as_one_key() {
+    // None is send-keys C-n C-n C-p C-n; Some holds the terminal's reads.
+    let routes: [(&str, Option<[&[u8]; 4]>); 4] = [
+        ("send-keys", None),
+        ("C0", Some([b"\x0e", b"\x0e", b"\x10", b"\x0e"])),
+        (
+            "CSI u",
+            Some([
+                b"\x1b[110;5u",
+                b"\x1b[110;5u",
+                b"\x1b[112;5u",
+                b"\x1b[110;5u",
+            ]),
+        ),
+        (
+            "modifyOtherKeys",
+            Some([
+                b"\x1b[27;5;110~",
+                b"\x1b[27;5;110~",
+                b"\x1b[27;5;112~",
+                b"\x1b[27;5;110~",
+            ]),
+        ),
+    ];
+    let mut failures = Vec::new();
+    for (offset, (route, reads)) in (2484..).zip(routes) {
+        let label = format!("tree-control-letters-{offset}");
+        let (handler, attach_pid, _control_rx) = attached_choose_tree(&label, offset, 8).await;
+        let (start, _, len) = selected_tree_position(&handler, attach_pid).await;
+        assert!(start + 2 < len, "start {start}, len {len}");
+        if let Some(reads) = reads {
+            for read in reads {
+                handler
+                    .handle_attached_live_input_for_test(attach_pid, read)
+                    .await
+                    .expect("tree-mode input is handled");
+            }
+        } else {
+            let response = handler
+                .handle(Request::SendKeys(rmux_proto::SendKeysRequest {
+                    target: PaneTarget::new(SessionName::new(&label).expect("session"), 0),
+                    keys: ["C-n", "C-n", "C-p", "C-n"].map(String::from).to_vec(),
+                }))
+                .await;
+            assert!(matches!(response, Response::SendKeys(_)), "{response:?}");
+        }
+        let position = selected_tree_position(&handler, attach_pid).await.0;
+        if position != start + 2 || !handler.mode_tree_active(attach_pid).await {
+            failures.push(format!("{route}: {position} instead of {}", start + 2));
+        }
+    }
+    assert!(failures.is_empty(), "{failures:#?}");
+}
+
+#[test]
+fn page_keys_move_by_the_list_height_and_stop_at_the_ends() {
+    let ids: Vec<String> = (0..41).map(|index| format!("item-{index}")).collect();
+    let build = flat_build(&ids.iter().map(String::as_str).collect::<Vec<_>>());
+    let mut mode = test_mode(18);
+    mode.selected_id = Some("item-1".to_owned());
+
+    move_selection_by_page(&mut mode, &build, true);
+    assert_eq!(mode.selected_id.as_deref(), Some("item-19"));
+    move_selection_by_page(&mut mode, &build, true);
+    assert_eq!(mode.selected_id.as_deref(), Some("item-37"));
+    move_selection_by_page(&mut mode, &build, true);
+    assert_eq!(mode.selected_id.as_deref(), Some("item-40"), "no wrap");
+    move_selection_by_page(&mut mode, &build, true);
+    assert_eq!(
+        mode.selected_id.as_deref(),
+        Some("item-40"),
+        "stays at the end"
+    );
+    move_selection_by_page(&mut mode, &build, false);
+    assert_eq!(mode.selected_id.as_deref(), Some("item-22"));
+    mode.selected_id = Some("item-3".to_owned());
+    move_selection_by_page(&mut mode, &build, false);
+    assert_eq!(mode.selected_id.as_deref(), Some("item-0"), "no wrap");
+    move_selection_by_page(&mut mode, &build, false);
+    assert_eq!(
+        mode.selected_id.as_deref(),
+        Some("item-0"),
+        "stays at the start"
+    );
+}
+
+async fn selected_tree_position(
+    handler: &RequestHandler,
+    attach_pid: u32,
+) -> (usize, usize, usize) {
+    let mut mode = handler
+        .active_attach
+        .lock()
+        .await
+        .by_pid
+        .get(&attach_pid)
+        .and_then(|active| active.mode_tree.clone())
+        .expect("choose-tree is open");
+    let build = handler
+        .build_mode_tree(&mut mode, attach_pid)
+        .await
+        .expect("choose-tree builds");
+    let position = mode
+        .selected_id
+        .as_ref()
+        .and_then(|id| build.visible.iter().position(|visible| visible == id))
+        .expect("the selection is visible");
+    (position, mode.last_list_rows, build.visible.len())
+}
+
+/// R3509 M1: PgDn and PgUp from the terminal page through choose-tree by the
+/// height of its list, as tmux 3.7b tree-mode's NPage and PPage do.
+#[tokio::test]
+async fn choose_tree_page_keys_from_the_terminal_page_the_list() {
+    let (handler, attach_pid, _control_rx) = attached_choose_tree("tree-page-keys", 2396, 40).await;
+    let (start, rows, len) = selected_tree_position(&handler, attach_pid).await;
+    assert!(
+        rows > 1 && start + rows < len,
+        "start {start}, rows {rows}, len {len}"
+    );
+
+    handler
+        .handle_attached_live_input_for_test(attach_pid, b"\x1b[6~")
+        .await
+        .expect("PgDn is handled");
+    assert_eq!(
+        selected_tree_position(&handler, attach_pid).await.0,
+        start + rows
+    );
+
+    handler
+        .handle_attached_live_input_for_test(attach_pid, b"\x1b[5~")
+        .await
+        .expect("PgUp is handled");
+    assert_eq!(selected_tree_position(&handler, attach_pid).await.0, start);
+    assert!(handler.mode_tree_active(attach_pid).await);
+}
+
+async fn tree_position_after_input(
+    handler: &RequestHandler,
+    attach_pid: u32,
+    bytes: &[u8],
+) -> usize {
+    handler
+        .handle_attached_live_input_for_test(attach_pid, bytes)
+        .await
+        .expect("terminal input is handled");
+    selected_tree_position(handler, attach_pid).await.0
+}
+
+async fn tree_position_after_key(
+    handler: &RequestHandler,
+    attach_pid: u32,
+    event: PromptInputEvent,
+) -> usize {
+    handler
+        .handle_mode_tree_key_event(attach_pid, event)
+        .await
+        .expect("tree key is handled");
+    selected_tree_position(handler, attach_pid).await.0
+}
+
+/// R3602: C-f and C-b page choose-tree like NPage and PPage, as tmux 3.7b
+/// `mode_tree_key` binds them, and no page key wraps at an end of the list.
+/// A lone C-b is the default prefix, so it reaches the tree as a key event.
+#[tokio::test]
+async fn choose_tree_control_page_keys_page_and_no_page_key_wraps() {
+    let (handler, attach_pid, _control_rx) = attached_choose_tree("tree-ctrl-page", 2481, 40).await;
+    let (start, rows, len) = selected_tree_position(&handler, attach_pid).await;
+    assert!(
+        rows > 1 && start + rows < len,
+        "start {start}, rows {rows}, len {len}"
+    );
+    let (h, pid) = (&handler, attach_pid);
+
+    assert_eq!(
+        tree_position_after_input(h, pid, b"\x06").await,
+        start + rows,
+        "C-f"
+    );
+    let after_ctrl_b = tree_position_after_key(h, pid, PromptInputEvent::Ctrl('b')).await;
+    assert_eq!(after_ctrl_b, start, "C-b");
+
+    for (name, bytes) in [("PgDn", &b"\x1b[6~"[..]), ("C-f", b"\x06")] {
+        assert_eq!(
+            tree_position_after_key(h, pid, PromptInputEvent::End).await,
+            len - 1
+        );
+        let after = tree_position_after_input(h, pid, bytes).await;
+        assert_eq!(after, len - 1, "{name} stays on the last item");
+    }
+    assert_eq!(
+        tree_position_after_key(h, pid, PromptInputEvent::Home).await,
+        0
+    );
+    let after_pgup = tree_position_after_input(h, pid, b"\x1b[5~").await;
+    assert_eq!(after_pgup, 0, "PgUp stays on the first item");
+    let after_ctrl_b = tree_position_after_key(h, pid, PromptInputEvent::Ctrl('b')).await;
+    assert_eq!(after_ctrl_b, 0, "C-b stays on the first item");
+    assert!(handler.mode_tree_active(attach_pid).await);
+}
+
+/// S2442 (a): an unfinished key frame is not discarded at the escape time in
+/// tree-mode. tmux 3.7b reads `ESC [6;2` as M-[ then `6;2`, and
+/// `ESC ESC [1;2` as M-Escape then `[1;2`: tree-mode ignores the Meta key and
+/// takes the rest as typed, so its digit chooses a line and closes the tree.
+/// The choice runs its command inside the escape-time flush, deeper than the
+/// default test-thread stack in debug: run on the daemon worker stack.
+#[test]
+fn choose_tree_reads_an_expired_key_frame_as_meta_then_its_digits() {
+    run_on_daemon_test_stack(choose_tree_reads_an_expired_key_frame_on_the_daemon_stack);
+}
+
+async fn choose_tree_reads_an_expired_key_frame_on_the_daemon_stack() {
+    for (offset, read, typed) in [
+        (2473, &b"\x1b[6;2"[..], &b"6;2"[..]),
+        (2475, b"\x1b\x1b[1;2", b"[1;2"),
+    ] {
+        let (handler, attach_pid, _control_rx) =
+            attached_choose_tree("tree-typed-digits", offset, 3).await;
+        handler
+            .handle_attached_live_input_for_test(attach_pid, typed)
+            .await
+            .expect("typed digits");
+        assert!(
+            !handler.mode_tree_active(attach_pid).await,
+            "{typed:?} typed chooses a line"
+        );
+
+        let (handler, attach_pid, _control_rx) =
+            attached_choose_tree("tree-expired-key-frame", offset + 1, 3).await;
+        let mut pending_input = Vec::new();
+        handler
+            .handle_attached_live_input(attach_pid, &mut pending_input, read)
+            .await
+            .expect("unfinished key frame input");
+        assert_eq!(pending_input, read, "{read:?}: the whole read waits");
+        assert!(handler.mode_tree_active(attach_pid).await);
+        handler
+            .flush_attached_pending_escape_input(attach_pid, &mut pending_input)
+            .await
+            .expect("escape-time flush");
+        assert!(pending_input.is_empty(), "the escape time empties it");
+        assert!(
+            !handler.mode_tree_active(attach_pid).await,
+            "{read:?} at the escape time must be read as {typed:?}, as tmux"
+        );
+    }
+}
+
+const DAEMON_TEST_STACK_SIZE: usize = 8 * 1024 * 1024;
+
+fn run_on_daemon_test_stack<F, Fut>(test: F)
+where
+    F: FnOnce() -> Fut + Send + 'static,
+    Fut: std::future::Future<Output = ()> + 'static,
+{
+    let worker = std::thread::Builder::new()
+        .name("tree-expired-key-frame-test".to_owned())
+        .stack_size(DAEMON_TEST_STACK_SIZE)
+        .spawn(|| {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("tree test runtime builds");
+            runtime.block_on(test());
+        })
+        .expect("tree test worker spawns");
+    if let Err(panic) = worker.join() {
+        std::panic::resume_unwind(panic);
+    }
 }

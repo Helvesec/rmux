@@ -9,62 +9,28 @@ use tokio::sync::mpsc;
 
 use super::attach_control::{release_attach_control_backlog, AttachControl, QueuedAttachTarget};
 use super::attach_transport::AttachTransport;
+use super::deferred_passthrough::{
+    clear_deferred_passthroughs_if_target_changed, take_passthrough_frame_for_client,
+    DeferredPassthroughQueue, PaneOutputGeneration,
+};
 use super::exit_log::AttachExitReason;
-use super::passthrough::render_passthroughs;
-use super::pending_escape::PendingEscapeFlush;
 use super::persistent_overlay::{
     accept_persistent_overlay_state, advance_persistent_overlay_state, clear_then_base_frame,
     defer_persistent_clear, discard_stale_persistent_overlays, is_stale_persistent_switch,
-    persistent_overlay_replacement_pending, replacement_persistent_overlay_frame,
-    switch_requires_screen_clear, take_pending_persistent_overlay_for_state,
-    undelivered_client_title_bytes, update_persistent_overlay_cache,
+    persistent_overlay_replacement_pending, popup_frame_delta,
+    replacement_persistent_overlay_frame, switch_requires_screen_clear,
+    take_pending_persistent_overlay_for_state, undelivered_client_title_bytes,
+    update_persistent_overlay_cache, CachedPersistentOverlay,
 };
+use super::refresh_scheduler::AttachRefreshScheduler;
 use super::types::{AttachTarget, OpenAttachTarget, OverlayFrame};
 use super::wire::{
     emit_attach_bytes, emit_attach_message, emit_attach_stop, emit_detached_attach_stop,
     emit_render_frame, open_attach_target,
 };
 
-pub(super) struct PendingAttachInputState<'a> {
-    bytes: &'a mut Vec<u8>,
-    escape_flush: &'a mut PendingEscapeFlush,
-}
-
-impl<'a> PendingAttachInputState<'a> {
-    pub(super) fn new(bytes: &'a mut Vec<u8>, escape_flush: &'a mut PendingEscapeFlush) -> Self {
-        Self {
-            bytes,
-            escape_flush,
-        }
-    }
-
-    pub(super) fn clear_if_pane_source_changed(
-        &mut self,
-        current_target: &OpenAttachTarget,
-        next_target: &AttachTarget,
-    ) {
-        let same_pane_source = current_target
-            .pane_output
-            .as_ref()
-            .is_some_and(|current_output| {
-                current_output.shares_pane_source_with(&next_target.pane_output)
-            });
-        if same_pane_source {
-            return;
-        }
-
-        self.clear();
-    }
-
-    pub(super) fn parts_mut(&mut self) -> (&mut Vec<u8>, &mut PendingEscapeFlush) {
-        (self.bytes, self.escape_flush)
-    }
-
-    pub(super) fn clear(&mut self) {
-        self.bytes.clear();
-        self.escape_flush.clear();
-    }
-}
+mod pending_attach_input;
+pub(super) use pending_attach_input::PendingAttachInputState;
 
 pub(super) fn preserves_live_output(
     current_target: &OpenAttachTarget,
@@ -113,7 +79,7 @@ pub(super) async fn recv_attach_control(
             if let Some(control) = control.as_ref() {
                 release_attach_control_backlog(control_backlog, control.received_backlog_units());
             }
-            control
+            control.map(AttachControl::materialize_received)
         }
         None => pending().await,
     }
@@ -125,7 +91,7 @@ pub(super) fn try_recv_attach_control(
 ) -> Result<AttachControl, mpsc::error::TryRecvError> {
     let control = control_rx.try_recv()?;
     release_attach_control_backlog(control_backlog, control.received_backlog_units());
-    Ok(control)
+    Ok(control.materialize_received())
 }
 
 pub(super) fn coalesce_render_switches(
@@ -196,7 +162,7 @@ pub(super) async fn switch_attach_target(
     .await?;
     if let Some(sequence) = current_target
         .outer_terminal
-        .render_cursor_style_transition(Some(previous_cursor_style), current_target.cursor_style)
+        .render_cursor_state_transition(Some(previous_cursor_style), current_target.cursor_style)
     {
         emit_attach_bytes(stream, sequence.as_bytes()).await?;
     }
@@ -220,9 +186,14 @@ pub(super) async fn switch_attach_target(
 
 pub(super) enum PendingAttachAction {
     Exit(PendingAttachExit),
-    Continue { target_changed: bool },
+    Continue {
+        target_changed: bool,
+    },
     InteractiveInput,
-    Refresh { target_changed: bool },
+    Refresh {
+        target_changed: bool,
+        source_invalidated: bool,
+    },
     Write,
 }
 
@@ -232,6 +203,10 @@ pub(super) struct PendingAttachExit {
     pub(super) snapshot_covered_output_before_sequence: Option<u64>,
 }
 
+/// `deferred_passthroughs` and `pane_refresh` are the attach loop's own queue
+/// and refresh deadline. A switch handled here can retain positioned work
+/// exactly like the loop's other dispatch sites, so it must go through the same
+/// owner rather than emitting passthroughs of its own.
 #[allow(clippy::too_many_arguments)]
 pub(super) async fn apply_pending_attach_controls(
     deferred_controls: &mut VecDeque<AttachControl>,
@@ -239,9 +214,11 @@ pub(super) async fn apply_pending_attach_controls(
     control_backlog: &AtomicUsize,
     current_target: &mut OpenAttachTarget,
     stream: &AttachTransport,
+    deferred_passthroughs: &mut DeferredPassthroughQueue,
+    pane_refresh: &mut AttachRefreshScheduler,
     render_generation: &mut u64,
     overlay_generation: &mut u64,
-    persistent_overlay: &mut Option<Vec<u8>>,
+    persistent_overlay: &mut Option<CachedPersistentOverlay>,
     persistent_overlay_visible: &mut bool,
     persistent_overlay_state_id: &mut Option<u64>,
     locked: &mut bool,
@@ -298,7 +275,10 @@ pub(super) async fn apply_pending_attach_controls(
                 return Ok(PendingAttachAction::InteractiveInput);
             }
             Ok(AttachControl::Refresh) => {
-                return Ok(PendingAttachAction::Refresh { target_changed });
+                return Ok(PendingAttachAction::Refresh {
+                    target_changed,
+                    source_invalidated: should_drop_output,
+                });
             }
             Ok(AttachControl::Switch(next_target)) => {
                 let (next_target, switch_count) = coalesce_render_switches(
@@ -331,8 +311,8 @@ pub(super) async fn apply_pending_attach_controls(
                             .map_or(next_boundary, |boundary| boundary.min(next_boundary)),
                     );
                 }
-                let pending_passthroughs = if drop_live_output {
-                    Vec::new()
+                let (pending_generation, pending_passthroughs) = if drop_live_output {
+                    (PaneOutputGeneration::unsubscribed(), Vec::new())
                 } else {
                     take_pending_live_passthroughs(
                         current_target,
@@ -343,6 +323,13 @@ pub(super) async fn apply_pending_attach_controls(
                     pending_input
                         .clear_if_pane_source_changed(current_target, next_target.as_ref());
                 }
+                // A positioned payload queued against the old source cannot be
+                // drawn on the replacement, so it is discarded before the
+                // switch rather than emitted against the wrong pane.
+                clear_deferred_passthroughs_if_target_changed(
+                    drop_live_output,
+                    deferred_passthroughs,
+                );
                 *render_generation = (*render_generation).saturating_add(switch_count);
                 let pending_overlay = take_pending_persistent_overlay_for_state(
                     Some(control_rx),
@@ -384,9 +371,16 @@ pub(super) async fn apply_pending_attach_controls(
                     replacement_frame.as_deref(),
                 )
                 .await?;
-                if !pending_passthroughs.is_empty() {
-                    let passthrough_frame =
-                        render_passthroughs(current_target, &pending_passthroughs);
+                if !pending_passthroughs.is_empty() || !deferred_passthroughs.is_empty() {
+                    // The replacement frame was published above, so this is
+                    // the frame the queue must decide against.
+                    let passthrough_frame = take_passthrough_frame_for_client(
+                        current_target,
+                        deferred_passthroughs,
+                        pane_refresh,
+                        pending_generation,
+                        pending_passthroughs,
+                    );
                     emit_attach_bytes(stream, &passthrough_frame).await?;
                 }
                 target_changed = true;
@@ -439,6 +433,11 @@ pub(super) async fn apply_pending_attach_controls(
                 if persistent_clear
                     || should_emit_overlay(*render_generation, overlay_generation, &overlay)
                 {
+                    let delta = popup_frame_delta(
+                        persistent_overlay.as_deref(),
+                        *persistent_overlay_visible,
+                        &overlay,
+                    );
                     update_persistent_overlay_cache(
                         persistent_overlay,
                         persistent_overlay_visible,
@@ -451,15 +450,29 @@ pub(super) async fn apply_pending_attach_controls(
                     ) {
                         continue;
                     }
-                    let clear_frame =
-                        persistent_clear.then(|| clear_then_base_frame(current_target));
+                    let clear_frame = (persistent_clear || overlay.repaint_background).then(|| {
+                        let mut frame = clear_then_base_frame(current_target);
+                        if overlay.repaint_background {
+                            if let Some(live_pane) = current_target.live_pane.as_ref() {
+                                frame.extend_from_slice(&live_pane.delivered_screen_frame());
+                            }
+                        }
+                        frame.extend_from_slice(&overlay.frame);
+                        frame
+                    });
                     emit_render_frame(
                         stream,
                         &current_target.outer_terminal,
-                        clear_frame.as_deref().unwrap_or(&overlay.frame),
+                        clear_frame
+                            .as_deref()
+                            .or(delta.as_deref())
+                            .unwrap_or(&overlay.frame),
                     )
                     .await?;
                 }
+            }
+            Ok(AttachControl::CoalescedPopupOverlay(_)) => {
+                unreachable!("received popup overlays are materialized before dispatch")
             }
             Ok(AttachControl::Write(bytes)) => {
                 emit_attach_bytes(stream, &bytes).await?;
@@ -503,27 +516,35 @@ pub(super) async fn apply_pending_attach_controls(
 pub(super) fn take_pending_live_passthroughs(
     current_target: &mut OpenAttachTarget,
     before_sequence: u64,
-) -> Vec<TerminalPassthrough> {
+) -> (PaneOutputGeneration, Vec<TerminalPassthrough>) {
     let Some(pane_output) = current_target.pane_output.as_mut() else {
-        return Vec::new();
+        return (PaneOutputGeneration::unsubscribed(), Vec::new());
     };
+    let Some(first) = pane_output.try_recv_drained() else {
+        return (PaneOutputGeneration::unsubscribed(), Vec::new());
+    };
+    let generation = first.generation;
     let mut passthroughs = Vec::new();
-    while let Some(item) = pane_output.try_recv() {
-        let OutputCursorItem::Event(event) = item else {
+    let mut item = Some(first.item);
+    while let Some(next) = item {
+        let OutputCursorItem::Event(event) = next else {
             break;
         };
         if event.sequence() >= before_sequence {
             break;
         }
         passthroughs.extend(event.into_passthroughs());
+        item = pane_output
+            .try_recv_for_generation(generation)
+            .map(|drained| drained.item);
     }
-    passthroughs
+    (PaneOutputGeneration::subscribed(generation), passthroughs)
 }
 
 pub(super) async fn redraw_after_persistent_overlay_state_advance(
     _stream: &AttachTransport,
     _current_target: &OpenAttachTarget,
-    _persistent_overlay: &mut Option<Vec<u8>>,
+    _persistent_overlay: &mut Option<CachedPersistentOverlay>,
     persistent_overlay_visible: &mut bool,
     previous_state_id: Option<u64>,
     current_state_id: Option<u64>,

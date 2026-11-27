@@ -36,7 +36,7 @@ impl WebShareResponse {
 }
 
 /// Success payload for creating a browser-visible web share.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct WebShareCreatedResponse {
     /// Opaque share identifier.
     pub share_id: String,
@@ -79,6 +79,37 @@ pub struct WebShareCreatedResponse {
     pub kill_session_on_expire: bool,
     /// CLI stdout rendering.
     pub output: CommandOutput,
+}
+
+impl std::fmt::Debug for WebShareCreatedResponse {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("WebShareCreatedResponse")
+            .field("share_id", &self.share_id)
+            .field("scope", &self.scope)
+            .field("spectator_url", &self.spectator_url)
+            .field("operator_url", &self.operator_url)
+            .field("tunnel_provider", &self.tunnel_provider)
+            .field("tunnel_public_url", &self.tunnel_public_url)
+            .field("expires_at_unix", &self.expires_at_unix)
+            .field(
+                "operator_pairing_code",
+                &self.operator_pairing_code.as_ref().map(|_| "[REDACTED]"),
+            )
+            .field(
+                "spectator_pairing_code",
+                &self.spectator_pairing_code.as_ref().map(|_| "[REDACTED]"),
+            )
+            .field("max_spectators", &self.max_spectators)
+            .field("max_operators", &self.max_operators)
+            .field("operator", &self.operator)
+            .field("spectator", &self.spectator)
+            .field("controls", &self.controls)
+            .field("kill_session_on_expire", &self.kill_session_on_expire)
+            // Creation stdout repeats the PINs for the explicit CLI response.
+            .field("output", &"[REDACTED]")
+            .finish()
+    }
 }
 
 /// Success payload for listing active browser-visible web shares.

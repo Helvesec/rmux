@@ -1,8 +1,3 @@
-//! Runtime bootstrap helpers for SDK daemon discovery.
+//! SDK endpoint discovery and timeout policy.
 
-pub(crate) mod deadline;
-pub mod discovery;
-#[cfg(unix)]
-pub mod startup_unix;
-#[cfg(windows)]
-pub mod startup_windows;
+pub(crate) mod discovery;

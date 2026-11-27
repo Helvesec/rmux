@@ -6,7 +6,6 @@
 //! demo session's snapshot remains the canonical thing the docs
 //! show).
 
-#[path = "sdk_demo_helpers/mod.rs"]
 mod sdk_demo_helpers;
 
 #[tokio::main]
@@ -24,7 +23,7 @@ async fn main() -> rmux_sdk::Result<()> {
         println!("session: {}", name.as_str());
     }
     let alive = rmux
-        .has_session(rmux_sdk::SessionName::try_from("listsess".to_owned())?)
+        .has_session(rmux_sdk::SessionName::new("listsess").expect("valid static session name"))
         .await?;
     println!("listsess alive: {alive}");
     // example:end

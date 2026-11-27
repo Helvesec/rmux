@@ -159,6 +159,26 @@ fn csi_decscusr_cursor_style() {
     assert!(w.has_call("set_cursor_style(3)"));
 }
 
+#[test]
+fn csi_decscusr_ignores_styles_outside_zero_through_six() {
+    for invalid in [7, 99] {
+        let sequence = format!("\x1b[{invalid} q");
+        let (_p, w) = parse(sequence.as_bytes());
+        assert!(
+            !w.has_call("set_cursor_style("),
+            "invalid DECSCUSR {invalid} must not reach the screen mutation"
+        );
+    }
+}
+
+#[test]
+fn csi_decscusr_takes_blink_authority_from_an_earlier_decset_12() {
+    let (_p, w) = parse(b"\x1b[?12h\x1b[6 q");
+
+    assert!(w.has_call("set_cursor_style(6)"));
+    assert_eq!(w.mode & MODE_CURSOR_BLINKING_SET, 0);
+}
+
 // ─── SM/RM private mode tests ─────────────────────────────────────
 
 #[test]

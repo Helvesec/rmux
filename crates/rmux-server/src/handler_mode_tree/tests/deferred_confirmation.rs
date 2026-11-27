@@ -4,6 +4,28 @@ use super::super::mode_tree_model::{ModeTreeActionIdentity, ModeTreeDeferredActi
 use super::super::mode_tree_order::session_item_id;
 use crate::pane_io::AttachControl;
 
+#[test]
+fn choose_tree_auto_confirmation_completes_on_default_stack() {
+    // CI raises RUST_MIN_STACK. Exercise the real input/kill chain without
+    // that override, isolating an overflow from the parent test harness.
+    let output = std::process::Command::new(std::env::current_exe().expect("current test binary"))
+        .args([
+            "handler::mode_tree_support::mode_tree_tests::deferred_confirmation::choose_tree_y_confirms_current_and_tagged_kills_without_input",
+            "--exact",
+            "--test-threads=1",
+        ])
+        .env_remove("RUST_MIN_STACK")
+        .output()
+        .expect("spawn default-stack choose-tree witness");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        output.status.success() && stdout.contains("1 passed"),
+        "choose-tree auto-confirmation failed on the default stack: {:?}\nstdout:\n{stdout}\nstderr:\n{}",
+        output.status,
+        String::from_utf8_lossy(&output.stderr),
+    );
+}
+
 struct DeferredTreeFixture {
     handler: RequestHandler,
     attach_pid: u32,
@@ -27,7 +49,7 @@ async fn create_session(
             environment: None,
         }))
         .await;
-    assert!(matches!(response, Response::NewSession(_)), "{response:?}");
+    crate::session_fixture::assert_new_session(&response);
     let session_id = handler
         .state
         .lock()
@@ -140,7 +162,7 @@ async fn assert_only_first_was_killed(fixture: &DeferredTreeFixture) {
         state
             .sessions
             .session(&fixture.second_name)
-            .map(rmux_core::Session::id),
+            .map(|session| session.id()),
         Some(fixture.second_id),
         "the later mode-tree selection must survive"
     );
@@ -410,4 +432,41 @@ async fn confirmed_pane_kill_accepts_the_unchanged_output_generation() {
         .panes()
         .iter()
         .any(|pane| pane.id() == fixture.target_pane_id));
+}
+
+#[tokio::test]
+async fn choose_tree_y_confirms_current_and_tagged_kills_without_input() {
+    for (offset, key) in [(800, b'x'), (801, b'X')] {
+        let fixture = deferred_tree_fixture("tree-auto-confirm", offset).await;
+        let parsed = CommandParser::new()
+            .parse_arguments(["choose-tree", "-sy"])
+            .expect("choose-tree -sy parses");
+        let command = RequestHandler::parse_mode_tree_queue_command(parsed.commands()[0].clone())
+            .expect("-y is accepted")
+            .expect("chooser recognized");
+        fixture
+            .handler
+            .execute_queued_mode_tree(
+                fixture.attach_pid,
+                command,
+                &QueueExecutionContext::without_caller_cwd(),
+            )
+            .await
+            .expect("auto-confirm chooser opens");
+        set_current_selection(&fixture.handler, fixture.attach_pid, fixture.first_id).await;
+        if key == b'X' {
+            set_tagged_selection(&fixture.handler, fixture.attach_pid, fixture.first_id).await;
+        }
+        fixture
+            .handler
+            .handle_attached_live_input_for_test(fixture.attach_pid, &[key])
+            .await
+            .expect("kill is automatically confirmed");
+        assert!(fixture
+            .handler
+            .attached_prompt_render(fixture.attach_pid)
+            .await
+            .is_none());
+        assert_only_first_was_killed(&fixture).await;
+    }
 }

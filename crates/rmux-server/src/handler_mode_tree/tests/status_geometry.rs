@@ -132,8 +132,8 @@ async fn overlay_geometry_case(
         origin_case.label()
     );
     let session_name = SessionName::new(label).expect("valid session");
-    assert!(matches!(
-        handler
+    crate::session_fixture::assert_new_session(
+        &handler
             .handle(Request::NewSession(NewSessionRequest {
                 session_name: session_name.clone(),
                 detached: true,
@@ -141,8 +141,7 @@ async fn overlay_geometry_case(
                 environment: None,
             }))
             .await,
-        Response::NewSession(_)
-    ));
+    );
     set_status_case(&handler, status_case).await;
 
     let observer_pid = std::process::id().saturating_add(pid_offset);

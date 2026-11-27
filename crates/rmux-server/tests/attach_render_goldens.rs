@@ -17,7 +17,7 @@ fn attach_render_golden_coverage_matrix_is_present() {
         "attach_render_golden_normal_idle_pane_is_byte_stable",
         "pane_render_applies_window_style_to_default_cells",
         "pane_render_active_style_overlays_window_style_for_default_cells",
-        "pane_render_keeps_padding_for_split_panes_to_avoid_clearing_neighbors",
+        "pane_render_uses_spaces_for_small_split_tail_without_clearing_neighbors",
         "two_pane_sessions_render_the_main_vertical_border_column_and_exact_frame_bytes",
         "rendered_pane_line_truncates_to_pane_width_without_counting_sgr",
     ] {
@@ -37,8 +37,8 @@ fn attach_render_golden_exact_frame_assertion_stays_exact() {
         "attach render golden must compare exact bytes, not only substrings"
     );
     assert!(
-        source.contains("\\x1b[s\\x1b[?25l\\x1b[0m\\x1b[1;1H\\x1b[0mD\\x1b[0m\\x1b[K"),
-        "normal idle pane golden must keep cursor hide/save/reset/clear bytes pinned"
+        source.contains("\\x1b[s\\x1b[?25l\\x1b[0m\\x1b[1;1H\\x1b[0mD     "),
+        "normal idle pane golden must pin tmux's literal-space ladder below ten columns"
     );
     assert!(
         source.contains("\\x1b[0m\\x1b[u\\x1b[1;2H\\x1b[?25h"),

@@ -1,3 +1,5 @@
+use std::rc::Rc;
+
 use super::{
     format_expand1, format_skip, is_truthy, resolve_variable, ExpandState, FormatVariables,
     FORMAT_LOOP_LIMIT,
@@ -67,10 +69,13 @@ where
     V: FormatVariables + ?Sized,
 {
     let mut nested_state = ExpandState {
+        status: state.status,
         loop_depth: state.loop_depth,
         expand_time: state.expand_time,
         stop_expansion: false,
         preserve_jobs: state.preserve_jobs,
+        disable_jobs: state.disable_jobs,
+        budget: Rc::clone(&state.budget),
     };
     format_expand1(&mut nested_state, body, variables)
 }
@@ -112,10 +117,13 @@ where
     }
 
     let mut nested_state = ExpandState {
+        status: false,
         loop_depth: state.loop_depth,
         expand_time: state.expand_time,
         stop_expansion: false,
         preserve_jobs: state.preserve_jobs,
+        disable_jobs: state.disable_jobs,
+        budget: Rc::clone(&state.budget),
     };
     let expanded = format_expand1(&mut nested_state, raw, variables);
     if expanded == raw {

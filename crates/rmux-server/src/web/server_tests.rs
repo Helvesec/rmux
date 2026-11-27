@@ -1,3 +1,6 @@
+#[path = "server_slow_reader_tests.rs"]
+mod slow_reader_tests;
+
 use super::http::{path_from_target, HttpRequest};
 use super::pre_auth::PreAuthQueue;
 use super::{is_fd_exhaustion, serve_admitted_connection, should_continue_accept_loop};
@@ -8,10 +11,11 @@ use crate::web::protocol::{
 use crate::web::SecretHashForCrypto;
 use base64::Engine;
 use rmux_proto::{
-    CreateWebShareRequest, KillSessionRequest, ListSessionsRequest, ListWindowsRequest,
-    NewSessionExtRequest, NewSessionRequest, NewWindowRequest, PaneTarget, Request, Response,
-    SessionName, SplitDirection, SplitWindowRequest, SplitWindowTarget, StopWebShareRequest,
-    TerminalSize, WebShareCreatedResponse, WebShareRequest, WebShareResponse, WebShareScope,
+    CreateWebShareRequest, KillSessionRequest, KillWindowRequest, ListSessionsRequest,
+    ListWindowsRequest, NewSessionExtRequest, NewSessionRequest, NewWindowRequest, OptionName,
+    PaneTarget, Request, Response, ScopeSelector, SessionName, SetOptionMode, SetOptionRequest,
+    SplitDirection, SplitWindowRequest, SplitWindowTarget, StopWebShareRequest, TerminalSize,
+    WebShareCreatedResponse, WebShareRequest, WebShareResponse, WebShareScope, WindowTarget,
 };
 use rmux_web_crypto::{derive_client_session, generate_ephemeral, Message, Opener, Sealer};
 use serde_json::Value;
@@ -20,7 +24,9 @@ use std::io;
 use std::sync::Arc;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
-use tokio::time::{advance, pause, timeout, Duration};
+use tokio::time::{advance, pause, resume, timeout, Duration};
+
+mod selection_delivery;
 
 #[cfg(windows)]
 const WEBSOCKET_FRAME_TIMEOUT: Duration = Duration::from_secs(10);
@@ -73,16 +79,33 @@ async fn non_websocket_http_paths_return_404() {
 
 #[tokio::test]
 async fn shutdown_closes_the_web_listener() {
-    let port = {
-        let probe = std::net::TcpListener::bind(("127.0.0.1", 0)).expect("bind port probe");
-        probe.local_addr().expect("probe address").port()
-    };
+    use std::io::Read as _;
+
+    // A port number says nothing once it is free: a probed-then-released port,
+    // or the listener's own port after shutdown, can be bound by any socket on
+    // the host. Keep the requested port busy so the listener binds the port the
+    // kernel picks for it, read that port back, and judge the listener through
+    // a connection queued on its own socket instead of a later connect.
+    let occupied = std::net::TcpListener::bind(("127.0.0.1", 0)).expect("bind occupied port");
+    let occupied_port = occupied.local_addr().expect("occupied address").port();
     let handler = Arc::new(RequestHandler::new());
-    handler.update_web_listener_port(port);
+    handler.update_web_listener_port(occupied_port);
     super::spawn(Arc::clone(&handler))
         .await
         .expect("web listener starts");
+    let port = handler.web_settings().port;
+    assert_ne!(
+        port, occupied_port,
+        "the listener falls back from a busy port"
+    );
 
+    // No await separates this connect from closing admission, so the accept
+    // loop cannot take the connection: it waits in the listener's queue.
+    let mut queued =
+        std::net::TcpStream::connect(("127.0.0.1", port)).expect("queue on the live listener");
+    queued
+        .set_read_timeout(Some(Duration::from_secs(1)))
+        .expect("bound the queued read");
     handler.close_normal_request_admission();
     timeout(Duration::from_secs(1), async {
         while !handler.normal_requests_quiesced() {
@@ -91,10 +114,21 @@ async fn shutdown_closes_the_web_listener() {
     })
     .await
     .expect("listener admission drains on shutdown");
+
+    let mut byte = [0u8; 1];
+    let closed = queued.read(&mut byte);
     assert!(
-        TcpStream::connect(("127.0.0.1", port)).await.is_err(),
-        "the Web listener must stop accepting once normal admission closes"
+        match &closed {
+            Ok(0) => true,
+            Err(error) => matches!(
+                error.kind(),
+                io::ErrorKind::ConnectionReset | io::ErrorKind::ConnectionAborted
+            ),
+            Ok(_) => false,
+        },
+        "the Web listener must close its socket once normal admission closes: {closed:?}"
     );
+    drop(occupied);
 }
 
 #[tokio::test]
@@ -996,6 +1030,139 @@ async fn session_share_streams_attach_output_without_replacing_snapshot() {
 }
 
 #[tokio::test]
+async fn floating_session_scroll_replaces_live_output_with_a_coherent_keyframe() {
+    let handler = Arc::new(RequestHandler::new());
+    let session_name = create_session(&handler, "websocket-floating-scroll-live").await;
+    assert!(matches!(
+        handler
+            .handle(Request::SetOption(SetOptionRequest {
+                scope: ScopeSelector::Session(session_name.clone()),
+                option: OptionName::Status,
+                value: "off".to_owned(),
+                mode: SetOptionMode::Replace,
+            }))
+            .await,
+        Response::SetOption(_)
+    ));
+    handler
+        .wait_for_pane_startup_to_finish_for_test(&PaneTarget::with_window(
+            session_name.clone(),
+            0,
+            0,
+        ))
+        .await;
+    assert!(matches!(
+        handler
+            .handle(Request::SplitWindow(SplitWindowRequest {
+                target: SplitWindowTarget::Session(session_name.clone()),
+                direction: SplitDirection::Vertical,
+                before: false,
+                environment: None,
+            }))
+            .await,
+        Response::SplitWindow(_)
+    ));
+    handler
+        .wait_for_pane_startup_to_finish_for_test(&PaneTarget::with_window(
+            session_name.clone(),
+            0,
+            1,
+        ))
+        .await;
+
+    handler
+        .float_web_pane_for_test(
+            &WindowTarget::with_window(session_name.clone(), 0),
+            1,
+            rmux_core::FloatingPaneRect::new(4, 2, 20, 8).expect("floating rectangle"),
+        )
+        .await;
+    handler
+        .publish_web_pane_bytes_for_test(
+            &PaneTarget::with_window(session_name.clone(), 0, 0).into(),
+            b"00\r\n01\r\n02\r\n03\r\n04\r\n05\r\n06\r\n07\r\n08\r\n09\r\n10\r\n11\r\n12\r\n13\r\n14\r\n15\r\n16\r\n17\r\n18\r\n19\r\n20\r\n21\r\n22\r\n23\r\n24\r\n25\r\n26\r\n27\r\n28\r\n29\r\n"
+                .to_vec(),
+        )
+        .await
+        .expect("tiled history");
+    let created = create_share(
+        &handler,
+        share_request(WebShareScope::Session(session_name.clone())),
+    )
+    .await;
+    let mut client = TestWebSocket::connect(
+        Arc::clone(&handler),
+        &token_from_url(created.spectator_url.as_deref().expect("spectator URL")),
+    )
+    .await;
+    assert_eq!(client.read_json().await["scope"], "session");
+    client
+        .read_binary_with_prefix(0x10, "initial floating snapshot")
+        .await;
+    let initial_view = client
+        .read_binary_with_prefix_payload(0x11, "initial floating view")
+        .await;
+    let initial_view = parse_session_view(&initial_view);
+    let tiled_id = initial_view["panes"]
+        .as_array()
+        .expect("panes array")
+        .iter()
+        .find(|pane| pane["x"].as_u64() == Some(0))
+        .and_then(|pane| pane["id"].as_u64())
+        .expect("tiled pane id") as u32;
+    client
+        .read_binary_with_prefix(0x01, "initial attach render")
+        .await;
+
+    client
+        .send_json(&format!(
+            r#"{{"type":"pane_scroll","pane_id":{},"delta":-1}}"#,
+            tiled_id
+        ))
+        .await;
+    client
+        .read_binary_with_prefix(0x10, "floating scroll keyframe")
+        .await;
+    client
+        .read_binary_with_prefix(0x11, "floating scroll view")
+        .await;
+
+    handler
+        .publish_web_pane_bytes_for_test(
+            &PaneTarget::with_window(session_name, 0, 1).into(),
+            b"LIVE_AFTER_SCROLL".to_vec(),
+        )
+        .await
+        .expect("live floating output");
+    let next = client
+        .read_binary_payload("presentation after live floating output")
+        .await;
+    assert_eq!(
+        next.first(),
+        Some(&0x10),
+        "live attach output must be withheld until the scrolled scene is replaced atomically"
+    );
+    let refreshed_view = client
+        .read_binary_with_prefix_payload(0x11, "view after live floating output")
+        .await;
+    let refreshed_view = parse_session_view(&refreshed_view);
+    let tiled = refreshed_view["panes"]
+        .as_array()
+        .expect("panes array")
+        .iter()
+        .find(|pane| pane["id"].as_u64() == Some(u64::from(tiled_id)))
+        .expect("scrolled tiled pane");
+    assert!(
+        tiled["scroll_offset"]
+            .as_u64()
+            .is_some_and(|offset| offset > 0),
+        "the replacement keyframe view must retain the same scrolled presentation"
+    );
+
+    client.close().await;
+}
+
+#[tokio::test]
 async fn spectator_session_share_rejects_binary_frames() {
     let handler = Arc::new(RequestHandler::new());
     let session_name = create_session(&handler, "websocket-spectator-binary").await;
@@ -1220,6 +1387,41 @@ async fn session_operator_can_run_typed_window_actions() {
 }
 
 #[tokio::test]
+async fn session_operator_reads_its_next_view_across_a_keepalive_ping() {
+    let handler = Arc::new(RequestHandler::new());
+    let session_name = create_session(&handler, "websocket-session-ping-between-views").await;
+    let created = create_share(
+        &handler,
+        CreateWebShareRequest {
+            operator: true,
+            ..share_request(WebShareScope::Session(session_name))
+        },
+    )
+    .await;
+    let mut client = TestWebSocket::connect(
+        Arc::clone(&handler),
+        &token_from_url(created.operator_url.as_deref().expect("operator URL")),
+    )
+    .await;
+    assert_eq!(client.read_json().await["role"], "operator");
+    client.read_binary_with_prefix(0x10, "snapshot").await;
+
+    // One keepalive tick, as a loaded host reaches after two real seconds.
+    pause();
+    advance(Duration::from_secs(2)).await;
+    tokio::task::yield_now().await;
+    resume();
+
+    client.send_json(r#"{"type":"new_window"}"#).await;
+    read_session_view_until(&mut client, "new window view", |view| {
+        window_count(view) == 2
+    })
+    .await;
+
+    client.close().await;
+}
+
+#[tokio::test]
 async fn session_spectator_can_select_windows_without_operator_access() {
     let handler = Arc::new(RequestHandler::new());
     let session_name = create_session(&handler, "websocket-spectator-window-select").await;
@@ -1288,6 +1490,217 @@ async fn session_spectator_can_select_windows_without_operator_access() {
         .any(|window| window.target.window_index() == 1 && !window.active));
 
     client.close().await;
+}
+
+#[tokio::test]
+async fn stale_spectator_window_selection_blocks_attach_refresh_output() {
+    let handler = Arc::new(RequestHandler::new());
+    let session_name = create_quiet_session(&handler, "websocket-stale-window-selection").await;
+    assert!(matches!(
+        handler
+            .handle(Request::NewWindow(Box::new(NewWindowRequest {
+                target: session_name.clone(),
+                name: Some("selected".to_owned()),
+                detached: true,
+                environment: None,
+                command: None,
+                process_command: Some(rmux_proto::ProcessCommand::Argv(quiet_pane_command())),
+                start_directory: None,
+                target_window_index: Some(1),
+                insert_at_target: false,
+            })))
+            .await,
+        Response::NewWindow(_)
+    ));
+    let selected_window_id = handler.web_window_id_for_test(&session_name, 1).await;
+    let created = create_share(
+        &handler,
+        share_request(WebShareScope::Session(session_name.clone())),
+    )
+    .await;
+    let mut client = TestWebSocket::connect(
+        Arc::clone(&handler),
+        &token_from_url(created.spectator_url.as_deref().expect("spectator URL")),
+    )
+    .await;
+    assert_eq!(client.read_json().await["scope"], "session");
+    client
+        .read_binary_with_prefix(0x10, "initial session snapshot")
+        .await;
+    read_session_view_until(&mut client, "initial session view", |view| {
+        window_count(view) == 2 && active_window_index(view) == Some(0)
+    })
+    .await;
+    client
+        .read_binary_with_prefix(0x01, "initial attach render")
+        .await;
+
+    client
+        .send_json(r#"{"type":"select_window","window_index":1}"#)
+        .await;
+    let mut selected_snapshot = false;
+    let mut selected_view = false;
+    let mut selected_attach_render = false;
+    for _ in 0..MAX_INTERLEAVED_WEBSOCKET_FRAMES {
+        let payload = client
+            .read_binary_payload("selected session presentation")
+            .await;
+        match payload.first() {
+            Some(0x01) => selected_attach_render = true,
+            Some(0x10) => selected_snapshot = true,
+            Some(0x11) => {
+                let view = parse_session_view(&payload);
+                selected_view |= active_window_index(&view) == Some(1);
+            }
+            _ => {}
+        }
+        if selected_snapshot && selected_view && selected_attach_render {
+            break;
+        }
+    }
+    assert!(
+        selected_snapshot && selected_view && selected_attach_render,
+        "a still-valid spectator selection must retain its normal snapshot, view, and attach output"
+    );
+
+    // Deliberately leave known, valid selected-window output unread. This is
+    // transport backlog, not output produced by the recycled WindowId.
+    let marker = format!("pre-recycle-selected-{selected_window_id:?}");
+    let queued =
+        super::selection_delivery_pause::observe_raw_queue(&created.share_id, marker.as_bytes());
+    handler
+        .publish_web_pane_bytes_for_test(
+            &PaneTarget::with_window(session_name.clone(), 1, 0).into(),
+            marker.as_bytes().to_vec(),
+        )
+        .await
+        .expect("publish owned pre-recycle selected output");
+    timeout(Duration::from_secs(2), queued.notified())
+        .await
+        .expect("marked pre-recycle raw output is enqueued before recycling");
+
+    let boundary = super::selection_delivery_pause::install_drain(&created.share_id);
+    write_client_frame(&mut client.stream, OPCODE_PING, &boundary.marker).await;
+    let mut marked_raw_drained = false;
+    let mut watermark_drained = false;
+    for _ in 0..MAX_INTERLEAVED_WEBSOCKET_FRAMES {
+        let payload = client
+            .read_binary_payload("pre-recycle FIFO watermark")
+            .await;
+        if payload.first() == Some(&0x01) {
+            if payload[1..] == boundary.marker {
+                watermark_drained = true;
+                break;
+            }
+            marked_raw_drained |= payload
+                .windows(marker.len())
+                .any(|part| part == marker.as_bytes());
+        }
+    }
+    assert!(
+        watermark_drained,
+        "the FIFO watermark must delimit all pre-recycle terminal output"
+    );
+    assert!(
+        marked_raw_drained,
+        "the known selected-window raw payload must be drained before recycling"
+    );
+
+    let attach_pid = handler.web_session_attach_pid_for_test(&session_name).await;
+    let refresh_pause =
+        crate::handler::attach_support::install_generic_render_delivery_pause(attach_pid);
+    assert!(matches!(
+        handler
+            .handle(Request::KillWindow(KillWindowRequest {
+                target: WindowTarget::with_window(session_name.clone(), 1),
+                kill_all_others: false,
+            }))
+            .await,
+        Response::KillWindow(_)
+    ));
+    timeout(Duration::from_secs(2), refresh_pause.reached.notified())
+        .await
+        .expect("attach refresh reaches its delivery boundary after the selected window vanishes");
+
+    assert!(matches!(
+        handler
+            .handle(Request::NewWindow(Box::new(NewWindowRequest {
+                target: session_name.clone(),
+                name: Some("replacement".to_owned()),
+                detached: true,
+                environment: None,
+                command: None,
+                process_command: Some(rmux_proto::ProcessCommand::Argv(quiet_pane_command())),
+                start_directory: None,
+                target_window_index: Some(1),
+                insert_at_target: false,
+            })))
+            .await,
+        Response::NewWindow(_)
+    ));
+    let replacement_window_id = handler.web_window_id_for_test(&session_name, 1).await;
+    assert_ne!(replacement_window_id, selected_window_id);
+    handler.refresh_attached_session(&session_name).await;
+
+    let TestWebSocket {
+        mut stream,
+        task,
+        mut opener,
+        ..
+    } = client;
+    refresh_pause.release.notify_one();
+    boundary.release.notify_one();
+    timeout(Duration::from_secs(2), async {
+        loop {
+            match read_server_frame_inner(&mut stream).await {
+                Ok(frame) if frame.opcode == OPCODE_BINARY => {
+                    if let Message::Binary(payload) = opener
+                        .open(&frame.payload)
+                        .expect("post-recycle encrypted server frame opens")
+                    {
+                        assert_ne!(
+                            payload.first(),
+                            Some(&0x01),
+                            "a stale selected WindowId must block WS_OUTPUT_RAW; payload={payload:?}, pre-recycle marker={marker}, selected={selected_window_id:?}, replacement={replacement_window_id:?}"
+                        );
+                        assert_ne!(
+                            payload.first(),
+                            Some(&0x10),
+                            "a stale selected WindowId must block a replacement keyframe; payload={payload:?}"
+                        );
+                    }
+                }
+                Ok(frame) if frame.opcode == OPCODE_CLOSE => break,
+                Ok(_) => {}
+                Err(error)
+                    if matches!(
+                        error.kind(),
+                        io::ErrorKind::UnexpectedEof
+                            | io::ErrorKind::ConnectionAborted
+                            | io::ErrorKind::ConnectionReset
+                            | io::ErrorKind::BrokenPipe
+                    ) =>
+                {
+                    break;
+                }
+                Err(error) => panic!("stale WebSocket ended unexpectedly: {error}"),
+            }
+        }
+    })
+    .await
+    .expect("stale selected-window connection fails closed");
+    let _ = task.await.expect("server task joins after failing closed");
+    assert!(matches!(
+        handler
+            .handle(Request::KillSession(KillSessionRequest {
+                target: session_name,
+                kill_all_except_target: false,
+                clear_alerts: false,
+                kill_group: false,
+            }))
+            .await,
+        Response::KillSession(_)
+    ));
 }
 
 #[tokio::test]
@@ -1388,8 +1801,7 @@ async fn loopback_backoff_waiters_do_not_block_another_share_over_websocket() {
     let unrelated_token =
         token_from_url(unrelated.spectator_url.as_deref().expect("unrelated URL"));
 
-    // Four settled failures make the next attempt wait 800 ms, leaving enough
-    // time to complete a real encrypted handshake for the unrelated share.
+    // Four real wrong-PIN attempts settle as backoff failures.
     for _ in 0..4 {
         let HandshakeSession {
             mut stream, task, ..
@@ -1405,6 +1817,13 @@ async fn loopback_backoff_waiters_do_not_block_another_share_over_websocket() {
         let _ = task.await.expect("failed PIN task joins");
     }
 
+    // A waiter that wakes takes the single connection permit, so every waiter
+    // must still sleep while the unrelated share completes its own handshake.
+    // At 800 ms (four failures) that window also held three more waiter
+    // handshakes, and a loaded Mac lost it (S2018). Four more failures through
+    // the same backoff put every waiter at the 10 s cap.
+    handler.record_web_authentication_failures_for_test(&protected_token_id, 4);
+
     let mut waiters = Vec::with_capacity(4);
     for _ in 0..4 {
         waiters.push(
@@ -1417,7 +1836,7 @@ async fn loopback_backoff_waiters_do_not_block_another_share_over_websocket() {
             .await,
         );
     }
-    tokio::time::timeout(Duration::from_millis(100), async {
+    tokio::time::timeout(Duration::from_secs(5), async {
         while handler.web_authentication_wait_count() != 4 {
             tokio::task::yield_now().await;
         }
@@ -1426,7 +1845,7 @@ async fn loopback_backoff_waiters_do_not_block_another_share_over_websocket() {
     .expect("four loopback connections enter authentication backoff");
 
     let mut unrelated = TestWebSocket::connect(Arc::clone(&handler), &unrelated_token).await;
-    let ready = tokio::time::timeout(Duration::from_millis(600), unrelated.read_json())
+    let ready = tokio::time::timeout(Duration::from_secs(5), unrelated.read_json())
         .await
         .expect("unrelated share reaches ready while protected share waits");
     assert_eq!(ready["type"], "ready");
@@ -1676,8 +2095,8 @@ fn transient_accept_errors_keep_listener_alive() {
 
 async fn create_session(handler: &RequestHandler, name: &str) -> SessionName {
     let session_name = SessionName::new(name).expect("valid session");
-    assert!(matches!(
-        handler
+    crate::session_fixture::assert_new_session(
+        &handler
             .handle(Request::NewSession(NewSessionRequest {
                 session_name: session_name.clone(),
                 detached: true,
@@ -1685,8 +2104,7 @@ async fn create_session(handler: &RequestHandler, name: &str) -> SessionName {
                 environment: None,
             }))
             .await,
-        Response::NewSession(_)
-    ));
+    );
     session_name
 }
 
@@ -1739,7 +2157,7 @@ async fn create_quiet_session(handler: &RequestHandler, name: &str) -> SessionNa
             skip_environment_update: false,
         })))
         .await;
-    assert!(matches!(response, Response::NewSession(_)), "{response:?}");
+    crate::session_fixture::assert_new_session(&response);
     session_name
 }
 
@@ -1941,7 +2359,14 @@ async fn websocket_client_with_queue(
     handler: Arc<RequestHandler>,
     pre_auth: PreAuthQueue,
 ) -> (TcpStream, tokio::task::JoinHandle<io::Result<()>>) {
-    let (mut client, task) = raw_connection(handler, pre_auth).await;
+    let (client, task) = raw_connection(handler, pre_auth).await;
+    upgrade_test_websocket(client, task).await
+}
+
+async fn upgrade_test_websocket(
+    mut client: TcpStream,
+    task: tokio::task::JoinHandle<io::Result<()>>,
+) -> (TcpStream, tokio::task::JoinHandle<io::Result<()>>) {
     client
         .write_all(
             concat!(
@@ -2095,8 +2520,18 @@ async fn drive_handshake_through_auth(
     token_id: &str,
     auth: &str,
 ) -> HandshakeSession {
+    let (stream, task) = websocket_client(handler).await;
+    authenticate_test_websocket(stream, task, token, token_id, auth).await
+}
+
+async fn authenticate_test_websocket(
+    mut stream: TcpStream,
+    task: tokio::task::JoinHandle<io::Result<()>>,
+    token: &str,
+    token_id: &str,
+    auth: &str,
+) -> HandshakeSession {
     let psk = SecretHashForCrypto::from_secret(token).as_bytes();
-    let (mut stream, task) = websocket_client(handler).await;
 
     // Generate the client ephemeral X25519 key and the ML-KEM keypair, and
     // advertise the X25519 public key + ML-KEM encapsulation key.
@@ -2367,7 +2802,7 @@ fn push_client_frame_len(frame: &mut Vec<u8>, len: usize) {
 
 async fn read_encrypted_text(stream: &mut TcpStream, opener: &mut Opener) -> String {
     loop {
-        let frame = read_server_frame(stream).await;
+        let frame = read_server_data_frame(stream).await;
         match frame.opcode {
             OPCODE_BINARY => {
                 if let Message::Text(text) = opener
@@ -2377,7 +2812,10 @@ async fn read_encrypted_text(stream: &mut TcpStream, opener: &mut Opener) -> Str
                     return text;
                 }
             }
-            OPCODE_CLOSE => panic!("websocket closed before encrypted text frame"),
+            OPCODE_CLOSE => panic!(
+                "websocket closed before encrypted text frame: {}",
+                describe_close_payload(&frame.payload)
+            ),
             opcode => panic!("unexpected websocket opcode {opcode} before encrypted text frame"),
         }
     }
@@ -2389,7 +2827,7 @@ async fn read_encrypted_binary_frame(
     label: &str,
 ) -> Vec<u8> {
     loop {
-        let frame = read_server_frame(stream).await;
+        let frame = read_server_data_frame(stream).await;
         match frame.opcode {
             OPCODE_BINARY => {
                 if let Message::Binary(payload) = opener
@@ -2412,7 +2850,7 @@ async fn read_encrypted_binary_frame_with_prefix(
     label: &str,
 ) -> Vec<u8> {
     for _ in 0..MAX_INTERLEAVED_WEBSOCKET_FRAMES {
-        let frame = read_server_frame(stream).await;
+        let frame = read_server_data_frame(stream).await;
         match frame.opcode {
             OPCODE_BINARY => {
                 if let Message::Binary(payload) = opener
@@ -2439,7 +2877,7 @@ async fn read_encrypted_binary_frame_with_prefix_containing(
     label: &str,
 ) -> Vec<u8> {
     for _ in 0..MAX_INTERLEAVED_WEBSOCKET_FRAMES {
-        let frame = read_server_frame(stream).await;
+        let frame = read_server_data_frame(stream).await;
         match frame.opcode {
             OPCODE_BINARY => {
                 if let Message::Binary(payload) = opener
@@ -2465,6 +2903,19 @@ async fn read_server_frame(stream: &mut TcpStream) -> ServerFrame {
         .await
         .expect("websocket frame timeout")
         .expect("read websocket frame")
+}
+
+/// Reads the next non-ping frame and answers each keepalive ping as a browser
+/// does. The server pings every two seconds of real time, so a slow scenario
+/// sees pings between its data frames.
+async fn read_server_data_frame(stream: &mut TcpStream) -> ServerFrame {
+    loop {
+        let frame = read_server_frame(stream).await;
+        if frame.opcode != OPCODE_PING {
+            return frame;
+        }
+        write_client_frame(stream, OPCODE_PONG, &frame.payload).await;
+    }
 }
 
 async fn acknowledge_next_keepalive(stream: &mut TcpStream) {
@@ -2524,6 +2975,18 @@ async fn read_server_frame_inner(stream: &mut TcpStream) -> io::Result<ServerFra
     let mut payload = vec![0u8; len as usize];
     stream.read_exact(&mut payload).await?;
     Ok(ServerFrame { opcode, payload })
+}
+
+// Name the server's close code and reason, so a rejected client says why.
+fn describe_close_payload(payload: &[u8]) -> String {
+    match payload {
+        [high, low, reason @ ..] => format!(
+            "code {} reason {:?}",
+            u16::from_be_bytes([*high, *low]),
+            String::from_utf8_lossy(reason)
+        ),
+        _ => format!("payload {payload:?}"),
+    }
 }
 
 struct ServerFrame {

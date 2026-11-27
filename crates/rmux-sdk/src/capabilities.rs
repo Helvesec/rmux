@@ -1,10 +1,16 @@
 //! SDK capability negotiation helpers.
 
+use rmux_proto::capabilities::{
+    capability_availability, resolve_capability, CapabilityAvailability, CapabilityRequirement,
+};
 use std::sync::Arc;
 
 use crate::diagnostics::FEATURE_PROTOCOL_CAPABILITIES;
 use crate::transport::TransportClient;
 use crate::{Result, RmuxError};
+
+#[cfg(test)]
+mod tests;
 use rmux_proto::{
     HandshakeRequest, ProcessCommand, Request, Response, CAPABILITY_HANDSHAKE,
     CAPABILITY_SDK_PROCESS_COMMAND, RMUX_WIRE_VERSION,
@@ -17,9 +23,9 @@ pub(crate) async fn require(client: &TransportClient, capabilities: &[&str]) -> 
 /// Non-erroring probe: whether the daemon advertises every listed capability.
 pub(crate) async fn supports(client: &TransportClient, capabilities: &[&str]) -> Result<bool> {
     let supported = negotiated_capabilities_requiring(client, &[]).await?;
-    Ok(capabilities
-        .iter()
-        .all(|capability| supported.iter().any(|entry| entry == capability)))
+    Ok(capabilities.iter().all(|capability| {
+        capability_availability(capability, &supported) == CapabilityAvailability::Available
+    }))
 }
 
 pub(crate) async fn require_with_handshake(
@@ -72,11 +78,13 @@ async fn negotiated_capabilities_requiring(
             ensure_capability(&response.capabilities, CAPABILITY_HANDSHAKE)?;
             Ok(client.cache_capabilities(response.capabilities).await)
         }
-        Response::Error(error) => Err(error.into()),
-        response => Err(RmuxError::protocol(rmux_proto::RmuxError::Server(format!(
-            "rmux daemon sent `{}` response for capability handshake",
-            response.command_name()
-        )))),
+        Response::Error(error) => Err(RmuxError::from_proto(error.error)),
+        response => Err(RmuxError::from_proto(rmux_proto::RmuxError::Server(
+            format!(
+                "rmux daemon sent `{}` response for capability handshake",
+                response.command_name()
+            ),
+        ))),
     }
 }
 
@@ -93,7 +101,7 @@ fn ensure_selected_wire_version(wire_version: u32) -> Result<()> {
         return Ok(());
     }
 
-    Err(RmuxError::protocol(
+    Err(RmuxError::from_proto(
         rmux_proto::RmuxError::UnsupportedWireVersion {
             got: wire_version,
             minimum: RMUX_WIRE_VERSION,
@@ -103,23 +111,16 @@ fn ensure_selected_wire_version(wire_version: u32) -> Result<()> {
 }
 
 fn ensure_capability(supported: &[String], capability: &str) -> Result<()> {
-    if supported.iter().any(|supported| supported == capability) {
-        return Ok(());
-    }
-
-    Err(RmuxError::protocol(
-        rmux_proto::RmuxError::UnsupportedCapability {
-            feature: capability.to_owned(),
-            supported: supported.to_vec(),
-        },
-    ))
+    resolve_capability(capability, CapabilityRequirement::Required, supported)
+        .map(|_| ())
+        .map_err(RmuxError::from_proto)
 }
 
 fn normalize_handshake_error(error: RmuxError) -> RmuxError {
+    if let Some(rmux_proto::RmuxError::Decode(message)) = error.protocol_source() {
+        return unsupported_handshake_error(message);
+    }
     match error {
-        RmuxError::Protocol {
-            source: rmux_proto::RmuxError::Decode(message),
-        } => unsupported_handshake_error(&message),
         RmuxError::Unsupported { feature, .. }
             if feature == crate::diagnostics::command_feature_id("handshake") =>
         {

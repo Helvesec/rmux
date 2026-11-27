@@ -1,5 +1,5 @@
 #[cfg(windows)]
-use std::ffi::{OsStr, OsString};
+use std::ffi::OsString;
 #[cfg(all(test, unix))]
 use std::fs;
 use std::io;
@@ -8,6 +8,7 @@ use std::io::Read;
 #[cfg(windows)]
 use std::io::Write;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex as StdMutex};
 #[cfg(windows)]
 use std::time::Duration;
@@ -21,10 +22,12 @@ use rmux_ipc::connect_blocking;
 use rmux_ipc::LocalEndpoint;
 #[cfg(windows)]
 use rmux_ipc::LocalListener;
+use rmux_os::daemon::StartupReadyNotification;
 #[cfg(windows)]
 use rmux_proto::{
     encode_frame, FrameDecoder, HasSessionRequest, Request, Response, RmuxError, SessionName,
 };
+use rmux_pty::{ProcessShell, RmuxShell};
 
 use crate::listener;
 use crate::listener_options::ServeOptions;
@@ -83,9 +86,7 @@ pub struct DaemonConfig {
     web_port: u16,
     web_port_explicit: bool,
     web_required: bool,
-    startup_ready_fd: Option<i32>,
-    #[cfg(windows)]
-    startup_ready_event: Option<OsString>,
+    startup_ready: StartupReadyNotification,
 }
 
 impl DaemonConfig {
@@ -100,9 +101,7 @@ impl DaemonConfig {
             web_port: DEFAULT_WEB_PORT,
             web_port_explicit: false,
             web_required: false,
-            startup_ready_fd: None,
-            #[cfg(windows)]
-            startup_ready_event: None,
+            startup_ready: StartupReadyNotification::default(),
         }
     }
 
@@ -208,26 +207,16 @@ impl DaemonConfig {
     #[cfg(target_os = "linux")]
     #[must_use]
     pub const fn with_startup_ready_fd(mut self, ready_fd: i32) -> Self {
-        self.startup_ready_fd = Some(ready_fd);
+        self.startup_ready = StartupReadyNotification::from_inherited_fd(ready_fd);
         self
-    }
-
-    #[cfg(unix)]
-    const fn startup_ready_fd(&self) -> Option<i32> {
-        self.startup_ready_fd
     }
 
     /// Signals this named Win32 event after the daemon listener is bound.
     #[cfg(windows)]
     #[must_use]
     pub fn with_startup_ready_event(mut self, ready_event: OsString) -> Self {
-        self.startup_ready_event = Some(ready_event);
+        self.startup_ready = StartupReadyNotification::from_event_name(ready_event);
         self
-    }
-
-    #[cfg(windows)]
-    fn startup_ready_event(&self) -> Option<&OsStr> {
-        self.startup_ready_event.as_deref()
     }
 }
 
@@ -289,6 +278,8 @@ pub struct ServerDaemon {
 #[derive(Debug, Clone)]
 pub(crate) struct ShutdownHandle {
     sender: Arc<StdMutex<Option<oneshot::Sender<()>>>>,
+    releases_endpoint_early: Arc<AtomicBool>,
+    endpoint_promised_until_drain: Arc<AtomicBool>,
 }
 
 impl ShutdownHandle {
@@ -297,13 +288,47 @@ impl ShutdownHandle {
         (
             Self {
                 sender: Arc::new(StdMutex::new(Some(sender))),
+                releases_endpoint_early: Arc::new(AtomicBool::new(false)),
+                endpoint_promised_until_drain: Arc::new(AtomicBool::new(false)),
             },
             receiver,
         )
     }
 
     pub(crate) fn request_shutdown(&self) {
+        self.request(false);
+    }
+
+    /// Requests the shutdown of a daemon that exits because it became idle.
+    ///
+    /// Nobody waits for its endpoint to disappear, so the daemon may release
+    /// it once it stops accepting instead of at the end of its drain.
+    pub(crate) fn request_idle_shutdown(&self) {
+        self.request(true);
+    }
+
+    /// Records that a seamless-upgrade client was told this daemon shuts down.
+    ///
+    /// That client relaunches without the startup lock as soon as the endpoint
+    /// disappears, so whichever shutdown follows, idle or not, keeps the
+    /// endpoint bound until the end of its drain.
+    pub(crate) fn promise_endpoint_until_drain(&self) {
+        self.endpoint_promised_until_drain
+            .store(true, Ordering::SeqCst);
+    }
+
+    /// Whether the shutdown that was requested first was an idle one and no
+    /// upgrade client was promised the endpoint until the drain.
+    #[cfg(unix)]
+    pub(crate) fn releases_endpoint_early(&self) -> bool {
+        self.releases_endpoint_early.load(Ordering::SeqCst)
+            && !self.endpoint_promised_until_drain.load(Ordering::SeqCst)
+    }
+
+    fn request(&self, releases_endpoint_early: bool) {
         if let Some(sender) = self.sender.lock().expect("shutdown sender").take() {
+            self.releases_endpoint_early
+                .store(releases_endpoint_early, Ordering::SeqCst);
             let _ = sender.send(());
         }
     }
@@ -317,7 +342,40 @@ impl ServerDaemon {
     }
 
     /// Binds the local IPC endpoint, starts accepting requests, and returns a handle.
+    ///
+    /// Panes and popups are spawned as operating-system processes through
+    /// [`ProcessShell`].
     pub async fn bind(self) -> io::Result<ServerHandle> {
+        self.bind_with_shell(Arc::new(ProcessShell)).await
+    }
+
+    /// Binds like [`bind`](Self::bind) but spawns every pane and popup of this
+    /// server through `shell` instead of [`ProcessShell`].
+    pub async fn bind_with_shell(self, shell: Arc<dyn RmuxShell>) -> io::Result<ServerHandle> {
+        #[cfg(unix)]
+        {
+            self.bind_inner(shell, None).await
+        }
+        #[cfg(not(unix))]
+        {
+            self.bind_inner(shell).await
+        }
+    }
+
+    /// Binds with the private socket owned by the client bootstrapping this generation.
+    #[cfg(unix)]
+    pub async fn bind_with_startup_owner(
+        self,
+        owner: Option<std::os::unix::net::UnixStream>,
+    ) -> io::Result<ServerHandle> {
+        self.bind_inner(Arc::new(ProcessShell), owner).await
+    }
+
+    async fn bind_inner(
+        self,
+        shell: Arc<dyn RmuxShell>,
+        #[cfg(unix)] startup_owner: Option<std::os::unix::net::UnixStream>,
+    ) -> io::Result<ServerHandle> {
         #[cfg(unix)]
         {
             let bound_listener = bind_unix_listener_at(self.config.socket_path())?;
@@ -329,10 +387,11 @@ impl ServerDaemon {
             let signal_watcher = crate::signals::SignalWatcher::install()?;
             let socket_path = self.config.socket_path().to_path_buf();
             let owner_uid = real_user_id()?;
-            let serve_options = ServeOptions::new(
+            let mut serve_options = ServeOptions::new(
                 self.config.config_load().clone(),
                 self.config.subscription_limits(),
                 owner_uid,
+                Arc::clone(&shell),
             )
             .with_web_options(
                 self.config.web_port(),
@@ -343,6 +402,7 @@ impl ServerDaemon {
             .with_socket_identity(bound_listener.identity)
             .with_socket_access(socket_access)
             .with_server_signals(signal_watcher);
+            serve_options.startup_owner = startup_owner;
 
             let task = tokio::spawn(listener::serve(
                 bound_listener.listener,
@@ -351,9 +411,7 @@ impl ServerDaemon {
                 shutdown_receiver,
                 serve_options,
             ));
-            if let Some(ready_fd) = self.config.startup_ready_fd() {
-                signal_startup_ready_fd(ready_fd);
-            }
+            let _ = self.config.startup_ready.signal();
 
             Ok(ServerHandle {
                 socket_path,
@@ -373,6 +431,7 @@ impl ServerDaemon {
                 self.config.config_load().clone(),
                 self.config.subscription_limits(),
                 owner_uid,
+                Arc::clone(&shell),
             )
             .with_web_options(
                 self.config.web_port(),
@@ -388,9 +447,7 @@ impl ServerDaemon {
                 shutdown_receiver,
                 serve_options,
             ));
-            if let Some(ready_event) = self.config.startup_ready_event() {
-                signal_startup_ready_event(ready_event);
-            }
+            let _ = self.config.startup_ready.signal();
 
             Ok(ServerHandle {
                 socket_path,
@@ -399,19 +456,6 @@ impl ServerDaemon {
             })
         }
     }
-}
-
-#[cfg(unix)]
-fn signal_startup_ready_fd(_ready_fd: i32) {
-    #[cfg(target_os = "linux")]
-    {
-        let _ = rmux_os::daemon::signal_startup_ready_fd(_ready_fd);
-    }
-}
-
-#[cfg(windows)]
-fn signal_startup_ready_event(ready_event: &OsStr) {
-    let _ = rmux_os::daemon::signal_startup_ready_event(ready_event);
 }
 
 #[cfg(windows)]

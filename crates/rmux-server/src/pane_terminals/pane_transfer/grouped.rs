@@ -1,6 +1,6 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
-use rmux_core::{BreakPaneOptions, PaneId, PaneJoinOptions, PaneSwapOptions, SessionPaneTarget};
+use rmux_core::{BreakPaneOptions, PaneId, PaneJoinOptions, PaneSwapOptions};
 use rmux_proto::{
     BreakPaneRequest, BreakPaneResponse, JoinPaneRequest, JoinPaneResponse, PaneTarget, RmuxError,
     SessionName, SwapPaneResponse, WindowTarget,
@@ -9,6 +9,13 @@ use rmux_proto::{
 use super::super::{session_not_found, HandlerState};
 use super::window_metadata::PaneTransferWindowMetadata;
 use super::{join_pane_internal_direction, pane_id_for_target, pane_index_for_id};
+
+mod runtime_moves;
+
+use runtime_moves::{
+    move_grouped_runtime_pane, move_grouped_runtime_swap, rollback_grouped_runtime_pane,
+    rollback_grouped_runtime_swap,
+};
 
 impl HandlerState {
     pub(super) fn swap_pane_within_group(
@@ -43,12 +50,21 @@ impl HandlerState {
 
         let (response, ()) = self.mutate_session_transfer_and_resize_terminals(
             &session_name,
-            |session| {
-                session.swap_panes(
-                    SessionPaneTarget::from(&source),
-                    SessionPaneTarget::from(&target),
+            |store, snapshot| {
+                let transfer = store.swap_panes(
+                    &WindowTarget::with_window(
+                        source.session_name().clone(),
+                        source.window_index(),
+                    ),
+                    source.pane_index(),
+                    &WindowTarget::with_window(
+                        target.session_name().clone(),
+                        target.window_index(),
+                    ),
+                    target.pane_index(),
                     PaneSwapOptions::new(detached, preserve_zoom),
                 )?;
+                snapshot.retain_transfer(transfer);
                 Ok(SwapPaneResponse {
                     source: source.clone(),
                     target: target.clone(),
@@ -127,10 +143,18 @@ impl HandlerState {
         let direction = join_pane_internal_direction(request.direction);
         let (_, destroyed_sessions) = self.mutate_session_transfer_and_resize_terminals(
             &session_name,
-            |session| {
-                session.join_pane(
-                    SessionPaneTarget::from(&request.source),
-                    SessionPaneTarget::from(&request.target),
+            |store, snapshot| {
+                let transfer = store.join_pane_for_runtime_transfer(
+                    &WindowTarget::with_window(
+                        request.source.session_name().clone(),
+                        request.source.window_index(),
+                    ),
+                    request.source.pane_index(),
+                    &WindowTarget::with_window(
+                        request.target.session_name().clone(),
+                        request.target.window_index(),
+                    ),
+                    request.target.pane_index(),
                     PaneJoinOptions::new(
                         direction,
                         request.detached,
@@ -139,10 +163,15 @@ impl HandlerState {
                         request.size,
                     ),
                 )?;
-                let moved_index = pane_index_for_id(session, target.window_index(), moved_pane_id)
-                    .ok_or_else(|| {
-                        RmuxError::Server("moved pane disappeared after join-pane".to_owned())
-                    })?;
+                snapshot.retain_transfer(transfer);
+                let moved_index = pane_index_for_id(
+                    store.session(&session_name).expect("destination survives"),
+                    target.window_index(),
+                    moved_pane_id,
+                )
+                .ok_or_else(|| {
+                    RmuxError::Server("moved pane disappeared after join-pane".to_owned())
+                })?;
                 Ok(JoinPaneResponse {
                     target: PaneTarget::with_window(
                         session_name.clone(),
@@ -221,9 +250,14 @@ impl HandlerState {
         )?;
         let (response, ()) = self.mutate_session_transfer_and_resize_terminals(
             &session_name,
-            |session| {
-                let destination_index = session.break_pane(
-                    SessionPaneTarget::from(&request.source),
+            |store, snapshot| {
+                let result = store.break_pane_for_runtime_transfer(
+                    &WindowTarget::with_window(
+                        request.source.session_name().clone(),
+                        request.source.window_index(),
+                    ),
+                    request.source.pane_index(),
+                    &destination_session_name,
                     BreakPaneOptions::new(
                         request.target.as_ref().map(WindowTarget::window_index),
                         request.name.clone(),
@@ -232,6 +266,8 @@ impl HandlerState {
                         request.before,
                     ),
                 )?;
+                let destination_index = result.window_index;
+                snapshot.retain_transfer(result.transfer);
                 Ok(BreakPaneResponse {
                     target: PaneTarget::with_window(
                         destination_session_name.clone(),
@@ -385,11 +421,10 @@ impl HandlerState {
     }
 }
 
-fn window_ids_by_index(session: &rmux_core::Session) -> BTreeMap<u32, u32> {
+fn window_ids_by_index(session: rmux_core::ManagedSessionView<'_>) -> BTreeMap<u32, u32> {
     session
         .windows()
-        .iter()
-        .map(|(window_index, window)| (*window_index, window.id().as_u32()))
+        .map(|(window_index, window)| (window_index, window.id().as_u32()))
         .collect()
 }
 
@@ -504,96 +539,4 @@ fn remap_pane_slot_windows(
             (*pane_id, targets)
         })
         .collect()
-}
-
-fn move_grouped_runtime_pane(
-    state: &mut HandlerState,
-    source_runtime: &SessionName,
-    destination_runtime: &SessionName,
-    pane_id: PaneId,
-) -> Result<(), RmuxError> {
-    state
-        .terminals
-        .move_panes_between_sessions(source_runtime, destination_runtime, &[pane_id])?;
-    if let Err(error) =
-        state.move_pane_outputs_between_sessions(source_runtime, destination_runtime, &[pane_id])
-    {
-        state.terminals.move_panes_between_sessions(
-            destination_runtime,
-            source_runtime,
-            &[pane_id],
-        )?;
-        return Err(error);
-    }
-    Ok(())
-}
-
-fn rollback_grouped_runtime_pane(
-    state: &mut HandlerState,
-    source_runtime: &SessionName,
-    destination_runtime: &SessionName,
-    pane_id: PaneId,
-) -> Result<(), RmuxError> {
-    let output_result =
-        state.move_pane_outputs_between_sessions(destination_runtime, source_runtime, &[pane_id]);
-    let terminal_result = state.terminals.move_panes_between_sessions(
-        destination_runtime,
-        source_runtime,
-        &[pane_id],
-    );
-    output_result?;
-    terminal_result
-}
-
-fn move_grouped_runtime_swap(
-    state: &mut HandlerState,
-    source_runtime: &SessionName,
-    source_pane_id: PaneId,
-    target_runtime: &SessionName,
-    target_pane_id: PaneId,
-) -> Result<(), RmuxError> {
-    state.terminals.swap_panes_between_sessions(
-        source_runtime,
-        &[source_pane_id],
-        target_runtime,
-        &[target_pane_id],
-    )?;
-    if let Err(error) = state.swap_pane_outputs_between_sessions(
-        source_runtime,
-        &[source_pane_id],
-        target_runtime,
-        &[target_pane_id],
-    ) {
-        state.terminals.swap_panes_between_sessions(
-            source_runtime,
-            &[target_pane_id],
-            target_runtime,
-            &[source_pane_id],
-        )?;
-        return Err(error);
-    }
-    Ok(())
-}
-
-fn rollback_grouped_runtime_swap(
-    state: &mut HandlerState,
-    source_runtime: &SessionName,
-    source_pane_id: PaneId,
-    target_runtime: &SessionName,
-    target_pane_id: PaneId,
-) -> Result<(), RmuxError> {
-    let output_result = state.swap_pane_outputs_between_sessions(
-        source_runtime,
-        &[target_pane_id],
-        target_runtime,
-        &[source_pane_id],
-    );
-    let terminal_result = state.terminals.swap_panes_between_sessions(
-        source_runtime,
-        &[target_pane_id],
-        target_runtime,
-        &[source_pane_id],
-    );
-    output_result?;
-    terminal_result
 }

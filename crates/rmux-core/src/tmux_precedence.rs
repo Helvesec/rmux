@@ -62,7 +62,7 @@ fn normalize_resize_pane(arguments: Vec<String>) -> Vec<String> {
     collapse_short_flag_group_by_priority_in_option_prefix(
         arguments,
         &['L', 'R', 'U', 'D'],
-        &BTreeSet::from(['t', 'x', 'y']),
+        &BTreeSet::from(['t', 'x', 'y', 'X', 'Y']),
     )
 }
 

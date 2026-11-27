@@ -1,6 +1,5 @@
 use super::{CommandParseError, CommandParser, EnvironmentAssignment};
 
-#[path = "lexer/word.rs"]
 mod word;
 
 use self::word::classify_word;

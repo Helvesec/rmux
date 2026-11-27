@@ -339,3 +339,115 @@ fn compact_ascii_data_end_survives_materialization_without_absorbing_padding() {
     assert_eq!(line.plain_text(), Some(""));
     assert!(line.cell(0).expect("cleared cell").is_blank());
 }
+
+#[test]
+fn wide_prewrap_preserves_cached_explicit_spaces_across_cursor_paths_and_reflow() {
+    // tmux 3.7b, measured 2026-09-05: the explicit last-column space remains
+    // part of the joined text through 80 -> 40 -> 80, including an all-space row.
+    for position in ["\x1b[80G", "\x1b[1;80H", "\r\x1b[79C"] {
+        for prefix in [String::new(), "abc".to_owned(), "a".repeat(79)] {
+            let mut screen = screen(80, 24, 1_000, b"");
+            let mut parser = InputParser::new();
+            parser.parse(format!("{prefix}{position} ").as_bytes(), &mut screen);
+            let line = screen.grid().visible_line(0).unwrap();
+            assert_eq!(line.plain_text(), Some(prefix.as_str()));
+            assert!(!line.cell(79).unwrap().is_blank());
+
+            // The empty-prefix CHA case is exactly ESC[80G SP ESC[80G 표.
+            // It asserted in mark_reflow_gap before the mutation guard fix.
+            parser.parse(format!("{position}표").as_bytes(), &mut screen);
+            let line = screen.grid().visible_line(0).unwrap();
+            assert!(line.flags().contains(GridLineFlags::WRAPPED));
+            assert!(!line.cell(79).unwrap().is_reflow_gap());
+            assert!(!line.cell(79).unwrap().is_blank());
+            assert_eq!(screen.cursor_position(), (2, 1));
+            assert!(screen.grid().visible_line(1).unwrap().is_padding_cell(1));
+
+            let padded = format!("{prefix:<80}");
+            let logical = format!("{padded}표");
+            let joined = format!("{logical}{}", "\n".repeat(23));
+            for cols in [80, 40, 80] {
+                if screen.size().cols != cols {
+                    screen.resize(TerminalSize { cols, rows: 24 });
+                }
+                let mut raw = String::new();
+                for chunk in padded.as_bytes().chunks(usize::from(cols)) {
+                    raw.push_str(std::str::from_utf8(chunk).unwrap().trim_end_matches(' '));
+                    raw.push('\n');
+                }
+                raw.push('표');
+                raw.push_str(&"\n".repeat(23));
+                assert_eq!(raw_capture(&screen), raw.as_bytes(), "{position:?}, {cols}");
+                assert_eq!(
+                    joined_capture(&screen),
+                    joined.as_bytes(),
+                    "{position:?}, {cols}"
+                );
+                assert_eq!(screen.capture_grid(true).lines[0], logical);
+            }
+        }
+    }
+}
+
+#[test]
+fn wide_prewrap_distinguishes_unused_suffix_and_ordinary_overwrite() {
+    for (payload, gap, cursor, wrapped) in [
+        ("\x1b[80G표", 1, (2, 1), true),
+        (" \x1b[80G표", 1, (2, 1), true),
+        ("\x1b[80Gx\x1b[80G표", 0, (2, 1), true),
+        ("\x1b[80G \x1b[80GA", 0, (79, 0), false),
+    ] {
+        let screen = screen(80, 24, 1_000, payload.as_bytes());
+        assert_eq!(screen.cursor_position(), cursor, "{payload:?}");
+        assert_eq!(
+            screen.grid().absolute_line_trailing_reflow_gap(0),
+            Some(gap)
+        );
+        assert_eq!(
+            screen
+                .grid()
+                .visible_line(0)
+                .unwrap()
+                .flags()
+                .contains(GridLineFlags::WRAPPED),
+            wrapped
+        );
+        let last = screen.grid().visible_line(0).unwrap().cell(79).unwrap();
+        assert_eq!(last.is_blank(), gap == 1);
+        if !wrapped {
+            assert_eq!(last.text(), "A");
+        }
+    }
+}
+
+#[test]
+fn wide_prewrap_line_edits_restore_only_existing_trailing_gaps() {
+    // tmux 3.7b, measured 2026-09-05 in an 8x4 pane. DCH/ICH retain an
+    // existing final placement gap only on the applicable mutation paths;
+    // an explicit space must never acquire that metadata.
+    for (edit, raw_prefix, gap) in [
+        ("\x1b[1;8H\x1b[@", "abcdefg", 1),
+        ("\x1b[1;1H\x1b[P", "bcdefg", 1),
+        ("\x1b[1;8H\x1b[P", "abcdefg", 1),
+        ("\x1b[1;1H\x1b[@", " abcdefg", 0),
+    ] {
+        for explicit in [false, true] {
+            let suffix = if explicit { " \x1b[8G" } else { "" };
+            let payload = format!("abcdefg{suffix}표{edit}");
+            let screen = screen(8, 4, 20, payload.as_bytes());
+            assert_eq!(
+                raw_capture(&screen),
+                format!("{raw_prefix}\n표\n\n\n").as_bytes()
+            );
+            assert_eq!(
+                screen.grid().absolute_line_trailing_reflow_gap(0),
+                Some(if explicit { 0 } else { gap }),
+                "{edit:?}, explicit={explicit}"
+            );
+            let line = screen.grid().visible_line(0).unwrap();
+            for cell in line.cells().iter().filter(|cell| cell.is_reflow_gap()) {
+                assert!(cell.is_blank());
+            }
+        }
+    }
+}

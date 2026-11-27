@@ -1,3 +1,5 @@
+#[cfg(test)]
+use crate::session_fixture::SessionSetupExt as _;
 use std::time::Duration;
 
 use super::*;
@@ -66,9 +68,9 @@ async fn parsed_implicit_mutation_revalidates_after_slot_replacement() {
 
     let replacement_id = {
         let mut state = handler.state.lock().await;
-        let session = state
+        let mut session = state
             .sessions
-            .session_mut(&session_name)
+            .session_setup(&session_name)
             .expect("session exists");
         session
             .remove_window_allowing_empty(0)
@@ -105,7 +107,7 @@ async fn implicit_pane_role_revalidates_after_same_window_slot_replacement() {
         let session_name = create_session_in_state(&mut state, "retained-pane-role");
         state
             .sessions
-            .session_mut(&session_name)
+            .session_setup(&session_name)
             .expect("session exists")
             .split_active_pane()
             .expect("create second pane");
@@ -139,9 +141,9 @@ async fn implicit_pane_role_revalidates_after_same_window_slot_replacement() {
 
     {
         let mut state = handler.state.lock().await;
-        state
+        let _ = state
             .sessions
-            .session_mut(&session_name)
+            .session_setup(&session_name)
             .expect("session remains live")
             .swap_panes(
                 SessionPaneTarget::new(0, 0),
@@ -269,9 +271,9 @@ async fn explicit_send_keys_revalidates_before_copy_mode_effects() {
 
     {
         let mut state = handler.state.lock().await;
-        state
+        let _ = state
             .sessions
-            .session_mut(&session_name)
+            .session_setup(&session_name)
             .expect("session remains live")
             .swap_panes(
                 SessionPaneTarget::new(0, 0),
@@ -306,11 +308,7 @@ async fn explicit_send_keys_revalidates_before_copy_mode_effects() {
         .transcript_handle(&target)
         .expect("replacement transcript remains available");
     assert!(
-        transcript
-            .lock()
-            .expect("replacement transcript lock")
-            .copy_mode_state()
-            .is_some(),
+        transcript.lock().copy_mode_state().is_some(),
         "rejected send-keys must not cancel copy mode on the replacement pane"
     );
 }
@@ -401,7 +399,7 @@ async fn join_pane_implicit_source_revalidates_after_slot_replacement() {
 
     {
         let mut state = handler.state.lock().await;
-        let session = state.sessions.session_mut(&alpha).expect("source exists");
+        let mut session = state.sessions.session_setup(&alpha).expect("source exists");
         session
             .remove_window_allowing_empty(0)
             .expect("remove implicit source");
@@ -439,7 +437,7 @@ async fn assert_session_command_rejects_stale_window(command_name: &str, command
                 create_session_in_state(&mut state, &format!("retained-{command_name}-{replace}"));
             state
                 .sessions
-                .session_mut(&session_name)
+                .session_setup(&session_name)
                 .expect("session exists")
                 .create_window(terminal_size())
                 .expect("create surviving window");
@@ -463,9 +461,9 @@ async fn assert_session_command_rejects_stale_window(command_name: &str, command
 
         {
             let mut state = handler.state.lock().await;
-            let session = state
+            let mut session = state
                 .sessions
-                .session_mut(&session_name)
+                .session_setup(&session_name)
                 .expect("session survives");
             session
                 .remove_window_allowing_empty(0)
@@ -522,9 +520,9 @@ async fn queued_new_window_relative_target_keeps_its_captured_anchor() {
     assert!(matches!(response, Response::NewWindow(_)), "{response:?}");
     {
         let mut state = handler.state.lock().await;
-        let session = state
+        let mut session = state
             .sessions
-            .session_mut(&session_name)
+            .session_setup(&session_name)
             .expect("session exists");
         session.select_window(0).expect("select relative anchor");
     }
@@ -549,7 +547,7 @@ async fn queued_new_window_relative_target_keeps_its_captured_anchor() {
         .lock()
         .await
         .sessions
-        .session_mut(&session_name)
+        .session_setup(&session_name)
         .expect("session exists")
         .select_window(2)
         .expect("move the live active cursor after capture");
@@ -581,7 +579,7 @@ async fn queued_new_window_insert_rejects_replaced_before_and_after_anchors() {
                 create_session_in_state(&mut state, &format!("queued-new-window-anchor-{flag}"));
             state
                 .sessions
-                .session_mut(&session_name)
+                .session_setup(&session_name)
                 .expect("session exists")
                 .insert_window_with_initial_pane(1, terminal_size())
                 .expect("create neighboring window");
@@ -605,9 +603,9 @@ async fn queued_new_window_insert_rejects_replaced_before_and_after_anchors() {
 
         let replacement_id = {
             let mut state = handler.state.lock().await;
-            let session = state
+            let mut session = state
                 .sessions
-                .session_mut(&session_name)
+                .session_setup(&session_name)
                 .expect("session exists");
             session
                 .remove_window_allowing_empty(0)
@@ -637,7 +635,7 @@ async fn queued_new_window_insert_rejects_replaced_before_and_after_anchors() {
         );
         assert!(session
             .windows()
-            .values()
+            .map(|(_, window)| window)
             .all(|window| window.name() != Some("stale-placement-anchor")));
     }
 }
@@ -737,10 +735,10 @@ async fn queued_new_window_kill_revalidates_the_destination_at_replacement() {
         .sessions
         .session(&session_name)
         .expect("destination session survives");
-    assert_eq!(session.windows().len(), 1);
+    assert_eq!(session.windows().count(), 1);
     assert!(session
         .windows()
-        .values()
+        .map(|(_, window)| window)
         .all(|window| window.name() != Some("stale-kill-window")));
     assert!(state
         .buffers
@@ -795,7 +793,7 @@ async fn queued_new_window_kill_publishes_only_the_committed_window_identity() {
             .session(&session_name)
             .expect("session survives");
         assert_eq!(
-            session.windows().len(),
+            session.windows().count(),
             1,
             "temporary window must be gone before lifecycle publication"
         );
@@ -823,7 +821,7 @@ async fn queued_new_window_kill_publishes_only_the_committed_window_identity() {
             .sessions
             .session(&session_name)
             .expect("session survives");
-        assert_eq!(session.windows().len(), 1);
+        assert_eq!(session.windows().count(), 1);
         let committed = session.window_at(0).expect("committed window exists");
         assert_eq!(committed.name(), Some("committed-window"));
         assert_eq!(
@@ -869,7 +867,7 @@ async fn implicit_session_role_rejects_a_post_parse_alias_move() {
         let beta = create_session_in_state(&mut state, "retained-alias-move-beta");
         state
             .sessions
-            .session_mut(&alpha)
+            .session_setup(&alpha)
             .expect("source session exists")
             .create_window(terminal_size())
             .expect("source session keeps a spare window");
@@ -877,13 +875,13 @@ async fn implicit_session_role_rejects_a_post_parse_alias_move() {
             .sessions
             .session(&alpha)
             .and_then(|session| session.window_at(0))
-            .cloned()
+            .map(|window| window.id())
             .expect("retained window exists");
         state
             .sessions
-            .session_mut(&beta)
+            .session_setup(&beta)
             .expect("alias session exists")
-            .link_window(1, retained_window, false, false)
+            .link_window_id(1, retained_window, false, false)
             .expect("link retained window into alias session");
         (alpha, beta)
     };
@@ -906,7 +904,7 @@ async fn implicit_session_role_rejects_a_post_parse_alias_move() {
         let mut state = handler.state.lock().await;
         state
             .sessions
-            .session_mut(&alpha)
+            .session_setup(&alpha)
             .expect("source session survives")
             .remove_window_allowing_empty(0)
             .expect("unlink parsed alias while stable window survives elsewhere");
@@ -926,7 +924,7 @@ async fn implicit_session_role_rejects_a_post_parse_alias_move() {
             .session(&alpha)
             .expect("source session remains")
             .windows()
-            .len(),
+            .count(),
         1
     );
     assert!(state
@@ -960,9 +958,9 @@ async fn assert_read_rejects_replaced_target(command_name: &str, command: &str) 
 
     {
         let mut state = handler.state.lock().await;
-        let session = state
+        let mut session = state
             .sessions
-            .session_mut(&session_name)
+            .session_setup(&session_name)
             .expect("session exists");
         session
             .remove_window_allowing_empty(0)
@@ -1100,15 +1098,51 @@ async fn capture_pane_read_revalidates_after_slot_replacement() {
 
 #[tokio::test]
 async fn explicit_target_bypasses_retired_lifecycle_role_and_remains_pinned() {
-    for replace in [false, true] {
+    for (surviving_window, replace) in [(false, false), (true, false), (false, true)] {
         let handler = RequestHandler::new();
         let alpha = create_handler_session(&handler, &format!("retained-explicit-{replace}")).await;
         let beta =
             create_handler_session(&handler, &format!("explicit-destination-{replace}")).await;
+        let (attach_tx, _attach_rx) = mpsc::unbounded_channel();
+        handler
+            .register_attach(619_901, beta.clone(), attach_tx)
+            .await;
+        let (control_tx, _control_rx) =
+            mpsc::channel(crate::control::CONTROL_SERVER_EVENT_CAPACITY);
+        handler
+            .register_control_with_closing(
+                619_902,
+                crate::control::ControlModeUpgrade {
+                    initial_command_count: 0,
+                    mode: rmux_proto::ControlMode::Plain,
+                    terminal_context: crate::outer_terminal::OuterTerminalContext::default(),
+                },
+                control_tx,
+                std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            )
+            .await;
+        handler
+            .set_control_session(619_902, Some(beta.clone()))
+            .await
+            .expect("control client attaches to explicit destination");
+        let clients_before = handler.client_loop_snapshots().await;
+        assert_eq!(clients_before.len(), 2);
+        let destination_identity = {
+            let state = handler.state.lock().await;
+            let session = state.sessions.session(&beta).expect("destination exists");
+            (session.id(), session.window_id(0), session.active_pane_id())
+        };
         let (current_target, lease) = retained_alert_binding(&handler, &alpha).await;
         {
             let mut state = handler.state.lock().await;
-            let session = state.sessions.session_mut(&alpha).expect("source exists");
+            let mut session = state.sessions.session_setup(&alpha).expect("source exists");
+            let source_id = session.id();
+            let retired_id = session.window().id();
+            if surviving_window {
+                session
+                    .create_window(terminal_size())
+                    .expect("surviving window");
+            }
             session
                 .remove_window_allowing_empty(0)
                 .expect("remove implicit lifecycle window");
@@ -1117,7 +1151,30 @@ async fn explicit_target_bypasses_retired_lifecycle_role_and_remains_pinned() {
                     .insert_window_with_initial_pane(0, terminal_size())
                     .expect("replace implicit lifecycle window");
             }
+            // This fixture uses the runtime teardown primitive, which defers
+            // session destruction. Complete that transaction before snapshots
+            // can observe the store, just as the real removal paths do.
+            if !surviving_window && !replace {
+                let removed = state
+                    .sessions
+                    .remove_session(&alpha)
+                    .expect("remove empty source");
+                assert_eq!(removed.id(), source_id);
+            } else {
+                let source = state.sessions.session(&alpha).expect("source survives");
+                assert_eq!(source.id(), source_id);
+                assert_ne!(source.window().id(), retired_id);
+            }
             state.retire_removed_lifecycle_targets();
+            if replace {
+                assert!(matches!(lease.resolve(&state), LeaseResolution::Replaced));
+            } else {
+                assert_retired(&lease, &state);
+            }
+            assert!(state
+                .sessions
+                .iter()
+                .all(|session| { session.window_at(session.active_window_index()).is_some() }));
         }
 
         handler
@@ -1130,7 +1187,18 @@ async fn explicit_target_bypasses_retired_lifecycle_role_and_remains_pinned() {
             .await
             .expect("explicit target bypasses stale implicit lifecycle role");
 
+        assert_eq!(handler.client_loop_snapshots().await, clients_before);
         let state = handler.state.lock().await;
+        let destination = state.sessions.session(&beta).expect("destination survives");
+        assert_eq!(
+            (
+                destination.id(),
+                destination.window_id(0),
+                destination.active_pane_id()
+            ),
+            destination_identity,
+            "the explicit target retains its session, window and pane identities"
+        );
         assert_eq!(
             state
                 .sessions
@@ -1139,5 +1207,10 @@ async fn explicit_target_bypasses_retired_lifecycle_role_and_remains_pinned() {
                 .and_then(rmux_core::Window::name),
             Some("explicit-target")
         );
+        if let Some(source) = state.sessions.session(&alpha) {
+            assert!(source
+                .windows()
+                .all(|(_, window)| window.name() != Some("explicit-target")));
+        }
     }
 }

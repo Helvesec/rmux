@@ -1,0 +1,560 @@
+{
+  "schema": "rmux-d570-recorded-proof-epochs/1",
+  "runtime_consumer": null,
+  "entries": [
+    {
+      "epoch": "D570-413e4026",
+      "revision": "413e4026ea86ca96151234bcb4f80c411a3dba9e",
+      "decision": "D570(1)-(4)",
+      "recorded_at": "2026-11-03T14:09:22.235517+00:00",
+      "previous_sha256": null,
+      "admission": "RECORDED_ONLY; no runtime activation or independent PASS",
+      "declaration_base_revision": "f7f744fb51e3f6bbfce1de475011a9b0efe85e20",
+      "declaration_base_sha256": "6a3129e4b9cbe0978a403461fa6724c155ab2ce8c236401e1bdf2e1e09678761",
+      "declaration_additions": {
+        "scripts/pin_revisions.py": [
+          "87afcc803517cc49217813931818035166bd99cc"
+        ],
+        "tests/pin_revisions_spec.py": [
+          "2632294bc301a902f0fcc92633c84bf670094633"
+        ]
+      },
+      "sha256": "f43421851ea63496ed662da171704baa5c39871ca4625807cca5cb621706426c"
+    },
+    {
+      "epoch": "D570-330141c0",
+      "revision": "330141c0eb1eeb3f709dc12172795a040dd21f05",
+      "decision": "D570(1)-(4)",
+      "recorded_at": "2026-11-03T14:09:22.259281+00:00",
+      "previous_sha256": "f43421851ea63496ed662da171704baa5c39871ca4625807cca5cb621706426c",
+      "admission": "RECORDED_ONLY; no runtime activation or independent PASS",
+      "declaration_base_revision": "f7f744fb51e3f6bbfce1de475011a9b0efe85e20",
+      "declaration_base_sha256": "6a3129e4b9cbe0978a403461fa6724c155ab2ce8c236401e1bdf2e1e09678761",
+      "declaration_additions": {
+        "scripts/pin_revisions.py": [
+          "87afcc803517cc49217813931818035166bd99cc"
+        ],
+        "tests/pin_revisions_spec.py": [
+          "2632294bc301a902f0fcc92633c84bf670094633"
+        ]
+      },
+      "sha256": "2aadbb31759fd526cfc8aee6292eee7898fdc68b8959c31170408be77db8c78f"
+    },
+    {
+      "epoch": "D570-f7f744fb",
+      "revision": "f7f744fb51e3f6bbfce1de475011a9b0efe85e20",
+      "decision": "D570(1)-(4)",
+      "recorded_at": "2026-11-03T14:09:22.279544+00:00",
+      "previous_sha256": "2aadbb31759fd526cfc8aee6292eee7898fdc68b8959c31170408be77db8c78f",
+      "admission": "RECORDED_ONLY; no runtime activation or independent PASS",
+      "declaration_base_revision": "f7f744fb51e3f6bbfce1de475011a9b0efe85e20",
+      "declaration_base_sha256": "6a3129e4b9cbe0978a403461fa6724c155ab2ce8c236401e1bdf2e1e09678761",
+      "declaration_additions": {},
+      "semantic_additions": [
+        {
+          "key": [
+            "crates/rmux-pty/src/process_shell.rs",
+            {
+              "classification": "production",
+              "condition": {
+                "all": [
+                  {
+                    "not": [
+                      "unix"
+                    ]
+                  },
+                  {
+                    "not": [
+                      "windows"
+                    ]
+                  }
+                ]
+              },
+              "kind": "allow_dead_code",
+              "owner": [
+                "struct ProcessChild",
+                "struct ProcessChild"
+              ],
+              "value": "dead_code"
+            },
+            [
+              {
+                "ancestry": [
+                  true
+                ],
+                "condition": true,
+                "consumers": [
+                  "crates/rmux-pty/src/lib.rs:mod"
+                ],
+                "module_dir": "crates/rmux-pty/src/process_shell",
+                "role": "production"
+              }
+            ]
+          ],
+          "count": 1
+        },
+        {
+          "key": [
+            "crates/rmux-server/tests/common/mod.rs",
+            {
+              "classification": "tests",
+              "condition": true,
+              "kind": "allow_dead_code",
+              "owner": [
+                "file"
+              ],
+              "value": "dead_code"
+            },
+            [
+              {
+                "ancestry": [
+                  true,
+                  "unix"
+                ],
+                "condition": "unix",
+                "consumers": [
+                  "crates/rmux-server/tests/attach_session.rs:mod",
+                  "crates/rmux-server/tests/buffers.rs:mod",
+                  "crates/rmux-server/tests/capture.rs:mod",
+                  "crates/rmux-server/tests/formats.rs:mod",
+                  "crates/rmux-server/tests/hooks.rs:mod",
+                  "crates/rmux-server/tests/injected_pane_shell.rs:mod",
+                  "crates/rmux-server/tests/listing.rs:mod",
+                  "crates/rmux-server/tests/options_environment.rs:mod",
+                  "crates/rmux-server/tests/pane_management.rs:mod",
+                  "crates/rmux-server/tests/pane_transfer.rs:mod",
+                  "crates/rmux-server/tests/request_end_to_end.rs:mod",
+                  "crates/rmux-server/tests/scripting.rs:mod",
+                  "crates/rmux-server/tests/send_keys.rs:mod",
+                  "crates/rmux-server/tests/session_crud.rs:mod",
+                  "crates/rmux-server/tests/status.rs:mod",
+                  "crates/rmux-server/tests/window_management.rs:mod"
+                ],
+                "module_dir": "crates/rmux-server/tests/common",
+                "role": "tests"
+              }
+            ]
+          ],
+          "count": 1
+        },
+        {
+          "key": [
+            "tests/common/mod.rs",
+            {
+              "classification": "tests",
+              "condition": true,
+              "kind": "allow_dead_code",
+              "owner": [
+                "file"
+              ],
+              "value": "dead_code"
+            },
+            [
+              {
+                "ancestry": [
+                  true,
+                  "target_os = \"linux\""
+                ],
+                "condition": "target_os = \"linux\"",
+                "consumers": [
+                  "tests/copy_pipe_shutdown.rs:mod",
+                  "tests/empty_daemon_retry_scope.rs:mod",
+                  "tests/options_argv_consumer_linux.rs:mod",
+                  "tests/unix_daemon_resource_acceptance.rs:mod"
+                ],
+                "module_dir": "tests/common",
+                "role": "tests"
+              },
+              {
+                "ancestry": [
+                  true,
+                  "unix"
+                ],
+                "condition": "unix",
+                "consumers": [
+                  "tests/attach_signal_cleanup.rs:mod",
+                  "tests/automatic_rename_initial.rs:mod",
+                  "tests/automation_alias_deadline.rs:mod",
+                  "tests/automation_cli.rs:mod",
+                  "tests/buffer_files.rs:mod",
+                  "tests/buffers.rs:mod",
+                  "tests/canonical_workflow.rs:mod",
+                  "tests/capture.rs:mod",
+                  "tests/capture_join_wrap.rs:mod",
+                  "tests/choose_tree_invalid_template.rs:mod",
+                  "tests/choose_tree_template_switch.rs:mod",
+                  "tests/cli_attach_flow.rs:mod",
+                  "tests/cli_display_panes_session.rs:mod",
+                  "tests/cli_new_session_client_size.rs:mod",
+                  "tests/cli_pane_transfer_surface.rs:mod",
+                  "tests/cli_surface.rs:mod",
+                  "tests/cli_target_actions.rs:mod",
+                  "tests/cli_window_surface.rs:mod",
+                  "tests/control_cli_lifecycle.rs:mod",
+                  "tests/diagnose_acceptance.rs:mod",
+                  "tests/diagnose_compatibility.rs:mod",
+                  "tests/diagnose_direct_budget_neighbors.rs:mod",
+                  "tests/diagnose_source_resolution.rs:mod",
+                  "tests/display_message.rs:mod",
+                  "tests/formats.rs:mod",
+                  "tests/internal_daemon.rs:mod",
+                  "tests/issue8_interactive_exit.rs:mod",
+                  "tests/lifecycle_dispatch.rs:mod",
+                  "tests/list_panes.rs:mod",
+                  "tests/popup_burst_attach.rs:mod",
+                  "tests/popup_repaint.rs:mod",
+                  "tests/quiet_only_if_unset_cli.rs:mod",
+                  "tests/request_end_to_end.rs:mod",
+                  "tests/run_shell_context.rs:mod",
+                  "tests/scripting.rs:mod",
+                  "tests/scripting_sdk.rs:mod",
+                  "tests/select_layout_flag_precedence.rs:mod",
+                  "tests/send_keys_formats.rs:mod",
+                  "tests/send_keys_wait_exit_status.rs:mod",
+                  "tests/sessions.rs:mod",
+                  "tests/sixel_passthrough.rs:mod",
+                  "tests/socket_dropin.rs:mod",
+                  "tests/status.rs:mod",
+                  "tests/stress.rs:mod",
+                  "tests/tmux_compat_harness.rs:mod",
+                  "tests/tmux_compat_surface_matrix.rs:mod",
+                  "tests/unix_background_lifecycle_acceptance.rs:mod",
+                  "tests/unix_pty_resize_acceptance.rs:mod",
+                  "tests/unix_source_file_tmux_oracle.rs:mod",
+                  "tests/window_pane_flag_semantics.rs:mod",
+                  "tests/window_snapshot.rs:mod"
+                ],
+                "module_dir": "tests/common",
+                "role": "tests"
+              },
+              {
+                "ancestry": [
+                  true,
+                  {
+                    "any": [
+                      "target_os = \"linux\"",
+                      "target_os = \"macos\""
+                    ]
+                  }
+                ],
+                "condition": {
+                  "any": [
+                    "target_os = \"linux\"",
+                    "target_os = \"macos\""
+                  ]
+                },
+                "consumers": [
+                  "tests/empty_daemon_control_lifecycle.rs:mod"
+                ],
+                "module_dir": "tests/common",
+                "role": "tests"
+              }
+            ]
+          ],
+          "count": 1
+        },
+        {
+          "key": [
+            "tests/common_cross/mod.rs",
+            {
+              "classification": "tests",
+              "condition": true,
+              "kind": "allow_dead_code",
+              "owner": [
+                "file"
+              ],
+              "value": "dead_code"
+            },
+            [
+              {
+                "ancestry": [
+                  true,
+                  "unix"
+                ],
+                "condition": "unix",
+                "consumers": [
+                  "tests/daemon_shutdown_barrier.rs:mod",
+                  "tests/startup_config_acceptance.rs:mod"
+                ],
+                "module_dir": "tests/common_cross",
+                "role": "tests"
+              },
+              {
+                "ancestry": [
+                  true,
+                  "windows"
+                ],
+                "condition": "windows",
+                "consumers": [
+                  "tests/windows_cli_queue_formats.rs:mod"
+                ],
+                "module_dir": "tests/common_cross",
+                "role": "tests"
+              },
+              {
+                "ancestry": [
+                  true
+                ],
+                "condition": true,
+                "consumers": [
+                  "tests/acceptance_source_config_matrix.rs:mod",
+                  "tests/acceptance_target_format_matrix.rs:mod",
+                  "tests/cli_error_contract.rs:mod",
+                  "tests/queued_server_startup.rs:mod",
+                  "tests/web_share_cli_lifecycle.rs:mod"
+                ],
+                "module_dir": "tests/common_cross",
+                "role": "tests"
+              }
+            ]
+          ],
+          "count": 1
+        }
+      ],
+      "semantic_removals": [
+        {
+          "key": [
+            "crates/rmux-server/tests/common/mod.rs",
+            {
+              "classification": "tests",
+              "condition": true,
+              "kind": "allow_dead_code",
+              "owner": [
+                "file"
+              ],
+              "value": "dead_code"
+            },
+            [
+              {
+                "ancestry": [
+                  true,
+                  "unix"
+                ],
+                "condition": "unix",
+                "consumers": [
+                  "crates/rmux-server/tests/attach_session.rs:mod",
+                  "crates/rmux-server/tests/buffers.rs:mod",
+                  "crates/rmux-server/tests/capture.rs:mod",
+                  "crates/rmux-server/tests/formats.rs:mod",
+                  "crates/rmux-server/tests/hooks.rs:mod",
+                  "crates/rmux-server/tests/listing.rs:mod",
+                  "crates/rmux-server/tests/options_environment.rs:mod",
+                  "crates/rmux-server/tests/pane_management.rs:mod",
+                  "crates/rmux-server/tests/pane_transfer.rs:mod",
+                  "crates/rmux-server/tests/request_end_to_end.rs:mod",
+                  "crates/rmux-server/tests/scripting.rs:mod",
+                  "crates/rmux-server/tests/send_keys.rs:mod",
+                  "crates/rmux-server/tests/session_crud.rs:mod",
+                  "crates/rmux-server/tests/status.rs:mod",
+                  "crates/rmux-server/tests/window_management.rs:mod"
+                ],
+                "module_dir": "crates/rmux-server/tests/common",
+                "role": "tests"
+              }
+            ]
+          ],
+          "count": 1
+        },
+        {
+          "key": [
+            "tests/common/mod.rs",
+            {
+              "classification": "tests",
+              "condition": true,
+              "kind": "allow_dead_code",
+              "owner": [
+                "file"
+              ],
+              "value": "dead_code"
+            },
+            [
+              {
+                "ancestry": [
+                  true,
+                  "target_os = \"linux\""
+                ],
+                "condition": "target_os = \"linux\"",
+                "consumers": [
+                  "tests/copy_pipe_shutdown.rs:mod",
+                  "tests/empty_daemon_retry_scope.rs:mod",
+                  "tests/options_argv_consumer_linux.rs:mod",
+                  "tests/unix_daemon_resource_acceptance.rs:mod"
+                ],
+                "module_dir": "tests/common",
+                "role": "tests"
+              },
+              {
+                "ancestry": [
+                  true,
+                  "unix"
+                ],
+                "condition": "unix",
+                "consumers": [
+                  "tests/attach_signal_cleanup.rs:mod",
+                  "tests/automatic_rename_initial.rs:mod",
+                  "tests/automation_alias_deadline.rs:mod",
+                  "tests/automation_cli.rs:mod",
+                  "tests/buffer_files.rs:mod",
+                  "tests/buffers.rs:mod",
+                  "tests/canonical_workflow.rs:mod",
+                  "tests/capture.rs:mod",
+                  "tests/capture_join_wrap.rs:mod",
+                  "tests/choose_tree_invalid_template.rs:mod",
+                  "tests/choose_tree_template_switch.rs:mod",
+                  "tests/cli_attach_flow.rs:mod",
+                  "tests/cli_pane_transfer_surface.rs:mod",
+                  "tests/cli_surface.rs:mod",
+                  "tests/cli_target_actions.rs:mod",
+                  "tests/cli_window_surface.rs:mod",
+                  "tests/control_cli_lifecycle.rs:mod",
+                  "tests/diagnose_acceptance.rs:mod",
+                  "tests/diagnose_direct_budget_neighbors.rs:mod",
+                  "tests/diagnose_source_resolution.rs:mod",
+                  "tests/display_message.rs:mod",
+                  "tests/formats.rs:mod",
+                  "tests/internal_daemon.rs:mod",
+                  "tests/issue8_interactive_exit.rs:mod",
+                  "tests/lifecycle_dispatch.rs:mod",
+                  "tests/list_panes.rs:mod",
+                  "tests/quiet_only_if_unset_cli.rs:mod",
+                  "tests/request_end_to_end.rs:mod",
+                  "tests/run_shell_context.rs:mod",
+                  "tests/scripting.rs:mod",
+                  "tests/scripting_sdk.rs:mod",
+                  "tests/select_layout_flag_precedence.rs:mod",
+                  "tests/send_keys_formats.rs:mod",
+                  "tests/send_keys_wait_exit_status.rs:mod",
+                  "tests/sessions.rs:mod",
+                  "tests/sixel_passthrough.rs:mod",
+                  "tests/socket_dropin.rs:mod",
+                  "tests/status.rs:mod",
+                  "tests/stress.rs:mod",
+                  "tests/tmux_compat_harness.rs:mod",
+                  "tests/tmux_compat_surface_matrix.rs:mod",
+                  "tests/unix_background_lifecycle_acceptance.rs:mod",
+                  "tests/unix_pty_resize_acceptance.rs:mod",
+                  "tests/unix_source_file_tmux_oracle.rs:mod",
+                  "tests/window_pane_flag_semantics.rs:mod",
+                  "tests/window_snapshot.rs:mod"
+                ],
+                "module_dir": "tests/common",
+                "role": "tests"
+              },
+              {
+                "ancestry": [
+                  true,
+                  {
+                    "any": [
+                      "target_os = \"linux\"",
+                      "target_os = \"macos\""
+                    ]
+                  }
+                ],
+                "condition": {
+                  "any": [
+                    "target_os = \"linux\"",
+                    "target_os = \"macos\""
+                  ]
+                },
+                "consumers": [
+                  "tests/empty_daemon_control_lifecycle.rs:mod"
+                ],
+                "module_dir": "tests/common",
+                "role": "tests"
+              }
+            ]
+          ],
+          "count": 1
+        },
+        {
+          "key": [
+            "tests/common_cross/mod.rs",
+            {
+              "classification": "tests",
+              "condition": true,
+              "kind": "allow_dead_code",
+              "owner": [
+                "file"
+              ],
+              "value": "dead_code"
+            },
+            [
+              {
+                "ancestry": [
+                  true,
+                  "windows"
+                ],
+                "condition": "windows",
+                "consumers": [
+                  "tests/windows_cli_queue_formats.rs:mod"
+                ],
+                "module_dir": "tests/common_cross",
+                "role": "tests"
+              },
+              {
+                "ancestry": [
+                  true
+                ],
+                "condition": true,
+                "consumers": [
+                  "tests/acceptance_source_config_matrix.rs:mod",
+                  "tests/acceptance_target_format_matrix.rs:mod",
+                  "tests/web_share_cli_lifecycle.rs:mod"
+                ],
+                "module_dir": "tests/common_cross",
+                "role": "tests"
+              }
+            ]
+          ],
+          "count": 1
+        }
+      ],
+      "source_evidence_sha256": "0d375eaafa56ece162ff6c59c332c897f7ddf9c0df6b132bdeb3063a8ad800c0",
+      "sha256": "dda052e58b0fb6a475909ac734967f099237f46be01c4b0dd31b3ec391da56c1"
+    },
+    {
+      "revision": "413e4026ea86ca96151234bcb4f80c411a3dba9e",
+      "decision": "D570(1)-(4)",
+      "admission": "RECORDED_ONLY; no runtime activation or independent PASS",
+      "declaration_base_revision": "f7f744fb51e3f6bbfce1de475011a9b0efe85e20",
+      "declaration_base_sha256": "6a3129e4b9cbe0978a403461fa6724c155ab2ce8c236401e1bdf2e1e09678761",
+      "epoch": "D570-413e4026-declaration-supplement",
+      "recorded_at": "2026-11-03T14:12:00.311369+00:00",
+      "previous_sha256": "dda052e58b0fb6a475909ac734967f099237f46be01c4b0dd31b3ec391da56c1",
+      "declaration_additions": {
+        "tests/release_policy_reachability_spec.py": [
+          "fea59c27ae1ee1b8ceca03c6d0cf1e7dde78157e"
+        ],
+        "scripts/pin_proof_publication.py": [
+          "922983ba221d54759d27b0372ea44004164f9b81"
+        ],
+        "tests/pin_proof_publication_spec.py": [
+          "bfb8dfb76e388262ca6f24e4c8b3f0dd5279f1ba"
+        ]
+      },
+      "sha256": "b0502a03c0884824d12b956cd28ff8781312d72e4d811b693e5473eaa4d8a20d"
+    },
+    {
+      "revision": "330141c0eb1eeb3f709dc12172795a040dd21f05",
+      "decision": "D570(1)-(4)",
+      "admission": "RECORDED_ONLY; no runtime activation or independent PASS",
+      "declaration_base_revision": "f7f744fb51e3f6bbfce1de475011a9b0efe85e20",
+      "declaration_base_sha256": "6a3129e4b9cbe0978a403461fa6724c155ab2ce8c236401e1bdf2e1e09678761",
+      "epoch": "D570-330141c0-declaration-supplement",
+      "recorded_at": "2026-11-03T14:12:00.445526+00:00",
+      "previous_sha256": "b0502a03c0884824d12b956cd28ff8781312d72e4d811b693e5473eaa4d8a20d",
+      "declaration_additions": {
+        "tests/release_policy_reachability_spec.py": [
+          "fea59c27ae1ee1b8ceca03c6d0cf1e7dde78157e"
+        ],
+        "scripts/pin_proof_publication.py": [
+          "922983ba221d54759d27b0372ea44004164f9b81"
+        ],
+        "tests/pin_proof_publication_spec.py": [
+          "bfb8dfb76e388262ca6f24e4c8b3f0dd5279f1ba"
+        ]
+      },
+      "sha256": "d0410d2bac913c69919b108a1f4fc7415dfbf63f7cb3be3aec5de69481093a1b"
+    }
+  ]
+}

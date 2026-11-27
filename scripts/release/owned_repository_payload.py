@@ -6,8 +6,17 @@ import json
 import re
 import tarfile
 from pathlib import Path
+from typing import Callable
+
+from sdk_distribution_policy import wasm_package_metadata
 
 VERSION = r"[0-9]+\.[0-9]+\.[0-9]+(?:-rc\.[0-9]+)?"
+RELEASE_VERSION = re.compile(
+    r"(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)(?:-rc\.([1-9][0-9]*))?"
+)
+FORMULA_VERSION = re.compile(
+    rb'^[ \t]*version[ \t]+"([^"\n]*)"[ \t]*(?:#[^\n]*)?$', re.MULTILINE
+)
 WASM_ARCHIVE = re.compile(rf"rmux-web-crypto-wasm-{VERSION}\.tar")
 WASM_PROVENANCE = re.compile(rf"rmux-web-crypto-wasm-{VERSION}\.provenance\.json")
 PACKAGE_FILES = (
@@ -84,6 +93,8 @@ def wasm_files(root: Path, *, source_sha: str, version: str) -> dict[str, bytes]
             data = extracted.read()
             if not data:
                 raise ValueError("web share archive member is empty")
+            if member.name == "package.json":
+                wasm_package_metadata(data, version)
             updates[f"src/scripts/share/wasm/{member.name}"] = data
     updates["src/scripts/share/wasm/PROVENANCE.json"] = provenance_path.read_bytes()
     return updates
@@ -99,3 +110,66 @@ def repository_updates(
     if channel == "web_share":
         return wasm_files(root, source_sha=source_sha, version=version)
     raise ValueError("channel is not an RMUX-owned repository writer")
+
+
+def version_order(value: str) -> tuple[int, int, int, int, int]:
+    match = RELEASE_VERSION.fullmatch(value)
+    if match is None:
+        raise ValueError(f"owned repository version is malformed: {value!r}")
+    major, minor, patch, rc = match.groups()
+    final = (1, 0) if rc is None else (0, int(rc))
+    return (int(major), int(minor), int(patch), *final)
+
+
+def json_version(data: bytes) -> str:
+    try:
+        value = json.loads(data.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as error:
+        raise ValueError("published owned repository manifest is not JSON") from error
+    version = value.get("version") if isinstance(value, dict) else None
+    if not isinstance(version, str):
+        raise ValueError("published owned repository manifest has no version")
+    return version
+
+
+def formula_version(data: bytes) -> str:
+    versions = FORMULA_VERSION.findall(data)
+    if len(versions) != 1:
+        raise ValueError("published Homebrew formula must declare exactly one version")
+    return versions[0].decode("ascii", errors="replace")
+
+
+PUBLISHED_VERSION = {
+    "homebrew_tap": ("Formula/rmux.rb", formula_version),
+    "scoop": ("bucket/rmux.json", json_version),
+    "web_share": ("src/scripts/share/wasm/package.json", json_version),
+}
+
+
+def refuse_replacing_published(
+    channel: str, version: str, read_published: Callable[[str], bytes | None]
+) -> None:
+    """Refuse to replace a newer or equal published release, as apt_rpm does.
+
+    The caller runs this only once the published bytes are known to differ from
+    the payload, so an equal published version means different bytes for the
+    same release: that fails closed, and only the exact-bytes case is a no-op.
+    """
+    if channel not in PUBLISHED_VERSION:
+        raise ValueError("channel is not an RMUX-owned repository writer")
+    path, parse = PUBLISHED_VERSION[channel]
+    current = version_order(version)
+    data = read_published(path)
+    if data is None:
+        return
+    published = parse(data)
+    published_order = version_order(published)
+    if published_order > current:
+        raise ValueError(
+            f"refusing to replace newer {channel} release {published} with {version}"
+        )
+    if published_order == current:
+        raise ValueError(
+            f"refusing to replace published {channel} release {version} "
+            "with different bytes"
+        )

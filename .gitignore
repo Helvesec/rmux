@@ -24,11 +24,12 @@ SDK demo/playwright-report/
 # Local release orchestrator. Kept in the repo working directory, not tracked.
 /rmux-release.sh
 /.release-deployment/
-/.rmux-audit/
+/.rmux-*/
+/docs/generated/
 # Private compatibility ledger retained locally for future development.
 /docs/compat/tmux-3.7-divergences.md
 /scripts/bench/README.md
-/.claude/settings.local.json
+/.*/settings.local.json
 /AGENTS.md
 
 # Local secret material and environment overrides.

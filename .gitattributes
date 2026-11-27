@@ -1,7 +1,13 @@
 * text=auto eol=lf
 
+# Preserve the digest-pinned upstream Microsoft license bytes.
+scripts/conpty/LICENSE -text whitespace=cr-at-eol
+
 # PTY transcript bytes are runtime payload, not source text.
 target/release-artifacts/**/logs/*.log -text -diff
 target/release-artifacts/**/logs/*.out -text -diff
+
+# Append-only population declarations: neighbouring rows union-merge.
+scripts/source-inventory/population-additions.jsonl merge=union
 
 # Manual Windows console captures preserve terminal spacing.

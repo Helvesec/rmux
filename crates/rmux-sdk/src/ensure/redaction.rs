@@ -17,9 +17,10 @@ pub(super) fn redact_environment_error(
             feature,
             hint: redact_environment_message(&hint, environment),
         },
-        RmuxError::Protocol { source } => {
-            RmuxError::protocol(redact_environment_protocol_error(source, environment))
-        }
+        RmuxError::Protocol { source } => RmuxError::from_proto(redact_environment_protocol_error(
+            source.into_proto(),
+            environment,
+        )),
         RmuxError::Transport { operation, source } => {
             let kind = source.kind();
             RmuxError::transport(

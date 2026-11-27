@@ -2,12 +2,27 @@ use serde::{Deserialize, Deserializer, Serialize};
 use std::path::PathBuf;
 
 use crate::{
-    PaneOutputSubscriptionId, PaneStateSubscriptionId, PaneTarget, PaneTargetRef, ProcessCommand,
-    ResizePaneAdjustment, SessionName, SetOptionMode, SplitDirection, WindowTarget,
+    PaneTarget, ProcessCommand, ResizePaneAdjustment, SessionName, SplitDirection, WindowTarget,
 };
 
-#[path = "pane/compat.rs"]
 mod compat;
+
+mod output;
+pub use output::{
+    PaneOutputCursorRequest, PaneOutputSubscriptionStart, PaneSnapshotRequest,
+    PaneStreamCursorRequest, PaneStreamMode, SubscribePaneOutputRefRequest,
+    SubscribePaneOutputRequest, SubscribePaneStreamRequest, UnsubscribePaneOutputRequest,
+    UnsubscribePaneStreamRequest,
+};
+mod sdk;
+pub use sdk::{
+    PaneBroadcastInputRequest, PaneForegroundStateRequest, PaneInputRequest, PaneKillRequest,
+    PaneOptionGetRequest, PaneOptionSetRequest, PaneResizeRequest, PaneRespawnRequest,
+    PaneSelectRequest, PaneSnapshotRefRequest, PaneStateCursorRequest, SubscribePaneStateRequest,
+    UnsubscribePaneStateRequest,
+};
+mod send_keys;
+pub use send_keys::{SendKeysExt2Request, SendKeysExtRequest, SendKeysRequest};
 
 /// Target forms accepted by `split-window`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -440,174 +455,6 @@ impl<'de> Deserialize<'de> for SelectPaneRequest {
     }
 }
 
-/// SDK pane input request that can address a stable pane id.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct PaneInputRequest {
-    /// The exact pane target or stable pane id.
-    pub target: PaneTargetRef,
-    /// Text or key tokens to send.
-    pub keys: Vec<String>,
-    /// Whether tokens should be written literally instead of interpreted as
-    /// tmux-compatible key names.
-    #[serde(default)]
-    pub literal: bool,
-}
-
-/// SDK pane input broadcast request with stable pane-id targeting.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct PaneBroadcastInputRequest {
-    /// Pane targets addressed in caller order.
-    pub targets: Vec<PaneTargetRef>,
-    /// Text or key tokens to send to each pane.
-    pub keys: Vec<String>,
-    /// Whether tokens should be written literally instead of interpreted as
-    /// tmux-compatible key names.
-    #[serde(default)]
-    pub literal: bool,
-}
-
-/// SDK resize request that can address a stable pane id.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct PaneResizeRequest {
-    /// The exact pane target or stable pane id.
-    pub target: PaneTargetRef,
-    /// The semantic resize request.
-    pub adjustment: ResizePaneAdjustment,
-}
-
-/// SDK kill request that can address a stable pane id.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct PaneKillRequest {
-    /// The exact pane target or stable pane id.
-    pub target: PaneTargetRef,
-    /// Whether all panes except the target should be killed.
-    #[serde(default)]
-    pub kill_all_except: bool,
-}
-
-/// SDK respawn request that can address a stable pane id.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct PaneRespawnRequest {
-    /// The exact pane target or stable pane id.
-    pub target: PaneTargetRef,
-    /// Whether a running pane should be killed before respawning.
-    #[serde(default)]
-    pub kill: bool,
-    /// Optional working-directory override.
-    #[serde(default)]
-    pub start_directory: Option<PathBuf>,
-    /// Optional per-spawn environment overrides in `NAME=VALUE` form.
-    #[serde(default)]
-    pub environment: Option<Vec<String>>,
-    /// Legacy optional shell command argv. A single argument is executed via
-    /// `$SHELL -c`.
-    #[serde(default)]
-    pub command: Option<Vec<String>>,
-    /// Explicit process launch mode.
-    #[serde(default)]
-    pub process_command: Option<ProcessCommand>,
-    /// Optional pane-local `remain-on-exit` override applied before respawn.
-    #[serde(default)]
-    pub keep_alive_on_exit: Option<bool>,
-}
-
-/// SDK snapshot request that can address a stable pane id.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct PaneSnapshotRefRequest {
-    /// The exact pane target or stable pane id.
-    pub target: PaneTargetRef,
-}
-
-/// SDK select/title request that can address a stable pane id.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct PaneSelectRequest {
-    /// The exact pane target or stable pane id.
-    pub target: PaneTargetRef,
-    /// Optional pane title to set without changing the active pane.
-    #[serde(default)]
-    pub title: Option<String>,
-}
-
-/// SDK pane option mutation request that can address a stable pane id.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct PaneOptionSetRequest {
-    /// The exact pane target or stable pane id.
-    pub target: PaneTargetRef,
-    /// The tmux-style option name.
-    pub name: String,
-    /// The value to set. `None` is valid only when `unset` is true or when the
-    /// option type supports value-less toggles.
-    #[serde(default)]
-    pub value: Option<String>,
-    /// The scalar/array mutation mode.
-    pub mode: SetOptionMode,
-    /// Whether to remove the pane-local explicit value instead of setting it.
-    #[serde(default)]
-    pub unset: bool,
-}
-
-/// SDK pane option lookup request that can address a stable pane id.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct PaneOptionGetRequest {
-    /// The exact pane target or stable pane id.
-    pub target: PaneTargetRef,
-    /// The tmux-style option name.
-    pub name: String,
-}
-
-/// SDK pane-state subscription request that can address a stable pane id.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct SubscribePaneStateRequest {
-    /// The exact pane target or stable pane id.
-    pub target: PaneTargetRef,
-    /// Whether the initial snapshot and stream should include title changes.
-    #[serde(default = "default_include_pane_state_title")]
-    pub include_title: bool,
-    /// Whether the initial snapshot and stream should include pane options.
-    #[serde(default = "default_include_pane_state_options")]
-    pub include_options: bool,
-    /// Whether the initial snapshot and stream should include foreground state.
-    #[serde(default)]
-    pub include_foreground: bool,
-}
-
-/// SDK pane-state cursor request.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct PaneStateCursorRequest {
-    /// The subscription to poll.
-    pub subscription_id: PaneStateSubscriptionId,
-    /// Return records whose revision is strictly greater than this value.
-    pub after_revision: u64,
-    /// Whether the server may hold the request until a new record appears.
-    #[serde(default)]
-    pub wait: bool,
-    /// Optional per-response event cap.
-    #[serde(default)]
-    pub max_events: Option<u16>,
-}
-
-/// SDK pane-state unsubscription request.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-pub struct UnsubscribePaneStateRequest {
-    /// The subscription to remove.
-    pub subscription_id: PaneStateSubscriptionId,
-}
-
-/// SDK foreground-state request that can address a stable pane id.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct PaneForegroundStateRequest {
-    /// The exact pane target or stable pane id.
-    pub target: PaneTargetRef,
-}
-
-const fn default_include_pane_state_title() -> bool {
-    true
-}
-
-const fn default_include_pane_state_options() -> bool {
-    true
-}
-
 /// Direction used by `select-pane -U/-D/-L/-R`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum SelectPaneDirection {
@@ -656,171 +503,4 @@ pub struct SelectPaneMarkRequest {
     /// Optional pane title to set while applying the mark operation (`-T`).
     #[serde(default)]
     pub title: Option<String>,
-}
-
-/// Request payload for the daemon-backed pane snapshot endpoint.
-///
-/// Unlike [`CapturePaneRequest`](crate::CapturePaneRequest), which returns a
-/// pre-rendered byte stream of the visible viewport, this request asks the
-/// daemon to expose its live in-memory grid as structured cells. The daemon
-/// reads the cells directly from the rmux-core screen that is fed by its
-/// crate-private terminal parser, so there is no `String::from_utf8_lossy`
-/// reconstruction step on either side of the wire.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct PaneSnapshotRequest {
-    /// The exact pane target whose visible viewport should be captured.
-    pub target: PaneTarget,
-}
-
-/// Starting position for a pane-output subscription cursor.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-pub enum PaneOutputSubscriptionStart {
-    /// Start after the newest output currently retained by the pane.
-    Now,
-    /// Start at the oldest retained output event.
-    Oldest,
-}
-
-/// Request payload for subscribing to live pane-output events.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct SubscribePaneOutputRequest {
-    /// The exact pane target whose output should be subscribed.
-    pub target: PaneTarget,
-    /// The initial cursor position.
-    pub start: PaneOutputSubscriptionStart,
-}
-
-/// Request payload for subscribing to live pane-output events by slot or id.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct SubscribePaneOutputRefRequest {
-    /// The exact pane target or stable pane id whose output should be
-    /// subscribed.
-    pub target: PaneTargetRef,
-    /// The initial cursor position.
-    pub start: PaneOutputSubscriptionStart,
-}
-
-/// Request payload for unsubscribing from live pane-output events.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-pub struct UnsubscribePaneOutputRequest {
-    /// The subscription to remove.
-    pub subscription_id: PaneOutputSubscriptionId,
-}
-
-/// Request payload for polling a pane-output subscription cursor.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-pub struct PaneOutputCursorRequest {
-    /// The subscription whose cursor should be polled.
-    pub subscription_id: PaneOutputSubscriptionId,
-    /// Optional caller-requested event cap. The server clamps this to the
-    /// recorded v1 default batch limit.
-    #[serde(default)]
-    pub max_events: Option<u16>,
-}
-
-/// Projection selected for a recoverable pane stream.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[non_exhaustive]
-pub enum PaneStreamMode {
-    /// Raw terminal bytes with automatic in-band renderer rebases.
-    Raw,
-    /// Authoritative structured viewport frames.
-    Surface,
-}
-
-/// Request payload for opening a recoverable pane stream.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct SubscribePaneStreamRequest {
-    /// Stable pane identity or pane slot resolved atomically by the daemon.
-    pub target: PaneTargetRef,
-    /// Requested projection.
-    pub mode: PaneStreamMode,
-    /// Include a typed snapshot with raw rebases.
-    ///
-    /// Raw emulator consumers normally leave this false; inspection tools can
-    /// request it without forcing every rebase to carry duplicate state.
-    pub include_snapshot: bool,
-}
-
-/// Request payload for polling a recoverable pane stream.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-pub struct PaneStreamCursorRequest {
-    /// Opaque stream subscription allocated by the daemon.
-    pub subscription_id: PaneOutputSubscriptionId,
-    /// Optional caller cap, clamped to the daemon subscription limit.
-    #[serde(default)]
-    pub max_events: Option<u16>,
-}
-
-/// Request payload for closing a recoverable pane stream.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-pub struct UnsubscribePaneStreamRequest {
-    /// Opaque stream subscription allocated by the daemon.
-    pub subscription_id: PaneOutputSubscriptionId,
-}
-
-/// Request payload for `send-keys`.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct SendKeysRequest {
-    /// The exact pane target.
-    pub target: PaneTarget,
-    /// Key tokens in left-to-right order.
-    pub keys: Vec<String>,
-}
-
-/// Extended request payload for `send-keys`.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct SendKeysExtRequest {
-    /// The optional explicit pane target.
-    pub target: Option<PaneTarget>,
-    /// Key tokens in left-to-right order.
-    pub keys: Vec<String>,
-    /// Whether tmux format expansion should be applied to each token first.
-    pub expand_formats: bool,
-    /// Whether each token should be interpreted as a hexadecimal byte value.
-    pub hex: bool,
-    /// Whether tokens should be sent as literal bytes instead of key names.
-    #[serde(default)]
-    pub literal: bool,
-    /// Whether keys should be dispatched through the client's key table.
-    pub dispatch_key_table: bool,
-    /// Whether tokens describe copy-mode commands.
-    pub copy_mode_command: bool,
-    /// Whether the payload should be treated as a mouse event.
-    pub forward_mouse_event: bool,
-    /// Whether the target terminal should be reset before sending keys.
-    pub reset_terminal: bool,
-    /// Optional tmux repeat count for command or key dispatch.
-    pub repeat_count: Option<usize>,
-}
-
-/// Further-extended request payload for `send-keys -c`.
-///
-/// This is intentionally separate from [`SendKeysExtRequest`] so the original
-/// bincode field order remains wire-compatible with older clients and daemons.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct SendKeysExt2Request {
-    /// The optional explicit pane target.
-    pub target: Option<PaneTarget>,
-    /// Key tokens in left-to-right order.
-    pub keys: Vec<String>,
-    /// Whether tmux format expansion should be applied to each token first.
-    pub expand_formats: bool,
-    /// Whether each token should be interpreted as a hexadecimal byte value.
-    pub hex: bool,
-    /// Whether tokens should be sent as literal bytes instead of key names.
-    #[serde(default)]
-    pub literal: bool,
-    /// Whether keys should be dispatched through the client's key table.
-    pub dispatch_key_table: bool,
-    /// Whether tokens describe copy-mode commands.
-    pub copy_mode_command: bool,
-    /// Whether the payload should be treated as a mouse event.
-    pub forward_mouse_event: bool,
-    /// Whether the target terminal should be reset before sending keys.
-    pub reset_terminal: bool,
-    /// Optional tmux repeat count for command or key dispatch.
-    pub repeat_count: Option<usize>,
-    /// Optional target client used for current-pane resolution and client key dispatch.
-    pub target_client: Option<String>,
 }

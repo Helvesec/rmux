@@ -126,8 +126,24 @@ mod tests {
             include_str!("../../crates/rmux-server/src/control/subscriptions.rs"),
             include_str!("../../crates/rmux-server/src/control/output_queue.rs"),
             include_str!("../../crates/rmux-server/src/control_notifications.rs"),
-            include_str!("../../crates/rmux-server/src/handler_control.rs"),
-            include_str!("../../crates/rmux-server/src/handler_pane/inspection.rs"),
+            include_str!("../../crates/rmux-server/src/handler/control_support.rs"),
+            // Keep every control_support child in the scan after module splits.
+            include_str!("../../crates/rmux-server/src/handler/control_support/client_lookup.rs"),
+            include_str!(
+                "../../crates/rmux-server/src/handler/control_support/control_response_stream.rs"
+            ),
+            include_str!("../../crates/rmux-server/src/handler/control_support/detach.rs"),
+            include_str!("../../crates/rmux-server/src/handler/control_support/notifications.rs"),
+            include_str!("../../crates/rmux-server/src/handler/control_support/pane_output.rs"),
+            include_str!("../../crates/rmux-server/src/handler/control_support/registration.rs"),
+            include_str!("../../crates/rmux-server/src/handler/control_support/session_attach.rs"),
+            include_str!("../../crates/rmux-server/src/handler/control_support/session_switch.rs"),
+            include_str!("../../crates/rmux-server/src/handler/control_support/session_update.rs"),
+            include_str!(
+                "../../crates/rmux-server/src/handler/control_support/window_notifications.rs"
+            ),
+            include_str!("../../crates/rmux-server/src/handler/control_support/window_sizes.rs"),
+            include_str!("../../crates/rmux-server/src/handler/pane_support/pane_inspection.rs"),
         ]
         .into_iter()
         .flat_map(control_prefixes_in_source)

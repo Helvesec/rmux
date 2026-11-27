@@ -1,5 +1,4 @@
 use std::fs;
-use std::path::PathBuf;
 
 use rmux_core::command_parser::CommandParser;
 use rmux_proto::{
@@ -13,6 +12,7 @@ use super::{
     session_name, OracleRemoval, Scenario, TargetClientKind,
 };
 use crate::pane_io::AttachControl;
+use crate::test_shell::ScratchPath;
 use crate::DaemonConfig;
 
 const BINDING_PID: u32 = u32::MAX - 83_000;
@@ -34,13 +34,8 @@ struct BindingGuard {
     _events: mpsc::UnboundedReceiver<AttachControl>,
 }
 
-fn durable_test_root(label: &str) -> PathBuf {
-    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("../../target/rmux-kill-selection-tests")
-        .join(format!("{label}-{}", std::process::id()));
-    let _ = fs::remove_dir_all(&root);
-    fs::create_dir_all(&root).expect("create durable test root");
-    root
+fn durable_test_root(label: &str) -> ScratchPath {
+    ScratchPath::directory(&format!("kill-selection-{label}"))
 }
 
 async fn prepare_binding(scenario: &mut Scenario, target: &str) -> BindingGuard {
@@ -126,7 +121,7 @@ async fn invoke_entry_path(
                     verbose: false,
                     expand_paths: false,
                     target: None,
-                    caller_cwd: Some(root.clone()),
+                    caller_cwd: Some(root.to_path_buf()),
                     stdin: None,
                 })))
                 .await;
@@ -140,7 +135,7 @@ async fn invoke_entry_path(
             let daemon_config = DaemonConfig::new(root.join("rmux.sock")).with_config_files(
                 vec![config],
                 false,
-                Some(root.clone()),
+                Some(root.to_path_buf()),
             );
             scenario
                 .handler

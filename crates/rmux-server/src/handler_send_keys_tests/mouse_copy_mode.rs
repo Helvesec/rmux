@@ -16,17 +16,11 @@ async fn replace_transcript_contents(
             .transcript_handle(target)
             .expect("session transcript must exist")
     };
-    let history_limit = transcript
-        .lock()
-        .expect("pane transcript mutex must not be poisoned")
-        .history_limit();
+    let history_limit = transcript.lock().history_limit();
     let mut screen = Screen::new(size, history_limit);
     let mut parser = InputParser::new();
     parser.parse(content, &mut screen);
-    transcript
-        .lock()
-        .expect("pane transcript mutex must not be poisoned")
-        .set_screen_for_test(screen);
+    transcript.lock().set_screen_for_test(screen);
 }
 
 #[tokio::test]
@@ -44,7 +38,7 @@ async fn copy_mode_mouse_drag_start_anchors_on_press_cell() {
             environment: None,
         }))
         .await;
-    assert!(matches!(created, Response::NewSession(_)));
+    crate::session_fixture::assert_new_session(&created);
 
     let (control_tx, _control_rx) = mpsc::unbounded_channel();
     let _attach_id = handler
@@ -66,6 +60,7 @@ async fn copy_mode_mouse_drag_start_anchors_on_press_cell() {
             .get_mut(&requester_pid)
             .expect("attached client exists");
         active.mouse.current_event = Some(AttachedMouseEvent {
+            coordinates: None,
             raw: MouseForwardEvent {
                 b: 32,
                 lb: 0,
@@ -168,7 +163,7 @@ async fn copy_mode_single_motion_drag_copies_from_press_to_motion_cell() {
             skip_environment_update: false,
         })))
         .await;
-    assert!(matches!(created, Response::NewSession(_)));
+    crate::session_fixture::assert_new_session(&created);
     replace_transcript_contents(&handler, &target, size, b"ABCDEF\r\n").await;
 
     let (control_tx, _control_rx) = mpsc::unbounded_channel();
@@ -191,6 +186,7 @@ async fn copy_mode_single_motion_drag_copies_from_press_to_motion_cell() {
             .get_mut(&requester_pid)
             .expect("attached client exists");
         active.mouse.current_event = Some(AttachedMouseEvent {
+            coordinates: None,
             raw: MouseForwardEvent {
                 b: 32,
                 lb: 0,
@@ -287,7 +283,7 @@ async fn copy_mode_mouse_entry_uses_left_scrollbar_content_origin() {
             skip_environment_update: false,
         })))
         .await;
-    assert!(matches!(created, Response::NewSession(_)));
+    crate::session_fixture::assert_new_session(&created);
     for (option, value) in [
         (OptionName::PaneScrollbars, "on"),
         (OptionName::PaneScrollbarsPosition, "left"),
@@ -334,6 +330,7 @@ async fn copy_mode_mouse_entry_uses_left_scrollbar_content_origin() {
             .expect("attached client exists")
             .mouse
             .current_event = Some(AttachedMouseEvent {
+            coordinates: None,
             raw: MouseForwardEvent {
                 b: 32,
                 lb: 0,
@@ -396,5 +393,96 @@ async fn copy_mode_mouse_entry_uses_left_scrollbar_content_origin() {
         response.command_output().stdout(),
         b"A",
         "the first content cell after a left scrollbar must remain copy-mode x=0"
+    );
+}
+
+#[tokio::test]
+async fn copy_mode_mouse_drag_start_on_a_pane_already_in_copy_mode_starts_no_drag() {
+    // tmux 3.7b starts a drag only when `copy-mode -M` opens the mode
+    // (`cmd-copy-mode.c`): dragged over a pane already in copy mode, it leaves
+    // `selection_present=0` (S2231 `sonde-client.sh` m2; m1 opens one).
+    let handler = RequestHandler::new();
+    let alpha = session_name("alpha");
+    let requester_pid = std::process::id();
+    let target = PaneTarget::new(alpha.clone(), 0);
+    let created = handler
+        .handle(Request::NewSession(NewSessionRequest {
+            session_name: alpha.clone(),
+            detached: true,
+            size: Some(TerminalSize { cols: 20, rows: 5 }),
+            environment: None,
+        }))
+        .await;
+    crate::session_fixture::assert_new_session(&created);
+    let (control_tx, _control_rx) = mpsc::unbounded_channel();
+    handler
+        .register_attach(requester_pid, alpha.clone(), control_tx)
+        .await;
+    let (window_id, pane_id) = {
+        let state = handler.state.lock().await;
+        let window = state
+            .sessions
+            .session(&alpha)
+            .expect("session exists")
+            .window();
+        (window.id(), window.pane(0).expect("pane exists").id())
+    };
+    handler
+        .active_attach
+        .lock()
+        .await
+        .by_pid
+        .get_mut(&requester_pid)
+        .expect("attached client exists")
+        .mouse
+        .current_event = Some(AttachedMouseEvent {
+        coordinates: None,
+        raw: MouseForwardEvent {
+            b: 32,
+            lb: 0,
+            x: 6,
+            y: 1,
+            lx: 1,
+            ly: 1,
+            sgr_b: 32,
+            sgr_type: 'M',
+            ignore: false,
+        },
+        session_id: 0,
+        window_id: Some(window_id.as_u32()),
+        pane_id: Some(pane_id),
+        pane_target: Some(target.clone()),
+        location: MouseLocation::Pane,
+        status_at: None,
+        status_lines: 0,
+        ignore: false,
+    });
+
+    for mouse_drag_start in [false, true] {
+        let response = handler
+            .handle(Request::CopyMode(CopyModeRequest {
+                target: Some(target.clone()),
+                page_down: false,
+                exit_on_scroll: false,
+                hide_position: false,
+                mouse_drag_start,
+                cancel_mode: false,
+                scrollbar_scroll: false,
+                source: None,
+                page_up: false,
+            }))
+            .await;
+        assert!(matches!(response, Response::CopyMode(_)), "{response:?}");
+    }
+
+    let summary = handler
+        .state
+        .lock()
+        .await
+        .pane_copy_mode_summary(&alpha, pane_id)
+        .expect("copy mode summary");
+    assert!(
+        summary.selection_start.is_none(),
+        "copy-mode -M over an open consultation must not begin a selection"
     );
 }

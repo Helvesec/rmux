@@ -11,12 +11,15 @@ pub fn command_target_metadata(command_name: &str) -> Option<CommandTargetMetada
             Some(spec('s', Type::Pane, Flags::NONE)),
             Some(spec('t', Type::Window, Flags::WINDOW_INDEX)),
         )),
-        "capture-pane" | "kill-pane" | "paste-buffer" | "pipe-pane" | "resize-pane"
-        | "respawn-pane" | "select-pane" | "send-keys" | "send-prefix" | "split-window" => {
-            Some(metadata(None, Some(spec('t', Type::Pane, Flags::NONE))))
-        }
+        "capture-pane" | "kill-pane" | "new-pane" | "paste-buffer" | "pipe-pane"
+        | "resize-pane" | "respawn-pane" | "select-pane" | "send-keys" | "send-prefix"
+        | "split-window" => Some(metadata(None, Some(spec('t', Type::Pane, Flags::NONE)))),
         "copy-mode" => Some(metadata(
             Some(spec('s', Type::Pane, Flags::NONE)),
+            Some(spec('t', Type::Pane, Flags::NONE)),
+        )),
+        "set-pane-placement" => Some(metadata(
+            Some(spec('a', Type::Pane, Flags::NONE)),
             Some(spec('t', Type::Pane, Flags::NONE)),
         )),
         "display-menu" | "display-message" | "display-popup" | "if-shell" | "show-hooks"

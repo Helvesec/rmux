@@ -13,7 +13,7 @@ pub(super) enum DropinInvocation {
 pub(super) fn parse_invocation(
     arguments: &[OsString],
 ) -> Result<Option<DropinInvocation>, ExitFailure> {
-    let Some(command_index) = split_top_level_prefix(arguments) else {
+    let Some(command_index) = crate::cli_top_level::top_level_command_index(arguments) else {
         return Ok(None);
     };
     let Some(command) = arguments
@@ -92,46 +92,6 @@ fn single_subcommand<'a>(
         ));
     }
     Ok(subcommand)
-}
-
-fn split_top_level_prefix(arguments: &[OsString]) -> Option<usize> {
-    let mut index = 0;
-
-    while let Some(argument) = arguments.get(index) {
-        let value = argument.to_str()?;
-        if value == "--" {
-            return Some(index + 1);
-        }
-        if !value.starts_with('-') || value == "-" {
-            return Some(index);
-        }
-
-        match value {
-            "-2" | "-D" | "-N" | "-l" | "-u" => {}
-            "-C" | "-v" => {}
-            "-c" | "-f" | "-L" | "-S" | "-T" => {
-                index += 1;
-            }
-            _ if value.starts_with("-L") && value.len() > 2 => {}
-            _ if value.starts_with("-S") && value.len() > 2 => {}
-            _ if value.starts_with("-c") && value.len() > 2 => {}
-            _ if value.starts_with("-f") && value.len() > 2 => {}
-            _ if value.starts_with("-T") && value.len() > 2 => {}
-            _ if is_short_flag_cluster(value, "2CDNluv") => {}
-            _ => return Some(index),
-        }
-
-        index += 1;
-    }
-
-    None
-}
-
-fn is_short_flag_cluster(value: &str, allowed: &str) -> bool {
-    value.len() > 2
-        && value.starts_with('-')
-        && !value.starts_with("--")
-        && value.chars().skip(1).all(|flag| allowed.contains(flag))
 }
 
 fn run_doctor(argv0: Option<&OsString>) -> Result<i32, ExitFailure> {
@@ -261,19 +221,12 @@ struct SetupTmuxShimTarget {
 
 #[cfg(unix)]
 fn setup_tmux_shim_target(argv0: Option<&OsString>) -> Result<SetupTmuxShimTarget, ExitFailure> {
-    const PUBLIC_BINARY_OVERRIDE_ENV: &str = "RMUX_INTERNAL_PUBLIC_BINARY_PATH";
-
-    let current = std::env::current_exe().map_err(|error| {
+    let public = crate::helper_handoff::public_exe().map_err(|error| {
         ExitFailure::new(
             1,
             format!("rmux setup tmux-shim: failed to resolve current rmux binary: {error}"),
         )
     })?;
-    let public = std::env::var_os(PUBLIC_BINARY_OVERRIDE_ENV)
-        .map(std::path::PathBuf::from)
-        .and_then(|path| absolute_without_resolving_links(&path))
-        .filter(|path| path.is_file())
-        .unwrap_or(current);
     let executable = std::fs::canonicalize(&public).unwrap_or_else(|_| public.clone());
     let link_target = stable_rmux_invocation_path(argv0, &public).unwrap_or(public);
     Ok(SetupTmuxShimTarget {
@@ -562,3 +515,7 @@ mod tests {
         ));
     }
 }
+
+#[cfg(test)]
+#[path = "tmux_dropin_prefix_tests.rs"]
+mod prefix_tests;

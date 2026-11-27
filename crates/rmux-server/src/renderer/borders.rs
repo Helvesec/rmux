@@ -2,20 +2,19 @@ use std::collections::{btree_map::Entry, BTreeMap};
 
 use rmux_core::formats::FormatContext;
 use rmux_core::style::Style;
-use rmux_core::{OptionStore, Pane, Session, Window};
+use rmux_core::{OptionStore, Pane, ResolvedPaneLayer, Window};
 use rmux_proto::OptionName;
 
 use crate::format_runtime::RuntimeFormatContext;
 
 use super::{apply_runtime_style_overlay, cursor_position_bytes, style_sgr_bytes, StatusGeometry};
 
-#[path = "borders/layout.rs"]
 mod layout;
-#[path = "borders/status.rs"]
 mod status;
 
-use self::layout::border_layout_cells_with_geometry;
+use self::layout::{border_layout_cells_for_geometries, border_layout_cells_with_geometry};
 pub(super) use self::status::render_pane_border_status_lines;
+use super::projection::TerminalSceneProjection;
 
 #[cfg_attr(not(test), allow(dead_code))]
 pub(super) fn border_cells(
@@ -56,10 +55,35 @@ fn border_cells_with_geometry(
 }
 
 pub(super) fn runtime_border_cells(
-    session: &Session,
+    session: rmux_core::ManagedSessionView<'_>,
     options: &OptionStore,
     geometry: StatusGeometry,
 ) -> Vec<BorderCell> {
+    if let Some((ox, oy)) = session.viewport_offset() {
+        let mut source = rmux_core::ManagedSessionPresentation::new(session);
+        source.set_viewport_offset(None);
+        let size = session.window().size();
+        source.set_terminal_size(rmux_proto::TerminalSize {
+            cols: size.cols,
+            rows: size.rows.saturating_add(geometry.status_lines),
+        });
+        let source_geometry = StatusGeometry::for_session(source.view(), options);
+        return runtime_border_cells(source.view(), options, source_geometry)
+            .into_iter()
+            .filter_map(|mut cell| {
+                cell.x = cell.x.checked_sub(ox)?;
+                let y = cell
+                    .y
+                    .checked_sub(source_geometry.content_y_offset)?
+                    .checked_sub(oy)?;
+                if cell.x >= geometry.content_size().cols || y >= geometry.content_rows {
+                    return None;
+                }
+                cell.y = y.saturating_add(geometry.content_y_offset);
+                Some(cell)
+            })
+            .collect();
+    }
     let window = session.window();
     let window_index = session.active_window_index();
     let indicators_colour = pane_border_indicators_colour_enabled(options.resolve_for_window(
@@ -67,52 +91,92 @@ pub(super) fn runtime_border_cells(
         window_index,
         OptionName::PaneBorderIndicators,
     ));
-    let layout_cells = border_layout_cells_with_geometry(
-        window,
-        session.active_pane_index(),
-        geometry,
-        indicators_colour,
-    );
     let line_style = PaneBorderLineStyle::from_option(options.resolve_for_window(
         session.name(),
         window_index,
         OptionName::PaneBorderLines,
     ));
     let mut style_cache = BTreeMap::<(u32, bool), BorderStyle>::new();
+    let projection = TerminalSceneProjection::resolve(session, options);
+    let pane_geometries = projection.tiled_content_geometries();
+    let layout_cells = border_layout_cells_for_geometries(
+        &pane_geometries,
+        session.active_pane_index(),
+        geometry,
+        indicators_colour,
+    );
+    let mut cells = Vec::new();
 
-    layout_cells
-        .into_iter()
-        .map(|cell| {
-            let style = cell
-                .owner_pane_index
-                .and_then(
-                    |pane_index| match style_cache.entry((pane_index, cell.active)) {
-                        Entry::Occupied(entry) => Some(entry.get().clone()),
-                        Entry::Vacant(entry) => {
-                            let pane = window.pane(pane_index)?;
-                            Some(
-                                entry
-                                    .insert(resolve_border_style_for_pane(
-                                        session,
-                                        options,
-                                        window_index,
-                                        pane,
-                                        cell.active,
-                                    ))
-                                    .clone(),
-                            )
-                        }
-                    },
+    for cell in layout_cells {
+        let Some(content_y) = cell.y.checked_sub(geometry.content_y_offset) else {
+            continue;
+        };
+        if !projection.cell_visible_at_layer(cell.x, content_y, ResolvedPaneLayer::Tiled) {
+            continue;
+        }
+        cells.push(BorderCell {
+            x: cell.x,
+            y: cell.y,
+            glyph: line_style.map_glyph(cell.glyph),
+            style: resolve_cached_border_style(
+                session,
+                options,
+                window,
+                window_index,
+                &mut style_cache,
+                cell.owner_pane_index,
+                cell.active,
+            ),
+        });
+    }
+
+    for cell in projection.floating_border_cells() {
+        cells.push(BorderCell {
+            x: cell.x,
+            y: cell.y,
+            glyph: line_style.map_glyph(cell.glyph),
+            style: resolve_cached_border_style(
+                session,
+                options,
+                window,
+                window_index,
+                &mut style_cache,
+                Some(cell.pane_index),
+                cell.active,
+            ),
+        });
+    }
+    cells
+}
+
+fn resolve_cached_border_style(
+    session: rmux_core::ManagedSessionView<'_>,
+    options: &OptionStore,
+    window: &Window,
+    window_index: u32,
+    style_cache: &mut BTreeMap<(u32, bool), BorderStyle>,
+    pane_index: Option<u32>,
+    active: bool,
+) -> BorderStyle {
+    pane_index
+        .and_then(|pane_index| match style_cache.entry((pane_index, active)) {
+            Entry::Occupied(entry) => Some(entry.get().clone()),
+            Entry::Vacant(entry) => {
+                let pane = window.pane(pane_index)?;
+                Some(
+                    entry
+                        .insert(resolve_border_style_for_pane(
+                            session,
+                            options,
+                            window_index,
+                            pane,
+                            active,
+                        ))
+                        .clone(),
                 )
-                .unwrap_or_default();
-            BorderCell {
-                x: cell.x,
-                y: cell.y,
-                glyph: line_style.map_glyph(cell.glyph),
-                style,
             }
         })
-        .collect()
+        .unwrap_or_default()
 }
 
 fn pane_border_indicators_colour_enabled(value: Option<&str>) -> bool {
@@ -165,6 +229,20 @@ impl PaneBorderLineStyle {
             Some("simple") => Self::Simple,
             Some("spaces") => Self::Spaces,
             _ => Self::Single,
+        }
+    }
+
+    /// The glyph tmux paints on a cell no pane owns.
+    ///
+    /// `number` and every unknown value already fold to `Single` in
+    /// `from_option`, which is also what tmux does for this cell in
+    /// particular: its number branch writes the same bullet as its default one,
+    /// because there is no pane whose index it could show.
+    pub(super) const fn outside_glyph(self) -> char {
+        match self {
+            Self::Single | Self::Double | Self::Heavy => '\u{b7}',
+            Self::Simple => '.',
+            Self::Spaces => ' ',
         }
     }
 
@@ -229,13 +307,14 @@ const SIMPLE_BORDER_GLYPHS: &[(char, char)] = &[
 ];
 
 pub(super) fn resolve_border_style_for_pane(
-    session: &Session,
+    session: rmux_core::ManagedSessionView<'_>,
     options: &OptionStore,
     window_index: u32,
     pane: &Pane,
     active: bool,
 ) -> Style {
-    let context = FormatContext::from_session(session)
+    let context = FormatContext::new()
+        .with_managed_session(session)
         .with_window(window_index, session.window(), true, false)
         .with_window_pane(session.window(), pane);
     let runtime = RuntimeFormatContext::new(context)

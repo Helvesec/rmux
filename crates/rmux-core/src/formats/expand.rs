@@ -1,17 +1,48 @@
+use std::rc::Rc;
+
 use super::time::expand_time_tokens;
-use super::{format_replace, format_skip, resolve_variable, ExpandState, FormatVariables};
+use super::{
+    format_replace, format_skip, resolve_variable, ExpandBudget, ExpandState, FormatVariables,
+};
 
 /// Recursion depth limit matching tmux `FORMAT_LOOP_LIMIT`.
 pub(super) const FORMAT_LOOP_LIMIT: u32 = 100;
+
+/// Renders status text with NUL standing for a literal hash supplied by OSC 7501.
+#[must_use]
+pub fn render_status_template<V: FormatVariables + ?Sized>(
+    template: &str,
+    variables: &V,
+) -> String {
+    render_output(template, variables, true)
+}
+
+pub(super) fn render_output<V: FormatVariables + ?Sized>(
+    template: &str,
+    variables: &V,
+    status: bool,
+) -> String {
+    let mut state = ExpandState {
+        status,
+        loop_depth: 0,
+        expand_time: false,
+        stop_expansion: false,
+        preserve_jobs: false,
+        disable_jobs: false,
+        budget: Rc::new(ExpandBudget::start()),
+    };
+    format_expand1(&mut state, template, variables)
+}
 
 /// The main expansion loop, matching tmux `format_expand1`.
 pub(super) fn format_expand1<V>(state: &mut ExpandState, fmt: &str, variables: &V) -> String
 where
     V: FormatVariables + ?Sized,
 {
-    if fmt.is_empty() {
+    if fmt.is_empty() || state.budget.is_exhausted() {
         return String::new();
     }
+    state.budget.charge(fmt.len());
 
     if state.stop_expansion || state.loop_depth >= FORMAT_LOOP_LIMIT {
         return String::new();
@@ -26,9 +57,11 @@ where
         fmt
     };
 
+    let status = state.status && !state.disable_jobs;
     let bytes = fmt.as_bytes();
     let mut out = String::with_capacity(fmt.len());
     let mut i = 0;
+    let mut style_end = None;
 
     while i < bytes.len() {
         if state.stop_expansion {
@@ -39,16 +72,15 @@ where
             while i < bytes.len() && bytes[i] != b'#' {
                 i += 1;
             }
-            out.push_str(&fmt[start..i]);
+            push_raw(&mut out, &fmt[start..i], status);
             continue;
         }
 
         // We have a `#`. Peek at next char.
         i += 1;
         if i >= bytes.len() {
-            // Keep trailing `#` literal. tmux drops it, but rmux treats a bare
-            // marker as text unless it starts a complete expansion.
-            out.push('#');
+            // tmux stops at an incomplete final marker (format_expand1).
+            // Escaped pairs have already emitted their literal hash.
             break;
         }
 
@@ -72,11 +104,25 @@ where
                     i += 1;
                 }
                 if i < bytes.len() {
-                    // Found matching `)`. Job expansion is not run in this
-                    // path, but status rendering can preserve it for a later
-                    // runtime execution pass.
                     if state.preserve_jobs {
                         out.push_str(&fmt[start - 2..=i]);
+                    } else if !state.disable_jobs {
+                        // Keep the caller's recursion guard and current loop item.
+                        // A job command cannot recursively launch another job.
+                        let expand_time = state.expand_time;
+                        state.expand_time = false;
+                        state.disable_jobs = true;
+                        let source = &fmt[start..i];
+                        let command = format_expand1(state, source, variables);
+                        state.disable_jobs = false;
+                        state.expand_time = expand_time;
+                        if !state.stop_expansion {
+                            push_raw(
+                                &mut out,
+                                &variables.format_job(source, &command).unwrap_or_default(),
+                                status,
+                            );
+                        }
                     }
                     i += 1; // skip `)`
                 } else {
@@ -85,6 +131,11 @@ where
                 }
             }
             b'{' => {
+                // tmux `format_skip1` finds no end once the time budget is
+                // spent, and `format_expand1` stops scanning there.
+                if state.budget.is_exhausted() {
+                    break;
+                }
                 // `#{...}` — format expression.
                 // Use format_skip to find matching `}`, starting from the `#`.
                 let skip_start = i - 2; // points at `#`
@@ -94,11 +145,15 @@ where
                         let key_start = i; // first char after `{`
                         let key_end = skip_start + off;
                         let key = &fmt[key_start..key_end];
+                        let display_field = status && style_end.is_none_or(|end| skip_start > end);
+                        let previous = state.status;
+                        state.status = display_field;
                         let result = format_replace(state, key, variables);
+                        let forwarded = std::mem::replace(&mut state.status, previous);
                         if state.stop_expansion {
                             break;
                         }
-                        out.push_str(&result);
+                        push_raw(&mut out, &result, status && !forwarded);
                         i = key_end + 1; // skip past `}`
                     }
                     None => {
@@ -111,9 +166,6 @@ where
                 // `##` — check if followed by more `#` and then `[` for styles.
                 // For now, `##` produces literal `#`. Style pass-through is
                 // handled below.
-                let hash_start = i - 2; // first `#`
-                let _ = hash_start;
-
                 // Count consecutive `#` chars including the ones we consumed.
                 // We already consumed `##` (two hashes).
                 let mut n = 2;
@@ -124,12 +176,10 @@ where
                 if i < bytes.len() && bytes[i] == b'[' {
                     let style_start = i - n;
                     let skip_bytes = &bytes[style_start..];
-                    if let Some(off) = format_skip(skip_bytes, b"]") {
-                        let end = style_start + off + 1;
-                        out.push_str(&fmt[style_start..end]);
-                        i = end;
-                        continue;
-                    }
+                    style_end = format_skip(skip_bytes, b"]").map(|off| style_start + off);
+                    out.push_str(&fmt[style_start..=i]);
+                    i += 1;
+                    continue;
                 }
                 // Plain `##...` — output literal `#` characters.
                 // `##` = `#`, `###` = `##`, `####` = `##`, etc.
@@ -157,35 +207,33 @@ where
                 out.push('#');
             }
             b'[' => {
-                // `#[...]` — style sequence. Pass through for format_draw.
-                // Find matching `]` using format_skip.
+                // Preserve style syntax while expanding expressions in its
+                // current context. Single-character aliases remain literal.
                 let skip_start = i - 2; // points at `#`
                 let skip_bytes = &bytes[skip_start..];
-                if let Some(off) = format_skip(skip_bytes, b"]") {
-                    // Output `#[` through `]`.
-                    let end = skip_start + off + 1;
-                    out.push_str(&fmt[skip_start..end]);
-                    i = end;
-                } else {
-                    // No matching `]` — output `#[` and continue.
-                    out.push('#');
-                    out.push('[');
-                }
+                style_end = format_skip(skip_bytes, b"]").map(|off| skip_start + off);
+                out.push_str("#[");
             }
             b'}' | b',' => {
                 // `#}` -> `}`, `#,` -> `,`
                 out.push(ch as char);
             }
             _ => {
-                if let Some(alias) = single_char_alias(ch) {
-                    out.push_str(&resolve_variable(alias, variables));
+                if let Some(alias) =
+                    single_char_alias(ch).filter(|_| style_end.is_none_or(|end| i - 1 > end))
+                {
+                    push_raw(&mut out, &resolve_variable(alias, variables), status);
                 } else {
                     out.push('#');
                     // `ch` was the byte right after `#` and `i` is already past
                     // it. If ch is ASCII, push it directly. If it starts a
                     // multi-byte UTF-8 sequence, copy the whole character.
                     if ch < 0x80 {
-                        out.push(ch as char);
+                        out.push(if status && ch == 0 {
+                            '\x01'
+                        } else {
+                            ch as char
+                        });
                     } else {
                         let start = i - 1;
                         let char_len = if ch & 0xE0 == 0xC0 {
@@ -206,6 +254,37 @@ where
 
     state.loop_depth -= 1;
     out
+}
+
+/// Mark reported text before any modifier transforms it.
+pub(super) fn status_field<V: FormatVariables + ?Sized>(
+    status: bool,
+    body: &str,
+    variables: &V,
+) -> Option<String> {
+    if !status
+        || !matches!(
+            body,
+            "pane_program_status_title" | "pane_program_status_message"
+        )
+    {
+        return None;
+    }
+    let (text, reported) = variables.format_status_field(body);
+    reported.then(|| text.replace('#', "\0"))
+}
+
+fn push_raw(out: &mut String, text: &str, status: bool) {
+    out.push_str(&raw_text(text, status));
+}
+
+pub(super) fn raw_text(text: &str, status: bool) -> std::borrow::Cow<'_, str> {
+    // Keep a genuine NUL nonprinting when the status renderer reserves it for '#'.
+    if status && text.contains('\0') {
+        text.replace('\0', "\x01").into()
+    } else {
+        text.into()
+    }
 }
 
 fn single_char_alias(ch: u8) -> Option<&'static str> {

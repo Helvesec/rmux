@@ -1,6 +1,41 @@
 use super::*;
 
 #[tokio::test]
+async fn new_window_occupied_slot_returns_creation_error_without_mutation() {
+    let handler = RequestHandler::new();
+    let alpha = session_name("alpha");
+    create_session(&handler, "alpha").await;
+    handler
+        .wait_for_pane_startup_to_finish_for_test(&PaneTarget::with_window(alpha.clone(), 0, 0))
+        .await;
+    let before = format!("{:?}", handler.state.lock().await.sessions);
+    for detached in [false, true] {
+        let response = handler
+            .handle(Request::NewWindow(Box::new(NewWindowRequest {
+                target: alpha.clone(),
+                name: Some("refused".to_owned()),
+                detached,
+                start_directory: None,
+                environment: None,
+                command: None,
+                process_command: None,
+                target_window_index: Some(0),
+                insert_at_target: false,
+            })))
+            .await;
+        assert_eq!(
+            response,
+            Response::Error(rmux_proto::ErrorResponse {
+                error: rmux_proto::RmuxError::Server(
+                    "create window failed: index 0 in use".to_owned(),
+                ),
+            })
+        );
+        assert_eq!(format!("{:?}", handler.state.lock().await.sessions), before);
+    }
+}
+
+#[tokio::test]
 async fn new_window_detached_leaves_the_active_window_unchanged() {
     let handler = RequestHandler::new();
     let alpha = session_name("alpha");
@@ -33,7 +68,10 @@ async fn new_window_detached_leaves_the_active_window_unchanged() {
         .session(&alpha)
         .expect("session should exist");
     assert_eq!(
-        session.windows().keys().copied().collect::<Vec<_>>(),
+        session
+            .windows()
+            .map(|(index, _)| index)
+            .collect::<Vec<_>>(),
         vec![0, 1]
     );
     assert_eq!(session.active_window_index(), 0);
@@ -293,9 +331,9 @@ async fn kill_window_prefers_last_window_as_the_active_fallback() {
 
     {
         let mut state = handler.state.lock().await;
-        let session = state
+        let mut session = state
             .sessions
-            .session_mut(&alpha)
+            .session_setup(&alpha)
             .expect("session should exist");
         session.select_window(2).expect("window 2 select succeeds");
         session.select_window(1).expect("window 1 select succeeds");
@@ -349,11 +387,17 @@ async fn kill_window_prefers_last_window_as_the_active_fallback() {
         .session(&alpha)
         .expect("session should exist");
     assert_eq!(
-        session.windows().keys().copied().collect::<Vec<_>>(),
+        session
+            .windows()
+            .map(|(index, _)| index)
+            .collect::<Vec<_>>(),
         vec![0, 2]
     );
     assert_eq!(session.active_window_index(), 2);
-    assert_eq!(session.last_window_index(), None);
+    // Detaching the current window selects the return first, which pushes the
+    // window being left, and only then drops the occurrence that goes away
+    // (`session.c:346-350`): window 0 is what the session still visited.
+    assert_eq!(session.last_window_index(), Some(0));
     drop(state);
     assert_eq!(
         handler.last_emitted_pane_snapshot_revision(removed_pane_id),
@@ -377,7 +421,7 @@ async fn kill_window_falls_back_to_previous_then_next_when_needed() {
         let mut state = handler.state.lock().await;
         state
             .sessions
-            .session_mut(&alpha)
+            .session_setup(&alpha)
             .expect("session should exist")
             .select_window(2)
             .expect("window 2 select succeeds");
@@ -411,9 +455,9 @@ async fn kill_window_falls_back_to_previous_then_next_when_needed() {
 
     {
         let mut state = handler.state.lock().await;
-        let session = state
+        let mut session = state
             .sessions
-            .session_mut(&alpha)
+            .session_setup(&alpha)
             .expect("session should exist");
         session.select_window(1).expect("window 1 select succeeds");
         session.select_window(2).expect("window 2 select succeeds");
@@ -478,7 +522,10 @@ async fn kill_window_all_others_leaves_only_the_target_window() {
         .session(&alpha)
         .expect("session should exist");
     assert_eq!(
-        session.windows().keys().copied().collect::<Vec<_>>(),
+        session
+            .windows()
+            .map(|(index, _)| index)
+            .collect::<Vec<_>>(),
         vec![1]
     );
     assert_eq!(session.active_window_index(), 1);
@@ -548,7 +595,10 @@ async fn new_window_reuses_the_lowest_available_index_after_kill() {
         .session(&alpha)
         .expect("session should exist");
     assert_eq!(
-        session.windows().keys().copied().collect::<Vec<_>>(),
+        session
+            .windows()
+            .map(|(index, _)| index)
+            .collect::<Vec<_>>(),
         vec![0, 1]
     );
     assert_eq!(
@@ -611,7 +661,10 @@ async fn new_window_does_not_mutate_the_session_when_existing_terminals_are_miss
         .session(&alpha)
         .expect("session should exist");
     assert_eq!(
-        session.windows().keys().copied().collect::<Vec<_>>(),
+        session
+            .windows()
+            .map(|(index, _)| index)
+            .collect::<Vec<_>>(),
         vec![0]
     );
     assert_eq!(session.active_window_index(), 0);
@@ -808,7 +861,10 @@ async fn kill_last_linked_window_orders_target_session_before_surviving_alias() 
     assert!(state.sessions.session(&alpha).is_none());
     let beta_session = state.sessions.session(&beta).expect("beta should survive");
     assert_eq!(
-        beta_session.windows().keys().copied().collect::<Vec<_>>(),
+        beta_session
+            .windows()
+            .map(|(index, _)| index)
+            .collect::<Vec<_>>(),
         vec![0, 1]
     );
 }
@@ -921,7 +977,10 @@ async fn kill_window_all_others_prevalidates_the_full_removal_set() {
         .session(&alpha)
         .expect("session should exist");
     assert_eq!(
-        session.windows().keys().copied().collect::<Vec<_>>(),
+        session
+            .windows()
+            .map(|(index, _)| index)
+            .collect::<Vec<_>>(),
         vec![0, 1, 2]
     );
     assert_eq!(session.active_window_index(), 0);
@@ -963,7 +1022,7 @@ async fn kill_window_cleans_grouped_member_window_metadata_before_synchronizing(
             skip_environment_update: false,
         })))
         .await;
-    assert!(matches!(grouped, Response::NewSession(_)));
+    crate::session_fixture::assert_new_session(&grouped);
 
     let alpha_target = WindowTarget::with_window(alpha.clone(), 1);
     let beta_target = WindowTarget::with_window(beta.clone(), 1);

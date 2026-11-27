@@ -11,7 +11,8 @@
 //! `set-titles-string`, once per distinct value.
 
 use super::set_titles_support::{
-    client_title_of, new_detached_session, set_global, title_capable_context, titles_in, TITLE_OPEN,
+    append_global, client_title_of, new_detached_session, set_global, title_capable_context,
+    titles_in, TITLE_OPEN,
 };
 use super::*;
 
@@ -216,6 +217,41 @@ async fn a_client_without_the_title_capability_receives_no_title() {
     );
 }
 
+/// Issue #182, step 3 of the report: a client with no `TERM` (Windows
+/// Terminal) gains the title capability from `terminal-features '*:title'`,
+/// and once it re-attaches `set-titles on` must reach its outer terminal.
+#[tokio::test]
+async fn issue_182_wildcard_title_feature_gives_a_term_less_client_its_title() {
+    let handler = RequestHandler::new();
+    let alpha = session_name("alpha");
+    new_detached_session(&handler, &alpha).await;
+    set_global(&handler, OptionName::SetTitlesString, "RMUXTEST #S").await;
+    append_global(&handler, OptionName::TerminalFeatures, "*:title").await;
+
+    let (control_tx, mut control_rx) = mpsc::unbounded_channel();
+    let _attach_id = handler
+        .register_attach_with_terminal_context(
+            std::process::id(),
+            alpha.clone(),
+            control_tx,
+            OuterTerminalContext::default(),
+        )
+        .await;
+    drain_attach_controls(&mut control_rx);
+    set_global(&handler, OptionName::SetTitles, "on").await;
+
+    let target = recv_switch_target(&mut control_rx, "set-titles on refresh").await;
+    assert!(
+        target.outer_terminal.features_string().contains("title"),
+        "'*:title' must advertise the title capability to a TERM-less client"
+    );
+    assert_eq!(
+        titles_in(&target.render_frame),
+        vec!["RMUXTEST alpha".to_owned()],
+        "the re-attached TERM-less client must receive the expanded title"
+    );
+}
+
 /// Control characters inside the expansion must not be able to close the OSC
 /// and inject a second sequence. tmux 3.7b writes the expansion verbatim and
 /// is injectable; RMUX neutralises the payload instead.
@@ -302,21 +338,23 @@ async fn an_active_pane_title_change_carries_the_new_title_to_the_client() {
         b"\x1b]2;APP-DRIVEN\x07",
     )
     .await;
-    handler.pane_alert_callback()(crate::pane_io::PaneAlertEvent {
-        session_name: alpha,
-        pane_id,
-        bell_count: 0,
-        title_changed: true,
-        title_change: None,
-        path_changed: false,
-        clipboard_set: false,
-        clipboard_writes: Vec::new(),
-        clipboard_queries: Vec::new(),
-        mouse_mode_changed: false,
-        alternate_mode_changed: false,
-        queue_activity_alert: false,
-        generation: None,
-    });
+    handler
+        .pane_alert_callback()
+        .alert(crate::pane_io::PaneAlertEvent {
+            session_name: alpha,
+            pane_id,
+            bell_count: 0,
+            title_changed: true,
+            title_change: None,
+            path_changed: false,
+            clipboard_set: false,
+            clipboard_writes: Vec::new(),
+            clipboard_queries: Vec::new(),
+            mouse_mode_changed: false,
+            alternate_mode_changed: false,
+            queue_activity_alert: false,
+            generation: None,
+        });
 
     let refreshed = recv_switch_target(&mut control_rx, "pane title change refresh").await;
     assert_eq!(
@@ -361,21 +399,23 @@ async fn an_active_pane_title_change_does_not_refresh_when_set_titles_is_off() {
         b"\x1b]2;APP-DRIVEN\x07",
     )
     .await;
-    handler.pane_alert_callback()(crate::pane_io::PaneAlertEvent {
-        session_name: alpha,
-        pane_id,
-        bell_count: 0,
-        title_changed: true,
-        title_change: None,
-        path_changed: false,
-        clipboard_set: false,
-        clipboard_writes: Vec::new(),
-        clipboard_queries: Vec::new(),
-        mouse_mode_changed: false,
-        alternate_mode_changed: false,
-        queue_activity_alert: false,
-        generation: None,
-    });
+    handler
+        .pane_alert_callback()
+        .alert(crate::pane_io::PaneAlertEvent {
+            session_name: alpha,
+            pane_id,
+            bell_count: 0,
+            title_changed: true,
+            title_change: None,
+            path_changed: false,
+            clipboard_set: false,
+            clipboard_writes: Vec::new(),
+            clipboard_queries: Vec::new(),
+            mouse_mode_changed: false,
+            alternate_mode_changed: false,
+            queue_activity_alert: false,
+            generation: None,
+        });
 
     assert!(
         tokio::time::timeout(std::time::Duration::from_millis(750), control_rx.recv())
@@ -491,11 +531,14 @@ async fn the_attach_frame_title_is_not_repeated_by_the_first_refresh() {
         crate::handler::attach_support::attach_target_for_session(
             &state,
             &alpha,
-            1,
-            &title_capable_context(),
-            None,
-            None,
-            Path::new("rmux.sock"),
+            crate::handler::attach_support::AttachSessionRenderOptions {
+                attached_count: 1,
+                terminal_context: &title_capable_context(),
+                previous_title: None,
+                client: None,
+                socket_path: Path::new("rmux.sock"),
+                client_loop_snapshots: None,
+            },
         )
         .expect("attach target builds")
     };
@@ -572,6 +615,7 @@ async fn attach_with_initial_title(
 /// The web and snapshot render paths share `render_prelude`, but a browser
 /// client advertises no terminal capabilities at all, so `set-titles on` must
 /// not push OSC 0 / OSC 7 into a snapshot that xterm.js will replay.
+#[cfg(feature = "web")]
 #[tokio::test]
 async fn the_web_and_snapshot_renders_carry_no_title() {
     let handler = RequestHandler::new();

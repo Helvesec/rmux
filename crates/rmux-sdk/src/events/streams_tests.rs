@@ -75,13 +75,13 @@ fn pane_output_start_maps_to_proto_variants() {
 
 #[test]
 fn is_subscription_gone_matches_known_server_strings() {
-    let gone = RmuxError::protocol(rmux_proto::RmuxError::Server(
+    let gone = RmuxError::from_proto(rmux_proto::RmuxError::Server(
         "subscription not found".to_owned(),
     ));
-    let receiver_gone = RmuxError::protocol(rmux_proto::RmuxError::Server(
+    let receiver_gone = RmuxError::from_proto(rmux_proto::RmuxError::Server(
         "subscription receiver not found".to_owned(),
     ));
-    let other = RmuxError::protocol(rmux_proto::RmuxError::Server(
+    let other = RmuxError::from_proto(rmux_proto::RmuxError::Server(
         "different daemon error".to_owned(),
     ));
     assert!(is_subscription_gone(&gone));
@@ -96,15 +96,15 @@ fn is_subscription_gone_does_not_match_ownership_or_invalid_target_errors() {
     // is a real protocol violation, not a subscription-gone signal,
     // so it must propagate as an SDK error rather than silently
     // ending the stream.
-    let owned_elsewhere = RmuxError::protocol(rmux_proto::RmuxError::Server(
+    let owned_elsewhere = RmuxError::from_proto(rmux_proto::RmuxError::Server(
         "subscription is not owned by this connection".to_owned(),
     ));
-    let invalid_target = RmuxError::protocol(rmux_proto::RmuxError::InvalidTarget {
+    let invalid_target = RmuxError::from_proto(rmux_proto::RmuxError::InvalidTarget {
         value: "alpha:0.0".to_owned(),
         reason: "pane index does not exist in session".to_owned(),
     });
     let session_not_found =
-        RmuxError::protocol(rmux_proto::RmuxError::SessionNotFound("alpha".to_owned()));
+        RmuxError::from_proto(rmux_proto::RmuxError::SessionNotFound("alpha".to_owned()));
     assert!(!is_subscription_gone(&owned_elsewhere));
     assert!(!is_subscription_gone(&invalid_target));
     assert!(!is_subscription_gone(&session_not_found));

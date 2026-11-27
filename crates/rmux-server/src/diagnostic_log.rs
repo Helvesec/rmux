@@ -19,6 +19,20 @@ pub(crate) fn record_shutdown_queued(reason: &str) {
     ));
 }
 
+/// One attached input the server dropped instead of closing the attach.
+///
+/// The attach forwarder must not end a healthy attach for one lost key, so
+/// the drop is silent to the client; this line is what lets a missing key be
+/// told apart from a key the client never sent.
+pub(crate) fn record_attached_input_dropped(cause: &str, error: &dyn std::fmt::Display) {
+    record_line(&format!(
+        "time_ms={} process_pid={} event=attached-input-dropped cause={cause} detail={:?}",
+        timestamp_ms(),
+        std::process::id(),
+        error.to_string()
+    ));
+}
+
 fn record_line(line: &str) {
     let Some(path) = std::env::var_os(EXIT_LOG_ENV) else {
         return;

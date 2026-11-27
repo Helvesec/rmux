@@ -34,6 +34,31 @@ impl WindowsShellEnvironment {
     }
 }
 
+pub(crate) fn invoking_client_shell() -> Option<String> {
+    let pid = rmux_os::process::parent_pid(std::process::id())?;
+    let name = rmux_os::process::command_name(pid)?;
+    client_shell_for_parent_name(&name, &WindowsShellEnvironment::current())
+}
+
+pub(crate) fn invoking_client_environment(
+    vars: impl IntoIterator<Item = (OsString, OsString)>,
+    shell: Option<String>,
+) -> Vec<String> {
+    let mut environment: Vec<_> = vars
+        .into_iter()
+        .filter(|(name, _)| {
+            !rmux_os::is_internal_environment_name(name)
+                && !name.eq_ignore_ascii_case("RMUX_CLIENT_SHELL")
+                && !name.as_encoded_bytes().starts_with(b"=")
+        })
+        .map(|(name, value)| format!("{}={}", name.to_string_lossy(), value.to_string_lossy()))
+        .collect();
+    if let Some(shell) = shell {
+        environment.push(format!("RMUX_CLIENT_SHELL={shell}"));
+    }
+    environment
+}
+
 pub(crate) fn client_shell_for_parent_name(
     parent_name: &str,
     environment: &WindowsShellEnvironment,

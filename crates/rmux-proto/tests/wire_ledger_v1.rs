@@ -22,34 +22,37 @@ use rmux_proto::{
     AttachSessionExt2Request, AttachSessionExt3Request, BindKeyRequest, CancelSdkWaitRequest,
     CancelSdkWaitResponse, CapturePaneRequest, CapturePaneTargetActionRequest,
     ClientTerminalContext, ClockModeRequest, ControlMode, ControlModeRequest, ControlModeResponse,
-    DetachClientRequest, DisplayMessageExtRequest, ErrorResponse, ForegroundFieldSource,
-    ForegroundSourcesDto, ForegroundStateDto, FrameDecoder, FrameDirection, FrameFeature,
-    FrameKind, FrameStatus, HandshakeRequest, HandshakeResponse, HasSessionRequest,
-    HasSessionResponse, HookLifecycle, HookName, KillServerResponse, KillSessionRequest,
-    ListBuffersRequest, NewSessionResponse, OptionName, PaneForegroundStateRequest,
-    PaneForegroundStateResponse, PaneId, PaneInputRequest, PaneKillRequest, PaneOptionEntry,
-    PaneOptionGetRequest, PaneOptionGetResponse, PaneOptionSetRequest, PaneOptionSetResponse,
-    PaneOutputCursor, PaneOutputCursorRequest, PaneOutputCursorResponse, PaneOutputEvent,
-    PaneOutputLagNotice, PaneOutputLagResponse, PaneOutputSubscriptionId,
-    PaneOutputSubscriptionStart, PaneRawBytes, PaneRawRebase, PaneRawRebaseReason,
-    PaneRecentOutput, PaneRecoveryCoverage, PaneResizeRequest, PaneRespawnRequest,
-    PaneSelectRequest, PaneSnapshotCursor, PaneSnapshotRefRequest, PaneSnapshotResponse,
-    PaneStateClosedReason, PaneStateCursorRequest, PaneStateCursorResponse, PaneStateEventDto,
-    PaneStateLagResponse, PaneStateSnapshot, PaneStateSubscriptionId, PaneStreamCursorRequest,
-    PaneStreamCursorResponse, PaneStreamEndReason, PaneStreamEvent, PaneStreamLifecycleEvent,
-    PaneStreamMode, PaneSurfaceDynamicColors, PaneSurfaceFrame, PaneSurfaceHyperlink,
-    PaneSurfaceSnapshot, PaneTarget, PaneTargetRef, Request, ResizePaneAdjustment,
-    ResizePaneTargetActionRequest, ResolveTargetRequest, ResolveTargetType, Response, RmuxError,
-    ScopeSelector, SdkWaitForOutputRefRequest, SdkWaitForOutputRequest, SdkWaitForOutputResponse,
-    SdkWaitId, SdkWaitOutcome, SdkWaitOwnerId, SendKeysExt2Request, SendKeysRequest,
-    SendKeysResponse, SessionName, SetHookRequest, SetOptionMode, SetOptionRequest, SplitDirection,
-    SplitWindowIdentityRequest, SplitWindowIdentityResponse, SplitWindowTargetActionRequest,
-    SubscribePaneOutputRefRequest, SubscribePaneOutputRequest, SubscribePaneOutputResponse,
-    SubscribePaneStateRequest, SubscribePaneStateResponse, SubscribePaneStreamRequest,
-    SubscribePaneStreamResponse, TerminalSize, UnsubscribePaneOutputRequest,
-    UnsubscribePaneOutputResponse, UnsubscribePaneStateRequest, UnsubscribePaneStateResponse,
-    UnsubscribePaneStreamRequest, UnsubscribePaneStreamResponse, WebShareConfigRequest,
-    WebShareListener, WebShareRequest, WebShareResponse, WindowTarget, RMUX_FRAME_MAGIC,
+    DetachClientRequest, DisplayMessageExtRequest, ErrorResponse, ExportWindowSnapshotRequest,
+    ExportWindowSnapshotResponse, ForegroundFieldSource, ForegroundSourcesDto, ForegroundStateDto,
+    FrameDecoder, FrameDirection, FrameFeature, FrameKind, FrameStatus, HandshakeRequest,
+    HandshakeResponse, HasSessionRequest, HasSessionResponse, HookLifecycle, HookName,
+    KillServerResponse, KillSessionRequest, ListBuffersRequest, NewSessionResponse, OptionName,
+    PaneForegroundStateRequest, PaneForegroundStateResponse, PaneId, PaneInputRequest,
+    PaneKillRequest, PaneOptionEntry, PaneOptionGetRequest, PaneOptionGetResponse,
+    PaneOptionSetRequest, PaneOptionSetResponse, PaneOutputCursor, PaneOutputCursorRequest,
+    PaneOutputCursorResponse, PaneOutputEvent, PaneOutputLagNotice, PaneOutputLagResponse,
+    PaneOutputSubscriptionId, PaneOutputSubscriptionStart, PaneRawBytes, PaneRawRebase,
+    PaneRawRebaseReason, PaneRecentOutput, PaneRecoveryCoverage, PaneResizeRequest,
+    PaneRespawnRequest, PaneSelectRequest, PaneSnapshotCursor, PaneSnapshotRefRequest,
+    PaneSnapshotResponse, PaneStateClosedReason, PaneStateCursorRequest, PaneStateCursorResponse,
+    PaneStateEventDto, PaneStateLagResponse, PaneStateSnapshot, PaneStateSubscriptionId,
+    PaneStreamCursorRequest, PaneStreamCursorResponse, PaneStreamEndReason, PaneStreamEvent,
+    PaneStreamLifecycleEvent, PaneStreamMode, PaneSurfaceDynamicColors, PaneSurfaceFrame,
+    PaneSurfaceHyperlink, PaneSurfaceSnapshot, PaneTarget, PaneTargetRef, Request,
+    ResizePaneAdjustment, ResizePaneTargetActionRequest, ResolveTargetRequest, ResolveTargetType,
+    Response, RestoreWindowSnapshotRequest, RestoreWindowSnapshotResponse, RmuxError,
+    RmuxFloatingPaneSnapshot, RmuxWindowSnapshot, RmuxWindowSnapshotCell,
+    RmuxWindowSnapshotSplitDirection, ScopeSelector, SdkWaitForOutputRefRequest,
+    SdkWaitForOutputRequest, SdkWaitForOutputResponse, SdkWaitId, SdkWaitOutcome, SdkWaitOwnerId,
+    SendKeysExt2Request, SendKeysRequest, SendKeysResponse, SessionId, SessionName, SetHookRequest,
+    SetOptionMode, SetOptionRequest, SplitDirection, SplitWindowIdentityRequest,
+    SplitWindowIdentityResponse, SplitWindowTargetActionRequest, SubscribePaneOutputRefRequest,
+    SubscribePaneOutputRequest, SubscribePaneOutputResponse, SubscribePaneStateRequest,
+    SubscribePaneStateResponse, SubscribePaneStreamRequest, SubscribePaneStreamResponse,
+    TerminalSize, UnsubscribePaneOutputRequest, UnsubscribePaneOutputResponse,
+    UnsubscribePaneStateRequest, UnsubscribePaneStateResponse, UnsubscribePaneStreamRequest,
+    UnsubscribePaneStreamResponse, WebShareConfigRequest, WebShareListener, WebShareRequest,
+    WebShareResponse, WindowId, WindowTarget, RMUX_FRAME_MAGIC, RMUX_WINDOW_SNAPSHOT_VERSION,
     RMUX_WIRE_VERSION, V1_FRAME_LEDGER,
 };
 
@@ -74,6 +77,64 @@ fn alpha() -> SessionName {
 
 fn pane_alpha_2() -> PaneTarget {
     PaneTarget::new(alpha(), 2)
+}
+
+fn window_snapshot_fixture() -> RmuxWindowSnapshot {
+    let target = WindowTarget::with_window(alpha(), 0);
+    RmuxWindowSnapshot {
+        version: RMUX_WINDOW_SNAPSHOT_VERSION,
+        session_id: SessionId::new(3),
+        target,
+        window_id: WindowId::new(9),
+        size: TerminalSize { cols: 80, rows: 24 },
+        zoomed: false,
+        tiled: Some(RmuxWindowSnapshotCell::Split {
+            direction: RmuxWindowSnapshotSplitDirection::LeftRight,
+            cols: 80,
+            rows: 24,
+            x: 0,
+            y: 0,
+            children: vec![
+                RmuxWindowSnapshotCell::Pane {
+                    pane_id: PaneId::new(1),
+                    cols: 39,
+                    rows: 24,
+                    x: 0,
+                    y: 0,
+                },
+                RmuxWindowSnapshotCell::Pane {
+                    pane_id: PaneId::new(2),
+                    cols: 40,
+                    rows: 24,
+                    x: 40,
+                    y: 0,
+                },
+            ],
+        }),
+        floating: vec![RmuxFloatingPaneSnapshot {
+            pane_id: PaneId::new(3),
+            x: -2,
+            y: 4,
+            cols: 30,
+            rows: 8,
+            visible: false,
+        }],
+        active_pane: PaneId::new(3),
+        last_pane: Some(PaneId::new(1)),
+        runtimes: (1..=3)
+            .map(|id| rmux_proto::RmuxPaneRuntimeIdentity {
+                pane_id: PaneId::new(id),
+                incarnation: [id as u8; 32],
+            })
+            .collect(),
+        metadata: rmux_proto::RmuxWindowLayoutMetadata {
+            layout: rmux_proto::LayoutName::EvenHorizontal,
+            last_layout: Some(rmux_proto::LayoutName::EvenHorizontal),
+            custom_layout: false,
+            requested_main_width: None,
+            requested_main_height: None,
+        },
+    }
 }
 
 #[derive(Debug)]
@@ -408,7 +469,158 @@ fn fixtures() -> Vec<FullFrameFixture> {
             removed: true,
         });
 
+    let runtime_execution = Request::RuntimeCommandExecution(Box::new(
+        rmux_proto::RuntimeCommandExecutionRequest::new(
+            vec![
+                "send-keys".to_owned(),
+                "-t".to_owned(),
+                "alpha".to_owned(),
+                "Enter".to_owned(),
+            ],
+            Some(PathBuf::from("/client/cwd")),
+        ),
+    ));
+    let runtime_execution_v2 = Request::RuntimeCommandExecutionV2(Box::new(
+        rmux_proto::RuntimeCommandExecutionV2Request::new(
+            vec![
+                "send-keys".to_owned(),
+                "-t".to_owned(),
+                "alpha".to_owned(),
+                "Enter".to_owned(),
+            ],
+            Some(PathBuf::from("/client/cwd")),
+            rmux_proto::RuntimeCommandIntent::GenericCli,
+        ),
+    ));
+    let runtime_execution_response = Response::RuntimeCommandExecution(Box::new(
+        rmux_proto::RuntimeCommandExecutionResponse::Complete {
+            command_name: "display-message".to_owned(),
+            stdout: b"hello\n".to_vec(),
+            error: None,
+            exit_status: 0,
+        },
+    ));
+
+    let split_command =
+        Request::SplitWindowCommandV1(Box::new(rmux_proto::SplitWindowCommandV1Request::new(
+            vec!["split-window".to_owned(), "-Ik".to_owned()],
+            None,
+            Some(vec![0, 255, 27, 59]),
+        )));
+    let split_result = Response::SplitWindowCommandV1(Box::new(
+        rmux_proto::SplitWindowCommandV1Response::Complete {
+            stdout: vec![0, 255],
+            error: None,
+            exit_status: 0,
+        },
+    ));
+    let new_pane_input = Request::NewPaneInputV1(Box::new(rmux_proto::NewPaneInputV1Request::new(
+        vec!["new-pane".to_owned(), "-I".to_owned()],
+        None,
+        Some(vec![0, 255, 27, 10]),
+    )));
+    let new_pane_input_result =
+        Response::NewPaneInputV1(Box::new(rmux_proto::NewPaneInputV1Response::Complete {
+            stdout: vec![0, 255],
+            error: None,
+            exit_status: 0,
+        }));
+    let window_snapshot = window_snapshot_fixture();
+    let export_window_snapshot = Request::ExportWindowSnapshot(ExportWindowSnapshotRequest {
+        target: window_snapshot.target.clone(),
+    });
+    let restore_window_snapshot =
+        Request::RestoreWindowSnapshot(Box::new(RestoreWindowSnapshotRequest {
+            target: window_snapshot.target.clone(),
+            snapshot: window_snapshot.clone(),
+        }));
+    let export_window_snapshot_response = Response::ExportWindowSnapshot(Box::new(
+        ExportWindowSnapshotResponse::from_snapshot(window_snapshot.clone())
+            .expect("snapshot response encodes"),
+    ));
+    let restore_window_snapshot_response =
+        Response::RestoreWindowSnapshot(RestoreWindowSnapshotResponse {
+            target: window_snapshot.target.clone(),
+            window_id: window_snapshot.window_id,
+        });
     vec![
+        FullFrameFixture {
+            name: "export_window_snapshot_request",
+            kind: frame_kind_for_request(&export_window_snapshot),
+            direction: FrameDirection::ClientToServer,
+            feature: FrameFeature::Layouts,
+            encode: Frame::Request(export_window_snapshot),
+        },
+        FullFrameFixture {
+            name: "restore_window_snapshot_request",
+            kind: frame_kind_for_request(&restore_window_snapshot),
+            direction: FrameDirection::ClientToServer,
+            feature: FrameFeature::Layouts,
+            encode: Frame::Request(restore_window_snapshot),
+        },
+        FullFrameFixture {
+            name: "export_window_snapshot_response",
+            kind: frame_kind_for_response(&export_window_snapshot_response),
+            direction: FrameDirection::ServerToClient,
+            feature: FrameFeature::Layouts,
+            encode: Frame::Response(export_window_snapshot_response),
+        },
+        FullFrameFixture {
+            name: "restore_window_snapshot_response",
+            kind: frame_kind_for_response(&restore_window_snapshot_response),
+            direction: FrameDirection::ServerToClient,
+            feature: FrameFeature::Layouts,
+            encode: Frame::Response(restore_window_snapshot_response),
+        },
+        FullFrameFixture {
+            name: "split_window_command_v1_request",
+            kind: frame_kind_for_request(&split_command),
+            direction: FrameDirection::ClientToServer,
+            feature: FrameFeature::Panes,
+            encode: Frame::Request(split_command),
+        },
+        FullFrameFixture {
+            name: "split_window_command_v1_response",
+            kind: frame_kind_for_response(&split_result),
+            direction: FrameDirection::ServerToClient,
+            feature: FrameFeature::Panes,
+            encode: Frame::Response(split_result),
+        },
+        FullFrameFixture {
+            name: "new_pane_input_v1_request",
+            kind: frame_kind_for_request(&new_pane_input),
+            direction: FrameDirection::ClientToServer,
+            feature: FrameFeature::Panes,
+            encode: Frame::Request(new_pane_input),
+        },
+        FullFrameFixture {
+            name: "new_pane_input_v1_response",
+            kind: frame_kind_for_response(&new_pane_input_result),
+            direction: FrameDirection::ServerToClient,
+            feature: FrameFeature::Panes,
+            encode: Frame::Response(new_pane_input_result),
+        },
+        FullFrameFixture {
+            name: "runtime_command_execution_v2_request",
+            kind: frame_kind_for_request(&runtime_execution_v2),
+            direction: FrameDirection::ClientToServer,
+            feature: FrameFeature::Protocol,
+            encode: Frame::Request(runtime_execution_v2),
+        },
+        FullFrameFixture {
+            name: "runtime_command_execution_request",
+            kind: frame_kind_for_request(&runtime_execution),
+            direction: FrameDirection::ClientToServer,
+            feature: FrameFeature::Protocol,
+            encode: Frame::Request(runtime_execution),
+        },
+        FullFrameFixture {
+            name: "runtime_command_execution_response",
+            kind: frame_kind_for_response(&runtime_execution_response),
+            direction: FrameDirection::ServerToClient,
+            feature: FrameFeature::Protocol,
+            encode: Frame::Response(runtime_execution_response),
+        },
         FullFrameFixture {
             name: "has_session_request",
             kind: frame_kind_for_request(&has_session),
@@ -640,7 +852,7 @@ fn encode_fixture(fixture: &FullFrameFixture) -> Vec<u8> {
 fn fixture_count_matches_manifest() {
     assert_eq!(
         fixtures().len(),
-        31,
+        42,
         "ledger fixture manifest must stay explicit"
     );
 }
@@ -890,6 +1102,7 @@ fn cross_section_requests() -> Vec<Request> {
     let alpha = alpha();
     let pane = pane_alpha_2();
     let pane_ref = PaneTargetRef::by_id(alpha.clone(), PaneId::new(9));
+    let window_snapshot = window_snapshot_fixture();
     vec![
         Request::HasSession(HasSessionRequest {
             target: alpha.clone(),
@@ -1078,11 +1291,19 @@ fn cross_section_requests() -> Vec<Request> {
                 stdin_payload: None,
             },
         })),
+        Request::ExportWindowSnapshot(ExportWindowSnapshotRequest {
+            target: window_snapshot.target.clone(),
+        }),
+        Request::RestoreWindowSnapshot(Box::new(RestoreWindowSnapshotRequest {
+            target: window_snapshot.target.clone(),
+            snapshot: window_snapshot,
+        })),
     ]
 }
 
 fn cross_section_responses() -> Vec<Response> {
     let alpha = alpha();
+    let window_snapshot = window_snapshot_fixture();
     let cursor = PaneOutputCursor {
         next_sequence: 2,
         missed_events: 0,
@@ -1163,6 +1384,14 @@ fn cross_section_responses() -> Vec<Response> {
         Response::SplitWindowIdentity(SplitWindowIdentityResponse {
             pane: PaneTarget::with_window(alpha, 2, 7),
             pane_id: PaneId::new(42),
+        }),
+        Response::ExportWindowSnapshot(Box::new(
+            ExportWindowSnapshotResponse::from_snapshot(window_snapshot.clone())
+                .expect("snapshot response encodes"),
+        )),
+        Response::RestoreWindowSnapshot(RestoreWindowSnapshotResponse {
+            target: window_snapshot.target.clone(),
+            window_id: window_snapshot.window_id,
         }),
     ]
 }
@@ -1285,8 +1514,8 @@ fn ledger_active_size_matches_request_and_response_variant_count() {
         .iter()
         .filter(|entry| matches!(entry.status, FrameStatus::Active))
         .count();
-    // Active entries = 131 Request variants + 105 Response variants.
-    assert_eq!(active_count, 131 + 105, "active ledger size mismatch");
+    // Active entries = 143 Request variants + 116 Response variants.
+    assert_eq!(active_count, 143 + 116, "active ledger size mismatch");
 }
 
 #[test]
@@ -1504,6 +1733,27 @@ fn assert_request_semantic_equal(actual: &Request, expected: &Request, label: &s
         (Request::UnsubscribePaneStream(actual), Request::UnsubscribePaneStream(expected)) => {
             assert_eq!(actual, expected, "{label}");
         }
+        (
+            Request::RuntimeCommandExecutionV2(actual),
+            Request::RuntimeCommandExecutionV2(expected),
+        ) => {
+            assert_eq!(actual, expected, "{label}");
+        }
+        (Request::NewPaneInputV1(actual), Request::NewPaneInputV1(expected)) => {
+            assert_eq!(actual, expected, "{label}");
+        }
+        (Request::RuntimeCommandExecution(actual), Request::RuntimeCommandExecution(expected)) => {
+            assert_eq!(actual, expected, "{label}");
+        }
+        (Request::SplitWindowCommandV1(actual), Request::SplitWindowCommandV1(expected)) => {
+            assert_eq!(actual, expected, "{label}");
+        }
+        (Request::ExportWindowSnapshot(actual), Request::ExportWindowSnapshot(expected)) => {
+            assert_eq!(actual, expected, "{label}");
+        }
+        (Request::RestoreWindowSnapshot(actual), Request::RestoreWindowSnapshot(expected)) => {
+            assert_eq!(actual, expected, "{label}");
+        }
         (Request::NewSession(actual), Request::NewSession(expected)) => {
             assert_eq!(
                 actual.session_name.as_str(),
@@ -1568,6 +1818,24 @@ fn assert_response_semantic_equal(actual: &Response, expected: &Response, label:
             assert_eq!(actual, expected, "{label}");
         }
         (Response::PaneStreamCursor(actual), Response::PaneStreamCursor(expected)) => {
+            assert_eq!(actual, expected, "{label}");
+        }
+        (
+            Response::RuntimeCommandExecution(actual),
+            Response::RuntimeCommandExecution(expected),
+        ) => {
+            assert_eq!(actual, expected, "{label}");
+        }
+        (Response::NewPaneInputV1(actual), Response::NewPaneInputV1(expected)) => {
+            assert_eq!(actual, expected, "{label}");
+        }
+        (Response::SplitWindowCommandV1(actual), Response::SplitWindowCommandV1(expected)) => {
+            assert_eq!(actual, expected, "{label}");
+        }
+        (Response::ExportWindowSnapshot(actual), Response::ExportWindowSnapshot(expected)) => {
+            assert_eq!(actual, expected, "{label}");
+        }
+        (Response::RestoreWindowSnapshot(actual), Response::RestoreWindowSnapshot(expected)) => {
             assert_eq!(actual, expected, "{label}");
         }
         (Response::UnsubscribePaneStream(actual), Response::UnsubscribePaneStream(expected)) => {
@@ -1940,6 +2208,12 @@ fn fixture_set_kinds_match_manifest_table() {
         ("subscribe_pane_stream_request", 0x0080),
         ("pane_stream_cursor_request", 0x0081),
         ("unsubscribe_pane_stream_request", 0x0082),
+        ("runtime_command_execution_v2_request", 0x0087),
+        ("runtime_command_execution_request", 0x0083),
+        ("split_window_command_v1_request", 0x0084),
+        ("export_window_snapshot_request", 0x0085),
+        ("restore_window_snapshot_request", 0x0086),
+        ("new_pane_input_v1_request", 0x0088),
         ("new_session_response", 0x8000),
         ("error_response", 0x801F),
         ("pane_option_set_response", 0x805E),
@@ -1953,6 +2227,11 @@ fn fixture_set_kinds_match_manifest_table() {
         ("subscribe_pane_stream_response", 0x8066),
         ("pane_stream_cursor_response", 0x8067),
         ("unsubscribe_pane_stream_response", 0x8068),
+        ("runtime_command_execution_response", 0x8069),
+        ("split_window_command_v1_response", 0x806a),
+        ("export_window_snapshot_response", 0x806b),
+        ("restore_window_snapshot_response", 0x806c),
+        ("new_pane_input_v1_response", 0x806d),
     ];
     let mut by_name: std::collections::HashMap<&str, u16> = std::collections::HashMap::new();
     for entry in V1_FRAME_LEDGER {
@@ -2075,3 +2354,82 @@ fn regenerate_v1_fixtures() {
 // Suppress unused imports when this file is compiled in isolation.
 #[allow(dead_code)]
 fn _types_used(_: WindowTarget, _: TerminalSize) {}
+
+#[test]
+fn snapshot_v2_adds_new_tags_and_roundtrips_without_reinterpreting_v1() {
+    use rmux_proto::{
+        ExportWindowSnapshotV2Request, ExportWindowSnapshotV2Response,
+        RestoreWindowSnapshotV2Request, RestoreWindowSnapshotV2Response, RmuxWindowResizeTopology,
+        RmuxWindowSnapshotV2,
+    };
+    let old = window_snapshot_fixture();
+    let v2 = RmuxWindowSnapshotV2 {
+        version: 2,
+        session_id: old.session_id,
+        target: old.target.clone(),
+        window_id: old.window_id,
+        size: old.size,
+        zoomed: old.zoomed,
+        tiled: old.tiled.clone(),
+        floating: old.floating.clone(),
+        active_pane: old.active_pane,
+        last_pane: old.last_pane,
+        runtimes: old.runtimes.clone(),
+        metadata: old.metadata.clone(),
+        resize_topology: RmuxWindowResizeTopology {
+            root_direction: Some(RmuxWindowSnapshotSplitDirection::LeftRight),
+            floating_attachment_order: vec![PaneId::new(3)],
+        },
+    };
+    for (request, tag) in [
+        (
+            Request::ExportWindowSnapshotV2(ExportWindowSnapshotV2Request {
+                target: old.target.clone(),
+            }),
+            137u32,
+        ),
+        (
+            Request::RestoreWindowSnapshotV2(Box::new(RestoreWindowSnapshotV2Request {
+                target: old.target.clone(),
+                snapshot: v2.clone(),
+            })),
+            138,
+        ),
+    ] {
+        let bytes = encode_frame(&request).unwrap();
+        assert_eq!(u32::from_le_bytes(bytes[6..10].try_into().unwrap()), tag);
+        let decoded: Request = decode_frame(&bytes).unwrap();
+        assert_eq!(encode_frame(&decoded).unwrap(), bytes);
+        assert_eq!(frame_kind_for_request(&request).bincode_tag(), tag);
+    }
+    for (response, tag) in [
+        (
+            Response::ExportWindowSnapshotV2(Box::new(
+                ExportWindowSnapshotV2Response::from_snapshot(v2).unwrap(),
+            )),
+            110u32,
+        ),
+        (
+            Response::RestoreWindowSnapshotV2(RestoreWindowSnapshotV2Response {
+                target: old.target.clone(),
+                window_id: old.window_id,
+            }),
+            111,
+        ),
+    ] {
+        let bytes = encode_frame(&response).unwrap();
+        assert_eq!(u32::from_le_bytes(bytes[6..10].try_into().unwrap()), tag);
+        let decoded: Response = decode_frame(&bytes).unwrap();
+        assert_eq!(encode_frame(&decoded).unwrap(), bytes);
+        assert_eq!(frame_kind_for_response(&response).bincode_tag(), tag);
+    }
+    assert_eq!(rmux_proto::RMUX_WINDOW_SNAPSHOT_VERSION, 1);
+    assert_eq!(rmux_proto::RMUX_WINDOW_SNAPSHOT_V2_VERSION, 2);
+    assert_eq!(
+        encode_frame(&Request::ExportWindowSnapshot(
+            ExportWindowSnapshotRequest { target: old.target }
+        ))
+        .unwrap(),
+        read_fixture("export_window_snapshot_request")
+    );
+}

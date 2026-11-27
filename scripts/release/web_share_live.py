@@ -12,6 +12,8 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import urlsplit
 
+from web_compatibility_contract import validate_browser_contract
+
 MANIFEST_URL = "https://share.rmux.io/.well-known/rmux-web-share.json"
 PUBLIC_ORIGIN = "https://share.rmux.io"
 REPOSITORY_URL = "https://github.com/Helvesec/rmux-web-share"
@@ -19,6 +21,7 @@ ASSET_PATH = re.compile(r"/_astro/[A-Za-z0-9._-]+\.wasm")
 
 
 def expected_wasm_hash(provenance_path: Path, source_sha: str, version: str) -> str:
+    validate_browser_contract()
     try:
         value = json.loads(provenance_path.read_text(encoding="utf-8"))
     except (OSError, UnicodeDecodeError, json.JSONDecodeError) as error:

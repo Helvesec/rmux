@@ -2,6 +2,12 @@
 
 mod common;
 
+#[path = "scripting/attach_targets.rs"]
+mod attach_targets;
+
+#[path = "scripting/has_targets.rs"]
+mod has_targets;
+
 use std::error::Error;
 use std::fs;
 use std::io::Write;
@@ -429,8 +435,9 @@ fn targeted_run_shell_follows_the_stable_pane_after_renumber_or_break() -> Resul
             ]);
         }
         let caller = std::thread::spawn(move || command.output());
-        wait_for_file(&marker)?;
-        assert_eq!(fs::read_to_string(&marker)?, original_pane_id.trim());
+        // The shell creates the marker before it writes the pane id into it,
+        // so its existence alone does not prove the id is readable yet.
+        wait_for_file_text(&marker, original_pane_id.trim())?;
 
         let current_target = if break_to_window {
             assert_success(&harness.run(&["break-pane", "-d", "-s", original_target.as_str()])?);
@@ -1457,6 +1464,93 @@ fn if_shell_ignores_a_stale_inherited_pane_without_emitting_command_error(
 }
 
 #[test]
+fn stale_inherited_pane_does_not_hide_an_explicit_invalid_target() -> Result<(), Box<dyn Error>> {
+    let harness = CliHarness::new("stale-inherited-explicit-target")?;
+    let _daemon = harness.start_hidden_daemon()?;
+    assert_success(&harness.run(&["new-session", "-d", "-s", "alpha"])?);
+    let before = stdout(&harness.run(&["display-message", "-p", "-t", "alpha", "#{pane_id}"])?);
+    let rmux = format!("{},0,0", harness.socket_path().display());
+    let output = harness.run_with(&["select-pane", "-t", "%999999"], |command| {
+        command.env("RMUX", rmux);
+        command.env("RMUX_PANE", "%999999");
+    })?;
+    assert_eq!(output.status.code(), Some(1));
+    assert!(stderr(&output).contains("999999"), "{}", stderr(&output));
+    assert!(stdout(&output).is_empty());
+    assert_eq!(
+        stdout(&harness.run(&["display-message", "-p", "-t", "alpha", "#{pane_id}"])?),
+        before
+    );
+    Ok(())
+}
+
+#[test]
+fn source_file_ignores_an_obsolete_inherited_pane_hint() -> Result<(), Box<dyn Error>> {
+    let harness = CliHarness::new("source-stale-inherited-pane")?;
+    let _daemon = harness.start_hidden_daemon()?;
+    assert_success(&harness.run(&["new-session", "-d", "-s", "alpha"])?);
+    assert_success(&harness.run(&["set-buffer", "-b", "stale-source-hook", "seed"])?);
+    assert_success(&harness.run(&[
+        "set-hook",
+        "-g",
+        "command-error",
+        "set-buffer -a -b stale-source-hook x",
+    ])?);
+    let config = harness.tmpdir().join("stale.conf");
+    fs::write(
+        &config,
+        "if-shell -F -t alpha 1 'set-buffer -b stale-source-selected yes'\n",
+    )?;
+    let rmux = format!("{},0,0", harness.socket_path().display());
+    let output = harness.run_with(&["source-file", config.to_str().unwrap()], |command| {
+        command.env("RMUX", rmux);
+        command.env("RMUX_PANE", "%999999");
+    })?;
+    assert_success(&output);
+    assert!(stderr(&output).is_empty());
+    assert_eq!(
+        stdout(&harness.run(&["show-buffer", "-b", "stale-source-hook"])?),
+        "seed"
+    );
+    assert_eq!(
+        stdout(&harness.run(&["show-buffer", "-b", "stale-source-selected"])?),
+        "yes"
+    );
+    Ok(())
+}
+
+#[test]
+fn display_message_json_ignores_an_obsolete_inherited_pane_hint() -> Result<(), Box<dyn Error>> {
+    let harness = CliHarness::new("display-json-stale-inherited-pane")?;
+    let _daemon = harness.start_hidden_daemon()?;
+    assert_success(&harness.run(&["new-session", "-d", "-s", "alpha"])?);
+    assert_success(&harness.run(&["set-buffer", "-b", "stale-json-hook", "seed"])?);
+    assert_success(&harness.run(&[
+        "set-hook",
+        "-g",
+        "command-error",
+        "set-buffer -a -b stale-json-hook x",
+    ])?);
+    let rmux = format!("{},0,0", harness.socket_path().display());
+    let output = harness.run_with(
+        &["display-message", "--json", "#{session_name}"],
+        |command| {
+            command.env("RMUX", rmux);
+            command.env("RMUX_PANE", "%999999");
+        },
+    )?;
+    assert_eq!(output.status.code(), Some(0), "{}", stderr(&output));
+    assert!(stderr(&output).is_empty());
+    let value: serde_json::Value = serde_json::from_slice(&output.stdout)?;
+    assert_eq!(value["message"], "alpha");
+    assert_eq!(
+        stdout(&harness.run(&["show-buffer", "-b", "stale-json-hook"])?),
+        "seed"
+    );
+    Ok(())
+}
+
+#[test]
 fn if_shell_preserves_source_file_shaped_stdout() -> Result<(), Box<dyn Error>> {
     let harness = CliHarness::new("if-shell-source-shaped-stdout")?;
     let _daemon = harness.start_hidden_daemon()?;
@@ -1527,6 +1621,7 @@ fn nested_commands_report_missing_session_without_invalid_target_wrapper(
 ) -> Result<(), Box<dyn Error>> {
     let harness = CliHarness::new("nested-missing-session-error")?;
     let _daemon = harness.start_hidden_daemon()?;
+    assert_success(&harness.run(&["new-session", "-d", "-s", "alpha"])?);
 
     let run_shell = harness.run(&["run-shell", "-C", "has-session -t missing"])?;
     assert_eq!(run_shell.status.code(), Some(1));
@@ -1561,9 +1656,151 @@ fn run_shell_command_mode_ignores_trailing_positional_arguments() -> Result<(), 
 }
 
 #[test]
+fn attach_session_diagnostic_precedence_across_command_paths() -> Result<(), Box<dyn Error>> {
+    for (session, expected) in [
+        (None, "no sessions\n"),
+        (Some("alpha"), "open terminal failed: not a terminal\n"),
+        (Some("beta"), "can't find session: alpha\n"),
+    ] {
+        let harness = CliHarness::new("attach-diagnostic-precedence")?;
+        let _daemon = harness.start_hidden_daemon()?;
+        if let Some(session) = session {
+            assert_success(&harness.run(&["new-session", "-d", "-s", session])?);
+        }
+        let config = harness.socket_path().with_extension("conf");
+        fs::write(&config, "attach-session -t alpha\n")?;
+        for args in [
+            vec!["attach-session", "-t", "alpha"],
+            vec!["run-shell", "-C", "attach-session -t alpha"],
+            vec!["run-shell", "-C", "attach -t alpha"],
+            vec!["run-shell", "-C", "attach-session -t '' -t alpha"],
+        ] {
+            let output = harness.run(&args)?;
+            assert_eq!(output.status.code(), Some(1), "{session:?}: {args:?}");
+            assert!(stdout(&output).is_empty(), "{session:?}: {args:?}");
+            assert_eq!(stderr(&output), expected, "{session:?}: {args:?}");
+        }
+        if session.is_none() {
+            for args in [
+                vec!["if-shell", "-F", "1", "attach-session -t alpha"],
+                vec!["source-file", config.to_str().expect("UTF-8 config path")],
+                vec!["start-server", ";", "attach-session", "-t", "alpha"],
+            ] {
+                let output = harness.run(&args)?;
+                assert_eq!(output.status.code(), Some(1), "{args:?}");
+                assert!(stdout(&output).is_empty(), "{args:?}");
+                assert_eq!(stderr(&output), "no sessions\n", "{args:?}");
+            }
+        }
+        let invalid = harness.run(&["run-shell", "-C", "attach-session -Q"])?;
+        assert_eq!(invalid.status.code(), Some(1));
+        assert!(stdout(&invalid).is_empty());
+        assert_eq!(
+            stderr(&invalid),
+            "command attach-session: unknown flag -Q\n"
+        );
+        assert_success(&harness.run(&[
+            "source-file",
+            "-n",
+            config.to_str().expect("UTF-8 config path"),
+        ])?);
+        let output = harness.run(&["run-shell", "-C", "attach-session"])?;
+        assert_eq!(output.status.code(), Some(1));
+        assert!(stdout(&output).is_empty());
+        assert_eq!(
+            stderr(&output),
+            if session.is_none() {
+                "no sessions\n"
+            } else {
+                "open terminal failed: not a terminal\n"
+            }
+        );
+        let sessions = harness.run(&["list-sessions", "-F", "#{session_name}"])?;
+        assert_eq!(sessions.status.code(), Some(0));
+        assert!(stderr(&sessions).is_empty());
+        assert_eq!(
+            stdout(&sessions),
+            session.map(|name| format!("{name}\n")).unwrap_or_default()
+        );
+    }
+    Ok(())
+}
+
+#[test]
+fn attach_session_final_empty_target_single() -> Result<(), Box<dyn Error>> {
+    check_attach_session_final_empty_target("-t ''")
+}
+
+#[test]
+fn attach_session_final_empty_target_repeated() -> Result<(), Box<dyn Error>> {
+    check_attach_session_final_empty_target("-t alpha -t ''")
+}
+
+fn check_attach_session_final_empty_target(options: &str) -> Result<(), Box<dyn Error>> {
+    for session in [None, Some("alpha"), Some("beta")] {
+        let harness = CliHarness::new("attach-final-empty-target")?;
+        let _daemon = harness.start_hidden_daemon()?;
+        if let Some(session) = session {
+            assert_success(&harness.run(&["new-session", "-d", "-s", session])?);
+        }
+        let command = format!("attach-session {options}");
+        let alias = format!("attach {options}");
+        let compact = format!("attach-session -d{}", options.trim_start_matches('-'));
+        for command in [&command, &alias, &compact] {
+            let output = harness.run(&["run-shell", "-C", command])?;
+            assert_eq!(output.status.code(), Some(1), "{session:?}: {command}");
+            assert!(stdout(&output).is_empty(), "{session:?}: {command}");
+            assert_eq!(
+                stderr(&output),
+                if session.is_none() {
+                    "no sessions\n"
+                } else {
+                    "open terminal failed: not a terminal\n"
+                },
+                "{session:?}: {command}"
+            );
+        }
+        let config = harness.socket_path().with_extension("conf");
+        fs::write(&config, format!("{command}\n"))?;
+        let config = config.to_str().expect("UTF-8 config path");
+        if session.is_none() {
+            for args in [
+                vec!["if-shell", "-F", "1", command.as_str()],
+                vec!["source-file", config],
+            ] {
+                let output = harness.run(&args)?;
+                assert_eq!(output.status.code(), Some(1), "{args:?}");
+                assert!(stdout(&output).is_empty(), "{args:?}");
+                assert_eq!(stderr(&output), "no sessions\n", "{args:?}");
+            }
+        }
+        for (suffix, expected) in [
+            ("-Q", "command attach-session: unknown flag -Q\n"),
+            ("-c", "command attach-session: -c expects an argument\n"),
+        ] {
+            let invalid = format!("{command} {suffix}");
+            let output = harness.run(&["run-shell", "-C", &invalid])?;
+            assert_eq!(output.status.code(), Some(1), "{session:?}: {invalid}");
+            assert!(stdout(&output).is_empty());
+            assert_eq!(stderr(&output), expected, "{session:?}: {invalid}");
+        }
+        assert_success(&harness.run(&["source-file", "-n", config])?);
+        let output = harness.run(&["list-sessions", "-F", "#{session_name}"])?;
+        assert_eq!(output.status.code(), Some(0));
+        assert!(stderr(&output).is_empty());
+        assert_eq!(
+            stdout(&output),
+            session.map(|name| format!("{name}\n")).unwrap_or_default()
+        );
+    }
+    Ok(())
+}
+
+#[test]
 fn run_shell_command_mode_attach_session_requires_terminal() -> Result<(), Box<dyn Error>> {
     let harness = CliHarness::new("run-shell-c-attach-requires-terminal")?;
     let _daemon = harness.start_hidden_daemon()?;
+    assert_success(&harness.run(&["new-session", "-d", "-s", "alpha"])?);
 
     let output = harness.run(&["run-shell", "-C", "attach-session -t alpha"])?;
     assert_eq!(output.status.code(), Some(1));
@@ -1839,7 +2076,7 @@ fn source_file_reports_invalid_command_flags_on_stdout_with_line_prefix(
     let config = harness.tmpdir().join("unsupported-command-flags.conf");
     fs::write(
         &config,
-        "capture-pane -Z\nchoose-tree -y 1\nlist-clients -Q\nlist-buffers -Q\n",
+        "capture-pane -Z\nchoose-tree -Q 1\nlist-clients -Q\nlist-buffers -Q\n",
     )?;
 
     let output = harness.run(&["source-file", config.to_str().expect("utf-8 config path")])?;
@@ -1848,7 +2085,7 @@ fn source_file_reports_invalid_command_flags_on_stdout_with_line_prefix(
     assert_eq!(
         stdout(&output),
         format!(
-            "{}:1: command capture-pane: unknown flag -Z\n{}:2: command choose-tree: unknown flag -y\n{}:3: command list-clients: unknown flag -Q\n{}:4: command list-buffers: unknown flag -Q\n",
+            "{}:1: command capture-pane: unknown flag -Z\n{}:2: command choose-tree: unknown flag -Q\n{}:3: command list-clients: unknown flag -Q\n{}:4: command list-buffers: unknown flag -Q\n",
             config.display(),
             config.display(),
             config.display(),
@@ -1864,6 +2101,7 @@ fn source_file_execution_errors_report_on_stderr_without_line_prefix() -> Result
 {
     let harness = CliHarness::new("source-file-execution-error-stderr")?;
     let _daemon = harness.start_hidden_daemon()?;
+    assert_success(&harness.run(&["new-session", "-d", "-s", "alpha"])?);
     let config = harness.tmpdir().join("execution-error.conf");
     fs::write(&config, "has-session -t missing\n")?;
 
@@ -2185,7 +2423,9 @@ fn startup_config_run_shell_can_call_back_into_daemon() -> Result<(), Box<dyn Er
     let marker = harness.tmpdir().join("startup-ok.txt");
     let command = format!(
         "{} -S {} show-options -g > {}",
-        shell_quote_str(env!("CARGO_BIN_EXE_rmux")),
+        shell_quote_str(rmux_os::build_identity::cargo_binary(env!(
+            "CARGO_BIN_EXE_rmux"
+        ))),
         shell_quote(harness.socket_path()),
         shell_quote(&marker)
     );
@@ -2453,7 +2693,10 @@ fn tmux_fallback_nested_shim_missing_local_is_not_logged_as_config_error(
     let home = harness.tmpdir().join("home");
     let fake_bin = harness.tmpdir().join("fake-bin");
     fs::create_dir_all(&fake_bin)?;
-    std::os::unix::fs::symlink(env!("CARGO_BIN_EXE_rmux"), fake_bin.join("tmux"))?;
+    std::os::unix::fs::symlink(
+        rmux_os::build_identity::cargo_binary(env!("CARGO_BIN_EXE_rmux")),
+        fake_bin.join("tmux"),
+    )?;
     fs::write(
         home.join(".tmux.conf"),
         "run-shell 'tmux -S #{socket_path} source \"$HOME/.tmux.conf.local\"'\n\
@@ -2491,8 +2734,6 @@ fn tmux_fallback_nested_shim_missing_local_is_not_logged_as_config_error(
 #[cfg(unix)]
 #[test]
 fn tmux_fallback_loads_minimal_tpm_plugin_through_shim() -> Result<(), Box<dyn Error>> {
-    use std::os::unix::fs::PermissionsExt;
-
     let harness = CliHarness::new("tmux-fallback-tpm")?;
     let home = harness.tmpdir().join("home");
     let tpm_dir = home.join(".tmux/plugins/tpm");
@@ -2502,7 +2743,7 @@ fn tmux_fallback_loads_minimal_tpm_plugin_through_shim() -> Result<(), Box<dyn E
     fs::create_dir_all(&spaced_plugin_dir)?;
     fs::create_dir_all(&nested_plugin_dir)?;
     let tpm = tpm_dir.join("tpm");
-    fs::write(
+    common::executable_fixture::write_executable(
         &tpm,
         "#!/bin/sh\n\
          set -eu\n\
@@ -2512,10 +2753,8 @@ fn tmux_fallback_loads_minimal_tpm_plugin_through_shim() -> Result<(), Box<dyn E
          tmux source-file \"$HOME/.tmux/plugins/nested/nested.tmux\"\n\
          tmux set-option -g @plugin-status JOB\n\
          tmux set-option -g status-right 'X#(tmux show-options -gqv @plugin-status)Y'\n",
+        0o700,
     )?;
-    let mut permissions = fs::metadata(&tpm)?.permissions();
-    permissions.set_mode(0o700);
-    fs::set_permissions(&tpm, permissions)?;
     fs::write(
         spaced_plugin_dir.join("plugin.tmux"),
         "set -g @spaced-plugin yes\n\
@@ -2568,7 +2807,7 @@ fn tmux_fallback_tpm_reads_all_plugin_entries_from_tmux_conf() -> Result<(), Box
     let tpm_dir = plugins_root.join("tpm");
     fs::create_dir_all(&tpm_dir)?;
     let tpm = tpm_dir.join("tpm");
-    fs::write(
+    common::executable_fixture::write_executable(
         &tpm,
         "#!/bin/sh\n\
          set -eu\n\
@@ -2582,8 +2821,8 @@ fn tmux_fallback_tpm_reads_all_plugin_entries_from_tmux_conf() -> Result<(), Box
              \"$file\"\n\
            done\n\
          done\n",
+        0o700,
     )?;
-    make_executable(&tpm)?;
 
     write_executable_plugin(
         &plugins_root,
@@ -2675,19 +2914,19 @@ fn tmux_fallback_runs_representative_executable_plugin_scripts() -> Result<(), B
     fs::create_dir_all(&fake_bin)?;
 
     let fake_tmux = fake_bin.join("tmux");
-    fs::write(
+    common::executable_fixture::write_executable(
         &fake_tmux,
         format!(
             "#!/bin/sh\nprintf called >> {}\nexit 97\n",
             shell_quote(&external_tmux_marker)
         ),
+        0o700,
     )?;
-    make_executable(&fake_tmux)?;
 
     let tpm_dir = plugins_root.join("tpm");
     fs::create_dir_all(&tpm_dir)?;
     let tpm = tpm_dir.join("tpm");
-    fs::write(
+    common::executable_fixture::write_executable(
         &tpm,
         "#!/bin/sh\n\
          set -eu\n\
@@ -2698,8 +2937,8 @@ fn tmux_fallback_runs_representative_executable_plugin_scripts() -> Result<(), B
              \"$file\"\n\
            done\n\
          done\n",
+        0o700,
     )?;
-    make_executable(&tpm)?;
 
     write_executable_plugin(
         &plugins_root,
@@ -2822,24 +3061,20 @@ fn tmux_fallback_runs_representative_executable_plugin_scripts() -> Result<(), B
 #[cfg(unix)]
 #[test]
 fn tmux_fallback_shim_preempts_external_tmux_in_path() -> Result<(), Box<dyn Error>> {
-    use std::os::unix::fs::PermissionsExt;
-
     let harness = CliHarness::new("tmux-fallback-shim-path")?;
     let home = harness.tmpdir().join("home");
     let external_bin = harness.tmpdir().join("external-bin");
     let marker = harness.tmpdir().join("external-tmux-called");
     fs::create_dir_all(&external_bin)?;
     let fake_tmux = external_bin.join("tmux");
-    fs::write(
+    common::executable_fixture::write_executable(
         &fake_tmux,
         format!(
             "#!/bin/sh\nprintf called >> {}\nexit 99\n",
             shell_quote(&marker)
         ),
+        0o700,
     )?;
-    let mut permissions = fs::metadata(&fake_tmux)?.permissions();
-    permissions.set_mode(0o700);
-    fs::set_permissions(&fake_tmux, permissions)?;
     fs::write(
         home.join(".tmux.conf"),
         "run-shell 'tmux set-option -g @shim-precedence yes'\n",
@@ -4267,17 +4502,7 @@ fn write_executable_plugin(
     let dir = plugins_root.join(plugin);
     fs::create_dir_all(&dir)?;
     let path = dir.join(name);
-    fs::write(&path, contents)?;
-    make_executable(&path)
-}
-
-#[cfg(unix)]
-fn make_executable(path: &std::path::Path) -> Result<(), Box<dyn Error>> {
-    use std::os::unix::fs::PermissionsExt;
-
-    let mut permissions = fs::metadata(path)?.permissions();
-    permissions.set_mode(0o700);
-    fs::set_permissions(path, permissions)?;
+    common::executable_fixture::write_executable(&path, contents, 0o700)?;
     Ok(())
 }
 

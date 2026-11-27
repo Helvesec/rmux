@@ -1,5 +1,6 @@
 use super::buffer_support::{install_paste_buffer_identity_pause, OrderedPasteBufferResult};
 use super::RequestHandler;
+use crate::handler::test_support::SERVER_SIGNAL_LIVENESS;
 use crate::outer_terminal::OuterTerminalContext;
 use crate::pane_io::AttachControl;
 use rmux_core::LifecycleEvent;
@@ -66,7 +67,7 @@ async fn create_session(handler: &RequestHandler, name: &str) {
         }))
         .await;
 
-    assert!(matches!(response, Response::NewSession(_)));
+    crate::session_fixture::assert_new_session(&response);
     handler
         .wait_for_pane_startup_to_finish_for_test(&PaneTarget::new(session_name, 0))
         .await;
@@ -78,7 +79,7 @@ async fn wait_for_dead_pane(
     window_index: u32,
     pane_index: u32,
 ) {
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    let deadline = tokio::time::Instant::now() + SERVER_SIGNAL_LIVENESS;
     loop {
         let exited = {
             let mut state = handler.state.lock().await;
@@ -1370,6 +1371,80 @@ async fn missing_buffer_target_client_is_a_successful_clipboard_noop() {
             .expect("stored buffer")
             .stdout(),
         b"still stored"
+    );
+}
+
+#[tokio::test]
+async fn gh2610_custom_ms_off_suppresses_explicit_buffer_clipboard_writes() {
+    let handler = RequestHandler::new();
+    create_session(&handler, "custom-off").await;
+    for (option, value) in [
+        (OptionName::TerminalOverrides, r"xterm*:Ms=\E]52;c;%p2%s\a"),
+        (OptionName::SetClipboard, "off"),
+    ] {
+        let response = handler
+            .handle(Request::SetOption(SetOptionRequest {
+                scope: ScopeSelector::Global,
+                option,
+                value: value.to_owned(),
+                mode: SetOptionMode::Replace,
+            }))
+            .await;
+        assert!(matches!(response, Response::SetOption(_)));
+    }
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+    handler
+        .register_attach_with_terminal_context(
+            236,
+            session_name("custom-off"),
+            tx,
+            OuterTerminalContext::from_pairs(&[("TERM", "xterm-256color")]),
+        )
+        .await;
+
+    let path = std::env::temp_dir().join(format!(
+        "rmux-custom-ms-off-{}-{}.txt",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("time after epoch")
+            .as_nanos()
+    ));
+    fs::write(&path, b"custom off clipboard").expect("write buffer input");
+    let mut load = load_buffer_request(path.to_str().expect("UTF-8 path"));
+    load.name = Some("loaded".to_owned());
+    load.set_clipboard = true;
+    load.target_client = Some("236".to_owned());
+    let response = handler
+        .dispatch(999, Request::LoadBuffer(Box::new(load)))
+        .await
+        .response;
+    fs::remove_file(path).expect("remove buffer input");
+    assert!(matches!(response, Response::LoadBuffer(_)));
+    let load_write = rx.try_recv();
+
+    let mut set = set_buffer_request(Some("set"), b"custom off clipboard");
+    set.set_clipboard = true;
+    let response = handler
+        .dispatch(236, Request::SetBuffer(Box::new(set)))
+        .await
+        .response;
+    assert!(matches!(response, Response::SetBuffer(_)));
+    let set_write = rx.try_recv();
+    for name in ["loaded", "set"] {
+        let response = handler
+            .handle(Request::ShowBuffer(ShowBufferRequest {
+                name: Some(name.to_owned()),
+            }))
+            .await;
+        assert_eq!(
+            response.command_output().expect("stored buffer").stdout(),
+            b"custom off clipboard"
+        );
+    }
+    assert!(
+        load_write.is_err() && set_write.is_err(),
+        "set-clipboard off must suppress OSC52 without losing buffers: load={load_write:?}, set={set_write:?}"
     );
 }
 

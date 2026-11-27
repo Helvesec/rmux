@@ -107,10 +107,13 @@ impl HandlerState {
         ))
     }
 
-    fn pane_target_for_id(&self, pane_id: PaneId) -> Option<PaneTarget> {
-        self.sessions.iter().find_map(|(session_name, session)| {
-            let window_index = session.window_index_for_pane_id(pane_id)?;
-            self.pane_target_for_id_in_window(session_name, window_index, pane_id)
-        })
+    pub(crate) fn pane_target_for_id(&self, pane_id: PaneId) -> Option<PaneTarget> {
+        self.sessions
+            .iter()
+            .map(|session| (session.name(), session))
+            .find_map(|(session_name, session)| {
+                let window_index = session.window_index_for_pane_id(pane_id)?;
+                self.pane_target_for_id_in_window(session_name, window_index, pane_id)
+            })
     }
 }

@@ -4,39 +4,51 @@ use rmux_core::PaneId;
 use rmux_proto::{PaneTarget, RmuxError, SessionName};
 
 use super::super::super::{
-    HandlerState, PaneExitMetadata, PaneLifecycleState, SessionTransferSnapshot,
+    HandlerState, PaneExitObservation, PaneLifecycleState, SessionTransferSnapshot,
 };
 
 pub(super) struct CrossSessionTransferSnapshot {
     model: SessionTransferSnapshot,
     pane_lifecycle: HashMap<PaneId, PaneLifecycleState>,
-    dead_panes: HashMap<SessionName, HashMap<PaneId, PaneExitMetadata>>,
+    dead_panes: HashMap<SessionName, HashMap<PaneId, PaneExitObservation>>,
+    kept_dead_pane_preparations: HashMap<SessionName, HashMap<PaneId, u64>>,
 }
 
+type PaneRuntimeSnapshot = (
+    HashMap<PaneId, PaneLifecycleState>,
+    HashMap<SessionName, HashMap<PaneId, PaneExitObservation>>,
+    HashMap<SessionName, HashMap<PaneId, u64>>,
+);
+
 impl CrossSessionTransferSnapshot {
-    pub(super) fn capture(state: &HandlerState) -> Self {
-        Self {
-            model: SessionTransferSnapshot::capture(state),
+    pub(super) fn retain_transfer(&mut self, transfer: rmux_core::ManagedPaneTransfer) {
+        self.model.retain_transfer(transfer);
+    }
+    pub(super) fn capture(state: &HandlerState, names: &[SessionName]) -> Result<Self, RmuxError> {
+        Ok(Self {
+            model: SessionTransferSnapshot::capture(state, names)?,
             pane_lifecycle: state.pane_lifecycle.clone(),
             dead_panes: state.dead_panes.clone(),
-        }
+            kept_dead_pane_preparations: state.kept_dead_pane_preparations.clone(),
+        })
     }
 
-    pub(super) fn restore(self, state: &mut HandlerState) {
-        let (pane_lifecycle, dead_panes) = self.restore_model(state);
+    pub(super) fn restore(self, state: &mut HandlerState) -> Result<(), RmuxError> {
+        let (pane_lifecycle, dead_panes, kept_dead_pane_preparations) =
+            self.restore_model(state)?;
         state.pane_lifecycle = pane_lifecycle;
         state.dead_panes = dead_panes;
+        state.kept_dead_pane_preparations = kept_dead_pane_preparations;
+        Ok(())
     }
 
-    fn restore_model(
-        self,
-        state: &mut HandlerState,
-    ) -> (
-        HashMap<PaneId, PaneLifecycleState>,
-        HashMap<SessionName, HashMap<PaneId, PaneExitMetadata>>,
-    ) {
-        self.model.restore(state);
-        (self.pane_lifecycle, self.dead_panes)
+    fn restore_model(self, state: &mut HandlerState) -> Result<PaneRuntimeSnapshot, RmuxError> {
+        self.model.restore(state)?;
+        Ok((
+            self.pane_lifecycle,
+            self.dead_panes,
+            self.kept_dead_pane_preparations,
+        ))
     }
 }
 
@@ -107,12 +119,11 @@ fn pane_slots_for_session(
         .ok_or_else(|| super::super::super::session_not_found(session_name))?;
     Ok(session
         .windows()
-        .iter()
         .flat_map(|(window_index, window)| {
             window.panes().iter().map(move |pane| {
                 (
                     pane.id(),
-                    PaneTarget::with_window(session_name.clone(), *window_index, pane.index()),
+                    PaneTarget::with_window(session_name.clone(), window_index, pane.index()),
                 )
             })
         })
@@ -169,8 +180,7 @@ pub(in crate::pane_terminals::pane_transfer) fn window_ids_by_index(
         .ok_or_else(|| super::super::super::session_not_found(session_name))?;
     Ok(session
         .windows()
-        .iter()
-        .map(|(window_index, window)| (*window_index, window.id().as_u32()))
+        .map(|(window_index, window)| (window_index, window.id().as_u32()))
         .collect())
 }
 
@@ -231,10 +241,12 @@ pub(super) fn rollback_cross_session_move(
         state
             .terminals
             .move_panes_between_sessions(target_runtime, source_runtime, &[pane_id]);
-    let (pane_lifecycle, dead_panes) = snapshot.restore_model(state);
+    let (pane_lifecycle, dead_panes, kept_dead_pane_preparations) =
+        snapshot.restore_model(state)?;
     let resize_rollback = resize_two_sessions(state, source_session_name, target_session_name);
     state.pane_lifecycle = pane_lifecycle;
     state.dead_panes = dead_panes;
+    state.kept_dead_pane_preparations = kept_dead_pane_preparations;
     cross_session_rollback_result(
         source_error,
         [output_rollback, terminal_rollback, resize_rollback],
@@ -265,10 +277,12 @@ pub(super) fn rollback_cross_session_swap(
         target_runtime,
         &[source_pane_id],
     );
-    let (pane_lifecycle, dead_panes) = snapshot.restore_model(state);
+    let (pane_lifecycle, dead_panes, kept_dead_pane_preparations) =
+        snapshot.restore_model(state)?;
     let resize_rollback = resize_two_sessions(state, source_session_name, target_session_name);
     state.pane_lifecycle = pane_lifecycle;
     state.dead_panes = dead_panes;
+    state.kept_dead_pane_preparations = kept_dead_pane_preparations;
     cross_session_rollback_result(
         source_error,
         [output_rollback, terminal_rollback, resize_rollback],

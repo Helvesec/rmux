@@ -1,19 +1,16 @@
 use std::collections::HashMap;
 use std::ffi::OsString;
 use std::fmt;
-use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{mpsc, Arc, Mutex, MutexGuard};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
-use rmux_os::process_tree::{ConsoleWindowBehavior, ProcessTreeChild, ProcessTreeController};
-#[cfg(unix)]
-use rustix::process::Signal;
-
 use crate::terminal::TerminalProfile;
 
-#[path = "status_jobs/output.rs"]
+mod scope;
+pub(crate) use scope::{new_job_owner_id, StatusJobOwner, StatusJobScope};
+
 mod output;
 use output::{CaptureProgress, StatusJobOutputCapture};
 
@@ -40,12 +37,14 @@ struct StatusJobRuntimeInner {
     state: Mutex<StatusJobRuntimeState>,
     shutdown: Mutex<()>,
     owners: AtomicUsize,
+    updates: tokio::sync::watch::Sender<u64>,
 }
 
 #[derive(Default)]
 struct StatusJobRuntimeState {
     closing: bool,
     next_job_id: u64,
+    capacity_waiting: bool,
     cache: HashMap<StatusJobKey, StatusJobCacheEntry>,
     active: HashMap<u64, ActiveStatusJob>,
 }
@@ -59,6 +58,8 @@ struct ActiveStatusJob {
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
 struct StatusJobKey {
     command: String,
+    source: Option<String>,
+    scope: Option<StatusJobScope>,
     shell: Option<OsString>,
     cwd: Option<OsString>,
     environment: Option<Arc<Vec<(OsString, OsString)>>>,
@@ -68,6 +69,8 @@ impl StatusJobKey {
     fn new(command: &str, profile: Option<&TerminalProfile>) -> Self {
         Self {
             command: command.to_owned(),
+            source: None,
+            scope: None,
             shell: profile.map(|profile| profile.shell().as_os_str().to_owned()),
             cwd: profile.map(|profile| profile.cwd().as_os_str().to_owned()),
             environment: profile.map(status_job_environment_key),
@@ -89,6 +92,7 @@ struct StatusJobCacheEntry {
     output: String,
     updated_at: Option<Instant>,
     in_flight: bool,
+    job_id: Option<u64>,
 }
 
 impl StatusJobRuntime {
@@ -98,18 +102,52 @@ impl StatusJobRuntime {
                 state: Mutex::new(StatusJobRuntimeState::default()),
                 shutdown: Mutex::new(()),
                 owners: AtomicUsize::new(1),
+                updates: tokio::sync::watch::channel(0).0,
             }),
         }
     }
 
+    #[cfg(test)]
     pub(crate) fn cached_output(
         &self,
         command: &str,
         profile: Option<&TerminalProfile>,
         cache_ttl: Duration,
     ) -> String {
+        self.cached_output_key(StatusJobKey::new(command, profile), profile, cache_ttl)
+    }
+
+    pub(crate) fn subscribe(&self) -> tokio::sync::watch::Receiver<u64> {
+        let mut receiver = self.inner.updates.subscribe();
+        // The initial attach frame may have started a job before subscribing.
+        // Recheck the retained cache once even if its only update already landed.
+        if !self.inner.lock_state().cache.is_empty() {
+            receiver.mark_changed();
+        }
+        receiver
+    }
+
+    pub(crate) fn scoped_output(
+        &self,
+        source: &str,
+        command: &str,
+        profile: Option<&TerminalProfile>,
+        scope: StatusJobScope,
+        cache_ttl: Duration,
+    ) -> String {
+        let mut key = StatusJobKey::new(command, profile);
+        key.source = Some(source.to_owned());
+        key.scope = Some(scope);
+        self.cached_output_key(key, profile, cache_ttl)
+    }
+
+    fn cached_output_key(
+        &self,
+        key: StatusJobKey,
+        profile: Option<&TerminalProfile>,
+        cache_ttl: Duration,
+    ) -> String {
         let now = Instant::now();
-        let key = StatusJobKey::new(command, profile);
         let mut state = self.inner.lock_state();
         reap_completed_workers(&mut state);
         if state.closing {
@@ -120,25 +158,36 @@ impl StatusJobRuntime {
                 .unwrap_or_default();
         }
 
+        let previous = invalidate_changed_input(&mut state, &key);
         ensure_status_job_cache_capacity(&mut state.cache, &key, now);
-        let active_limit_reached = state.active.len() >= STATUS_JOB_ACTIVE_LIMIT;
+        let active_limit_reached =
+            state.active.values().filter(|job| !job.completed).count() >= STATUS_JOB_ACTIVE_LIMIT;
         let entry = state.cache.entry(key.clone()).or_default();
+        if let Some(output) = previous {
+            entry.output = output;
+        }
         let cached = entry.output.clone();
         let stale = entry
             .updated_at
             .is_none_or(|updated_at| now.duration_since(updated_at) >= cache_ttl);
-        if !stale || entry.in_flight || active_limit_reached {
+        if !stale || entry.in_flight {
+            return cached;
+        }
+        if active_limit_reached {
+            state.capacity_waiting = true;
             return cached;
         }
 
-        entry.in_flight = true;
         let job_id = state.next_job_id;
+        let entry = state.cache.get_mut(&key).expect("admitted cache entry");
+        entry.in_flight = true;
+        entry.job_id = Some(job_id);
         state.next_job_id = state.next_job_id.wrapping_add(1);
         let cancellation = Arc::new(AtomicBool::new(false));
         let worker_cancellation = Arc::clone(&cancellation);
         let weak_runtime = Arc::downgrade(&self.inner);
         let worker_key = key.clone();
-        let command = command.to_owned();
+        let command = key.command.clone();
         let profile = profile.cloned();
         let (start_sender, start_receiver) = mpsc::channel();
         let worker = thread::Builder::new()
@@ -147,10 +196,16 @@ impl StatusJobRuntime {
                 if start_receiver.recv().is_err() {
                     return;
                 }
-                let output = run_status_job_with_cancellation(
+                let output = run_status_job_until(
                     &command,
                     profile.as_ref(),
                     &worker_cancellation,
+                    STATUS_JOB_TIMEOUT,
+                    &mut |output| {
+                        if let Some(runtime) = weak_runtime.upgrade() {
+                            runtime.publish_job(job_id, &worker_key, output);
+                        }
+                    },
                 );
                 if let Some(runtime) = weak_runtime.upgrade() {
                     runtime.complete_job(job_id, &worker_key, output);
@@ -187,6 +242,48 @@ impl StatusJobRuntime {
         cached
     }
 
+    pub(crate) fn refresh_owner(&self, owner: &StatusJobOwner) {
+        let mut state = self.inner.lock_state();
+        let mut cancelled = Vec::new();
+        for (key, entry) in &mut state.cache {
+            if key
+                .scope
+                .as_ref()
+                .is_some_and(|scope| &scope.owner == owner)
+            {
+                entry.updated_at = None;
+                entry.in_flight = false;
+                cancelled.extend(entry.job_id.take());
+            }
+        }
+        for id in cancelled {
+            if let Some(job) = state.active.get(&id) {
+                job.cancellation.store(true, Ordering::Release);
+            }
+        }
+    }
+
+    pub(crate) fn cancel_owner(&self, owner: &StatusJobOwner) {
+        let mut state = self.inner.lock_state();
+        let keys = state
+            .cache
+            .keys()
+            .filter(|key| {
+                key.scope
+                    .as_ref()
+                    .is_some_and(|scope| &scope.owner == owner)
+            })
+            .cloned()
+            .collect::<Vec<_>>();
+        for key in keys {
+            if let Some(entry) = state.cache.remove(&key) {
+                if let Some(job) = entry.job_id.and_then(|id| state.active.get(&id)) {
+                    job.cancellation.store(true, Ordering::Release);
+                }
+            }
+        }
+    }
+
     pub(crate) fn shutdown_and_join(&self) {
         let _shutdown = self
             .inner
@@ -216,18 +313,6 @@ impl StatusJobRuntime {
     #[cfg(test)]
     fn seed_cache(&self, key: StatusJobKey, entry: StatusJobCacheEntry) {
         self.inner.lock_state().cache.insert(key, entry);
-    }
-
-    #[cfg(test)]
-    pub(crate) fn seed_completed_output(&self, command: &str, output: &str) {
-        self.seed_cache(
-            StatusJobKey::new(command, None),
-            StatusJobCacheEntry {
-                output: output.to_owned(),
-                updated_at: Some(Instant::now()),
-                in_flight: false,
-            },
-        );
     }
 
     #[cfg(test)]
@@ -282,10 +367,34 @@ impl StatusJobRuntimeInner {
             .unwrap_or_else(|poisoned| poisoned.into_inner())
     }
 
+    fn publish_job(&self, job_id: u64, key: &StatusJobKey, output: String) {
+        let mut state = self.lock_state();
+        if state.closing {
+            return;
+        }
+        if let Some(entry) = state
+            .cache
+            .get_mut(key)
+            .filter(|entry| entry.job_id == Some(job_id))
+        {
+            if entry.output != output {
+                entry.output = output;
+                self.updates
+                    .send_modify(|epoch| *epoch = epoch.wrapping_add(1));
+            }
+        }
+    }
+
     fn complete_job(&self, job_id: u64, key: &StatusJobKey, output: String) {
         let mut state = self.lock_state();
         let closing = state.closing;
-        if let Some(entry) = state.cache.get_mut(key) {
+        let mut current = false;
+        if let Some(entry) = state
+            .cache
+            .get_mut(key)
+            .filter(|entry| entry.job_id == Some(job_id))
+        {
+            current = true;
             if !closing {
                 entry.output = output;
                 entry.updated_at = Some(Instant::now());
@@ -294,6 +403,14 @@ impl StatusJobRuntimeInner {
         }
         if let Some(job) = state.active.get_mut(&job_id) {
             job.completed = true;
+        }
+        // A stale generation must not recursively redraw consumers merely
+        // because its cancellation finished. It may still provide the one
+        // wakeup needed to retry work previously refused at the active limit.
+        let capacity_waiting = std::mem::take(&mut state.capacity_waiting);
+        if !closing && (current || capacity_waiting) {
+            self.updates
+                .send_modify(|epoch| *epoch = epoch.wrapping_add(1));
         }
     }
 
@@ -328,13 +445,38 @@ fn reap_completed_workers(state: &mut StatusJobRuntimeState) {
     let completed = state
         .active
         .iter()
-        .filter_map(|(job_id, job)| job.completed.then_some(*job_id))
+        .filter_map(|(job_id, job)| {
+            (job.completed && job.worker.as_ref().is_none_or(JoinHandle::is_finished))
+                .then_some(*job_id)
+        })
         .collect::<Vec<_>>();
     for job_id in completed {
         if let Some(worker) = state.active.remove(&job_id).and_then(|job| job.worker) {
             let _ = worker.join();
         }
     }
+}
+
+fn invalidate_changed_input(
+    state: &mut StatusJobRuntimeState,
+    key: &StatusJobKey,
+) -> Option<String> {
+    key.scope.as_ref()?;
+    let obsolete = state
+        .cache
+        .keys()
+        .find(|old| *old != key && old.scope == key.scope && old.source == key.source)
+        .cloned()?;
+    let entry = state.cache.remove(&obsolete)?;
+    if let Some(job) = entry.job_id.and_then(|id| state.active.get(&id)) {
+        job.cancellation.store(true, Ordering::Release);
+    }
+    // A command edit may display its previous line while refreshing. A profile
+    // change must never expose output from the old environment or directory.
+    (obsolete.shell == key.shell
+        && obsolete.cwd == key.cwd
+        && obsolete.environment == key.environment)
+        .then_some(entry.output)
 }
 
 fn ensure_status_job_cache_capacity(
@@ -357,225 +499,8 @@ fn ensure_status_job_cache_capacity(
     jobs.remove(&oldest_key);
 }
 
-#[cfg(test)]
-fn run_status_job(command: &str, profile: Option<&TerminalProfile>) -> String {
-    run_status_job_with_cancellation(command, profile, &AtomicBool::new(false))
-}
-
-#[cfg(all(test, windows))]
-fn run_status_job_with_timeout(
-    command: &str,
-    profile: Option<&TerminalProfile>,
-    timeout: Duration,
-) -> String {
-    run_status_job_until(command, profile, &AtomicBool::new(false), timeout)
-}
-
-fn run_status_job_with_cancellation(
-    command: &str,
-    profile: Option<&TerminalProfile>,
-    cancellation: &AtomicBool,
-) -> String {
-    run_status_job_until(command, profile, cancellation, STATUS_JOB_TIMEOUT)
-}
-
-fn run_status_job_until(
-    command: &str,
-    profile: Option<&TerminalProfile>,
-    cancellation: &AtomicBool,
-    timeout: Duration,
-) -> String {
-    if cancellation.load(Ordering::Acquire) {
-        return String::new();
-    }
-    let mut process = status_job_command(command, profile);
-    process
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::null());
-    let Ok(mut child) =
-        ProcessTreeChild::spawn_with_console_window(&mut process, ConsoleWindowBehavior::Suppress)
-    else {
-        return String::new();
-    };
-    let process_group = child.controller();
-    let Some(stdout) = child.child_mut().stdout.take() else {
-        terminate_status_job(child, &process_group);
-        return String::new();
-    };
-    let mut stdout = StatusJobOutputCapture::new(stdout, STATUS_JOB_OUTPUT_LIMIT);
-
-    let started = Instant::now();
-    loop {
-        if cancellation.load(Ordering::Acquire) {
-            terminate_status_job(child, &process_group);
-            wait_for_status_job_output_close(&mut stdout);
-            return String::new();
-        }
-
-        match stdout.poll() {
-            Ok(CaptureProgress::Pending | CaptureProgress::Eof) => {}
-            Ok(CaptureProgress::LimitReached) => {
-                terminate_status_job(child, &process_group);
-                wait_for_status_job_output_close(&mut stdout);
-                return status_job_stdout(stdout.into_output());
-            }
-            Err(_) => {
-                terminate_status_job(child, &process_group);
-                return String::new();
-            }
-        }
-
-        let child_exited = match child.has_exited() {
-            Ok(exited) => exited,
-            Err(_) => {
-                terminate_status_job(child, &process_group);
-                wait_for_status_job_output_close(&mut stdout);
-                return String::new();
-            }
-        };
-        if child_exited {
-            terminate_completed_status_job(child, &process_group);
-            return status_job_stdout(drain_completed_status_job_output(stdout));
-        }
-
-        if started.elapsed() >= timeout {
-            terminate_status_job(child, &process_group);
-            wait_for_status_job_output_close(&mut stdout);
-            return String::new();
-        }
-
-        thread::sleep(STATUS_JOB_POLL_INTERVAL);
-    }
-}
-
-fn drain_completed_status_job_output(mut stdout: StatusJobOutputCapture) -> Vec<u8> {
-    let deadline = Instant::now() + STATUS_JOB_OUTPUT_DRAIN_GRACE;
-    loop {
-        match stdout.poll() {
-            Ok(CaptureProgress::Eof) | Err(_) => {
-                return stdout.into_output();
-            }
-            Ok(CaptureProgress::LimitReached) => {
-                wait_for_status_job_output_close_until(&mut stdout, deadline);
-                return stdout.into_output();
-            }
-            Ok(CaptureProgress::Pending) if Instant::now() >= deadline => {
-                return stdout.into_output();
-            }
-            Ok(CaptureProgress::Pending) => thread::sleep(STATUS_JOB_POLL_INTERVAL),
-        }
-    }
-}
-
-fn wait_for_status_job_output_close(stdout: &mut StatusJobOutputCapture) {
-    wait_for_status_job_output_close_until(stdout, Instant::now() + STATUS_JOB_OUTPUT_DRAIN_GRACE);
-}
-
-fn wait_for_status_job_output_close_until(stdout: &mut StatusJobOutputCapture, deadline: Instant) {
-    loop {
-        match stdout.poll_discard() {
-            Ok(CaptureProgress::Eof) | Err(_) => return,
-            Ok(CaptureProgress::Pending) if Instant::now() >= deadline => return,
-            Ok(CaptureProgress::Pending) => thread::sleep(STATUS_JOB_POLL_INTERVAL),
-            Ok(CaptureProgress::LimitReached) => {
-                unreachable!("discarding output does not enforce the capture limit")
-            }
-        }
-    }
-}
-
-#[cfg(unix)]
-fn request_status_job_stop(child: &mut ProcessTreeChild) {
-    let _ = child.forward_signal(Signal::TERM.as_raw());
-}
-
-#[cfg(not(unix))]
-fn request_status_job_stop(_: &mut ProcessTreeChild) {}
-
-fn terminate_status_job(mut child: ProcessTreeChild, process_group: &ProcessTreeController) {
-    request_status_job_stop(&mut child);
-    thread::sleep(STATUS_JOB_TERMINATION_GRACE);
-    terminate_status_job_immediately(child, process_group);
-}
-
-fn terminate_completed_status_job(child: ProcessTreeChild, process_group: &ProcessTreeController) {
-    terminate_status_job_immediately(child, process_group);
-}
-
-fn terminate_status_job_immediately(
-    mut child: ProcessTreeChild,
-    process_group: &ProcessTreeController,
-) {
-    // `wait` disarms both the Unix group identity and Windows kill-on-close.
-    // Terminate first while the unreaped leader still makes the PGID
-    // non-reusable and the Job Object still owns every descendant.
-    let tree_stopped = process_group
-        .terminate_and_wait(STATUS_JOB_FORCE_TERMINATION_WAIT)
-        .unwrap_or(false);
-    if !tree_stopped {
-        // Enumeration is unavailable on a few Unix targets and can fail under
-        // restrictive host policies. Preserve the bounded cleanup contract by
-        // making one final force-termination attempt before reaping the leader.
-        let _ = child.terminate();
-    }
-    let _ = child.wait();
-}
-
-fn status_job_command(command: &str, profile: Option<&TerminalProfile>) -> Command {
-    if let Some(profile) = profile {
-        let mut process = status_job_profile_command(command, profile);
-        process.env_clear();
-        for (name, value) in profile.raw_environment() {
-            process.env(name, value);
-        }
-        return process;
-    }
-
-    shell_command(command)
-}
-
-#[cfg(unix)]
-fn status_job_profile_command(command: &str, profile: &TerminalProfile) -> Command {
-    let mut process =
-        crate::terminal::shell_std_command(std::path::Path::new("/bin/sh"), profile.cwd(), command);
-    process.current_dir(profile.cwd());
-    process
-}
-
-#[cfg(not(unix))]
-fn status_job_profile_command(command: &str, profile: &TerminalProfile) -> Command {
-    profile.shell_std_command(command)
-}
-
-fn shell_command(command: &str) -> Command {
-    #[cfg(windows)]
-    {
-        use std::os::windows::process::CommandExt as _;
-
-        let shell = std::env::var_os("ComSpec").unwrap_or_else(|| "cmd.exe".into());
-        let mut process = Command::new(shell);
-        process.arg("/D").arg("/S").arg("/C");
-        process.raw_arg(rmux_os::command::cmd_c_verbatim_tail(command));
-        process
-    }
-
-    #[cfg(not(windows))]
-    {
-        let shell = std::env::var_os("SHELL").unwrap_or_else(|| "/bin/sh".into());
-        let mut process = Command::new(shell);
-        process.arg("-c").arg(command);
-        process
-    }
-}
-
-fn status_job_stdout(stdout: Vec<u8>) -> String {
-    let mut output = String::from_utf8_lossy(&stdout).into_owned();
-    while output.ends_with(['\r', '\n']) {
-        output.pop();
-    }
-    output
-}
+mod execution;
+use execution::*;
 
 #[cfg(test)]
 #[path = "status_jobs/tests.rs"]
@@ -584,3 +509,7 @@ mod tests;
 #[cfg(all(test, windows))]
 #[path = "status_jobs/windows_tests.rs"]
 mod windows_tests;
+
+#[cfg(test)]
+#[path = "status_jobs/cache_tests.rs"]
+mod cache_tests;

@@ -1,8 +1,12 @@
 //! Process identity helpers.
 
 #[cfg(unix)]
-use std::ffi::{CStr, CString};
+use std::ffi::{CStr, CString, OsStr};
 use std::io;
+#[cfg(unix)]
+use std::os::unix::ffi::OsStrExt;
+#[cfg(unix)]
+use std::path::PathBuf;
 
 #[cfg(windows)]
 use std::mem::{size_of, MaybeUninit};
@@ -116,6 +120,14 @@ impl IdentityResolver {
     pub fn unix_user_by_uid(uid: u32) -> io::Result<Option<UnixUser>> {
         unix_user_by_uid(uid)
     }
+
+    /// Resolves a Unix user's login shell by uid through the platform account
+    /// database, including directory-service accounts absent from
+    /// `/etc/passwd`. Returns `None` when the account or its shell is missing.
+    #[cfg(unix)]
+    pub fn unix_login_shell_by_uid(uid: u32) -> io::Result<Option<PathBuf>> {
+        unix_passwd_by_uid(uid, passwd_login_shell).map(Option::flatten)
+    }
 }
 
 /// Returns the real user id for the current process.
@@ -154,7 +166,7 @@ fn unix_user_by_name(name: &str) -> io::Result<Option<UnixUser>> {
                 &mut result,
             )
         };
-        match passwd_lookup_result(status, result, &passwd)? {
+        match passwd_lookup_result(status, result, &passwd, passwd_to_unix_user)? {
             PasswdLookup::Found(user) => return Ok(Some(user)),
             PasswdLookup::Missing => return Ok(None),
             PasswdLookup::Retry => grow_passwd_lookup_buffer(&mut buffer)?,
@@ -164,6 +176,14 @@ fn unix_user_by_name(name: &str) -> io::Result<Option<UnixUser>> {
 
 #[cfg(unix)]
 fn unix_user_by_uid(uid: u32) -> io::Result<Option<UnixUser>> {
+    unix_passwd_by_uid(uid, passwd_to_unix_user)
+}
+
+#[cfg(unix)]
+fn unix_passwd_by_uid<Record>(
+    uid: u32,
+    convert: fn(&libc::passwd) -> io::Result<Record>,
+) -> io::Result<Option<Record>> {
     let mut buffer = passwd_lookup_buffer();
 
     loop {
@@ -180,8 +200,8 @@ fn unix_user_by_uid(uid: u32) -> io::Result<Option<UnixUser>> {
                 &mut result,
             )
         };
-        match passwd_lookup_result(status, result, &passwd)? {
-            PasswdLookup::Found(user) => return Ok(Some(user)),
+        match passwd_lookup_result(status, result, &passwd, convert)? {
+            PasswdLookup::Found(record) => return Ok(Some(record)),
             PasswdLookup::Missing => return Ok(None),
             PasswdLookup::Retry => grow_passwd_lookup_buffer(&mut buffer)?,
         }
@@ -189,18 +209,19 @@ fn unix_user_by_uid(uid: u32) -> io::Result<Option<UnixUser>> {
 }
 
 #[cfg(unix)]
-enum PasswdLookup {
-    Found(UnixUser),
+enum PasswdLookup<Record> {
+    Found(Record),
     Missing,
     Retry,
 }
 
 #[cfg(unix)]
-fn passwd_lookup_result(
+fn passwd_lookup_result<Record>(
     status: libc::c_int,
     result: *mut libc::passwd,
     passwd: &libc::passwd,
-) -> io::Result<PasswdLookup> {
+    convert: fn(&libc::passwd) -> io::Result<Record>,
+) -> io::Result<PasswdLookup<Record>> {
     if status == libc::ENOENT && result.is_null() {
         return Ok(PasswdLookup::Missing);
     }
@@ -213,7 +234,21 @@ fn passwd_lookup_result(
     if result.is_null() {
         return Ok(PasswdLookup::Missing);
     }
-    passwd_to_unix_user(passwd).map(PasswdLookup::Found)
+    convert(passwd).map(PasswdLookup::Found)
+}
+
+#[cfg(unix)]
+fn passwd_login_shell(passwd: &libc::passwd) -> io::Result<Option<PathBuf>> {
+    if passwd.pw_shell.is_null() {
+        return Ok(None);
+    }
+    let shell = unsafe {
+        // SAFETY: successful getpw*_r lookups expose a non-null `pw_shell` as a
+        // nul-terminated C string inside the caller-owned lookup buffer.
+        CStr::from_ptr(passwd.pw_shell)
+    }
+    .to_bytes();
+    Ok((!shell.is_empty()).then(|| PathBuf::from(OsStr::from_bytes(shell))))
 }
 
 #[cfg(unix)]

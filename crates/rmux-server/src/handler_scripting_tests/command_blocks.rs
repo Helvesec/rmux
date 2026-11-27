@@ -30,8 +30,8 @@ fn parsed_list_keys_accepts_attached_sort_order_format_and_reverse() {
 async fn parsed_list_panes_accepts_filter_sort_order_and_reverse() {
     let handler = RequestHandler::new();
     let alpha = session_name("alpha");
-    assert!(matches!(
-        handler
+    crate::session_fixture::assert_new_session(
+        &handler
             .handle(Request::NewSession(NewSessionRequest {
                 session_name: alpha,
                 detached: true,
@@ -39,8 +39,7 @@ async fn parsed_list_panes_accepts_filter_sort_order_and_reverse() {
                 environment: None,
             }))
             .await,
-        Response::NewSession(_)
-    ));
+    );
     let state = handler.state.lock().await;
     let parsed = crate::handler::scripting_support::parse_request_from_parts(
         "list-panes".to_owned(),
@@ -77,8 +76,8 @@ async fn parsed_list_panes_accepts_filter_sort_order_and_reverse() {
 async fn parsed_list_windows_applies_filter_sort_order_and_reverse() {
     let handler = RequestHandler::new();
     let alpha = session_name("alpha");
-    assert!(matches!(
-        handler
+    crate::session_fixture::assert_new_session(
+        &handler
             .handle(Request::NewSession(NewSessionRequest {
                 session_name: alpha.clone(),
                 detached: true,
@@ -86,8 +85,7 @@ async fn parsed_list_windows_applies_filter_sort_order_and_reverse() {
                 environment: None,
             }))
             .await,
-        Response::NewSession(_)
-    ));
+    );
     handler
         .handle(Request::NewWindow(Box::new(NewWindowRequest {
             target: alpha.clone(),
@@ -125,8 +123,8 @@ async fn parsed_list_windows_applies_filter_sort_order_and_reverse() {
 async fn parsed_set_option_scope_flags_use_tmux_precedence_and_natural_tables() {
     let handler = RequestHandler::new();
     let alpha = session_name("alpha");
-    assert!(matches!(
-        handler
+    crate::session_fixture::assert_new_session(
+        &handler
             .handle(Request::NewSession(NewSessionRequest {
                 session_name: alpha,
                 detached: true,
@@ -134,8 +132,7 @@ async fn parsed_set_option_scope_flags_use_tmux_precedence_and_natural_tables() 
                 environment: None,
             }))
             .await,
-        Response::NewSession(_)
-    ));
+    );
 
     let parsed = CommandParser::new()
         .parse("set-option -s -p @scope server")
@@ -350,8 +347,8 @@ async fn parsed_queue_set_hook_accepts_command_blocks() {
 async fn parsed_queue_set_hook_resolves_relative_targets_before_block_parse() {
     let handler = RequestHandler::new();
     let alpha = session_name("alpha");
-    assert!(matches!(
-        handler
+    crate::session_fixture::assert_new_session(
+        &handler
             .handle(Request::NewSession(NewSessionRequest {
                 session_name: alpha.clone(),
                 detached: true,
@@ -359,8 +356,7 @@ async fn parsed_queue_set_hook_resolves_relative_targets_before_block_parse() {
                 environment: None,
             }))
             .await,
-        Response::NewSession(_)
-    ));
+    );
 
     let parsed = CommandParser::new()
         .parse("set-hook -t . after-new-window { display-message -p -- hook-block }")
@@ -380,8 +376,8 @@ async fn parsed_queue_set_hook_resolves_relative_targets_before_block_parse() {
 async fn parsed_queue_set_hook_session_target_uses_hook_natural_window_scope() {
     let handler = RequestHandler::new();
     let alpha = session_name("alpha");
-    assert!(matches!(
-        handler
+    crate::session_fixture::assert_new_session(
+        &handler
             .handle(Request::NewSession(NewSessionRequest {
                 session_name: alpha.clone(),
                 detached: true,
@@ -389,8 +385,7 @@ async fn parsed_queue_set_hook_session_target_uses_hook_natural_window_scope() {
                 environment: None,
             }))
             .await,
-        Response::NewSession(_)
-    ));
+    );
 
     let parsed = CommandParser::new()
         .parse("set-hook -t alpha window-renamed { display-message -p -- renamed }")
@@ -418,8 +413,8 @@ async fn parsed_queue_set_hook_session_target_uses_hook_natural_window_scope() {
 async fn parsed_hook_commands_resolve_implicit_current_scopes() {
     let handler = RequestHandler::new();
     let alpha = session_name("alpha-implicit-hooks");
-    assert!(matches!(
-        handler
+    crate::session_fixture::assert_new_session(
+        &handler
             .handle(Request::NewSession(NewSessionRequest {
                 session_name: alpha.clone(),
                 detached: true,
@@ -427,8 +422,7 @@ async fn parsed_hook_commands_resolve_implicit_current_scopes() {
                 environment: None,
             }))
             .await,
-        Response::NewSession(_)
-    ));
+    );
 
     let state = handler.state.lock().await;
     let current = TargetFindContext::new(Some(Target::Pane(PaneTarget::with_window(

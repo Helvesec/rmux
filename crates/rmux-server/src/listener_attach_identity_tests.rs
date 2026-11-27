@@ -9,6 +9,7 @@
 //! Everything here goes the whole way: a real wire request, the real
 //! authenticated peer, the real upgraded byte stream and the real registration.
 
+use rmux_core::LifecycleEvent;
 use rmux_os::identity::UserIdentity;
 use rmux_proto::request::AttachSessionExt3Request;
 use rmux_proto::{
@@ -328,6 +329,84 @@ async fn the_first_attach_frame_describes_the_authenticated_peer() -> io::Result
     );
 
     attached.finish().await
+}
+
+#[tokio::test]
+async fn first_native_attach_focus_precedes_client_lifecycle() -> io::Result<()> {
+    let (handler, session) = armed_handler("listener-attach-focus-order").await;
+    let mut events = handler.subscribe_lifecycle_events();
+    let attached = attach_peer_through_listener(
+        &handler,
+        "listener-attach-focus-order",
+        delegated_peer(
+            std::process::id().wrapping_add(18_208),
+            delegated_peer_uid(),
+        ),
+        &session,
+        Some(CLIENT_SIZE),
+    )
+    .await;
+
+    let ordered = tokio::time::timeout(Duration::from_secs(2), async {
+        let mut ordered = Vec::new();
+        while ordered.len() != 3 {
+            let event = events.recv().await.expect("attach lifecycle remains open");
+            match event.event_for_test() {
+                LifecycleEvent::PaneFocusIn { .. } => ordered.push("pane-focus-in"),
+                LifecycleEvent::ClientSessionChanged { .. } => {
+                    ordered.push("client-session-changed")
+                }
+                LifecycleEvent::ClientAttached { .. } => ordered.push("client-attached"),
+                _ => {}
+            }
+        }
+        ordered
+    })
+    .await
+    .expect("the three first-attach lifecycle events are published");
+    assert_eq!(
+        ordered,
+        ["pane-focus-in", "client-session-changed", "client-attached"]
+    );
+
+    attached.finish().await
+}
+
+#[tokio::test]
+async fn first_native_attach_announces_arrival_before_its_layout_change() -> io::Result<()> {
+    let (handler, session) = armed_handler("listener-attach-layout-order").await;
+    let mut events = handler.subscribe_lifecycle_events();
+    let attached = attach_peer_through_listener(
+        &handler,
+        "listener-attach-layout-order",
+        delegated_peer(
+            std::process::id().wrapping_add(18_220),
+            delegated_peer_uid(),
+        ),
+        &session,
+        Some(TerminalSize {
+            cols: 101,
+            rows: 41,
+        }),
+    )
+    .await;
+    let ordered = tokio::time::timeout(Duration::from_secs(2), async {
+        let mut ordered = Vec::new();
+        loop {
+            match events.recv().await.unwrap().event_for_test() {
+                LifecycleEvent::WindowLayoutChanged { .. } => ordered.push("layout"),
+                LifecycleEvent::ClientSessionChanged { .. } => ordered.push("arrival"),
+                LifecycleEvent::ClientAttached { .. } => break,
+                _ => {}
+            }
+        }
+        ordered
+    })
+    .await
+    .expect("initial attach publishes its lifecycle");
+    attached.finish().await?;
+    assert_eq!(ordered, ["arrival", "layout"]);
+    Ok(())
 }
 
 /// One authenticated connection, still live, plus the upgraded bytes read up

@@ -543,9 +543,15 @@ async fn vacant_slot_replacement_fixture(
     let server = tokio::spawn(async move {
         serve_pane_listing(&mut server_stream, &session_name(), Some(0), "").await;
 
+        // Once the operation ends, its last handle may close the transport
+        // before `done` arrives. A close without a request also means the
+        // replacement was never targeted.
         let request = tokio::select! {
-            _ = &mut done_rx => return false,
-            request = read_request(&mut server_stream) => request,
+            _ = &mut done_rx => None,
+            request = read_request_or_close(&mut server_stream) => request,
+        };
+        let Some(request) = request else {
+            return false;
         };
         let Request::ListPanes(request) = request else {
             panic!("expected replacement pane lookup");
@@ -673,10 +679,9 @@ async fn lookup_error_fixture() -> (PaneSet, tokio::task::JoinHandle<()>) {
 fn assert_lookup_error(error: &RmuxError) {
     assert!(
         matches!(
-            error,
-            RmuxError::Protocol {
-                source: rmux_proto::RmuxError::Server(message),
-            } if message == "injected identity lookup failure"
+            error.protocol_source(),
+            Some(rmux_proto::RmuxError::Server(message))
+                if message == "injected identity lookup failure"
         ),
         "expected injected identity lookup failure, got {error:?}"
     );
@@ -768,6 +773,13 @@ async fn serve_delayed_pane_lookup(stream: &mut tokio::io::DuplexStream) {
 }
 
 async fn read_request(stream: &mut tokio::io::DuplexStream) -> Request {
+    read_request_or_close(stream)
+        .await
+        .expect("client closed before request")
+}
+
+/// Reads one request, or `None` when the client closes before sending one.
+async fn read_request_or_close(stream: &mut tokio::io::DuplexStream) -> Option<Request> {
     let mut decoder = FrameDecoder::new();
     let mut buffer = [0_u8; 256];
     loop {
@@ -775,10 +787,12 @@ async fn read_request(stream: &mut tokio::io::DuplexStream) -> Request {
             .next_frame::<Request>()
             .expect("request frame decodes")
         {
-            return request;
+            return Some(request);
         }
         let read = stream.read(&mut buffer).await.expect("read request");
-        assert_ne!(read, 0, "client closed before request");
+        if read == 0 {
+            return None;
+        }
         decoder.push_bytes(&buffer[..read]);
     }
 }

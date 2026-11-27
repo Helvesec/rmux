@@ -98,7 +98,7 @@ def load(name, path):
 exact = load('verify_exact_file_set', 'scripts/release/verify-exact-file-set.py')
 snap = load('snap_candidate_status', 'scripts/release/snap-candidate-status.py')
 
-with tempfile.TemporaryDirectory(dir=pathlib.Path.cwd()) as directory:
+with tempfile.TemporaryDirectory(dir=pathlib.Path.cwd().parent) as directory:
     root = pathlib.Path(directory)
     artifact = root / 'artifact'
     artifact.mkdir()
@@ -162,7 +162,7 @@ commit = 'b' * 40
 wasm = b'exact-wasm-bytes'
 digest = hashlib.sha256(wasm).hexdigest()
 
-with tempfile.TemporaryDirectory(dir=pathlib.Path.cwd()) as directory:
+with tempfile.TemporaryDirectory(dir=pathlib.Path.cwd().parent) as directory:
     provenance = pathlib.Path(directory) / 'provenance.json'
     provenance.write_text(json.dumps({
         'version': '1.2.3',
@@ -328,7 +328,7 @@ def write_tar(path, payloads):
             info.size = len(data)
             archive.addfile(info, io.BytesIO(data))
 
-with tempfile.TemporaryDirectory(dir=pathlib.Path.cwd()) as directory:
+with tempfile.TemporaryDirectory(dir=pathlib.Path.cwd().parent) as directory:
     root = pathlib.Path(directory)
     canonical = {
         'crate-package-set.json': (json.dumps(manifest) + '\n').encode(),
@@ -709,6 +709,209 @@ except ValueError as error:
         raise
 else:
     raise SystemExit('unsigned repository commit was accepted')
+"#,
+    );
+}
+
+#[test]
+fn owned_repository_writer_refuses_to_replace_a_newer_published_release() {
+    assert_python(
+        r#"
+import argparse
+import base64
+import hashlib
+import importlib.util
+import io
+import json
+import pathlib
+import sys
+import tarfile
+import tempfile
+import urllib.parse
+
+sys.path.insert(0, 'scripts/release')
+from downstream_channels import target_for_channel
+from owned_repository_payload import PACKAGE_FILES
+
+spec = importlib.util.spec_from_file_location(
+    'publish_owned_repository', 'scripts/release/publish-owned-repository.py'
+)
+por = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(por)
+SOURCE = 'a' * 40
+
+def blob_sha(data):
+    digest = hashlib.sha1()
+    digest.update(f'blob {len(data)}\0'.encode())
+    digest.update(data)
+    return digest.hexdigest()
+
+class FakeApi:
+    def __init__(self, files):
+        root = '1' * 40
+        self.branches = {'main': root}
+        self.trees = {root: dict(files)}
+        self.parents = {}
+        self.graphql_calls = 0
+
+    @property
+    def files(self):
+        return self.trees[self.branches['main']]
+
+    def get(self, path):
+        if '/git/ref/heads/' in path:
+            branch = urllib.parse.unquote(path.split('/git/ref/heads/', 1)[1])
+            return {
+                'ref': f'refs/heads/{branch}',
+                'object': {'type': 'commit', 'sha': self.branches[branch]},
+            }
+        if '/git/commits/' in path:
+            sha = path.rsplit('/', 1)[1]
+            return {
+                'parents': [{'sha': self.parents[sha]}],
+                'verification': {'verified': True, 'reason': 'valid', 'signature': 'sig'},
+            }
+        if '/git/trees/' in path:
+            sha = path.split('/git/trees/', 1)[1].split('?', 1)[0]
+            return {
+                'truncated': False,
+                'tree': [
+                    {'path': name, 'type': 'blob', 'sha': blob_sha(data)}
+                    for name, data in sorted(self.trees[sha].items())
+                ],
+            }
+        raise AssertionError(path)
+
+    def get_bytes(self, path, *, limit):
+        name = urllib.parse.unquote(path.split('/contents/', 1)[1].split('?ref=', 1)[0])
+        ref = urllib.parse.unquote(path.split('?ref=', 1)[1])
+        files = self.trees[self.branches.get(ref, ref)]
+        if name not in files:
+            raise ValueError(f'GitHub API GET {path} failed: 404 missing')
+        return files[name]
+
+    def graphql(self, query, variables):
+        self.graphql_calls += 1
+        payload = variables['input']
+        branch = payload['branch']['branchName']
+        if payload['expectedHeadOid'] != self.branches[branch]:
+            raise AssertionError('non-atomic branch update')
+        sha = f'{len(self.parents) + 2:040x}'
+        files = dict(self.trees[payload['expectedHeadOid']])
+        for entry in payload['fileChanges']['deletions']:
+            files.pop(entry['path'], None)
+        for entry in payload['fileChanges']['additions']:
+            files[entry['path']] = base64.b64decode(entry['contents'])
+        self.trees[sha] = files
+        self.parents[sha] = payload['expectedHeadOid']
+        self.branches[branch] = sha
+        signature = {'isValid': True, 'state': 'VALID', 'wasSignedByGitHub': True}
+        return {
+            'createCommitOnBranch': {
+                'commit': {'oid': sha, 'signature': signature},
+                'ref': {'target': {'oid': sha}},
+            }
+        }
+
+def formula(version):
+    return f'class Rmux < Formula\n  desc "rmux"\n  version "{version}"\n  url "u"\nend\n'.encode()
+
+def manifest(version):
+    return json.dumps({'version': version}).encode()
+
+def wasm_package(version):
+    return json.dumps({'name': 'rmux-web-crypto', 'version': version}).encode()
+
+def write_payload(channel, root, version):
+    if channel == 'homebrew_tap':
+        (root / 'rmux.rb').write_bytes(formula(version))
+    elif channel == 'scoop':
+        (root / 'rmux.json').write_bytes(manifest(version))
+    else:
+        with tarfile.open(root / f'rmux-web-crypto-wasm-{version}.tar', 'w:') as bundle:
+            for name in sorted(PACKAGE_FILES):
+                data = wasm_package(version) if name == 'package.json' else name.encode()
+                member = tarfile.TarInfo(name)
+                member.size = len(data)
+                bundle.addfile(member, io.BytesIO(data))
+        provenance = {'version': version, 'source': {'source_commit': SOURCE}}
+        (root / f'rmux-web-crypto-wasm-{version}.provenance.json').write_text(
+            json.dumps(provenance)
+        )
+
+WASM_BINARY = 'src/scripts/share/wasm/rmux_web_crypto_wasm_bg.wasm'
+PUBLISHED = {
+    'homebrew_tap': ('Formula/rmux.rb', formula),
+    'scoop': ('bucket/rmux.json', manifest),
+    'web_share': ('src/scripts/share/wasm/package.json', wasm_package),
+}
+
+def run(channel, published, version, work):
+    work = pathlib.Path(tempfile.mkdtemp(dir=work))
+    full_name = target_for_channel(channel)['repository_full_name']
+    payload = work / f'{channel}-{version}-payload'
+    payload.mkdir()
+    write_payload(channel, payload, version)
+    updates = por.repository_updates(channel, payload, source_sha=SOURCE, version=version)
+    api = FakeApi({'README.md': b'keep', **published(updates)})
+    por.GitHubApi = lambda token: api
+    por.repository_identity = lambda *args, **kwargs: None
+    por.wait_for_live = lambda **kw: f"https://github.com/{full_name}/commit/{kw['commit_sha']}"
+    output = work / f'{channel}-{version}.out'
+    output.write_text('')
+    evidence = work / f'{channel}-{version}-evidence.json'
+    args = argparse.Namespace(
+        channel=channel, payload_dir=payload, source_sha=SOURCE,
+        release_ref=f'v{version}', target_evidence=evidence, github_output=output,
+    )
+    before = dict(api.files)
+    try:
+        por.execute(args)
+    except ValueError as error:
+        if api.graphql_calls or api.files != before or output.read_text() or evidence.exists():
+            raise SystemExit(f'{channel}: refused publication still mutated or reported')
+        return str(error), updates, api
+    return output.read_text(), updates, api
+
+with tempfile.TemporaryDirectory(dir=pathlib.Path.cwd().parent) as temporary:
+    work = pathlib.Path(temporary)
+    for channel, (path, render) in PUBLISHED.items():
+        for newer, older in (('0.12.0', '0.11.0'), ('0.11.10', '0.11.9')):
+            result, _, _ = run(channel, lambda _u: {path: render(newer)}, older, work)
+            expected = f'refusing to replace newer {channel} release {newer} with {older}'
+            if result != expected:
+                raise SystemExit(f'{channel}: older receipt over {newer} gave {result!r}')
+
+        expected = f'refusing to replace published {channel} release 0.11.0 with different bytes'
+        for name in (path, WASM_BINARY) if channel == 'web_share' else (path,):
+            result, _, _ = run(
+                channel,
+                lambda updates, name=name: {**updates, name: updates[name] + b'\n'},
+                '0.11.0',
+                work,
+            )
+            if result != expected:
+                raise SystemExit(f'{channel}: equal version with different {name} gave {result!r}')
+
+        result, _, api = run(channel, lambda updates: dict(updates), '0.11.0', work)
+        if not result.startswith('state=no-op-exact\nmutation_started=false\n'):
+            raise SystemExit(f'{channel}: equal exact release is not idempotent: {result!r}')
+        if api.graphql_calls:
+            raise SystemExit(f'{channel}: equal exact release wrote Git objects')
+
+        result, updates, api = run(channel, lambda _u: {path: render('0.10.0')}, '0.11.0', work)
+        if not result.startswith('state=public-live\nmutation_started=true\n'):
+            raise SystemExit(f'{channel}: newer receipt was not published: {result!r}')
+        if any(api.files.get(name) != data for name, data in updates.items()):
+            raise SystemExit(f'{channel}: newer receipt bytes differ after publication')
+
+        result, _, _ = run(channel, lambda _u: {}, '0.11.0', work)
+        if not result.startswith('state=public-live\n'):
+            raise SystemExit(f'{channel}: first publication was refused: {result!r}')
+
+    result, _, _ = run('homebrew_tap', lambda _u: {'Formula/rmux.rb': b'class Rmux\nend\n'}, '0.11.0', work)
+    if 'exactly one version' not in result:
+        raise SystemExit(f'unreadable published formula version was replaced: {result!r}')
 "#,
     );
 }

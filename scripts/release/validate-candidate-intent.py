@@ -11,6 +11,8 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
+from candidate_route import add_arguments, from_args
+
 import toml_reader  # noqa: E402  (path bootstrap must run first)
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -39,8 +41,11 @@ def validate(args: argparse.Namespace) -> dict[str, object]:
         raise ValueError("expected source SHA must be 40 lowercase hex characters")
     if args.actual_source_sha != args.expected_source_sha:
         raise ValueError("checked-out source SHA does not match the requested SHA")
-    if args.github_ref != "refs/heads/main":
-        raise ValueError("canonical candidates must run from refs/heads/main")
+    route = from_args(args)
+    if args.github_ref != route.source_ref:
+        raise ValueError(f"{route.profile} candidates must run from {route.source_ref}")
+    route.validate_intent(args.expected_source_sha, args.release_intent_id,
+                          args.planned_release_ref, args.release_kind)
     if args.github_run_attempt != 1:
         raise ValueError("canonical candidate runs must use attempt 1")
     if args.fast_run_id <= 0:
@@ -64,7 +69,7 @@ def validate(args: argparse.Namespace) -> dict[str, object]:
     release_version = args.planned_release_ref.removeprefix("v")
 
     return {
-        "schema_version": 1,
+        **route.fields,
         "repository_id": 1239918790,
         "source_git_sha": args.expected_source_sha,
         "fast_run_id": args.fast_run_id,
@@ -80,6 +85,7 @@ def validate(args: argparse.Namespace) -> dict[str, object]:
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser()
+    add_arguments(parser)
     parser.add_argument("--repository-root", type=Path, default=ROOT)
     parser.add_argument("--expected-source-sha", required=True)
     parser.add_argument("--actual-source-sha", required=True)

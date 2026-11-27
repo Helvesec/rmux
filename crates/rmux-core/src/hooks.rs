@@ -4,17 +4,11 @@ use rmux_proto::{
     HookLifecycle, HookName, PaneTarget, RmuxError, ScopeSelector, SessionName, WindowTarget,
 };
 
-#[path = "hooks/bindings.rs"]
 mod bindings;
-#[path = "hooks/deferred.rs"]
 mod deferred;
-#[path = "hooks/identity.rs"]
 mod identity;
-#[path = "hooks/rules.rs"]
 mod rules;
-#[path = "hooks/targets.rs"]
 mod targets;
-#[path = "hooks/types.rs"]
 mod types;
 
 use bindings::HookBindings;

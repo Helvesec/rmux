@@ -1,4 +1,62 @@
 use super::*;
+#[cfg(test)]
+use crate::session_fixture::SessionSetupExt as _;
+
+#[tokio::test]
+async fn prompt_with_status_off_survives_full_pane_refresh() {
+    let handler = RequestHandler::new();
+    let alpha = session_name("prompt-no-status");
+    create_quiet_session(&handler, &alpha).await;
+    handler
+        .execute_parsed_commands_for_test(
+            std::process::id(),
+            rmux_core::command_parser::CommandParser::new()
+                .parse_one_group("set-option -g status off")
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    replace_transcript_contents(
+        &handler,
+        &PaneTarget::with_window(alpha.clone(), 0, 0),
+        TerminalSize { cols: 80, rows: 24 },
+        b"\x1b[24;1HUNDER-PROMPT",
+    )
+    .await;
+    let prompt = crate::renderer::RenderedPrompt {
+        prompt: "PROMPT ".to_owned(),
+        input: "abc".to_owned(),
+        cursor: 3,
+        command_prompt: true,
+        completion_menu: Vec::new(),
+    };
+    let state = handler.state.lock().await;
+    let target = super::super::attach_support::attach_render_target_for_session_with_prompt(
+        &state,
+        &alpha,
+        1,
+        super::super::attach_support::AttachRenderTargetRequest {
+            prompt: Some(&prompt),
+            key_table: None,
+            previous_title: None,
+            client: None,
+            terminal_context: &OuterTerminalContext::default(),
+            render_size: None,
+            socket_path: Path::new("/tmp/rmux-test.sock"),
+            client_loop_snapshots: None,
+        },
+    )
+    .unwrap();
+    let mut screen = Screen::new(TerminalSize { cols: 80, rows: 24 }, 0);
+    InputParser::new().parse(&target.render_frame, &mut screen);
+    let rendered =
+        String::from_utf8(screen.capture_transcript(Default::default(), Default::default()))
+            .unwrap();
+    assert!(
+        rendered.lines().nth(23).unwrap().starts_with("PROMPT abc"),
+        "{rendered:?}"
+    );
+}
 
 #[tokio::test]
 async fn session_target_refreshes_follow_the_current_active_window() {
@@ -17,22 +75,17 @@ async fn session_target_refreshes_follow_the_current_active_window() {
             environment: None,
         }))
         .await;
-    assert!(matches!(created, Response::NewSession(_)));
+    crate::session_fixture::assert_new_session(&created);
 
     {
         let mut state = handler.state.lock().await;
-        let pane_id = state.sessions.allocate_pane_id();
         {
-            let session = state
+            let mut session = state
                 .sessions
-                .session_mut(&alpha)
+                .session_setup(&alpha)
                 .expect("session should exist");
             session
-                .insert_window_with_initial_pane_with_id(
-                    5,
-                    TerminalSize { cols: 90, rows: 30 },
-                    pane_id,
-                )
+                .insert_window_with_initial_pane(5, TerminalSize { cols: 90, rows: 30 })
                 .expect("window 5 insert succeeds");
             session
                 .select_window(5)
@@ -85,20 +138,19 @@ async fn attach_session_upgrade_renders_only_the_active_window() {
     let handler = RequestHandler::new();
     let alpha = session_name("alpha");
 
-    assert!(matches!(
-        handler
+    crate::session_fixture::assert_new_session(
+        &handler
             .handle(Request::NewSession(NewSessionRequest {
                 session_name: alpha.clone(),
                 detached: true,
                 size: Some(TerminalSize {
                     cols: 120,
-                    rows: 40
+                    rows: 40,
                 }),
                 environment: None,
             }))
             .await,
-        Response::NewSession(_)
-    ));
+    );
     assert!(matches!(
         handler
             .handle(Request::SplitWindow(SplitWindowRequest {
@@ -114,10 +166,12 @@ async fn attach_session_upgrade_renders_only_the_active_window() {
     let ready_marker = format!("RMUX_ATTACH_ACTIVE_READY_{}", std::process::id());
     let quiet_command = rmux_proto::ProcessCommand::Argv(quiet_ready_command(&ready_marker));
     let mut state = handler.state.lock().await;
-    let pane_id = state.sessions.allocate_pane_id();
-    let session = state.sessions.session_mut(&alpha).expect("session exists");
+    let mut session = state
+        .sessions
+        .session_setup(&alpha)
+        .expect("session exists");
     session
-        .insert_window_with_initial_pane_with_id(5, TerminalSize { cols: 90, rows: 30 }, pane_id)
+        .insert_window_with_initial_pane(5, TerminalSize { cols: 90, rows: 30 })
         .expect("window 5 insert succeeds");
     session.select_window(5).expect("window 5 select succeeds");
     state
@@ -355,8 +409,8 @@ async fn attach_session_uses_client_size_before_first_frame() {
     let handler = RequestHandler::new();
     let alpha = session_name("alpha");
 
-    assert!(matches!(
-        handler
+    crate::session_fixture::assert_new_session(
+        &handler
             .handle(Request::NewSession(NewSessionRequest {
                 session_name: alpha.clone(),
                 detached: true,
@@ -364,8 +418,7 @@ async fn attach_session_uses_client_size_before_first_frame() {
                 environment: None,
             }))
             .await,
-        Response::NewSession(_)
-    ));
+    );
 
     let outcome = handler
         .dispatch(
@@ -402,8 +455,8 @@ async fn attach_session_target_spec_selects_requested_window_and_pane_before_att
     let handler = RequestHandler::new();
     let alpha = session_name("alpha");
 
-    assert!(matches!(
-        handler
+    crate::session_fixture::assert_new_session(
+        &handler
             .handle(Request::NewSession(NewSessionRequest {
                 session_name: alpha.clone(),
                 detached: true,
@@ -411,8 +464,7 @@ async fn attach_session_target_spec_selects_requested_window_and_pane_before_att
                 environment: None,
             }))
             .await,
-        Response::NewSession(_)
-    ));
+    );
     assert!(matches!(
         handler
             .handle(Request::NewWindow(Box::new(rmux_proto::NewWindowRequest {
@@ -477,8 +529,8 @@ async fn legacy_attach_request_disables_render_stream_frames() {
     let handler = RequestHandler::new();
     let alpha = session_name("alpha");
 
-    assert!(matches!(
-        handler
+    crate::session_fixture::assert_new_session(
+        &handler
             .handle(Request::NewSession(NewSessionRequest {
                 session_name: alpha.clone(),
                 detached: true,
@@ -486,8 +538,7 @@ async fn legacy_attach_request_disables_render_stream_frames() {
                 environment: None,
             }))
             .await,
-        Response::NewSession(_)
-    ));
+    );
 
     let outcome = handler
         .dispatch(
@@ -519,8 +570,8 @@ async fn attach_render_capability_enables_render_stream_frames() {
     let handler = RequestHandler::new();
     let alpha = session_name("alpha");
 
-    assert!(matches!(
-        handler
+    crate::session_fixture::assert_new_session(
+        &handler
             .handle(Request::NewSession(NewSessionRequest {
                 session_name: alpha.clone(),
                 detached: true,
@@ -528,8 +579,7 @@ async fn attach_render_capability_enables_render_stream_frames() {
                 environment: None,
             }))
             .await,
-        Response::NewSession(_)
-    ));
+    );
 
     let request = AttachSessionExt3Request::from_ext2(
         AttachSessionExt2Request {

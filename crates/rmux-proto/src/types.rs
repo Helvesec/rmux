@@ -13,13 +13,17 @@ pub use crate::identity::SessionName;
 use crate::{PaneId, RmuxError};
 pub use rmux_types::{TerminalGeometry, TerminalPixels, TerminalSize};
 
-#[path = "types/hooks.rs"]
 mod hooks;
-#[path = "types/options.rs"]
 mod options;
 
 pub use hooks::{HookLifecycle, HookName};
 pub use options::{OptionName, SetOptionMode};
+
+mod ids;
+mod layout;
+
+pub use ids::{PaneOutputSubscriptionId, PaneStateSubscriptionId, SdkWaitId, SdkWaitOwnerId};
+pub use layout::{LayoutName, ResizePaneAdjustment, ResizePaneRelativeDirection, SplitDirection};
 
 /// Explicit process launch mode for daemon-owned pane processes.
 ///
@@ -75,90 +79,6 @@ impl ProcessCommand {
     }
 }
 
-/// Stable identifier for one pane-output subscription on a live server
-/// connection.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
-#[serde(transparent)]
-pub struct PaneOutputSubscriptionId(u64);
-
-impl PaneOutputSubscriptionId {
-    /// Wraps a raw subscription identifier.
-    #[must_use]
-    pub const fn new(value: u64) -> Self {
-        Self(value)
-    }
-
-    /// Returns the raw subscription identifier.
-    #[must_use]
-    pub const fn as_u64(self) -> u64 {
-        self.0
-    }
-}
-
-/// Stable identifier for one pane-state event subscription on a live server
-/// connection.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
-#[serde(transparent)]
-pub struct PaneStateSubscriptionId(u64);
-
-impl PaneStateSubscriptionId {
-    /// Wraps a raw subscription identifier.
-    #[must_use]
-    pub const fn new(value: u64) -> Self {
-        Self(value)
-    }
-
-    /// Returns the raw subscription identifier.
-    #[must_use]
-    pub const fn as_u64(self) -> u64 {
-        self.0
-    }
-}
-
-/// Opaque owner token for daemon-backed SDK waits.
-///
-/// The SDK assigns one owner token to each transport connection and then
-/// allocates [`SdkWaitId`] values within that owner. The server treats the
-/// owner as an opaque cancellation key; actual connection teardown cleanup is
-/// still keyed by the server's private connection identity.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
-#[serde(transparent)]
-pub struct SdkWaitOwnerId(u64);
-
-impl SdkWaitOwnerId {
-    /// Wraps a raw SDK wait owner identifier.
-    #[must_use]
-    pub const fn new(value: u64) -> Self {
-        Self(value)
-    }
-
-    /// Returns the raw SDK wait owner identifier.
-    #[must_use]
-    pub const fn as_u64(self) -> u64 {
-        self.0
-    }
-}
-
-/// Stable identifier for one daemon-backed SDK wait under an
-/// [`SdkWaitOwnerId`].
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
-#[serde(transparent)]
-pub struct SdkWaitId(u64);
-
-impl SdkWaitId {
-    /// Wraps a raw SDK wait identifier.
-    #[must_use]
-    pub const fn new(value: u64) -> Self {
-        Self(value)
-    }
-
-    /// Returns the raw SDK wait identifier.
-    #[must_use]
-    pub const fn as_u64(self) -> u64 {
-        self.0
-    }
-}
-
 /// A parsed exact target.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum Target {
@@ -172,9 +92,14 @@ pub enum Target {
 
 impl Target {
     /// Parses the exact detached target forms supported by the detached server.
+    ///
+    /// The session part is lookup text for an existing session, so it is read
+    /// as a canonical name: a `\\` typed in the target matches the `\\` that
+    /// [`SessionName::new`] stored for a literal backslash, as in tmux.
     pub fn parse(value: &str) -> Result<Self, RmuxError> {
         if let Some((session_name, tail)) = value.split_once(':') {
-            let session_name = SessionName::new(session_name.to_owned())?;
+            let session_name = SessionName::from_canonical(session_name)
+                .map_err(|_| RmuxError::EmptySessionName)?;
 
             if !tail.is_empty() && tail.chars().all(|character| character.is_ascii_digit()) {
                 let window_index = parse_window_index(value, tail)?;
@@ -200,7 +125,9 @@ impl Target {
             ));
         }
 
-        Ok(Self::Session(SessionName::new(value.to_owned())?))
+        Ok(Self::Session(
+            SessionName::from_canonical(value).map_err(|_| RmuxError::EmptySessionName)?,
+        ))
     }
 
     /// Returns the session name addressed by the target.
@@ -428,160 +355,6 @@ pub enum OptionScopeSelector {
     Window(WindowTarget),
     /// Pane-local options.
     Pane(PaneTarget),
-}
-
-/// The detached layout name subset.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-pub enum LayoutName {
-    /// The required `main-vertical` layout.
-    MainVertical,
-    /// Internal `split-window -h` geometry using a top main pane.
-    MainHorizontal,
-    /// The tmux `even-horizontal` left-to-right layout.
-    EvenHorizontal,
-    /// The tmux `even-vertical` top-to-bottom layout.
-    EvenVertical,
-    /// The tmux `tiled` grid layout.
-    Tiled,
-    /// The tmux `main-horizontal-mirrored` layout.
-    MainHorizontalMirrored,
-    /// The tmux `main-vertical-mirrored` layout.
-    MainVerticalMirrored,
-}
-
-impl fmt::Display for LayoutName {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::MainVertical => formatter.write_str("main-vertical"),
-            Self::MainHorizontal => formatter.write_str("main-horizontal"),
-            Self::EvenHorizontal => formatter.write_str("even-horizontal"),
-            Self::EvenVertical => formatter.write_str("even-vertical"),
-            Self::Tiled => formatter.write_str("tiled"),
-            Self::MainHorizontalMirrored => formatter.write_str("main-horizontal-mirrored"),
-            Self::MainVerticalMirrored => formatter.write_str("main-vertical-mirrored"),
-        }
-    }
-}
-
-impl FromStr for LayoutName {
-    type Err = RmuxError;
-
-    fn from_str(value: &str) -> Result<Self, Self::Err> {
-        match value {
-            "main-vertical" => Ok(Self::MainVertical),
-            "main-horizontal" => Ok(Self::MainHorizontal),
-            "even-horizontal" => Ok(Self::EvenHorizontal),
-            "even-vertical" => Ok(Self::EvenVertical),
-            "tiled" => Ok(Self::Tiled),
-            "main-horizontal-mirrored" => Ok(Self::MainHorizontalMirrored),
-            "main-vertical-mirrored" => Ok(Self::MainVerticalMirrored),
-            _ => Err(RmuxError::Server(format!("unknown layout: {value}"))),
-        }
-    }
-}
-
-/// Wire-level split orientation accepted by `split-window`.
-///
-/// The variant names follow tmux's flag convention (pane arrangement), not
-/// the divider-line convention: `Horizontal` means "panes arranged
-/// horizontally" (side by side), `Vertical` means "panes arranged
-/// vertically" (stacked). New SDK code should prefer
-/// [`rmux_sdk::SplitDirection`](https://docs.rs/rmux-sdk/latest/rmux_sdk/enum.SplitDirection.html)
-/// (`Right`/`Left`/`Up`/`Down`), which avoids this ambiguity.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
-pub enum SplitDirection {
-    /// Stacked panes (top + bottom). Matches tmux `split-window -v`,
-    /// the tmux default when no flag is passed.
-    #[default]
-    Vertical,
-    /// Side-by-side panes (left + right). Matches tmux `split-window -h`.
-    Horizontal,
-}
-
-/// The detached resize semantics supported in V1.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-pub enum ResizePaneAdjustment {
-    /// Sets the absolute pane width in columns.
-    AbsoluteWidth {
-        /// The requested pane width in columns.
-        columns: u16,
-    },
-    /// Sets the absolute pane height in rows.
-    AbsoluteHeight {
-        /// The requested pane height in rows.
-        rows: u16,
-    },
-    /// Toggles zoom for the targeted pane's window.
-    Zoom,
-    /// Shrinks the pane height upward by a relative amount.
-    Up {
-        /// The requested row delta.
-        cells: u16,
-    },
-    /// Grows the pane height downward by a relative amount.
-    Down {
-        /// The requested row delta.
-        cells: u16,
-    },
-    /// Shrinks the pane width leftward by a relative amount.
-    Left {
-        /// The requested column delta.
-        cells: u16,
-    },
-    /// Grows the pane width rightward by a relative amount.
-    Right {
-        /// The requested column delta.
-        cells: u16,
-    },
-    /// Resolves the target and reports success without changing layout.
-    NoOp,
-    /// Sets the absolute pane width and height.
-    AbsoluteSize {
-        /// The requested pane width in columns.
-        columns: u16,
-        /// The requested pane height in rows.
-        rows: u16,
-    },
-    /// Trims lines below the cursor and pulls history into the viewport.
-    TrimBelow,
-    /// Applies tmux's composed resize form: absolute width/height first, then
-    /// one prioritized relative direction.
-    Composite {
-        /// Optional absolute width in columns.
-        columns: Option<u16>,
-        /// Optional absolute height in rows.
-        rows: Option<u16>,
-        /// Optional relative direction applied after absolute dimensions.
-        relative: Option<ResizePaneRelativeDirection>,
-        /// Relative delta in cells when `relative` is present.
-        cells: u16,
-    },
-}
-
-/// Relative direction used by composed `resize-pane` requests.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-pub enum ResizePaneRelativeDirection {
-    /// Shrinks the pane height upward by a relative amount.
-    Up,
-    /// Grows the pane height downward by a relative amount.
-    Down,
-    /// Shrinks the pane width leftward by a relative amount.
-    Left,
-    /// Grows the pane width rightward by a relative amount.
-    Right,
-}
-
-impl ResizePaneRelativeDirection {
-    /// Converts this relative direction and delta into a regular adjustment.
-    #[must_use]
-    pub const fn to_adjustment(self, cells: u16) -> ResizePaneAdjustment {
-        match self {
-            Self::Up => ResizePaneAdjustment::Up { cells },
-            Self::Down => ResizePaneAdjustment::Down { cells },
-            Self::Left => ResizePaneAdjustment::Left { cells },
-            Self::Right => ResizePaneAdjustment::Right { cells },
-        }
-    }
 }
 
 fn parse_pane_index(target: &str, pane_index: &str) -> Result<u32, RmuxError> {

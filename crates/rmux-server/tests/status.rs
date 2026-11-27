@@ -39,7 +39,7 @@ async fn attach_session_emits_status_row_for_single_pane_session() -> Result<(),
         }),
     )
     .await?;
-    assert!(matches!(created, Response::NewSession(_)));
+    crate::common::assert_new_session(&created);
 
     let (_response, mut attach_stream) = ClientConnection::connect(&socket_path)
         .await?
@@ -74,7 +74,7 @@ async fn attach_session_status_context_populates_session_attached() -> Result<()
         }),
     )
     .await?;
-    assert!(matches!(created, Response::NewSession(_)));
+    crate::common::assert_new_session(&created);
 
     for (option, value) in [
         (OptionName::StatusLeft, "attached=#{session_attached}"),
@@ -126,7 +126,7 @@ async fn kill_server_reaps_a_running_status_job_descendant() -> Result<(), Box<d
         }),
     )
     .await?;
-    assert!(matches!(created, Response::NewSession(_)));
+    crate::common::assert_new_session(&created);
 
     for (option, value) in [
         (OptionName::StatusLeft, format!("#({})", probe.command())),
@@ -183,7 +183,7 @@ async fn status_interval_refreshes_time_formats_without_pane_output() -> Result<
         }),
     )
     .await?;
-    assert!(matches!(created, Response::NewSession(_)));
+    crate::common::assert_new_session(&created);
 
     for (option, value) in [
         (OptionName::StatusInterval, "1"),
@@ -263,7 +263,7 @@ async fn status_interval_does_not_refresh_suspended_attach_client() -> Result<()
         }),
     )
     .await?;
-    assert!(matches!(created, Response::NewSession(_)));
+    crate::common::assert_new_session(&created);
 
     for (option, value) in [
         (OptionName::StatusInterval, "1"),

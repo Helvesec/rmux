@@ -83,7 +83,7 @@ async fn new_session(handler: &RequestHandler, name: &SessionName) {
             environment: None,
         }))
         .await;
-    assert!(matches!(response, Response::NewSession(_)), "{response:?}");
+    crate::session_fixture::assert_new_session(&response);
 }
 
 async fn new_window(handler: &RequestHandler, session: &SessionName) {
@@ -119,8 +119,7 @@ async fn set_window_size_mode(handler: &RequestHandler, session_name: &SessionNa
             .session(session_name)
             .expect("target session exists")
             .windows()
-            .keys()
-            .copied()
+            .map(|(index, _)| index)
             .collect::<Vec<_>>()
     };
     for index in indexes {
@@ -262,7 +261,10 @@ async fn capture_oracle_removal(
         .session(session_name)
         .expect("target session exists");
     let active_index = session.active_window_index();
-    let indexes = session.windows().keys().copied().collect::<Vec<_>>();
+    let indexes = session
+        .windows()
+        .map(|(index, _)| index)
+        .collect::<Vec<_>>();
     assert!(indexes.len() > 1, "oracle removal requires a survivor");
     assert_eq!(
         session.last_window_index(),
@@ -294,7 +296,7 @@ async fn capture_oracle_removal(
     let expected_window_id = expected_window.id().to_string();
     let window_ids = session
         .windows()
-        .values()
+        .map(|(_, window)| window)
         .map(|window| window.id().to_string())
         .collect::<BTreeSet<_>>();
     let expected_window_ids = window_ids
@@ -403,7 +405,7 @@ async fn assert_oracle_transition(scenario: &mut Scenario, oracle: OracleRemoval
             active_window_id: session.window().id().to_string(),
             window_ids: session
                 .windows()
-                .values()
+                .map(|(_, window)| window)
                 .map(|window| window.id().to_string())
                 .collect(),
         }

@@ -12,7 +12,7 @@
 //! depend on `rmux-client`, `rmux-core`, `rmux-server`, or `rmux-pty` as
 //! normal dependencies. The authoritative identity newtypes
 //! ([`SessionName`], [`SessionId`], [`WindowId`], [`PaneId`]) live in
-//! `rmux-proto` and are re-exported here so SDK users import them through
+//! `rmux-types` and are re-exported here so SDK users import them through
 //! `rmux_sdk` without ever depending on those internal crates.
 //!
 //! # Quickstart
@@ -51,7 +51,9 @@
 //! ```
 //!
 pub mod actions;
-pub mod bootstrap;
+#[doc(hidden)]
+pub mod automation;
+mod bootstrap;
 pub mod broadcast;
 pub(crate) mod capabilities;
 pub mod capture;
@@ -69,13 +71,20 @@ pub mod layout;
 pub mod load_state;
 pub mod locator;
 pub mod pane_set;
+pub mod scene;
 pub mod snapshot;
+pub use scene::{
+    SceneBorder, SceneHitRegion, ScenePane, SceneRect, SceneSnapshot, SceneSpan, SceneState,
+    SceneUpdate,
+};
 pub mod spec;
 pub mod trace;
 pub mod types;
 pub mod wait;
 #[cfg(feature = "web")]
 pub mod web_share;
+#[cfg(feature = "web")]
+mod web_terminal;
 
 #[allow(dead_code)]
 pub(crate) mod transport;
@@ -93,7 +102,7 @@ pub use diagnostics::{
 };
 pub use discovery::{DiscoveredPane, DiscoveredSession, PaneFinder, SessionFinder};
 pub use ensure::{EnsureSession, EnsureSessionPolicy};
-pub use error::{CollectError, Result, RmuxError};
+pub use error::{CollectError, ProtocolError, Result, RmuxError};
 pub use events::{
     PaneCommandStatus, PaneCommandSummary, PaneDisconnectReason, PaneEvent, PaneExitReason,
     PaneLagNotice, PaneLineItem, PaneLineStream, PaneNotification, PaneOutputChunk,
@@ -117,8 +126,12 @@ pub use info::{InfoSnapshot, PaneExitState, PaneInfo, PaneProcessState, SessionI
 pub use input::{
     DetachChord, DetachDetector, DetachOutcome, KeyCode, KeyConversionError, KeyEvent, KeyModifiers,
 };
-pub use layout::{GridLayoutBuilder, LayoutPaneBuilder, SessionLayoutBuilder};
+pub use layout::{
+    GridLayoutBuilder, LayoutName, LayoutPaneBuilder, ParseLayoutNameError, SessionLayoutBuilder,
+};
 pub use load_state::{TerminalLoadState, TerminalLoadStateWait};
+#[cfg(feature = "regex")]
+pub use locator::LocatorRegex;
 pub use locator::{
     Locator, LocatorAssertion, LocatorExpectation, LocatorFilter, LocatorMatch, LocatorState,
     LocatorText, LocatorWait,
@@ -127,9 +140,6 @@ pub use pane_set::{
     PaneSet, PaneSetAny, PaneSetBatch, PaneSetExpectation, PaneSetFailure, PaneSetSuccess,
     PaneSetVisibleTextOutcome, PaneSetVisibleTextWait,
 };
-pub use rmux_proto::LayoutName;
-#[cfg(feature = "web")]
-pub use rmux_proto::{WebTerminalPalette, WebTerminalTheme};
 pub use snapshot::{
     PaneAttributes, PaneCell, PaneColor, PaneCursor, PaneGlyph, PaneSnapshot,
     PaneSnapshotShapeError,
@@ -141,11 +151,14 @@ pub use spec::{
 };
 pub use trace::{RmuxTraceBuilder, TraceSession};
 pub use types::{
-    PaneId, PaneRef, RmuxEndpoint, SessionId, SessionName, TargetRef, TerminalSizeSpec, WindowId,
-    WindowRef,
+    PaneId, PaneRef, RmuxEndpoint, SessionId, SessionName, SessionNameError, TargetRef,
+    TerminalSizeSpec, WindowId, WindowRef,
 };
 pub use wait::{ArmedWait, VisibleTextExpectation, VisibleTextWait, WaitTimeoutError};
 #[cfg(feature = "web")]
 pub use web_share::{
-    WebConfigInfo, WebShareBuilder, WebShareHandle, WebShareLookup, WebShareSummary,
+    WebConfigInfo, WebShareBuilder, WebShareHandle, WebShareLookup, WebSharePaneTarget,
+    WebShareScope, WebShareSummary,
 };
+#[cfg(feature = "web")]
+pub use web_terminal::{WebTerminalPalette, WebTerminalTheme};

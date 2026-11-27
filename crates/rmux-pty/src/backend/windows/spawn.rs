@@ -13,13 +13,6 @@ use windows_sys::Win32::Foundation::{
     WAIT_TIMEOUT,
 };
 use windows_sys::Win32::System::Console::SetConsoleCtrlHandler;
-use windows_sys::Win32::System::JobObjects::{
-    AssignProcessToJobObject, CreateJobObjectW, JobObjectBasicAccountingInformation,
-    JobObjectExtendedLimitInformation, QueryInformationJobObject, SetInformationJobObject,
-    TerminateJobObject, JOBOBJECT_BASIC_ACCOUNTING_INFORMATION,
-    JOBOBJECT_EXTENDED_LIMIT_INFORMATION, JOB_OBJECT_LIMIT_BREAKAWAY_OK,
-    JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
-};
 use windows_sys::Win32::System::Threading::{
     CreateProcessW, DeleteProcThreadAttributeList, GetCurrentProcess, GetExitCodeProcess,
     InitializeProcThreadAttributeList, ResumeThread, TerminateProcess, UpdateProcThreadAttribute,
@@ -34,6 +27,7 @@ use crate::{
 
 use super::application::resolve_application_path;
 use super::command_line::{command_line, environment_block, wide_null};
+use super::job::JobObjectGuard;
 use super::perf;
 use super::{should_enable_dsr_bootstrap, WindowsPty};
 
@@ -175,7 +169,11 @@ fn create_suspended_process(
     };
     let mut environment = {
         let _span = perf::span("conpty_build_environment_block");
+        // This path is io::Result-typed, so the typed PtyError::Nul is carried
+        // as the source and the kind is the InvalidInput that std reports for
+        // the same configuration on Unix.
         environment_block(command)
+            .map_err(|error| io::Error::new(io::ErrorKind::InvalidInput, error))?
     };
     let current_dir = command
         .current_dir
@@ -189,7 +187,7 @@ fn create_suspended_process(
     let created = {
         let _span = perf::span("conpty_create_process_w");
         ensure_child_processes_inherit_ctrl_c();
-        unsafe {
+        let result = unsafe {
             CreateProcessW(
                 application.as_ptr(),
                 command_line.as_mut_ptr(),
@@ -207,11 +205,14 @@ fn create_suspended_process(
                 &startup.StartupInfo as *const STARTUPINFOW,
                 &mut process_info,
             )
+        };
+        if result == 0 {
+            Err(last_os_error())
+        } else {
+            Ok(())
         }
     };
-    if created == 0 {
-        return Err(last_os_error());
-    }
+    created?;
 
     // SAFETY: `CreateProcessW` succeeded, so these returned handles are owned
     // by this function and are transferred exactly once into `OwnedHandle`.
@@ -246,17 +247,12 @@ fn resume_as_child(
     job: Option<JobObjectGuard>,
     pty: Arc<WindowsPty>,
 ) -> Result<WindowsChild> {
-    // SAFETY: `process.thread` is the primary thread handle returned by
-    // `CreateProcessW` in suspended mode and is still owned here.
-    let resume = {
-        let _span = perf::span("conpty_resume_thread");
-        unsafe { ResumeThread(process.thread.as_raw_handle() as HANDLE) }
-    };
-    if resume == u32::MAX {
-        let _ = terminate_process(&process.process, 1);
-        return Err(last_os_error().into());
-    }
+    resume_primary_thread(&process.process, &process.thread)?;
 
+    if let Err(error) = pty.finish_companion_startup() {
+        let _ = terminate_process(&process.process, 1);
+        return Err(error.into());
+    }
     let pid = ProcessId::new(process.pid)?;
     tracing::debug!(
         target: "rmux::conpty",
@@ -264,6 +260,23 @@ fn resume_as_child(
         job_guarded = job.is_some(),
         "resumed ConPTY child"
     );
+    // The backend THIS child ended up on, tied to its own pid and read after
+    // the companion startup has completed - so a creation fallback or a
+    // recreate has already landed in the state this reads. A global "ConPTY
+    // created" line says nothing about which child it belonged to, and is
+    // emitted before the spawn besides.
+    #[cfg(feature = "test-seams")]
+    if let Some((hpcon, companion, create_flags, passthrough)) = pty.backend_snapshot() {
+        tracing::debug!(
+            target: "rmux::conpty::attest",
+            pid = pid.as_u32(),
+            hpcon = hpcon,
+            companion = companion,
+            create_flags = create_flags,
+            passthrough = passthrough,
+            "ConPTY backend attested for child"
+        );
+    }
     Ok(WindowsChild {
         process: process.process,
         thread: process.thread,
@@ -271,6 +284,24 @@ fn resume_as_child(
         pty,
         pid,
     })
+}
+
+pub(super) fn resume_primary_thread(process: &OwnedHandle, thread: &OwnedHandle) -> io::Result<()> {
+    // SAFETY: The caller owns both live handles from the suspended process.
+    let resume = {
+        let _span = perf::span("conpty_resume_thread");
+        let result = unsafe { ResumeThread(thread.as_raw_handle() as HANDLE) };
+        if result == u32::MAX {
+            Err(last_os_error())
+        } else {
+            Ok(())
+        }
+    };
+    if let Err(error) = resume {
+        let _ = terminate_process(process, 1);
+        return Err(error);
+    }
+    Ok(())
 }
 
 struct SuspendedProcess {
@@ -417,7 +448,7 @@ fn job_required_error(stage: &'static str, source: io::Error) -> io::Error {
     )
 }
 
-fn duplicate_handle(handle: &OwnedHandle) -> io::Result<OwnedHandle> {
+pub(super) fn duplicate_handle(handle: &OwnedHandle) -> io::Result<OwnedHandle> {
     // SAFETY: `GetCurrentProcess` returns a pseudo-handle for the current
     // process and has no preconditions.
     let current_process = unsafe { GetCurrentProcess() };
@@ -452,102 +483,6 @@ fn exit_status(process: &OwnedHandle) -> Result<ExitStatus> {
         return Err(last_os_error().into());
     }
     Ok(ExitStatus::from_raw(exit_code))
-}
-
-#[derive(Debug)]
-struct JobObjectGuard {
-    handle: OwnedHandle,
-}
-
-impl JobObjectGuard {
-    fn new(allow_explicit_breakaway: bool) -> io::Result<Self> {
-        // SAFETY: Null security attributes and name request the default unnamed
-        // job object; the returned handle is checked before ownership transfer.
-        let handle = unsafe { CreateJobObjectW(null(), null()) };
-        if handle.is_null() {
-            return Err(last_os_error());
-        }
-        // SAFETY: `CreateJobObjectW` returned a non-null owned handle and this
-        // function transfers it exactly once into `OwnedHandle`.
-        let handle = unsafe { OwnedHandle::from_raw_handle(handle as _) };
-        let mut limits = JOBOBJECT_EXTENDED_LIMIT_INFORMATION::default();
-        limits.BasicLimitInformation.LimitFlags = child_job_limit_flags(allow_explicit_breakaway);
-        // SAFETY: `handle` is a live job handle, `limits` points to an
-        // initialized structure of the declared size, and the API borrows it
-        // only for the duration of the call.
-        let ok = unsafe {
-            SetInformationJobObject(
-                handle.as_raw_handle() as HANDLE,
-                JobObjectExtendedLimitInformation,
-                &limits as *const _ as *const _,
-                size_of::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>() as u32,
-            )
-        };
-        if ok == 0 {
-            return Err(last_os_error());
-        }
-        Ok(Self { handle })
-    }
-
-    fn assign(&self, process: &OwnedHandle) -> io::Result<()> {
-        // SAFETY: Both handles are live and owned by their wrappers; the API
-        // associates the process with the job without taking ownership.
-        let ok = unsafe {
-            AssignProcessToJobObject(
-                self.handle.as_raw_handle() as HANDLE,
-                process.as_raw_handle() as HANDLE,
-            )
-        };
-        if ok == 0 {
-            return Err(last_os_error());
-        }
-        Ok(())
-    }
-
-    fn try_clone(&self) -> io::Result<Self> {
-        Ok(Self {
-            handle: duplicate_handle(&self.handle)?,
-        })
-    }
-
-    fn terminate(&self, exit_code: u32) -> io::Result<()> {
-        // SAFETY: `self.handle` is a live job handle owned by this guard; the
-        // API does not take ownership of it.
-        let ok = unsafe { TerminateJobObject(self.handle.as_raw_handle() as HANDLE, exit_code) };
-        if ok == 0 {
-            return Err(last_os_error());
-        }
-        Ok(())
-    }
-
-    fn active_process_count(&self) -> io::Result<u32> {
-        let mut accounting = JOBOBJECT_BASIC_ACCOUNTING_INFORMATION::default();
-        // SAFETY: `self.handle` is a live job handle and `accounting` is
-        // writable for the exact information-class size. No pointer is
-        // retained after the call.
-        let ok = unsafe {
-            QueryInformationJobObject(
-                self.handle.as_raw_handle() as HANDLE,
-                JobObjectBasicAccountingInformation,
-                (&mut accounting as *mut JOBOBJECT_BASIC_ACCOUNTING_INFORMATION).cast(),
-                u32::try_from(size_of::<JOBOBJECT_BASIC_ACCOUNTING_INFORMATION>())
-                    .map_err(|_| io::Error::other("job accounting size exceeds u32"))?,
-                null_mut(),
-            )
-        };
-        if ok == 0 {
-            return Err(last_os_error());
-        }
-        Ok(accounting.ActiveProcesses)
-    }
-}
-
-const fn child_job_limit_flags(allow_explicit_breakaway: bool) -> u32 {
-    if allow_explicit_breakaway {
-        JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE | JOB_OBJECT_LIMIT_BREAKAWAY_OK
-    } else {
-        JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE
-    }
 }
 
 struct AttributeList {
@@ -612,36 +547,9 @@ impl Drop for AttributeList {
     }
 }
 
-fn last_os_error() -> io::Error {
+pub(super) fn last_os_error() -> io::Error {
     // SAFETY: `GetLastError` reads the calling thread's last-error slot and has
     // no preconditions.
     let code = unsafe { GetLastError() };
     io::Error::from_raw_os_error(code as i32)
-}
-
-#[cfg(test)]
-mod tests {
-    use super::child_job_limit_flags;
-    use windows_sys::Win32::System::JobObjects::{
-        JOB_OBJECT_LIMIT_BREAKAWAY_OK, JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
-        JOB_OBJECT_LIMIT_SILENT_BREAKAWAY_OK,
-    };
-
-    #[test]
-    fn child_job_defaults_to_strict_cleanup() {
-        let flags = child_job_limit_flags(false);
-
-        assert_ne!(flags & JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE, 0);
-        assert_eq!(flags & JOB_OBJECT_LIMIT_BREAKAWAY_OK, 0);
-        assert_eq!(flags & JOB_OBJECT_LIMIT_SILENT_BREAKAWAY_OK, 0);
-    }
-
-    #[test]
-    fn opted_in_child_job_allows_only_explicit_breakaway() {
-        let flags = child_job_limit_flags(true);
-
-        assert_ne!(flags & JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE, 0);
-        assert_ne!(flags & JOB_OBJECT_LIMIT_BREAKAWAY_OK, 0);
-        assert_eq!(flags & JOB_OBJECT_LIMIT_SILENT_BREAKAWAY_OK, 0);
-    }
 }

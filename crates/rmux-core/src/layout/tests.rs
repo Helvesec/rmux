@@ -37,7 +37,8 @@ fn custom_layout_rejects_excessive_nesting_before_stack_growth() {
     }
     let layout = format!("{:04x},{body}", layout_checksum(&body));
 
-    let error = LayoutTree::parse(&layout, 1).expect_err("deep layout must be rejected");
+    let error = LayoutTree::parse(&layout, &[crate::PaneId::new(0)])
+        .expect_err("deep layout must be rejected");
 
     assert!(
         error.to_string().contains("too deeply nested"),
@@ -547,7 +548,9 @@ fn all_named_layouts_clamp_impossible_geometry_to_nonzero_valid_trees() {
         for pane_count in 2..=6 {
             let tree = LayoutTree::named(
                 layout,
-                pane_count,
+                &(0..pane_count as u32)
+                    .map(crate::PaneId::new)
+                    .collect::<Vec<_>>(),
                 TerminalSize { cols: 1, rows: 1 },
                 LayoutOptions::default(),
             );

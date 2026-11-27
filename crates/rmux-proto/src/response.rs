@@ -1,11 +1,11 @@
 //! Detached response contracts.
 
-use serde::de::{self, MapAccess, SeqAccess, Visitor};
-use serde::{Deserialize, Deserializer, Serialize};
+use serde::{Deserialize, Serialize};
 
 use crate::{ControlModeResponse, HandshakeResponse, LayoutName, RmuxError, SdkWaitId};
 
-#[path = "response/session.rs"]
+mod routing;
+
 mod session;
 pub use session::{
     CreateSessionLeaseResponse, HasSessionResponse, KillSessionResponse, ListSessionsResponse,
@@ -13,18 +13,15 @@ pub use session::{
     RenewSessionLeaseResponse,
 };
 
-#[path = "response/server.rs"]
 mod server;
 pub use server::{
     DaemonStatusResponse, KillServerResponse, LockClientResponse, LockServerResponse,
     LockSessionResponse, ServerAccessResponse, ShutdownIfIdleResponse,
 };
 
-#[path = "response/target.rs"]
 mod target;
 pub use target::ResolveTargetResponse;
 
-#[path = "response/window.rs"]
 mod window;
 pub use window::{
     KillWindowResponse, LastWindowResponse, LinkWindowResponse, ListWindowsResponse,
@@ -33,7 +30,6 @@ pub use window::{
     SelectWindowResponse, SwapWindowResponse, UnlinkWindowResponse, WindowListEntry,
 };
 
-#[path = "response/pane.rs"]
 mod pane;
 pub use pane::{
     BreakPaneResponse, DisplayPanesResponse, ForegroundFieldSource, ForegroundSourcesDto,
@@ -53,33 +49,44 @@ pub use pane::{
     UnsubscribePaneStateResponse, UnsubscribePaneStreamResponse,
 };
 
-#[path = "response/client.rs"]
 mod client;
 pub use client::{
     AttachSessionResponse, DetachClientResponse, ListClientsResponse, RefreshClientResponse,
     SuspendClientResponse, SwitchClientResponse,
 };
 
-#[path = "response/keys.rs"]
 mod keys;
 pub use keys::{
     BindKeyResponse, ClockModeResponse, CopyModeResponse, ListKeysResponse, SendPrefixResponse,
     UnbindKeyResponse,
 };
 
-#[path = "response/options.rs"]
 mod options;
 pub use options::{
     SetEnvironmentResponse, SetHookResponse, SetOptionByNameResponse, SetOptionResponse,
     ShowEnvironmentResponse, ShowHooksResponse, ShowOptionsResponse,
 };
 
-#[path = "response/web.rs"]
 mod web;
 pub use web::{
     WebShareConfigResponse, WebShareCreatedResponse, WebShareListResponse, WebShareListener,
     WebShareLookupResponse, WebShareResponse, WebShareStoppedAllResponse, WebShareStoppedResponse,
     WebShareSummary,
+};
+
+mod buffer;
+pub use buffer::{
+    DeleteBufferResponse, ListBuffersResponse, LoadBufferResponse, PasteBufferResponse,
+    SaveBufferResponse, SetBufferResponse, ShowBufferResponse,
+};
+
+mod shell;
+pub use shell::{IfShellResponse, RunShellResponse, SourceFileResponse};
+
+mod snapshot;
+pub use snapshot::{
+    ExportWindowSnapshotResponse, ExportWindowSnapshotV2Response, RestoreWindowSnapshotResponse,
+    RestoreWindowSnapshotV2Response,
 };
 
 /// All detached responses supported by the wire protocol.
@@ -296,183 +303,28 @@ pub enum Response {
     PaneStreamCursor(Box<PaneStreamCursorResponse>),
     /// Recoverable pane stream unsubscription result.
     UnsubscribePaneStream(UnsubscribePaneStreamResponse),
-}
-
-impl Response {
-    /// Returns the stable routing name for the response variant.
-    ///
-    /// `Error` is not tied to one command on the current wire and therefore
-    /// reports the generic `error` tag.
-    #[must_use]
-    pub const fn command_name(&self) -> &'static str {
-        match self {
-            Self::NewSession(_) => "new-session",
-            Self::HasSession(_) => "has-session",
-            Self::KillSession(_) => "kill-session",
-            Self::NewWindow(_) => "new-window",
-            Self::KillWindow(_) => "kill-window",
-            Self::SelectWindow(_) => "select-window",
-            Self::RenameWindow(_) => "rename-window",
-            Self::NextWindow(_) => "next-window",
-            Self::PreviousWindow(_) => "previous-window",
-            Self::LastWindow(_) => "last-window",
-            Self::ListWindows(_) => "list-windows",
-            Self::MoveWindow(_) => "move-window",
-            Self::SwapWindow(_) => "swap-window",
-            Self::RotateWindow(_) => "rotate-window",
-            Self::SplitWindow(_) | Self::SplitWindowIdentity(_) => "split-window",
-            Self::SwapPane(_) => "swap-pane",
-            Self::LastPane(_) => "last-pane",
-            Self::JoinPane(_) => "join-pane",
-            Self::BreakPane(_) => "break-pane",
-            Self::KillPane(_) => "kill-pane",
-            Self::SelectLayout(_) => "select-layout",
-            Self::ResizePane(_) => "resize-pane",
-            Self::DisplayPanes(_) => "display-panes",
-            Self::SelectPane(_) => "select-pane",
-            Self::SendKeys(_) => "send-keys",
-            Self::AttachSession(_) => "attach-session",
-            Self::SwitchClient(_) => "switch-client",
-            Self::DetachClient(_) => "detach-client",
-            Self::SetOption(_) | Self::SetOptionByName(_) => "set-option",
-            Self::SetEnvironment(_) => "set-environment",
-            Self::SetHook(_) => "set-hook",
-            Self::Error(_) => "error",
-            Self::NextLayout(_) => "next-layout",
-            Self::PreviousLayout(_) => "previous-layout",
-            Self::ShowOptions(_) => "show-options",
-            Self::ShowEnvironment(_) => "show-environment",
-            Self::SetBuffer(_) => "set-buffer",
-            Self::ShowBuffer(_) => "show-buffer",
-            Self::PasteBuffer(_) => "paste-buffer",
-            Self::ListBuffers(_) => "list-buffers",
-            Self::DeleteBuffer(_) => "delete-buffer",
-            Self::LoadBuffer(_) => "load-buffer",
-            Self::SaveBuffer(_) => "save-buffer",
-            Self::CapturePane(_) => "capture-pane",
-            Self::DisplayMessage(_) => "display-message",
-            Self::RunShell(_) => "run-shell",
-            Self::IfShell(_) => "if-shell",
-            Self::WaitFor(_) => "wait-for",
-            Self::RenameSession(_) => "rename-session",
-            Self::ListSessions(_) => "list-sessions",
-            Self::ListPanes(_) => "list-panes",
-            Self::SourceFile(_) => "source-file",
-            Self::ShowHooks(_) => "show-hooks",
-            Self::BindKey(_) => "bind-key",
-            Self::UnbindKey(_) => "unbind-key",
-            Self::ListKeys(_) => "list-keys",
-            Self::SendPrefix(_) => "send-prefix",
-            Self::ClearHistory(_) => "clear-history",
-            Self::CopyMode(_) => "copy-mode",
-            Self::ControlMode(_) => "control-mode",
-            Self::ClockMode(_) => "clock-mode",
-            Self::ShowMessages(_) => "show-messages",
-            Self::KillServer(_) => "kill-server",
-            Self::LockServer(_) => "lock-server",
-            Self::LockSession(_) => "lock-session",
-            Self::LockClient(_) => "lock-client",
-            Self::ServerAccess(_) => "server-access",
-            Self::RefreshClient(_) => "refresh-client",
-            Self::ListClients(_) => "list-clients",
-            Self::SuspendClient(_) => "suspend-client",
-            Self::ResizeWindow(_) => "resize-window",
-            Self::RespawnWindow(_) => "respawn-window",
-            Self::MovePane(_) => "move-pane",
-            Self::PipePane(_) => "pipe-pane",
-            Self::RespawnPane(_) => "respawn-pane",
-            Self::PaneSnapshot(_) => "pane-snapshot",
-            Self::SubscribePaneOutput(_) => "subscribe-pane-output",
-            Self::UnsubscribePaneOutput(_) => "unsubscribe-pane-output",
-            Self::PaneOutputCursor(_) => "pane-output-cursor",
-            Self::PaneOutputLag(_) => "pane-output-lag",
-            Self::SubscribePaneStream(_) => "subscribe-pane-stream",
-            Self::PaneStreamCursor(_) => "pane-stream-cursor",
-            Self::UnsubscribePaneStream(_) => "unsubscribe-pane-stream",
-            Self::SdkWaitForOutput(_) => "sdk-wait-output",
-            Self::CancelSdkWait(_) => "cancel-sdk-wait",
-            Self::PaneBroadcastInput(_) => "send-keys",
-            Self::PaneOptionSet(_) => "pane-option-set",
-            Self::PaneOptionGet(_) => "pane-option-get",
-            Self::SubscribePaneState(_) => "subscribe-pane-state",
-            Self::PaneStateCursor(_) => "pane-state-cursor",
-            Self::PaneStateLag(_) => "pane-state-lag",
-            Self::UnsubscribePaneState(_) => "unsubscribe-pane-state",
-            Self::PaneForegroundState(_) => "pane-foreground-state",
-            Self::CreateSessionLease(_) => "create-session-lease",
-            Self::RenewSessionLease(_) => "renew-session-lease",
-            Self::ReleaseSessionLease(_) => "release-session-lease",
-            Self::LinkWindow(_) => "link-window",
-            Self::UnlinkWindow(_) => "unlink-window",
-            Self::ResolveTarget(_) => "resolve-target",
-            Self::Handshake(_) => "handshake",
-            Self::DaemonStatus(_) => "daemon-status",
-            Self::ShutdownIfIdle(_) => "shutdown-if-idle",
-            Self::WebShare(_) => "web-share",
-        }
-    }
-
-    /// Returns `true` when this response carries an error payload.
-    #[must_use]
-    pub const fn is_error(&self) -> bool {
-        matches!(self, Self::Error(_))
-    }
-
-    /// Returns the shared stdout contract when this response carries printable output.
-    #[must_use]
-    pub fn command_output(&self) -> Option<&CommandOutput> {
-        match self {
-            Self::NewSession(response) => response.command_output(),
-            Self::ListWindows(response) => Some(response.command_output()),
-            Self::ShowOptions(response) => Some(response.command_output()),
-            Self::ShowEnvironment(response) => Some(response.command_output()),
-            Self::ShowHooks(response) => Some(response.command_output()),
-            Self::ShowBuffer(response) => Some(response.command_output()),
-            Self::ListBuffers(response) => Some(response.command_output()),
-            Self::CapturePane(response) => response.command_output(),
-            Self::DisplayMessage(response) => response.command_output(),
-            Self::ResolveTarget(_) => None,
-            Self::RunShell(response) => response.command_output(),
-            Self::IfShell(response) => response.command_output(),
-            Self::ListSessions(response) => Some(response.command_output()),
-            Self::ListPanes(response) => Some(response.command_output()),
-            Self::SourceFile(response) => response.command_output(),
-            Self::SetOptionByName(_) => None,
-            Self::ListKeys(response) => Some(response.command_output()),
-            Self::ControlMode(_) => None,
-            Self::ClockMode(_) => None,
-            Self::ShowMessages(response) => Some(response.command_output()),
-            Self::ServerAccess(response) => Some(response.command_output()),
-            Self::ListClients(response) => Some(response.command_output()),
-            Self::BreakPane(response) => response.command_output(),
-            Self::Handshake(_) => None,
-            Self::WebShare(response) => response.command_output(),
-            Self::SubscribePaneOutput(_)
-            | Self::UnsubscribePaneOutput(_)
-            | Self::PaneOutputCursor(_)
-            | Self::PaneOutputLag(_)
-            | Self::SubscribePaneStream(_)
-            | Self::PaneStreamCursor(_)
-            | Self::UnsubscribePaneStream(_)
-            | Self::SdkWaitForOutput(_)
-            | Self::CancelSdkWait(_)
-            | Self::PaneBroadcastInput(_)
-            | Self::PaneOptionSet(_)
-            | Self::PaneOptionGet(_)
-            | Self::SubscribePaneState(_)
-            | Self::PaneStateCursor(_)
-            | Self::PaneStateLag(_)
-            | Self::UnsubscribePaneState(_)
-            | Self::PaneForegroundState(_)
-            | Self::SplitWindowIdentity(_)
-            | Self::CreateSessionLease(_)
-            | Self::RenewSessionLease(_)
-            | Self::ReleaseSessionLease(_)
-            | Self::DaemonStatus(_)
-            | Self::ShutdownIfIdle(_) => None,
-            _ => None,
-        }
-    }
+    /// Negotiation or completion result of the CLI argv execution offer.
+    RuntimeCommandExecution(Box<crate::RuntimeCommandExecutionResponse>),
+    /// Terminal result of explicit split/key command admission.
+    SplitWindowCommandV1(Box<crate::SplitWindowCommandV1Response>),
+    /// Success payload for `export-window-snapshot`.
+    ExportWindowSnapshot(Box<ExportWindowSnapshotResponse>),
+    /// Success payload for `restore-window-snapshot`.
+    RestoreWindowSnapshot(RestoreWindowSnapshotResponse),
+    /// Terminal result of the `new-pane -I` offer.
+    NewPaneInputV1(Box<crate::NewPaneInputV1Response>),
+    /// Explicit V2 canonical snapshot response.
+    ExportWindowSnapshotV2(Box<ExportWindowSnapshotV2Response>),
+    /// Explicit V2 canonical restore response.
+    RestoreWindowSnapshotV2(RestoreWindowSnapshotV2Response),
+    /// Source completion with explicitly negotiated CLI queue disposition.
+    SourceFileQueueV1(Box<crate::SourceFileQueueV1Response>),
+    /// The running source has reached a consumer. Send one SourceFileInputDataV1.
+    SourceFileReadStdinV1(crate::SourceFileReadStdinV1Response),
+    /// Transfer the stdin offer to an independent reader before completion.
+    SourceFileRelayV1(crate::SourceFileRelayV1Response),
+    /// Confirm the claim and prove ownership of the offer.
+    SourceFileRelayReadyV1(crate::SourceFileRelayReadyV1Response),
 }
 
 /// Reusable stdout payload for commands that produce printable output.
@@ -517,71 +369,6 @@ pub struct NextLayoutResponse {
 pub struct PreviousLayoutResponse {
     /// The applied layout.
     pub layout: LayoutName,
-}
-
-/// Response payload for `set-buffer`.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct SetBufferResponse {
-    /// The name of the created or replaced buffer.
-    pub buffer_name: String,
-}
-
-/// Response payload for `show-buffer`.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct ShowBufferResponse {
-    /// The pre-rendered stdout bytes for the CLI.
-    pub output: CommandOutput,
-}
-
-impl ShowBufferResponse {
-    /// Returns the reusable stdout payload.
-    #[must_use]
-    pub fn command_output(&self) -> &CommandOutput {
-        &self.output
-    }
-}
-
-/// Response payload for `paste-buffer`.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct PasteBufferResponse {
-    /// The buffer name that was pasted.
-    pub buffer_name: String,
-}
-
-/// Response payload for `list-buffers`.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct ListBuffersResponse {
-    /// The pre-rendered stdout bytes for the CLI.
-    pub output: CommandOutput,
-}
-
-impl ListBuffersResponse {
-    /// Returns the reusable stdout payload.
-    #[must_use]
-    pub fn command_output(&self) -> &CommandOutput {
-        &self.output
-    }
-}
-
-/// Response payload for `delete-buffer`.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct DeleteBufferResponse {
-    /// The name of the deleted buffer.
-    pub buffer_name: String,
-}
-
-/// Response payload for `load-buffer`.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct LoadBufferResponse {
-    /// The name of the created or replaced buffer.
-    pub buffer_name: String,
-}
-
-/// Response payload for `save-buffer`.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct SaveBufferResponse {
-    /// The name of the saved buffer.
-    pub buffer_name: String,
 }
 
 /// Response payload for `capture-pane`.
@@ -670,302 +457,6 @@ impl DisplayMessageResponse {
     #[must_use]
     pub fn command_output(&self) -> Option<&CommandOutput> {
         self.output.as_ref()
-    }
-}
-
-/// Response payload for `run-shell`.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
-pub struct RunShellResponse {
-    /// Captured stdout for foreground `run-shell`.
-    pub output: Option<CommandOutput>,
-    /// Exit status returned by a foreground shell command.
-    pub exit_status: Option<i32>,
-}
-
-impl RunShellResponse {
-    /// Builds a background `run-shell` response.
-    #[must_use]
-    pub const fn background() -> Self {
-        Self {
-            output: None,
-            exit_status: None,
-        }
-    }
-
-    /// Builds a response with no command output.
-    #[must_use]
-    pub const fn no_output() -> Self {
-        Self::background()
-    }
-
-    /// Builds a foreground `run-shell` response.
-    #[must_use]
-    pub fn from_output(output: CommandOutput) -> Self {
-        Self {
-            output: Some(output),
-            exit_status: Some(0),
-        }
-    }
-
-    /// Builds a foreground shell response with an exact exit status.
-    #[must_use]
-    pub const fn from_exit_status(exit_status: i32) -> Self {
-        Self {
-            output: None,
-            exit_status: Some(exit_status),
-        }
-    }
-
-    /// Builds a foreground shell response with output and an exact exit status.
-    #[must_use]
-    pub fn from_output_and_exit_status(output: CommandOutput, exit_status: i32) -> Self {
-        Self {
-            output: Some(output),
-            exit_status: Some(exit_status),
-        }
-    }
-
-    /// Returns the reusable stdout payload for foreground `run-shell`.
-    #[must_use]
-    pub fn command_output(&self) -> Option<&CommandOutput> {
-        self.output.as_ref()
-    }
-
-    /// Returns the shell exit status when the response came from a foreground shell.
-    #[must_use]
-    pub const fn exit_status(&self) -> Option<i32> {
-        self.exit_status
-    }
-}
-
-impl<'de> Deserialize<'de> for RunShellResponse {
-    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
-    where
-        D: Deserializer<'de>,
-    {
-        deserializer.deserialize_struct(
-            "RunShellResponse",
-            &["output", "exit_status"],
-            RunShellResponseVisitor,
-        )
-    }
-}
-
-struct RunShellResponseVisitor;
-
-impl<'de> Visitor<'de> for RunShellResponseVisitor {
-    type Value = RunShellResponse;
-
-    fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        formatter.write_str("a run-shell response")
-    }
-
-    fn visit_seq<A>(self, mut seq: A) -> Result<Self::Value, A::Error>
-    where
-        A: SeqAccess<'de>,
-    {
-        let output = seq
-            .next_element()?
-            .ok_or_else(|| de::Error::invalid_length(0, &self))?;
-        let exit_status = compat_next_response_element(&mut seq)?;
-        Ok(RunShellResponse {
-            output,
-            exit_status,
-        })
-    }
-
-    fn visit_map<A>(self, mut map: A) -> Result<Self::Value, A::Error>
-    where
-        A: MapAccess<'de>,
-    {
-        let mut output = None;
-        let mut exit_status = None;
-
-        while let Some(key) = map.next_key::<String>()? {
-            match key.as_str() {
-                "output" => output = Some(map.next_value()?),
-                "exit_status" => exit_status = Some(map.next_value()?),
-                _ => {
-                    let _: de::IgnoredAny = map.next_value()?;
-                }
-            }
-        }
-
-        Ok(RunShellResponse {
-            output: output.ok_or_else(|| de::Error::missing_field("output"))?,
-            exit_status: exit_status.unwrap_or_default(),
-        })
-    }
-}
-
-fn compat_next_response_element<'de, A, T>(seq: &mut A) -> Result<T, A::Error>
-where
-    A: SeqAccess<'de>,
-    T: Deserialize<'de> + Default,
-{
-    match seq.next_element::<T>() {
-        Ok(Some(value)) => Ok(value),
-        Ok(None) => Ok(T::default()),
-        Err(error) => Err(error),
-    }
-}
-
-/// Response payload for `if-shell`.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
-pub struct IfShellResponse {
-    /// Captured stdout from the selected nested command when it produced output.
-    pub output: Option<CommandOutput>,
-}
-
-impl IfShellResponse {
-    /// Builds a response with no nested command output.
-    #[must_use]
-    pub const fn no_output() -> Self {
-        Self { output: None }
-    }
-
-    /// Builds a response with nested command output.
-    #[must_use]
-    pub fn from_output(output: CommandOutput) -> Self {
-        Self {
-            output: Some(output),
-        }
-    }
-
-    /// Returns the reusable stdout payload when the selected nested command printed output.
-    #[must_use]
-    pub fn command_output(&self) -> Option<&CommandOutput> {
-        self.output.as_ref()
-    }
-}
-
-/// Response payload for `source-file`.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
-pub struct SourceFileResponse {
-    /// Verbose parsed-command output, when requested.
-    pub output: Option<CommandOutput>,
-    /// Exit status surfaced by a nested foreground command.
-    pub exit_status: Option<i32>,
-    /// File-loading diagnostics that tmux writes to stderr.
-    pub stderr: Vec<u8>,
-}
-
-impl SourceFileResponse {
-    /// Builds a response without command output.
-    #[must_use]
-    pub const fn no_output() -> Self {
-        Self {
-            output: None,
-            stderr: Vec::new(),
-            exit_status: None,
-        }
-    }
-
-    /// Builds a response with command output.
-    #[must_use]
-    pub fn from_output(output: CommandOutput) -> Self {
-        Self {
-            output: Some(output),
-            stderr: Vec::new(),
-            exit_status: None,
-        }
-    }
-
-    /// Returns the reusable stdout payload when `source-file -v` printed output.
-    #[must_use]
-    pub fn command_output(&self) -> Option<&CommandOutput> {
-        self.output.as_ref()
-    }
-
-    /// Returns bytes to write to stderr for file-loading diagnostics.
-    #[must_use]
-    pub fn stderr(&self) -> &[u8] {
-        &self.stderr
-    }
-
-    /// Adds stderr bytes to the response.
-    #[must_use]
-    pub fn with_stderr(mut self, stderr: Vec<u8>) -> Self {
-        self.stderr = stderr;
-        self
-    }
-
-    /// Adds a command exit status to the response.
-    #[must_use]
-    pub const fn with_exit_status(mut self, exit_status: Option<i32>) -> Self {
-        self.exit_status = exit_status;
-        self
-    }
-
-    /// Returns the surfaced nested command exit status, if any.
-    #[must_use]
-    pub const fn exit_status(&self) -> Option<i32> {
-        self.exit_status
-    }
-}
-
-impl<'de> Deserialize<'de> for SourceFileResponse {
-    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
-    where
-        D: Deserializer<'de>,
-    {
-        deserializer.deserialize_struct(
-            "SourceFileResponse",
-            &["output", "exit_status", "stderr"],
-            SourceFileResponseVisitor,
-        )
-    }
-}
-
-struct SourceFileResponseVisitor;
-
-impl<'de> Visitor<'de> for SourceFileResponseVisitor {
-    type Value = SourceFileResponse;
-
-    fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        formatter.write_str("a source-file response")
-    }
-
-    fn visit_seq<A>(self, mut seq: A) -> Result<Self::Value, A::Error>
-    where
-        A: SeqAccess<'de>,
-    {
-        let output = seq
-            .next_element()?
-            .ok_or_else(|| de::Error::invalid_length(0, &self))?;
-        let exit_status = compat_next_response_element(&mut seq)?;
-        let stderr = compat_next_response_element(&mut seq)?;
-        Ok(SourceFileResponse {
-            output,
-            exit_status,
-            stderr,
-        })
-    }
-
-    fn visit_map<A>(self, mut map: A) -> Result<Self::Value, A::Error>
-    where
-        A: MapAccess<'de>,
-    {
-        let mut output = None;
-        let mut exit_status = None;
-        let mut stderr = None;
-
-        while let Some(key) = map.next_key::<String>()? {
-            match key.as_str() {
-                "output" => output = Some(map.next_value()?),
-                "exit_status" => exit_status = Some(map.next_value()?),
-                "stderr" => stderr = Some(map.next_value()?),
-                _ => {
-                    let _: de::IgnoredAny = map.next_value()?;
-                }
-            }
-        }
-
-        Ok(SourceFileResponse {
-            output: output.ok_or_else(|| de::Error::missing_field("output"))?,
-            exit_status: exit_status.unwrap_or_default(),
-            stderr: stderr.unwrap_or_default(),
-        })
     }
 }
 
@@ -1134,6 +625,8 @@ mod tests {
 
     #[test]
     fn pr6g_response_boxing_keeps_response_size_bounded() {
+        assert_eq!(size_of::<Box<crate::RuntimeCommandExecutionResponse>>(), 8);
+        assert!(size_of::<crate::RuntimeCommandExecutionResponse>() > 72);
         assert_eq!(size_of::<Box<WebShareResponse>>(), 8);
         assert_eq!(size_of::<Box<PaneOutputLagResponse>>(), 8);
         assert_eq!(size_of::<Box<PaneOptionSetResponse>>(), 8);
@@ -1164,6 +657,41 @@ mod tests {
             size_of::<PaneForegroundStateResponse>() > size_of::<Response>(),
             "PaneForegroundStateResponse must remain boxed while it is larger than Response"
         );
+    }
+
+    #[test]
+    fn runtime_command_execution_boxing_preserves_wire_bytes() {
+        use crate::RuntimeCommandExecutionResponse as Execution;
+
+        for payload in [
+            Execution::Fallback,
+            Execution::Unsupported(RmuxError::UnsupportedCapability {
+                feature: "future.execution".to_owned(),
+                supported: vec!["cli.runtime-command-execution".to_owned()],
+            }),
+            Execution::Complete {
+                command_name: "display-message".to_owned(),
+                stdout: vec![0, 255, b'\n'],
+                error: None,
+                exit_status: 0,
+            },
+            Execution::Complete {
+                command_name: "run-shell".to_owned(),
+                stdout: b"partial\n".to_vec(),
+                error: Some(RmuxError::Decode("command error".to_owned())),
+                exit_status: 17,
+            },
+        ] {
+            // The published outer tag and unboxed payload define the old bytes.
+            let mut expected = 105_u32.to_le_bytes().to_vec();
+            expected.extend(bincode::serialize(&payload).unwrap());
+            let response = Response::RuntimeCommandExecution(Box::new(payload));
+            assert_eq!(bincode::serialize(&response).unwrap(), expected);
+            assert_eq!(
+                bincode::deserialize::<Response>(&expected).unwrap(),
+                response
+            );
+        }
     }
 
     #[test]

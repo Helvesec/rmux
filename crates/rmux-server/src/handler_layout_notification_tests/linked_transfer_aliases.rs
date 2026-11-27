@@ -6,22 +6,29 @@ use rmux_proto::{
 use tokio::sync::oneshot;
 
 use super::{
-    create_session, register_control_client, run_control_command, run_detached_command,
-    settle_control_notifications, wait_for_buffer_text, RequestHandler,
+    create_session, register_control_client, run_detached_command, settle_control_notifications,
+    wait_for_buffer_text, RequestHandler,
 };
 use crate::handler::pane_group_transfer_tests::create_grouped_session;
 
+// FMT1 R2 retired the transfer reflow: a destination with no room refuses
+// instead of being widened, so a join or move never publishes `window-resized`
+// any more. What still has to retain the requested alias is the layout change,
+// and a destination with no room must publish nothing at all.
 #[tokio::test]
-async fn linked_and_grouped_join_move_keep_requested_resize_alias() {
+async fn linked_and_grouped_join_move_keep_requested_layout_alias() {
     for operation in ["join-pane", "move-pane"] {
         for family in ["linked", "grouped"] {
-            assert_transfer_alias(operation, family).await;
+            for width in [1, 3] {
+                assert_transfer_alias(operation, family, width).await;
+            }
         }
     }
 }
 
-async fn assert_transfer_alias(operation: &str, family: &str) {
-    let label = format!("{operation}-{family}");
+async fn assert_transfer_alias(operation: &str, family: &str, width: u16) {
+    let label = format!("{operation}-{family}-{width}");
+    let expect_refusal = width == 1;
     let alpha = session_name(&format!("resize-alias-alpha-{label}"));
     let beta = session_name(&format!("resize-alias-beta-{label}"));
     let source = session_name(&format!("resize-alias-source-{label}"));
@@ -64,17 +71,27 @@ async fn assert_transfer_alias(operation: &str, family: &str) {
     .await;
     run_detached_command(
         &handler,
-        &format!("resize-window -t {requested}:0 -x 1 -y 1"),
+        &format!("resize-window -t {requested}:0 -x {width} -y 1"),
     )
     .await;
     run_detached_command(&handler, &format!("set-buffer -b {buffer} ''")).await;
-    set_resize_hook(&handler, &buffer).await;
+    set_layout_hook(&handler, &buffer).await;
 
     let (control_pid, mut notifications) = register_control_client(&handler, &requested).await;
     let _ = settle_control_notifications(&mut notifications).await;
     let mut lifecycle_events = handler.subscribe_lifecycle_events();
     let command = format!("{operation} -h -d -s {source}:0.0 -t {requested}:0.0");
-    run_control_command(&handler, control_pid, &command).await;
+    let error = super::run_control_command_result(&handler, control_pid, &command).await;
+    if expect_refusal {
+        let error =
+            error.unwrap_or_else(|| panic!("{label}: a destination with no room must refuse"));
+        assert!(
+            error.to_string().contains("cannot split target pane"),
+            "{label}: unexpected refusal {error}"
+        );
+    } else {
+        assert!(error.is_none(), "{label}: {error:?}");
+    }
     let control_lines = settle_control_notifications(&mut notifications).await;
     let hook_events = wait_for_buffer_text(&handler, &buffer, requested.as_str()).await;
     let mut events = Vec::new();
@@ -84,29 +101,46 @@ async fn assert_transfer_alias(operation: &str, family: &str) {
         events.push(event.event);
     }
 
-    let resized_targets = events
+    assert!(
+        !events
+            .iter()
+            .any(|event| matches!(event, LifecycleEvent::WindowResized { .. })),
+        "{label}: a transfer never resizes its destination window; events={events:?}"
+    );
+    let layout_targets = events
         .iter()
         .filter_map(|event| match event {
-            LifecycleEvent::WindowResized { target } => Some(target.clone()),
+            LifecycleEvent::WindowLayoutChanged { target } => Some(target.clone()),
             _ => None,
         })
+        .filter(|target| target.window_index() == 0)
         .collect::<Vec<_>>();
-    assert_eq!(
-        resized_targets,
-        vec![WindowTarget::with_window(requested.clone(), 0)],
-        "{label}: lifecycle resize must retain the requested alias; events={events:?}"
-    );
-    assert_eq!(
-        hook_events,
-        Some(requested.to_string()),
-        "{label}: the hook format context must retain the requested session alias"
-    );
+    if expect_refusal {
+        assert!(
+            layout_targets.is_empty(),
+            "{label}: a refusal publishes nothing; events={events:?}"
+        );
+        assert!(
+            hook_events.is_none(),
+            "{label}: a refusal fires no hook; got {hook_events:?}"
+        );
+    } else {
+        assert!(
+            layout_targets.contains(&WindowTarget::with_window(requested.clone(), 0)),
+            "{label}: the lifecycle layout change must retain the requested alias; events={events:?}"
+        );
+        assert_eq!(
+            hook_events,
+            Some(requested.to_string()),
+            "{label}: the hook format context must retain the requested session alias"
+        );
+    }
     assert_eq!(
         control_lines
             .iter()
             .filter(|line| line.starts_with("%layout-change "))
             .count(),
-        1,
+        usize::from(!expect_refusal),
         "{label}: linked/grouped aliases must still receive one control layout"
     );
 
@@ -130,6 +164,7 @@ async fn alias_opposite_hashmap_first(
     let first = state
         .sessions
         .iter()
+        .map(|session| (session.name(), session))
         .find_map(|(session_name, session)| {
             session
                 .window_at(0)
@@ -144,11 +179,11 @@ async fn alias_opposite_hashmap_first(
     }
 }
 
-async fn set_resize_hook(handler: &RequestHandler, buffer: &str) {
+async fn set_layout_hook(handler: &RequestHandler, buffer: &str) {
     let response = handler
         .handle(Request::SetHook(SetHookRequest {
             scope: ScopeSelector::Global,
-            hook: HookName::WindowResized,
+            hook: HookName::WindowLayoutChanged,
             command: format!("run-shell -C 'set-buffer -b {buffer} #{{session_name}}'"),
             lifecycle: HookLifecycle::Persistent,
         }))

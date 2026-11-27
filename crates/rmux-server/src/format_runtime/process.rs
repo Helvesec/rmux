@@ -20,6 +20,7 @@ impl RuntimeFormatContext<'_> {
                 state
                     .pane_pid_in_window(session_name, window_index, pane.index())
                     .ok()
+                    .filter(|pid| *pid != 0)
             })
     }
 
@@ -33,6 +34,7 @@ impl RuntimeFormatContext<'_> {
             state
                 .pane_pid_in_window(session_name, window_index, pane.index())
                 .ok()
+                .filter(|pid| *pid != 0)
                 .and_then(process::current_path)
         };
         let profile_cwd = || {
@@ -85,6 +87,7 @@ impl RuntimeFormatContext<'_> {
                 state
                     .pane_pid_in_window(session_name, window_index, pane.index())
                     .ok()
+                    .filter(|pid| *pid != 0)
                     .and_then(process::command_name)
             })
             .or_else(|| {

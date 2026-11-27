@@ -193,7 +193,10 @@ fn remove_window_prefers_last_window_as_the_active_fallback() {
 
     assert_eq!(removed.name(), None);
     assert_eq!(session.active_window_index(), 2);
-    assert_eq!(session.last_window_index(), None);
+    // Detaching the current window selects the return first, which pushes the
+    // window being left, and only then drops the occurrence that goes away
+    // (`session.c:346-350`): window 0 is what the session still visited.
+    assert_eq!(session.last_window_index(), Some(0));
 }
 
 #[test]

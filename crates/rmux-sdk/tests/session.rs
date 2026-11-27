@@ -1,11 +1,14 @@
 #![cfg(unix)]
 
+#[path = "../../../tests/support/executable_fixture.rs"]
+mod executable_fixture;
+
 mod common;
+#[path = "session/exact_name.rs"]
+mod exact_name;
 
 use std::error::Error;
 use std::ffi::{OsStr, OsString};
-use std::fs;
-use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -15,7 +18,6 @@ use std::time::Duration;
 use rmux_proto::{
     encode_frame, FrameDecoder, HasSessionRequest, ListSessionsRequest, Request, Response,
 };
-use rmux_sdk::bootstrap::discovery::{SDK_ENDPOINT_ENV, SDK_TIMEOUT_MS_ENV};
 use rmux_sdk::{
     EnsureSession, InfoSnapshot, NewSessionSpec, ProcessSpec, RmuxBuilder, RmuxError, SessionName,
     TerminalSizeSpec,
@@ -84,16 +86,18 @@ async fn ensure_session_command_preserves_legacy_and_explicit_modes_are_clear() 
     let legacy_name = session_name("sdkensurelegacy");
     let direct_name = session_name("sdkensureargv");
     let shell_name = session_name("sdkensureshell");
+    // Output markers synchronize readiness; cat holds each test-owned PTY open
+    // until the explicit kills below, even if later consumers are delayed.
     let executable = write_executable_script(
         harness.root(),
         "ensure direct binary",
-        "#!/bin/sh\nprintf 'sdk_ensure_direct_argv\\n'; sleep 2\n",
+        "#!/bin/sh\nprintf 'sdk_ensure_direct_argv\\n'; cat\n",
     )?;
 
     let legacy = EnsureSession::named(legacy_name.clone())
         .create_only()
         .detached(true)
-        .command(["printf 'sdk_ensure_legacy_shell\\n'; sleep 2"])
+        .command(["printf 'sdk_ensure_legacy_shell\\n'; cat"])
         .ensure(&rmux)
         .await?;
     legacy
@@ -115,7 +119,7 @@ async fn ensure_session_command_preserves_legacy_and_explicit_modes_are_clear() 
     let shell = EnsureSession::named(shell_name.clone())
         .create_only()
         .detached(true)
-        .shell("printf 'sdk_ensure_shell\\n'; sleep 2")
+        .shell("printf 'sdk_ensure_shell\\n'; cat")
         .ensure(&rmux)
         .await?;
     shell.pane(0, 0).wait_for_text("sdk_ensure_shell").await?;
@@ -261,8 +265,8 @@ async fn explicit_endpoint_timeout_and_empty_tag_semantics_are_preserved() -> Te
     let _env_lock = ENV_LOCK.lock().await;
     let harness = Harness::start("precedence").await?;
     let wrong_endpoint = harness.root().join("wrong.sock");
-    let _endpoint = EnvGuard::set_os(SDK_ENDPOINT_ENV, wrong_endpoint.as_os_str());
-    let _timeout = EnvGuard::set(SDK_TIMEOUT_MS_ENV, "1");
+    let _endpoint = EnvGuard::set_os("RMUX_SDK_ENDPOINT", wrong_endpoint.as_os_str());
+    let _timeout = EnvGuard::set("RMUX_SDK_TIMEOUT_MS", "1");
     let rmux = RmuxBuilder::new()
         .unix_socket(harness.socket_path())
         .default_timeout(Duration::from_secs(30))
@@ -325,20 +329,20 @@ fn session_name(value: &str) -> SessionName {
 
 fn assert_duplicate_session(error: &RmuxError, expected: &str) {
     match error {
-        RmuxError::Protocol {
-            source: rmux_proto::RmuxError::DuplicateSession(actual),
-            ..
-        } => assert_eq!(actual, expected),
+        RmuxError::Protocol { source, .. } if source.duplicate_session().is_some() => {
+            let actual = source.duplicate_session().unwrap();
+            assert_eq!(actual, expected)
+        }
         other => panic!("expected duplicate session diagnostic, got {other:?}"),
     }
 }
 
 fn assert_session_not_found(error: &RmuxError, expected: &str) {
     match error {
-        RmuxError::Protocol {
-            source: rmux_proto::RmuxError::SessionNotFound(actual),
-            ..
-        } => assert_eq!(actual, expected),
+        RmuxError::Protocol { source, .. } if source.session_not_found().is_some() => {
+            let actual = source.session_not_found().unwrap();
+            assert_eq!(actual, expected)
+        }
         other => panic!("expected session-not-found diagnostic, got {other:?}"),
     }
 }
@@ -362,10 +366,7 @@ fn assert_no_secret(label: &str, rendered: &str, secret: &str) {
 
 fn write_executable_script(root: &Path, name: &str, body: &str) -> TestResult<PathBuf> {
     let path = root.join(name);
-    fs::write(&path, body)?;
-    let mut permissions = fs::metadata(&path)?.permissions();
-    permissions.set_mode(0o755);
-    fs::set_permissions(&path, permissions)?;
+    executable_fixture::write_executable(&path, body, 0o755)?;
     Ok(path)
 }
 
@@ -390,18 +391,29 @@ async fn raw_list_session_names(socket_path: &Path) -> TestResult<Vec<SessionNam
 }
 
 async fn raw_new_session(socket_path: &Path, name: SessionName) -> TestResult {
-    let request = NewSessionSpec {
+    // This fixture intentionally exercises raw IPC; construct its protocol DTO
+    // directly instead of crossing the public SDK command boundary.
+    let request = rmux_proto::NewSessionExtRequest {
         session_name: Some(name.clone()),
+        working_directory: None,
         detached: true,
-        ..NewSessionSpec::default()
+        size: None,
+        environment: None,
+        group_target: None,
+        attach_if_exists: false,
+        detach_other_clients: false,
+        kill_other_clients: false,
+        flags: None,
+        window_name: None,
+        print_session_info: false,
+        print_format: None,
+        command: None,
+        process_command: None,
+        client_environment: None,
+        skip_environment_update: false,
     };
 
-    match framed_request(
-        socket_path,
-        Request::NewSessionExt(Box::new(request.into())),
-    )
-    .await?
-    {
+    match framed_request(socket_path, Request::NewSessionExt(Box::new(request))).await? {
         Response::NewSession(response) => {
             assert_eq!(response.session_name, name);
             Ok(())

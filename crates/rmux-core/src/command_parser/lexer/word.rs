@@ -3,7 +3,8 @@ use crate::command_parser::{is_parse_time_assignment, CommandParseError};
 
 impl<'a> Lexer<'a> {
     pub(super) fn read_token(&mut self, ch: char) -> Result<String, CommandParseError> {
-        let mut buffer = String::new();
+        let mut buffer = TokenBuffer::default();
+        let mut literal_windows_paths = true;
         let mut state = QuoteState::None;
         let mut last = QuoteState::Start;
         let mut current = Some(ch);
@@ -46,14 +47,17 @@ impl<'a> Lexer<'a> {
 
             if ch == '\\' && state != QuoteState::SingleQuotes {
                 #[cfg(windows)]
-                if can_start_windows_path_prefix(&buffer)
+                if literal_windows_paths
+                    && buffer
+                        .windows_path_text()
+                        .is_some_and(can_start_windows_path_prefix)
                     && self.read_windows_path_prefix(&mut buffer)
                 {
                     last = state;
                     current = self.get_char();
                     continue;
                 }
-                self.read_escape(&mut buffer)?;
+                self.read_escape(&mut buffer, &mut literal_windows_paths)?;
                 last = state;
                 current = self.get_char();
                 continue;
@@ -117,11 +121,11 @@ impl<'a> Lexer<'a> {
         if let Some(ch) = delimiter {
             self.unget_char(ch);
         }
-        Ok(buffer)
+        Ok(buffer.into_string())
     }
 
     #[cfg(windows)]
-    fn read_windows_path_prefix(&mut self, buffer: &mut String) -> bool {
+    fn read_windows_path_prefix(&mut self, buffer: &mut TokenBuffer) -> bool {
         let Some(second) = self.get_char() else {
             return false;
         };
@@ -213,16 +217,33 @@ impl<'a> Lexer<'a> {
         None
     }
 
-    fn read_escape(&mut self, buffer: &mut String) -> Result<(), CommandParseError> {
+    fn read_escape(
+        &mut self,
+        buffer: &mut TokenBuffer,
+        _literal_windows_paths: &mut bool,
+    ) -> Result<(), CommandParseError> {
         let Some(ch) = self.get_char() else {
             return Err(CommandParseError::new(self.line, "invalid escape"));
         };
 
         #[cfg(windows)]
-        if is_windows_path_escape_context(buffer) && !matches!(ch, '\\' | '\'' | '"') {
-            buffer.push('\\');
-            buffer.push(ch);
-            return Ok(());
+        {
+            // A leading numeric escape explicitly selects escaped text. Do not
+            // infer native path syntax again from its decoded characters: a
+            // canonical argument may contain both slashes and control bytes.
+            if buffer.is_empty() && matches!(ch, '0'..='3' | 'u' | 'U') {
+                *_literal_windows_paths = false;
+            }
+            if *_literal_windows_paths
+                && buffer
+                    .windows_path_text()
+                    .is_some_and(is_windows_path_escape_context)
+                && !matches!(ch, '\\' | '\'' | '"')
+            {
+                buffer.push('\\');
+                buffer.push(ch);
+                return Ok(());
+            }
         }
 
         if matches!(ch, '4'..='7') {
@@ -241,7 +262,7 @@ impl<'a> Lexer<'a> {
             let value = 64 * (ch as u32 - '0' as u32)
                 + 8 * (o2 as u32 - '0' as u32)
                 + (o3 as u32 - '0' as u32);
-            buffer.push(char::from_u32(value).expect("three octal digits fit in char"));
+            buffer.push_octal_byte(u8::try_from(value).expect("\\[0-3][0-7][0-7] fits in a byte"));
             return Ok(());
         }
 
@@ -265,7 +286,7 @@ impl<'a> Lexer<'a> {
 
     fn read_unicode_escape(
         &mut self,
-        buffer: &mut String,
+        buffer: &mut TokenBuffer,
         size: usize,
         escape_type: char,
     ) -> Result<(), CommandParseError> {
@@ -299,7 +320,7 @@ impl<'a> Lexer<'a> {
         Ok(())
     }
 
-    fn read_variable(&mut self, buffer: &mut String) -> Result<(), CommandParseError> {
+    fn read_variable(&mut self, buffer: &mut TokenBuffer) -> Result<(), CommandParseError> {
         let Some(ch) = self.get_char() else {
             return Err(CommandParseError::new(
                 self.line,
@@ -356,7 +377,7 @@ impl<'a> Lexer<'a> {
         Ok(())
     }
 
-    fn read_tilde(&mut self, buffer: &mut String) -> Result<(), CommandParseError> {
+    fn read_tilde(&mut self, buffer: &mut TokenBuffer) -> Result<(), CommandParseError> {
         let mut user = String::new();
         let mut delimiter = None;
         while let Some(ch) = self.get_char() {
@@ -388,6 +409,86 @@ impl<'a> Lexer<'a> {
         };
         buffer.push_str(home);
         Ok(())
+    }
+}
+
+/// Token text built the way tmux builds it: from bytes.
+///
+/// tmux 3.7b (`cmd-parse.y`, `yylex_token_escape`) appends the byte of a
+/// `\ooo` escape to the token, so `"\303\251"` is `é` (c3 a9), not two
+/// Latin-1 code points. Literal characters, `\u`, variables and tildes are
+/// already UTF-8 text; only octal escapes contribute single bytes. `pending`
+/// holds at most a valid but incomplete UTF-8 prefix made of octal bytes; it
+/// becomes text as soon as it completes. Bytes that cannot form UTF-8 become
+/// U+FFFD, as a raw invalid byte of a sourced file does through
+/// `String::from_utf8_lossy`: tmux keeps them raw, a Rust `String` cannot
+/// (divergence C-D97).
+#[derive(Debug, Default)]
+pub(super) struct TokenBuffer {
+    text: String,
+    pending: Vec<u8>,
+}
+
+impl TokenBuffer {
+    pub(super) fn push(&mut self, ch: char) {
+        self.flush_pending();
+        self.text.push(ch);
+    }
+
+    pub(super) fn push_str(&mut self, text: &str) {
+        self.flush_pending();
+        self.text.push_str(text);
+    }
+
+    pub(super) fn push_octal_byte(&mut self, byte: u8) {
+        self.pending.push(byte);
+        loop {
+            let error = match std::str::from_utf8(&self.pending) {
+                Ok(complete) => {
+                    self.text.push_str(complete);
+                    self.pending.clear();
+                    return;
+                }
+                Err(error) => error,
+            };
+            let valid = error.valid_up_to();
+            self.text.push_str(
+                std::str::from_utf8(&self.pending[..valid]).expect("prefix validated by from_utf8"),
+            );
+            let Some(invalid) = error.error_len() else {
+                self.pending.drain(..valid);
+                return;
+            };
+            self.text.push(char::REPLACEMENT_CHARACTER);
+            self.pending.drain(..valid + invalid);
+        }
+    }
+
+    /// Whether the token has no text and no pending octal byte.
+    #[cfg(windows)]
+    pub(super) fn is_empty(&self) -> bool {
+        self.text.is_empty() && self.pending.is_empty()
+    }
+
+    /// The text the Windows path checks classify, or `None` while an
+    /// incomplete octal sequence is pending. Such a token ends with a
+    /// non-ASCII byte and its prefix was already classified as no path when
+    /// the first octal escape was read, so no path syntax applies to it.
+    #[cfg(windows)]
+    pub(super) fn windows_path_text(&self) -> Option<&str> {
+        self.pending.is_empty().then_some(self.text.as_str())
+    }
+
+    pub(super) fn into_string(mut self) -> String {
+        self.flush_pending();
+        self.text
+    }
+
+    fn flush_pending(&mut self) {
+        if !self.pending.is_empty() {
+            self.pending.clear();
+            self.text.push(char::REPLACEMENT_CHARACTER);
+        }
     }
 }
 

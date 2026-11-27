@@ -46,6 +46,7 @@ async fn parsed_queue_resize_pane_trim_flag_trims_below_cursor() {
                     pending_input: false,
                     quiet: false,
                     escape_pending: false,
+                    hyperlinks: false,
                 },
             )
             .expect("capture succeeds")
@@ -203,6 +204,7 @@ async fn parsed_queue_resize_pane_mouse_flag_resizes_from_border_context() {
     let before = pane_sizes(&handler, &session).await;
     let border_x = before.first().expect("first pane").0.saturating_add(5);
     let mouse_event = AttachedMouseEvent {
+        coordinates: None,
         raw: MouseForwardEvent {
             b: 32,
             lb: 32,
@@ -362,6 +364,7 @@ async fn parsed_queue_mouse_resize_survives_prior_command_in_pipeline() {
     let before = pane_sizes(&handler, &session).await;
     let border_x = before.first().expect("first pane").0.saturating_add(5);
     let mouse_event = AttachedMouseEvent {
+        coordinates: None,
         raw: MouseForwardEvent {
             b: 32,
             lb: 32,
@@ -426,6 +429,7 @@ async fn parsed_queue_mouse_resize_can_recover_attached_current_mouse_event() {
     let before = pane_sizes(&handler, &session).await;
     let border_x = before.first().expect("first pane").0.saturating_add(5);
     let mouse_event = AttachedMouseEvent {
+        coordinates: None,
         raw: MouseForwardEvent {
             b: 32,
             lb: 32,
@@ -577,6 +581,7 @@ fn border_mouse_event(
     start_y: u16,
 ) -> AttachedMouseEvent {
     AttachedMouseEvent {
+        coordinates: None,
         raw: MouseForwardEvent {
             b: 32,
             lb: 0,

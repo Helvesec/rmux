@@ -39,7 +39,7 @@ impl HandlerState {
             if self
                 .sessions
                 .session(session_name)
-                .is_some_and(|session| !session.windows().is_empty())
+                .is_some_and(|session| session.windows().next().is_some())
             {
                 let _ = self.renumber_windows_if_enabled(session_name)?;
             }
@@ -48,7 +48,7 @@ impl HandlerState {
             if self
                 .sessions
                 .session(&session_name)
-                .is_some_and(|session| !session.windows().is_empty())
+                .is_some_and(|session| session.windows().next().is_some())
             {
                 self.synchronize_session_group_from(&session_name)?;
                 self.sync_pane_lifecycle_dimensions_for_session(&session_name);
@@ -62,32 +62,44 @@ impl HandlerState {
         session_name: &SessionName,
     ) -> Result<BTreeMap<u32, u32>, RmuxError> {
         let base_index = self.session_base_index(session_name);
-        let previous_session = self
-            .sessions
-            .session(session_name)
-            .cloned()
-            .ok_or_else(|| session_not_found(session_name))?;
-        let previous_options = self.options.clone();
-        let previous_hooks = self.hooks.clone();
-        let previous_auto_named_windows = self.auto_named_windows.clone();
-        let previous_window_link_slots = self.window_link_slots.clone();
-        let previous_window_link_groups = self.window_link_groups.clone();
-        let previous_window_link_occurrences = self.window_link_occurrences.clone();
-
         let session = self
             .sessions
-            .session_mut(session_name)
+            .session(session_name)
             .ok_or_else(|| session_not_found(session_name))?;
-        let index_map = session.reindex_windows_from(base_index)?;
-        if let Err(error) = self.remap_reindexed_window_metadata(session_name, &index_map) {
-            self.replace_session(session_name, previous_session)?;
-            self.options = previous_options;
-            self.hooks = previous_hooks;
-            self.auto_named_windows = previous_auto_named_windows;
-            self.window_link_slots = previous_window_link_slots;
-            self.window_link_groups = previous_window_link_groups;
-            self.window_link_occurrences = previous_window_link_occurrences;
-            return Err(error);
+        let index_map = session
+            .windows()
+            .enumerate()
+            .map(|(offset, (index, _))| {
+                let offset = u32::try_from(offset)
+                    .map_err(|_| RmuxError::Server("window index space exhausted".to_owned()))?;
+                let destination = base_index
+                    .checked_add(offset)
+                    .ok_or_else(|| RmuxError::Server("window index space exhausted".to_owned()))?;
+                Ok((index, destination))
+            })
+            .collect::<Result<BTreeMap<_, _>, RmuxError>>()?;
+        let members = self.sessions.session_group_members(session_name);
+        // Stage fallible ancillary rekeys before the atomic canonical commit.
+        // These stores contain no window owners or pane layout state.
+        let mut options = self.options.clone();
+        let mut hooks = self.hooks.clone();
+        for member in &members {
+            options.remap_session_window_indices(member, &index_map)?;
+            hooks.remap_session_window_indices(member, &index_map)?;
+        }
+        let change = self
+            .sessions
+            .reindex_windows_from(session_name, base_index)?;
+        self.options = options;
+        self.hooks = hooks;
+        for member_change in change.sessions {
+            let name = self
+                .sessions
+                .session_by_id(member_change.session_id)
+                .expect("reindex retains session identity")
+                .name()
+                .clone();
+            self.remap_window_indexed_state(&name, &member_change.index_map);
         }
         Ok(index_map)
     }

@@ -3,6 +3,12 @@ name: Release promotion simulation
 on:
   workflow_dispatch:
     inputs:
+      candidate_profile:
+        description: Canonical main or permitted premerge evidence (never publication)
+        required: false
+        default: canonical
+        type: choice
+        options: [canonical, premerge-rehearsal-v1]
       simulation_id:
         description: Unique nonpublishing simulation identifier
         required: true
@@ -56,6 +62,7 @@ concurrency:
 
 jobs:
   prepare-policy-audit:
+    if: inputs.candidate_profile == 'canonical'
     name: Prepare exact policy audit inputs
     permissions:
       actions: read
@@ -438,3 +445,21 @@ jobs:
           if-no-files-found: error
           retention-days: 7
           compression-level: 0
+
+  premerge-rehearsal:
+    if: inputs.candidate_profile == 'premerge-rehearsal-v1'
+    uses: ./.github/workflows/premerge-rehearsal.yml
+    permissions:
+      actions: read
+      contents: read
+    with:
+      stage: simulate
+      candidate_run_id: ${{ inputs.candidate_run_id }}
+      expected_source_sha: ${{ inputs.expected_source_sha }}
+      release_intent_id: ${{ inputs.release_intent_id }}
+      planned_release_ref: ${{ inputs.planned_release_ref }}
+      release_kind: ${{ inputs.release_kind }}
+      candidate_manifest_run_id: ${{ inputs.candidate_manifest_run_id }}
+      candidate_manifest_artifact_id: ${{ inputs.candidate_manifest_artifact_id }}
+      candidate_manifest_artifact_digest: ${{ inputs.candidate_manifest_artifact_digest }}
+      candidate_manifest_sha256: ${{ inputs.candidate_manifest_sha256 }}

@@ -378,7 +378,7 @@ async fn link_window_k_rejects_same_window_identity_through_group_peer_atomicall
                     .sessions
                     .session(session_name)
                     .expect("session exists before rejected replacement")
-                    .clone()
+                    .test_snapshot()
             })
             .collect::<Vec<_>>();
         let before_targets = state.window_linked_window_targets(&owner, 0);
@@ -446,7 +446,7 @@ async fn link_window_k_rejects_same_window_identity_through_group_peer_atomicall
                     .sessions
                     .session(session_name)
                     .expect("session survives rejected replacement")
-                    .clone()
+                    .test_snapshot()
             })
             .collect::<Vec<_>>();
         assert_eq!(after_sessions, before_sessions);
@@ -872,9 +872,11 @@ async fn linked_session_formats_include_session_group_peers() {
         .stdout()
         .to_vec();
 
+    // tmux 3.7b counts each session group once: two groups hold this window
+    // (measured, S2365 `linked2.sh` case 11, private sockets).
     assert_eq!(
         String::from_utf8_lossy(&linked_formats),
-        "1:4:alpha,beta,gamma,delta\n"
+        "1:2:alpha,beta,gamma,delta\n"
     );
 }
 
@@ -980,7 +982,10 @@ async fn link_window_relative_same_destination_slot_makes_room_like_tmux() {
     let state = handler.state.lock().await;
     let session = state.sessions.session(&alpha).expect("alpha should exist");
     assert_eq!(
-        session.windows().keys().copied().collect::<Vec<_>>(),
+        session
+            .windows()
+            .map(|(index, _)| index)
+            .collect::<Vec<_>>(),
         vec![0, 1, 2, 3]
     );
     assert_eq!(session.pane_id_in_window(1, 0), Some(source_pane_id));
@@ -1525,6 +1530,32 @@ async fn unlink_window_kill_if_last_rekeys_renumbered_silence_timers_without_del
     insert_window(&handler, &alpha, 1).await;
     insert_window(&handler, &alpha, 2).await;
     create_session(&handler, unrelated.as_str()).await;
+
+    // ConPTY's startup preamble is activity even for these quiet children.
+    // Publish and drain it before arming the timers whose deadlines we pin.
+    for session in [&alpha, &unrelated] {
+        handler
+            .wait_for_pane_startup_output_for_test(&PaneTarget::new(session.clone(), 0))
+            .await;
+        let (pane_id, generation) = {
+            let state = handler.state.lock().await;
+            let pane_id = state
+                .sessions
+                .session(session)
+                .expect("fixture session exists")
+                .window()
+                .active_pane()
+                .expect("fixture pane exists")
+                .id();
+            (
+                pane_id,
+                Some(state.pane_output_generation(session, pane_id)),
+            )
+        };
+        handler
+            .flush_pending_pane_alert_for_exit(pane_id, generation)
+            .await;
+    }
 
     let response = handler
         .handle(Request::SetOption(SetOptionRequest {

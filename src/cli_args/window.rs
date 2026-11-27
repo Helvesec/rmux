@@ -80,6 +80,20 @@ pub(crate) struct WindowTargetArgs {
 }
 
 #[derive(Debug, Clone, Args)]
+pub(crate) struct ExportWindowSnapshotArgs {
+    #[arg(short = 't', value_parser = parse_target_spec, allow_hyphen_values = true)]
+    pub(crate) target: Option<TargetSpec>,
+}
+
+#[derive(Debug, Clone, Args)]
+pub(crate) struct RestoreWindowSnapshotArgs {
+    #[arg(short = 't', value_parser = parse_target_spec, allow_hyphen_values = true)]
+    pub(crate) target: Option<TargetSpec>,
+    #[arg(value_name = "snapshot-file", allow_hyphen_values = true)]
+    pub(crate) snapshot_path: PathBuf,
+}
+
+#[derive(Debug, Clone, Args)]
 #[command(group(
     ArgGroup::new("navigation")
         .required(false)
@@ -293,9 +307,9 @@ pub(crate) struct ResizeWindowArgs {
     pub(crate) left: bool,
     #[arg(short = 'R', action = ArgAction::SetTrue)]
     pub(crate) right: bool,
-    #[arg(short = 'x')]
+    #[arg(short = 'x', value_parser = parse_window_width, allow_hyphen_values = true)]
     pub(crate) width: Option<u16>,
-    #[arg(short = 'y')]
+    #[arg(short = 'y', value_parser = parse_window_height, allow_hyphen_values = true)]
     pub(crate) height: Option<u16>,
     #[arg(short = 't', value_parser = parse_target_spec, allow_hyphen_values = true)]
     pub(crate) target: Option<TargetSpec>,
@@ -343,4 +357,12 @@ impl QueuedCommand for FindWindowArgs {
     fn set_queue_command(&mut self, queue_command: String) {
         self.queue_command = queue_command;
     }
+}
+
+fn parse_window_width(value: &str) -> Result<u16, String> {
+    rmux_core::parse_window_dimension(value, "width").map_err(|error| error.to_string())
+}
+
+fn parse_window_height(value: &str) -> Result<u16, String> {
+    rmux_core::parse_window_dimension(value, "height").map_err(|error| error.to_string())
 }

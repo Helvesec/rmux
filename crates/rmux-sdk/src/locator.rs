@@ -35,9 +35,73 @@ pub enum LocatorState {
 pub enum LocatorText {
     /// Literal text searched line-by-line in the rendered snapshot.
     Literal(String),
-    /// Regular expression searched line-by-line in the rendered snapshot.
+    /// Regular expression pattern text searched line-by-line in the rendered
+    /// snapshot.
+    ///
+    /// The SDK compiles the pattern with the default `regex` options and
+    /// bounded automaton sizes. Choose other options with inline flags such
+    /// as `(?i)`, or pass a compiled `regex::Regex` instead.
     #[cfg(feature = "regex")]
     Regex(String),
+    /// Caller-compiled regular expression searched line-by-line in the
+    /// rendered snapshot with every option it was built with.
+    ///
+    /// Produced by `From<regex::Regex>`.
+    #[cfg(feature = "regex")]
+    CompiledRegex(LocatorRegex),
+}
+
+/// Caller-compiled [`regex::Regex`] held by [`LocatorText::CompiledRegex`].
+///
+/// The locator searches with this exact automaton, so options chosen through
+/// `regex::RegexBuilder` (`case_insensitive`, `multi_line`, `unicode`, size
+/// limits, ...) are preserved. Two values are equal only when they share the
+/// same compiled regex, because `regex::Regex` does not expose its options and
+/// equal pattern text does not imply equal matching behaviour.
+#[cfg(feature = "regex")]
+#[derive(Clone)]
+pub struct LocatorRegex(std::sync::Arc<regex::Regex>);
+
+#[cfg(feature = "regex")]
+impl LocatorRegex {
+    /// Returns the caller's compiled regex.
+    pub fn as_regex(&self) -> &regex::Regex {
+        &self.0
+    }
+}
+
+#[cfg(feature = "regex")]
+impl From<regex::Regex> for LocatorRegex {
+    fn from(value: regex::Regex) -> Self {
+        Self(std::sync::Arc::new(value))
+    }
+}
+
+#[cfg(feature = "regex")]
+impl std::fmt::Debug for LocatorRegex {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_tuple("LocatorRegex")
+            .field(&self.0.as_str())
+            .finish()
+    }
+}
+
+#[cfg(feature = "regex")]
+impl PartialEq for LocatorRegex {
+    fn eq(&self, other: &Self) -> bool {
+        std::sync::Arc::ptr_eq(&self.0, &other.0)
+    }
+}
+
+#[cfg(feature = "regex")]
+impl Eq for LocatorRegex {}
+
+#[cfg(feature = "regex")]
+impl std::hash::Hash for LocatorRegex {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        self.0.as_str().hash(state);
+    }
 }
 
 impl From<&str> for LocatorText {
@@ -55,7 +119,7 @@ impl From<String> for LocatorText {
 #[cfg(feature = "regex")]
 impl From<regex::Regex> for LocatorText {
     fn from(value: regex::Regex) -> Self {
-        Self::Regex(value.as_str().to_owned())
+        Self::CompiledRegex(LocatorRegex::from(value))
     }
 }
 
@@ -208,7 +272,7 @@ impl Locator {
 
     pub(crate) async fn resolve(&self, snapshot: &PaneSnapshot) -> Result<Vec<LocatorMatch>> {
         if let Some(reason) = &self.invalid_reason {
-            return Err(RmuxError::protocol(rmux_proto::RmuxError::Server(
+            return Err(RmuxError::from_proto(rmux_proto::RmuxError::Server(
                 reason.clone(),
             )));
         }

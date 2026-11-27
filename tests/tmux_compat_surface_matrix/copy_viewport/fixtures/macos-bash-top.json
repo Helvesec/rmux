@@ -1,0 +1,29 @@
+{
+  "provenance": "S1104-A2 native tmux 3.7b, /bin/bash argv[-bash], 80x24, 2026-11-01T21:18Z; identical rmux rows, no rmux-derived expectation; row 23 host later replaced by the neutral DemoStation at the same width",
+  "rows": [
+    "                                                                   22:18 [13/13]",
+    "The default interactive shell is now zsh.",
+    "To update your account to use zsh, please run `chsh -s /bin/zsh`.",
+    "For more details, please visit https://support.apple.com/kb/HT208050.",
+    "tester@RMUXHOST:~$ for i in $(seq 1 30); do printf 'P0-LINE-%02d\\n' \"$i\"; done",
+    "P0-LINE-01",
+    "P0-LINE-02",
+    "P0-LINE-03",
+    "P0-LINE-04",
+    "P0-LINE-05",
+    "P0-LINE-06",
+    "P0-LINE-07",
+    "P0-LINE-08",
+    "P0-LINE-09",
+    "P0-LINE-10",
+    "P0-LINE-11",
+    "P0-LINE-12",
+    "P0-LINE-13",
+    "P0-LINE-14",
+    "P0-LINE-15",
+    "P0-LINE-16",
+    "P0-LINE-17",
+    "P0-LINE-18",
+    "[alpha] 0:bash*                                    \"DemoStation\" 22:18 01-Nov-26"
+  ]
+}

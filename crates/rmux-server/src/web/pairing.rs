@@ -3,10 +3,24 @@ use rmux_proto::{CreateWebShareRequest, RmuxError};
 use super::record::WebShareConnectRole;
 use super::secrets::{random_pairing_code, secret_eq};
 
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[cfg(test)]
+#[path = "pin_debug_logging_tests.rs"]
+mod logging;
+
+#[derive(Clone, Default, PartialEq, Eq)]
 pub(super) struct WebSharePairingCodes {
     operator: Option<String>,
     spectator: Option<String>,
+}
+
+impl std::fmt::Debug for WebSharePairingCodes {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("WebSharePairingCodes")
+            .field("operator", &self.operator.as_ref().map(|_| "[REDACTED]"))
+            .field("spectator", &self.spectator.as_ref().map(|_| "[REDACTED]"))
+            .finish()
+    }
 }
 
 impl WebSharePairingCodes {
@@ -116,7 +130,7 @@ mod tests {
 
     use super::WebSharePairingCodes;
 
-    fn request() -> CreateWebShareRequest {
+    pub(super) fn request() -> CreateWebShareRequest {
         CreateWebShareRequest {
             scope: WebShareScope::Session("demo".parse().expect("session name")),
             public_base_url: None,
@@ -135,6 +149,83 @@ mod tests {
             spectator: true,
             controls: true,
             kill_session_on_expire: false,
+        }
+    }
+
+    #[test]
+    fn debug_redacts_operator_and_spectator_pins() {
+        use crate::web::connection_limit::ConnectionLimit;
+        use crate::web::leases::LeaseBook;
+        use crate::web::record::{WebShareConnectRole, WebShareRecord, WebShareTarget};
+        use crate::web::secrets::SecretHash;
+
+        let mut request = request();
+        request.operator_pin = Some("193847".to_owned());
+        request.spectator_pin = Some("826591".to_owned());
+        let codes = WebSharePairingCodes::for_request(&request).expect("pairing codes");
+        let record = WebShareRecord {
+            allow_loopback_development_origins: false,
+            endpoint_origin: "https://share.example".to_owned(),
+            expires_at: None,
+            frontend_origin: "https://share.example".to_owned(),
+            frontend_url: "https://share.example".to_owned(),
+            kill_session_on_expire: false,
+            lease_book: LeaseBook::new(None, None),
+            max_operators: None,
+            max_spectators: None,
+            operator_token_hash: Some(SecretHash::from_secret("operator-token-canary")),
+            pairing_codes: codes.clone(),
+            revoke_tx: tokio::sync::watch::channel(None).0,
+            controls: true,
+            share_id: "debug-pin-canary".to_owned(),
+            target: WebShareTarget::session(
+                "demo".parse().expect("session name"),
+                rmux_proto::SessionId::new(1),
+            ),
+            terminal_palette: None,
+            url_options: Default::default(),
+            spectator_token_hash: Some(SecretHash::from_secret("spectator-token-canary")),
+            _tunnel: None,
+            operator: true,
+            spectator: true,
+        };
+        let limit = ConnectionLimit::new(2);
+        let operator = record
+            .connect(
+                Some("193847"),
+                WebShareConnectRole::Operator,
+                limit.try_acquire().unwrap(),
+            )
+            .expect("operator authenticates");
+        let spectator = record
+            .connect(
+                Some("826591"),
+                WebShareConnectRole::Spectator,
+                limit.try_acquire().unwrap(),
+            )
+            .expect("spectator authenticates");
+        assert_eq!(
+            operator.operator_visible_spectator_pairing_code(),
+            Some("826591")
+        );
+        assert_eq!(spectator.operator_visible_spectator_pairing_code(), None);
+        let diagnostics = [
+            format!("{codes:?}"),
+            format!("{codes:#?}"),
+            format!("{record:?}"),
+            format!("{record:#?}"),
+            format!("{operator:?}"),
+            format!("{operator:#?}"),
+            format!("{spectator:?}"),
+            format!("{spectator:#?}"),
+        ];
+        for diagnostic in diagnostics {
+            for pin in ["193847", "826591"] {
+                assert!(
+                    !diagnostic.contains(pin),
+                    "Debug must redact both role PINs"
+                );
+            }
         }
     }
 

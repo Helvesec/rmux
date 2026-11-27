@@ -1,7 +1,9 @@
 #[cfg(unix)]
-use std::fs;
+#[path = "support/executable_fixture.rs"]
+mod executable_fixture;
+
 #[cfg(unix)]
-use std::os::unix::fs::PermissionsExt;
+use std::fs;
 #[cfg(unix)]
 use std::path::{Path, PathBuf};
 #[cfg(unix)]
@@ -39,10 +41,7 @@ fn run(program: &Path, args: &[&str]) -> Output {
 
 #[cfg(unix)]
 fn write_executable(path: &Path, source: &str) {
-    fs::write(path, source).expect("write executable fixture");
-    let mut permissions = fs::metadata(path).expect("fixture metadata").permissions();
-    permissions.set_mode(0o755);
-    fs::set_permissions(path, permissions).expect("set fixture permissions");
+    executable_fixture::write_executable(path, source, 0o755).expect("write executable fixture");
 }
 
 #[test]
@@ -138,6 +137,21 @@ fn release_contract_validator_stays_bounded() {
     assert!(
         validator.lines().count() < 600,
         "release contract orchestrator became a God File"
+    );
+}
+
+#[test]
+#[cfg(unix)]
+fn release_policy_committed_root_covers_workflow_dependencies() {
+    let output = run(
+        Path::new("python3"),
+        &["tests/release_policy_reachability_spec.py"],
+    );
+    assert!(
+        output.status.success(),
+        "stdout={} stderr={}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
     );
 }
 

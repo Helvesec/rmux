@@ -9,6 +9,8 @@ import re
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
+from notice_assets import NOTICE_ROLES, package_files
+from candidate_route import CandidateRoute
 
 REPOSITORY_ID = 1239918790
 REPOSITORY = "Helvesec/rmux"
@@ -49,7 +51,7 @@ PLATFORM_ROLES = {
     "macos-aarch64": {"archive", "checksums"},
     "windows-x86_64": {"archive", "checksums", "chocolatey-package"},
 }
-PUBLIC_ASSET_ROLES = {"archive", "debian", "rpm", "snap-amd64", "snap-arm64"}
+PUBLIC_ASSET_ROLES = {"archive", "debian", "rpm", "snap-amd64", "snap-arm64"} | NOTICE_ROLES
 
 
 def read_object(path: Path, label: str) -> dict[str, Any]:
@@ -185,6 +187,8 @@ def validate_candidate_reference(
 
 
 def validate_candidate_manifest(manifest: dict[str, Any]) -> list[dict[str, Any]]:
+    if CandidateRoute.extra_fields_present(manifest):
+        raise ValueError("premerge rehearsal evidence cannot enter production promotion")
     required = {
         "schema_version",
         "repository_id",
@@ -271,7 +275,7 @@ def publishable_assets(
         if not isinstance(files, list) or not files:
             raise ValueError(f"candidate {platform} files are missing")
         expected_roles = PLATFORM_ROLES[platform]
-        actual_roles = [item.get("role") for item in files if isinstance(item, dict)]
+        actual_roles = [item["role"] for item in package_files(files)]
         if set(actual_roles) != expected_roles or len(actual_roles) != len(
             expected_roles
         ):

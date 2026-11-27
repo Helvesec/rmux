@@ -244,10 +244,10 @@ async fn armed_wait_preserves_cancelled_outcome() -> TestResult {
         .await
         .expect_err("daemon-cancelled wait must fail");
     match error {
-        RmuxError::Protocol {
-            source: rmux_proto::RmuxError::Server(message),
-            ..
-        } => assert!(message.contains("was cancelled")),
+        RmuxError::Protocol { source, .. } if source.server_message().is_some() => {
+            let message = source.server_message().unwrap();
+            assert!(message.contains("was cancelled"))
+        }
         other => panic!("expected typed cancelled protocol error, got {other:?}"),
     }
     drop(pane);
@@ -282,10 +282,10 @@ async fn armed_wait_preserves_mismatched_id_failure_and_cancels_expected_wait() 
         .await
         .expect_err("mismatched wait id must fail");
     match error {
-        RmuxError::Protocol {
-            source: rmux_proto::RmuxError::Server(message),
-            ..
-        } => assert!(message.contains("did not match request id")),
+        RmuxError::Protocol { source, .. } if source.server_message().is_some() => {
+            let message = source.server_message().unwrap();
+            assert!(message.contains("did not match request id"))
+        }
         other => panic!("expected protocol mismatch, got {other:?}"),
     }
     drop(pane);
@@ -321,10 +321,10 @@ async fn armed_wait_surfaces_stale_pane_failure() -> TestResult {
         .await
         .expect_err("stale pane wait must fail");
     match error {
-        RmuxError::Protocol {
-            source: rmux_proto::RmuxError::InvalidTarget { reason, .. },
-            ..
-        } => assert!(reason.contains("pane index does not exist")),
+        RmuxError::Protocol { source, .. } if source.invalid_target().is_some() => {
+            let (_, reason) = source.invalid_target().unwrap();
+            assert!(reason.contains("pane index does not exist"));
+        }
         other => panic!("expected stale-pane protocol error, got {other:?}"),
     }
     drop(pane);
@@ -349,10 +349,10 @@ async fn wait_for_next_rejects_empty_needles_locally() -> TestResult {
         .await
         .expect_err("empty armed byte waits must be rejected locally");
     match error {
-        RmuxError::Protocol {
-            source: rmux_proto::RmuxError::Server(message),
-            ..
-        } => assert!(message.contains("must not be empty")),
+        RmuxError::Protocol { source, .. } if source.server_message().is_some() => {
+            let message = source.server_message().unwrap();
+            assert!(message.contains("must not be empty"))
+        }
         other => panic!("expected local protocol error, got {other:?}"),
     }
     let error = pane
@@ -360,10 +360,10 @@ async fn wait_for_next_rejects_empty_needles_locally() -> TestResult {
         .await
         .expect_err("empty armed text waits must be rejected locally");
     match error {
-        RmuxError::Protocol {
-            source: rmux_proto::RmuxError::Server(message),
-            ..
-        } => assert!(message.contains("must not be empty")),
+        RmuxError::Protocol { source, .. } if source.server_message().is_some() => {
+            let message = source.server_message().unwrap();
+            assert!(message.contains("must not be empty"))
+        }
         other => panic!("expected local protocol error, got {other:?}"),
     }
     drop(pane);
@@ -378,11 +378,12 @@ async fn live_wait_for_next_ignores_history_and_matches_split_future_output() ->
     let rmux = harness.rmux();
     let session = EnsureSession::named(unique_session_name("armedlive"))
         .create_only()
-        .environment(["SHELL=/bin/sh"])
+        .environment(live_pane_environment(&harness.pane_home()?))
         .ensure(&rmux)
         .await?;
     let pane = session.pane(0, 0);
     let id = UNIQUE_ID.fetch_add(1, Ordering::Relaxed);
+    wait_for_live_shell(&pane).await?;
 
     let history_marker = format!("rmux_armed_history_{id}");
     pane.send_text(printf_line_command(&history_marker)).await?;
@@ -659,7 +660,7 @@ impl Drop for TestSocket {
 }
 
 struct Harness {
-    _root: TestRoot,
+    root: TestRoot,
     socket_path: PathBuf,
     child: Option<Child>,
 }
@@ -678,10 +679,17 @@ impl Harness {
         wait_for_daemon_ready(&socket_path, &mut child).await?;
 
         Ok(Self {
-            _root: root,
+            root,
             socket_path,
             child: Some(child),
         })
+    }
+
+    /// Empty `HOME` for live panes, so no account startup file is reachable.
+    fn pane_home(&self) -> TestResult<PathBuf> {
+        let home = self.root.path().join("home");
+        std::fs::create_dir_all(&home)?;
+        Ok(home)
     }
 
     fn rmux(&self) -> rmux_sdk::Rmux {
@@ -891,6 +899,45 @@ fn compact_label(label: &str) -> String {
     } else {
         compact
     }
+}
+
+/// Environment of the live pane, so the waits above bound rmux and not the
+/// account running the tests.
+///
+/// The first pane starts from this test process's environment, read by pid,
+/// and `-e` assignments override it; its shell is `default-shell`, else that
+/// `SHELL`, else the password database. The pane is a login shell, so `/bin/sh`
+/// still reads `$HOME/.profile`, and an interactive `sh` sources `$ENV`: both
+/// lead nowhere here.
+fn live_pane_environment(home: &Path) -> [String; 3] {
+    [
+        "SHELL=/bin/sh".to_owned(),
+        format!("HOME={}", home.display()),
+        "ENV=".to_owned(),
+    ]
+}
+
+/// Bound for a live pane's shell to come up and run its first line.
+///
+/// Pinning `HOME` and `ENV` leaves the system startup: `exec` of `/bin/sh`,
+/// `/etc/profile` (`path_helper` on macOS) and the disk they read. A stall
+/// there is not rmux's, so it gets this bound, not the two-second one of
+/// [`Harness::rmux`].
+const LIVE_SHELL_STARTUP_TIMEOUT: Duration = Duration::from_secs(60);
+
+/// Returns once the pane's shell has read and run a line.
+///
+/// Text typed afterwards is read at once, so the two-second waits that follow
+/// time rmux's input, rendering and waits, not the shell's startup.
+async fn wait_for_live_shell(pane: &Pane) -> TestResult {
+    // The echo carries `%s`, so only the shell's own output reads `Ready.`.
+    pane.send_text("printf 'Ready%s\\n' .").await?;
+    pane.send_key("Enter").await?;
+    pane.expect_visible_text()
+        .to_contain("Ready.")
+        .timeout(LIVE_SHELL_STARTUP_TIMEOUT)
+        .await?;
+    Ok(())
 }
 
 fn printf_line_command(text: &str) -> String {

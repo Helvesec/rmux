@@ -124,7 +124,7 @@ async fn windows_daemon_creates_detached_session() -> io::Result<()> {
     .await
     .map_err(io::Error::other)??;
 
-    assert!(matches!(response, Response::NewSession(_)));
+    crate::session_fixture::assert_new_session(&response);
     handle.shutdown().await
 }
 

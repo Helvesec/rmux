@@ -11,7 +11,7 @@ use crate::vis::encode_buffer_sample;
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct BufferEntry {
     /// The buffer content.
-    content: Vec<u8>,
+    content: std::sync::Arc<[u8]>,
     /// Monotonic insertion/replacement order for stack-head tracking.
     order: u64,
     /// Creation timestamp matching tmux's `buffer_created`.
@@ -78,7 +78,7 @@ impl BufferStore {
     /// Returns the content of the named buffer, or `None` if it does not exist.
     #[must_use]
     pub fn get(&self, name: &str) -> Option<&[u8]> {
-        self.buffers.get(name).map(|entry| entry.content.as_slice())
+        self.buffers.get(name).map(|entry| entry.content.as_ref())
     }
 
     /// Sets a named buffer, replacing it if it already exists.
@@ -116,7 +116,7 @@ impl BufferStore {
                 self.buffers.insert(
                     name.to_owned(),
                     BufferEntry {
-                        content,
+                        content: content.into(),
                         order,
                         created,
                         unnamed: false,
@@ -129,7 +129,7 @@ impl BufferStore {
                 self.buffers.insert(
                     buffer_name.clone(),
                     BufferEntry {
-                        content,
+                        content: content.into(),
                         order,
                         created,
                         unnamed: true,
@@ -246,6 +246,23 @@ impl BufferStore {
         } else {
             false
         }
+    }
+
+    /// Replaces only the selected entry, preserving its order and creation time.
+    /// Empty content or a replaced entry leaves the store unchanged.
+    pub fn replace_if_order_matches(&mut self, name: &str, order: u64, content: Vec<u8>) -> bool {
+        let Some(entry) = self
+            .buffers
+            .get_mut(name)
+            .filter(|entry| entry.order == order)
+        else {
+            return false;
+        };
+        if content.is_empty() {
+            return false;
+        }
+        entry.content = content.into();
+        true
     }
 
     /// Returns the content of a buffer by name, or the most recent automatic

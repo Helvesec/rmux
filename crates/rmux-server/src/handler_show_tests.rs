@@ -23,7 +23,7 @@ async fn create_session(handler: &RequestHandler, name: &str) {
         }))
         .await;
 
-    assert!(matches!(response, Response::NewSession(_)));
+    crate::session_fixture::assert_new_session(&response);
 }
 
 #[tokio::test]
@@ -953,3 +953,9 @@ async fn set_option_at_window_scope_rejects_nonexistent_window() {
         })
     );
 }
+
+#[path = "handler_show_tests/hook_array_inheritance.rs"]
+mod hook_array_inheritance;
+
+#[path = "handler_show_tests/hook_display.rs"]
+mod hook_display;

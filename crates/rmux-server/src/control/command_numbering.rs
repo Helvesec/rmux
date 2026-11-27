@@ -12,13 +12,8 @@ pub(super) enum ControlCommandOrigin {
 }
 
 impl ControlCommandOrigin {
-    pub(super) const fn completes_initial_batch(self) -> bool {
-        matches!(
-            self,
-            Self::Initial {
-                completes_batch: true
-            }
-        )
+    pub(super) const fn is_initial(self) -> bool {
+        matches!(self, Self::Initial { .. })
     }
 }
 
@@ -72,6 +67,12 @@ impl ControlCommandNumbering {
         }
     }
 
+    /// Ends the initial batch before its last command and returns how many
+    /// initial commands will now never start.
+    pub(super) fn cancel_remaining_initial_commands(&mut self) -> usize {
+        std::mem::take(&mut self.initial_frames_remaining)
+    }
+
     pub(super) fn next_synchronous_child_number(&mut self) -> u64 {
         let number = self.next_number;
         self.next_number = self.next_number.saturating_add(1);
@@ -100,10 +101,30 @@ mod tests {
         let last = numbering.next_frame();
         assert_eq!(last.number, 2);
         assert_eq!(last.guard_flag, 0);
-        assert!(last.origin.completes_initial_batch());
+        assert_eq!(
+            last.origin,
+            ControlCommandOrigin::Initial {
+                completes_batch: true
+            }
+        );
 
         let stdin = numbering.next_frame();
         assert_eq!(stdin.number, 3);
+        assert_eq!(stdin.guard_flag, 1);
+        assert_eq!(stdin.origin, ControlCommandOrigin::Stdin);
+    }
+
+    #[test]
+    fn cancelled_initial_batch_numbers_the_next_frame_as_stdin() {
+        let mut numbering = ControlCommandNumbering::with_initial_commands(3);
+
+        let first = numbering.next_frame();
+        assert!(first.origin.is_initial());
+        assert_eq!(numbering.cancel_remaining_initial_commands(), 2);
+        assert_eq!(numbering.cancel_remaining_initial_commands(), 0);
+
+        let stdin = numbering.next_frame();
+        assert_eq!(stdin.number, 2);
         assert_eq!(stdin.guard_flag, 1);
         assert_eq!(stdin.origin, ControlCommandOrigin::Stdin);
     }

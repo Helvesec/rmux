@@ -14,9 +14,9 @@ use std::sync::OnceLock;
 use std::time::Duration;
 
 use rmux_sdk::{
-    bootstrap::discovery::SDK_DAEMON_BINARY_ENV, EnsureSession, EnsureSessionPolicy, PaneExitState,
-    PaneOutputChunk, PaneOutputStart, PaneOutputStream, PaneProcessState, ProcessSpec, Rmux,
-    RmuxBuilder, RmuxError, SessionName, SplitDirection,
+    EnsureSession, EnsureSessionPolicy, PaneExitState, PaneOutputChunk, PaneOutputStart,
+    PaneOutputStream, PaneProcessState, ProcessSpec, Rmux, RmuxBuilder, RmuxError, SessionName,
+    SplitDirection,
 };
 use tokio::time::{sleep, timeout, Instant};
 
@@ -804,7 +804,7 @@ impl Harness {
         fs::set_permissions(&root, fs::Permissions::from_mode(0o700))?;
         let socket_path = root.join("daemon.sock");
         let daemon_binary = rmux_binary()?.to_path_buf();
-        let _daemon_binary_env = EnvGuard::set(SDK_DAEMON_BINARY_ENV, daemon_binary.as_os_str());
+        let _daemon_binary_env = EnvGuard::set("RMUX_SDK_DAEMON_BINARY", daemon_binary.as_os_str());
         let rmux = RmuxBuilder::new()
             .unix_socket(&socket_path)
             .default_timeout(DEFAULT_TIMEOUT)

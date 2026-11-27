@@ -1,0 +1,62 @@
+name: MSRV
+
+# Runs the exact-floor check promised by CONTRIBUTING.md ("Rust compiler
+# support and toolchain bumps"). xtask msrv rejects a toolchain whose
+# rustc/cargo/rustdoc differ from the declared workspace rust-version.
+on:
+  push:
+    branches:
+      - main
+      - release/0.11.0
+  pull_request:
+    branches:
+      - main
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  msrv-linux:
+    name: MSRV 1.88.0 (Linux)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 240
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
+        with:
+          persist-credentials: false
+
+      - name: Install the 1.88.0 toolchain
+        run: |
+          rustup toolchain install 1.88.0 --profile minimal --target wasm32-unknown-unknown
+          toolchain="$(rustup run 1.88.0 rustc --print sysroot)"
+          mkdir "$RUNNER_TEMP/msrv-cargo-home"
+          {
+            echo "RMUX_MSRV_TOOLCHAIN=$toolchain"
+            echo "CARGO_HOME=$RUNNER_TEMP/msrv-cargo-home"
+            echo "CARGO_TARGET_DIR=$RUNNER_TEMP/msrv-target"
+            echo "RUSTC=$toolchain/bin/rustc"
+            echo "RUSTDOC=$toolchain/bin/rustdoc"
+          } >> "$GITHUB_ENV"
+
+      - name: Fetch locked dependencies
+        run: '"$RMUX_MSRV_TOOLCHAIN/bin/cargo" fetch --locked'
+
+      - name: xtask msrv
+        env:
+          RUST_MIN_STACK: "8388608"
+          RUST_TEST_THREADS: "2"
+        run: |
+          "$RMUX_MSRV_TOOLCHAIN/bin/cargo" run --locked --offline --jobs 2 -p xtask -- msrv \
+            --toolchain-dir "$RMUX_MSRV_TOOLCHAIN" \
+            --output-dir "$RUNNER_TEMP/msrv-receipts" \
+            --target-dir "$CARGO_TARGET_DIR"
+
+      - name: Upload MSRV receipts
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: msrv-receipts
+          path: ${{ runner.temp }}/msrv-receipts
+          if-no-files-found: warn
+          retention-days: 14

@@ -9,9 +9,9 @@ async fn move_window_with_d_keeps_the_next_window_active_when_moving_the_current
 
     {
         let mut state = handler.state.lock().await;
-        let session = state
+        let mut session = state
             .sessions
-            .session_mut(&alpha)
+            .session_setup(&alpha)
             .expect("alpha should exist");
         session.select_window(2).expect("window 2 select succeeds");
         session.select_window(0).expect("window 0 select succeeds");
@@ -40,7 +40,10 @@ async fn move_window_with_d_keeps_the_next_window_active_when_moving_the_current
     let state = handler.state.lock().await;
     let session = state.sessions.session(&alpha).expect("alpha should exist");
     assert_eq!(
-        session.windows().keys().copied().collect::<Vec<_>>(),
+        session
+            .windows()
+            .map(|(index, _)| index)
+            .collect::<Vec<_>>(),
         vec![2, 4]
     );
     assert_eq!(session.active_window_index(), 2);
@@ -81,9 +84,9 @@ async fn swap_window_without_d_preserves_active_slot() {
 
     {
         let mut state = handler.state.lock().await;
-        let session = state
+        let mut session = state
             .sessions
-            .session_mut(&alpha)
+            .session_setup(&alpha)
             .expect("alpha should exist");
         session.select_window(5).expect("window 5 select succeeds");
         session.select_window(2).expect("window 2 select succeeds");
@@ -195,7 +198,10 @@ async fn move_window_reindex_with_source_ignores_source_and_preserves_active_win
     let state = handler.state.lock().await;
     let session = state.sessions.session(&alpha).expect("alpha should exist");
     assert_eq!(
-        session.windows().keys().copied().collect::<Vec<_>>(),
+        session
+            .windows()
+            .map(|(index, _)| index)
+            .collect::<Vec<_>>(),
         vec![0, 1]
     );
     assert_eq!(session.active_window_index(), 0);
@@ -245,7 +251,10 @@ async fn move_window_across_sessions_removes_source_session_when_moving_its_last
     );
     let beta_session = state.sessions.session(&beta).expect("beta should exist");
     assert_eq!(
-        beta_session.windows().keys().copied().collect::<Vec<_>>(),
+        beta_session
+            .windows()
+            .map(|(index, _)| index)
+            .collect::<Vec<_>>(),
         vec![0, 5]
     );
     assert_eq!(beta_session.pane_id_in_window(5, 0), Some(moved_pane_id));

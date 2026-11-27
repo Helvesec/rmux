@@ -111,6 +111,45 @@ fn substitution_keeps_dollar_references_literal() {
     );
 }
 
+#[test]
+fn status_substitution_preserves_captured_hashes_and_configured_styles() {
+    struct ReportedText;
+    impl FormatVariables for ReportedText {
+        fn format_value(&self, _: FormatVariable) -> Option<String> {
+            None
+        }
+
+        fn format_status_field(&self, _: &str) -> (String, bool) {
+            ("foo#bar".to_owned(), true)
+        }
+    }
+
+    for (modifiers, expected) in [
+        (r"s/(##)(bar)/X\2/", "#[fg=green]fooXbar"),
+        (r"s/(##)(bar)/\1\1\2/", "#[fg=green]foo\0\0bar"),
+    ] {
+        let template = format!("#{{{modifiers}:#[fg=green]#{{pane_program_status_message}}}}");
+        assert_eq!(
+            super::super::render_status_template(&template, &ReportedText),
+            expected,
+            "{template}"
+        );
+    }
+
+    // Zero-width matches use captures relative to their remaining suffix.
+    let template = r"#{s/x*(##)?/\1/:#{pane_program_status_message}}";
+    let plain = FormatContext::new().with_named_value("pane_program_status_message", "foo#bar");
+    let marked = super::super::render_status_template(template, &ReportedText);
+    assert_eq!(marked.replace('\0', "#"), render_template(template, &plain));
+    assert!(marked.contains('\0'));
+
+    let raw = FormatContext::new().with_named_value("@raw", "foo\0bar");
+    assert_eq!(
+        super::super::render_status_template("#{s/##/X/:@raw}", &raw),
+        "foo\x01bar"
+    );
+}
+
 // -----------------------------------------------------------------------
 // Hardening tests — named_values precedence
 // -----------------------------------------------------------------------
@@ -166,4 +205,14 @@ fn nested_parentheses_in_job_expansion() {
         render_template("x#(echo (foo))y", &StaticWindowValues),
         "xy"
     );
+}
+
+#[test]
+fn colour_modifier_renders_non_ascii_operands_as_empty_like_tmux() {
+    // tmux 3.7b printed "" for each non-ASCII operand and "800000" for red.
+    let context = FormatContext::new();
+    for format in ["#{c:abcde\u{e9}}", "#{c:\u{e9}}", "#{c:colour\u{e9}}"] {
+        assert_eq!(render_template(format, &context), "", "{format:?}");
+    }
+    assert_eq!(render_template("#{c:red}", &context), "800000");
 }

@@ -1,0 +1,6 @@
+#!/usr/bin/env sh
+# Builders explicitly select the notice-carrying format; historical projections
+# remain available through layout without this selector.
+set -eu
+tool_dir="$(cd "$(dirname "$0")" && pwd)"
+exec "$tool_dir/layout" --with-notices "$@"

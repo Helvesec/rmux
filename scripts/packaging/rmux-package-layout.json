@@ -1,0 +1,1148 @@
+{
+  "schema": 1,
+  "layout": "rmux-package-layout-v1",
+  "description": "The one layout every RMUX package format projects. Builders stage from it, installers install from it, validators check against it, and every consumer refuses an omission, an extra entry, a wrong mode or an unknown variant.",
+  "variants": {
+    "unix-archive": {
+      "format": "tar.gz",
+      "package_layout": "rmux-package-v3",
+      "legacy_package_layouts": [
+        "rmux-package-v2"
+      ],
+      "artifact_kind": "unix-package-binary",
+      "executable_suffix": "",
+      "modes": true,
+      "allow_unknown_paths": false,
+      "ignored_prefixes": [],
+      "source_spaces": {
+        "binary": "binaries",
+        "completion": "completions",
+        "generated": "generated",
+        "repo": "repo"
+      },
+      "flattened_source_spaces": []
+    },
+    "windows-archive": {
+      "format": "zip",
+      "package_layout": "rmux-windows-package-v3",
+      "legacy_package_layouts": [
+        "rmux-windows-package-v2"
+      ],
+      "artifact_kind": "windows-package-binary",
+      "executable_suffix": ".exe",
+      "modes": false,
+      "allow_unknown_paths": false,
+      "ignored_prefixes": [],
+      "source_spaces": {
+        "binary": "binaries",
+        "completion": "completions",
+        "conpty": "conpty",
+        "generated": "generated",
+        "repo": "repo"
+      },
+      "flattened_source_spaces": []
+    },
+    "debian": {
+      "format": "deb",
+      "package_layout": "rmux-debian-package-v2",
+      "artifact_kind": "debian-package-binary",
+      "executable_suffix": "",
+      "modes": true,
+      "allow_unknown_paths": false,
+      "ignored_prefixes": [
+        "DEBIAN/"
+      ],
+      "source_spaces": {
+        "binary": "binaries",
+        "completion": "completions",
+        "generated": "generated",
+        "repo": "repo"
+      },
+      "flattened_source_spaces": []
+    },
+    "rpm": {
+      "format": "rpm",
+      "package_layout": "rmux-rpm-package-v2",
+      "artifact_kind": "rpm-package-binary",
+      "executable_suffix": "",
+      "modes": true,
+      "allow_unknown_paths": false,
+      "ignored_prefixes": [],
+      "content_attributes": {
+        "documentation": "%doc",
+        "license": "%license"
+      },
+      "source_spaces": {
+        "binary": "sources",
+        "completion": "sources",
+        "generated": "sources",
+        "repo": "sources"
+      },
+      "flattened_source_spaces": [
+        "sources"
+      ]
+    }
+  },
+  "entries": [
+    {
+      "id": "cli",
+      "source": {
+        "kind": "binary",
+        "name": "rmux"
+      },
+      "role": "executable",
+      "variants": {
+        "unix-archive": {
+          "path": "bin/rmux",
+          "mode": "0755",
+          "install": "bin/rmux",
+          "install_order": 3
+        },
+        "windows-archive": {
+          "path": "rmux.exe",
+          "install": "bin/rmux.exe",
+          "install_order": 3
+        },
+        "debian": {
+          "path": "usr/bin/rmux",
+          "mode": "0755"
+        },
+        "rpm": {
+          "path": "usr/bin/rmux",
+          "mode": "0755"
+        }
+      }
+    },
+    {
+      "id": "helper",
+      "source": {
+        "kind": "binary",
+        "name": "rmux-full"
+      },
+      "role": "executable",
+      "variants": {
+        "unix-archive": {
+          "path": "libexec/rmux/rmux",
+          "mode": "0755",
+          "install": "libexec/rmux/rmux",
+          "install_order": 1
+        },
+        "windows-archive": {
+          "path": "libexec/rmux/rmux.exe",
+          "install": "libexec/rmux/rmux.exe",
+          "install_order": 1
+        },
+        "debian": {
+          "path": "usr/libexec/rmux/rmux",
+          "mode": "0755"
+        },
+        "rpm": {
+          "path": "usr/libexec/rmux/rmux",
+          "mode": "0755"
+        }
+      }
+    },
+    {
+      "id": "daemon",
+      "source": {
+        "kind": "binary",
+        "name": "rmux-daemon"
+      },
+      "role": "executable",
+      "variants": {
+        "unix-archive": {
+          "path": "bin/rmux-daemon",
+          "mode": "0755",
+          "install": "bin/rmux-daemon",
+          "install_order": 2
+        },
+        "windows-archive": {
+          "path": "rmux-daemon.exe",
+          "install": "bin/rmux-daemon.exe",
+          "install_order": 2
+        },
+        "debian": {
+          "path": "usr/bin/rmux-daemon",
+          "mode": "0755"
+        },
+        "rpm": {
+          "path": "usr/bin/rmux-daemon",
+          "mode": "0755"
+        }
+      }
+    },
+    {
+      "id": "installer-unix",
+      "source": {
+        "kind": "repo",
+        "path": "scripts/install-unix-archive.sh"
+      },
+      "role": "executable",
+      "variants": {
+        "unix-archive": {
+          "path": "install.sh",
+          "mode": "0755"
+        }
+      }
+    },
+    {
+      "id": "installer-windows",
+      "source": {
+        "kind": "repo",
+        "path": "scripts/install-windows.ps1"
+      },
+      "role": "file",
+      "variants": {
+        "windows-archive": {
+          "path": "install.ps1",
+          "install": "install.ps1",
+          "install_optional": true,
+          "install_order": 50
+        }
+      }
+    },
+    {
+      "id": "man-page",
+      "source": {
+        "kind": "repo",
+        "path": "docs/man/rmux.1"
+      },
+      "role": "file",
+      "variants": {
+        "unix-archive": {
+          "path": "share/man/man1/rmux.1",
+          "mode": "0644",
+          "install": "share/man/man1/rmux.1",
+          "install_order": 50
+        },
+        "windows-archive": {
+          "path": "rmux.1",
+          "install": "rmux.1",
+          "install_optional": true,
+          "install_order": 50
+        },
+        "debian": {
+          "path": "usr/share/man/man1/rmux.1.gz",
+          "mode": "0644",
+          "transform": "gzip"
+        },
+        "rpm": {
+          "path": "usr/share/man/man1/rmux.1",
+          "mode": "0644",
+          "alternatives": [
+            "usr/share/man/man1/rmux.1.gz"
+          ]
+        }
+      }
+    },
+    {
+      "id": "completion-bash",
+      "source": {
+        "kind": "completion",
+        "shell": "bash",
+        "name": "rmux.bash"
+      },
+      "role": "file",
+      "variants": {
+        "unix-archive": {
+          "path": "share/bash-completion/completions/rmux",
+          "mode": "0644",
+          "install": "share/bash-completion/completions/rmux",
+          "install_order": 50
+        },
+        "windows-archive": {
+          "path": "share/bash-completion/completions/rmux",
+          "install": "share/bash-completion/completions/rmux",
+          "install_order": 50
+        },
+        "debian": {
+          "path": "usr/share/bash-completion/completions/rmux",
+          "mode": "0644"
+        },
+        "rpm": {
+          "path": "usr/share/bash-completion/completions/rmux",
+          "mode": "0644"
+        }
+      }
+    },
+    {
+      "id": "completion-zsh",
+      "source": {
+        "kind": "completion",
+        "shell": "zsh",
+        "name": "_rmux"
+      },
+      "role": "file",
+      "variants": {
+        "unix-archive": {
+          "path": "share/zsh/site-functions/_rmux",
+          "mode": "0644",
+          "install": "share/zsh/site-functions/_rmux",
+          "install_order": 50
+        },
+        "windows-archive": {
+          "path": "share/zsh/site-functions/_rmux",
+          "install": "share/zsh/site-functions/_rmux",
+          "install_order": 50
+        },
+        "debian": {
+          "path": "usr/share/zsh/site-functions/_rmux",
+          "mode": "0644"
+        },
+        "rpm": {
+          "path": "usr/share/zsh/site-functions/_rmux",
+          "mode": "0644"
+        }
+      }
+    },
+    {
+      "id": "completion-fish",
+      "source": {
+        "kind": "completion",
+        "shell": "fish",
+        "name": "rmux.fish"
+      },
+      "role": "file",
+      "variants": {
+        "unix-archive": {
+          "path": "share/fish/vendor_completions.d/rmux.fish",
+          "mode": "0644",
+          "install": "share/fish/vendor_completions.d/rmux.fish",
+          "install_order": 50
+        },
+        "windows-archive": {
+          "path": "share/fish/vendor_completions.d/rmux.fish",
+          "install": "share/fish/vendor_completions.d/rmux.fish",
+          "install_order": 50
+        },
+        "debian": {
+          "path": "usr/share/fish/vendor_completions.d/rmux.fish",
+          "mode": "0644"
+        },
+        "rpm": {
+          "path": "usr/share/fish/vendor_completions.d/rmux.fish",
+          "mode": "0644"
+        }
+      }
+    },
+    {
+      "id": "completion-powershell",
+      "source": {
+        "kind": "completion",
+        "shell": "powershell",
+        "name": "_rmux.ps1"
+      },
+      "role": "file",
+      "variants": {
+        "unix-archive": {
+          "path": "share/powershell/Completions/_rmux.ps1",
+          "mode": "0644",
+          "install": "share/powershell/Completions/_rmux.ps1",
+          "install_order": 50
+        },
+        "windows-archive": {
+          "path": "share/powershell/Completions/_rmux.ps1",
+          "install": "share/powershell/Completions/_rmux.ps1",
+          "install_order": 50
+        },
+        "debian": {
+          "path": "usr/share/powershell/Completions/_rmux.ps1",
+          "mode": "0644"
+        },
+        "rpm": {
+          "path": "usr/share/powershell/Completions/_rmux.ps1",
+          "mode": "0644"
+        }
+      }
+    },
+    {
+      "id": "completion-elvish",
+      "source": {
+        "kind": "completion",
+        "shell": "elvish",
+        "name": "rmux.elv"
+      },
+      "role": "file",
+      "variants": {
+        "unix-archive": {
+          "path": "share/elvish/lib/rmux.elv",
+          "mode": "0644",
+          "install": "share/elvish/lib/rmux.elv",
+          "install_order": 50
+        },
+        "windows-archive": {
+          "path": "share/elvish/lib/rmux.elv",
+          "install": "share/elvish/lib/rmux.elv",
+          "install_order": 50
+        },
+        "debian": {
+          "path": "usr/share/elvish/lib/rmux.elv",
+          "mode": "0644"
+        },
+        "rpm": {
+          "path": "usr/share/elvish/lib/rmux.elv",
+          "mode": "0644"
+        }
+      }
+    },
+    {
+      "id": "artifact-metadata",
+      "source": {
+        "kind": "generated",
+        "name": "artifact-metadata.json"
+      },
+      "role": "file",
+      "variants": {
+        "unix-archive": {
+          "path": "share/rmux/artifact-metadata.json",
+          "mode": "0644",
+          "install": "share/rmux/artifact-metadata.json",
+          "install_order": 50
+        },
+        "windows-archive": {
+          "path": "share/rmux/artifact-metadata.json",
+          "install": "share/rmux/artifact-metadata.json",
+          "install_order": 50
+        },
+        "debian": {
+          "path": "usr/share/rmux/artifact-metadata.json",
+          "mode": "0644"
+        },
+        "rpm": {
+          "path": "usr/share/rmux/artifact-metadata.json",
+          "mode": "0644"
+        }
+      }
+    },
+    {
+      "id": "package-manifest",
+      "source": {
+        "kind": "generated",
+        "name": "package-layout.tsv"
+      },
+      "role": "file",
+      "variants": {
+        "unix-archive": {
+          "path": "share/rmux/package-layout.tsv",
+          "mode": "0644",
+          "install": "share/rmux/package-layout.tsv",
+          "install_order": 50
+        },
+        "windows-archive": {
+          "path": "share/rmux/package-layout.tsv",
+          "install": "share/rmux/package-layout.tsv",
+          "install_order": 50
+        }
+      }
+    },
+    {
+      "id": "package-checksums",
+      "source": {
+        "kind": "generated",
+        "name": "SHA256SUMS.txt"
+      },
+      "role": "file",
+      "variants": {
+        "unix-archive": {
+          "path": "SHA256SUMS.txt",
+          "mode": "0644"
+        },
+        "windows-archive": {
+          "path": "SHA256SUMS.txt",
+          "install": "SHA256SUMS.txt",
+          "install_optional": true,
+          "install_order": 50
+        }
+      }
+    },
+    {
+      "id": "readme",
+      "source": {
+        "kind": "repo",
+        "path": "README.md"
+      },
+      "role": "file",
+      "content_class": "documentation",
+      "variants": {
+        "windows-archive": {
+          "path": "README.md",
+          "install": "README.md",
+          "install_optional": true,
+          "install_order": 50
+        },
+        "debian": {
+          "path": "usr/share/doc/rmux/README.md",
+          "mode": "0644"
+        },
+        "rpm": {
+          "path": "usr/share/doc/rmux/README.md",
+          "mode": "0644"
+        }
+      }
+    },
+    {
+      "id": "license",
+      "source": {
+        "kind": "repo",
+        "path": "LICENSE"
+      },
+      "role": "file",
+      "content_class": "license",
+      "variants": {
+        "unix-archive": {
+          "path": "LICENSE",
+          "mode": "0644"
+        }
+      }
+    },
+    {
+      "id": "license-apache",
+      "source": {
+        "kind": "repo",
+        "path": "LICENSE-APACHE"
+      },
+      "role": "file",
+      "content_class": "license",
+      "variants": {
+        "unix-archive": {
+          "path": "LICENSE-APACHE",
+          "mode": "0644"
+        },
+        "windows-archive": {
+          "path": "LICENSE-APACHE",
+          "install": "LICENSE-APACHE",
+          "install_optional": true,
+          "install_order": 50
+        },
+        "debian": {
+          "path": "usr/share/doc/rmux/LICENSE-APACHE",
+          "mode": "0644"
+        },
+        "rpm": {
+          "path": "usr/share/doc/rmux/LICENSE-APACHE",
+          "mode": "0644"
+        }
+      }
+    },
+    {
+      "id": "license-mit",
+      "source": {
+        "kind": "repo",
+        "path": "LICENSE-MIT"
+      },
+      "role": "file",
+      "content_class": "license",
+      "variants": {
+        "unix-archive": {
+          "path": "LICENSE-MIT",
+          "mode": "0644"
+        },
+        "windows-archive": {
+          "path": "LICENSE-MIT",
+          "install": "LICENSE-MIT",
+          "install_optional": true,
+          "install_order": 50
+        },
+        "debian": {
+          "path": "usr/share/doc/rmux/LICENSE-MIT",
+          "mode": "0644"
+        },
+        "rpm": {
+          "path": "usr/share/doc/rmux/LICENSE-MIT",
+          "mode": "0644"
+        }
+      }
+    },
+    {
+      "id": "debian-copyright",
+      "source": {
+        "kind": "generated",
+        "name": "copyright"
+      },
+      "role": "file",
+      "variants": {
+        "debian": {
+          "path": "usr/share/doc/rmux/copyright",
+          "mode": "0644"
+        }
+      }
+    },
+    {
+      "id": "conpty-runtime-manifest",
+      "source": {
+        "kind": "generated",
+        "name": "conpty-runtime.json"
+      },
+      "role": "file",
+      "variants": {
+        "windows-archive": {
+          "path": "share/rmux/conpty-runtime.json",
+          "install": "share/rmux/conpty-runtime.json",
+          "install_order": 50
+        }
+      }
+    },
+    {
+      "id": "conpty-license",
+      "source": {
+        "kind": "conpty",
+        "name": "LICENSE"
+      },
+      "role": "file",
+      "variants": {
+        "windows-archive": {
+          "path": "share/licenses/Microsoft.Windows.Console.ConPTY/LICENSE",
+          "install": "share/licenses/Microsoft.Windows.Console.ConPTY/LICENSE",
+          "install_order": 50
+        }
+      }
+    },
+    {
+      "id": "conpty-dll",
+      "source": {
+        "kind": "conpty",
+        "name": "conpty.dll"
+      },
+      "role": "file",
+      "variants": {
+        "windows-archive": {
+          "path": "conpty.dll",
+          "install": "bin/conpty.dll",
+          "install_order": 50
+        }
+      }
+    },
+    {
+      "id": "conpty-dll-helper",
+      "source": {
+        "kind": "conpty",
+        "name": "conpty.dll"
+      },
+      "role": "file",
+      "variants": {
+        "windows-archive": {
+          "path": "libexec/rmux/conpty.dll",
+          "install": "libexec/rmux/conpty.dll",
+          "install_order": 50
+        }
+      }
+    },
+    {
+      "id": "conpty-openconsole",
+      "source": {
+        "kind": "conpty",
+        "name": "OpenConsole.exe"
+      },
+      "role": "file",
+      "variants": {
+        "windows-archive": {
+          "path": "OpenConsole.exe",
+          "install": "bin/OpenConsole.exe",
+          "install_order": 50
+        }
+      }
+    },
+    {
+      "id": "conpty-openconsole-helper",
+      "source": {
+        "kind": "conpty",
+        "name": "OpenConsole.exe"
+      },
+      "role": "file",
+      "variants": {
+        "windows-archive": {
+          "path": "libexec/rmux/OpenConsole.exe",
+          "install": "libexec/rmux/OpenConsole.exe",
+          "install_order": 50
+        }
+      }
+    }
+  ],
+  "downstream": {
+    "homebrew": {
+      "from_variant": "unix-archive",
+      "install_map": [
+        {
+          "entry": "cli",
+          "into": "bin"
+        },
+        {
+          "entry": "daemon",
+          "into": "bin"
+        },
+        {
+          "entry": "helper",
+          "into": "libexec",
+          "subdirectory": "rmux"
+        },
+        {
+          "entry": "man-page",
+          "into": "man1"
+        },
+        {
+          "entry": "completion-bash",
+          "into": "bash_completion"
+        },
+        {
+          "entry": "completion-zsh",
+          "into": "zsh_completion"
+        },
+        {
+          "entry": "completion-fish",
+          "into": "fish_completion"
+        },
+        {
+          "entry": "artifact-metadata",
+          "into": "pkgshare"
+        }
+      ]
+    },
+    "winget": {
+      "from_variant": "windows-archive",
+      "nested_entry": "cli",
+      "portable_command_alias": "rmux"
+    },
+    "chocolatey": {
+      "from_variant": "windows-archive",
+      "shims": [
+        {
+          "entry": "cli",
+          "command": "rmux"
+        },
+        {
+          "entry": "daemon",
+          "command": "rmux-daemon"
+        }
+      ],
+      "private_entries": [
+        "helper",
+        "conpty-openconsole",
+        "conpty-openconsole-helper"
+      ]
+    }
+  },
+  "sbom": {
+    "profiles": {
+      "linux-archive-cargo-build-closure-v1": {
+        "format": "rmux-sbom-json",
+        "version": 1,
+        "profile": "linux-archive-cargo-build-closure-v1",
+        "subject_variant": "unix-archive",
+        "target": "x86_64-unknown-linux-gnu",
+        "component_scope": "archive-files-and-actual-contained-binary-cargo-build-closures",
+        "relation_types": [
+          "contains",
+          "built_from",
+          "instance_of",
+          "depends_on"
+        ],
+        "reuse_key_version": 1,
+        "preserved_layout_sha256": "a458248e3115f57c00a812cbb4a208ca9982a02dcc38275c36dcea0a521ceee5",
+        "generator": {
+          "path": "scripts/packaging/sbom.py",
+          "sha256": "0b6decf7e4b0461ee2af0e552112333114236ead0a497c3b5713c979338d7f40"
+        },
+        "validator": {
+          "path": "scripts/packaging/sbom.py",
+          "sha256": "0b6decf7e4b0461ee2af0e552112333114236ead0a497c3b5713c979338d7f40"
+        },
+        "layout": {
+          "path": "scripts/packaging/layout.py",
+          "sha256": "8f74f22a2a4ae07ee33f67152cc841ca9165563e5787e70fb44cb73f09c7bbee"
+        },
+        "interpreter": {
+          "path": "/usr/bin/python3.12",
+          "sha256": "e50d468e8b0adfb05733f5b87b3cff34829c4a8c1aea50c865aa8bdfe4bb150f",
+          "version": "3.12.3 (main, Aug 31 2026, 10:18:26) [GCC 13.3.0]"
+        },
+        "schema_path": "scripts/packaging/sbom-schema-v1.json",
+        "schema_sha256": "836fcea84b079df995fa28ed9b92d9786b2cdf675028c489f5078bf5afcebe75"
+      },
+      "linux-rpm-cargo-build-closure-v1": {
+        "format": "rmux-sbom-json",
+        "version": 1,
+        "profile": "linux-rpm-cargo-build-closure-v1",
+        "subject_variant": "rpm",
+        "target": "x86_64-unknown-linux-gnu",
+        "component_scope": "archive-files-and-actual-contained-binary-cargo-build-closures",
+        "relation_types": [
+          "contains",
+          "built_from",
+          "instance_of",
+          "depends_on"
+        ],
+        "reuse_key_version": 1,
+        "preserved_layout_sha256": "a458248e3115f57c00a812cbb4a208ca9982a02dcc38275c36dcea0a521ceee5",
+        "generator": {
+          "path": "scripts/packaging/sbom.py",
+          "sha256": "0b6decf7e4b0461ee2af0e552112333114236ead0a497c3b5713c979338d7f40"
+        },
+        "validator": {
+          "path": "scripts/packaging/sbom.py",
+          "sha256": "0b6decf7e4b0461ee2af0e552112333114236ead0a497c3b5713c979338d7f40"
+        },
+        "layout": {
+          "path": "scripts/packaging/layout.py",
+          "sha256": "8f74f22a2a4ae07ee33f67152cc841ca9165563e5787e70fb44cb73f09c7bbee"
+        },
+        "interpreter": {
+          "path": "/usr/bin/python3.12",
+          "sha256": "e50d468e8b0adfb05733f5b87b3cff34829c4a8c1aea50c865aa8bdfe4bb150f",
+          "version": "3.12.3 (main, Aug 31 2026, 10:18:26) [GCC 13.3.0]"
+        },
+        "schema_path": "scripts/packaging/sbom-schema-v1.json",
+        "schema_sha256": "836fcea84b079df995fa28ed9b92d9786b2cdf675028c489f5078bf5afcebe75",
+        "native_reader": {
+          "path": "/usr/lib/x86_64-linux-gnu/libarchive.so.13.7.2",
+          "bytes": 854168,
+          "sha256": "6de6959b1a1d0c4bbe0c8fadc3d410060f579e0cc671c9d3dc9ad20f5de91e47",
+          "version": "libarchive 3.7.2"
+        }
+      },
+      "linux-deb-cargo-build-closure-v1": {
+        "format": "rmux-sbom-json",
+        "version": 1,
+        "profile": "linux-deb-cargo-build-closure-v1",
+        "subject_variant": "debian",
+        "target": "x86_64-unknown-linux-gnu",
+        "component_scope": "archive-files-and-actual-contained-binary-cargo-build-closures",
+        "relation_types": [
+          "contains",
+          "built_from",
+          "instance_of",
+          "depends_on"
+        ],
+        "reuse_key_version": 1,
+        "preserved_layout_sha256": "a458248e3115f57c00a812cbb4a208ca9982a02dcc38275c36dcea0a521ceee5",
+        "generator": {
+          "path": "scripts/packaging/sbom.py",
+          "sha256": "0b6decf7e4b0461ee2af0e552112333114236ead0a497c3b5713c979338d7f40"
+        },
+        "validator": {
+          "path": "scripts/packaging/sbom.py",
+          "sha256": "0b6decf7e4b0461ee2af0e552112333114236ead0a497c3b5713c979338d7f40"
+        },
+        "layout": {
+          "path": "scripts/packaging/layout.py",
+          "sha256": "8f74f22a2a4ae07ee33f67152cc841ca9165563e5787e70fb44cb73f09c7bbee"
+        },
+        "interpreter": {
+          "path": "/usr/bin/python3.12",
+          "sha256": "e50d468e8b0adfb05733f5b87b3cff34829c4a8c1aea50c865aa8bdfe4bb150f",
+          "version": "3.12.3 (main, Aug 31 2026, 10:18:26) [GCC 13.3.0]"
+        },
+        "schema_path": "scripts/packaging/sbom-schema-v1.json",
+        "schema_sha256": "836fcea84b079df995fa28ed9b92d9786b2cdf675028c489f5078bf5afcebe75",
+        "native_reader": {
+          "path": "/usr/lib/x86_64-linux-gnu/libarchive.so.13.7.2",
+          "bytes": 854168,
+          "sha256": "6de6959b1a1d0c4bbe0c8fadc3d410060f579e0cc671c9d3dc9ad20f5de91e47",
+          "version": "libarchive 3.7.2"
+        }
+      },
+      "linux-tar-repro-cargo-build-closure-v1": {
+        "format": "rmux-sbom-json",
+        "version": 1,
+        "profile": "linux-tar-repro-cargo-build-closure-v1",
+        "subject_variant": "unix-archive",
+        "target": "x86_64-unknown-linux-gnu",
+        "component_scope": "archive-files-and-actual-contained-binary-cargo-build-closures",
+        "relation_types": [
+          "contains",
+          "built_from",
+          "instance_of",
+          "depends_on"
+        ],
+        "reuse_key_version": 1,
+        "preserved_layout_sha256": "a458248e3115f57c00a812cbb4a208ca9982a02dcc38275c36dcea0a521ceee5",
+        "generator": {
+          "path": "scripts/packaging/sbom.py",
+          "sha256": "0b6decf7e4b0461ee2af0e552112333114236ead0a497c3b5713c979338d7f40"
+        },
+        "validator": {
+          "path": "scripts/packaging/sbom.py",
+          "sha256": "0b6decf7e4b0461ee2af0e552112333114236ead0a497c3b5713c979338d7f40"
+        },
+        "layout": {
+          "path": "scripts/packaging/layout.py",
+          "sha256": "8f74f22a2a4ae07ee33f67152cc841ca9165563e5787e70fb44cb73f09c7bbee"
+        },
+        "interpreter": {
+          "path": "/usr/bin/python3.12",
+          "sha256": "e50d468e8b0adfb05733f5b87b3cff34829c4a8c1aea50c865aa8bdfe4bb150f",
+          "version": "3.12.3 (main, Aug 31 2026, 10:18:26) [GCC 13.3.0]"
+        },
+        "schema_path": "scripts/packaging/sbom-schema-v1.json",
+        "schema_sha256": "836fcea84b079df995fa28ed9b92d9786b2cdf675028c489f5078bf5afcebe75",
+        "parent_sbom_sha256": "2ab9bab60b20abbd24b71514dd820abe0e97d2567031550cdafe806b16014dbd",
+        "packaging_receipt_sha256": "73679c106cc39b8b78cbc0c472a3a6d768b54d7fcd55dc9e87902e375542b000",
+        "subject_name": "rmux-0.10.0-linux-x86_64.tar.gz",
+        "review_scope": "accepted-integrated-before-mandate"
+      },
+      "linux-deb-repro-cargo-build-closure-v1": {
+        "format": "rmux-sbom-json",
+        "version": 1,
+        "profile": "linux-deb-repro-cargo-build-closure-v1",
+        "subject_variant": "debian",
+        "target": "x86_64-unknown-linux-gnu",
+        "component_scope": "archive-files-and-actual-contained-binary-cargo-build-closures",
+        "relation_types": [
+          "contains",
+          "built_from",
+          "instance_of",
+          "depends_on"
+        ],
+        "reuse_key_version": 1,
+        "preserved_layout_sha256": "a458248e3115f57c00a812cbb4a208ca9982a02dcc38275c36dcea0a521ceee5",
+        "generator": {
+          "path": "scripts/packaging/sbom.py",
+          "sha256": "0b6decf7e4b0461ee2af0e552112333114236ead0a497c3b5713c979338d7f40"
+        },
+        "validator": {
+          "path": "scripts/packaging/sbom.py",
+          "sha256": "0b6decf7e4b0461ee2af0e552112333114236ead0a497c3b5713c979338d7f40"
+        },
+        "layout": {
+          "path": "scripts/packaging/layout.py",
+          "sha256": "8f74f22a2a4ae07ee33f67152cc841ca9165563e5787e70fb44cb73f09c7bbee"
+        },
+        "interpreter": {
+          "path": "/usr/bin/python3.12",
+          "sha256": "e50d468e8b0adfb05733f5b87b3cff34829c4a8c1aea50c865aa8bdfe4bb150f",
+          "version": "3.12.3 (main, Aug 31 2026, 10:18:26) [GCC 13.3.0]"
+        },
+        "schema_path": "scripts/packaging/sbom-schema-v1.json",
+        "schema_sha256": "836fcea84b079df995fa28ed9b92d9786b2cdf675028c489f5078bf5afcebe75",
+        "native_reader": {
+          "path": "/usr/lib/x86_64-linux-gnu/libarchive.so.13.7.2",
+          "bytes": 854168,
+          "sha256": "6de6959b1a1d0c4bbe0c8fadc3d410060f579e0cc671c9d3dc9ad20f5de91e47",
+          "version": "libarchive 3.7.2"
+        },
+        "parent_sbom_sha256": "019c53a903cee68176b97500e5ce20ff983d3b8f97fa71e95616349eb2d09135",
+        "packaging_receipt_sha256": "26c9cdf1d80fbf8698a950543617f21557a2e2176224584632adccf80c2e137f",
+        "subject_name": "rmux_0.10.0_amd64.deb",
+        "review_scope": "accepted-integrated-before-mandate"
+      },
+      "linux-rpm-repro-cargo-build-closure-v1": {
+        "format": "rmux-sbom-json",
+        "version": 1,
+        "profile": "linux-rpm-repro-cargo-build-closure-v1",
+        "subject_variant": "rpm",
+        "target": "x86_64-unknown-linux-gnu",
+        "component_scope": "archive-files-and-actual-contained-binary-cargo-build-closures",
+        "relation_types": [
+          "contains",
+          "built_from",
+          "instance_of",
+          "depends_on"
+        ],
+        "reuse_key_version": 1,
+        "preserved_layout_sha256": "a458248e3115f57c00a812cbb4a208ca9982a02dcc38275c36dcea0a521ceee5",
+        "generator": {
+          "path": "scripts/packaging/sbom.py",
+          "sha256": "0b6decf7e4b0461ee2af0e552112333114236ead0a497c3b5713c979338d7f40"
+        },
+        "validator": {
+          "path": "scripts/packaging/sbom.py",
+          "sha256": "0b6decf7e4b0461ee2af0e552112333114236ead0a497c3b5713c979338d7f40"
+        },
+        "layout": {
+          "path": "scripts/packaging/layout.py",
+          "sha256": "8f74f22a2a4ae07ee33f67152cc841ca9165563e5787e70fb44cb73f09c7bbee"
+        },
+        "interpreter": {
+          "path": "/usr/bin/python3.12",
+          "sha256": "e50d468e8b0adfb05733f5b87b3cff34829c4a8c1aea50c865aa8bdfe4bb150f",
+          "version": "3.12.3 (main, Aug 31 2026, 10:18:26) [GCC 13.3.0]"
+        },
+        "schema_path": "scripts/packaging/sbom-schema-v1.json",
+        "schema_sha256": "836fcea84b079df995fa28ed9b92d9786b2cdf675028c489f5078bf5afcebe75",
+        "native_reader": {
+          "path": "/usr/lib/x86_64-linux-gnu/libarchive.so.13.7.2",
+          "bytes": 854168,
+          "sha256": "6de6959b1a1d0c4bbe0c8fadc3d410060f579e0cc671c9d3dc9ad20f5de91e47",
+          "version": "libarchive 3.7.2"
+        },
+        "parent_sbom_sha256": "731914660f75f5074bf61206282024e4feba6da957892a872cf66a37aa4b504a",
+        "packaging_receipt_sha256": "a9e736d7353253ad34929bea3abb70995aa53e853122dd64ee5a2075bc25d1b3",
+        "subject_name": "rmux-0.10.0-1.x86_64.rpm",
+        "review_scope": "author-proof-review-pending-at-mandate"
+      },
+      "linux-rpm-full-repro-cargo-build-closure-v1": {
+        "format": "rmux-sbom-json",
+        "version": 1,
+        "profile": "linux-rpm-full-repro-cargo-build-closure-v1",
+        "subject_variant": "rpm",
+        "target": "x86_64-unknown-linux-gnu",
+        "component_scope": "archive-files-and-actual-contained-binary-cargo-build-closures",
+        "relation_types": [
+          "contains",
+          "built_from",
+          "instance_of",
+          "depends_on"
+        ],
+        "reuse_key_version": 1,
+        "preserved_layout_sha256": "a458248e3115f57c00a812cbb4a208ca9982a02dcc38275c36dcea0a521ceee5",
+        "generator": {
+          "path": "scripts/packaging/sbom.py",
+          "sha256": "0b6decf7e4b0461ee2af0e552112333114236ead0a497c3b5713c979338d7f40"
+        },
+        "validator": {
+          "path": "scripts/packaging/sbom.py",
+          "sha256": "0b6decf7e4b0461ee2af0e552112333114236ead0a497c3b5713c979338d7f40"
+        },
+        "layout": {
+          "path": "scripts/packaging/layout.py",
+          "sha256": "8f74f22a2a4ae07ee33f67152cc841ca9165563e5787e70fb44cb73f09c7bbee"
+        },
+        "interpreter": {
+          "path": "/usr/bin/python3.12",
+          "sha256": "e50d468e8b0adfb05733f5b87b3cff34829c4a8c1aea50c865aa8bdfe4bb150f",
+          "version": "3.12.3 (main, Aug 31 2026, 10:18:26) [GCC 13.3.0]"
+        },
+        "schema_path": "scripts/packaging/sbom-schema-v1.json",
+        "schema_sha256": "836fcea84b079df995fa28ed9b92d9786b2cdf675028c489f5078bf5afcebe75",
+        "native_reader": {
+          "path": "/usr/lib/x86_64-linux-gnu/libarchive.so.13.7.2",
+          "bytes": 854168,
+          "sha256": "6de6959b1a1d0c4bbe0c8fadc3d410060f579e0cc671c9d3dc9ad20f5de91e47",
+          "version": "libarchive 3.7.2"
+        },
+        "parent_sbom_sha256": "731914660f75f5074bf61206282024e4feba6da957892a872cf66a37aa4b504a",
+        "packaging_receipt_sha256": "9b360a1b1c144dda8ce1049aa11c6f2fd31abbda73d3a517b823eec4fc644cc4",
+        "subject_name": "rmux-0.10.0-1.x86_64.rpm",
+        "review_scope": "author-proof-review-pending-at-mandate",
+        "packager_source": {
+          "commit": "d7cd34be2955a862f755fff611b329411ad4a676",
+          "tree": "4daaeb750becc77b3db0513606a0aa73c2d1b90b"
+        },
+        "payload_source": {
+          "commit": "b592010d0f41f8a6deba30a526c84a668ff6c6e4",
+          "tree": "1054199351aeb237d90e767947732c0967ce0b08"
+        },
+        "metadata": {
+          "bytes": 2014,
+          "sha256": "4ec2129b36a398f1dbc7be2f4414815c2ed9d210a1b5a08346d508cd2e6b5685"
+        },
+        "cargo_closure_sha256": "2491e6845a5421b8d6546f9d5920423c9852c04efd38275ddc07cfb8bca042b9"
+      },
+      "linux-deb-full-repro-cargo-build-closure-v1": {
+        "format": "rmux-sbom-json",
+        "version": 1,
+        "profile": "linux-deb-full-repro-cargo-build-closure-v1",
+        "subject_variant": "debian",
+        "target": "x86_64-unknown-linux-gnu",
+        "component_scope": "archive-files-and-actual-contained-binary-cargo-build-closures",
+        "relation_types": [
+          "contains",
+          "built_from",
+          "instance_of",
+          "depends_on"
+        ],
+        "reuse_key_version": 1,
+        "preserved_layout_sha256": "a458248e3115f57c00a812cbb4a208ca9982a02dcc38275c36dcea0a521ceee5",
+        "generator": {
+          "path": "scripts/packaging/sbom.py",
+          "sha256": "0b6decf7e4b0461ee2af0e552112333114236ead0a497c3b5713c979338d7f40"
+        },
+        "validator": {
+          "path": "scripts/packaging/sbom.py",
+          "sha256": "0b6decf7e4b0461ee2af0e552112333114236ead0a497c3b5713c979338d7f40"
+        },
+        "layout": {
+          "path": "scripts/packaging/layout.py",
+          "sha256": "8f74f22a2a4ae07ee33f67152cc841ca9165563e5787e70fb44cb73f09c7bbee"
+        },
+        "interpreter": {
+          "path": "/usr/bin/python3.12",
+          "sha256": "e50d468e8b0adfb05733f5b87b3cff34829c4a8c1aea50c865aa8bdfe4bb150f",
+          "version": "3.12.3 (main, Aug 31 2026, 10:18:26) [GCC 13.3.0]"
+        },
+        "schema_path": "scripts/packaging/sbom-schema-v1.json",
+        "schema_sha256": "836fcea84b079df995fa28ed9b92d9786b2cdf675028c489f5078bf5afcebe75",
+        "native_reader": {
+          "path": "/usr/lib/x86_64-linux-gnu/libarchive.so.13.7.2",
+          "bytes": 854168,
+          "sha256": "6de6959b1a1d0c4bbe0c8fadc3d410060f579e0cc671c9d3dc9ad20f5de91e47",
+          "version": "libarchive 3.7.2"
+        },
+        "parent_sbom_sha256": "019c53a903cee68176b97500e5ce20ff983d3b8f97fa71e95616349eb2d09135",
+        "packaging_receipt_sha256": "8b7922f35e9de31f58de42d9e59f28c46a009f68715056008f7cd7a12b912035",
+        "subject_name": "rmux_0.10.0_amd64.deb",
+        "review_scope": "author-proof-review-pending-at-mandate",
+        "packager_source": {
+          "commit": "919f784b5d17d498f449d8641a557176e8c8cdf8",
+          "tree": "8da811444bb2297bf790c7140ba82bb48f87b119"
+        },
+        "payload_source": {
+          "commit": "b592010d0f41f8a6deba30a526c84a668ff6c6e4",
+          "tree": "1054199351aeb237d90e767947732c0967ce0b08"
+        },
+        "metadata": {
+          "bytes": 2017,
+          "sha256": "f556eba2e775dbaf2cee8a1efdbb848192c8ec96ec152f888d4989c758371b01"
+        },
+        "control": {
+          "bytes": 409,
+          "sha256": "26bf129222316a3678f4b560de74f303a3c009a07ade05a606e4e80d5374049d"
+        },
+        "generated_at_utc": "2026-09-27T06:37:01+02:00",
+        "cargo_closure_sha256": "2491e6845a5421b8d6546f9d5920423c9852c04efd38275ddc07cfb8bca042b9"
+      },
+      "linux-tar-full-repro-cargo-build-closure-v1": {
+        "format": "rmux-sbom-json",
+        "version": 1,
+        "profile": "linux-tar-full-repro-cargo-build-closure-v1",
+        "subject_variant": "unix-archive",
+        "target": "x86_64-unknown-linux-gnu",
+        "component_scope": "archive-files-and-actual-contained-binary-cargo-build-closures",
+        "relation_types": [
+          "contains",
+          "built_from",
+          "instance_of",
+          "depends_on"
+        ],
+        "reuse_key_version": 1,
+        "preserved_layout_sha256": "a458248e3115f57c00a812cbb4a208ca9982a02dcc38275c36dcea0a521ceee5",
+        "generator": {
+          "path": "scripts/packaging/sbom.py",
+          "sha256": "0b6decf7e4b0461ee2af0e552112333114236ead0a497c3b5713c979338d7f40"
+        },
+        "validator": {
+          "path": "scripts/packaging/sbom.py",
+          "sha256": "0b6decf7e4b0461ee2af0e552112333114236ead0a497c3b5713c979338d7f40"
+        },
+        "layout": {
+          "path": "scripts/packaging/layout.py",
+          "sha256": "8f74f22a2a4ae07ee33f67152cc841ca9165563e5787e70fb44cb73f09c7bbee"
+        },
+        "interpreter": {
+          "path": "/usr/bin/python3.12",
+          "sha256": "e50d468e8b0adfb05733f5b87b3cff34829c4a8c1aea50c865aa8bdfe4bb150f",
+          "version": "3.12.3 (main, Aug 31 2026, 10:18:26) [GCC 13.3.0]"
+        },
+        "schema_path": "scripts/packaging/sbom-schema-v1.json",
+        "schema_sha256": "836fcea84b079df995fa28ed9b92d9786b2cdf675028c489f5078bf5afcebe75",
+        "parent_sbom_sha256": "2ab9bab60b20abbd24b71514dd820abe0e97d2567031550cdafe806b16014dbd",
+        "packaging_receipt_sha256": "7d428991ef6b2e923315dffbfae2d5623dc727359eea09fc649892c8f6f15db7",
+        "subject_name": "rmux-0.10.0-linux-x86_64.tar.gz",
+        "review_scope": "author-proof-review-pending-at-mandate",
+        "packager_source": {
+          "commit": "830d738f97d013dcaf30c4c2f0be6d2f87bf1782",
+          "tree": "58f6343c74ef330b3fd9c6be8c77d2b637109d76"
+        },
+        "payload_source": {
+          "commit": "b592010d0f41f8a6deba30a526c84a668ff6c6e4",
+          "tree": "1054199351aeb237d90e767947732c0967ce0b08"
+        },
+        "metadata": {
+          "bytes": 2061,
+          "sha256": "fccba4b053c0329ea36fbaae616e6781bb48f342d48367aa2673d431da33eb30"
+        },
+        "generated_at_utc": "2026-09-27T07:58:11+02:00",
+        "cargo_closure_sha256": "2491e6845a5421b8d6546f9d5920423c9852c04efd38275ddc07cfb8bca042b9"
+      }
+    }
+  }
+}

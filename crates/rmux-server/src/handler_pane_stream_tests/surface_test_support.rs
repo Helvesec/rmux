@@ -21,31 +21,21 @@ pub(super) const MAX_CELL_TEXT: &str =
     "a\u{0301}\u{0301}\u{0301}\u{0301}\u{0301}\u{0301}\u{0301}\u{0301}\u{0301}\u{0301}";
 
 pub(super) fn install_blank_screen(transcript: &SharedPaneTranscript, size: TerminalSize) {
-    let history_limit = transcript
-        .lock()
-        .expect("pane transcript mutex")
-        .history_limit();
+    let history_limit = transcript.lock().history_limit();
     transcript
         .lock()
-        .expect("pane transcript mutex")
         .set_screen_for_test(Screen::new(size, history_limit));
 }
 
 pub(super) fn install_max_text_screen(transcript: &SharedPaneTranscript, size: TerminalSize) {
     assert_eq!(MAX_CELL_TEXT.len(), 21);
     let cells = usize::from(size.cols) * usize::from(size.rows);
-    let history_limit = transcript
-        .lock()
-        .expect("pane transcript mutex")
-        .history_limit();
+    let history_limit = transcript.lock().history_limit();
     let mut screen = Screen::new(size, history_limit);
     let mut parser = InputParser::new();
     let content = MAX_CELL_TEXT.repeat(cells);
     parser.parse(content.as_bytes(), &mut screen);
-    transcript
-        .lock()
-        .expect("pane transcript mutex")
-        .set_screen_for_test(screen);
+    transcript.lock().set_screen_for_test(screen);
 }
 
 pub(super) fn install_frame_at_size(
@@ -70,10 +60,7 @@ pub(super) fn install_frame_at_size(
         title_len <= MAX_RECOVERY_STRING_BYTES,
         "title calibration {title_len} exceeds the production metadata bound"
     );
-    transcript
-        .lock()
-        .expect("pane transcript mutex")
-        .set_title("t".repeat(title_len));
+    transcript.lock().set_title("t".repeat(title_len));
 
     (materialize_frame(handler, transcript), title_len)
 }
@@ -116,7 +103,7 @@ pub(super) fn materialize_frame(
     transcript: &SharedPaneTranscript,
 ) -> std::sync::Arc<rmux_proto::PaneSurfaceFrame> {
     let seed = {
-        let transcript = transcript.lock().expect("pane transcript mutex");
+        let transcript = transcript.lock();
         PaneProjectionSeed::capture(&transcript).expect("test Surface projection")
     };
     super::super::materialize_surface_frame(handler, PaneId::new(1), 1, 1, 1, 0, &seed)

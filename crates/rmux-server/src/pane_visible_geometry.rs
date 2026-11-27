@@ -1,5 +1,8 @@
-use rmux_core::{OptionStore, PaneGeometry};
-use rmux_proto::{OptionName, SessionName};
+use rmux_core::{
+    OptionStore, PaneGeometry, ResolvedPaneBorderStatus, ResolvedSceneContext,
+    ResolvedZoomVisibility,
+};
+use rmux_proto::{OptionName, SessionName, TerminalSize};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum PaneBorderStatusPosition {
@@ -18,6 +21,32 @@ impl PaneBorderStatusPosition {
             Some("bottom") => Some(Self::Bottom),
             _ => None,
         }
+    }
+}
+
+pub(crate) fn resolved_scene_context(
+    options: &OptionStore,
+    session_name: &SessionName,
+    window_index: u32,
+    content_size: TerminalSize,
+    zoom_visibility: ResolvedZoomVisibility,
+) -> ResolvedSceneContext {
+    ResolvedSceneContext::new(
+        content_size,
+        resolved_pane_border_status(options, session_name, window_index),
+        zoom_visibility,
+    )
+}
+
+pub(crate) fn resolved_pane_border_status(
+    options: &OptionStore,
+    session_name: &SessionName,
+    window_index: u32,
+) -> ResolvedPaneBorderStatus {
+    match PaneBorderStatusPosition::from_options(options, session_name, window_index) {
+        Some(PaneBorderStatusPosition::Top) => ResolvedPaneBorderStatus::Top,
+        Some(PaneBorderStatusPosition::Bottom) => ResolvedPaneBorderStatus::Bottom,
+        None => ResolvedPaneBorderStatus::Off,
     }
 }
 
@@ -60,6 +89,7 @@ pub(crate) fn visible_pane_content_geometry(
     }
 }
 
+#[cfg(test)]
 pub(crate) fn pane_border_status_row(
     position: PaneBorderStatusPosition,
     geometry: PaneGeometry,
@@ -88,6 +118,31 @@ pub(crate) fn pane_border_status_row(
         }
     };
     (row < content_rows).then_some(row)
+}
+
+/// Resolve in canonical coordinates before translating a client viewport. This
+/// keeps zoom, border status, floating clips and mouse source coordinates aligned.
+pub(crate) fn resolved_session_scene(
+    session: rmux_core::ManagedSessionView<'_>,
+    options: &OptionStore,
+    content_size: TerminalSize,
+) -> rmux_core::ResolvedScene {
+    let source_size = if session.viewport_offset().is_some() {
+        session.window().size()
+    } else {
+        content_size
+    };
+    let scene = session.window().resolved_scene(resolved_scene_context(
+        options,
+        session.name(),
+        session.active_window_index(),
+        source_size,
+        ResolvedZoomVisibility::Rendered,
+    ));
+    match session.viewport_offset() {
+        Some((x, y)) => scene.into_viewport(x, y, content_size),
+        None => scene,
+    }
 }
 
 #[cfg(test)]

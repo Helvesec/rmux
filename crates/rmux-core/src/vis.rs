@@ -76,11 +76,13 @@ fn encode_paste_byte(byte: u8, output: &mut Vec<u8>) {
         b'\0' => output.extend_from_slice(b"\\000"),
         b'\x07' => output.extend_from_slice(b"\\a"),
         b'\x08' => output.extend_from_slice(b"\\b"),
-        b'\t' => output.extend_from_slice(b"\\t"),
+        // vis(3) VIS_SAFE keeps horizontal tabs raw in pasted content.
+        b'\t' => output.push(byte),
         b'\n' => output.extend_from_slice(b"\\n"),
         b'\x0b' => output.extend_from_slice(b"\\v"),
         b'\x0c' => output.extend_from_slice(b"\\f"),
-        b'\r' => output.extend_from_slice(b"\\r"),
+        // vis(3) VIS_SAFE keeps CR raw: it is the byte that ends each pasted line.
+        b'\r' => output.push(byte),
         _ => {
             output.push(b'\\');
             output.push(b'0' + ((byte >> 6) & 0x7));
@@ -209,15 +211,32 @@ mod tests {
     }
 
     #[test]
+    fn safe_paste_encoding_preserves_multiline_shell_commands() {
+        let commands = b"echo one\recho two\r";
+        assert_eq!(encode_paste_bytes(commands), commands);
+    }
+
+    #[test]
     fn safe_paste_encoding_escapes_controls_without_backslash_escaping() {
         let encoded = String::from_utf8(encode_paste_bytes(b"\t\\\x1b")).expect("utf8");
-        assert_eq!(encoded, "\\t\\\\033");
+        assert_eq!(encoded, "\t\\\\033");
+    }
+
+    #[test]
+    fn safe_paste_encoding_preserves_tabs_in_buffer_content() {
+        let input = b"one\ttwo\rthree\\\rfour";
+        assert_eq!(encode_paste_bytes(input), input);
     }
 
     #[test]
     fn safe_paste_encoding_preserves_utf8_bytes() {
         let input = "echo PASTED_漢字".as_bytes();
         assert_eq!(encode_paste_bytes(input), input);
+    }
+
+    #[test]
+    fn safe_paste_encoding_keeps_carriage_returns() {
+        assert_eq!(encode_paste_bytes(b"ab\rcd\r"), b"ab\rcd\r");
     }
 
     #[test]

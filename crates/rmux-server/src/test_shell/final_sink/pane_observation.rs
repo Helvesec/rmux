@@ -134,6 +134,7 @@ fn screen_capture() -> PaneCaptureRequest {
         pending_input: false,
         quiet: true,
         escape_pending: false,
+        hyperlinks: false,
     }
 }
 

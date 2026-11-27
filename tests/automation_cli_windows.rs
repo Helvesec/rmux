@@ -667,7 +667,7 @@ fn rmux_command(label: &str) -> Command {
 }
 
 fn rmux_binary() -> &'static str {
-    env!("CARGO_BIN_EXE_rmux")
+    rmux_os::build_identity::cargo_binary(env!("CARGO_BIN_EXE_rmux"))
 }
 
 fn unique_label(prefix: &str) -> Result<String, Box<dyn Error>> {

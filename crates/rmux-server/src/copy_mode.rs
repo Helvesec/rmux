@@ -1,33 +1,22 @@
 use rmux_core::{Screen, ScreenLineView, Utf8Config};
 use rmux_proto::{PaneTarget, TerminalSize};
 
-#[path = "copy_mode/args.rs"]
 mod args;
-#[path = "copy_mode/commands.rs"]
 mod commands;
 mod line_numbers;
-#[path = "copy_mode/motion.rs"]
 mod motion;
-#[path = "copy_mode/render.rs"]
 mod render;
-#[path = "copy_mode/search.rs"]
 mod search;
-#[path = "copy_mode/selection.rs"]
 mod selection;
-#[path = "copy_mode/text.rs"]
 mod text;
-#[path = "copy_mode/transfer.rs"]
 mod transfer;
-#[path = "copy_mode/types.rs"]
 mod types;
-#[path = "copy_mode/word.rs"]
 mod word;
 
+use motion::PageColumn;
+
 pub(crate) use line_numbers::{CopyModeLineNumberLayout, CopyModeLineNumberMode};
-use text::{
-    classify_word_char, is_owner_position, line_char, owner_positions, pattern_looks_like_regex,
-    WordClass,
-};
+use text::{classify_word_char, is_owner_position, line_char, owner_positions, WordClass};
 #[cfg_attr(windows, allow(unused_imports))]
 pub(crate) use types::{
     CopyBufferTarget, CopyModeCommandContext, CopyModeCommandOutcome, CopyModeMouseContext,
@@ -62,8 +51,12 @@ pub(crate) struct CopyModeState {
     search_timed_out: bool,
     search_count_partial: bool,
     search_highlighted: bool,
+    // The live marks of tmux's `searchmark`, which the search formats report.
+    // The render flag above is also dropped on paths where those marks stay.
+    search_marked: bool,
     jump: Option<JumpState>,
     recentre_top_bottom: Option<RecentreTopBottomState>,
+    page_column: PageColumn,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -124,8 +117,10 @@ impl CopyModeState {
             search_timed_out: false,
             search_count_partial: false,
             search_highlighted: false,
+            search_marked: false,
             jump: None,
             recentre_top_bottom: None,
+            page_column: PageColumn::default(),
             backing,
         };
         state.top_line = state.bottom_top_line();
@@ -162,16 +157,9 @@ impl CopyModeState {
         self.source_target.as_ref()
     }
 
-    pub(crate) fn set_source_target(&mut self, source_target: Option<PaneTarget>) {
-        self.source_target = source_target;
-    }
-
+    #[cfg(test)]
     pub(crate) fn set_show_position(&mut self, show_position: bool) {
         self.show_position = show_position;
-    }
-
-    pub(crate) fn set_exit_on_scroll(&mut self, exit_on_scroll: bool) {
-        self.exit_on_scroll = exit_on_scroll;
     }
 
     pub(crate) fn set_utf8_config(&mut self, utf8_config: Utf8Config) {
@@ -179,35 +167,39 @@ impl CopyModeState {
     }
 
     pub(crate) fn resize(&mut self, size: TerminalSize) {
+        // Attaching a client reapplies pane geometry even if it is unchanged.
+        // Do not discard selection/search state or move the saved viewport for
+        // a no-op resize when returning to an existing copy-mode pane.
+        if self.backing.size() == size {
+            return;
+        }
+        let marks_survive = self.search_marked && !self.search_timed_out;
         self.backing.resize(size);
         self.selection = None;
         self.search_timed_out = false;
         self.search_count_partial = false;
         self.search_highlighted = false;
         self.clamp_cursor();
+        self.clamp_mark();
         self.top_line = self.top_line.min(self.bottom_top_line());
         self.ensure_cursor_visible();
-        if !self.search_pattern.is_empty() {
-            let plain = !pattern_looks_like_regex(&self.search_pattern);
-            self.rebuild_search_results(plain);
-        }
+        self.rebuild_search_keeping_marks(marks_survive);
     }
 
     pub(crate) fn refresh_from_screen(&mut self, backing: Screen) {
+        let marks_survive = self.search_marked && !self.search_timed_out;
         self.backing = backing;
         self.cursor = CopyPosition {
             x: self.backing.cursor_position().0,
             y: self.backing.cursor_absolute_y(),
         };
+        self.clamp_mark();
         self.top_line = self.bottom_top_line();
         self.selection = None;
         self.search_timed_out = false;
         self.search_count_partial = false;
         self.search_highlighted = false;
-        if !self.search_pattern.is_empty() {
-            let plain = !pattern_looks_like_regex(&self.search_pattern);
-            self.rebuild_search_results(plain);
-        }
+        self.rebuild_search_keeping_marks(marks_survive);
     }
 
     pub(crate) fn summary(&self) -> CopyModeSummary {
@@ -223,10 +215,7 @@ impl CopyModeState {
             } else {
                 (None, None, false, false, None)
             };
-        let search_match = self
-            .search_current
-            .and_then(|index| self.search_results.get(index))
-            .map(|result| result.text.clone());
+        let search_match = self.search_match_at_cursor();
         CopyModeSummary {
             view_mode: self.view_mode,
             line_numbers_enabled: self.line_numbers_enabled,
@@ -242,7 +231,7 @@ impl CopyModeState {
             selection_active,
             selection_present,
             selection_mode,
-            search_present: !self.search_pattern.is_empty(),
+            search_present: self.search_marked,
             search_timed_out: self.search_timed_out,
             search_count: self.search_results.len(),
             search_count_partial: self.search_count_partial,
@@ -271,7 +260,7 @@ impl CopyModeState {
         if class != WordClass::Word {
             return None;
         }
-        Some(self.extract_line_range(&line, range.start.x, range.end.x, false))
+        Some(self.soft_wrapped_word_text(range))
     }
 
     fn current_line_text(&self) -> String {
@@ -534,15 +523,25 @@ impl CopyModeState {
     }
 
     fn clamp_cursor(&mut self) {
+        self.cursor = self.clamp_position(self.cursor);
+    }
+
+    /// The mark is an absolute backing position, so every backing change
+    /// (resize reflow, refresh-from-pane) must bring it back inside the new
+    /// backing before `jump-to-mark` can copy it to the cursor.
+    fn clamp_mark(&mut self) {
+        self.mark = self.mark.map(|mark| self.clamp_position(mark));
+    }
+
+    fn clamp_position(&self, position: CopyPosition) -> CopyPosition {
         if self.total_lines() == 0 {
-            self.cursor = CopyPosition { x: 0, y: 0 };
-            return;
+            return CopyPosition { x: 0, y: 0 };
         }
-        self.cursor.y = self.cursor.y.min(self.total_lines().saturating_sub(1));
-        self.cursor.x = self.owning_or_zero(
-            self.cursor.y,
-            self.cursor.x.min(self.cols().saturating_sub(1)),
-        );
+        let y = position.y.min(self.total_lines().saturating_sub(1));
+        CopyPosition {
+            x: self.owning_or_zero(y, position.x.min(self.cols().saturating_sub(1))),
+            y,
+        }
     }
 
     fn ensure_cursor_visible(&mut self) {
@@ -573,11 +572,24 @@ impl CopyModeState {
             .saturating_sub(usize::from(self.rows().max(1)))
     }
 
-    fn at_bottom(&self) -> bool {
+    /// The view shows the last line: where tmux's `scroll_exit` leaves the
+    /// mode (`window_copy_pagedown1`).
+    pub(crate) fn at_bottom(&self) -> bool {
         self.top_line >= self.bottom_top_line()
     }
 }
 
 #[cfg(test)]
+#[path = "copy_mode/shell_marks_tests.rs"]
+mod shell_marks_tests;
+#[cfg(test)]
 #[path = "copy_mode/tests.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "copy_mode/end_of_line_tests.rs"]
+mod end_of_line_tests;
+
+#[cfg(test)]
+#[path = "copy_mode/empty_selection_tests.rs"]
+mod empty_selection_tests;

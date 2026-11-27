@@ -69,7 +69,11 @@ pub(super) fn truncate_styled_text_right_to_width(
         return value.to_owned();
     }
 
-    let mut skip = visible.len().saturating_sub(clipped.len());
+    // The core truncator returns a source suffix. Use that source relation,
+    // rather than a folded-cell byte count, as the UTF-8 slice boundary.
+    let mut skip = visible
+        .strip_suffix(&clipped)
+        .map_or(visible.len(), str::len);
     let mut output = String::with_capacity(value.len().min(clipped.len() + 32));
     for token in tokens {
         if token.visible.is_empty() {
@@ -236,6 +240,17 @@ mod tests {
             ),
             "#[fg=red]表A#[range=control|7]👋🏽"
         );
+    }
+
+    #[test]
+    fn left_truncation_of_an_ordinary_family_emoji_is_a_source_prefix() {
+        let family = "👨\u{200D}👩\u{200D}👦\u{200D}👦";
+        let value = format!("{family}中ABCDEFGH");
+
+        let clipped = truncate_styled_text_to_width(&value, 2, &Utf8Config::default());
+
+        assert_eq!(clipped, family);
+        assert!(value.starts_with(&clipped));
     }
 
     #[test]

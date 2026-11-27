@@ -344,8 +344,12 @@ pub(super) fn key_string_search_table(string: &str) -> Option<KeyCode> {
             return Some(entry.key);
         }
     }
-    if string.len() >= 4 && string[..4].eq_ignore_ascii_case("User") {
-        let user = &string[4..];
+    // `split_at_checked` keeps a multi-byte character straddling the prefix
+    // length from being sliced; such a name cannot be a `User` key.
+    if let Some(user) = string
+        .split_at_checked(4)
+        .and_then(|(head, user)| head.eq_ignore_ascii_case("User").then_some(user))
+    {
         let user = user.parse::<u32>().ok()?;
         if user <= KEYC_NUSER {
             return Some(KEYC_USER + KeyCode::from(user));

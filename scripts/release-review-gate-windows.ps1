@@ -1,4 +1,12 @@
+<#
+.SYNOPSIS
+Run review checks, or the complete native qualification recipe with -QualificationDir.
+.PARAMETER QualificationDir
+New persistent evidence directory. Requires measured RMUX_FROZEN_TMUX (tmux 3.7b).
+No skip flags are accepted. A successful native cell leaves other OS cells pending.
+#>
 param(
+    [string]$QualificationDir,
     [string]$OutputDir = "target\release-review-gate-windows",
     [string]$TargetDir = "target\release-review-gate-windows-cargo",
     [switch]$SkipPackage,
@@ -8,6 +16,18 @@ param(
 )
 
 $ErrorActionPreference = "Stop"
+
+if ($QualificationDir) {
+    if ($SkipPackage -or $SkipClippy -or $RunCtrlMatrixSmoke -or $EndpointSmokeOnly -or
+        $PSBoundParameters.ContainsKey("TargetDir") -or $PSBoundParameters.ContainsKey("OutputDir")) {
+        throw "qualification requires the complete recipe; no skip or smoke-only flags"
+    }
+    $python = Get-Command python -ErrorAction SilentlyContinue
+    if (-not $python) { $python = Get-Command python3 -ErrorAction Stop }
+    & $python.Source (Join-Path $PSScriptRoot "validation\contracts.py") `
+        --root (Split-Path $PSScriptRoot -Parent) --run-qualification $QualificationDir
+    exit $LASTEXITCODE
+}
 
 $env:RUST_MIN_STACK = "8388608"
 $env:RMUX_ALLOW_INTERNAL_DAEMON_IN_CALLER_JOB = "1"
@@ -70,6 +90,17 @@ function Run-PythonScript([string]$Script, [string[]]$Arguments = @()) {
     Run $python.Source (@($Script) + $Arguments)
 }
 
+function Run-InCandidateIdentity([string[]]$Arguments) {
+    # candidate_identity builds into its own private target and refuses the gate's shared one.
+    $sharedTargetDir = $env:CARGO_TARGET_DIR
+    Remove-Item Env:CARGO_TARGET_DIR
+    try {
+        Run-PythonScript "scripts\candidate_identity.py" (@("with", "--") + $Arguments)
+    } finally {
+        $env:CARGO_TARGET_DIR = $sharedTargetDir
+    }
+}
+
 function Read-CargoPackageVersion([string]$Manifest) {
     $inPackage = $false
     $workspaceVersion = $null
@@ -122,21 +153,35 @@ function Check-ReleaseVersions {
         throw "docs\man\rmux.1 does not contain RMUX $rootVersion"
     }
 
-    $manifests = @(
-        "crates\ratatui-rmux\Cargo.toml",
-        "crates\rmux-client\Cargo.toml",
-        "crates\rmux-core\Cargo.toml",
-        "crates\rmux-ipc\Cargo.toml",
-        "crates\rmux-os\Cargo.toml",
-        "crates\rmux-proto\Cargo.toml",
-        "crates\rmux-pty\Cargo.toml",
-        "crates\rmux-render-core\Cargo.toml",
-        "crates\rmux-sdk\Cargo.toml",
-        "crates\rmux-server\Cargo.toml",
-        "crates\rmux-types\Cargo.toml",
-        "crates\rmux-web-crypto\Cargo.toml",
-        "xtask\Cargo.toml"
-    )
+    $metadataJson = @(& cargo metadata --locked --no-deps --format-version 1)
+    if ($LASTEXITCODE -ne 0) {
+        throw "cargo metadata failed with exit code $LASTEXITCODE"
+    }
+    $metadata = ($metadataJson -join "`n") | ConvertFrom-Json -ErrorAction Stop
+    if ($null -eq $metadata -or $metadata -is [array] -or
+        $metadata.workspace_members -isnot [array] -or $metadata.workspace_members.Count -eq 0 -or
+        $metadata.packages -isnot [array] -or $metadata.packages.Count -eq 0) {
+        throw "cargo metadata has no valid workspace membership"
+    }
+    # IDs are opaque and case-sensitive; names and directory layout are not membership.
+    $memberIds = @()
+    $manifests = foreach ($memberId in $metadata.workspace_members) {
+        if ($memberId -isnot [string] -or [string]::IsNullOrWhiteSpace($memberId) -or
+            $memberIds -ccontains $memberId) {
+            throw "cargo metadata has an invalid or duplicate workspace member ID"
+        }
+        $memberIds += $memberId
+        $packages = @($metadata.packages | Where-Object { $_.id -is [string] -and $_.id -ceq $memberId })
+        # .NET Framework's IsPathRooted also accepts C:foo and \foo. Require a
+        # drive plus separator, UNC/device prefix, or the NT device prefix \??\.
+        if ($packages.Count -ne 1 -or $packages[0].manifest_path -isnot [string] -or
+            [string]::IsNullOrWhiteSpace($packages[0].manifest_path) -or
+            -not [System.IO.Path]::IsPathRooted($packages[0].manifest_path) -or
+            $packages[0].manifest_path -notmatch '^(?:[A-Za-z]:[\\/]|[\\/]{2}|\\\?\?\\)') {
+            throw "cargo metadata has no unique manifest path for workspace member $memberId"
+        }
+        $packages[0].manifest_path
+    }
     foreach ($manifest in $manifests) {
         if (-not (Test-Path -LiteralPath $manifest)) {
             throw "missing manifest $manifest"
@@ -147,6 +192,7 @@ function Check-ReleaseVersions {
             throw "$manifest version $version != root version $rootVersion"
         }
     }
+    Write-Host "workspace-members=$($memberIds.Count)"
     Write-Host "release-version-check=ok"
 }
 
@@ -169,7 +215,7 @@ function Check-CfgBudgets {
         @("rmux-types", "crates\rmux-types\src", 0),
         @("rmux-core", "crates\rmux-core\src", 0),
         @("rmux-proto", "crates\rmux-proto\src", 0),
-        @("rmux-server", "crates\rmux-server\src", 5),
+        @("rmux-server", "crates\rmux-server\src", 9),
         @("rmux-client", "crates\rmux-client\src", 10),
         @("rmux-ipc", "crates\rmux-ipc\src", 15),
         @("rmux-pty", "crates\rmux-pty\src", 20),
@@ -242,6 +288,7 @@ if ($EndpointSmokeOnly) {
 }
 
 Step "release TOML reader self-test" { Run-PythonScript "scripts\toml_reader.py" @("--self-test") }
+Step "publication identity regression" { Run-PythonScript "-B" @("-m", "unittest", "discover", "-s", "scripts/release", "-p", "test_publication*.py") }
 Step "release versions" { Check-ReleaseVersions }
 Step "changelog release audit" { Run-PythonScript "scripts\check-changelog-release.py" @("CHANGELOG.md") }
 Step "tmux divergence ledger" { Run-PythonScript "scripts\check-tmux-release-ledger.py" }
@@ -255,6 +302,8 @@ Write-Host "cargo-profile-test-debug=$env:CARGO_PROFILE_TEST_DEBUG"
 Write-Host "rust-min-stack=$env:RUST_MIN_STACK"
 Write-Host "rustflags=$env:RUSTFLAGS"
 Step "formatting" { Run "cargo" @("fmt", "--all", "--check") }
+Step "feature compilation gate regression" { Run-PythonScript "scripts/test_feature_powerset.py" }
+Step "workspace and isolated feature powerset" { Run-PythonScript "scripts/check_feature_powerset.py" }
 Step "platform cfg budget" { Check-CfgBudgets }
 Step "worktree hygiene" { Check-WorktreeHygiene }
 
@@ -265,15 +314,17 @@ if (-not $SkipClippy) {
 }
 
 Step "tiny parser and boundary tests" {
-    Assert-CargoFilter 1 @("test", "-p", "rmux", "--features", "tiny-cli", "tiny_main", "--locked")
-    Run "cargo" @("test", "-p", "rmux", "--features", "tiny-cli", "tiny_main", "--locked")
+    # tiny_main tests live in the rmux binaries; integration targets select none of them.
+    Assert-CargoFilter 1 @("test", "-p", "rmux", "--features", "tiny-cli", "--bins", "tiny_main", "--locked")
+    Run "cargo" @("test", "-p", "rmux", "--features", "tiny-cli", "--bins", "tiny_main", "--locked")
 }
 Step "mutating target-action retry tests" {
     Assert-CargoFilter 1 @("test", "-p", "rmux", "--bin", "rmux", "--locked", "target_action_retry_is_limited")
     Run "cargo" @("test", "-p", "rmux", "--bin", "rmux", "--locked", "target_action_retry_is_limited")
 }
 Step "server lib tests" {
-    Run "cargo" @("test", "-p", "rmux-server", "--lib", "--locked", "--", "--test-threads=1")
+    # The Windows final-sink child is certified by candidate_identity (RMUX_IDENTITY_PYTHON).
+    Run-InCandidateIdentity @("cargo", "test", "-p", "rmux-server", "--lib", "--locked", "--", "--test-threads=1")
 }
 Step "independent xterm.js recovery oracle" {
     $npm = Get-Command npm.cmd -ErrorAction SilentlyContinue

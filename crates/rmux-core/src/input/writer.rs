@@ -83,6 +83,11 @@ pub trait ScreenWriter {
     fn clear_line(&mut self, bg: i32) {}
 
     // ─── Mode operations ───────────────────────────────────────
+    /// Policy applied when the application changes xterm key reporting.
+    fn extended_key_policy(&self) -> super::ExtendedKeyPolicy {
+        super::ExtendedKeyPolicy::On
+    }
+
     /// Set mode bits.
     fn mode_set(&mut self, mode: u32) {}
     /// Clear mode bits.
@@ -97,6 +102,19 @@ pub trait ScreenWriter {
     fn alternate_on(&mut self, bg: i32, save_cursor: bool) {}
     /// Switch back from alternate screen.
     fn alternate_off(&mut self, bg: i32, restore_cursor: bool) {}
+    /// Switch to alternate screen and remember the rendition of `cell`, as
+    /// tmux `screen_alternate_on` does on every entry (`?47h`, `?1047h` and
+    /// `?1049h`). Writers that keep no rendition fall back to `alternate_on`.
+    fn alternate_on_with_rendition(&mut self, cell: &CellState, save_cursor: bool) {
+        self.alternate_on(cell.bg(), save_cursor);
+    }
+    /// Switch back from alternate screen. When the exit restores the saved
+    /// cursor (`?1049l`), the rendition remembered on entry is written back
+    /// into `cell`, as tmux `screen_alternate_off` does; the character sets
+    /// are kept. Writers that keep no rendition fall back to `alternate_off`.
+    fn alternate_off_with_rendition(&mut self, cell: &mut CellState, restore_cursor: bool) {
+        self.alternate_off(cell.bg(), restore_cursor);
+    }
 
     // ─── Attributes ────────────────────────────────────────────
     /// Reset cell attributes to default.
@@ -146,6 +164,11 @@ pub trait ScreenWriter {
     /// Set cursor style (DECSCUSR). `n` is the Ps value 0-6.
     fn set_cursor_style(&mut self, n: u32) {}
 
+    /// Pure pane cursor presentation, including its synchronized configured default.
+    fn resolved_cursor_state(&self) -> crate::ResolvedCursorStyle {
+        crate::ResolvedCursorStyle::default()
+    }
+
     // ─── OSC handlers ──────────────────────────────────────────
     /// Handle OSC 4 palette colour.
     fn osc_palette(&mut self, data: &str, end: InputEndType) {}
@@ -175,10 +198,19 @@ pub trait ScreenWriter {
     fn osc_reset_cursor(&mut self) {}
     /// Handle OSC 133 shell integration.
     fn osc_shell_integration(&mut self, data: &str) {}
+    /// Whether this writer stores OSC 7501 program-status reports.
+    fn supports_program_status(&self) -> bool {
+        false
+    }
+    /// Handle an OSC 7501 report (not a support query).
+    fn osc_program_status(&mut self, data: &str, end: InputEndType) {}
 
     // ─── DCS handlers ──────────────────────────────────────────
     /// Handle DCS passthrough string.
     fn dcs_passthrough(&mut self, data: &[u8]) {}
+
+    /// Restores a compact row's written extent after recovery replay padding.
+    fn restore_recovery_written_columns(&mut self, columns: u32) {}
 
     /// Handle an opaque SIXEL DCS passthrough string.
     fn sixel_passthrough(&mut self, data: &[u8]) {}
@@ -192,6 +224,14 @@ pub trait ScreenWriter {
     fn bell(&mut self) {}
 
     // ─── Query responses ───────────────────────────────────────
+    /// Whether a native SIXEL passthrough path is available for this pane.
+    fn sixel_passthrough_available(&self) -> bool {
+        false
+    }
+    /// Pixel dimensions of a terminal cell, when the outer client supplied them.
+    fn cell_pixels(&self) -> Option<rmux_types::TerminalPixels> {
+        None
+    }
     /// Get screen width in columns.
     fn screen_size_x(&self) -> u32 {
         80
@@ -208,9 +248,23 @@ pub trait ScreenWriter {
     fn cursor_y(&self) -> u32 {
         0
     }
+    /// Whether the alternate screen is actually active.
+    fn alternate_active(&self) -> bool {
+        false
+    }
+
     /// Get current screen mode flags.
     fn current_mode(&self) -> u32 {
         0
+    }
+
+    /// Apply an application keyboard request when this writer owns keyboard state.
+    /// Render-only writers may leave the protocol unsupported.
+    fn keyboard_control(
+        &mut self,
+        control: crate::kitty_keyboard::Control,
+    ) -> crate::kitty_keyboard::Effect {
+        crate::kitty_keyboard::Effect::None
     }
 
     // ─── Title stack ───────────────────────────────────────────

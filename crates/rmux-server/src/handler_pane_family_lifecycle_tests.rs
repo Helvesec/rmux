@@ -327,7 +327,7 @@ async fn pane_id_duplicate_winlink_removes_only_the_resolved_alias() {
 
     let state = handler.state.lock().await;
     let session = state.sessions.session(&source).expect("session survives");
-    assert_eq!(session.windows().len(), 1);
+    assert_eq!(session.windows().count(), 1);
     state
         .ensure_panes_exist(&source, &[pane_id])
         .expect("the unresolved duplicate alias retains the pane runtime");
@@ -832,8 +832,7 @@ async fn natural_linked_last_pane_exit_emits_each_tmux_3_7b_window_unlinked_hook
     assert_eq!(
         survivor_session
             .windows()
-            .keys()
-            .copied()
+            .map(|(index, _)| index)
             .collect::<Vec<_>>(),
         vec![0]
     );

@@ -299,6 +299,57 @@ fn decoder_handles_fragmented_messages() {
 }
 
 #[test]
+fn attach_fragment_current_read_excludes_stale_payload() {
+    let first = encode_attach_message(&AttachMessage::Data(vec![b'A'; 64])).unwrap();
+    let second = AttachMessage::Data(b"y\x1b[?1049l".to_vec());
+    let encoded = encode_attach_message(&second).unwrap();
+    let mut scratch = [0_u8; 8192];
+    scratch[..first.len()].copy_from_slice(&first);
+    let mut decoder = AttachFrameDecoder::new();
+    scratch[..5].copy_from_slice(&encoded[..5]);
+    assert!(decode_attach_data_frame(&scratch[..5]).unwrap().is_none());
+    decoder.push_bytes(&scratch[..5]);
+    assert_eq!(decoder.next_message().unwrap(), None);
+    scratch[..encoded.len() - 5].copy_from_slice(&encoded[5..]);
+    decoder.push_bytes(&scratch[..encoded.len() - 5]);
+    assert_eq!(decoder.next_message().unwrap(), Some(second));
+    assert!(decoder.is_empty());
+}
+
+#[test]
+fn attach_fragment_every_split_preserves_payload_and_coalesced_successor() {
+    // CR is also a valid attach tag: stale completion can silently consume a
+    // following frame instead of producing the unknown-tag error from `y`.
+    for payload in [b"y\x1b[?1049l".as_slice(), b"\r\n".as_slice()] {
+        let message = AttachMessage::Data(payload.to_vec());
+        let frame = encode_attach_message(&message).unwrap();
+        let successor = AttachMessage::Data(b"next\x1b[?1049l".to_vec());
+        let next_frame = encode_attach_message(&successor).unwrap();
+        for split in 1..frame.len() {
+            let mut scratch = [b'A'; 8192];
+            scratch[..split].copy_from_slice(&frame[..split]);
+            assert!(decode_attach_data_frame(&scratch[..split])
+                .unwrap()
+                .is_none());
+            let mut decoder = AttachFrameDecoder::new();
+            decoder.push_bytes(&scratch[..split]);
+            assert_eq!(decoder.next_message().unwrap(), None);
+
+            let tail_len = frame.len() - split;
+            scratch[..tail_len].copy_from_slice(&frame[split..]);
+            scratch[tail_len..tail_len + next_frame.len()].copy_from_slice(&next_frame);
+            decoder.push_bytes(&scratch[..tail_len + next_frame.len()]);
+            assert_eq!(decoder.next_message().unwrap(), Some(message.clone()));
+            assert_eq!(decoder.next_message().unwrap(), Some(successor.clone()));
+            assert!(
+                decoder.is_empty(),
+                "split {split} must consume exactly two frames"
+            );
+        }
+    }
+}
+
+#[test]
 fn suspend_messages_round_trip() {
     let message = AttachMessage::Suspend;
     let encoded = encode_attach_message(&message).expect("encode attach suspend");
@@ -322,6 +373,25 @@ fn detach_kill_messages_round_trip() {
         decoder.next_message().expect("decode attach detach-kill"),
         Some(message)
     );
+}
+
+#[test]
+fn server_exited_messages_round_trip_as_a_single_tag() {
+    let message = AttachMessage::ServerExited;
+    let encoded = encode_attach_message(&message).expect("encode attach server-exited");
+    assert_eq!(
+        encoded,
+        [15],
+        "server-exited is a published single-tag frame"
+    );
+    let mut decoder = AttachFrameDecoder::new();
+    decoder.push_bytes(&encoded);
+
+    assert_eq!(
+        decoder.next_message().expect("decode attach server-exited"),
+        Some(message)
+    );
+    assert!(decoder.is_empty());
 }
 
 #[test]

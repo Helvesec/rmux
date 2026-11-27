@@ -33,7 +33,7 @@ async fn create_session(handler: &RequestHandler, name: &str) {
         }))
         .await;
 
-    assert!(matches!(response, Response::NewSession(_)));
+    crate::session_fixture::assert_new_session(&response);
 }
 
 async fn create_grouped_session(handler: &RequestHandler, name: &str, group_target: &SessionName) {
@@ -59,7 +59,7 @@ async fn create_grouped_session(handler: &RequestHandler, name: &str, group_targ
         })))
         .await;
 
-    assert!(matches!(response, Response::NewSession(_)));
+    crate::session_fixture::assert_new_session(&response);
 }
 
 async fn set_global_hook(handler: &RequestHandler, hook: HookName, command: &str) {
@@ -1767,7 +1767,7 @@ async fn environment_override_layering_session_then_override_then_rmux_pane() {
             environment: Some(vec!["MY_VAR=override".to_owned()]),
         }))
         .await;
-    assert!(matches!(response, Response::NewSession(_)));
+    crate::session_fixture::assert_new_session(&response);
 
     let state = handler.state.lock().await;
     let pane_zero = state
@@ -1847,7 +1847,7 @@ async fn new_session_ext_client_environment_respects_tmux_precedence() {
         })))
         .await;
 
-    assert!(matches!(response, Response::NewSession(_)));
+    crate::session_fixture::assert_new_session(&response);
 
     let state = handler.state.lock().await;
     let pane_zero = state
@@ -1887,7 +1887,11 @@ async fn new_session_ext_client_environment_respects_tmux_precedence() {
             shell_format: false,
         }))
         .await;
-    assert!(matches!(shown, Response::Error(_)));
+    assert!(
+        matches!(&shown, Response::Error(ErrorResponse { error: RmuxError::Server(message) })
+            if message == "unknown variable: RMUX_CLIENT_ONLY_ENV_SENTINEL"),
+        "expected an absent variable in a live session, got {shown:?}"
+    );
 }
 
 #[tokio::test]
@@ -1920,7 +1924,7 @@ async fn new_session_ext_skip_environment_update_keeps_client_spawn_environment(
         })))
         .await;
 
-    assert!(matches!(response, Response::NewSession(_)));
+    crate::session_fixture::assert_new_session(&response);
 
     let state = handler.state.lock().await;
     let pane_zero = state
@@ -1940,7 +1944,11 @@ async fn new_session_ext_skip_environment_update_keeps_client_spawn_environment(
             shell_format: false,
         }))
         .await;
-    assert!(matches!(shown, Response::Error(_)));
+    assert!(
+        matches!(&shown, Response::Error(ErrorResponse { error: RmuxError::Server(message) })
+            if message == "unknown variable: PATH"),
+        "expected an absent variable in a live session, got {shown:?}"
+    );
 }
 
 fn shell_quote_str(value: &str) -> String {

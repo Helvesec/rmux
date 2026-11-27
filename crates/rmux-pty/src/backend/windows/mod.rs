@@ -1,12 +1,15 @@
+mod api;
 mod application;
 mod bounded_write;
 mod command_line;
 mod dsr;
 mod flags;
 mod io;
+mod job;
 mod perf;
 mod pty;
 mod spawn;
+mod startup;
 mod version;
 
 pub(crate) use dsr::{should_enable_dsr_bootstrap, DsrBootstrap};

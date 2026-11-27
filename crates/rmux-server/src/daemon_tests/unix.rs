@@ -6,7 +6,7 @@ use std::ffi::OsStr;
 use std::fs;
 use std::os::unix::fs::{FileTypeExt, PermissionsExt};
 use std::os::unix::net::{UnixListener as StdUnixListener, UnixStream as StdUnixStream};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
@@ -165,11 +165,39 @@ fn stale_socket_removal_leaves_non_socket_paths_untouched() {
 }
 
 fn unique_socket_path(label: &str) -> PathBuf {
+    unique_socket_path_in(&std::env::temp_dir(), label)
+}
+
+#[test]
+fn unique_socket_path_fits_unix_limit_with_long_temp_root() {
+    let root = PathBuf::from("/").join("t".repeat(56));
+    for label in [
+        "stale-socket",
+        "permissions",
+        "group-permissions",
+        "nested-permissions",
+        "bound-permissions",
+        "not-a-socket",
+    ] {
+        let path = unique_socket_path_in(&root, label);
+        assert!(
+            path.as_os_str().len() < 104,
+            "fixture socket must fit the Unix limit: {} bytes for {label}",
+            path.as_os_str().len()
+        );
+    }
+}
+
+fn unique_socket_path_in(root: &Path, label: &str) -> PathBuf {
     let unique_id = UNIQUE_ID.fetch_add(1, Ordering::Relaxed);
     let process_id = std::process::id();
-    std::env::temp_dir()
-        .join(format!("rmux-server-{label}-{process_id}-{unique_id}"))
-        .join("default.sock")
+    let directory = format!("rmux-server-{label}-{process_id}-{unique_id}");
+    let socket_path = root.join(&directory).join("default.sock");
+    // macOS sun_path has 104 bytes, including the terminating NUL.
+    if socket_path.as_os_str().len() < 104 {
+        return socket_path;
+    }
+    Path::new("/tmp").join(directory).join("default.sock")
 }
 
 fn wait_until_socket_is_stale(socket_path: &std::path::Path) -> std::io::Result<()> {

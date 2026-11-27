@@ -10,6 +10,7 @@ use rmux_server::{DaemonConfig, ServerDaemon};
 use crate::cli_args::{Cli, Command, ConfigFileSelection, StartServerArgs, TopLevelCommandScan};
 use crate::server_runtime::build_daemon_runtime;
 
+use super::dispatch::command_has_start_server_flag;
 use super::ExitFailure;
 
 #[derive(Debug)]
@@ -103,6 +104,11 @@ impl StartupEndpoint {
         self.inner.borrow_mut().connection.take()
     }
 
+    /// Retains a commandless invocation's probe for its first starting command.
+    pub(in crate::cli) fn retain_connection(&self, connection: Connection) {
+        self.inner.borrow_mut().connection = Some(connection);
+    }
+
     /// Adopts the endpoint and provenance of a daemon started mid-queue.
     ///
     /// Auto-start may launch the daemon on a different endpoint than the one
@@ -129,6 +135,7 @@ pub(in crate::cli) struct StartupOptions {
     pub(in crate::cli) no_start_server: bool,
     pub(in crate::cli) config: AutoStartConfig,
     pub(in crate::cli) endpoint: StartupEndpoint,
+    pub(in crate::cli) automation_deadline: Option<rmux_bootstrap::deadline::StartupDeadline>,
 }
 
 impl StartupOptions {
@@ -141,6 +148,7 @@ impl StartupOptions {
             no_start_server,
             config,
             endpoint,
+            automation_deadline: None,
         }
     }
 
@@ -167,6 +175,7 @@ impl StartupOptions {
             no_start_server: self.no_start_server || !command_has_start_server_flag,
             config,
             endpoint: self.endpoint.clone(),
+            automation_deadline: self.automation_deadline,
         }
     }
 }
@@ -193,7 +202,16 @@ pub(super) enum ServerStartupConfig {
 }
 
 pub(super) fn startup_config_from_cli(cli: &Cli) -> StartupConfig {
-    startup_config_from_selection(cli.config_file_selection(), cli.command.as_ref())
+    startup_config_from_selection(cli.config_file_selection(), server_starting_command(cli))
+}
+
+/// As in tmux, a queue such as `set-option ... ; new-session` starts the
+/// server before its first command, with the start options of the command
+/// that starts it.
+pub(super) fn server_starting_command(cli: &Cli) -> Option<&Command> {
+    cli.command_queue()
+        .iter()
+        .find(|command| command_has_start_server_flag(command))
 }
 
 pub(super) fn startup_config_from_top_level_scan(

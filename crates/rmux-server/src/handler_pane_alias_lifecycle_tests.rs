@@ -1,4 +1,7 @@
 use super::RequestHandler;
+
+#[path = "handler_pane_alias_lifecycle_tests/indexed_unset.rs"]
+mod indexed_unset;
 use rmux_core::PaneId;
 use rmux_proto::{
     ErrorResponse, KillPaneRequest, KillSessionRequest, LinkWindowRequest, NewSessionExtRequest,
@@ -24,7 +27,7 @@ async fn create_session(handler: &RequestHandler, value: &str) -> SessionName {
             environment: None,
         }))
         .await;
-    assert!(matches!(response, Response::NewSession(_)), "{response:?}");
+    crate::session_fixture::assert_new_session(&response);
     session
 }
 
@@ -55,7 +58,7 @@ async fn create_grouped_session(
             skip_environment_update: false,
         })))
         .await;
-    assert!(matches!(response, Response::NewSession(_)), "{response:?}");
+    crate::session_fixture::assert_new_session(&response);
     session
 }
 

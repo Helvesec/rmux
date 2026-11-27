@@ -4,7 +4,6 @@
 //! orphan the session — so this scenario also shows the typed error you
 //! get in that case, which is the contract a real caller needs to handle.
 
-#[path = "sdk_demo_helpers/mod.rs"]
 mod sdk_demo_helpers;
 
 #[tokio::main]

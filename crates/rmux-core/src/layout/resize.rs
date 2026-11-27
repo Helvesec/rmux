@@ -1,8 +1,11 @@
-use rmux_proto::TerminalSize;
+use crate::PaneId;
+use rmux_proto::{RmuxError, TerminalSize};
 
 use super::cell::LayoutKind;
 use super::mutation::{axis_size, cell_at_path, cell_mut_at_path};
 use super::{LayoutCell, LayoutDirection, LayoutTree};
+
+type AttachedResize = (Option<LayoutTree>, Vec<(PaneId, u16, u16)>);
 
 impl LayoutTree {
     pub(crate) fn resize(&mut self, size: TerminalSize) {
@@ -32,50 +35,11 @@ impl LayoutTree {
 
     pub(crate) fn resize_pane_to(
         &mut self,
-        pane_position: usize,
+        pane_id: PaneId,
         direction: LayoutDirection,
         new_size: u32,
     ) -> bool {
-        let Some(leaf_index) = self
-            .leaf_map
-            .as_ref()
-            .map_or(Some(pane_position), |map| map.get(pane_position).copied())
-        else {
-            return false;
-        };
-
-        self.resize_leaf_to(leaf_index, direction, new_size)
-    }
-
-    pub(crate) fn resize_pane_by(
-        &mut self,
-        pane_position: usize,
-        direction: LayoutDirection,
-        change: i32,
-    ) -> bool {
-        if change == 0 {
-            return true;
-        }
-
-        let Some(leaf_index) = self
-            .leaf_map
-            .as_ref()
-            .map_or(Some(pane_position), |map| map.get(pane_position).copied())
-        else {
-            return false;
-        };
-
-        self.resize_leaf_by(leaf_index, direction, change)
-    }
-
-    fn resize_leaf_to(
-        &mut self,
-        leaf_index: usize,
-        direction: LayoutDirection,
-        new_size: u32,
-    ) -> bool {
-        let paths = self.leaf_paths();
-        let Some(mut cell_path) = paths.get(leaf_index).cloned() else {
+        let Some(mut cell_path) = self.root.leaf_path(pane_id) else {
             return false;
         };
 
@@ -114,14 +78,44 @@ impl LayoutTree {
         }
     }
 
-    fn resize_leaf_by(
+    /// The cells `pane_id` shares with its next sibling along `direction`,
+    /// their border included, in the nearest ancestor split that way: the
+    /// cell a split inserted before its target divided. `None` when the pane
+    /// has no next sibling along `direction`.
+    pub(crate) fn cell_with_next_sibling(
+        &self,
+        pane_id: PaneId,
+        direction: LayoutDirection,
+    ) -> Option<u32> {
+        let mut cell_path = self.root.leaf_path(pane_id)?;
+        loop {
+            let child_index = *cell_path.last()?;
+            let parent_path = &cell_path[..cell_path.len() - 1];
+            let parent = cell_at_path(&self.root, parent_path)?;
+            if let LayoutKind::Split(parent_direction, children) = &parent.kind {
+                if *parent_direction == direction {
+                    let next = children.get(child_index + 1)?;
+                    return Some(
+                        axis_size(&children[child_index], direction)
+                            .saturating_add(axis_size(next, direction))
+                            .saturating_add(1),
+                    );
+                }
+            }
+            cell_path.pop();
+        }
+    }
+
+    pub(crate) fn resize_pane_by(
         &mut self,
-        leaf_index: usize,
+        pane_id: PaneId,
         direction: LayoutDirection,
         change: i32,
     ) -> bool {
-        let Some((parent_path, handle_index)) = self.find_resize_handle(leaf_index, direction)
-        else {
+        if change == 0 {
+            return self.root.leaf_path(pane_id).is_some();
+        }
+        let Some((parent_path, handle_index)) = self.find_resize_handle(pane_id, direction) else {
             return false;
         };
 
@@ -130,11 +124,10 @@ impl LayoutTree {
 
     fn find_resize_handle(
         &self,
-        leaf_index: usize,
+        pane_id: PaneId,
         direction: LayoutDirection,
     ) -> Option<(Vec<usize>, usize)> {
-        let paths = self.leaf_paths();
-        let mut cell_path = paths.get(leaf_index)?.clone();
+        let mut cell_path = self.root.leaf_path(pane_id)?;
 
         loop {
             let child_index = *cell_path.last()?;
@@ -297,5 +290,107 @@ fn resize_children(
         let (left, right) = children.split_at_mut(add_index);
         right[0].resize_adjust(direction, size as i32);
         left[remove_index].resize_adjust(direction, -(size as i32));
+    }
+}
+
+impl LayoutTree {
+    pub(crate) fn root_direction(&self) -> Option<LayoutDirection> {
+        match self.root.kind {
+            LayoutKind::Pane(_) => None,
+            LayoutKind::Split(direction, _) => Some(direction),
+        }
+    }
+
+    /// One transient operation over canonical owners. No combined tree is stored.
+    pub(crate) fn resize_attached(
+        tiled: Option<Self>,
+        floats: &[(PaneId, u16, u16)],
+        root_direction: LayoutDirection,
+        pane_id: PaneId,
+        columns: Option<u16>,
+        rows: Option<u16>,
+    ) -> Result<AttachedResize, RmuxError> {
+        use super::cell::LayoutGeometry;
+        let error = || RmuxError::Server("canonical resize exceeds representable geometry".into());
+        let mut children = match tiled {
+            None => Vec::new(),
+            Some(tree) => match tree.root.kind {
+                LayoutKind::Split(direction, children) if direction == root_direction => children,
+                kind => vec![LayoutCell {
+                    geometry: tree.root.geometry,
+                    kind,
+                }],
+            },
+        };
+        let tiled_count = children.len();
+        for &(id, cols, rows) in floats {
+            let geometry = LayoutGeometry::new(cols.into(), rows.into(), 0, 0);
+            children.push(LayoutCell::pane(id, geometry));
+        }
+        if children.is_empty() {
+            return Err(error());
+        }
+        let mut plan = Self {
+            root: LayoutCell::split(root_direction, LayoutGeometry::new(1, 1, 0, 0), children),
+        };
+        if let Some(columns) = columns {
+            plan.resize_pane_to(pane_id, LayoutDirection::LeftRight, u32::from(columns));
+        }
+        if let Some(rows) = rows {
+            plan.resize_pane_to(pane_id, LayoutDirection::TopBottom, u32::from(rows));
+        }
+        let LayoutKind::Split(_, mut children) = plan.root.kind else {
+            unreachable!()
+        };
+        let floating_sizes = children
+            .drain(tiled_count..)
+            .map(|cell| {
+                let LayoutKind::Pane(id) = cell.kind else {
+                    unreachable!()
+                };
+                Ok((
+                    id,
+                    u16::try_from(cell.geometry.width).map_err(|_| error())?,
+                    u16::try_from(cell.geometry.height).map_err(|_| error())?,
+                ))
+            })
+            .collect::<Result<Vec<_>, RmuxError>>()?;
+        let root = match children.len() {
+            0 => None,
+            1 => children.pop(),
+            _ => {
+                let mut span = u32::try_from(children.len() - 1).map_err(|_| error())?;
+                let mut cross_span = 0;
+                for child in &children {
+                    let (along, across) = match root_direction {
+                        LayoutDirection::LeftRight => (child.geometry.width, child.geometry.height),
+                        LayoutDirection::TopBottom => (child.geometry.height, child.geometry.width),
+                    };
+                    span = span.checked_add(along).ok_or_else(error)?;
+                    cross_span = cross_span.max(across);
+                }
+                let (width, height) = match root_direction {
+                    LayoutDirection::LeftRight => (span, cross_span),
+                    LayoutDirection::TopBottom => (cross_span, span),
+                };
+                Some(LayoutCell::split(
+                    root_direction,
+                    LayoutGeometry::new(width, height, 0, 0),
+                    children,
+                ))
+            }
+        };
+        let tiled = root
+            .map(|mut root| {
+                root.fix_offsets(0, 0);
+                if !root.check() {
+                    return Err(error());
+                }
+                let tree = Self { root };
+                tree.snapshot_cell()?; // Checked u16 bounds on every canonical rectangle.
+                Ok(tree)
+            })
+            .transpose()?;
+        Ok((tiled, floating_sizes))
     }
 }

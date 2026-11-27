@@ -84,6 +84,17 @@ fn session_name(value: &str) -> rmux_proto::SessionName {
 }
 
 async fn create_session(handler: &RequestHandler, name: rmux_proto::SessionName) {
+    // Pane readiness does not quiesce reader callbacks: interactive shell
+    // prompts can enqueue a delayed output refresh after setup's control drain.
+    let response = handler
+        .handle(Request::SetOption(rmux_proto::SetOptionRequest {
+            scope: ScopeSelector::Global,
+            option: rmux_proto::OptionName::DefaultCommand,
+            value: crate::test_shell::stdin_discard_command(),
+            mode: rmux_proto::SetOptionMode::Replace,
+        }))
+        .await;
+    assert!(matches!(response, Response::SetOption(_)), "{response:?}");
     let response = handler
         .handle(Request::NewSession(NewSessionRequest {
             session_name: name,
@@ -92,7 +103,8 @@ async fn create_session(handler: &RequestHandler, name: rmux_proto::SessionName)
             environment: None,
         }))
         .await;
-    assert!(matches!(response, Response::NewSession(_)), "{response:?}");
+    crate::session_fixture::assert_new_session(&response);
+    handler.wait_for_initial_pane_tasks_for_test().await;
 }
 
 async fn create_runtime_window(
@@ -380,6 +392,10 @@ async fn closed_attach_switch_rolls_back_environment_geometry_selection_touch_an
     set_attached_geometry(&handler, attach_pid).await;
     open_zoomed_choose_tree(&handler, attach_pid).await;
     while control_rx.try_recv().is_ok() {}
+    // Quiet ConPTY children still emit resize repaints. Join any current
+    // reader dispatch, then keep subsequent dispatch outside the switch's
+    // observation interval. PTYs and queued reader events remain live.
+    let _reader_dispatch = handler.pane_alert_dispatch.lock().await;
     while observer_rx.try_recv().is_ok() {}
     let mode_tree_before =
         capture_mode_tree_preservation_snapshot(&handler, &alpha, observer_pid, observer_attach_id)
@@ -396,7 +412,11 @@ async fn closed_attach_switch_rolls_back_environment_geometry_selection_touch_an
         );
         state.set_attached_terminal_pixels(&beta, Some(initial_pixels));
         (
-            state.sessions.session(&beta).expect("beta exists").clone(),
+            state
+                .sessions
+                .session(&beta)
+                .expect("beta exists")
+                .test_snapshot(),
             state
                 .environment
                 .session_value(&beta, "DISPLAY")
@@ -420,7 +440,13 @@ async fn closed_attach_switch_rolls_back_environment_geometry_selection_touch_an
     );
 
     let state = handler.state.lock().await;
-    assert_eq!(state.sessions.session(&beta), Some(&before_session));
+    assert_eq!(
+        state
+            .sessions
+            .session(&beta)
+            .map(|session| session.test_snapshot()),
+        Some(before_session)
+    );
     assert_eq!(
         state.environment.session_value(&beta, "DISPLAY"),
         before_display.as_deref()
@@ -481,7 +507,11 @@ async fn receiver_close_after_precheck_uses_runtime_rollback_for_the_residual_ra
         );
         state.set_attached_terminal_pixels(&beta, Some(initial_pixels));
         (
-            state.sessions.session(&beta).expect("beta exists").clone(),
+            state
+                .sessions
+                .session(&beta)
+                .expect("beta exists")
+                .test_snapshot(),
             state
                 .environment
                 .session_value(&beta, "DISPLAY")
@@ -510,7 +540,13 @@ async fn receiver_close_after_precheck_uses_runtime_rollback_for_the_residual_ra
     );
 
     let state = handler.state.lock().await;
-    assert_eq!(state.sessions.session(&beta), Some(&before_session));
+    assert_eq!(
+        state
+            .sessions
+            .session(&beta)
+            .map(|session| session.test_snapshot()),
+        Some(before_session)
+    );
     assert_eq!(
         state.environment.session_value(&beta, "DISPLAY"),
         before_display.as_deref()
@@ -634,9 +670,12 @@ async fn successful_attach_switch_applies_mode_tree_dismissal_after_delivery() {
         capture_mode_tree_preservation_snapshot(&handler, &alpha, observer_pid, observer_attach_id)
             .await;
 
-    let response = handler
-        .handle_switch_client_ext3(attach_pid, switch_request(beta.to_string()))
-        .await;
+    let response = tokio::time::timeout(
+        std::time::Duration::from_secs(2),
+        handler.handle_switch_client_ext3(attach_pid, switch_request(beta.to_string())),
+    )
+    .await
+    .expect("focus transition drains before committed mode-tree lifecycle effects");
     assert!(
         matches!(response, Response::SwitchClient(_)),
         "{response:?}"
@@ -843,7 +882,11 @@ async fn closed_control_switch_preserves_environment_selection_and_touch() {
             "switch-atomic-control-before".to_owned(),
         );
         (
-            state.sessions.session(&beta).expect("beta exists").clone(),
+            state
+                .sessions
+                .session(&beta)
+                .expect("beta exists")
+                .test_snapshot(),
             state
                 .environment
                 .session_value(&beta, "DISPLAY")
@@ -865,7 +908,13 @@ async fn closed_control_switch_preserves_environment_selection_and_touch() {
         })
     );
     let state = handler.state.lock().await;
-    assert_eq!(state.sessions.session(&beta), Some(&before_session));
+    assert_eq!(
+        state
+            .sessions
+            .session(&beta)
+            .map(|session| session.test_snapshot()),
+        Some(before_session)
+    );
     assert_eq!(
         state.environment.session_value(&beta, "DISPLAY"),
         before_display.as_deref()
@@ -920,7 +969,11 @@ async fn control_switch_resize_failure_preserves_session_identity_and_event_stre
         let state = handler.state.lock().await;
         (
             state.sessions.session(&alpha).expect("alpha exists").id(),
-            state.sessions.session(&beta).expect("beta exists").clone(),
+            state
+                .sessions
+                .session(&beta)
+                .expect("beta exists")
+                .test_snapshot(),
         )
     };
     let before_terminal_size = pane_terminal_size(&handler, &beta, target_window).await;
@@ -971,7 +1024,13 @@ async fn control_switch_resize_failure_preserves_session_identity_and_event_stre
 
     {
         let state = handler.state.lock().await;
-        assert_eq!(state.sessions.session(&beta), Some(&before_session));
+        assert_eq!(
+            state
+                .sessions
+                .session(&beta)
+                .map(|session| session.test_snapshot()),
+            Some(before_session)
+        );
     }
     assert_eq!(
         pane_terminal_size(&handler, &beta, target_window).await,
@@ -1074,6 +1133,7 @@ async fn control_switch_success_commits_environment_touch_selection_and_event() 
         let state = handler.state.lock().await;
         let target = state.sessions.session(&beta).expect("beta survives");
         assert_eq!(target.active_window_index(), target_window);
+        assert_eq!(target.terminal_size(), SWITCH_SIZE);
         assert_eq!(target.window().size(), SWITCH_SIZE);
         assert!(target.last_attached_at().is_some());
         assert_eq!(
@@ -1116,6 +1176,10 @@ async fn attach_identity_replacement_after_size_selection_commits_no_target_muta
     set_attached_geometry(&handler, attach_pid).await;
     open_zoomed_choose_tree(&handler, attach_pid).await;
     while old_rx.try_recv().is_ok() {}
+    // Quiet ConPTY children still emit resize repaints. Join any current
+    // reader dispatch, then keep subsequent dispatch outside the switch's
+    // observation interval. PTYs and queued reader events remain live.
+    let _reader_dispatch = handler.pane_alert_dispatch.lock().await;
     while observer_rx.try_recv().is_ok() {}
     let mode_tree_before =
         capture_mode_tree_preservation_snapshot(&handler, &alpha, observer_pid, observer_attach_id)
@@ -1127,7 +1191,11 @@ async fn attach_identity_replacement_after_size_selection_commits_no_target_muta
             "DISPLAY".to_owned(),
             "switch-atomic-replace-before".to_owned(),
         );
-        state.sessions.session(&beta).expect("beta exists").clone()
+        state
+            .sessions
+            .session(&beta)
+            .expect("beta exists")
+            .test_snapshot()
     };
     let pause = handler.install_attached_size_selection_pause();
 
@@ -1165,7 +1233,13 @@ async fn attach_identity_replacement_after_size_selection_commits_no_target_muta
         );
     }
     let state = handler.state.lock().await;
-    assert_eq!(state.sessions.session(&beta), Some(&before_session));
+    assert_eq!(
+        state
+            .sessions
+            .session(&beta)
+            .map(|session| session.test_snapshot()),
+        Some(before_session)
+    );
     assert_eq!(
         state.environment.session_value(&beta, "DISPLAY"),
         Some("switch-atomic-replace-before")
@@ -1180,3 +1254,11 @@ async fn attach_identity_replacement_after_size_selection_commits_no_target_muta
     assert_eq!(replacement.id, replacement_id);
     assert_eq!(replacement.session_name, alpha);
 }
+
+#[cfg(test)]
+#[path = "switch_startup_synchronization_tests.rs"]
+mod startup_synchronization;
+
+#[cfg(test)]
+#[path = "switch_output_synchronization_tests.rs"]
+mod output_synchronization;

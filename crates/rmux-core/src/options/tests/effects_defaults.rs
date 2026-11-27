@@ -264,7 +264,6 @@ fn invalid_number_values_use_tmux_error_text() {
     for option in [
         OptionName::BaseIndex,
         OptionName::StatusInterval,
-        OptionName::RepeatTime,
         OptionName::MessageLimit,
     ] {
         let too_large = store
@@ -288,6 +287,28 @@ fn invalid_number_values_use_tmux_error_text() {
                 SetOptionMode::Replace,
             )
             .expect("INT_MAX itself is accepted");
+    }
+    // options-table.c bounds both repeat delays at 2,000,000, not INT_MAX.
+    for option in [OptionName::RepeatTime, OptionName::InitialRepeatTime] {
+        store
+            .set(
+                ScopeSelector::Global,
+                option,
+                "2000000".to_owned(),
+                SetOptionMode::Replace,
+            )
+            .unwrap();
+        assert_eq!(
+            store.set(
+                ScopeSelector::Global,
+                option,
+                "2000001".to_owned(),
+                SetOptionMode::Replace
+            ),
+            Err(RmuxError::InvalidSetOption(
+                "value is too large: 2000001".to_owned()
+            ))
+        );
     }
 }
 
@@ -433,13 +454,51 @@ fn frozen_registry_scope_counts_match_tmux_partitioning() {
         .filter(|entry| entry.scope_mask() == (registry::SCOPE_WINDOW | registry::SCOPE_PANE))
         .count();
 
-    // tmux 3.7b frozen: 25 server, 54 session, 70 window (52 window-only + 18 window|pane)
+    // Authenticated tmux 3.7b ordinary table: 55 window-only + 19 window|pane.
     assert_eq!(server_count, 25, "server options");
     assert_eq!(session_count, 54, "session options");
     assert_eq!(
         window_only_count + window_pane_count,
-        70,
+        74,
         "window options total"
     );
-    assert_eq!(window_pane_count, 18, "window|pane dual-scope options");
+    assert_eq!(window_pane_count, 19, "window|pane dual-scope options");
+}
+
+#[test]
+fn default_size_append_validates_the_supplied_size_before_concatenating() {
+    let mut store = OptionStore::new();
+    let alpha = session_name("alpha");
+    store
+        .set(
+            ScopeSelector::Session(alpha.clone()),
+            OptionName::DefaultSize,
+            "91x27".to_owned(),
+            SetOptionMode::Replace,
+        )
+        .unwrap();
+    store
+        .set(
+            ScopeSelector::Session(alpha.clone()),
+            OptionName::DefaultSize,
+            "89x26".to_owned(),
+            SetOptionMode::Append,
+        )
+        .unwrap();
+    assert_eq!(
+        store.resolve(Some(&alpha), OptionName::DefaultSize),
+        Some("91x2789x26")
+    );
+    assert!(store
+        .set(
+            ScopeSelector::Session(alpha.clone()),
+            OptionName::DefaultSize,
+            "invalid".to_owned(),
+            SetOptionMode::Append
+        )
+        .is_err());
+    assert_eq!(
+        store.resolve(Some(&alpha), OptionName::DefaultSize),
+        Some("91x2789x26")
+    );
 }

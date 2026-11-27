@@ -1,4 +1,6 @@
-use rmux_core::command_parser::{CommandParser, ParsedCommand};
+use rmux_core::command_parser::{
+    check_tmux_arguments, CommandArgument, CommandParser, ParsedCommand, ParsedCommands,
+};
 use rmux_proto::{
     HookLifecycle, HookName, RmuxError, ScopeSelector, SetHookMutationRequest, SetHookRequest,
 };
@@ -54,112 +56,43 @@ pub(crate) fn canonicalize_set_hook_mutation_command(
     match parser.parse(command) {
         Ok(parsed) => {
             validate_parsed_hook_commands(&parsed)?;
-            request.command = Some(parsed.to_tmux_binding_string());
+            request.command = Some(hook_command_list_string(&parsed));
             Ok(request)
         }
         Err(error) => Err(RmuxError::Server(error.to_string())),
     }
 }
 
-fn validate_parsed_hook_commands(
-    commands: &rmux_core::command_parser::ParsedCommands,
-) -> Result<(), RmuxError> {
+/// Renders a hook's command list the way tmux `cmd_list_print` shows it and
+/// so that replaying the stored text yields the same commands.
+///
+/// tmux keeps a hook as a parsed command list and runs every command in it.
+/// The bind-key argv form (` \; `) must not be stored here: the hook replay
+/// parses the stored text as a command string, where `\;` is a literal `;`
+/// argument, so the whole list would collapse into one invalid command. All
+/// commands are joined with ` ; `, whatever line they came from, because
+/// tmux shows them that way and stops the whole hook list on a failure.
+fn hook_command_list_string(commands: &ParsedCommands) -> String {
+    commands
+        .commands()
+        .iter()
+        .map(ParsedCommand::to_tmux_reparse_string)
+        .collect::<Vec<_>>()
+        .join(" ; ")
+}
+
+fn validate_parsed_hook_commands(commands: &ParsedCommands) -> Result<(), RmuxError> {
     for command in commands.commands() {
-        validate_no_positional_hook_command(command)?;
-    }
-    Ok(())
-}
-
-fn validate_no_positional_hook_command(command: &ParsedCommand) -> Result<(), RmuxError> {
-    let Some(spec) = NoPositionalCommandSpec::for_command(command.name()) else {
-        return Ok(());
-    };
-
-    let mut index = 0;
-    while index < command.arguments().len() {
-        let argument = &command.arguments()[index];
-        let Some(value) = argument.as_string() else {
-            return Err(too_many_hook_arguments(
-                command.name(),
-                spec.max_positionals,
-            ));
-        };
-
-        if value == "--" {
-            if index + 1 < command.arguments().len() {
-                return Err(too_many_hook_arguments(
-                    command.name(),
-                    spec.max_positionals,
-                ));
+        // tmux builds brace blocks before checking their containing command.
+        // Strings stay deferred until the command that owns them parses them.
+        for argument in command.arguments() {
+            if let CommandArgument::Commands(nested) = argument {
+                validate_parsed_hook_commands(nested)?;
             }
-            return Ok(());
         }
-
-        if spec.boolean_flags.contains(&value) {
-            index += 1;
-            continue;
-        }
-
-        if spec.value_flags.contains(&value) {
-            index += 2;
-            continue;
-        }
-
-        if spec
-            .value_flags
-            .iter()
-            .any(|flag| value.starts_with(flag) && value.len() > flag.len())
-        {
-            index += 1;
-            continue;
-        }
-
-        if value.starts_with('-') {
-            return Err(RmuxError::Server(format!(
-                "command {}: unknown flag {}",
-                command.name(),
-                value
-            )));
-        }
-
-        return Err(too_many_hook_arguments(
-            command.name(),
-            spec.max_positionals,
-        ));
+        check_tmux_arguments(command).map_err(|error| RmuxError::Server(error.to_string()))?;
     }
-
     Ok(())
-}
-
-fn too_many_hook_arguments(command: &str, max_positionals: usize) -> RmuxError {
-    RmuxError::Server(format!(
-        "command {command}: too many arguments (need at most {max_positionals})"
-    ))
-}
-
-#[derive(Debug, Clone, Copy)]
-struct NoPositionalCommandSpec {
-    max_positionals: usize,
-    boolean_flags: &'static [&'static str],
-    value_flags: &'static [&'static str],
-}
-
-impl NoPositionalCommandSpec {
-    fn for_command(command: &str) -> Option<Self> {
-        match command {
-            "last-window" | "next-layout" | "previous-layout" => Some(Self {
-                max_positionals: 0,
-                boolean_flags: &[],
-                value_flags: &["-t"],
-            }),
-            "next-window" | "previous-window" => Some(Self {
-                max_positionals: 0,
-                boolean_flags: &["-a"],
-                value_flags: &["-t"],
-            }),
-            _ => None,
-        }
-    }
 }
 
 fn extract_self_unsetting_shell_command(
@@ -342,8 +275,38 @@ mod tests {
         .expect("known commands should canonicalize");
         assert_eq!(
             canonical.command.as_deref(),
-            Some("display-message hi \\; select-window -t :0")
+            Some("display-message hi ; select-window -t :0")
         );
+    }
+
+    #[test]
+    fn stores_a_hook_list_as_a_replayable_tmux_command_list() {
+        let parser = rmux_core::command_parser::CommandParser::new();
+        for source in [
+            "set-option -g @a 1 ; set-option -g @b 'x;y'",
+            "set-option -g @a 1\nset-option -g @b 'x;y'",
+        ] {
+            let request = SetHookMutationRequest {
+                scope: ScopeSelector::Global,
+                hook: HookName::AfterNewWindow,
+                command: Some(source.to_owned()),
+                lifecycle: HookLifecycle::Persistent,
+                append: false,
+                unset: false,
+                run_immediately: false,
+                index: None,
+            };
+
+            let stored = super::canonicalize_set_hook_mutation_command(request, &parser)
+                .expect("a hook list should canonicalize")
+                .command
+                .expect("the hook keeps its command");
+
+            assert_eq!(stored, "set-option -g @a 1 ; set-option -g @b \"x;y\"");
+            let replayed = parser.parse(&stored).expect("stored hook reparses");
+            let names: Vec<_> = replayed.commands().iter().map(|c| c.name()).collect();
+            assert_eq!(names, ["set-option", "set-option"], "{source:?}");
+        }
     }
 
     #[test]
@@ -417,6 +380,133 @@ mod tests {
             error.to_string().contains("unknown command: printf"),
             "unexpected error: {error}"
         );
+    }
+
+    // Measured against tmux 3.7b on Darwin and Linux: parse errors reject the
+    // complete hook list, including brace blocks, before storage or execution.
+    #[test]
+    fn hook_args_parse_rejects_invalid_commands_everywhere_in_the_list() {
+        for (command, cause) in [
+            (
+                r"set-option -g @a 1 \; set-option -g @b 2",
+                "command set-option: too many arguments (need at most 2)",
+            ),
+            (
+                "set-option -g @a 1 ; display-message -Q",
+                "command display-message: unknown flag -Q",
+            ),
+            (
+                "set-option -g",
+                "command set-option: too few arguments (need at least 1)",
+            ),
+            (
+                "display-message -t",
+                "command display-message: -t expects an argument",
+            ),
+            (
+                "display-message -:",
+                "command display-message: invalid flag -:",
+            ),
+            (
+                "if-shell -F 1 -Z { display-message -Q }",
+                "command display-message: unknown flag -Q",
+            ),
+            (
+                "display-message -t { display-message hi }",
+                "command display-message: -t argument must be a string",
+            ),
+            (
+                "display-message hi -Q",
+                "command display-message: too many arguments (need at most 1)",
+            ),
+        ] {
+            let error = canonicalize_hook(command).expect_err(command);
+            assert_eq!(
+                error,
+                rmux_proto::RmuxError::Server(cause.to_owned()),
+                "{command}"
+            );
+        }
+    }
+
+    #[test]
+    fn hook_args_parse_preserves_valid_lists_and_deferred_strings() {
+        for command in [
+            "next-window -at:99",
+            "set-option -g @a 1 ; set-option -g @b 2",
+            "set-option -g @a 'x;y'",
+            "display-message -- -Q",
+            "if-shell -F 1 'display-message -Q'",
+            "if-shell -F 1 { display-message hi ; set-option -g @b 2 }",
+        ] {
+            canonicalize_hook(command).expect(command);
+        }
+    }
+
+    #[tokio::test]
+    async fn hook_args_parse_rejects_both_request_paths_without_mutating_the_hook() {
+        use rmux_proto::{Request, Response, ShowHooksRequest};
+
+        let handler = crate::handler::RequestHandler::new();
+        let valid = canonicalize_hook("display-message original").expect("valid hook");
+        assert!(matches!(
+            handler
+                .handle(Request::SetHookMutation(valid.clone()))
+                .await,
+            Response::SetHook(_)
+        ));
+        let show = Request::ShowHooks(ShowHooksRequest {
+            scope: ScopeSelector::Global,
+            window: false,
+            pane: false,
+            hook: Some(HookName::AfterNewWindow),
+        });
+        let before = handler.handle(show.clone()).await;
+        let invalid = "display-message first ; display-message -Q";
+        let legacy = Request::SetHook(SetHookRequest {
+            scope: valid.scope.clone(),
+            hook: valid.hook,
+            command: invalid.to_owned(),
+            lifecycle: valid.lifecycle,
+        });
+        let mut requests = vec![legacy];
+        for (append, index) in [(false, None), (true, None), (false, Some(2))] {
+            requests.push(Request::SetHookMutation(SetHookMutationRequest {
+                command: Some(invalid.to_owned()),
+                append,
+                index,
+                ..valid.clone()
+            }));
+        }
+        for request in requests {
+            let response = handler.handle(request).await;
+            let Response::Error(error) = response else {
+                panic!("invalid hook accepted: {response:?}");
+            };
+            assert_eq!(
+                error.error,
+                rmux_proto::RmuxError::Server(
+                    "command display-message: unknown flag -Q".to_owned()
+                )
+            );
+            assert_eq!(handler.handle(show.clone()).await, before);
+        }
+    }
+
+    fn canonicalize_hook(command: &str) -> Result<SetHookMutationRequest, rmux_proto::RmuxError> {
+        super::canonicalize_set_hook_mutation_command(
+            SetHookMutationRequest {
+                scope: ScopeSelector::Global,
+                hook: HookName::AfterNewWindow,
+                command: Some(command.to_owned()),
+                lifecycle: HookLifecycle::Persistent,
+                append: false,
+                unset: false,
+                run_immediately: false,
+                index: None,
+            },
+            &rmux_core::command_parser::CommandParser::new(),
+        )
     }
 
     fn shell_quote_str(value: &str) -> String {

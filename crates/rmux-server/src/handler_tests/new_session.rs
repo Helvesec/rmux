@@ -91,7 +91,7 @@ async fn new_session_honors_global_base_index_and_default_size() {
             environment: None,
         }))
         .await;
-    assert!(matches!(created, Response::NewSession(_)));
+    crate::session_fixture::assert_new_session(&created);
 
     let state = handler.state.lock().await;
     let session = state
@@ -136,7 +136,7 @@ async fn new_session_uses_default_command_when_request_omits_command() {
             environment: None,
         }))
         .await;
-    assert!(matches!(created, Response::NewSession(_)));
+    crate::session_fixture::assert_new_session(&created);
 
     let state = handler.state.lock().await;
     let session = state
@@ -173,7 +173,7 @@ async fn duplicate_new_session_returns_the_duplicate_session_error() {
     let first = handler.handle(request.clone()).await;
     let duplicate = handler.handle(request).await;
 
-    assert!(matches!(first, Response::NewSession(_)));
+    crate::session_fixture::assert_new_session(&first);
     assert_eq!(
         duplicate,
         Response::Error(rmux_proto::ErrorResponse {
@@ -253,7 +253,7 @@ async fn attach_if_exists_reports_attach_semantics_without_new_session_hook() {
             environment: None,
         }))
         .await;
-    assert!(matches!(created, Response::NewSession(_)));
+    crate::session_fixture::assert_new_session(&created);
 
     let hook = handler
         .handle(Request::SetHook(SetHookRequest {
@@ -311,7 +311,7 @@ async fn attach_if_exists_reports_attach_semantics_without_new_session_hook() {
             environment: None,
         }))
         .await;
-    assert!(matches!(fresh, Response::NewSession(_)), "{fresh:?}");
+    crate::session_fixture::assert_new_session(&fresh);
     let state = handler.state.lock().await;
     assert_eq!(
         state.environment.global_value("ATTACH_EXISTING_HOOK"),
@@ -333,7 +333,7 @@ async fn grouped_new_session_without_explicit_name_uses_tmux_suffix_shape() {
             environment: None,
         }))
         .await;
-    assert!(matches!(created, Response::NewSession(_)));
+    crate::session_fixture::assert_new_session(&created);
 
     let grouped = handler
         .handle(Request::NewSessionExt(Box::new(NewSessionExtRequest {
@@ -388,7 +388,10 @@ async fn new_session_print_resolves_captured_identity_after_concurrent_rename() 
     let handler = RequestHandler::new();
     let old_name = session_name("print-before-rename");
     let new_name = session_name("print-after-rename");
-    let session_id = handler.state.lock().await.sessions.next_session_id();
+    let session_id = rmux_core::SessionId::new(
+        u32::try_from(handler.state.lock().await.sessions.next_session_id())
+            .expect("fixture session identity fits"),
+    );
     let pause = handler.install_new_session_output_pause(session_id);
     let create_handler = handler.clone();
     let create = tokio::spawn(async move {
@@ -451,7 +454,7 @@ async fn auto_named_session_uses_next_global_session_id_after_named_sessions() {
                 environment: None,
             }))
             .await;
-        assert!(matches!(created, Response::NewSession(_)));
+        crate::session_fixture::assert_new_session(&created);
     }
 
     let unnamed = handler
@@ -499,7 +502,7 @@ async fn grouped_new_session_rejects_shell_command_like_tmux() {
             environment: None,
         }))
         .await;
-    assert!(matches!(created, Response::NewSession(_)));
+    crate::session_fixture::assert_new_session(&created);
 
     let grouped = handler
         .handle(Request::NewSessionExt(Box::new(NewSessionExtRequest {
@@ -541,7 +544,7 @@ async fn grouped_new_session_uses_next_global_session_id_suffix_when_group_is_ne
                 environment: None,
             }))
             .await;
-        assert!(matches!(created, Response::NewSession(_)));
+        crate::session_fixture::assert_new_session(&created);
     }
 
     let grouped = handler

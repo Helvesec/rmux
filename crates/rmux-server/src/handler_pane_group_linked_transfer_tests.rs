@@ -2409,13 +2409,17 @@ async fn break_last_linked_pane_between_group_aliases_matches_tmux_group_rejecti
                 .sessions
                 .session(&owner)
                 .expect("owner exists")
-                .clone(),
-            state.sessions.session(&peer).expect("peer exists").clone(),
+                .test_snapshot(),
+            state
+                .sessions
+                .session(&peer)
+                .expect("peer exists")
+                .test_snapshot(),
             state
                 .sessions
                 .session(&linked_owner)
                 .expect("linked owner exists")
-                .clone(),
+                .test_snapshot(),
         )
     };
 
@@ -2439,9 +2443,27 @@ async fn break_last_linked_pane_between_group_aliases_matches_tmux_group_rejecti
     }
 
     let state = handler.state.lock().await;
-    assert_eq!(state.sessions.session(&owner), Some(&owner_before));
-    assert_eq!(state.sessions.session(&peer), Some(&peer_before));
-    assert_eq!(state.sessions.session(&linked_owner), Some(&linked_before));
+    assert_eq!(
+        state
+            .sessions
+            .session(&owner)
+            .map(|session| session.test_snapshot()),
+        Some(owner_before)
+    );
+    assert_eq!(
+        state
+            .sessions
+            .session(&peer)
+            .map(|session| session.test_snapshot()),
+        Some(peer_before)
+    );
+    assert_eq!(
+        state
+            .sessions
+            .session(&linked_owner)
+            .map(|session| session.test_snapshot()),
+        Some(linked_before)
+    );
     state
         .pane_profile_in_window(&peer, 1, 0)
         .expect("rejected pane retains its linked runtime alias");

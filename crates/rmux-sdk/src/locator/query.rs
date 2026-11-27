@@ -36,17 +36,23 @@ fn evaluate_text(text: &LocatorText, snapshot: &PaneSnapshot) -> Result<Vec<Loca
             .map(|text_match| LocatorMatch { text_match })
             .collect()),
         #[cfg(feature = "regex")]
-        LocatorText::Regex(pattern) => evaluate_regex(pattern, snapshot),
+        LocatorText::Regex(pattern) => evaluate_regex(&compile_pattern(pattern)?, snapshot),
+        #[cfg(feature = "regex")]
+        LocatorText::CompiledRegex(regex) => evaluate_regex(regex.as_regex(), snapshot),
     }
 }
 
 #[cfg(feature = "regex")]
-fn evaluate_regex(pattern: &str, snapshot: &PaneSnapshot) -> Result<Vec<LocatorMatch>> {
-    let regex = regex::RegexBuilder::new(pattern)
+fn compile_pattern(pattern: &str) -> Result<regex::Regex> {
+    regex::RegexBuilder::new(pattern)
         .size_limit(1_000_000)
         .dfa_size_limit(1_000_000)
         .build()
-        .map_err(|error| RmuxError::invalid_regex(pattern, error.to_string()))?;
+        .map_err(|error| RmuxError::invalid_regex(pattern, error.to_string()))
+}
+
+#[cfg(feature = "regex")]
+fn evaluate_regex(regex: &regex::Regex, snapshot: &PaneSnapshot) -> Result<Vec<LocatorMatch>> {
     let mut matches = Vec::new();
     for row in 0..snapshot.rows {
         let line = snapshot.row_text(row);
@@ -67,7 +73,7 @@ fn evaluate_regex(pattern: &str, snapshot: &PaneSnapshot) -> Result<Vec<LocatorM
 
 pub(super) fn apply_filter(matches: &mut Vec<LocatorMatch>, filter: &LocatorFilter) -> Result<()> {
     if filter.visible == Some(false) {
-        return Err(RmuxError::protocol(rmux_proto::RmuxError::Server(
+        return Err(RmuxError::from_proto(rmux_proto::RmuxError::Server(
             "locator filter visible=false is unsupported for terminal snapshots; use wait_for_state(LocatorState::Hidden) or expect().to_be_hidden()"
                 .to_owned(),
         )));
@@ -98,6 +104,10 @@ pub(super) fn describe_query(query: &LocatorQuery) -> String {
         LocatorQuery::Text(LocatorText::Literal(text)) => format!("text={text:?}"),
         #[cfg(feature = "regex")]
         LocatorQuery::Text(LocatorText::Regex(pattern)) => format!("regex={pattern:?}"),
+        #[cfg(feature = "regex")]
+        LocatorQuery::Text(LocatorText::CompiledRegex(regex)) => {
+            format!("regex={:?}", regex.as_regex().as_str())
+        }
         LocatorQuery::Or(left, right) => {
             format!("({} or {})", describe_query(left), describe_query(right))
         }
@@ -152,7 +162,8 @@ mod tests {
         )
         .expect("valid snapshot");
 
-        let matches = evaluate_regex("界B", &snapshot).expect("valid regex");
+        let regex = compile_pattern("界B").expect("valid regex");
+        let matches = evaluate_regex(&regex, &snapshot).expect("regex evaluates");
 
         assert_eq!(matches.len(), 1);
         assert_eq!(matches[0].text_match.start_col, 1);

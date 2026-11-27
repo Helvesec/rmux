@@ -1,7 +1,9 @@
+#[path = "../../../../tests/support/executable_fixture.rs"]
+mod executable_fixture;
+
 use std::fs::File;
 use std::io::{self, Read, Write};
 use std::os::fd::{AsFd, BorrowedFd};
-use std::os::unix::fs::PermissionsExt;
 use std::os::unix::net::UnixStream;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
@@ -27,16 +29,108 @@ use super::{
 
 static RESIZE_WATCHER_SIGNAL_TEST_LOCK: Mutex<()> = Mutex::new(());
 
+#[test]
+fn attach_fragment_header_only_read_preserves_current_payload(
+) -> Result<(), Box<dyn std::error::Error>> {
+    let (client, mut server) = UnixStream::pair()?;
+    let read_probe = client.try_clone()?;
+    let (mut output_reader, output_writer) = UnixStream::pair()?;
+    output_reader.set_read_timeout(Some(Duration::from_secs(2)))?;
+    let closed = Arc::new(AtomicBool::new(false));
+    let locked = Arc::new(AttachLockState::default());
+    let (event_tx, _event_rx) = mpsc::channel();
+    let worker = std::thread::spawn(move || {
+        output_loop(
+            client,
+            Vec::new(),
+            output_writer,
+            closed,
+            locked,
+            AttachScreenTracker::default(),
+            event_tx,
+        )
+    });
+
+    server.write_all(&encode_attach_message(&AttachMessage::Data(vec![
+        b'A';
+        64
+    ]))?)?;
+    let mut first = [0_u8; 64];
+    output_reader.read_exact(&mut first)?;
+    assert_eq!(first, [b'A'; 64]);
+    let expected = b"y\x1b[?1049l";
+    let frame = encode_attach_message(&AttachMessage::Data(expected.to_vec()))?;
+    server.write_all(&frame[..5])?;
+    let deadline = Instant::now() + Duration::from_secs(2);
+    while rustix::io::ioctl_fionread(&read_probe)? != 0 {
+        assert!(
+            Instant::now() < deadline,
+            "attach must read the isolated header"
+        );
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    server.write_all(&frame[5..])?;
+    server.shutdown(std::net::Shutdown::Write)?;
+    let mut second = Vec::new();
+    output_reader.read_to_end(&mut second)?;
+    let result = worker.join().map_err(|_| "attach output worker panicked")?;
+    assert_eq!(second, expected, "fragment must not contain stale A bytes");
+    result?;
+    Ok(())
+}
+
 const CONTROLLING_TTY_CASE_ENV: &str = "RMUX_CLIENT_CONTROLLING_TTY_CASE";
 const LOCK_ACTIONS_TTY_CASE: &str = "lock-actions";
 const STRUCTURED_SHELL_TTY_CASE: &str = "structured-shell";
+
+#[test]
+fn controlling_tty_child_rejects_stale_selector() {
+    let error = run_test_with_controlling_tty(
+        "attach::tests::unix_lock_actions_rearm_screen_before_sending_unlock",
+        "stale-selector",
+    )
+    .expect_err("a successful child running zero tests must be rejected");
+    let message = error.to_string();
+    assert!(message.contains("exit status: 0"), "{message}");
+    assert!(message.contains("running 0 tests"), "{message}");
+}
+
+#[test]
+fn controlling_tty_child_rejects_missing_selector() {
+    let error = run_test_with_controlling_tty("missing_controlling_tty_test", "missing-selector")
+        .expect_err("a successful child running zero tests must be rejected");
+    let message = error.to_string();
+    assert!(message.contains("exit status: 0"), "{message}");
+    assert!(message.contains("running 0 tests"), "{message}");
+}
+
+#[test]
+fn controlling_tty_child_rejects_selected_failure() -> Result<(), Box<dyn std::error::Error>> {
+    const CASE: &str = "selected-failure";
+    if std::env::var(CONTROLLING_TTY_CASE_ENV).as_deref() == Ok(CASE) {
+        return Err("intentional controlling-TTY child failure".into());
+    }
+    let error =
+        run_test_with_controlling_tty("controlling_tty_child_rejects_selected_failure", CASE)
+            .expect_err("a selected failing child must be rejected");
+    let message = error.to_string();
+    assert!(message.contains("running 1 test"), "{message}");
+    assert!(
+        message.contains("intentional controlling-TTY child failure"),
+        "{message}"
+    );
+    assert!(message.contains("1 failed"), "{message}");
+    Ok(())
+}
 
 fn run_test_with_controlling_tty(
     test_name: &str,
     case: &str,
 ) -> Result<(), Box<dyn std::error::Error>> {
+    let module = module_path!().split_once("::").unwrap().1;
+    let test_name = format!("{module}::{test_name}");
     let spawned = ChildCommand::new(std::env::current_exe()?)
-        .arg(test_name)
+        .arg(&test_name)
         .args(["--exact", "--nocapture", "--test-threads=1"])
         .env(CONTROLLING_TTY_CASE_ENV, case)
         .size(rmux_pty::TerminalSize::new(80, 24))
@@ -57,6 +151,32 @@ fn run_test_with_controlling_tty(
         ))
         .into());
     }
+    let output = String::from_utf8_lossy(&output);
+    let passed_test = format!("test {test_name} ... ok");
+    if output
+        .lines()
+        .filter(|line| line.trim() == "running 1 test")
+        .count()
+        != 1
+        || output
+            .lines()
+            .filter(|line| line.trim() == passed_test)
+            .count()
+            != 1
+        || output
+            .lines()
+            .filter(|line| {
+                line.starts_with("test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured;")
+            })
+            .count()
+            != 1
+    {
+        return Err(io::Error::other(format!(
+            "controlling-TTY child {test_name} did not execute exactly one selected test with {status}: {output}"
+        ))
+        .into());
+    }
+    eprintln!("controlling-TTY child {test_name}: {status}\n{output}");
     Ok(())
 }
 
@@ -277,7 +397,7 @@ fn unix_lock_actions_rearm_screen_before_sending_unlock() -> Result<(), Box<dyn 
 {
     if std::env::var(CONTROLLING_TTY_CASE_ENV).as_deref() != Ok(LOCK_ACTIONS_TTY_CASE) {
         return run_test_with_controlling_tty(
-            "attach::tests::unix_lock_actions_rearm_screen_before_sending_unlock",
+            "unix_lock_actions_rearm_screen_before_sending_unlock",
             LOCK_ACTIONS_TTY_CASE,
         );
     }
@@ -438,6 +558,46 @@ fn output_loop_errors_when_server_hangs_up_before_attach_stop(
             .contains("attach stream closed before attach-stop sequence"),
         "unexpected output-loop error: {error}"
     );
+    Ok(())
+}
+
+#[test]
+fn output_loop_reports_a_server_exit_notice_after_its_banner(
+) -> Result<(), Box<dyn std::error::Error>> {
+    let (client_stream, mut server_stream) = UnixStream::pair()?;
+    let output = SharedOutput::default();
+    let captured = output.clone();
+    let closed = Arc::new(AtomicBool::new(false));
+    let closed_probe = Arc::clone(&closed);
+    let locked = Arc::new(AttachLockState::default());
+    let (action_tx, _action_rx) = mpsc::channel();
+
+    let mut payload = fallback_attach_stop_sequence("xterm-256color");
+    payload.extend_from_slice(b"[server exited]\r\n");
+    server_stream.write_all(&encode_attach_message(&AttachMessage::Data(payload))?)?;
+    server_stream.write_all(&encode_attach_message(&AttachMessage::ServerExited)?)?;
+    // The stream stays open: the typed notice alone ends the attach.
+    let error = output_loop(
+        client_stream,
+        Vec::new(),
+        output,
+        closed,
+        locked,
+        AttachScreenTracker::default(),
+        action_tx,
+    )
+    .expect_err("a server exit must not be reported as a clean detach");
+
+    assert!(
+        matches!(error, crate::ClientError::ServerExited),
+        "unexpected output-loop error: {error}"
+    );
+    assert!(closed_probe.load(Ordering::SeqCst));
+    assert!(
+        captured.into_bytes()?.ends_with(b"[server exited]\r\n"),
+        "the banner must reach the terminal before the client exits"
+    );
+    drop(server_stream);
     Ok(())
 }
 
@@ -915,7 +1075,7 @@ fn structured_shell_commands_use_server_resolved_shell_and_cwd(
 ) -> Result<(), Box<dyn std::error::Error>> {
     if std::env::var(CONTROLLING_TTY_CASE_ENV).as_deref() != Ok(STRUCTURED_SHELL_TTY_CASE) {
         return run_test_with_controlling_tty(
-            "attach::tests::structured_shell_commands_use_server_resolved_shell_and_cwd",
+            "structured_shell_commands_use_server_resolved_shell_and_cwd",
             STRUCTURED_SHELL_TTY_CASE,
         );
     }
@@ -928,13 +1088,11 @@ fn structured_shell_commands_use_server_resolved_shell_and_cwd(
     let cwd = root.join("cwd");
     std::fs::create_dir_all(&cwd)?;
     let shell = root.join("shell-wrapper");
-    std::fs::write(
+    executable_fixture::write_executable(
         &shell,
         b"#!/bin/sh\nprintf wrapper > wrapper.txt\nexec /bin/sh \"$@\"\n",
+        0o700,
     )?;
-    let mut permissions = std::fs::metadata(&shell)?.permissions();
-    permissions.set_mode(0o700);
-    std::fs::set_permissions(&shell, permissions)?;
 
     let raw = RawTerminal::from_fd(&io::stdin())?;
     let command = AttachShellCommand::new(

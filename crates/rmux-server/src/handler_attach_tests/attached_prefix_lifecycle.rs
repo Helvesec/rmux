@@ -1,4 +1,5 @@
 use super::*;
+use crate::test_shell::ScratchPath;
 
 #[cfg(windows)]
 const WINDOWS_ATTACH_EXIT_TIMEOUT: Duration = Duration::from_secs(20);
@@ -461,10 +462,10 @@ async fn attached_binding_run_shell_expands_client_name() {
     let requester_pid = u32::MAX - 71;
     let alpha = session_name("alpha");
     let _control_rx = create_attached_session(&handler, requester_pid, &alpha).await;
-    let root = std::env::temp_dir().join(format!(
+    let root = ScratchPath::adopt(std::env::temp_dir().join(format!(
         "rmux-attached-client-name-{}-{requester_pid}",
         std::process::id()
-    ));
+    )));
     std::fs::create_dir_all(&root).expect("client-name temp root");
     let output_path = root.join("client-name.txt");
     let shell_command = client_name_file_shell_command(&output_path);
@@ -500,10 +501,10 @@ async fn attached_binding_new_window_shell_command_expands_client_name() {
     let requester_pid = u32::MAX - 73;
     let alpha = session_name("alpha");
     let _control_rx = create_attached_session(&handler, requester_pid, &alpha).await;
-    let root = std::env::temp_dir().join(format!(
+    let root = ScratchPath::adopt(std::env::temp_dir().join(format!(
         "rmux-attached-new-window-client-name-{}-{requester_pid}",
         std::process::id()
-    ));
+    )));
     std::fs::create_dir_all(&root).expect("new-window client-name temp root");
     let output_path = root.join("client-name.txt");
     let pane_command = client_name_file_pane_command(&output_path);
@@ -546,10 +547,10 @@ async fn attached_binding_split_window_shell_command_expands_client_name() {
     let requester_pid = u32::MAX - 74;
     let alpha = session_name("alpha");
     let _control_rx = create_attached_session(&handler, requester_pid, &alpha).await;
-    let root = std::env::temp_dir().join(format!(
+    let root = ScratchPath::adopt(std::env::temp_dir().join(format!(
         "rmux-attached-split-window-client-name-{}-{requester_pid}",
         std::process::id()
-    ));
+    )));
     std::fs::create_dir_all(&root).expect("split-window client-name temp root");
     let output_path = root.join("client-name.txt");
     let pane_command = client_name_file_pane_command(&output_path);
@@ -625,6 +626,48 @@ async fn attached_binding_set_option_format_expands_client_name() {
 }
 
 #[tokio::test]
+async fn attached_binding_split_window_stdin_has_no_process_or_forced_keep() {
+    let handler = RequestHandler::new();
+    #[cfg(windows)]
+    set_windows_test_shell(&handler).await;
+    let pid = u32::MAX - 174;
+    let alpha = session_name("binding-empty");
+    let _control_rx = create_attached_session(&handler, pid, &alpha).await;
+    let response = handler
+        .handle(Request::BindKey(Box::new(rmux_proto::BindKeyRequest {
+            table_name: "prefix".to_owned(),
+            key: "W".to_owned(),
+            note: None,
+            repeat: false,
+            command: Some(vec!["split-window".to_owned(), "-dI".to_owned()]),
+        })))
+        .await;
+    assert!(matches!(response, Response::BindKey(_)));
+    handler
+        .handle_attached_live_input_for_test(pid, b"\x02W")
+        .await
+        .unwrap();
+    let state = handler.state.lock().await;
+    let pane = state
+        .sessions
+        .session(&alpha)
+        .unwrap()
+        .window_at(0)
+        .unwrap()
+        .pane(1)
+        .unwrap();
+    assert_eq!(state.pane_pid_in_window(&alpha, 0, 1).unwrap(), 0);
+    assert!(state.pane_is_empty(pane.id()));
+    assert!(!state.pane_is_dead(&alpha, pane.id()));
+    assert_eq!(
+        state
+            .options
+            .resolve_for_pane(&alpha, 0, 1, rmux_proto::OptionName::RemainOnExit),
+        Some("off")
+    );
+}
+
+#[tokio::test]
 async fn attached_binding_source_file_preserves_client_context() {
     let handler = RequestHandler::new();
     #[cfg(windows)]
@@ -632,10 +675,10 @@ async fn attached_binding_source_file_preserves_client_context() {
     let requester_pid = u32::MAX - 76;
     let alpha = session_name("alpha");
     let _control_rx = create_attached_session(&handler, requester_pid, &alpha).await;
-    let root = std::env::temp_dir().join(format!(
+    let root = ScratchPath::adopt(std::env::temp_dir().join(format!(
         "rmux-attached-source-client-context-{}-{requester_pid}",
         std::process::id()
-    ));
+    )));
     std::fs::create_dir_all(&root).expect("source-file client context temp root");
     let source_path = root.join("client-context.conf");
     let run_shell_path = root.join("run-shell-client-name.txt");
@@ -712,10 +755,10 @@ async fn attached_binding_two_clients_get_distinct_client_names() {
         .register_attach(second_pid, alpha.clone(), second_tx)
         .await;
 
-    let root = std::env::temp_dir().join(format!(
+    let root = ScratchPath::adopt(std::env::temp_dir().join(format!(
         "rmux-attached-two-client-names-{}",
         std::process::id()
-    ));
+    )));
     std::fs::create_dir_all(&root).expect("two-client name temp root");
     let shell_command = client_name_file_shell_command(&root.join("#{client_name}.txt"));
 
@@ -822,8 +865,8 @@ async fn attached_single_switch_queue_completes_after_session_transition() {
     let alpha = session_name("single-switch-alpha");
     let beta = session_name("single-switch-beta");
     let _control_rx = create_attached_session(&handler, requester_pid, &alpha).await;
-    assert!(matches!(
-        handler
+    crate::session_fixture::assert_new_session(
+        &handler
             .handle(Request::NewSession(NewSessionRequest {
                 session_name: beta.clone(),
                 detached: true,
@@ -831,8 +874,7 @@ async fn attached_single_switch_queue_completes_after_session_transition() {
                 environment: None,
             }))
             .await,
-        Response::NewSession(_)
-    ));
+    );
     let identity = handler.active_attach_identity_for_test(requester_pid).await;
     let commands = handler
         .parse_control_commands(&format!("switch-client -t {beta}"))
@@ -892,7 +934,7 @@ async fn attached_key_table_only_switch_allows_its_queue_tail() {
             .session(&alpha)
             .expect("attached session survives")
             .windows()
-            .len(),
+            .count(),
         2,
         "the suffix must continue after a key-table-only switch response"
     );
@@ -907,7 +949,7 @@ async fn attached_read_only_toggle_switch_allows_a_read_only_queue_tail() {
 
     let identity = handler.active_attach_identity_for_test(requester_pid).await;
     let commands = handler
-        .parse_control_commands("switch-client -r ; display-message -p queue-tail")
+        .parse_control_commands("switch-client -r ; list-clients -F queue-tail")
         .await
         .expect("read-only switch queue parses");
     crate::handler::with_expected_attach_and_session_identity(
@@ -932,6 +974,92 @@ async fn attached_read_only_toggle_switch_allows_a_read_only_queue_tail() {
     );
 }
 
+async fn listed_client_readonly(handler: &RequestHandler) -> String {
+    let response = handler
+        .handle(Request::ListClients(Box::new(
+            rmux_proto::ListClientsRequest {
+                format: Some("#{client_readonly}".to_owned()),
+                filter: None,
+                sort_order: None,
+                reversed: false,
+                target_session: None,
+            },
+        )))
+        .await;
+    let Response::ListClients(response) = response else {
+        panic!("list-clients answers a listing: {response:?}");
+    };
+    String::from_utf8(response.output.stdout().to_vec()).expect("UTF-8 output")
+}
+
+#[tokio::test]
+async fn attached_client_readonly_format_follows_switch_client_r_like_tmux() {
+    // tmux 3.7b, measured on an attached client toggled by `switch-client -r`
+    // and read with `list-clients -F` from outside: "0", then "1", then "0".
+    // The second toggle comes from outside (`switch-client -c NAME -r`):
+    // RMUX deliberately refuses a read-only client's own attempt to clear it.
+    let handler = RequestHandler::new();
+    let requester_pid = u32::MAX - 86;
+    let alpha = session_name("readonly-format-alpha");
+    let _control_rx = create_attached_session(&handler, requester_pid, &alpha).await;
+
+    let identity = handler.active_attach_identity_for_test(requester_pid).await;
+    let own_queue = |command: &'static str| {
+        let handler = &handler;
+        let alpha = alpha.clone();
+        async move {
+            let commands = handler
+                .parse_control_commands(command)
+                .await
+                .expect("client queue parses");
+            let output = crate::handler::with_expected_attach_and_session_identity(
+                identity,
+                alpha,
+                identity.session_id(),
+                handler.execute_parsed_commands_for_test(requester_pid, commands),
+            )
+            .await
+            .expect("client queue runs");
+            String::from_utf8(output.stdout().to_vec()).expect("UTF-8 output")
+        }
+    };
+
+    assert_eq!(
+        own_queue("display-message -p #{client_readonly}").await,
+        "0\n",
+        "a writable client reads its own value"
+    );
+    let mut listed = vec![listed_client_readonly(&handler).await];
+    own_queue("switch-client -r").await;
+    listed.push(listed_client_readonly(&handler).await);
+
+    // The request `rmux switch-client -c PID -r` sends from another process.
+    let toggled = handler
+        .dispatch(
+            u32::MAX - 87,
+            Request::SwitchClientExt3(Box::new(rmux_proto::request::SwitchClientExt3Request {
+                target_client: Some(requester_pid.to_string()),
+                target: None,
+                key_table: None,
+                last_session: false,
+                next_session: false,
+                previous_session: false,
+                toggle_read_only: true,
+                sort_order: None,
+                skip_environment_update: false,
+                zoom: false,
+            })),
+        )
+        .await
+        .response;
+    assert!(
+        matches!(toggled, Response::SwitchClient(_)),
+        "switch-client -c PID -r from another process: {toggled:?}"
+    );
+    listed.push(listed_client_readonly(&handler).await);
+    assert_eq!(listed, ["0\n", "1\n", "0\n"]);
+}
+
 #[tokio::test]
 async fn attached_binding_switch_client_rebases_its_command_queue() {
     let handler = RequestHandler::new();
@@ -939,8 +1067,8 @@ async fn attached_binding_switch_client_rebases_its_command_queue() {
     let alpha = session_name("binding-switch-alpha");
     let beta = session_name("binding-switch-beta");
     let _control_rx = create_attached_session(&handler, requester_pid, &alpha).await;
-    assert!(matches!(
-        handler
+    crate::session_fixture::assert_new_session(
+        &handler
             .handle(Request::NewSession(NewSessionRequest {
                 session_name: beta.clone(),
                 detached: true,
@@ -948,8 +1076,7 @@ async fn attached_binding_switch_client_rebases_its_command_queue() {
                 environment: None,
             }))
             .await,
-        Response::NewSession(_)
-    ));
+    );
 
     let response = handler
         .handle(Request::BindKey(Box::new(rmux_proto::BindKeyRequest {
@@ -994,7 +1121,7 @@ async fn attached_binding_switch_client_rebases_its_command_queue() {
             .session(&alpha)
             .expect("source session survives")
             .windows()
-            .len(),
+            .count(),
         1,
         "implicit suffix commands must stop targeting the source session"
     );
@@ -1004,7 +1131,7 @@ async fn attached_binding_switch_client_rebases_its_command_queue() {
             .session(&beta)
             .expect("switched session survives")
             .windows()
-            .len(),
+            .count(),
         2,
         "implicit suffix commands must use the switched session cursor"
     );
@@ -1029,8 +1156,8 @@ async fn attached_switch_rebases_wrappers_but_preserves_suffix_targets() {
         let alpha = session_name(&format!("explicit-{entry_path}-alpha"));
         let beta = session_name(&format!("explicit-{entry_path}-beta"));
         let _control_rx = create_attached_session(&handler, requester_pid, &alpha).await;
-        assert!(matches!(
-            handler
+        crate::session_fixture::assert_new_session(
+            &handler
                 .handle(Request::NewSession(NewSessionRequest {
                     session_name: beta.clone(),
                     detached: true,
@@ -1038,8 +1165,7 @@ async fn attached_switch_rebases_wrappers_but_preserves_suffix_targets() {
                     environment: None,
                 }))
                 .await,
-            Response::NewSession(_)
-        ));
+        );
 
         let suffix_has_explicit_target = entry_path == "run-shell-suffix-target";
         let nested = if suffix_has_explicit_target {
@@ -1047,12 +1173,15 @@ async fn attached_switch_rebases_wrappers_but_preserves_suffix_targets() {
         } else {
             format!("switch-client -t {beta} ; new-window -d")
         };
+        // Held past the match: the queue reads the file after this arm returns.
+        let mut source_fixture: Option<ScratchPath> = None;
         let command = match entry_path {
             "source-file" => {
-                let source_path = std::env::temp_dir().join(format!(
-                    "rmux-explicit-source-target-{}-{requester_pid}.conf",
-                    std::process::id()
-                ));
+                let source_path =
+                    source_fixture.insert(ScratchPath::adopt(std::env::temp_dir().join(format!(
+                        "rmux-explicit-source-target-{}-{requester_pid}.conf",
+                        std::process::id()
+                    ))));
                 std::fs::write(&source_path, &nested).expect("explicit source-file fixture");
                 format!(
                     "source-file -t {alpha}:0.0 {}",
@@ -1101,7 +1230,7 @@ async fn attached_switch_rebases_wrappers_but_preserves_suffix_targets() {
                 .session(&alpha)
                 .expect("explicit target session survives")
                 .windows()
-                .len(),
+                .count(),
             expected_alpha_windows,
             "{entry_path} must honor the suffix command's effective target"
         );
@@ -1111,7 +1240,7 @@ async fn attached_switch_rebases_wrappers_but_preserves_suffix_targets() {
                 .session(&beta)
                 .expect("switched session survives")
                 .windows()
-                .len(),
+                .count(),
             expected_beta_windows,
             "{entry_path} must distinguish wrapper context from a suffix command target"
         );
@@ -1125,8 +1254,8 @@ async fn attached_run_shell_inherited_target_rebases_after_switch() {
     let alpha = session_name("inherited-run-shell-alpha");
     let beta = session_name("inherited-run-shell-beta");
     let _control_rx = create_attached_session(&handler, requester_pid, &alpha).await;
-    assert!(matches!(
-        handler
+    crate::session_fixture::assert_new_session(
+        &handler
             .handle(Request::NewSession(NewSessionRequest {
                 session_name: beta.clone(),
                 detached: true,
@@ -1134,8 +1263,7 @@ async fn attached_run_shell_inherited_target_rebases_after_switch() {
                 environment: None,
             }))
             .await,
-        Response::NewSession(_)
-    ));
+    );
 
     let response = handler
         .handle(Request::BindKey(Box::new(rmux_proto::BindKeyRequest {
@@ -1174,7 +1302,7 @@ async fn attached_run_shell_inherited_target_rebases_after_switch() {
             .session(&alpha)
             .expect("source session survives")
             .windows()
-            .len(),
+            .count(),
         1,
         "an inherited run-shell target must not pin the queue tail to the source session"
     );
@@ -1184,7 +1312,7 @@ async fn attached_run_shell_inherited_target_rebases_after_switch() {
             .session(&beta)
             .expect("switched session survives")
             .windows()
-            .len(),
+            .count(),
         2,
         "the run-shell queue tail must follow the switched attached cursor"
     );
@@ -1204,8 +1332,8 @@ async fn attached_attach_session_rebases_every_queue_entry_path() {
         let beta = session_name(&format!("attach-{entry_path}-beta"));
         let buffer_name = format!("attach-{entry_path}-tail");
         let _control_rx = create_attached_session(&handler, requester_pid, &alpha).await;
-        assert!(matches!(
-            handler
+        crate::session_fixture::assert_new_session(
+            &handler
                 .handle(Request::NewSession(NewSessionRequest {
                     session_name: beta.clone(),
                     detached: true,
@@ -1213,17 +1341,19 @@ async fn attached_attach_session_rebases_every_queue_entry_path() {
                     environment: None,
                 }))
                 .await,
-            Response::NewSession(_)
-        ));
+        );
 
         let nested = format!("attach-session -t {beta} ; set-buffer -b {buffer_name} done");
+        // Held past the match: the queue reads the file after this arm returns.
+        let mut source_fixture: Option<ScratchPath> = None;
         let command = match entry_path {
             "direct" => nested,
             "source-file" => {
-                let source_path = std::env::temp_dir().join(format!(
-                    "rmux-attached-attach-session-{}-{requester_pid}.conf",
-                    std::process::id()
-                ));
+                let source_path =
+                    source_fixture.insert(ScratchPath::adopt(std::env::temp_dir().join(format!(
+                        "rmux-attached-attach-session-{}-{requester_pid}.conf",
+                        std::process::id()
+                    ))));
                 std::fs::write(&source_path, &nested).expect("attach-session source fixture");
                 format!(
                     "source-file {}",
@@ -1271,8 +1401,8 @@ async fn attached_switch_response_race_fails_closed_before_queue_continuation() 
     let gamma = session_name("switch-race-gamma");
     let _control_rx = create_attached_session(&handler, requester_pid, &alpha).await;
     for session in [&beta, &gamma] {
-        assert!(matches!(
-            handler
+        crate::session_fixture::assert_new_session(
+            &handler
                 .handle(Request::NewSession(NewSessionRequest {
                     session_name: session.clone(),
                     detached: true,
@@ -1280,8 +1410,7 @@ async fn attached_switch_response_race_fails_closed_before_queue_continuation() 
                     environment: None,
                 }))
                 .await,
-            Response::NewSession(_)
-        ));
+        );
     }
 
     let identity = handler.active_attach_identity_for_test(requester_pid).await;
@@ -1342,7 +1471,7 @@ async fn attached_switch_response_race_fails_closed_before_queue_continuation() 
                 .session(session)
                 .expect("race session survives")
                 .windows()
-                .len(),
+                .count(),
             1,
             "the queue suffix must not run after a stale switch response"
         );
@@ -1510,8 +1639,8 @@ async fn attached_switch_for_other_client_preserves_requester_queue_cursor() {
     let delta = session_name("other-switch-delta");
     let _requester_rx = create_attached_session(&handler, requester_pid, &alpha).await;
     for session in [&beta, &gamma, &delta] {
-        assert!(matches!(
-            handler
+        crate::session_fixture::assert_new_session(
+            &handler
                 .handle(Request::NewSession(NewSessionRequest {
                     session_name: session.clone(),
                     detached: true,
@@ -1519,8 +1648,7 @@ async fn attached_switch_for_other_client_preserves_requester_queue_cursor() {
                     environment: None,
                 }))
                 .await,
-            Response::NewSession(_)
-        ));
+        );
     }
     let (other_tx, _other_rx) = mpsc::unbounded_channel();
     let other_attach_id = handler
@@ -1573,7 +1701,7 @@ async fn attached_switch_for_other_client_preserves_requester_queue_cursor() {
             .session(&alpha)
             .expect("requester session survives")
             .windows()
-            .len(),
+            .count(),
         1,
         "-c other-client must not rebase the requester onto its attached session"
     );
@@ -1583,7 +1711,7 @@ async fn attached_switch_for_other_client_preserves_requester_queue_cursor() {
             .session(&beta)
             .expect("captured queue target survives")
             .windows()
-            .len(),
+            .count(),
         2,
         "the suffix must retain the requester's pre-switch queue target"
     );
@@ -1593,7 +1721,7 @@ async fn attached_switch_for_other_client_preserves_requester_queue_cursor() {
             .session(&delta)
             .expect("other client target survives")
             .windows()
-            .len(),
+            .count(),
         1,
         "the other client's switch target must not become the requester queue target"
     );
@@ -1646,8 +1774,8 @@ async fn attached_binding_allows_an_explicit_cross_session_target() {
     let alpha = session_name("binding-cross-alpha");
     let beta = session_name("binding-cross-beta");
     let _control_rx = create_attached_session(&handler, requester_pid, &alpha).await;
-    assert!(matches!(
-        handler
+    crate::session_fixture::assert_new_session(
+        &handler
             .handle(Request::NewSession(NewSessionRequest {
                 session_name: beta.clone(),
                 detached: true,
@@ -1655,8 +1783,7 @@ async fn attached_binding_allows_an_explicit_cross_session_target() {
                 environment: None,
             }))
             .await,
-        Response::NewSession(_)
-    ));
+    );
 
     let response = handler
         .handle(Request::BindKey(Box::new(rmux_proto::BindKeyRequest {
@@ -1696,8 +1823,8 @@ async fn attached_command_prompt_switch_client_rebases_its_continuation() {
     let alpha = session_name("prompt-switch-alpha");
     let beta = session_name("prompt-switch-beta");
     let _control_rx = create_attached_session(&handler, requester_pid, &alpha).await;
-    assert!(matches!(
-        handler
+    crate::session_fixture::assert_new_session(
+        &handler
             .handle(Request::NewSession(NewSessionRequest {
                 session_name: beta.clone(),
                 detached: true,
@@ -1705,8 +1832,7 @@ async fn attached_command_prompt_switch_client_rebases_its_continuation() {
                 environment: None,
             }))
             .await,
-        Response::NewSession(_)
-    ));
+    );
 
     let input = format!(
         "\x02:switch-client -t {} ; set-buffer -b prompt-switch-tail done\r",
@@ -1733,8 +1859,8 @@ async fn attached_command_prompt_attach_session_rebases_its_continuation() {
     let alpha = session_name("prompt-attach-alpha");
     let beta = session_name("prompt-attach-beta");
     let _control_rx = create_attached_session(&handler, requester_pid, &alpha).await;
-    assert!(matches!(
-        handler
+    crate::session_fixture::assert_new_session(
+        &handler
             .handle(Request::NewSession(NewSessionRequest {
                 session_name: beta.clone(),
                 detached: true,
@@ -1742,8 +1868,7 @@ async fn attached_command_prompt_attach_session_rebases_its_continuation() {
                 environment: None,
             }))
             .await,
-        Response::NewSession(_)
-    ));
+    );
 
     let input = format!(
         "\x02:attach-session -t {} ; set-buffer -b prompt-attach-tail done\r",
@@ -1846,7 +1971,7 @@ async fn attached_command_prompt_can_create_window_from_same_read() {
 #[cfg(unix)]
 #[tokio::test]
 async fn attached_exit_notifies_after_command_prompt_rename_session() {
-    let handler = RequestHandler::new();
+    let handler = RequestHandler::with_host_shell_for_test();
     let requester_pid = std::process::id();
     let alpha = session_name("alpha");
     let beta = session_name("beta");
@@ -2432,3 +2557,7 @@ async fn attached_resize_ignores_zero_sized_terminal_reports() {
         "ignored zero-sized resize must not emit a refresh frame"
     );
 }
+
+mod attached_new_session_switch;
+mod binding_characterization;
+mod natural_window_option;

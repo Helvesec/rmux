@@ -45,7 +45,7 @@ async fn list_sessions_uses_shared_formatter_through_real_socket() -> Result<(),
             }),
         )
         .await?;
-        assert!(matches!(created, Response::NewSession(_)));
+        crate::common::assert_new_session(&created);
     }
 
     let new_window = send_request(
@@ -107,7 +107,7 @@ async fn list_panes_uses_shared_formatter_through_real_socket() -> Result<(), Bo
         }),
     )
     .await?;
-    assert!(matches!(created, Response::NewSession(_)));
+    crate::common::assert_new_session(&created);
 
     let split = send_request(
         harness.socket_path(),
@@ -193,7 +193,7 @@ async fn rename_session_round_trips_and_migrates_session_scoped_state() -> Resul
         }),
     )
     .await?;
-    assert!(matches!(created, Response::NewSession(_)));
+    crate::common::assert_new_session(&created);
 
     assert!(matches!(
         send_request(

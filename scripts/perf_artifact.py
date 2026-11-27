@@ -16,6 +16,8 @@ CURRENT_KIND = "rmux-perf-current"
 CURRENT_GENERATOR = "scripts/perf-bench.sh"
 SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
 GIT_SHA_RE = re.compile(r"^[0-9a-f]{40}$")
+MAX_PUBLIC_BYTES = 12 * 1024 * 1024
+MAX_PRIVATE_BYTES = 64 * 1024 * 1024
 
 
 @dataclass(frozen=True)
@@ -255,3 +257,61 @@ def sha256_file(path: Path) -> str:
         for chunk in iter(lambda: handle.read(1024 * 1024), b""):
             digest.update(chunk)
     return digest.hexdigest()
+
+
+def validate_layout_member(
+    layout: dict[str, object], role: str, *, verify_files: bool
+) -> tuple[Path, str, int]:
+    member = layout.get(role)
+    if not isinstance(member, dict):
+        raise ValueError(f"current perf artifact is missing layout.{role}")
+    path = Path(str(member.get("path", "")))
+    digest = str(member.get("sha256", "")).lower()
+    size = member.get("size_bytes")
+    if not path.is_absolute():
+        raise ValueError(f"current perf layout.{role}.path must be absolute")
+    if SHA256_RE.fullmatch(digest) is None:
+        raise ValueError(f"current perf layout.{role}.sha256 is missing or invalid")
+    if isinstance(size, bool) or not isinstance(size, int) or size <= 0:
+        raise ValueError(f"current perf layout.{role}.size_bytes is missing or invalid")
+    if verify_files:
+        if not path.is_file():
+            raise ValueError(f"current perf layout.{role} binary is unavailable: {path}")
+        if path.stat().st_size != size:
+            raise ValueError(f"current perf layout.{role} size does not match the recorded value")
+        if sha256_file(path) != digest:
+            raise ValueError(f"current perf layout.{role} digest does not match the binary")
+    return path, digest, size
+
+
+def validate_release_layout(source: dict[str, object], *, verify_files: bool = True) -> None:
+    layout = source.get("layout")
+    if not isinstance(layout, dict) or layout.get("schema") != 1:
+        raise ValueError("current perf artifact is missing schema-1 release layout identity")
+    public_path, public_digest, public_size = validate_layout_member(
+        layout, "public", verify_files=verify_files
+    )
+    helper_path, _, helper_size = validate_layout_member(
+        layout, "helper", verify_files=verify_files
+    )
+    daemon_path, _, daemon_size = validate_layout_member(
+        layout, "daemon", verify_files=verify_files
+    )
+    expected_helper = public_path.parent / "libexec" / "rmux" / public_path.name
+    expected_daemon = public_path.parent / f"rmux-daemon{public_path.suffix}"
+    if helper_path != expected_helper or daemon_path != expected_daemon:
+        raise ValueError("current perf layout does not match the shipped public/helper/daemon topology")
+    if public_size > MAX_PUBLIC_BYTES or public_size >= helper_size:
+        raise ValueError("current perf public binary is not a bounded tiny-cli entry point")
+    if helper_size > MAX_PRIVATE_BYTES or daemon_size > MAX_PRIVATE_BYTES:
+        raise ValueError("current perf private binary size exceeds the release bound")
+
+    binary = source.get("binary")
+    if not isinstance(binary, dict):
+        raise ValueError("current perf artifact is missing binary identity")
+    if (
+        binary.get("path") != str(public_path)
+        or str(binary.get("sha256", "")).lower() != public_digest
+        or binary.get("size_bytes") != public_size
+    ):
+        raise ValueError("current perf binary identity does not match layout.public")

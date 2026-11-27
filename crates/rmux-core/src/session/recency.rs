@@ -1,4 +1,8 @@
-use std::sync::atomic::{AtomicU64, Ordering};
+#[cfg(not(target_has_atomic = "64"))]
+use portable_atomic::AtomicU64;
+#[cfg(target_has_atomic = "64")]
+use std::sync::atomic::AtomicU64;
+use std::sync::atomic::Ordering;
 
 static NEXT_SESSION_RECENCY: AtomicU64 = AtomicU64::new(0);
 
@@ -45,5 +49,32 @@ impl SessionRecency {
             })
             .expect("session recency sequence exhausted");
         Self(sequence)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::SessionRecency;
+
+    #[test]
+    fn atomic64_recency_is_unique_across_threads() {
+        let mut tokens = std::thread::scope(|scope| {
+            let threads: Vec<_> = (0..4)
+                .map(|_| {
+                    scope.spawn(|| (0..128).map(|_| SessionRecency::next()).collect::<Vec<_>>())
+                })
+                .collect();
+            threads
+                .into_iter()
+                .flat_map(|thread| {
+                    let tokens = thread.join().expect("recency thread");
+                    assert!(tokens.windows(2).all(|pair| pair[0] < pair[1]));
+                    tokens
+                })
+                .collect::<Vec<_>>()
+        });
+        tokens.sort_unstable();
+        tokens.dedup();
+        assert_eq!(tokens.len(), 512);
     }
 }

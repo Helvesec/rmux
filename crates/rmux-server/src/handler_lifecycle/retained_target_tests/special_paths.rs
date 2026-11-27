@@ -1,3 +1,5 @@
+#[cfg(test)]
+use crate::session_fixture::SessionSetupExt as _;
 use std::path::PathBuf;
 use std::time::{Duration, SystemTime};
 
@@ -30,7 +32,7 @@ async fn session_with_spare_window(handler: &RequestHandler, name: &str) -> Sess
         .lock()
         .await
         .sessions
-        .session_mut(&session_name)
+        .session_setup(&session_name)
         .expect("session exists")
         .create_window(terminal_size())
         .expect("create spare window");
@@ -45,9 +47,9 @@ async fn wait_for_pause(pause: &crate::handler::scripting_support::QueueExactTar
 
 async fn retire_window_zero(handler: &RequestHandler, session_name: &SessionName, replace: bool) {
     let mut state = handler.state.lock().await;
-    let session = state
+    let mut session = state
         .sessions
-        .session_mut(session_name)
+        .session_setup(session_name)
         .expect("session survives through its spare window");
     session
         .remove_window_allowing_empty(0)
@@ -295,7 +297,7 @@ async fn explicit_if_shell_target_rejects_same_name_slot_replacement() {
     wait_for_pause(&pause).await;
     {
         let mut state = handler.state.lock().await;
-        state.sessions.remove_session(&beta).expect("remove beta");
+        let _ = state.sessions.remove_session(&beta).expect("remove beta");
         state
             .sessions
             .create_session(beta.clone(), terminal_size())
@@ -463,3 +465,6 @@ fn delayed_file_command(started: &std::path::Path, finished: &std::path::Path) -
         ))
     }
 }
+
+#[path = "special_paths/historical_pane.rs"]
+mod historical_pane;

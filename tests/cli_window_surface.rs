@@ -551,6 +551,60 @@ fn empty_window_id_target_does_not_resolve_to_window_zero() -> Result<(), Box<dy
 }
 
 #[test]
+fn new_window_occupied_slot_preserves_state_across_command_entry_paths(
+) -> Result<(), Box<dyn Error>> {
+    let _guard = window_surface_guard();
+    let harness = CliHarness::new("new-window-occupied-entry-paths")?;
+    let mut daemon = harness.start_hidden_daemon()?;
+    assert_success(&harness.run(&["new-session", "-d", "-s", "alpha", "-n", "zero"])?);
+    assert_success(&harness.run(&["new-window", "-d", "-t", "alpha:1", "-n", "one"])?);
+    assert_success(&harness.run(&["set-buffer", "-b", "trace", "unchanged"])?);
+    assert_success(&harness.run(&[
+        "set-hook",
+        "-g",
+        "after-new-window",
+        "set-buffer -b trace changed",
+    ])?);
+    let list_args = [
+        "list-windows", "-t", "alpha", "-F",
+        "#{window_index}:#{window_id}:#{pane_id}:#{window_name}:#{window_active}:#{window_last_flag}",
+    ];
+    let before = harness.run(&list_args)?;
+    assert_eq!(before.status.code(), Some(0));
+    let source_file = harness.tmpdir().join("occupied.conf");
+    fs::write(&source_file, "new-window -t alpha:1 -n refused\n")?;
+    for args in [
+        vec!["new-window", "-t", "alpha:1", "-n", "refused"],
+        vec!["run-shell", "-C", "new-window -t alpha:1 -n refused"],
+        vec!["source-file", source_file.to_str().expect("utf-8 path")],
+        vec!["-C", "new-window", "-t", "alpha:1", "-n", "refused"],
+    ] {
+        let result = harness.run(&args)?;
+        if args[0] == "-C" {
+            assert!(stdout(&result).contains("%error"), "{result:?}");
+            assert!(
+                stdout(&result).contains("create window failed: index 1 in use"),
+                "{result:?}"
+            );
+        } else {
+            assert_eq!(result.status.code(), Some(1), "{args:?}: {result:?}");
+            assert!(
+                stderr(&result).contains("create window failed: index 1 in use"),
+                "{args:?}: {result:?}"
+            );
+        }
+        let after = harness.run(&list_args)?;
+        assert_eq!(after.status.code(), Some(0));
+        assert_eq!(stdout(&after), stdout(&before), "{args:?}");
+        let trace = harness.run(&["show-buffer", "-b", "trace"])?;
+        assert_eq!(trace.status.code(), Some(0));
+        assert_eq!(stdout(&trace), "unchanged", "{args:?}");
+    }
+    terminate_child(daemon.child_mut())?;
+    Ok(())
+}
+
+#[test]
 fn new_window_bare_window_name_target_uses_the_existing_window_slot() -> Result<(), Box<dyn Error>>
 {
     let _guard = window_surface_guard();

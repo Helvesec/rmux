@@ -11,8 +11,7 @@ use std::sync::OnceLock;
 use std::time::Duration;
 
 use rmux_sdk::{
-    bootstrap::discovery::SDK_DAEMON_BINARY_ENV, CommandRun, PaneOutputChunk, PaneOutputStream,
-    Rmux, RmuxBuilder, RmuxEndpoint, SessionName,
+    CommandRun, PaneOutputChunk, PaneOutputStream, Rmux, RmuxBuilder, RmuxEndpoint, SessionName,
 };
 use tokio::sync::Mutex;
 use tokio::time::{sleep, timeout, Instant};
@@ -53,7 +52,7 @@ impl Harness {
             None => unique_pipe_name(label)?,
         };
         let daemon_binary = rmux_binary()?.to_path_buf();
-        let _daemon_binary_env = EnvGuard::set(SDK_DAEMON_BINARY_ENV, daemon_binary.as_os_str());
+        let _daemon_binary_env = EnvGuard::set("RMUX_SDK_DAEMON_BINARY", daemon_binary.as_os_str());
         let rmux = if package_pipe.is_some() {
             builder(&pipe_name).connect().await?
         } else {
@@ -77,7 +76,7 @@ impl Harness {
         drop(rmux_ipc::LocalListener::bind(&old_endpoint)?);
 
         let daemon_binary = rmux_binary()?.to_path_buf();
-        let _daemon_binary_env = EnvGuard::set(SDK_DAEMON_BINARY_ENV, daemon_binary.as_os_str());
+        let _daemon_binary_env = EnvGuard::set("RMUX_SDK_DAEMON_BINARY", daemon_binary.as_os_str());
         let rmux = Rmux::connect_or_start_at(RmuxEndpoint::WindowsPipe(old_pipe.clone())).await?;
         let selected_pipe = match rmux.endpoint() {
             RmuxEndpoint::WindowsPipe(pipe) => pipe.clone(),
@@ -101,7 +100,7 @@ impl Harness {
     pub async fn start_via_cmd(label: &str, session_name: &SessionName) -> TestResult<Self> {
         let pipe_name = unique_pipe_name(label)?;
         let daemon_binary = rmux_binary()?.to_path_buf();
-        let _daemon_binary_env = EnvGuard::set(SDK_DAEMON_BINARY_ENV, daemon_binary.as_os_str());
+        let _daemon_binary_env = EnvGuard::set("RMUX_SDK_DAEMON_BINARY", daemon_binary.as_os_str());
         let rmux = builder(&pipe_name).build();
         let run = rmux
             .cmd(["new-session", "-d", "-s", session_name.as_str()])
@@ -128,7 +127,7 @@ impl Harness {
     ) -> TestResult<Self> {
         let pipe_name = unique_pipe_name(label)?;
         let daemon_binary = rmux_binary()?.to_path_buf();
-        let _daemon_binary_env = EnvGuard::set(SDK_DAEMON_BINARY_ENV, daemon_binary.as_os_str());
+        let _daemon_binary_env = EnvGuard::set("RMUX_SDK_DAEMON_BINARY", daemon_binary.as_os_str());
         let _appdata_env = EnvGuard::set("APPDATA", appdata.as_os_str());
         let _xdg_env = EnvGuard::remove("XDG_CONFIG_HOME");
         let _userprofile_env = EnvGuard::remove("USERPROFILE");
@@ -152,7 +151,7 @@ impl Harness {
         S: AsRef<std::ffi::OsStr>,
     {
         let daemon_binary = rmux_binary()?.to_path_buf();
-        let _daemon_binary_env = EnvGuard::set(SDK_DAEMON_BINARY_ENV, daemon_binary.as_os_str());
+        let _daemon_binary_env = EnvGuard::set("RMUX_SDK_DAEMON_BINARY", daemon_binary.as_os_str());
         Ok(self.rmux().cmd(args).await?)
     }
 
@@ -187,7 +186,11 @@ impl Drop for Harness {
         if !self.armed {
             return;
         }
-        let _ = Command::new(rmux_binary().unwrap_or_else(|_| Path::new("rmux")))
+        let selected = rmux_binary().unwrap_or_else(|_| Path::new("rmux"));
+        let Ok(binary) = windows_cargo_build::verify_binary(selected) else {
+            return;
+        };
+        let _ = Command::new(binary)
             .arg("-S")
             .arg(&self.pipe_name)
             .arg("kill-server")
@@ -395,7 +398,10 @@ fn cmd_exe() -> String {
 fn rmux_binary() -> TestResult<&'static Path> {
     static RMUX_BINARY: OnceLock<Result<PathBuf, String>> = OnceLock::new();
     match RMUX_BINARY.get_or_init(|| resolve_rmux_binary().map_err(|error| error.to_string())) {
-        Ok(path) => Ok(path.as_path()),
+        Ok(path) => {
+            windows_cargo_build::verify_binary(path)?;
+            Ok(path.as_path())
+        }
         Err(error) => Err(std::io::Error::other(error.clone()).into()),
     }
 }

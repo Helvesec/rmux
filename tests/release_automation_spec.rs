@@ -1,4 +1,8 @@
 #[cfg(unix)]
+#[path = "support/executable_fixture.rs"]
+mod executable_fixture;
+
+#[cfg(unix)]
 use std::fs;
 #[cfg(unix)]
 use std::path::{Path, PathBuf};
@@ -210,9 +214,9 @@ fn release_line_changelog_records_the_exact_detached_wire_version() {
         .split_whitespace()
         .collect::<Vec<_>>()
         .join(" ");
-    assert_eq!(rmux_proto::RMUX_WIRE_VERSION, 8);
+    assert_eq!(rmux_proto::RMUX_WIRE_VERSION, 9);
     assert!(
-        current_release.contains("wire version 5 to wire version 8"),
+        current_release.contains("wire version 8 to wire version 9"),
         "{current_version} changelog must record the current detached wire cut"
     );
     assert!(
@@ -277,13 +281,11 @@ fn run_release_ref_fixture(
 #[test]
 #[cfg(unix)]
 fn release_ref_verifier_peels_tags_and_rejects_identity_drift() {
-    use std::os::unix::fs::PermissionsExt;
-
     let root = temp_dir("release-ref-verifier");
     let fake_bin = root.join("bin");
     fs::create_dir_all(&fake_bin).expect("create fake bin");
     let fake_gh = fake_bin.join("gh");
-    fs::write(
+    executable_fixture::write_executable(
         &fake_gh,
         r#"#!/usr/bin/env bash
 set -euo pipefail
@@ -300,7 +302,22 @@ case "$endpoint" in
       "$FAKE_PEELED_TYPE" "$FAKE_PEELED_SHA" "$FAKE_TAG_VERIFIED" "$reason"
     ;;
   */releases/tags/*)
-    if [[ -z ${FAKE_RELEASE_TARGET:-} ]]; then exit 1; fi
+    # Mirror `gh api --include`: status line and headers precede the body, and
+    # an absent Release is an explicit HTTP 404 with gh exit status 1.
+    include=false
+    for argument in "$@"; do
+      if [[ $argument == --include || $argument == -i ]]; then include=true; fi
+    done
+    if [[ -z ${FAKE_RELEASE_TARGET:-} ]]; then
+      if [[ $include == true ]]; then
+        printf 'HTTP/2.0 404 Not Found\r\nContent-Type: application/json\r\n\r\n'
+      fi
+      printf '{"message":"Not Found","status":"404"}\n'
+      exit 1
+    fi
+    if [[ $include == true ]]; then
+      printf 'HTTP/2.0 200 OK\r\nContent-Type: application/json\r\n\r\n'
+    fi
     printf '{"tag_name":"v0.9.0","target_commitish":"%s"}\n' "$FAKE_RELEASE_TARGET"
     ;;
   *)
@@ -309,13 +326,9 @@ case "$endpoint" in
     ;;
 esac
 "#,
+        0o755,
     )
     .expect("write fake gh");
-    let mut permissions = fs::metadata(&fake_gh)
-        .expect("fake gh metadata")
-        .permissions();
-    permissions.set_mode(0o755);
-    fs::set_permissions(&fake_gh, permissions).expect("chmod fake gh");
 
     let expected = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
     let tag_object = "1111111111111111111111111111111111111111";
@@ -335,6 +348,14 @@ esac
         Some(expected),
     );
     assert!(annotated.status.success(), "{}", stderr(&annotated));
+
+    let absent_release =
+        run_release_ref_fixture(&fake_bin, "tag", tag_object, "commit", expected, true, None);
+    assert!(
+        absent_release.status.success(),
+        "explicit HTTP 404 proves the Release is absent: {}",
+        stderr(&absent_release)
+    );
 
     let unsigned = run_release_ref_fixture(
         &fake_bin, "tag", tag_object, "commit", expected, false, None,
@@ -571,8 +592,8 @@ fn github_windows_tests_keep_debug_daemons_inside_the_runner_job() {
 
     assert_eq!(
         ci.matches(opt_in).count(),
-        2,
-        "both Windows CI test surfaces must opt into the runner-owned job"
+        3,
+        "candidate, sharded and runtime Windows CI tests must opt into the runner-owned job"
     );
     assert_eq!(
         release.matches(opt_in).count(),
@@ -691,7 +712,7 @@ fn ci_builds_windows_tests_once_and_runs_eighteen_hosted_shards() {
         .split("\n  platform-runtime:\n")
         .nth(1)
         .expect("macOS platform runtime job")
-        .split("\n  windows-test-archive:\n")
+        .split("\n  windows-candidate-source:\n")
         .next()
         .expect("bounded macOS platform runtime job");
     let archive = ci
@@ -735,8 +756,8 @@ fn ci_builds_windows_tests_once_and_runs_eighteen_hosted_shards() {
     for required in [
         "name: cargo test parallel-safe portable crates",
         "run: cargo test --locked --no-fail-fast -p rmux-types -p rmux-os -p rmux-proto -p rmux-ipc -p rmux-core",
-        "name: cargo test rmux-client serially",
-        "run: cargo test --locked --no-fail-fast -p rmux-client -- --test-threads=1",
+        "name: cargo test bootstrap and client serially",
+        "run: cargo test --locked --no-fail-fast -p rmux-bootstrap -p rmux-client -- --test-threads=1",
         "run: cargo test --locked -p rmux --test cli_surface socket_path_flag_can_start_directly_under_tmp -- --exact --test-threads=1",
     ] {
         assert!(
@@ -786,7 +807,13 @@ fn ci_builds_windows_tests_once_and_runs_eighteen_hosted_shards() {
         "shard: [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18]",
         "--extract-to \"$env:GITHUB_WORKSPACE\"",
         "--extract-overwrite",
-        "--filterset \"not binary(public_api_extensibility)\"",
+        "--filterset \"$env:RMUX_WINDOWS_SHARD_FILTER\"",
+        "not binary(public_api_extensibility)",
+        "and not binary(candidate_identity_children)",
+        "test(/::bracketed_paste_final_sink(_tests)?::/)",
+        "run: cargo fetch --locked",
+        "./scripts/conpty/candidate-runtime.ps1 -Stage $stage -Target x86_64-pc-windows-msvc",
+        "foreach ($directory in @(\"target/debug\", \"target/debug/deps\")) {",
         "--partition \"slice:${{ matrix.shard }}/18\"",
         "--retries 0",
         "--test-threads num-cpus",
@@ -805,8 +832,8 @@ fn ci_builds_windows_tests_once_and_runs_eighteen_hosted_shards() {
     assert!(!shards.contains("self-hosted"));
     assert_eq!(
         ci.matches("CARGO_PROFILE_TEST_DEBUG: \"0\"").count(),
-        1,
-        "test debug metadata must only be disabled for the Windows test archive"
+        2,
+        "test debug metadata is disabled for the Windows archive and private candidate builds"
     );
     assert_eq!(
         nextest
@@ -828,7 +855,9 @@ fn ci_builds_windows_tests_once_and_runs_eighteen_hosted_shards() {
     for required in [
         "name: Platform build and smoke on windows-latest",
         "always() &&",
-        "needs: [windows-test-build, windows-tests]",
+        "needs: [windows-test-build, windows-candidate-source, windows-tests]",
+        "WINDOWS_SOURCE_RESULT: ${{ needs.windows-candidate-source.result }}",
+        "test \"$WINDOWS_SOURCE_RESULT\" = success",
         "WINDOWS_BUILD_RESULT: ${{ needs.windows-test-build.result }}",
         "WINDOWS_TESTS_RESULT: ${{ needs.windows-tests.result }}",
         "test \"$WINDOWS_BUILD_RESULT\" = success",
@@ -1008,6 +1037,66 @@ fn xterm_oracle_inputs_and_filter_are_release_policy() {
         ),
         "Windows xterm oracle may silently select zero tests"
     );
+}
+
+#[test]
+fn windows_release_gate_runs_server_lib_tests_under_candidate_identity() {
+    let child =
+        include_str!("../crates/rmux-server/src/test_shell/final_sink/windows_byte_child.rs");
+    assert!(
+        child.contains("std::env::var_os(\"RMUX_IDENTITY_PYTHON\")"),
+        "the Windows final-sink child no longer reads the identity interpreter; revisit this gate"
+    );
+
+    let windows = include_str!("../scripts/release-review-gate-windows.ps1");
+    let step = windows
+        .split_once("Step \"server lib tests\" {\n")
+        .and_then(|(_, rest)| rest.split_once("\n}\n"))
+        .map(|(body, _)| body)
+        .expect("Windows release gate lost its server lib tests step");
+    assert_eq!(
+        active_powershell_lines(step),
+        [
+            r#"    Run-InCandidateIdentity @("cargo", "test", "-p", "rmux-server", "--lib", "--locked", "--", "--test-threads=1")"#,
+        ],
+        "Windows server lib tests must run under candidate_identity, or final-sink tests fail"
+    );
+
+    assert_eq!(
+        windows.matches("function Run-InCandidateIdentity(").count(),
+        1,
+        "the gate must define Run-InCandidateIdentity exactly once"
+    );
+    let helper = windows
+        .split_once("function Run-InCandidateIdentity([string[]]$Arguments) {\n")
+        .and_then(|(_, rest)| rest.split_once("\n}\n"))
+        .map(|(body, _)| body)
+        .expect("Windows release gate lost Run-InCandidateIdentity");
+    // candidate_identity refuses the shared target, and every later step needs it back,
+    // even when the identity child fails: the restore belongs to the finally of that call.
+    assert_eq!(
+        active_powershell_lines(helper),
+        [
+            "    $sharedTargetDir = $env:CARGO_TARGET_DIR",
+            "    Remove-Item Env:CARGO_TARGET_DIR",
+            "    try {",
+            r#"        Run-PythonScript "scripts\candidate_identity.py" (@("with", "--") + $Arguments)"#,
+            "    } finally {",
+            "        $env:CARGO_TARGET_DIR = $sharedTargetDir",
+            "    }",
+        ],
+        "Run-InCandidateIdentity must clear the shared target, enter candidate_identity and restore the target in finally"
+    );
+}
+
+/// Lines PowerShell executes in a script block body: blank and `#` comment lines removed.
+fn active_powershell_lines(body: &str) -> Vec<&str> {
+    body.lines()
+        .filter(|line| {
+            let line = line.trim_start();
+            !line.is_empty() && !line.starts_with('#')
+        })
+        .collect()
 }
 
 #[test]
@@ -2211,15 +2300,15 @@ fn compatible_builder_routes_only_linux_gnu_through_the_pinned_floor() {
     let cargo_log = root.join("cargo.log");
     fs::create_dir(&fake_bin).expect("create fake bin");
     let fake_cargo = fake_bin.join("cargo");
-    fs::write(
+    executable_fixture::write_executable(
         &fake_cargo,
         "#!/bin/sh\nprintf '%s\\n' \"$@\" > \"$FAKE_CARGO_LOG\"\n",
+        0o755,
     )
     .expect("write fake cargo");
-    make_executable(&fake_cargo);
     let fake_zigbuild = fake_bin.join("cargo-zigbuild");
-    fs::write(&fake_zigbuild, "#!/bin/sh\nexit 0\n").expect("write fake cargo-zigbuild");
-    make_executable(&fake_zigbuild);
+    executable_fixture::write_executable(&fake_zigbuild, "#!/bin/sh\nexit 0\n", 0o755)
+        .expect("write fake cargo-zigbuild");
     let path = format!(
         "{}:{}",
         fake_bin.display(),
@@ -2319,12 +2408,12 @@ fn glibc_floor_helper_selects_newest_imported_symbol() {
     let second = root.join("second");
     fs::write(&first, b"elf").expect("write first fixture");
     fs::write(&second, b"elf").expect("write second fixture");
-    fs::write(
+    executable_fixture::write_executable(
         &fake_readelf,
         "#!/bin/sh\ncase \"$2\" in *first) echo 'Name: GLIBC_2.31';; *) echo 'Name: GLIBC_2.34'; echo 'Name: GLIBC_2.17';; esac\n",
+        0o755,
     )
     .expect("write fake readelf");
-    make_executable(&fake_readelf);
     let output = Command::new(repo_root().join("scripts/glibc-symbol-floor.sh"))
         .arg(&first)
         .arg(&second)
@@ -2334,6 +2423,34 @@ fn glibc_floor_helper_selects_newest_imported_symbol() {
         .expect("run glibc floor helper");
     assert!(output.status.success(), "{}", stderr(&output));
     assert_eq!(stdout(&output).trim(), "2.34");
+    fs::remove_dir_all(root).expect("remove temp directory");
+}
+
+#[test]
+#[cfg(unix)]
+fn glibc_floor_helper_parses_untranslated_readelf_under_a_translated_locale() {
+    // binutils translates readelf labels through gettext ("Name:" becomes
+    // "Nom:" under fr_FR), so the helper must read readelf in the C locale.
+    let root = temp_dir("glibc-floor-locale");
+    let fake_readelf = root.join("readelf");
+    let binary = root.join("binary");
+    fs::write(&binary, b"elf").expect("write binary fixture");
+    executable_fixture::write_executable(
+        &fake_readelf,
+        "#!/bin/sh\nif [ \"${LC_ALL:-}\" = C ]; then label=Name; else label=Nom; fi\necho \"  0x0010:   $label: GLIBC_2.28  Flags: none  Version: 2\"\n",
+        0o755,
+    )
+    .expect("write fake readelf");
+    let output = Command::new(repo_root().join("scripts/glibc-symbol-floor.sh"))
+        .arg(&binary)
+        .env("READELF", &fake_readelf)
+        .env("LC_ALL", "fr_FR.UTF-8")
+        .env("LANG", "fr_FR.UTF-8")
+        .current_dir(repo_root())
+        .output()
+        .expect("run glibc floor helper");
+    assert!(output.status.success(), "{}", stderr(&output));
+    assert_eq!(stdout(&output).trim(), "2.28");
     fs::remove_dir_all(root).expect("remove temp directory");
 }
 
@@ -2401,12 +2518,12 @@ fn rpm_repository_refuses_to_clean_unmanaged_output_directories() {
     fs::write(input.join("rmux-0.9.0-1.x86_64.rpm"), b"rpm").expect("write fake RPM");
 
     let createrepo = tools.join("createrepo_c");
-    fs::write(
+    executable_fixture::write_executable(
         &createrepo,
         "#!/bin/sh\nset -eu\nmkdir -p \"$1/repodata\"\nprintf metadata > \"$1/repodata/repomd.xml\"\n",
+        0o755,
     )
     .expect("write fake createrepo");
-    make_executable(&createrepo);
     let path = format!(
         "{}:{}",
         tools.display(),
@@ -2592,33 +2709,33 @@ fn rpm_repository_publishes_both_package_and_repodata_key_urls() {
     .expect("write legacy-named retained RPM");
 
     let createrepo = tools.join("createrepo_c");
-    fs::write(
+    executable_fixture::write_executable(
         &createrepo,
         "#!/bin/sh\nset -eu\nmkdir -p \"$1/repodata\"\nprintf metadata > \"$1/repodata/repomd.xml\"\n",
+        0o755,
     )
     .expect("write fake createrepo");
-    make_executable(&createrepo);
     let rpmsign = tools.join("rpmsign");
-    fs::write(
+    executable_fixture::write_executable(
         &rpmsign,
         "#!/bin/sh\nset -eu\nlast=\nfor arg in \"$@\"; do last=$arg; done\nprintf '%s\\n' \"${last##*/}\" >> \"$RPM_SIGN_LOG\"\nprintf '%s' signed >> \"$last\"\n",
+        0o755,
     )
     .expect("write fake rpmsign");
-    make_executable(&rpmsign);
     let rpm = tools.join("rpm");
-    fs::write(
+    executable_fixture::write_executable(
         &rpm,
         "#!/bin/sh\nset -eu\nlast=\nfor arg in \"$@\"; do last=$arg; done\ncase \"${last##*/}\" in\n  rmux-0.9.0-legacy.*) printf 'rmux\\t0.8.0' ;;\n  rmux-0.9.0-*) printf 'rmux\\t0.9.0' ;;\n  rmux-0.8.0-*) printf 'rmux\\t0.8.0' ;;\n  *) exit 92 ;;\nesac\n",
+        0o755,
     )
     .expect("write fake rpm query");
-    make_executable(&rpm);
     let gpg = tools.join("gpg");
-    fs::write(
+    executable_fixture::write_executable(
         &gpg,
         "#!/bin/sh\nset -eu\ncase \" $* \" in\n  *\" --with-colons --fingerprint \"*)\n    last=\n    for arg in \"$@\"; do last=$arg; done\n    case $last in package-key) fpr=PACKAGEFINGERPRINT ;; repository-key) fpr=REPOSITORYFINGERPRINT ;; *) exit 1 ;; esac\n    printf 'fpr:::::::::%s:\\n' \"$fpr\"\n    exit 0\n    ;;\nesac\nout=\nwhile [ \"$#\" -gt 0 ]; do\n  if [ \"$1\" = --output ]; then out=$2; shift 2; else shift; fi\ndone\n[ -n \"$out\" ]\nprintf signature > \"$out\"\n",
+        0o755,
     )
     .expect("write fake gpg");
-    make_executable(&gpg);
 
     let path = format!(
         "{}:{}",
@@ -2809,28 +2926,34 @@ fn linux_repository_history_is_authenticated_before_retention() {
     let alternate_rpm_fingerprint = "CCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCC";
     let rpm_subkey_fingerprint = "DDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDD";
     let gpg = tools.join("gpg");
-    fs::write(
+    executable_fixture::write_executable(
         &gpg,
         format!(
             "#!/bin/sh\nset -eu\ncase \" $* \" in\n  *\" --with-colons --fingerprint apt-key \"*)\n    printf 'pub:::::::::\\nfpr:::::::::{apt_fingerprint}:\\n'\n    ;;\n  *\" --with-colons --fingerprint rpm-key \"*)\n    printf 'pub:::::::::\\nfpr:::::::::{rpm_fingerprint}:\\nsub:::::::::\\nfpr:::::::::{rpm_subkey_fingerprint}:\\n'\n    if [ \"${{FAKE_AMBIGUOUS_RPM_SELECTOR:-0}}\" = 1 ]; then\n      printf 'pub:::::::::\\nfpr:::::::::{alternate_rpm_fingerprint}:\\n'\n    fi\n    ;;\n  *\" --status-fd 1 --verify \"*)\n    printf '[GNUPG:] VALIDSIG {apt_fingerprint} 2026 0 0 0 0 0 0 0 {apt_fingerprint}\\n'\n    ;;\n  *\" --armor --export {rpm_fingerprint} \"*) printf '%s\\n' 'PUBLIC KEY' ;;\n  *) exit 91 ;;\nesac\n"
         ),
+        0o755,
     )
     .expect("write fake gpg");
-    make_executable(&gpg);
     let rpmkeys = tools.join("rpmkeys");
-    fs::write(
+    executable_fixture::write_executable(
         &rpmkeys,
         "#!/bin/sh\nset -eu\ncase \" $* \" in\n  *\" --import \"*) exit 0 ;;\n  *\" --checksig \"*)\n    if [ \"${FAKE_RPM_DIGEST_ONLY:-0}\" = 1 ]; then\n      printf '%s\\n' 'package.rpm: digests OK'\n    else\n      printf '%s\\n' 'package.rpm: digests signatures OK'\n    fi\n    exit 0\n    ;;\n  *) exit 92 ;;\nesac\n",
+        0o755,
     )
     .expect("write fake rpmkeys");
-    make_executable(&rpmkeys);
     let rpm = tools.join("rpm");
-    fs::write(
+    executable_fixture::write_executable(
         &rpm,
-        "#!/bin/sh\nset -eu\n[ \"$1\" = -qp ]\nfor package do :; done\ncase \" $* \" in *0.7.0*) version=0.7.0 ;; *0.8.0*) version=0.8.0 ;; *) exit 93 ;; esac\ncase \" $* \" in *i686*) architecture=i686 ;; *) architecture=x86_64 ;; esac\ncase \" $* \" in\n  *SHA256HEADER*)\n    normalized=$(sed 's/^signature://' \"$package\")\n    digest=$(printf '%s' \"$normalized\" | sha256sum | cut -d' ' -f1)\n    printf 'rmux\\n%s\\n1\\n%s\\n%s\\n%s\\n' \"$version\" \"$architecture\" \"$digest\" \"$digest\"\n    ;;\n  *) printf 'rmux\\n%s\\n%s\\n' \"$version\" \"$architecture\" ;;\nesac\n",
+        "#!/bin/sh\nset -eu\n[ \"$1\" = -qp ]\nfor package do :; done\ncase \" $* \" in *0.7.0*) version=0.7.0 ;; *0.8.0*) version=0.8.0 ;; *) exit 93 ;; esac\ncase \" $* \" in *i686*) architecture=i686 ;; *) architecture=x86_64 ;; esac\ncase \" $* \" in\n  *SHA256HEADER*)\n    normalized=$(sed 's/^signature://' \"$package\")\n    digest=$(printf '%s' \"$normalized\" | python3 -c 'import hashlib, sys; print(hashlib.sha256(sys.stdin.buffer.read()).hexdigest())')\n    printf 'rmux\\n%s\\n1\\n%s\\n%s\\n%s\\n' \"$version\" \"$architecture\" \"$digest\" \"$digest\"\n    ;;\n  *) printf 'rmux\\n%s\\n%s\\n' \"$version\" \"$architecture\" ;;\nesac\n",
+        0o755,
     )
     .expect("write fake rpm");
-    make_executable(&rpm);
+
+    // The supported macOS release PATH can omit sha256sum. Reproduce that
+    // dependency boundary even on hosts that provide a checksum executable.
+    let unavailable_checksum = tools.join("sha256sum");
+    executable_fixture::write_executable(&unavailable_checksum, "#!/bin/sh\nexit 127\n", 0o755)
+        .expect("write unavailable checksum fixture");
 
     let path = format!(
         "{}:{}",
@@ -3078,12 +3201,4 @@ fn package_repository_base_guard_rejects_a_stale_snapshot() {
     assert!(accepted.status.success(), "{}", stderr(&accepted));
 
     fs::remove_dir_all(root).expect("remove package repository fixture");
-}
-
-#[cfg(unix)]
-fn make_executable(path: &Path) {
-    use std::os::unix::fs::PermissionsExt;
-    let mut permissions = fs::metadata(path).expect("read permissions").permissions();
-    permissions.set_mode(0o755);
-    fs::set_permissions(path, permissions).expect("set executable permissions");
 }

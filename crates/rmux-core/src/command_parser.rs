@@ -8,29 +8,39 @@
 //! `cmd-parse.y:1626` for argv parsing, continuation handling, and
 //! tokenization.
 
-use std::error::Error;
-use std::fmt;
-
 use crate::{
     formats::{is_truthy, render_template, FormatVariable, FormatVariables},
     EnvironmentStore,
 };
 
-#[path = "command_parser/aliases.rs"]
 mod aliases;
-#[path = "command_parser/grammar.rs"]
+mod argument_check;
+pub use argument_check::{
+    check_tmux_arguments, print_tmux_command_list, without_trailing_option_terminator,
+    TmuxArgumentError,
+};
+mod control_size;
+pub use control_size::ControlClientSize;
+mod pan_adjustment;
+pub use pan_adjustment::parse_pan_adjustment;
+mod error;
+mod escape;
 mod grammar;
-#[path = "command_parser/lexer.rs"]
 mod lexer;
-#[path = "command_parser/lookup.rs"]
 mod lookup;
-#[path = "command_parser/table.rs"]
+mod model;
+mod reparse;
 mod table;
 
 use aliases::CommandAlias;
+pub use error::{CommandParseError, CommandParseErrorKind};
+pub(crate) use escape::escape_argument;
 use grammar::GrammarParser;
 use lexer::Lexer;
 use lookup::lookup_command_at;
+pub use model::{
+    CommandArgument, CommandGrouping, EnvironmentAssignment, ParsedCommand, ParsedCommands,
+};
 pub use table::{CommandEntry, COMMAND_TABLE};
 
 const DEFAULT_MAX_COMMAND_BYTES: usize = 16 * 1024;
@@ -71,355 +81,6 @@ pub fn is_parse_time_assignment(argument: &str) -> bool {
 /// Looks up a frozen tmux command using exact alias then unique name prefix.
 pub fn lookup_command(name: &str) -> Result<&'static CommandEntry, CommandParseError> {
     lookup_command_at(name, 0, &[])
-}
-
-/// Parser output for one command list.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub struct ParsedCommands {
-    commands: Vec<ParsedCommand>,
-    assignments: Vec<EnvironmentAssignment>,
-    grouping: CommandGrouping,
-}
-
-impl ParsedCommands {
-    fn with_grouping(grouping: CommandGrouping) -> Self {
-        Self {
-            commands: Vec::new(),
-            assignments: Vec::new(),
-            grouping,
-        }
-    }
-
-    /// Returns the parsed command sequence.
-    #[must_use]
-    pub fn commands(&self) -> &[ParsedCommand] {
-        &self.commands
-    }
-
-    /// Returns parse-time environment assignments.
-    #[must_use]
-    pub fn assignments(&self) -> &[EnvironmentAssignment] {
-        &self.assignments
-    }
-
-    /// Returns how queue group IDs should be assigned for this parsed list.
-    #[must_use]
-    pub const fn grouping(&self) -> CommandGrouping {
-        self.grouping
-    }
-
-    /// Consumes the list and returns only the command sequence.
-    #[must_use]
-    pub fn into_commands(self) -> Vec<ParsedCommand> {
-        self.commands
-    }
-
-    /// Returns whether the parser found no executable commands.
-    #[must_use]
-    pub fn is_empty(&self) -> bool {
-        self.commands.is_empty()
-    }
-
-    fn push_assignment(&mut self, assignment: EnvironmentAssignment) {
-        self.assignments.push(assignment);
-    }
-
-    fn push_command(&mut self, mut command: ParsedCommand) {
-        command.drain_nested_assignments_into(&mut self.assignments);
-        self.commands.push(command);
-    }
-
-    /// Appends another parsed command list, preserving the grouping mode of
-    /// this list.
-    pub fn append(&mut self, mut other: Self) {
-        self.assignments.append(&mut other.assignments);
-        self.commands.append(&mut other.commands);
-    }
-
-    /// Adds an offset to every source line recorded in this command list.
-    ///
-    /// Recovery parsers use this after parsing a suffix of a larger source
-    /// file so diagnostics and verbose output still reference original lines.
-    pub fn add_line_offset(&mut self, offset: usize) {
-        if offset == 0 {
-            return;
-        }
-        for command in &mut self.commands {
-            command.add_line_offset(offset);
-        }
-    }
-
-    /// Converts the parsed commands back to a tmux-style command string.
-    #[must_use]
-    pub fn to_tmux_string(&self) -> String {
-        let mut rendered = String::new();
-        let mut previous_line = None;
-        for command in &self.commands {
-            if !rendered.is_empty() {
-                if previous_line.is_some_and(|line| line != command.line()) {
-                    rendered.push_str(" ;; ");
-                } else {
-                    rendered.push_str(" ; ");
-                }
-            }
-            rendered.push_str(&command.to_tmux_string());
-            previous_line = Some(command.line());
-        }
-        rendered
-    }
-
-    /// Converts the parsed commands to a command string suitable for
-    /// embedding in a `bind-key` line.
-    #[must_use]
-    pub fn to_tmux_binding_string(&self) -> String {
-        self.commands
-            .iter()
-            .map(ParsedCommand::to_tmux_reparse_string)
-            .collect::<Vec<_>>()
-            .join(" \\; ")
-    }
-
-    /// Converts the parsed commands to a lossless command string that can be
-    /// parsed again without applying display-only quote escaping twice.
-    #[must_use]
-    pub fn to_tmux_reparse_string(&self) -> String {
-        let mut rendered = self.assignments_to_tmux_reparse_string();
-        let mut previous_line = None;
-        for command in &self.commands {
-            if !rendered.is_empty() {
-                if previous_line.is_some_and(|line| line != command.line()) {
-                    rendered.push_str(" ;; ");
-                } else {
-                    rendered.push_str(" ; ");
-                }
-            }
-            rendered.push_str(&command.to_tmux_reparse_string());
-            previous_line = Some(command.line());
-        }
-        rendered
-    }
-
-    /// Converts only the parse-time assignments to a lossless command string.
-    #[must_use]
-    pub fn assignments_to_tmux_reparse_string(&self) -> String {
-        self.assignments
-            .iter()
-            .map(|assignment| {
-                let rendered = escape_argument_for_reparse(&format!(
-                    "{}={}",
-                    assignment.name(),
-                    assignment.value()
-                ));
-                if assignment.hidden() {
-                    format!("%hidden {rendered}")
-                } else {
-                    rendered
-                }
-            })
-            .collect::<Vec<_>>()
-            .join(" ; ")
-    }
-}
-
-/// Queue grouping mode captured while parsing a tmux command list.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub enum CommandGrouping {
-    /// Commands that start on the same source line share one queue group.
-    #[default]
-    ByLine,
-    /// All commands in the parsed list share one queue group.
-    OneGroup,
-}
-
-/// One parsed tmux command with a canonical command name.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ParsedCommand {
-    name: String,
-    arguments: Vec<CommandArgument>,
-    start_line: usize,
-    line: usize,
-}
-
-impl ParsedCommand {
-    /// Returns the canonical command name.
-    #[must_use]
-    pub fn name(&self) -> &str {
-        &self.name
-    }
-
-    /// Returns the parsed command arguments.
-    #[must_use]
-    pub fn arguments(&self) -> &[CommandArgument] {
-        &self.arguments
-    }
-
-    /// Returns this command with replacement arguments while preserving its
-    /// source location.
-    #[must_use]
-    pub fn with_arguments(mut self, arguments: Vec<CommandArgument>) -> Self {
-        self.arguments = arguments;
-        self
-    }
-
-    /// Returns the one-based input line where this command started.
-    #[must_use]
-    pub fn line(&self) -> usize {
-        self.line
-    }
-
-    fn new(name: String, arguments: Vec<CommandArgument>, line: usize) -> Self {
-        Self {
-            name,
-            arguments,
-            start_line: line,
-            line,
-        }
-    }
-
-    fn with_lines(
-        name: String,
-        arguments: Vec<CommandArgument>,
-        start_line: usize,
-        line: usize,
-    ) -> Self {
-        Self {
-            name,
-            arguments,
-            start_line,
-            line,
-        }
-    }
-
-    fn add_line_offset(&mut self, offset: usize) {
-        self.start_line = self.start_line.saturating_add(offset);
-        self.line = self.line.saturating_add(offset);
-        for argument in &mut self.arguments {
-            if let CommandArgument::Commands(commands) = argument {
-                commands.add_line_offset(offset);
-            }
-        }
-    }
-
-    fn drain_nested_assignments_into(&mut self, assignments: &mut Vec<EnvironmentAssignment>) {
-        for argument in &mut self.arguments {
-            if let CommandArgument::Commands(commands) = argument {
-                assignments.append(&mut commands.assignments);
-            }
-        }
-    }
-
-    /// Returns the first one-based input line occupied by this command.
-    #[must_use]
-    pub fn start_line(&self) -> usize {
-        self.start_line
-    }
-
-    /// Converts this command back to a tmux-style command string.
-    #[must_use]
-    pub fn to_tmux_string(&self) -> String {
-        std::iter::once(self.name.clone())
-            .chain(self.arguments.iter().map(CommandArgument::to_tmux_string))
-            .collect::<Vec<_>>()
-            .join(" ")
-    }
-
-    /// Converts this command to a lossless string for an internal
-    /// parse-execute bridge.
-    #[must_use]
-    pub fn to_tmux_reparse_string(&self) -> String {
-        std::iter::once(self.name.clone())
-            .chain(
-                self.arguments
-                    .iter()
-                    .map(CommandArgument::to_reparse_string),
-            )
-            .collect::<Vec<_>>()
-            .join(" ")
-    }
-}
-
-/// A parsed command argument.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum CommandArgument {
-    /// A scalar string argument after tmux quote and expansion handling.
-    String(String),
-    /// A brace-delimited nested command list.
-    Commands(ParsedCommands),
-}
-
-impl CommandArgument {
-    /// Returns the string value when this is a scalar argument.
-    #[must_use]
-    pub fn as_string(&self) -> Option<&str> {
-        match self {
-            Self::String(value) => Some(value),
-            Self::Commands(_) => None,
-        }
-    }
-
-    /// Converts the argument to a string suitable for the legacy CLI bridge.
-    #[must_use]
-    pub fn to_tmux_string(&self) -> String {
-        match self {
-            Self::String(value) => escape_argument(value),
-            Self::Commands(commands) => format!("{{ {} }}", commands.to_tmux_string()),
-        }
-    }
-
-    fn to_reparse_string(&self) -> String {
-        match self {
-            Self::String(value) => escape_argument_for_reparse(value),
-            Self::Commands(commands) => {
-                format!("{{ {} }}", commands.to_tmux_reparse_string())
-            }
-        }
-    }
-
-    /// Converts this argument to a lossless representation for an internal
-    /// parse-execute bridge.
-    #[must_use]
-    pub fn to_tmux_reparse_string(&self) -> String {
-        self.to_reparse_string()
-    }
-}
-
-/// A parse-time `name=value` environment assignment.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct EnvironmentAssignment {
-    name: String,
-    value: String,
-    hidden: bool,
-}
-
-impl EnvironmentAssignment {
-    /// Returns the assignment variable name.
-    #[must_use]
-    pub fn name(&self) -> &str {
-        &self.name
-    }
-
-    /// Returns the assignment value.
-    #[must_use]
-    pub fn value(&self) -> &str {
-        &self.value
-    }
-
-    /// Returns whether `%hidden` preceded this assignment.
-    #[must_use]
-    pub fn hidden(&self) -> bool {
-        self.hidden
-    }
-
-    fn from_equals(value: String, hidden: bool) -> Self {
-        let (name, value) = value
-            .split_once('=')
-            .expect("lexer only classifies assignments containing '='");
-        Self {
-            name: name.to_owned(),
-            value: value.to_owned(),
-            hidden,
-        }
-    }
 }
 
 /// A reusable parser with parse-time expansion context.
@@ -473,6 +134,16 @@ impl CommandParser {
     pub fn with_format_value(mut self, name: impl Into<String>, value: impl Into<String>) -> Self {
         self.format_variables.push((name.into(), value.into()));
         self
+    }
+
+    /// Returns whether parsing `source` can read parse-time format variables.
+    ///
+    /// Only `%if` and `%elif` conditions expand formats while parsing, and the
+    /// lexer recognises a directive only from a literal `%` in the source, so a
+    /// source without one never reads what [`Self::with_format_value`] adds.
+    #[must_use]
+    pub fn source_reads_parse_time_formats(source: &str) -> bool {
+        source.contains('%')
     }
 
     /// Copies global values from an RMUX environment store into the parser.
@@ -770,6 +441,12 @@ impl CommandParser {
             output.push_command(command);
         }
 
+        // Alias arguments are appended after parsing the expansion. Check the
+        // completed commands so argv, strings, source files and bindings agree.
+        for command in output.commands() {
+            argument_check::check_choose_template_arity(command)
+                .map_err(|error| CommandParseError::new(command.line(), error.to_string()))?;
+        }
         Ok(output)
     }
 
@@ -876,82 +553,6 @@ impl FormatVariables for ParseTimeFormatVariables<'_> {
     }
 }
 
-/// Error returned by command tokenization, parsing, or lookup.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct CommandParseError {
-    line: usize,
-    message: String,
-    kind: CommandParseErrorKind,
-}
-
-/// Coarse parse error class used by source-file recovery.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum CommandParseErrorKind {
-    /// The parser cannot safely identify a complete command boundary.
-    Structural,
-    /// Command name lookup failed after a structurally valid parse.
-    Lookup,
-    /// Tokenization or command-size validation failed.
-    Other,
-}
-
-impl CommandParseError {
-    /// Returns the one-based input line for the error, or zero when unknown.
-    #[must_use]
-    pub fn line(&self) -> usize {
-        self.line
-    }
-
-    /// Returns the tmux-style error message.
-    #[must_use]
-    pub fn message(&self) -> &str {
-        &self.message
-    }
-
-    /// Returns the coarse error class.
-    #[must_use]
-    pub const fn kind(&self) -> CommandParseErrorKind {
-        self.kind
-    }
-
-    pub(crate) fn new(line: usize, message: impl Into<String>) -> Self {
-        Self {
-            line,
-            message: message.into(),
-            kind: CommandParseErrorKind::Other,
-        }
-    }
-
-    pub(crate) fn structural(line: usize, message: impl Into<String>) -> Self {
-        Self {
-            line,
-            message: message.into(),
-            kind: CommandParseErrorKind::Structural,
-        }
-    }
-
-    pub(crate) fn lookup(line: usize, message: impl Into<String>) -> Self {
-        Self {
-            line,
-            message: message.into(),
-            kind: CommandParseErrorKind::Lookup,
-        }
-    }
-
-    fn with_line(mut self, line: usize) -> Self {
-        self.line = line;
-        self
-    }
-}
-
-impl fmt::Display for CommandParseError {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter.write_str(&self.message)
-    }
-}
-
-impl Error for CommandParseError {}
-
 fn command_from_arguments(
     mut arguments: Vec<CommandArgument>,
     line: usize,
@@ -962,127 +563,6 @@ fn command_from_arguments(
     let name = name.clone();
     arguments.remove(0);
     Ok(ParsedCommand::new(name, arguments, line))
-}
-
-pub(crate) fn escape_argument(value: &str) -> String {
-    if value.is_empty() {
-        return "''".to_owned();
-    }
-    if is_single_char_escaped_argument(value) {
-        return escape_unquoted_argument(value);
-    }
-    if !value.chars().any(argument_needs_double_quotes) {
-        if value.contains('"') {
-            return format!("'{}'", escape_single_quoted_argument(value));
-        }
-        return escape_unquoted_argument(value);
-    }
-
-    format!("\"{}\"", escape_double_quoted_argument(value))
-}
-
-fn escape_argument_for_reparse(value: &str) -> String {
-    let single_quoted_display =
-        value.contains('"') && !value.chars().any(argument_needs_double_quotes);
-    if single_quoted_display && value.chars().any(|ch| ch == '\\' || ch.is_ascii_control()) {
-        return format!("\"{}\"", escape_double_quoted_argument(value));
-    }
-    escape_argument(value)
-}
-
-fn is_single_char_escaped_argument(value: &str) -> bool {
-    let mut chars = value.chars();
-    let Some(ch) = chars.next() else {
-        return false;
-    };
-    chars.next().is_none() && matches!(ch, ';' | '{' | '}' | '\'' | '"' | '#' | '$' | '%')
-}
-
-fn argument_needs_double_quotes(ch: char) -> bool {
-    matches!(ch, ' ' | ';' | '{' | '}' | '\'' | '#' | '$' | '%')
-        || (ch.is_whitespace() && !matches!(ch, '\n' | '\r' | '\t'))
-}
-
-fn escape_unquoted_argument(value: &str) -> String {
-    let mut escaped = String::with_capacity(value.len());
-    for (index, ch) in value.chars().enumerate() {
-        match ch {
-            '~' if index == 0 => escaped.push_str(r"\~"),
-            ';' | '{' | '}' | '\'' | '"' | '#' | '$' | '%' => {
-                escaped.push('\\');
-                escaped.push(ch);
-            }
-            '\n' => escaped.push_str(r"\n"),
-            '\r' => escaped.push_str(r"\r"),
-            '\t' => escaped.push_str(r"\t"),
-            '\\' => escaped.push_str(r"\\"),
-            _ => escape_control_argument_char(&mut escaped, ch),
-        }
-    }
-    escaped
-}
-
-fn escape_single_quoted_argument(value: &str) -> String {
-    let mut escaped = String::with_capacity(value.len());
-    for ch in value.chars() {
-        match ch {
-            '\n' => escaped.push_str(r"\n"),
-            '\r' => escaped.push_str(r"\r"),
-            '\t' => escaped.push_str(r"\t"),
-            '\\' => escaped.push_str(r"\\"),
-            _ => escape_control_argument_char(&mut escaped, ch),
-        }
-    }
-    escaped
-}
-
-fn escape_double_quoted_argument(value: &str) -> String {
-    let mut escaped = String::with_capacity(value.len());
-    let mut chars = value.chars().enumerate().peekable();
-    while let Some((index, ch)) = chars.next() {
-        match ch {
-            '~' if index == 0 => escaped.push_str(r"\~"),
-            '\n' => escaped.push_str(r"\n"),
-            '\r' => escaped.push_str(r"\r"),
-            '\t' => escaped.push_str(r"\t"),
-            '\u{7}' => escaped.push_str(r"\a"),
-            '\u{8}' => escaped.push_str(r"\b"),
-            '\u{b}' => escaped.push_str(r"\v"),
-            '\u{c}' => escaped.push_str(r"\f"),
-            '\u{1b}' => escaped.push_str(r"\033"),
-            '$' if chars
-                .peek()
-                .is_some_and(|(_, next)| dollar_starts_variable(*next)) =>
-            {
-                escaped.push_str(r"\$")
-            }
-            '\\' | '"' => {
-                escaped.push('\\');
-                escaped.push(ch);
-            }
-            _ => escape_control_argument_char(&mut escaped, ch),
-        }
-    }
-    escaped
-}
-
-fn escape_control_argument_char(escaped: &mut String, ch: char) {
-    match ch {
-        '\u{7}' => escaped.push_str(r"\a"),
-        '\u{8}' => escaped.push_str(r"\b"),
-        '\u{b}' => escaped.push_str(r"\v"),
-        '\u{c}' => escaped.push_str(r"\f"),
-        '\u{1b}' => escaped.push_str(r"\033"),
-        '\0'..='\u{1f}' | '\u{7f}' => {
-            escaped.push('\\');
-            escaped.push_str(&format!("{:03o}", ch as u32));
-        }
-        _ => escaped.push(ch),
-    }
-}
-
-fn dollar_starts_variable(ch: char) -> bool {
-    ch == '{' || ch == '_' || ch.is_ascii_alphabetic()
 }
 
 #[cfg(test)]

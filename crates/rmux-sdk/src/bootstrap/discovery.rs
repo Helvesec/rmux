@@ -196,3 +196,6 @@ fn normalize_timeout(timeout: Duration) -> Option<Duration> {
 fn endpoint_discovery_error(error: io::Error) -> RmuxError {
     RmuxError::transport("resolve rmux SDK endpoint", error)
 }
+
+#[cfg(test)]
+mod tests;

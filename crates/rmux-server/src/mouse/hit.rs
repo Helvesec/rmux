@@ -112,6 +112,14 @@ pub(super) fn hit_to_attached_event(
         return None;
     }
     Some(AttachedMouseEvent {
+        coordinates: layout
+            .client_viewport
+            .then(|| {
+                hit.pane_id
+                    .and_then(|id| layout.panes.iter().find(|p| p.pane_id == id))
+                    .map(|p| p.coordinates())
+            })
+            .flatten(),
         raw,
         session_id: hit.session_id,
         window_id: hit.window_id,
@@ -194,7 +202,16 @@ fn status_hit(session_id: u32, status: &StatusLineLayout, x: u16, line: u16) -> 
 }
 
 fn active_pane_at(layout: &MouseLayout, x: u16, y: u16) -> Option<&PaneMouseTarget> {
-    layout.panes.iter().find(|pane| {
+    let mut selected = None;
+    for pane in &layout.panes {
+        if let Some(projection) = &pane.projection {
+            if projection.region_at(x, y).is_some()
+                && selected.is_none_or(|selected: &PaneMouseTarget| pane.layer > selected.layer)
+            {
+                selected = Some(pane);
+            }
+            continue;
+        }
         let scrollbar_width = pane
             .scrollbar
             .as_ref()
@@ -213,16 +230,21 @@ fn active_pane_at(layout: &MouseLayout, x: u16, y: u16) -> Option<&PaneMouseTarg
         let yoff = pane.geometry.y();
         let sy = pane.geometry.rows();
         if x < xoff || x > xoff.saturating_add(sx) {
-            return false;
+            continue;
         }
 
-        match layout.pane_border_status {
+        let contains = match layout.pane_border_status {
             PaneBorderStatus::Top => y >= yoff.saturating_sub(1) && y <= yoff.saturating_add(sy),
             PaneBorderStatus::Off | PaneBorderStatus::Bottom => {
                 !(y < yoff || y > yoff.saturating_add(sy))
             }
+        };
+        if contains && selected.is_none_or(|selected: &PaneMouseTarget| pane.layer > selected.layer)
+        {
+            selected = Some(pane);
         }
-    })
+    }
+    selected
 }
 
 fn check_mouse_in_pane(
@@ -231,6 +253,30 @@ fn check_mouse_in_pane(
     py: u16,
     pane_border_status: PaneBorderStatus,
 ) -> (MouseLocation, Option<u16>) {
+    if let Some(projection) = &pane.projection {
+        use rmux_core::ResolvedHitRegionKind;
+        return match projection.region_at(px, py) {
+            Some(ResolvedHitRegionKind::Frame | ResolvedHitRegionKind::PaneBorderStatus) => {
+                (MouseLocation::Border, None)
+            }
+            Some(ResolvedHitRegionKind::Content) => {
+                if let Some(scrollbar) = &pane.scrollbar {
+                    if super::projection::contains(projection.track, px, py) {
+                        let (_, y) = projection.coordinates.clamped_offset(px, py);
+                        if y < scrollbar.slider_y {
+                            return (MouseLocation::ScrollbarUp, None);
+                        }
+                        if y < scrollbar.slider_y.saturating_add(scrollbar.slider_h) {
+                            return (MouseLocation::ScrollbarSlider, Some(y - scrollbar.slider_y));
+                        }
+                        return (MouseLocation::ScrollbarDown, None);
+                    }
+                }
+                (MouseLocation::Pane, None)
+            }
+            None => (MouseLocation::Nowhere, None),
+        };
+    }
     let pane_status_line = match pane_border_status {
         PaneBorderStatus::Top => Some(pane.geometry.y().saturating_sub(1)),
         PaneBorderStatus::Bottom => Some(pane.geometry.y().saturating_add(pane.geometry.rows())),

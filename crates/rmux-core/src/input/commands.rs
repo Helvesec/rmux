@@ -114,6 +114,8 @@ pub enum CsiCommand {
     DsrPrivate,
     /// QUERY_PRIVATE — DECRPM Query (?$p).
     QueryPrivate,
+    /// ANSI mode query ($p).
+    Query,
     /// DECSCUSR — Set Cursor Style ( q).
     Decscusr,
     /// XDA — Extended Device Attributes (>q).
@@ -159,6 +161,8 @@ pub enum OscCommand {
     ResetCursor,
     /// OSC 133 — Shell integration / prompt mark.
     ShellIntegration,
+    /// OSC 7501 — Program status report or support query.
+    ProgramStatus,
 }
 
 /// DCS payload delivered to the screen writer.

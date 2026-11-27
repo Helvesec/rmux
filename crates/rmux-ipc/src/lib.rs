@@ -10,6 +10,7 @@ mod endpoint;
 mod listener;
 #[cfg(unix)]
 mod managed_socket_unix;
+mod server_write_drain;
 mod stream;
 #[cfg(any(windows, test))]
 mod windows_endpoint_components;
@@ -37,12 +38,15 @@ pub use endpoint::{
     LocalEndpoint,
 };
 pub use listener::LocalListener;
+pub use server_write_drain::ServerWriteDrain;
 pub use stream::{
     connect_blocking, is_peer_disconnect, wait_for_peer_close, BlockingLocalStream, LocalStream,
     PeerIdentity,
 };
 #[cfg(windows)]
 pub use stream::{connect_windows_pipe, WindowsPipeClient};
+#[cfg(unix)]
+pub use stream::{probe_socket_presence, SocketPresence};
 #[cfg(windows)]
 pub use windows_endpoint_reservation::ManagedEndpointStartReservation;
 #[cfg(windows)]

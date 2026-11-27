@@ -1,0 +1,43 @@
+{
+  "schema_version": 1,
+  "protocol_version": 1,
+  "capability": "e2ee-token-auth",
+  "support": [
+    {"id": "protocol", "path": "crates/rmux-server/src/web/protocol/mod.rs", "contains": "WEB_SHARE_PROTOCOL_VERSION: u16 = 1;"},
+    {"id": "capability", "path": "crates/rmux-server/src/web/crypto.rs", "contains": "E2EE_CAPABILITY: &str = \"e2ee-token-auth\";"},
+    {"id": "browser-crypto", "path": "crates/rmux-web-crypto/src/wasm.rs", "contains": "pub struct ClientSession {"},
+    {"id": "web-feature", "path": "crates/rmux-server/src/lib.rs", "contains": "#[cfg(all(any(unix, windows), feature = \"web\"))]\nmod web;"},
+    {"id": "tiny-helper", "path": "src/tiny_main/helper.rs", "contains": "pub(super) fn exec_full_helper(args: &[OsString]) -> Result<i32, String> {"},
+    {"id": "web-disabled", "path": "crates/rmux-server/src/handler.rs", "contains": "#[cfg(not(all(any(unix, windows), feature = \"web\")))]\nmod web_support_disabled;"},
+    {"id": "loopback", "path": "crates/rmux-server/src/web/settings.rs", "contains": "const DEFAULT_HOST: &str = \"127.0.0.1\";"},
+    {"id": "external-url", "path": "crates/rmux-server/src/web/registry/create.rs", "contains": "Some(value) => validate_public_base_url(value),"},
+    {"id": "provider-runner", "path": "crates/rmux-server/src/web/tunnel/mod.rs", "contains": "runner::start(preset, settings).await"},
+    {"id": "preset-loader", "path": "crates/rmux-server/src/web/tunnel/preset.rs", "contains": "SHIPPED_TUNNEL_PRESETS"}
+  ],
+  "frontends": [
+    {
+      "id": "web-v1", "protocol_version": 1,
+      "support": ["protocol", "capability", "browser-crypto"],
+      "requirements": ["Client implements Web protocol v1 and e2ee-token-auth using the shipped WASM bindings.", "Browser provides WebCrypto X25519, secure randomness and WebAssembly; frontend deployment identity is verified separately."]
+    }
+  ],
+  "daemons": [
+    {"id": "web-v1", "protocol_version": 1, "support": ["protocol", "capability", "web-feature"], "requirements": ["Daemon built with the web feature on Unix or Windows; this catalogue is source support, not native qualification."]}
+  ],
+  "artifacts": [
+    {"id": "full", "kind": "native", "support": ["web-feature"], "requirements": ["Default web feature enabled in the full binary and daemon."]},
+    {"id": "tiny", "kind": "delegated", "support": ["tiny-helper", "web-feature"], "requirements": ["Release tiny-cli dispatcher requires the matching full helper and web-enabled daemon; the tiny binary alone is insufficient."]},
+    {"id": "no-web", "kind": "disabled", "support": ["web-disabled"], "requirements": ["Built without default features and without web."]},
+    {"id": "wasm", "kind": "crypto", "support": ["browser-crypto"], "requirements": ["Browser crypto library only; it does not implement a daemon or tunnel runner."]}
+  ],
+  "networks": [
+    {"id": "loopback", "kind": "loopback", "support": ["loopback"], "requirements": ["Browser can reach the daemon loopback listener."], "preset": null},
+    {"id": "external-url", "kind": "external", "support": ["external-url"], "requirements": ["User supplies a reachable ingress URL with WebSocket forwarding to the loopback daemon; RMUX does not provision that ingress."], "preset": null},
+    {"id": "localhost-run", "kind": "provider", "support": ["provider-runner", "preset-loader"], "requirements": ["External service must be reachable; no service availability or uptime is asserted."], "preset": "crates/rmux-server/tunnels/localhost-run.toml"},
+    {"id": "sandhole", "kind": "provider", "support": ["provider-runner", "preset-loader"], "requirements": ["External service must be reachable; no service availability or uptime is asserted."], "preset": "crates/rmux-server/tunnels/sandhole.toml"},
+    {"id": "serveo", "kind": "provider", "support": ["provider-runner", "preset-loader"], "requirements": ["External service must be reachable; no service availability or uptime is asserted."], "preset": "crates/rmux-server/tunnels/serveo.toml"},
+    {"id": "srv-us", "kind": "provider", "support": ["provider-runner", "preset-loader"], "requirements": ["External service must be reachable; no service availability or uptime is asserted."], "preset": "crates/rmux-server/tunnels/srv-us.toml"},
+    {"id": "tailscale-funnel", "kind": "provider", "support": ["provider-runner", "preset-loader"], "requirements": ["Tailscale installed, authenticated and configured with Funnel permission; external reachability is not asserted."], "preset": "crates/rmux-server/tunnels/tailscale-funnel.toml"},
+    {"id": "tailscale-serve", "kind": "provider", "support": ["provider-runner", "preset-loader"], "requirements": ["Tailscale installed, authenticated and configured with operator permission; browser must be on the tailnet."], "preset": "crates/rmux-server/tunnels/tailscale-serve.toml"}
+  ]
+}

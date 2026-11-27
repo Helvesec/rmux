@@ -5,7 +5,7 @@ use std::time::Duration;
 use rmux_core::LifecycleEvent;
 use rmux_proto::{
     ControlMode, PaneKillRequest, PaneResizeRequest, PaneTargetRef, Request, ResizePaneAdjustment,
-    Response, SessionName, TerminalSize,
+    Response, RmuxError, SessionName, TerminalSize,
 };
 use tokio::sync::{mpsc, oneshot};
 
@@ -174,15 +174,81 @@ async fn custom_layout_resize_has_one_layout_notification_not_two() {
     );
 }
 
+/// A detached 80x24 window split four times and resized to 6x4: five
+/// stacked one-row panes hold it at 6x9. tmux 3.7b fires window-resized for
+/// every applied refit of such a manual window; RMUX keeps its one canonical
+/// layout notification beside it.
+async fn manual_window_refit_events(handler: &RequestHandler, label: &str, commands: &[&str]) {
+    let session = SessionName::new(format!("layout-notify-manual-{label}")).expect("test session");
+    create_session(handler, &session).await;
+    for _ in 0..4 {
+        run_detached_command(handler, &format!("split-window -d -v -t {session}")).await;
+    }
+    run_detached_command(handler, &format!("resize-window -t {session} -x 6 -y 4")).await;
+    let (control_pid, mut notifications) = register_control_client(handler, &session).await;
+    let _ = settle_control_notifications(&mut notifications).await;
+
+    for command in commands {
+        let command = render_command(command, &session);
+        let mut lifecycle_events = handler.subscribe_lifecycle_events();
+        run_control_command(handler, control_pid, &command).await;
+        assert_eq!(
+            layout_change_count(&mut notifications).await,
+            1,
+            "{command}"
+        );
+        let events = std::iter::from_fn(|| lifecycle_events.try_recv().ok())
+            .map(|event| event.event)
+            .collect::<Vec<_>>();
+        let count = |resized: bool| {
+            events
+                .iter()
+                .filter(|event| match event {
+                    LifecycleEvent::WindowResized { .. } => resized,
+                    LifecycleEvent::WindowLayoutChanged { .. } => !resized,
+                    _ => false,
+                })
+                .count()
+        };
+        assert_eq!((count(false), count(true)), (1, 1), "{command}");
+    }
+}
+
+#[tokio::test]
+async fn manual_window_kill_pane_refit_publishes_its_resize() {
+    // kill-pane takes the 6x9 window to 6x7.
+    let handler = RequestHandler::new();
+    manual_window_refit_events(&handler, "kill", &["kill-pane -t {session}:.4"]).await;
+}
+
+#[tokio::test]
+async fn manual_window_select_layout_refit_publishes_its_resize() {
+    // After kill-pane, select-layout main-vertical takes 6x7 to 6x5.
+    let handler = RequestHandler::new();
+    manual_window_refit_events(
+        &handler,
+        "layout",
+        &[
+            "kill-pane -t {session}:.4",
+            "select-layout -t {session} main-vertical",
+        ],
+    )
+    .await;
+}
+
 #[tokio::test]
 async fn join_and_move_reflow_minimum_target_and_publish_resize_product_divergence() {
-    // tmux 3.7b rejects every width-one case below with
-    // "size or position no space for a new pane". RMUX deliberately expands
-    // the target to the viable three-column minimum. Both engines accept the
-    // width-three neighborhood, where RMUX must not publish a spurious resize.
+    // tmux 3.7b rejects every width-one case below with "size or position no
+    // space for a new pane". RMUX used to expand the target to the viable
+    // three-column minimum instead, publishing a resize for a window the user
+    // never resized; FMT1 R2 retires that divergence for the two transfer
+    // commands, which now refuse atomically like tmux and publish nothing.
+    // `split-window` keeps its own reflow. Both engines accept the width-three
+    // neighborhood, where RMUX must not publish a spurious resize either.
     for operation in ["join-pane", "move-pane"] {
         for route in ["same", "cross"] {
-            for (initial_width, expected_resize_events) in [(1, 1), (3, 0)] {
+            for (initial_width, expected_resize_events) in [(1, 0), (3, 0)] {
+                let expect_refusal = initial_width == 1;
                 let label = format!("{operation}-{route}-{initial_width}");
                 let target = SessionName::new(format!("transfer-resize-target-{label}"))
                     .expect("target session");
@@ -251,13 +317,20 @@ async fn join_and_move_reflow_minimum_target_and_publish_resize_product_divergen
                 let mut lifecycle_events = handler.subscribe_lifecycle_events();
 
                 let command = format!("{} -h -d -s {source_target} -t {target}:0.0", operation);
-                run_control_command(&handler, control_pid, &command).await;
-                let control_lines = settle_control_notifications(&mut notifications).await;
-                let expected_hook_events = if expected_resize_events == 0 {
-                    "LL"
+                let error = run_control_command_result(&handler, control_pid, &command).await;
+                if expect_refusal {
+                    let error = error.unwrap_or_else(|| {
+                        panic!("{label}: a destination with no room must refuse")
+                    });
+                    assert!(
+                        error.to_string().contains("cannot split target pane"),
+                        "{label}: unexpected refusal {error}"
+                    );
                 } else {
-                    "LLR"
-                };
+                    assert!(error.is_none(), "{label}: {error:?}");
+                }
+                let control_lines = settle_control_notifications(&mut notifications).await;
+                let expected_hook_events = if expect_refusal { "" } else { "LL" };
                 let hook_events =
                     wait_for_buffer_text(&handler, "transfer-events", expected_hook_events).await;
                 let mut events = Vec::new();
@@ -279,15 +352,19 @@ async fn join_and_move_reflow_minimum_target_and_publish_resize_product_divergen
                 };
                 assert_eq!(
                     (target_size, target_panes),
-                    (TerminalSize { cols: 3, rows: 1 }, 2),
-                    "{label}"
+                    if expect_refusal {
+                        (TerminalSize { cols: 1, rows: 1 }, 1)
+                    } else {
+                        (TerminalSize { cols: 3, rows: 1 }, 2)
+                    },
+                    "{label}: a refusal resizes nothing and moves no pane"
                 );
                 assert_eq!(
                     control_lines
                         .iter()
                         .filter(|line| line.starts_with("%layout-change "))
                         .count(),
-                    1,
+                    usize::from(!expect_refusal),
                     "{label}: tmux 3.7b sends one control layout for the surviving target window"
                 );
                 assert_eq!(
@@ -295,7 +372,7 @@ async fn join_and_move_reflow_minimum_target_and_publish_resize_product_divergen
                         .iter()
                         .filter(|event| matches!(event, LifecycleEvent::WindowLayoutChanged { .. }))
                         .count(),
-                    2,
+                    if expect_refusal { 0 } else { 2 },
                     "{label}"
                 );
                 assert_eq!(
@@ -313,11 +390,21 @@ async fn join_and_move_reflow_minimum_target_and_publish_resize_product_divergen
                     expected_resize_events,
                     "{label}: hooks={hook_events:?}, lifecycle={events:?}"
                 );
-                assert_eq!(
-                    hook_events,
-                    Some(expected_hook_events.to_owned()),
-                    "{label}: lifecycle hooks must observe the same committed resize"
-                );
+                if expect_refusal {
+                    // An empty buffer is either unset or empty depending on the
+                    // buffer store; both mean no hook fired.
+                    assert!(
+                        hook_events.as_deref().unwrap_or_default().is_empty(),
+                        "{label}: a refusal fires no layout or resize hook, got {hook_events:?}"
+                    );
+                } else {
+                    assert_eq!(
+                        hook_events,
+                        Some(expected_hook_events.to_owned()),
+                        "{label}: lifecycle hooks must observe the same committed resize"
+                    );
+                }
+                let _ = expected_resize_events;
 
                 let _ = hook_shutdown_tx.send(());
                 hook_task.await.expect("lifecycle hook task");
@@ -444,16 +531,24 @@ async fn run_detached_command(handler: &RequestHandler, command: &str) {
 }
 
 async fn run_control_command(handler: &RequestHandler, control_pid: u32, command: &str) {
+    let error = run_control_command_result(handler, control_pid, command).await;
+    assert!(error.is_none(), "failed to execute {command:?}: {error:?}");
+}
+
+/// Runs a control command and hands back its error instead of asserting.
+async fn run_control_command_result(
+    handler: &RequestHandler,
+    control_pid: u32,
+    command: &str,
+) -> Option<RmuxError> {
     let parsed = handler
         .parse_control_commands(command)
         .await
         .unwrap_or_else(|error| panic!("failed to parse {command:?}: {error}"));
-    let result = handler.execute_control_commands(control_pid, parsed).await;
-    assert!(
-        result.error.is_none(),
-        "failed to execute {command:?}: {:?}",
-        result.error
-    );
+    handler
+        .execute_control_commands(control_pid, parsed)
+        .await
+        .error
 }
 
 async fn register_control_client(

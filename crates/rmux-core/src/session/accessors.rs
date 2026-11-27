@@ -297,35 +297,13 @@ impl Session {
         let previous_active = self.active_window;
         let previous_last = self.last_window;
         let previous_active_window_id = self.window_at(previous_active).map(Window::id);
-        let previous_last_window_id = previous_last
-            .and_then(|window_index| self.window_at(window_index))
-            .map(Window::id);
 
         let synchronized_active = previous_active_window_id
             .and_then(|window_id| window_index_for_id(&source.windows, window_id, previous_active))
             .unwrap_or_else(|| {
                 synchronized_active_window(&source.windows, previous_active, previous_last)
             });
-        let synchronized_last = previous_last_window_id
-            .and_then(|window_id| {
-                window_index_for_id(
-                    &source.windows,
-                    window_id,
-                    previous_last.expect("last window id requires an index"),
-                )
-            })
-            .filter(|window_index| *window_index != synchronized_active)
-            .or_else(|| {
-                (previous_active != synchronized_active
-                    && source.windows.contains_key(&previous_active))
-                .then_some(previous_active)
-            });
-        self.synchronize_group_windows(
-            source,
-            synchronized_active,
-            synchronized_last,
-            winlink_alert_map,
-        );
+        self.synchronize_group_windows(source, synchronized_active, winlink_alert_map);
     }
 
     /// Synchronizes grouped window state while remapping selected source slots explicitly.
@@ -359,29 +337,13 @@ impl Session {
         } else {
             synchronized_active_window(&source.windows, previous_active, previous_last)
         };
-        let synchronized_last = previous_last
-            .map(|window_index| {
-                window_selection_map
-                    .get(&window_index)
-                    .copied()
-                    .unwrap_or(window_index)
-            })
-            .filter(|window_index| {
-                *window_index != synchronized_active && source.windows.contains_key(window_index)
-            });
-        self.synchronize_group_windows(
-            source,
-            synchronized_active,
-            synchronized_last,
-            Some(winlink_alert_map),
-        );
+        self.synchronize_group_windows(source, synchronized_active, Some(winlink_alert_map));
     }
 
     fn synchronize_group_windows(
         &mut self,
         source: &Session,
         active_window: u32,
-        last_window: Option<u32>,
         winlink_alert_map: Option<&BTreeMap<u32, u32>>,
     ) {
         let synchronized_alert_flags = remap_local_winlink_alert_flags(
@@ -396,7 +358,22 @@ impl Session {
         self.next_pane_id = source.next_pane_id;
         self.cwd = source.cwd.clone();
         self.active_window = active_window;
-        self.last_window = last_window;
+        // A peer is resynchronised, never navigated: `session.c:663-678` keeps its
+        // visits on the slots it already knew, whatever now occupies them, and
+        // drops only the ones that went away. The head of what is left is then
+        // its return.
+        self.window_stack = crate::session::visit_history::carry_occurrences(
+            &self.window_stack,
+            &self
+                .windows
+                .keys()
+                .map(|&index| (index, index))
+                .collect::<BTreeMap<u32, u32>>(),
+            active_window,
+            |slot| self.windows.contains_key(&slot),
+        );
+        self.last_window =
+            crate::session::visit_history::live_head(&self.window_stack, active_window);
     }
 
     /// Returns the session's active window.
@@ -512,6 +489,15 @@ impl Session {
     #[must_use]
     pub const fn last_window_index(&self) -> Option<u32> {
         self.last_window
+    }
+
+    /// The windows this session really visited, most recent first.
+    ///
+    /// The active window is never in it and a window that was never visited is
+    /// never in it, which is what tmux keeps as `s->lastw`.
+    #[must_use]
+    pub fn window_visit_stack(&self) -> &[u32] {
+        &self.window_stack
     }
 
     /// Returns the active pane index owned by the session.

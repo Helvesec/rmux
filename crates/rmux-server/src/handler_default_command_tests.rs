@@ -55,7 +55,7 @@ async fn create_session(handler: &RequestHandler, session: &SessionName) {
             environment: None,
         }))
         .await;
-    assert!(matches!(response, Response::NewSession(_)), "{response:?}");
+    crate::session_fixture::assert_new_session(&response);
 }
 
 async fn create_grouped_session(
@@ -84,7 +84,7 @@ async fn create_grouped_session(
             skip_environment_update: false,
         })))
         .await;
-    assert!(matches!(response, Response::NewSession(_)), "{response:?}");
+    crate::session_fixture::assert_new_session(&response);
 }
 
 async fn set_default_command(handler: &RequestHandler, scope: ScopeSelector, command: &str) {

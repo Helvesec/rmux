@@ -1,8 +1,12 @@
+#[cfg(not(target_has_atomic = "64"))]
+use portable_atomic::AtomicU64;
 use std::future::Future;
 use std::io;
 use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::pin::Pin;
-use std::sync::atomic::{AtomicU64, Ordering};
+#[cfg(target_has_atomic = "64")]
+use std::sync::atomic::AtomicU64;
+use std::sync::atomic::Ordering;
 use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll, Waker};
 
@@ -182,6 +186,30 @@ fn sdk_wait_owner_ids_mix_process_seed_with_local_counter() {
         mix_sdk_wait_owner_id(0x1111_2222_3333_4444, 2)
     );
     assert_ne!(mix_sdk_wait_owner_id(0, 0), 0);
+}
+
+#[test]
+fn atomic64_sdk_wait_ids_cross_u32_boundary_under_contention() {
+    let start = u64::from(u32::MAX) - 2;
+    let counter = AtomicU64::new(start);
+    let mut ids = std::thread::scope(|scope| {
+        let threads: Vec<_> = (0..4)
+            .map(|_| {
+                scope.spawn(|| {
+                    (0..64)
+                        .map(|_| allocate_bounded_atomic_id(&counter, u64::MAX - 1, "exhausted"))
+                        .collect::<Vec<_>>()
+                })
+            })
+            .collect();
+        threads
+            .into_iter()
+            .flat_map(|thread| thread.join().expect("allocator thread"))
+            .collect::<Vec<_>>()
+    });
+    ids.sort_unstable();
+    assert_eq!(ids, (start..start + 256).collect::<Vec<_>>());
+    assert_eq!(counter.load(Ordering::Relaxed), start + 256);
 }
 
 #[test]
@@ -706,7 +734,7 @@ async fn error_response_completes_current_fifo_slot_as_protocol_error() {
     match join_request(request).await.expect_err("request must fail") {
         RmuxError::Protocol { source } => {
             assert_eq!(
-                source,
+                source.into_proto(),
                 rmux_proto::RmuxError::SessionNotFound("alpha".to_owned())
             );
         }
@@ -1142,3 +1170,295 @@ impl AsyncWrite for ScriptedIo {
         Poll::Ready(Ok(()))
     }
 }
+
+const PIPELINED_CALLERS: usize = 1000;
+const PIPELINED_RESPONSE_PADDING: usize = 4096;
+
+fn numbered_list_sessions_request(index: usize) -> Request {
+    Request::ListSessions(ListSessionsRequest {
+        format: Some(index.to_string()),
+        filter: None,
+        sort_order: None,
+        reversed: false,
+    })
+}
+
+fn numbered_list_sessions_stdout(index: &str) -> Vec<u8> {
+    let mut stdout = format!("{index}\n").into_bytes();
+    stdout.resize(stdout.len() + PIPELINED_RESPONSE_PADDING, b'.');
+    stdout
+}
+
+/// Serves a connection the way the daemon serves a detached client: it reads
+/// one request, writes that request's whole response, and only then reads the
+/// next request. A client that stops reading responses therefore stops this
+/// peer from reading requests.
+async fn serve_requests_serially<S>(mut stream: S)
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
+    let mut decoder = rmux_proto::FrameDecoder::new();
+    let mut buffer = [0_u8; 4096];
+    loop {
+        let request = loop {
+            if let Some(request) = decoder
+                .next_frame::<Request>()
+                .expect("request frame decodes")
+            {
+                break request;
+            }
+            match stream.read(&mut buffer).await {
+                Ok(0) | Err(_) => return,
+                Ok(read) => decoder.push_bytes(&buffer[..read]),
+            }
+        };
+        let Request::ListSessions(ListSessionsRequest {
+            format: Some(index),
+            ..
+        }) = request
+        else {
+            panic!("serial peer expects numbered list-sessions requests, got {request:?}");
+        };
+        let response = list_sessions_response(&numbered_list_sessions_stdout(&index));
+        let frame = encode_frame(&response).expect("response encodes");
+        if stream.write_all(&frame).await.is_err() {
+            return;
+        }
+    }
+}
+
+/// Issues `PIPELINED_CALLERS` concurrent requests on one shared transport and
+/// requires each caller to receive its own response before the per-request
+/// deadline. The outer bound only keeps a regressed actor from hanging CI.
+async fn assert_pipelined_callers_complete<S>(client_stream: S, peer_stream: S)
+where
+    S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+{
+    let peer = tokio::spawn(serve_requests_serially(peer_stream));
+    let client =
+        TransportClient::spawn(client_stream).with_default_timeout(Some(Duration::from_secs(10)));
+
+    let callers: Vec<_> = (0..PIPELINED_CALLERS)
+        .map(|index| {
+            let client = client.clone();
+            tokio::spawn(async move {
+                client
+                    .request(numbered_list_sessions_request(index))
+                    .await
+                    .map(|response| (index, response))
+            })
+        })
+        .collect();
+
+    let outcome = timeout(Duration::from_secs(30), async {
+        let mut failures = Vec::new();
+        for caller in callers {
+            match caller.await.expect("caller task") {
+                Ok((index, response)) => assert_eq!(
+                    response,
+                    list_sessions_response(&numbered_list_sessions_stdout(&index.to_string())),
+                    "caller {index} must receive its own FIFO response"
+                ),
+                Err(error) => failures.push(error),
+            }
+        }
+        failures
+    })
+    .await;
+    client.abort();
+    peer.abort();
+
+    let failures = outcome.expect("pipelined callers must not hang the shared transport");
+    assert!(
+        failures.is_empty(),
+        "{} of {PIPELINED_CALLERS} pipelined callers failed on a healthy serial peer; first: {:?}",
+        failures.len(),
+        failures.first()
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn pipelined_callers_on_a_serial_peer_do_not_deadlock_the_actor() {
+    let (client_stream, peer_stream) = tokio::io::duplex(8192);
+    assert_pipelined_callers_complete(client_stream, peer_stream).await;
+}
+
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn pipelined_callers_on_a_serial_unix_socket_peer_do_not_deadlock_the_actor() {
+    let (client_stream, peer_stream) = tokio::net::UnixStream::pair().expect("unix stream pair");
+    assert_pipelined_callers_complete(client_stream, peer_stream).await;
+}
+
+#[tokio::test]
+async fn stalled_peer_back_pressures_callers_into_the_bounded_command_queue() {
+    let (client_stream, _stalled_peer) = tokio::io::duplex(64);
+    let client = TransportClient::spawn(client_stream);
+    let callers: Vec<_> = (0..4 * super::ACTOR_QUEUE_CAPACITY)
+        .map(|_| spawn_request(&client, list_sessions_request()))
+        .collect();
+
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    assert_eq!(
+        client.commands.capacity(),
+        0,
+        "once its outgoing frame buffer is full, the actor must leave later callers \
+         waiting in the bounded command queue"
+    );
+
+    client.abort();
+    for caller in callers {
+        caller.abort();
+    }
+}
+
+#[tokio::test]
+async fn shutdown_closes_the_write_side_only_after_queued_requests_are_written() {
+    let peer_buffer = 4;
+    let request_frame = encode_frame(&list_sessions_request()).expect("request encodes");
+    assert!(request_frame.len() > 2 * peer_buffer);
+    let (client_stream, mut server_stream) = tokio::io::duplex(peer_buffer);
+    let client = TransportClient::spawn(client_stream);
+    let request = spawn_request(&client, list_sessions_request());
+
+    let mut received = vec![0_u8; 1];
+    server_stream
+        .read_exact(&mut received)
+        .await
+        .expect("first request byte");
+
+    let (reply, shutdown) = tokio::sync::oneshot::channel();
+    client
+        .commands
+        .send(ActorMessage::Shutdown { reply })
+        .await
+        .expect("queue shutdown behind the partly written request");
+    timeout(Duration::from_secs(1), async {
+        while client.commands.capacity() != super::ACTOR_QUEUE_CAPACITY {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("actor takes the shutdown while the request frame is still buffered");
+
+    server_stream
+        .read_to_end(&mut received)
+        .await
+        .expect("read until the client closes its write side");
+    assert_eq!(
+        received, request_frame,
+        "the write side must close only after the queued request frame is complete"
+    );
+
+    write_response(&mut server_stream, &list_sessions_response(b"alpha\n")).await;
+    assert_eq!(
+        join_request(request)
+            .await
+            .expect("queued request response"),
+        list_sessions_response(b"alpha\n")
+    );
+    drop(server_stream);
+    shutdown
+        .await
+        .expect("shutdown reply")
+        .expect("shutdown succeeds after the peer closes");
+}
+
+/// Starts unbounded callers on a stalled peer until the actor's outgoing
+/// frame buffer and the bounded command queue are both full, so that any
+/// further caller waits in `send` and its request is never written.
+async fn saturate_command_queue(
+    client: &TransportClient,
+) -> Vec<(usize, JoinHandle<crate::Result<Response>>)> {
+    let callers: Vec<_> = (0..4 * super::ACTOR_QUEUE_CAPACITY)
+        .map(|index| {
+            (
+                index,
+                spawn_request(client, numbered_list_sessions_request(index)),
+            )
+        })
+        .collect();
+    // With paused time, this sleep returns only once every task is idle: the
+    // actor has filled its outgoing frames and stopped taking commands.
+    tokio::time::sleep(Duration::from_millis(1)).await;
+    assert_eq!(
+        client.commands.capacity(),
+        0,
+        "the stalled peer must leave later callers waiting in the bounded command queue"
+    );
+    callers
+}
+
+fn assert_timed_out<T>(result: crate::Result<T>) {
+    match result {
+        Ok(_) => panic!("a caller whose deadline expired in the command queue must fail"),
+        Err(RmuxError::Transport { source, .. }) => {
+            assert_eq!(source.kind(), io::ErrorKind::TimedOut);
+        }
+        Err(error) => panic!("expected a timed-out transport error, got {error:?}"),
+    }
+}
+
+/// Serves the saturating callers once the queued caller has timed out, and
+/// requires every one of them, then a fresh request, to receive its own
+/// response on the same shared handle.
+async fn assert_queued_timeout_left_transport_healthy(
+    client: &TransportClient,
+    peer_stream: tokio::io::DuplexStream,
+    callers: Vec<(usize, JoinHandle<crate::Result<Response>>)>,
+) {
+    assert!(
+        client.state.terminal_failure().is_none(),
+        "a request that never left the command queue must not poison the shared transport"
+    );
+    let peer = tokio::spawn(serve_requests_serially(peer_stream));
+    for (index, caller) in callers {
+        assert_eq!(
+            join_request(caller)
+                .await
+                .unwrap_or_else(|error| panic!("unbounded caller {index} failed: {error:?}")),
+            list_sessions_response(&numbered_list_sessions_stdout(&index.to_string())),
+            "caller {index} must receive its own FIFO response"
+        );
+    }
+    let fresh = 4 * super::ACTOR_QUEUE_CAPACITY;
+    assert_eq!(
+        client
+            .request(numbered_list_sessions_request(fresh))
+            .await
+            .expect("a fresh request on the healthy handle succeeds"),
+        list_sessions_response(&numbered_list_sessions_stdout(&fresh.to_string()))
+    );
+    client.abort();
+    peer.abort();
+}
+
+#[tokio::test(start_paused = true)]
+async fn request_deadline_expiring_in_the_command_queue_fails_only_its_caller() {
+    let (client_stream, peer_stream) = tokio::io::duplex(64);
+    let unbounded = TransportClient::spawn(client_stream).with_default_timeout(None);
+    let callers = saturate_command_queue(&unbounded).await;
+
+    let short = unbounded.with_default_timeout(Some(Duration::from_millis(100)));
+    assert_timed_out(short.request(has_session_request()).await);
+
+    assert_queued_timeout_left_transport_healthy(&unbounded, peer_stream, callers).await;
+}
+
+#[tokio::test(start_paused = true)]
+async fn armed_request_deadline_expiring_in_the_command_queue_fails_only_its_caller() {
+    let (client_stream, peer_stream) = tokio::io::duplex(64);
+    let unbounded = TransportClient::spawn(client_stream).with_default_timeout(None);
+    let callers = saturate_command_queue(&unbounded).await;
+
+    let short = unbounded.with_default_timeout(Some(Duration::from_millis(100)));
+    assert_timed_out(
+        short
+            .armed_request(sdk_wait_request(SdkWaitId::new(42)))
+            .await,
+    );
+
+    assert_queued_timeout_left_transport_healthy(&unbounded, peer_stream, callers).await;
+}
+
+mod r3639;

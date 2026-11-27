@@ -2,6 +2,10 @@ use clap::{ArgAction, ArgGroup, Args, ValueEnum};
 
 use super::{parse_command_args, parse_target_spec, TargetSpec};
 
+#[cfg(test)]
+#[path = "web_pin_debug_tests.rs"]
+mod pin_debug_tests;
+
 pub(crate) const WEB_SHARE_TUNNEL_PROVIDERS: &[&str] = &[
     "localhost-run",
     "sandhole",
@@ -15,7 +19,7 @@ pub(crate) fn parse_web_share_args(arguments: Vec<String>) -> Result<WebShareArg
     parse_command_args("web-share", normalize_web_share_args(arguments))
 }
 
-#[derive(Debug, Clone, Args)]
+#[derive(Clone, Args)]
 #[command(
     after_help = WEB_SHARE_AFTER_HELP
 )]
@@ -114,6 +118,46 @@ pub(crate) struct WebShareArgs {
         conflicts_with = "no_pin"
     )]
     pub(crate) pin: bool,
+}
+
+impl std::fmt::Debug for WebShareArgs {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("WebShareArgs")
+            .field("list", &self.list)
+            .field("stop", &self.stop)
+            .field("disconnect", &self.disconnect)
+            .field("stop_all", &self.stop_all)
+            .field("lookup", &self.lookup)
+            .field("config", &self.config)
+            .field("target", &self.target)
+            .field("operator_only", &self.operator_only)
+            .field("spectator_only", &self.spectator_only)
+            .field("ttl_seconds", &self.ttl_seconds)
+            .field("expires_at", &self.expires_at)
+            .field("kill_session_on_expire", &self.kill_session_on_expire)
+            .field("max_spectators", &self.max_spectators)
+            .field("max_operators", &self.max_operators)
+            .field("frontend_url", &self.frontend_url)
+            .field("public_base_url", &self.public_base_url)
+            .field("tunnel_provider", &self.tunnel_provider)
+            .field("no_navbar", &self.no_navbar)
+            .field("no_disclaimer", &self.no_disclaimer)
+            .field("hide_viewers", &self.hide_viewers)
+            .field("show_viewers", &self.show_viewers)
+            .field("terminal_theme", &self.terminal_theme)
+            .field("no_pin", &self.no_pin)
+            .field(
+                "pin_operator",
+                &self.pin_operator.as_ref().map(|_| "[REDACTED]"),
+            )
+            .field(
+                "pin_spectator",
+                &self.pin_spectator.as_ref().map(|_| "[REDACTED]"),
+            )
+            .field("pin", &self.pin)
+            .finish()
+    }
 }
 
 const WEB_SHARE_AFTER_HELP: &str = "\

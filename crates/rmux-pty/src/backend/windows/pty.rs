@@ -1,18 +1,19 @@
+use std::collections::VecDeque;
 use std::io;
 use std::os::windows::io::{AsRawHandle, OwnedHandle};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
-use std::sync::{Mutex, RwLock};
+use std::sync::{Mutex, OnceLock, RwLock};
 use std::time::Duration;
 
 use windows_sys::Win32::Foundation::{
     GetLastError, ERROR_BROKEN_PIPE, ERROR_INVALID_PARAMETER, E_HANDLE, HANDLE, S_OK,
 };
-use windows_sys::Win32::System::Console::{
-    ClosePseudoConsole, CreatePseudoConsole, ResizePseudoConsole, COORD, HPCON,
-};
+use windows_sys::Win32::System::Console::{COORD, HPCON};
 
-use crate::{Result, TerminalGeometry, TerminalSize};
+use crate::{ProcessId, Result, TerminalGeometry, TerminalSize};
 
+use super::api::{self, ConptyApi};
 use super::bounded_write::OverlappedPipeWriter;
 use super::flags::{
     conpty_flags_without_passthrough, selected_conpty_flags, standard_conpty_flags, ConptyFlags,
@@ -52,7 +53,25 @@ impl WindowsPty {
             }
 
             let output_read = self.output_read_handle()?;
-            let bytes_read = super::io::read(&output_read, buffer)?;
+            let bytes_read = {
+                let mut state = self
+                    .state
+                    .write()
+                    .map_err(|_| io::Error::other("ConPTY state lock poisoned"))?;
+                let len = buffer.len().min(state.startup_output.len());
+                for byte in &mut buffer[..len] {
+                    *byte = state
+                        .startup_output
+                        .pop_front()
+                        .expect("counted startup output");
+                }
+                len
+            };
+            let bytes_read = if bytes_read == 0 {
+                super::io::read(&output_read, buffer)?
+            } else {
+                bytes_read
+            };
             let filtered = {
                 let mut dsr_bootstrap = self
                     .dsr_bootstrap
@@ -90,6 +109,18 @@ impl WindowsPty {
     ) -> io::Result<()> {
         let input_writer = self.input_writer()?;
         input_writer.write_all_with_stall_recovery(bytes, timeout, recovery_grace)
+    }
+
+    pub(crate) fn write_console_utf8_ordered(
+        &self,
+        process_id: ProcessId,
+        bytes: &[u8],
+        timeout: Duration,
+    ) -> io::Result<()> {
+        let input_writer = self.input_writer()?;
+        input_writer.run_after_pipe_drain(timeout, || {
+            crate::windows_console_input::write_windows_console_utf8(process_id, bytes)
+        })
     }
 
     fn output_read_handle(&self) -> io::Result<OwnedHandle> {
@@ -132,10 +163,46 @@ impl WindowsPty {
         Ok(drained)
     }
 
+    // The newly spawned child's master has not escaped to a reader yet.
+    pub(crate) fn finish_companion_startup(&self) -> io::Result<()> {
+        let mut state = self
+            .state
+            .write()
+            .map_err(|_| io::Error::other("ConPTY state lock poisoned"))?;
+        if state.hpc.api.companion {
+            state.startup_output =
+                super::startup::negotiate(&state.output_read, &state.input_writer)?;
+        }
+        Ok(())
+    }
+
+    /// A coherent snapshot of the console this PTY finally holds.
+    ///
+    /// Taken under the state guard, so the handle, the API and the flags all
+    /// describe the SAME console: a fallback that recreated it will already
+    /// have replaced the state, and this reads what replaced it. `create_flags`
+    /// is the value actually handed to `CreatePseudoConsole` - zero for the
+    /// companion API - and not the selected flags, which are not what the
+    /// companion was created with.
+    ///
+    /// Diagnostic only: compiled with `test-seams`, so no shipped runtime
+    /// carries it and no product behaviour changes.
+    #[cfg(feature = "test-seams")]
+    pub(crate) fn backend_snapshot(&self) -> Option<(u64, bool, u32, bool)> {
+        let state = self.state.read().ok()?;
+        let companion = state.hpc.api.companion;
+        Some((
+            state.hpc.raw() as u64,
+            companion,
+            if companion { 0 } else { state.flags.bits() },
+            state.flags.uses_passthrough(),
+        ))
+    }
+
     pub(crate) fn uses_passthrough(&self) -> bool {
         self.state
             .read()
-            .map(|state| state.flags.uses_passthrough())
+            .map(|state| state.hpc.api.companion || state.flags.uses_passthrough())
             .unwrap_or(false)
     }
 
@@ -144,7 +211,8 @@ impl WindowsPty {
             .size
             .lock()
             .map_err(|_| io::Error::other("ConPTY size mutex poisoned"))?;
-        let state = create_pty_state(size, conpty_flags_without_passthrough())?;
+        let state =
+            create_pty_state_with_fallback(size, &api::INBOX, conpty_flags_without_passthrough())?;
         let mut current = self
             .state
             .write()
@@ -168,12 +236,12 @@ pub(crate) fn open_pty_pair(size: TerminalSize) -> Result<WindowsPty> {
         rows = size.rows,
         "creating ConPTY"
     );
-    let state = create_pty_state_with_fallback(size, selected_conpty_flags())?;
+    let state = create_pty_state_with_fallback(size, api::selected(), selected_conpty_flags())?;
     tracing::debug!(
         target: "rmux::conpty",
         cols = size.cols,
         rows = size.rows,
-        flags = state.flags.bits(),
+        companion = state.hpc.api.companion,
         "ConPTY created"
     );
 
@@ -192,6 +260,29 @@ pub(crate) fn query_size(pty: &WindowsPty) -> Result<TerminalSize> {
     Ok(*size)
 }
 
+/// How many resize calls the CQUIT1-R7 trace reports before it goes quiet.
+const RESIZE_TRACE_LIMIT: u64 = 32;
+static RESIZE_TRACE_CALLS: AtomicU64 = AtomicU64::new(0);
+
+/// CQUIT1-R7 diagnostic: whether this process was asked to report its resizes.
+///
+/// Read once. Without `RMUX_CQUIT1_R7_TRACE=1` nothing below runs at all, so a
+/// server that was not asked to explain itself behaves exactly as before.
+fn resize_trace_enabled() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var("RMUX_CQUIT1_R7_TRACE").is_ok_and(|value| value == "1"))
+}
+
+/// Writes one CQUIT1-R7 record. It cannot panic and it returns nothing: a
+/// diagnostic must not decide anything the resize does.
+fn resize_trace(line: &str) {
+    use std::io::Write as _;
+
+    let mut out = std::io::stdout().lock();
+    let _ = writeln!(out, "CQUIT1-R7 {line}");
+    let _ = out.flush();
+}
+
 pub(crate) fn apply_size(pty: &WindowsPty, size: TerminalSize) -> Result<()> {
     tracing::trace!(
         target: "rmux::conpty",
@@ -200,14 +291,49 @@ pub(crate) fn apply_size(pty: &WindowsPty, size: TerminalSize) -> Result<()> {
         "resizing ConPTY"
     );
     let coord = coord_from_size(size)?;
+    // CQUIT1-R7: what the endpoint already holds, read before the state lock so
+    // this diagnostic can never invert the order the resize itself uses.
+    let call = if resize_trace_enabled() {
+        RESIZE_TRACE_CALLS.fetch_add(1, Ordering::Relaxed) + 1
+    } else {
+        0
+    };
+    let traced = call > 0 && call <= RESIZE_TRACE_LIMIT;
+    let stored = traced
+        .then(|| {
+            pty.size
+                .lock()
+                .ok()
+                .map(|stored| (stored.cols, stored.rows))
+        })
+        .flatten();
     let state = pty
         .state
         .read()
         .map_err(|_| io::Error::other("ConPTY state lock poisoned"))?;
+    if traced {
+        resize_trace(&format!(
+            "resize call={call} enter hpcon={:#x} api={} resize_fn={:#x} requested={}x{} \
+             stored={stored:?} identical={}",
+            state.hpc.raw(),
+            if state.hpc.api.companion {
+                "companion"
+            } else {
+                "inbox"
+            },
+            state.hpc.api.resize as usize,
+            size.cols,
+            size.rows,
+            stored == Some((size.cols, size.rows)),
+        ));
+    }
     // SAFETY: `state.hpc` is an owned live ConPTY handle while the read lock is
     // held, and `coord` was range-checked from `TerminalSize`.
-    let hr = unsafe { ResizePseudoConsole(state.hpc.raw(), coord) };
+    let hr = unsafe { (state.hpc.api.resize)(state.hpc.raw(), coord) };
     drop(state);
+    if traced {
+        resize_trace(&format!("resize call={call} exit hresult={hr:#010x}"));
+    }
     if hr != S_OK {
         if is_benign_resize_after_exit(hr) {
             tracing::debug!(
@@ -239,31 +365,27 @@ pub(crate) fn apply_geometry(pty: &WindowsPty, geometry: TerminalGeometry) -> Re
 
 fn create_pty_state_with_fallback(
     size: TerminalSize,
-    selected: ConptyFlags,
+    selected: &'static ConptyApi,
+    flags: ConptyFlags,
 ) -> Result<WindowsPtyState> {
-    match create_pty_state(size, selected) {
-        Ok(state) => Ok(state),
-        Err(error) if selected.uses_passthrough() => {
-            tracing::warn!(
-                target: "rmux::conpty",
-                flags = selected.bits(),
-                "CreatePseudoConsole with passthrough failed; retrying without passthrough: {error}"
-            );
-            create_pty_state_with_fallback(size, conpty_flags_without_passthrough())
+    match create_pty_state(size, selected, flags) {
+        Err(error) if selected.companion => {
+            tracing::warn!(target: "rmux::conpty", %error, "companion ConPTY creation failed; retrying system console");
+            create_pty_state_with_fallback(size, &api::INBOX, flags)
         }
-        Err(error) if selected.bits() != 0 => {
-            tracing::warn!(
-                target: "rmux::conpty",
-                flags = selected.bits(),
-                "CreatePseudoConsole with extended flags failed; retrying standard flags: {error}"
-            );
-            create_pty_state(size, standard_conpty_flags())
+        Err(_) if flags.uses_passthrough() => {
+            create_pty_state_with_fallback(size, selected, conpty_flags_without_passthrough())
         }
-        Err(error) => Err(error),
+        Err(_) if flags.bits() != 0 => create_pty_state(size, selected, standard_conpty_flags()),
+        other => other,
     }
 }
 
-fn create_pty_state(size: TerminalSize, flags: ConptyFlags) -> Result<WindowsPtyState> {
+fn create_pty_state(
+    size: TerminalSize,
+    api: &'static ConptyApi,
+    flags: ConptyFlags,
+) -> Result<WindowsPtyState> {
     let (input, output) = {
         let _span = perf::span("conpty_create_pipes");
         (
@@ -273,7 +395,7 @@ fn create_pty_state(size: TerminalSize, flags: ConptyFlags) -> Result<WindowsPty
     };
     let hpc = {
         let _span = perf::span("conpty_create_pseudoconsole");
-        create_pseudo_console(size, &input, &output, flags)?
+        create_pseudo_console(size, &input, &output, api, flags)?
     };
     drop(input.read);
     drop(output.write);
@@ -282,6 +404,7 @@ fn create_pty_state(size: TerminalSize, flags: ConptyFlags) -> Result<WindowsPty
         hpc,
         input_writer,
         output_read: output.read,
+        startup_output: VecDeque::new(),
         flags,
     })
 }
@@ -290,18 +413,20 @@ fn create_pseudo_console(
     size: TerminalSize,
     input: &PipePair,
     output: &PipePair,
+    api: &'static ConptyApi,
     flags: ConptyFlags,
 ) -> Result<OwnedHpcon> {
     let mut hpc = 0_isize;
+    let coord = coord_from_size(size)?;
     // SAFETY: `input` and `output` are valid pipe handles owned by the caller,
     // `hpc` is a valid out-pointer, and `coord_from_size` range-checks the
     // dimensions before the API call.
     let hr = unsafe {
-        CreatePseudoConsole(
-            coord_from_size(size)?,
+        (api.create)(
+            coord,
             input.read.as_raw_handle() as HANDLE,
             output.write.as_raw_handle() as HANDLE,
-            flags.bits(),
+            if api.companion { 0 } else { flags.bits() },
             &mut hpc,
         )
     };
@@ -309,12 +434,12 @@ fn create_pseudo_console(
         tracing::warn!(
             target: "rmux::conpty",
             hresult = hr,
-            flags = flags.bits(),
+            companion = api.companion,
             "CreatePseudoConsole failed"
         );
         return Err(hresult_error(hr).into());
     }
-    Ok(OwnedHpcon(hpc))
+    Ok(OwnedHpcon { handle: hpc, api })
 }
 
 fn coord_from_size(size: TerminalSize) -> Result<COORD> {
@@ -345,24 +470,28 @@ struct WindowsPtyState {
     hpc: OwnedHpcon,
     input_writer: Arc<OverlappedPipeWriter>,
     output_read: OwnedHandle,
+    startup_output: VecDeque<u8>,
     flags: ConptyFlags,
 }
 
 #[derive(Debug)]
-struct OwnedHpcon(HPCON);
+struct OwnedHpcon {
+    handle: HPCON,
+    api: &'static ConptyApi,
+}
 
 impl OwnedHpcon {
     fn raw(&self) -> HPCON {
-        self.0
+        self.handle
     }
 
     fn close(&mut self) {
-        if self.0 != 0 {
+        if self.handle != 0 {
             tracing::trace!(target: "rmux::conpty", "closing ConPTY");
             // SAFETY: `OwnedHpcon` owns a non-null ConPTY handle and closes it
             // exactly once here or from `Drop`.
-            unsafe { ClosePseudoConsole(self.0) };
-            self.0 = 0;
+            unsafe { (self.api.close)(self.handle) };
+            self.handle = 0;
         }
     }
 }
@@ -405,6 +534,77 @@ mod tests {
     use std::sync::{mpsc, Arc};
     use std::thread;
     use std::time::Duration;
+
+    unsafe extern "system" fn reject_companion(
+        _size: COORD,
+        _input: HANDLE,
+        _output: HANDLE,
+        _flags: u32,
+        _hpc: *mut HPCON,
+    ) -> i32 {
+        windows_sys::Win32::Foundation::E_INVALIDARG
+    }
+
+    #[test]
+    fn failed_companion_creation_falls_back_to_inbox_api() {
+        static REJECTED: ConptyApi = ConptyApi {
+            create: reject_companion,
+            resize: api::INBOX.resize,
+            close: api::INBOX.close,
+            companion: true,
+        };
+        let state = create_pty_state_with_fallback(
+            TerminalSize::new(80, 24),
+            &REJECTED,
+            selected_conpty_flags(),
+        )
+        .expect("system fallback");
+        assert!(!state.hpc.api.companion);
+        // Exercise the public backend resize path using the API retained by
+        // fallback, without depending on a recorder to observe its outcome.
+        let pty = WindowsPty {
+            state: RwLock::new(state),
+            size: Mutex::new(TerminalSize::new(80, 24)),
+            dsr_bootstrap: Mutex::new(None),
+        };
+        apply_size(&pty, TerminalSize::new(90, 25)).unwrap();
+        assert_eq!(query_size(&pty).unwrap(), TerminalSize::new(90, 25));
+    }
+
+    #[test]
+    fn rejected_creation_retries_flags_and_preserves_failure() {
+        // Thread-local observations belong only to this synchronous test; they
+        // cannot become a product control or race another native test.
+        thread_local! {
+            static FLAGS: std::cell::RefCell<Vec<u32>> = const { std::cell::RefCell::new(Vec::new()) };
+        }
+        unsafe extern "system" fn reject_and_record(
+            _size: COORD,
+            _input: HANDLE,
+            _output: HANDLE,
+            flags: u32,
+            _hpc: *mut HPCON,
+        ) -> i32 {
+            FLAGS.with(|calls| calls.borrow_mut().push(flags));
+            windows_sys::Win32::Foundation::E_INVALIDARG
+        }
+        static REJECTED: ConptyApi = ConptyApi {
+            create: reject_and_record,
+            resize: api::INBOX.resize,
+            close: api::INBOX.close,
+            companion: false,
+        };
+        let flags = selected_conpty_flags();
+        assert!(
+            create_pty_state_with_fallback(TerminalSize::new(80, 24), &REJECTED, flags).is_err()
+        );
+        FLAGS.with(|calls| {
+            let calls = calls.borrow();
+            assert_eq!(calls.len(), if flags.uses_passthrough() { 3 } else { 2 });
+            assert_eq!(calls[0], flags.bits());
+            assert_eq!(calls.last(), Some(&0));
+        });
+    }
 
     #[test]
     fn resize_after_exit_invalid_parameter_is_benign() {
@@ -450,6 +650,10 @@ mod tests {
             .recv_timeout(Duration::from_secs(1))
             .expect("reader thread started");
         thread::sleep(Duration::from_millis(50));
+        assert!(
+            matches!(read_done_rx.try_recv(), Err(mpsc::TryRecvError::Empty)),
+            "reader must still be blocked before recreation"
+        );
 
         let (recreate_tx, recreate_rx) = mpsc::channel();
         let recreate_pty = Arc::clone(&pty);
@@ -465,6 +669,8 @@ mod tests {
             .expect("ConPTY recreate should not wait for idle output")
             .expect("ConPTY recreate");
         recreate.join().expect("recreate thread");
+        assert!(!pty.state.read().expect("state").hpc.api.companion);
+        assert!(!pty.uses_passthrough());
         drop(pty);
 
         let _ = read_done_rx

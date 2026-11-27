@@ -15,6 +15,15 @@ pub(super) struct ShellSpec {
     kind: ShellKind,
 }
 
+/// What a Unix shell running a command with `-c` receives as `argv[0]`.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) enum CommandArgv0 {
+    /// The shell's path as spawned: run-shell, hooks, status jobs and pipes.
+    ShellPath,
+    /// The shell's file name, as tmux names pane commands and display-popup jobs.
+    ShellName,
+}
+
 impl ShellSpec {
     pub(super) fn new(shell: &Path) -> Self {
         Self {
@@ -23,25 +32,62 @@ impl ShellSpec {
         }
     }
 
-    pub(super) fn command_child(&self, cwd: &Path, command: &str) -> ChildCommand {
-        self.command_plan(cwd, command).into_child_command()
+    pub(super) fn quote_path(&self, path: &Path) -> String {
+        let value = path.to_string_lossy();
+        match self.kind {
+            #[cfg(unix)]
+            ShellKind::Unix => format!("'{}'", value.replace('\'', "'\\''")),
+            #[cfg(windows)]
+            ShellKind::Posix => format!("'{}'", value.replace('\'', "'\\''")),
+            #[cfg(windows)]
+            ShellKind::PowerShell | ShellKind::WindowsPowerShell => powershell_single_quoted(path),
+            #[cfg(windows)]
+            ShellKind::Nu => format!("\"{}\"", value.replace('\\', "\\\\").replace('\"', "\\\"")),
+            #[cfg(windows)]
+            ShellKind::Cmd | ShellKind::Batch | ShellKind::Other => cmd_double_quoted(&value),
+        }
+    }
+
+    pub(super) fn named_command_child(
+        &self,
+        cwd: &Path,
+        command: &str,
+        argv0: CommandArgv0,
+    ) -> ChildCommand {
+        self.command_plan(cwd, command, argv0).into_child_command()
     }
 
     pub(super) fn command_std_child(&self, cwd: &Path, command: &str) -> StdCommand {
-        self.command_plan(cwd, command).into_std_command()
+        self.command_plan(cwd, command, CommandArgv0::ShellPath)
+            .into_std_command()
     }
 
     pub(super) fn interactive_child(&self, cwd: &Path) -> ChildCommand {
         self.interactive_plan(cwd).into_child_command()
     }
 
-    fn command_plan(&self, cwd: &Path, command: &str) -> ShellCommandPlan {
+    /// A display-popup's shell when the popup has no command.
+    pub(super) fn popup_interactive_child(&self, cwd: &Path) -> ChildCommand {
+        self.popup_interactive_plan(cwd).into_child_command()
+    }
+
+    fn command_plan(&self, cwd: &Path, command: &str, argv0: CommandArgv0) -> ShellCommandPlan {
         #[cfg(unix)]
         let _ = cwd;
+        // Windows plans keep their argv[0]: the shell-name policy is measured on Unix only.
+        #[cfg(windows)]
+        let _ = argv0;
 
         match self.kind {
             #[cfg(unix)]
-            ShellKind::Unix => ShellCommandPlan::new(&self.program).arg("-c").arg(command),
+            ShellKind::Unix => {
+                let plan = ShellCommandPlan::new(&self.program);
+                let plan = match argv0 {
+                    CommandArgv0::ShellPath => plan,
+                    CommandArgv0::ShellName => plan.arg0(shell_name(&self.program)),
+                };
+                plan.arg("-c").arg(command)
+            }
             #[cfg(windows)]
             ShellKind::PowerShell | ShellKind::WindowsPowerShell => {
                 ShellCommandPlan::new(&self.program)
@@ -103,6 +149,20 @@ impl ShellSpec {
             ShellKind::Posix | ShellKind::Nu | ShellKind::Other => {
                 ShellCommandPlan::new(&self.program)
             }
+        }
+    }
+
+    /// As tmux 3.7b starts a popup's shell: on Unix under its path as `argv[0]`, so not as the
+    /// login shell a pane starts; Windows keeps its interactive plan.
+    fn popup_interactive_plan(&self, cwd: &Path) -> ShellCommandPlan {
+        #[cfg(unix)]
+        {
+            let _ = cwd;
+            ShellCommandPlan::new(&self.program)
+        }
+        #[cfg(windows)]
+        {
+            self.interactive_plan(cwd)
         }
     }
 }
@@ -254,13 +314,17 @@ fn cmd_double_quoted(value: &str) -> String {
 }
 
 #[cfg(unix)]
-fn login_shell_argv0(shell: &Path) -> OsString {
-    let name = shell
+fn shell_name(shell: &Path) -> OsString {
+    shell
         .file_name()
         .unwrap_or(shell.as_os_str())
-        .to_os_string();
+        .to_os_string()
+}
+
+#[cfg(unix)]
+fn login_shell_argv0(shell: &Path) -> OsString {
     let mut login_name = OsString::from("-");
-    login_name.push(name);
+    login_name.push(shell_name(shell));
     login_name
 }
 
@@ -340,7 +404,7 @@ mod tests {
     fn cmd_command_preserves_command_text_without_wrapping_cwd() {
         let spec = ShellSpec::new(Path::new("cmd.exe"));
         let command = r#"echo "RMUX OK" & echo left^&right"#;
-        let plan = spec.command_plan(Path::new(r"C:\tmp"), command);
+        let plan = spec.command_plan(Path::new(r"C:\tmp"), command, CommandArgv0::ShellPath);
 
         assert_eq!(plan.args, os_args(["/D", "/S", "/C"]));
         assert_eq!(
@@ -358,7 +422,7 @@ mod tests {
         let interactive = spec.interactive_plan(cwd);
         assert_eq!(interactive.args, os_args(["-NoLogo", "-NoExit"]));
 
-        let one_shot = spec.command_plan(cwd, "Write-Output RMUX_OK");
+        let one_shot = spec.command_plan(cwd, "Write-Output RMUX_OK", CommandArgv0::ShellPath);
         assert_eq!(
             one_shot.args,
             os_args([
@@ -373,7 +437,11 @@ mod tests {
     #[test]
     fn posix_shell_command_uses_lc_not_cmd_c() {
         let spec = ShellSpec::new(Path::new("bash.exe"));
-        let plan = spec.command_plan(Path::new(r"C:\tmp"), "echo RMUX_OK");
+        let plan = spec.command_plan(
+            Path::new(r"C:\tmp"),
+            "echo RMUX_OK",
+            CommandArgv0::ShellPath,
+        );
 
         assert_eq!(plan.args, os_args(["-lc", "echo RMUX_OK"]));
     }
@@ -382,7 +450,11 @@ mod tests {
     #[test]
     fn nushell_command_uses_c_not_cmd_c() {
         let spec = ShellSpec::new(Path::new("nu.exe"));
-        let plan = spec.command_plan(Path::new(r"C:\tmp"), "echo RMUX_OK");
+        let plan = spec.command_plan(
+            Path::new(r"C:\tmp"),
+            "echo RMUX_OK",
+            CommandArgv0::ShellPath,
+        );
 
         assert_eq!(plan.args, os_args(["-c", "echo RMUX_OK"]));
     }
@@ -391,7 +463,11 @@ mod tests {
     #[test]
     fn unknown_windows_shell_does_not_receive_cmd_c_flag() {
         let spec = ShellSpec::new(Path::new("custom-shell.exe"));
-        let plan = spec.command_plan(Path::new(r"C:\tmp"), "echo RMUX_OK");
+        let plan = spec.command_plan(
+            Path::new(r"C:\tmp"),
+            "echo RMUX_OK",
+            CommandArgv0::ShellPath,
+        );
 
         assert_eq!(plan.args, os_args(["echo RMUX_OK"]));
     }
@@ -419,7 +495,11 @@ mod tests {
     #[test]
     fn batch_default_shell_command_uses_cmd_c_wrapper() {
         let spec = ShellSpec::new(Path::new(r"C:\Users\RMUX User\shells\custom shell.bat"));
-        let plan = spec.command_plan(Path::new(r"C:\tmp"), "echo RMUX_OK");
+        let plan = spec.command_plan(
+            Path::new(r"C:\tmp"),
+            "echo RMUX_OK",
+            CommandArgv0::ShellPath,
+        );
 
         assert_eq!(
             plan.program
@@ -449,6 +529,46 @@ mod tests {
         assert_eq!(plan.program, PathBuf::from("/bin/bash"));
         assert_eq!(plan.arg0, Some(OsString::from("-bash")));
         assert!(plan.args.is_empty());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn unix_popup_interactive_shell_keeps_the_shell_path_as_argv0() {
+        let spec = ShellSpec::new(Path::new("/bin/sh"));
+        let plan = spec.popup_interactive_plan(Path::new("/tmp"));
+
+        assert_eq!(plan.program, PathBuf::from("/bin/sh"));
+        assert_eq!(plan.arg0, None);
+        assert!(plan.args.is_empty());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn unix_command_plan_names_the_shell_only_under_the_shell_name_policy() {
+        let spec = ShellSpec::new(Path::new("/bin/zsh"));
+        let by_path = spec.command_plan(Path::new("/"), "true", CommandArgv0::ShellPath);
+        let by_name = spec.command_plan(Path::new("/"), "true", CommandArgv0::ShellName);
+
+        assert_eq!(by_path.arg0, None);
+        assert_eq!(by_name.arg0, Some(OsString::from("zsh")));
+        for plan in [&by_path, &by_name] {
+            assert_eq!(plan.program, PathBuf::from("/bin/zsh"));
+            assert_eq!(
+                plan.args,
+                vec![OsString::from("-c"), OsString::from("true")]
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn unix_std_shell_command_keeps_the_shell_path_as_dollar_zero() {
+        let output = ShellSpec::new(Path::new("/bin/sh"))
+            .command_std_child(Path::new("/"), "printf '%s' \"$0\"")
+            .output()
+            .expect("run /bin/sh");
+
+        assert_eq!(output.stdout, b"/bin/sh");
     }
 
     #[cfg(windows)]

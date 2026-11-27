@@ -22,7 +22,7 @@ async fn create_session(handler: &RequestHandler, name: &str) {
             environment: None,
         }))
         .await;
-    assert!(matches!(response, Response::NewSession(_)), "{response:?}");
+    crate::session_fixture::assert_new_session(&response);
 }
 
 async fn set_indexed_global_hook(
@@ -484,7 +484,7 @@ async fn destroyed_session_hook_does_not_target_recreated_same_name() {
                 session_id: Some(session_id),
             },
         );
-        state
+        let _ = state
             .sessions
             .remove_session(&alpha)
             .expect("remove original alpha");
@@ -537,7 +537,7 @@ async fn removed_window_hook_does_not_target_recreated_same_slot() {
             .sessions
             .remove_session(&alpha)
             .expect("remove original alpha");
-        let removed_window = removed.window_at(0).expect("removed window exists");
+        let removed_window = removed.windows.first().expect("removed window exists");
         let queued = super::prepare_lifecycle_event(
             &mut state,
             &LifecycleEvent::WindowUnlinked {
@@ -814,7 +814,7 @@ async fn exited_pane_hook_does_not_target_recreated_same_slot() {
             .sessions
             .remove_session(&alpha)
             .expect("remove original alpha");
-        let removed_window = removed.window_at(0).expect("removed window exists");
+        let removed_window = removed.windows.first().expect("removed window exists");
         let removed_pane = removed_window.pane(0).expect("removed pane exists");
         let queued = super::prepare_lifecycle_event(
             &mut state,

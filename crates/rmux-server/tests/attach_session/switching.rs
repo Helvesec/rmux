@@ -40,7 +40,7 @@ async fn switch_client_reroutes_attach_input_and_output() -> Result<(), Box<dyn 
         }),
     )
     .await?;
-    assert!(matches!(created_alpha, Response::NewSession(_)));
+    crate::common::assert_new_session(&created_alpha);
 
     let created_beta = crate::common::send_request(
         &socket_path,
@@ -52,7 +52,7 @@ async fn switch_client_reroutes_attach_input_and_output() -> Result<(), Box<dyn 
         }),
     )
     .await?;
-    assert!(matches!(created_beta, Response::NewSession(_)));
+    crate::common::assert_new_session(&created_beta);
 
     let (_, mut attach_stream) = ClientConnection::connect(&socket_path)
         .await?
@@ -147,7 +147,7 @@ async fn switch_client_to_multi_pane_session_emits_border_frame_before_forwardin
         }),
     )
     .await?;
-    assert!(matches!(created_alpha, Response::NewSession(_)));
+    crate::common::assert_new_session(&created_alpha);
 
     let created_beta = crate::common::send_request(
         &socket_path,
@@ -159,7 +159,7 @@ async fn switch_client_to_multi_pane_session_emits_border_frame_before_forwardin
         }),
     )
     .await?;
-    assert!(matches!(created_beta, Response::NewSession(_)));
+    crate::common::assert_new_session(&created_beta);
 
     let first_split = crate::common::send_request(
         &socket_path,
@@ -311,7 +311,7 @@ async fn switch_client_to_missing_session_keeps_the_current_attach_stream(
         }),
     )
     .await?;
-    assert!(matches!(created, Response::NewSession(_)));
+    crate::common::assert_new_session(&created);
 
     let (_, mut attach_stream) = ClientConnection::connect(&socket_path)
         .await?

@@ -11,7 +11,6 @@ use rmux_proto::{
     INTERNAL_LIST_WINDOWS_ALL_EXECUTION_PATH, INTERNAL_RUNTIME_COMMAND_EXPANSION_PATH,
 };
 
-#[path = "server_access/access_store.rs"]
 mod access_store;
 
 pub(crate) use self::access_store::{
@@ -144,6 +143,14 @@ pub(crate) fn apply_access_policy(request: Request, can_write: bool) -> Result<R
     }
 
     match request {
+        // The argv route enforces read-only policy through the existing queue.
+        Request::RuntimeCommandExecution(request) => Ok(Request::RuntimeCommandExecution(request)),
+        Request::RuntimeCommandExecutionV2(request) => {
+            Ok(Request::RuntimeCommandExecutionV2(request))
+        }
+        Request::SplitWindowCommandV1(request) => Ok(Request::SplitWindowCommandV1(request)),
+        Request::NewPaneInputV1(request) => Ok(Request::NewPaneInputV1(request)),
+        Request::SourceFileInputV1(request) => Ok(Request::SourceFileInputV1(request)),
         Request::AttachSession(request) => Ok(Request::AttachSessionExt(AttachSessionExtRequest {
             target: Some(request.target),
             detach_other_clients: false,
@@ -215,6 +222,12 @@ fn read_only_attach_target(
     })
 }
 
+/// Requests a `server-access -r` client may run.
+///
+/// `display-message` is absent even with `-p`: its template is expanded with
+/// `#()` format jobs, which start a shell under the server owner's uid. tmux
+/// 3.7b gives `display-message` no `CMD_READONLY` flag and refuses it to a
+/// read-only client for the same reason.
 fn read_only_request_allowed(request: &Request) -> bool {
     match request {
         Request::CapturePane(request) => {
@@ -223,8 +236,6 @@ fn read_only_request_allowed(request: &Request) -> bool {
         Request::CapturePaneTargetAction(request) => {
             capture_pane_request_is_read_only(request.print, request.buffer_name.as_deref())
         }
-        Request::DisplayMessage(request) => display_message_request_is_read_only(request.print),
-        Request::DisplayMessageExt(request) => display_message_request_is_read_only(request.print),
         Request::SourceFile(request) => {
             internal_runtime_command_expansion_is_read_only(request)
                 || internal_list_windows_all_is_read_only(request)
@@ -239,6 +250,8 @@ fn read_only_request_allowed(request: &Request) -> bool {
                 | Request::AttachSessionExt2(_)
                 | Request::AttachSessionExt3(_)
                 | Request::ListClients(_)
+                | Request::ExportWindowSnapshotV2(_)
+                | Request::ExportWindowSnapshot(_)
                 | Request::ShowOptions(_)
                 | Request::ShowEnvironment(_)
                 | Request::ShowHooks(_)
@@ -301,10 +314,6 @@ fn capture_pane_request_is_read_only(print: bool, buffer_name: Option<&str>) -> 
     print && buffer_name.is_none()
 }
 
-fn display_message_request_is_read_only(print: bool) -> bool {
-    print
-}
-
 pub(crate) fn validate_server_access_request(
     request: &ServerAccessRequest,
 ) -> Result<(), RmuxError> {
@@ -349,13 +358,15 @@ mod tests {
         AttachSessionRequest, CancelSdkWaitRequest, CapturePaneRequest,
         CapturePaneTargetActionRequest, ClockModeRequest, CopyModeRequest, DetachClientExtRequest,
         DetachClientRequest, DisplayMessageExtRequest, DisplayMessageRequest, DisplayPanesRequest,
-        LastPaneRequest, LastWindowRequest, NextLayoutRequest, NextWindowRequest,
-        PaneOutputSubscriptionStart, PaneSnapshotRequest, PaneTarget, PreviousLayoutRequest,
-        PreviousWindowRequest, RefreshClientRequest, ResolveTargetRequest, ResolveTargetType,
-        SdkWaitForOutputRequest, SdkWaitId, SdkWaitOwnerId, SelectPaneAdjacentRequest,
-        SelectPaneDirection, SelectPaneRequest, SessionName, SuspendClientRequest,
-        SwitchClientExt2Request, SwitchClientExt3Request, SwitchClientExtRequest,
-        SwitchClientRequest, TerminalSize, WindowTarget,
+        ExportWindowSnapshotRequest, LastPaneRequest, LastWindowRequest, NextLayoutRequest,
+        NextWindowRequest, PaneId, PaneOutputSubscriptionStart, PaneSnapshotRequest, PaneTarget,
+        PreviousLayoutRequest, PreviousWindowRequest, RefreshClientRequest, ResolveTargetRequest,
+        ResolveTargetType, RestoreWindowSnapshotRequest, RmuxWindowSnapshot,
+        RmuxWindowSnapshotCell, SdkWaitForOutputRequest, SdkWaitId, SdkWaitOwnerId,
+        SelectPaneAdjacentRequest, SelectPaneDirection, SelectPaneRequest, SessionId, SessionName,
+        SuspendClientRequest, SwitchClientExt2Request, SwitchClientExt3Request,
+        SwitchClientExtRequest, SwitchClientRequest, TerminalSize, WindowId, WindowTarget,
+        RMUX_WINDOW_SNAPSHOT_VERSION,
     };
 
     #[test]
@@ -632,6 +643,7 @@ mod tests {
     fn read_only_access_allows_sdk_target_discovery_and_snapshot() {
         let session = session_name();
         let pane = PaneTarget::new(session.clone(), 0);
+        let window = WindowTarget::new(session.clone());
         let resolve = Request::ResolveTarget(ResolveTargetRequest {
             target: Some("s:0.0".to_owned()),
             target_type: ResolveTargetType::Pane,
@@ -639,6 +651,8 @@ mod tests {
             prefer_unattached: false,
         });
         let snapshot = Request::PaneSnapshot(PaneSnapshotRequest { target: pane });
+        let window_snapshot =
+            Request::ExportWindowSnapshot(ExportWindowSnapshotRequest { target: window });
 
         assert_eq!(
             apply_access_policy(resolve.clone(), false)
@@ -649,6 +663,11 @@ mod tests {
             apply_access_policy(snapshot.clone(), false)
                 .expect("pane snapshot is read-only observation"),
             snapshot
+        );
+        assert_eq!(
+            apply_access_policy(window_snapshot.clone(), false)
+                .expect("window snapshot export is read-only observation"),
+            window_snapshot
         );
     }
 
@@ -769,33 +788,32 @@ mod tests {
     }
 
     #[test]
-    fn read_only_access_allows_printed_display_message() {
-        let message = Request::DisplayMessage(DisplayMessageRequest {
+    fn read_only_access_rejects_printed_display_message_because_it_runs_format_jobs() {
+        // `-p` only changes where the expansion goes; the expansion still
+        // starts `#()` jobs under the server owner's uid.
+        assert_read_only_rejected(Request::DisplayMessage(DisplayMessageRequest {
             target: None,
             print: true,
-            message: Some("#{session_name}".to_owned()),
+            message: Some("#(id -un)".to_owned()),
             empty_target_context: false,
-        });
-        let extended = Request::DisplayMessageExt(Box::new(DisplayMessageExtRequest {
-            target: None,
-            print: true,
-            message: Some("#{client_name}".to_owned()),
-            target_client: Some("=".to_owned()),
-            empty_target_context: false,
-            duration_ms: None,
-            ignore_input: false,
         }));
-
-        assert_eq!(
-            apply_access_policy(message.clone(), false)
-                .expect("display-message -p is read-only format expansion"),
-            message
-        );
-        assert_eq!(
-            apply_access_policy(extended.clone(), false)
-                .expect("display-message -p -c is read-only format expansion"),
-            extended
-        );
+        assert_read_only_rejected(Request::DisplayMessage(DisplayMessageRequest {
+            target: None,
+            print: true,
+            message: Some("#(id -un)".to_owned()),
+            empty_target_context: true,
+        }));
+        assert_read_only_rejected(Request::DisplayMessageExt(Box::new(
+            DisplayMessageExtRequest {
+                target: None,
+                print: true,
+                message: Some("#(id -un)".to_owned()),
+                target_client: Some("=".to_owned()),
+                empty_target_context: false,
+                duration_ms: None,
+                ignore_input: false,
+            },
+        )));
     }
 
     #[test]
@@ -832,6 +850,7 @@ mod tests {
         let session = session_name();
         let window = WindowTarget::new(session.clone());
         let pane = PaneTarget::new(session.clone(), 0);
+        let snapshot = rmux_window_snapshot(session.clone());
         let select_pane = SelectPaneRequest {
             target: pane.clone(),
             title: None,
@@ -863,6 +882,10 @@ mod tests {
             Request::PreviousLayout(PreviousLayoutRequest {
                 target: window.clone(),
             }),
+            Request::RestoreWindowSnapshot(Box::new(RestoreWindowSnapshotRequest {
+                target: window.clone(),
+                snapshot,
+            })),
             Request::SelectPane(Box::new(select_pane)),
             Request::SelectPaneAdjacent(SelectPaneAdjacentRequest {
                 target: pane,
@@ -1078,6 +1101,35 @@ mod tests {
 
     fn session_name() -> SessionName {
         SessionName::new("s").expect("session name")
+    }
+
+    fn rmux_window_snapshot(session: SessionName) -> RmuxWindowSnapshot {
+        RmuxWindowSnapshot {
+            version: RMUX_WINDOW_SNAPSHOT_VERSION,
+            session_id: SessionId::new(1),
+            target: WindowTarget::new(session),
+            window_id: WindowId::new(1),
+            size: TerminalSize { cols: 80, rows: 24 },
+            zoomed: false,
+            tiled: Some(RmuxWindowSnapshotCell::Pane {
+                pane_id: PaneId::new(1),
+                cols: 80,
+                rows: 24,
+                x: 0,
+                y: 0,
+            }),
+            floating: Vec::new(),
+            active_pane: PaneId::new(1),
+            last_pane: None,
+            runtimes: vec![],
+            metadata: rmux_proto::RmuxWindowLayoutMetadata {
+                layout: rmux_proto::LayoutName::EvenHorizontal,
+                last_layout: None,
+                custom_layout: false,
+                requested_main_width: None,
+                requested_main_height: None,
+            },
+        }
     }
 
     fn capture_pane_target_action(

@@ -33,9 +33,7 @@ PREFERRED_TOOL_ORDER = {
     "windows": ["rmux", "tmux", "zellij", "psmux", "screen"],
 }
 
-PUBLIC_TABLE_HIDDEN_TOOLS = {
-    "windows": {"psmux"},
-}
+PUBLIC_TABLE_HIDDEN_TOOLS = {"windows": {"psmux"}}
 
 # Tools that only exist on Windows through a compatibility layer. Payloads
 # written by the current collectors carry `tool_environments` and do not need
@@ -128,7 +126,7 @@ LIGHT = {
 
 
 def now_iso() -> str:
-    return dt.datetime.now(dt.UTC).replace(microsecond=0).isoformat().replace("+00:00", "Z")
+    return dt.datetime.now(dt.timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
 
 
 def load_payloads(paths: list[Path]) -> list[dict[str, Any]]:
@@ -222,14 +220,22 @@ def ordered_tools(payload: dict[str, Any]) -> list[str]:
 
 
 def ordered_public_tools(payload: dict[str, Any]) -> list[str]:
+    if payload.get("native_only"):
+        return [tool for tool in ordered_tools(payload)
+                if tool_environment(payload, tool) == "native"
+                or (platform_id(payload) != "windows" and tool_environment(payload, tool) is None)
+                or (platform_id(payload) == "windows" and tool == "rmux"
+                    and tool_environment(payload, tool) is None)]
     hidden = PUBLIC_TABLE_HIDDEN_TOOLS.get(platform_id(payload), set())
     return [tool for tool in ordered_tools(payload) if tool not in hidden]
 
 
 def baseline_tool(payload: dict[str, Any]) -> str:
-    tools = ordered_tools(payload)
+    tools = ordered_public_tools(payload) if payload.get("native_only") else ordered_tools(payload)
     if "tmux" in tools:
         return "tmux"
+    if payload.get("native_only"):
+        return next((tool for tool in tools if tool != "rmux"), "")
     return str(payload.get("baseline", "tmux"))
 
 
@@ -280,7 +286,8 @@ def operation_rows(payload: dict[str, Any], operations: list[dict[str, Any]]) ->
         cells = [f"<td>{html.escape(scenario_label(operation_id))}</td>"]
         for tool in tools:
             cells.append(f"<td align=\"right\"><code>{format_ms(metric_value(op, tool))}</code></td>")
-        cells.append(f"<td align=\"right\"><strong>{ratio_badge(op, baseline)}</strong></td>")
+        if baseline:
+            cells.append(f"<td align=\"right\"><strong>{ratio_badge(op, baseline)}</strong></td>")
         rows.append("<tr>" + "".join(cells) + "</tr>")
     return "\n".join(rows)
 
@@ -290,7 +297,8 @@ def table_header(payload: dict[str, Any]) -> str:
     baseline = baseline_tool(payload)
     cells = ["<th align=\"left\">Scenario</th>"]
     cells.extend(f"<th align=\"right\">{html.escape(tool_label(payload, tool))}</th>" for tool in tools)
-    cells.append(f"<th align=\"right\">vs {html.escape(tool_label(payload, baseline))}</th>")
+    if baseline:
+        cells.append(f"<th align=\"right\">vs {html.escape(tool_label(payload, baseline))}</th>")
     return "<tr>" + "".join(cells) + "</tr>"
 
 
@@ -348,9 +356,11 @@ def platform_section(payload: dict[str, Any], summary_rows: int, asset_dir: Path
             "Most operations finish around 5 ms on this machine; read those rows "
             "as \"same speed\".</sub></p>\n"
         )
+    title = (f'<h2 align="center">{html.escape(str(platform["name"]))}</h2>'
+             if payload.get("native_only") else platform_title(platform_id, str(platform['name'])))
     return (
         f'<a id="{html.escape(platform_id)}"></a>\n'
-        f"{platform_title(platform_id, str(platform['name']))}\n\n"
+        f"{title}\n\n"
         f'<p align="center"><sub>{title_note}</sub></p>\n'
         f"{note_line}\n"
         f"{operation_table(payload, visible)}\n"
@@ -458,10 +468,10 @@ def methodology(
 Run the scripts locally on each OS, gather the JSON files, and generate the Markdown:
 
 ```bash
-scripts/bench/run-unix.sh --out target/benchmarks/linux.json
-scripts/bench/run-windows.ps1 -Out target/benchmarks/windows.json
-scripts/bench/run-unix.sh --out target/benchmarks/macos.json
-python3 scripts/bench/render.py target/benchmarks/*.json --output docs/benchmarks.md
+scripts/bench/run-unix.sh --out ../rmux-benchmarks/linux.json
+scripts/bench/run-windows.ps1 -Out ../rmux-benchmarks/windows.json
+scripts/bench/run-unix.sh --out ../rmux-benchmarks/macos.json
+python3 scripts/bench/render.py ../rmux-benchmarks/*.json --native-only --output ../rmux-benchmarks/report.md --asset-dir ../rmux-benchmarks/assets
 ```
 
 Each OS measures itself locally, so no number here includes SSH or remote-shell latency.
@@ -470,7 +480,7 @@ Note: Scripts run safely in isolated sessions and only kill their own test proce
 
 ## Methodology
 
-The `render.py` script updates this Markdown file and linked CSVs based on the JSON results.
+The `render.py` script writes campaign Markdown and linked CSVs outside the source content, based on the JSON results. Attach them with the original JSON evidence to the campaign; publication URL pending until that campaign exists.
 
 Each JSON artifact records the commit, platform, tool versions and every p50/p95 sample behind a cell.
 
@@ -478,7 +488,7 @@ Each JSON artifact records the commit, platform, tool versions and every p50/p95
 
 Zellij and GNU screen: results only show exact equivalents or close approximations.
 
-Tools reached through a compatibility layer are labelled as such, and the JSON records each measured tool's environment. On Windows the ratio compares RMUX against tmux under WSL, never against a native Windows multiplexer.
+The campaign command uses `--native-only`: compatibility-layer columns and ratios are omitted. Windows comparators need an explicit native environment; RMUX is the native Windows collector. Without a native comparator, no ratio is displayed. The original JSON and raw CSV evidence retain all measurements. Without `--native-only`, the diagnostic renderer labels compatibility-layer tools; that output is not the publication campaign.
 
 `≈ same speed` spans {low:.2f}x to {high:.2f}x, the spread repeated samples actually show on these hosts; a narrower claim would publish host noise as a result.
 
@@ -506,10 +516,12 @@ def markdown(payloads: list[dict[str, Any]], asset_dir: Path, summary_rows: int)
     )
     generated = now_iso()
     commit = benchmark_commit(payloads)
+    hero = "" if all(payload.get("native_only") for payload in payloads) else picture(
+        f"{rel}/{HERO_ASSET_STEM}-dark.svg", f"{rel}/{HERO_ASSET_STEM}-light.svg", "RMUX benchmark overview")
     return f"""<!-- Generated by scripts/bench/render.py; edit the renderer or benchmark JSON inputs. -->
 <div align="center">
 
-{picture(f"{rel}/{HERO_ASSET_STEM}-dark.svg", f"{rel}/{HERO_ASSET_STEM}-light.svg", "RMUX benchmark overview")}
+{hero}
 
 </div>
 
@@ -522,11 +534,20 @@ def markdown(payloads: list[dict[str, Any]], asset_dir: Path, summary_rows: int)
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("inputs", nargs="*", type=Path, help="benchmark JSON artifacts")
-    parser.add_argument("--output", type=Path, default=Path("docs/benchmarks.md"))
-    parser.add_argument("--asset-dir", type=Path, default=Path("docs/benchmarks"))
+    parser.add_argument("--output", type=Path, default=Path(".rmux-audit/benchmarks/report.md"))
+    parser.add_argument("--asset-dir", type=Path, default=Path(".rmux-audit/benchmarks/assets"))
+    parser.add_argument("--native-only", action="store_true", help="omit compatibility-layer columns and ratios for publication campaigns")
     parser.add_argument("--summary-rows", type=int, default=10)
     parser.add_argument("--write-assets", action="store_true", help="rewrite static hero SVG assets")
     args = parser.parse_args()
+
+    for destination in (args.output, args.asset_dir):
+        try:
+            relative = destination.resolve().relative_to(REPO_ROOT)
+        except ValueError:
+            continue
+        if not relative.parts or relative.parts[0] != ".rmux-audit":
+            parser.error("benchmark output must be outside source content or under .rmux-audit")
 
     if args.write_assets:
         write_static_assets(args.asset_dir)
@@ -537,6 +558,8 @@ def main() -> int:
         parser.error("pass benchmark JSON files")
 
     payloads = select_canonical_payloads(load_payloads(args.inputs))
+    for payload in payloads:
+        payload["native_only"] = args.native_only
     payloads.sort(key=lambda payload: PLATFORM_ORDER.get(payload["platform"]["id"], 99))
     write_csv_assets(payloads, args.asset_dir)
     args.output.parent.mkdir(parents=True, exist_ok=True)

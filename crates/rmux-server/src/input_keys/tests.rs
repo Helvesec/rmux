@@ -13,6 +13,29 @@ fn parse_key(name: &str) -> KeyCode {
 }
 
 #[test]
+fn unconsumed_user_keys_never_encode_pane_bytes() {
+    for pane_mode in [
+        0,
+        mode::MODE_KEYS_EXTENDED,
+        mode::MODE_KEYS_EXTENDED_2,
+        mode::MODE_KEYS_EXTENDED_2 | mode::MODE_KEYS_KITTY,
+    ] {
+        for format in [ExtendedKeyFormat::Xterm, ExtendedKeyFormat::CsiU] {
+            for index in [3, 0, 7, 127, 999] {
+                for modifiers in [0, KEYC_CTRL, KEYC_META, KEYC_SHIFT, KEYC_CTRL | KEYC_META] {
+                    let key = (rmux_core::KEYC_USER + index) | modifiers;
+                    assert_eq!(
+                        encode_key_with_backspace(pane_mode, format, key, 0x08),
+                        Some(Vec::new()),
+                        "User{index}, mode={pane_mode}, format={format:?}, modifiers={modifiers}"
+                    );
+                }
+            }
+        }
+    }
+}
+
+#[test]
 fn extended_key_round_trips_xterm_ascii_ctrl_meta() {
     let key = parse_key("M-C-a");
     let encoded = encode_key(mode::MODE_KEYS_EXTENDED_2, ExtendedKeyFormat::Xterm, key)
@@ -96,9 +119,27 @@ fn standard_mode_meta_printable_falls_back_to_escape_prefix() {
 }
 
 #[test]
-fn standard_mode_shift_enter_maps_to_line_feed() {
+fn standard_mode_shift_enter_maps_to_carriage_return() {
     let encoded = encode_key(0, ExtendedKeyFormat::Xterm, parse_key("S-Enter")).expect("encode");
-    assert_eq!(encoded, b"\n");
+    assert_eq!(encoded, b"\r");
+}
+
+#[test]
+fn extended_key_off_shift_enter_maps_to_carriage_return_for_send_keys() {
+    let key = parse_key("S-Enter");
+    let send_keys = encode_key(0, ExtendedKeyFormat::Xterm, key).expect("send-keys encode");
+    assert_eq!(send_keys, b"\r");
+}
+
+#[test]
+fn extended_key_off_shift_enter_maps_to_carriage_return_for_attach() {
+    let attached = match decode_extended_key(b"\x1b[13;2u", None) {
+        ExtendedKeyDecode::Matched { key, .. } => {
+            encode_key(0, ExtendedKeyFormat::Xterm, key).expect("attached encode")
+        }
+        other => panic!("attached S-Enter should decode, got {other:?}"),
+    };
+    assert_eq!(attached, b"\r");
 }
 
 #[test]
@@ -444,6 +485,193 @@ fn standard_key_encode_uses_xterm_modified_cursor_sequences() {
     }
 }
 
+/// tmux 3.7b `input-keys.c`, "Keys with an embedded modifier": `_` is the
+/// xterm modifier parameter of the key's Shift, Meta and Ctrl bits.
+const TMUX_EMBEDDED_MODIFIER_TEMPLATES: [(&str, &str); 22] = [
+    ("F1", "\x1b[1;_P"),
+    ("F2", "\x1b[1;_Q"),
+    ("F3", "\x1b[1;_R"),
+    ("F4", "\x1b[1;_S"),
+    ("F5", "\x1b[15;_~"),
+    ("F6", "\x1b[17;_~"),
+    ("F7", "\x1b[18;_~"),
+    ("F8", "\x1b[19;_~"),
+    ("F9", "\x1b[20;_~"),
+    ("F10", "\x1b[21;_~"),
+    ("F11", "\x1b[23;_~"),
+    ("F12", "\x1b[24;_~"),
+    ("Up", "\x1b[1;_A"),
+    ("Down", "\x1b[1;_B"),
+    ("Right", "\x1b[1;_C"),
+    ("Left", "\x1b[1;_D"),
+    ("Home", "\x1b[1;_H"),
+    ("End", "\x1b[1;_F"),
+    ("PPage", "\x1b[5;_~"),
+    ("NPage", "\x1b[6;_~"),
+    ("IC", "\x1b[2;_~"),
+    ("DC", "\x1b[3;_~"),
+];
+
+const TMUX_MODIFIER_PARAMETERS: [(&str, &str); 7] = [
+    ("S-", "2"),
+    ("M-", "3"),
+    ("S-M-", "4"),
+    ("C-", "5"),
+    ("S-C-", "6"),
+    ("C-M-", "7"),
+    ("C-M-S-", "8"),
+];
+
+#[test]
+fn modified_function_and_editing_keys_embed_the_xterm_modifier_in_every_key_mode() {
+    let modes = [
+        0,
+        mode::MODE_KCURSOR | mode::MODE_KKEYPAD,
+        mode::MODE_KEYS_EXTENDED,
+        mode::MODE_KEYS_EXTENDED_2,
+    ];
+    for pane_mode in modes {
+        for format in [ExtendedKeyFormat::Xterm, ExtendedKeyFormat::CsiU] {
+            for (name, template) in TMUX_EMBEDDED_MODIFIER_TEMPLATES {
+                for (prefix, parameter) in TMUX_MODIFIER_PARAMETERS {
+                    let key = format!("{prefix}{name}");
+                    let expected = template.replace('_', parameter);
+                    assert_eq!(
+                        encode_key(pane_mode, format, parse_key(&key)).as_deref(),
+                        Some(expected.as_bytes()),
+                        "{key} in pane mode {pane_mode:#x} with {format:?}"
+                    );
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn shifted_function_keys_are_not_control_bytes_and_ctrl_ones_are_not_dropped() {
+    // Before the fix S-F12 sent XOFF, S-F5 form feed, S-F1 backspace; C-F5 and C-DC
+    // could not be sent; M-F5 lost its modifier to a second Escape.
+    for (name, expected) in [
+        ("S-F12", b"\x1b[24;2~".as_slice()),
+        ("S-F5", b"\x1b[15;2~".as_slice()),
+        ("S-F1", b"\x1b[1;2P".as_slice()),
+        ("S-NPage", b"\x1b[6;2~".as_slice()),
+        ("C-F5", b"\x1b[15;5~".as_slice()),
+        ("C-DC", b"\x1b[3;5~".as_slice()),
+        ("M-F5", b"\x1b[15;3~".as_slice()),
+    ] {
+        assert_eq!(
+            encode_key(0, ExtendedKeyFormat::Xterm, parse_key(name)).as_deref(),
+            Some(expected),
+            "{name}"
+        );
+    }
+}
+
+/// Measured against tmux 3.7b with an attached client typing Escape then the
+/// key: Meta without `KEYC_IMPLIED_META` is Escape followed by the key's own
+/// sequence, re-encoded for the pane's cursor mode, in every key mode.
+#[test]
+fn escape_typed_before_a_key_writes_escape_then_its_sequence_in_every_key_mode() {
+    let kcursor = mode::MODE_KCURSOR;
+    let ext1 = mode::MODE_KEYS_EXTENDED;
+    let ext2 = mode::MODE_KEYS_EXTENDED_2;
+    for (pane_mode, format) in [
+        (0, ExtendedKeyFormat::Xterm),
+        (kcursor, ExtendedKeyFormat::Xterm),
+        (ext1, ExtendedKeyFormat::Xterm),
+        (ext2, ExtendedKeyFormat::Xterm),
+        (ext2, ExtendedKeyFormat::CsiU),
+    ] {
+        let up: &[u8] = if pane_mode == kcursor {
+            b"\x1b\x1bOA"
+        } else {
+            b"\x1b\x1b[A"
+        };
+        for (name, expected) in [
+            ("F5", b"\x1b\x1b[15~".as_slice()),
+            ("F12", b"\x1b\x1b[24~".as_slice()),
+            ("DC", b"\x1b\x1b[3~".as_slice()),
+            ("NPage", b"\x1b\x1b[6~".as_slice()),
+            ("F1", b"\x1b\x1bOP".as_slice()),
+            ("S-F5", b"\x1b\x1b[15;2~".as_slice()),
+            ("C-DC", b"\x1b\x1b[3;5~".as_slice()),
+            ("S-Up", b"\x1b\x1b[1;2A".as_slice()),
+            ("Up", up),
+        ] {
+            assert_eq!(
+                encode_key(pane_mode, format, parse_key(name) | KEYC_META).as_deref(),
+                Some(expected),
+                "Escape then {name} in pane mode {pane_mode:#x} {format:?}"
+            );
+        }
+    }
+}
+
+#[test]
+fn implied_meta_keeps_the_embedded_modifier_parameter() {
+    for (name, expected) in [
+        ("Up", b"\x1b[1;3A".as_slice()),
+        ("F5", b"\x1b[15;3~".as_slice()),
+        ("DC", b"\x1b[3;3~".as_slice()),
+    ] {
+        assert_eq!(
+            encode_key(
+                0,
+                ExtendedKeyFormat::Xterm,
+                parse_key(name) | KEYC_META | KEYC_IMPLIED_META
+            )
+            .as_deref(),
+            Some(expected),
+            "{name} with implied Meta"
+        );
+    }
+}
+
+/// Measured against tmux 3.7b (send-keys): an explicit Meta on a keypad key
+/// is Escape then the key's sequence for the pane's keypad mode.
+#[test]
+fn meta_keypad_keys_follow_the_application_keypad_mode_like_tmux() {
+    for (name, normal, keypad) in [
+        ("M-KP1", b"\x1b1".as_slice(), b"\x1b\x1bOq".as_slice()),
+        ("M-KP/", b"\x1b/", b"\x1b\x1bOo"),
+        ("M-KP0", b"\x1b0", b"\x1b\x1bOp"),
+    ] {
+        assert_eq!(
+            encode_key(0, ExtendedKeyFormat::Xterm, parse_key(name)).as_deref(),
+            Some(normal),
+            "{name} with the normal keypad"
+        );
+        assert_eq!(
+            encode_key(
+                mode::MODE_KKEYPAD,
+                ExtendedKeyFormat::Xterm,
+                parse_key(name)
+            )
+            .as_deref(),
+            Some(keypad),
+            "{name} with the application keypad"
+        );
+    }
+}
+
+#[test]
+fn escape_before_a_key_without_a_builtin_sequence_keeps_its_meta_encoding() {
+    assert_eq!(
+        encode_key(0, ExtendedKeyFormat::Xterm, u64::from(b'a') | KEYC_META).as_deref(),
+        Some(b"\x1ba".as_slice())
+    );
+    assert_eq!(
+        encode_key(
+            mode::MODE_KEYS_EXTENDED_2,
+            ExtendedKeyFormat::Xterm,
+            u64::from(b'a') | KEYC_META
+        )
+        .as_deref(),
+        Some(b"\x1b[27;3;97~".as_slice())
+    );
+}
+
 #[test]
 fn meta_backspace_encodes_escape_del() {
     assert_eq!(
@@ -464,6 +692,65 @@ fn configured_backspace_byte_controls_plain_and_meta_backspace() {
             .as_deref(),
         Some(b"\x1b\x08".as_slice())
     );
+}
+
+/// tmux 3.7b `input_key` replaces Backspace by the `backspace` option (0x7f)
+/// before any encoding and keeps its modifiers; the extended forms carry 127,
+/// never the internal key number (R3509 M2). Expected bytes are measured from
+/// tmux 3.7b `send-keys` under `extended-keys always`.
+#[test]
+fn modified_backspace_extended_forms_carry_the_backspace_byte() {
+    let extended_1 = mode::MODE_KEYS_EXTENDED;
+    let extended_2 = mode::MODE_KEYS_EXTENDED_2;
+    let kitty = mode::MODE_KEYS_EXTENDED_2 | mode::MODE_KEYS_KITTY;
+    let xterm = ExtendedKeyFormat::Xterm;
+    let csi_u = ExtendedKeyFormat::CsiU;
+    let cases: [(u32, ExtendedKeyFormat, &str, &[u8]); 18] = [
+        (extended_2, xterm, "M-BSpace", b"\x1b[27;3;127~"),
+        (extended_2, xterm, "C-BSpace", b"\x1b[27;5;127~"),
+        (extended_2, xterm, "S-BSpace", b"\x1b[27;2;127~"),
+        (extended_2, xterm, "S-M-BSpace", b"\x1b[27;4;127~"),
+        (extended_2, xterm, "C-S-BSpace", b"\x1b[27;6;127~"),
+        (extended_2, xterm, "C-M-BSpace", b"\x1b[27;7;127~"),
+        (extended_2, csi_u, "M-BSpace", b"\x1b[127;3u"),
+        (extended_2, csi_u, "C-BSpace", b"\x1b[127;5u"),
+        (extended_2, csi_u, "S-BSpace", b"\x1b[127;2u"),
+        (extended_2, csi_u, "S-M-BSpace", b"\x1b[127;4u"),
+        (kitty, xterm, "M-BSpace", b"\x1b[127;3u"),
+        (extended_1, xterm, "M-BSpace", b"\x1b\x7f"),
+        (extended_1, xterm, "S-M-BSpace", b"\x1b\x7f"),
+        (extended_1, xterm, "C-BSpace", b"\x1b[27;5;127~"),
+        (extended_1, xterm, "S-BSpace", b"\x1b[27;2;127~"),
+        (extended_1, xterm, "C-M-BSpace", b"\x1b[27;7;127~"),
+        (extended_1, csi_u, "C-BSpace", b"\x1b[127;5u"),
+        (extended_1, csi_u, "S-BSpace", b"\x1b[127;2u"),
+    ];
+    for (pane_mode, format, name, expected) in cases {
+        assert_eq!(
+            encode_key(pane_mode, format, parse_key(name)).as_deref(),
+            Some(expected),
+            "{name}, mode={pane_mode}, format={format:?}"
+        );
+    }
+}
+
+/// A real Alt+Backspace reported by the outer terminal in an extended form
+/// decodes to M-BSpace and is written to a modifyOtherKeys 2 pane with 127.
+#[test]
+fn typed_extended_meta_backspace_reaches_the_pane_with_the_backspace_byte() {
+    for (format, typed) in [
+        (ExtendedKeyFormat::Xterm, b"\x1b[27;3;127~".as_slice()),
+        (ExtendedKeyFormat::CsiU, b"\x1b[127;3u".as_slice()),
+    ] {
+        let ExtendedKeyDecode::Matched { key, .. } = decode_extended_key(typed, Some(0x7f)) else {
+            panic!("{typed:?} must decode");
+        };
+        assert_eq!(
+            encode_key(mode::MODE_KEYS_EXTENDED_2, format, key).as_deref(),
+            Some(typed),
+            "{format:?}"
+        );
+    }
 }
 
 #[test]

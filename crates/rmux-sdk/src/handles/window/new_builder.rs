@@ -181,7 +181,7 @@ async fn create_window(
         })))
         .await?
     {
-        Response::NewWindow(response) => Ok(response.target.into()),
+        Response::NewWindow(response) => Ok(WindowRef::from_proto(response.target)),
         response => Err(unexpected_response("new-window", response)),
     }
 }
@@ -198,5 +198,5 @@ fn proto_process_command(
         });
     }
 
-    Ok(Some(process_command.into()))
+    Ok(Some(process_command.into_proto()))
 }

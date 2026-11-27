@@ -258,7 +258,7 @@ impl StablePaneOutputIdentity {
         &self,
         state: &HandlerState,
         operation: &str,
-    ) -> Result<(), RmuxError> {
+    ) -> Result<&PaneTarget, RmuxError> {
         let current_id = state
             .sessions
             .session(self.target.session_name())
@@ -269,11 +269,29 @@ impl StablePaneOutputIdentity {
             && state.pane_output_generation_for_target(&self.target, self.pane_id)
                 == self.generation
         {
-            return Ok(());
+            return Ok(&self.target);
         }
         Err(RmuxError::Server(format!(
             "{operation} pane process was replaced before execution"
         )))
+    }
+
+    /// Follow this process across moves, including a reused former slot.
+    pub(in crate::handler) fn resolve_live_process(
+        &self,
+        state: &HandlerState,
+        operation: &str,
+    ) -> Result<PaneTarget, RmuxError> {
+        state
+            .pane_target_for_id(self.pane_id)
+            .filter(|target| {
+                state.pane_output_generation_for_target(target, self.pane_id) == self.generation
+            })
+            .ok_or_else(|| {
+                RmuxError::Server(format!(
+                    "{operation} pane process was replaced before execution"
+                ))
+            })
     }
 
     pub(in crate::handler) fn rename_session(
@@ -358,6 +376,27 @@ where
     EXPECTED_STABLE_TARGET_IDENTITIES
         .scope(ExpectedStableTargetIdentities::default(), future)
         .await
+}
+
+/// Expand a validated input destination to its live synchronized recipients.
+/// The caller holds the state lock through capture and write preparation.
+pub(in crate::handler) fn with_expected_synchronized_input_targets<T>(
+    state: &mut HandlerState,
+    target: &PaneTarget,
+    targets: Vec<PaneTarget>,
+    prepare: impl FnOnce(&mut HandlerState, Vec<PaneTarget>) -> Result<T, RmuxError>,
+) -> Result<T, RmuxError> {
+    require_expected_stable_pane_identity(state, target)?;
+    let mut expected = EXPECTED_STABLE_TARGET_IDENTITIES
+        .try_with(Clone::clone)
+        .unwrap_or_default();
+    for recipient in &targets {
+        expected.identities.push(StableTargetIdentity::capture(
+            state,
+            Target::Pane(recipient.clone()),
+        )?);
+    }
+    EXPECTED_STABLE_TARGET_IDENTITIES.sync_scope(expected, || prepare(state, targets))
 }
 
 pub(in crate::handler) fn require_expected_stable_session_identity(

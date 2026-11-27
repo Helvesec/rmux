@@ -1,4 +1,5 @@
 [package]
+rust-version.workspace = true
 name = "rmux-pty"
 version.workspace = true
 edition.workspace = true
@@ -9,18 +10,21 @@ description = "PTY allocation, resize, and child-process control for the RMUX te
 keywords = ["terminal", "multiplexer", "pty"]
 categories = ["command-line-interface", "os"]
 
+[features]
+test-seams = []
+
 [dependencies]
-rmux-types = { path = "../rmux-types", version = "0.10.0" }
+rmux-types = { path = "../rmux-types", version = "0.11.0" }
 tracing = "0.1.44"
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2.185"
-rmux-os = { path = "../rmux-os", version = "0.10.0" }
+rmux-os = { path = "../rmux-os", version = "0.11.0" }
 rustix = { version = "1.1.4", features = ["process", "termios", "pty", "fs"] }
 
 [target.'cfg(windows)'.dependencies]
 getrandom = "0.3"
-rmux-os = { path = "../rmux-os", version = "0.10.0" }
+rmux-os = { path = "../rmux-os", version = "0.11.0" }
 windows-sys = { version = "0.61.2", features = [
     "Win32_Foundation",
     "Win32_Security",
@@ -31,6 +35,7 @@ windows-sys = { version = "0.61.2", features = [
     "Win32_System_Pipes",
     "Win32_Storage_FileSystem",
     "Win32_System_JobObjects",
+    "Win32_System_LibraryLoader",
     "Win32_System_SystemInformation",
     "Win32_System_Threading",
 ] }

@@ -1,0 +1,25 @@
+FAIL — P1 de preuve C2 ; 330141c0eb1e propre.
+C1 PASS : sceau 3f48b7cc… et 23 entrées conformes.
+370 déplacements ; bijection 321 racines/2495 consommateurs.
+Cfg et multiplicités comparés individuellement, sans OR masquant.
+SDK mod.rs : six consommateurs, aucune racine Cargo ajoutée.
+150 allow et 4 path tooling conservés par transport exact.
+C2 FAIL : 51 alertes ; 23 compteurs identiques, 28 différents.
+Aucune croissance ni nouveau gros fichier. Exemple :
+attach_support 1970→1960 ; attach/unix 1052P/30T→1046P/31T.
+Liste exacte des 28 et des 51 : réponse board, C2.
+23 sources égales après seuls path ; rejeu tokens global
+indisponible (tree_sitter absent), sans installation ni outil neuf.
+Correction : garder le blocage des 28 ; compteurs identiques
+ou nouveau mandat borné prouvant chaque delta physique.
+C3 PASS (prescription) : 4 réadressages après seulement ; avant,
+12 identités, BASELINE/BOUNDS/CORE et seuil 599 inchangés.
+Transport semantic_population exact ; aucun filtre global.
+Activation des 51 interdite tant que C2 FAIL.
+Chaîne ajout seul : hashes source/preuve R2, date, décision,
+commit d’activation ; lecture explicite de l’époque historique.
+Canaris ajout/retrait/substitution/collision/borne relâchée exigés.
+C4 PASS : R1 relit le seul diff de révision et ses canaris ;
+adoption après C2 résolu, chaîne et raccord final validés.
+HEAD/33 entrées rehachés stables ; zéro crédit Cargo/natif/train/clôture.
+Aucun produit, garde, pin modifié ; aucun autre rôle piloté.

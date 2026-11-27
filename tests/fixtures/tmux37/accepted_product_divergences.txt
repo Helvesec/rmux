@@ -21,7 +21,7 @@ Exact command:
 
   TMUX_BIN="$HOME/.local/bin/tmux"
   SOCKET=rmux-alt-cycles-oracle-$$
-  EVIDENCE_DIR=.rmux-audit/alt-cycles-oracle
+  EVIDENCE_DIR=target/tmp/alt-cycles-oracle
   mkdir -p "$EVIDENCE_DIR"
   "$TMUX_BIN" -L "$SOCKET" -f /dev/null new-session -d -x 8 -y 2 -s probe \
     "$TMUX_BIN -L $SOCKET wait-for start;
@@ -145,7 +145,7 @@ C-D81: cursor anchor across width reflow
 Exact command:
 
   TMUX_BIN="$HOME/.local/bin/tmux"
-  RMUX_BIN=.rmux-audit/target-1.96.1/debug/rmux
+  RMUX_BIN=target/debug/rmux
   probe_engine() {
     engine="$1"
     binary="$2"
@@ -209,7 +209,7 @@ C-D82: minimum tiled layout hang
 Exact command, run from the repository root:
 
   TMUX_BIN="$HOME/.local/bin/tmux"
-  RMUX_BIN=.rmux-audit/target-1.96.1/debug/rmux
+  RMUX_BIN=target/debug/rmux
   run_with_two_second_timeout() {
     "$@" >/dev/null 2>&1 &
     command_pid="$!"
@@ -291,7 +291,7 @@ C-D83: width-deficient tiled partial rows
 Exact command, run from the repository root:
 
   TMUX_BIN="$HOME/.local/bin/tmux"
-  RMUX_BIN=.rmux-audit/target-1.96.1/debug/rmux
+  RMUX_BIN=target/debug/rmux
   RUNTIME_DIR="$HOME/Projects/.rmux-c-d83-runtime"
   mkdir -p "$RUNTIME_DIR"
   export RMUX_TMPDIR="$RUNTIME_DIR"
@@ -379,7 +379,7 @@ C-D84: width-deficient join-pane and move-pane targets
 Exact command, run from the repository root:
 
   TMUX_BIN="$HOME/.local/bin/tmux"
-  RMUX_BIN=.rmux-audit/target-1.96.1/debug/rmux
+  RMUX_BIN=target/debug/rmux
   SOCKET_ROOT="$HOME/Projects/.r4-c-d84-runtime"
   mkdir -p "$SOCKET_ROOT/tmux" "$SOCKET_ROOT/rmux"
   probe() {
@@ -463,3 +463,39 @@ the target to the first viable width. The target therefore owes one
 `window-resized` notification in addition to the two existing layout events.
 The tracked test also covers the three-column neighborhood and proves that a
 transfer which does not change the target size emits no resize notification.
+
+C-D85: native long version (product extension)
+---------------------------------------------
+Measured on Linux, 2026-09-05, with /usr/local/bin/tmux:
+  tmux -V          stdout="tmux 3.7b\n", stderr="", exit=0
+  tmux --version   stdout="", stderr starts "tmux: unknown option -- -\n", exit=1
+  tmux -V --version  stdout="tmux 3.7b\n", stderr="", exit=0
+  tmux --version -V  retains the unknown-long-option failure, exit=1
+
+Native rmux --version deliberately equals rmux -V: package version on stdout,
+empty stderr, exit0, no daemon, in tiny and full paths. Only the exact long
+spelling is added. Earlier help/errors, argument values and terminators retain
+their boundary semantics. The tmux personality retains its prior rejection of
+--version and its existing tmux 3.4 branding for -V. This is a product extension,
+not a correction of a tmux defect and not a parity claim.
+
+C-D86: native long help (product extension)
+------------------------------------------
+Measured on Linux, 2026-09-05, with /usr/local/bin/tmux 3.7b:
+  tmux --help       stdout="", unknown long option on stderr, exit=1
+  tmux -h --help    short usage on stdout, stderr="", exit=0
+  tmux -V --help    stdout="tmux 3.7b\n", stderr="", exit=0
+  tmux --help -V    retains the unknown-long-option failure, exit=1
+
+Native rmux --help deliberately prints the complete help inventory on stdout,
+with empty stderr and exit0. Each canonical compatible command and each RMUX
+extension appears once, using shared inventory signatures. Diagnose takes its
+usage from its existing CLI handler without becoming a parser/server command.
+The short usage header now includes h; detailed extension signatures replace
+hand-written hints, combined roots become separate entries, and web-share has
+one root line. The compatible Commands section remains the bare list-commands
+output. RMUX's tmux personality receives the same regenerated content while
+retaining stderr/exit1 and its existing option-decision order. Short help,
+version, value consumption, unknown options and command boundaries keep their
+contracts. Full and actual tiny with its matching helper agree without daemon
+work; tiny version remains helper-free. This is not a tmux parity claim.

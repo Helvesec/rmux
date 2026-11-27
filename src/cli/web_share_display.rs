@@ -10,13 +10,9 @@ use ratatui::{
 };
 use rmux_proto::{CommandOutput, WebShareCreatedResponse};
 
-#[path = "web_share_display/ansi.rs"]
 mod ansi;
-#[path = "web_share_display/plain.rs"]
 mod plain;
-#[path = "web_share_display/qr.rs"]
 mod qr;
-#[path = "web_share_display/support.rs"]
 mod support;
 #[cfg(test)]
 #[path = "web_share_display/tests.rs"]

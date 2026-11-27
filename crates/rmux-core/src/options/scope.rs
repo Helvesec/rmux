@@ -87,6 +87,22 @@ pub(super) enum ShowScope<'a> {
 }
 
 impl<'a> ShowScope<'a> {
+    pub(super) fn resolve_context(self) -> ResolveContext<'a> {
+        match self {
+            Self::Server => ResolveContext::Server,
+            Self::SessionGlobal => ResolveContext::SessionGlobal,
+            Self::WindowGlobal => ResolveContext::WindowGlobal,
+            Self::Session(name) => ResolveContext::Session(name),
+            Self::Window(target) => {
+                ResolveContext::Window(target.session_name(), target.window_index())
+            }
+            Self::Pane(target) => ResolveContext::Pane(
+                target.session_name(),
+                target.window_index(),
+                target.pane_index(),
+            ),
+        }
+    }
     pub(super) fn from_selector(scope: &'a OptionScopeSelector) -> Self {
         match scope {
             OptionScopeSelector::ServerGlobal => Self::Server,

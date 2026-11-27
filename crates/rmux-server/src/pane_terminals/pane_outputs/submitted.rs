@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 
-use rmux_core::PaneId;
+use rmux_core::{LineFormatCapture, PaneId};
 use rmux_proto::{PaneTarget, RmuxError, SessionName};
 
 use crate::pane_terminal_lookup::pane_id_for_target;
@@ -18,7 +18,8 @@ impl HandlerState {
         &mut self,
         target: &PaneTarget,
         request: PaneCaptureRequest,
-    ) -> Result<Vec<u8>, RmuxError> {
+        include_line_format: bool,
+    ) -> Result<(Vec<u8>, Option<LineFormatCapture>), RmuxError> {
         if !request.pending_input && !request.use_mode_screen && !request.alternate {
             let runtime_session_name =
                 self.runtime_session_name_for_window(target.session_name(), target.window_index());
@@ -33,7 +34,7 @@ impl HandlerState {
             }
         }
 
-        self.capture_transcript(target, request)
+        self.capture_transcript_with_line_format(target, request, include_line_format)
     }
 
     pub(crate) fn record_attached_submitted_text(
@@ -63,11 +64,7 @@ impl HandlerState {
         else {
             return Ok(());
         };
-        let absolute_y = transcript
-            .lock()
-            .expect("pane transcript mutex must not be poisoned")
-            .clone_screen()
-            .cursor_absolute_y();
+        let absolute_y = transcript.lock().clone_screen().cursor_absolute_y();
         self.attached_submitted_rows
             .entry(runtime_session_name)
             .or_default()
@@ -117,7 +114,6 @@ impl HandlerState {
         } else {
             transcript
                 .lock()
-                .expect("pane transcript mutex must not be poisoned")
                 .delete_attached_submitted_line(submitted_line.absolute_y, &submitted_line.text)
         };
         if removed {
@@ -199,10 +195,7 @@ mod tests {
             .get(&session_name)
             .is_some_and(|panes| panes.contains_key(&pane_id)));
 
-        transcript
-            .lock()
-            .expect("pane transcript mutex must not be poisoned")
-            .append_bytes(b"PROMPT> exit\r\n");
+        transcript.lock().append_bytes(b"PROMPT> exit\r\n");
 
         assert!(state
             .strip_attached_submitted_line(&session_name, pane_id)
@@ -213,7 +206,6 @@ mod tests {
             .is_some_and(|panes| panes.contains_key(&pane_id)));
         let capture = transcript
             .lock()
-            .expect("pane transcript mutex must not be poisoned")
             .capture_main(ScreenCaptureRange::default(), GridRenderOptions::default());
         assert!(
             !String::from_utf8_lossy(&capture).contains("PROMPT> exit"),
@@ -228,7 +220,6 @@ mod tests {
         let transcript = PaneTranscript::shared(2_000, TerminalSize { cols: 80, rows: 24 });
         transcript
             .lock()
-            .expect("pane transcript mutex must not be poisoned")
             .append_bytes(b"PROMPT> exit\r\nlogout\r\n");
 
         let mut state = HandlerState::default();
@@ -253,7 +244,12 @@ mod tests {
             .dead_panes
             .entry(session_name.clone())
             .or_default()
-            .insert(pane_id, PaneExitMetadata::without_exit_details());
+            .insert(
+                pane_id,
+                crate::pane_terminals::PaneExitObservation::published(
+                    PaneExitMetadata::without_exit_details(),
+                ),
+            );
         state
             .attached_submitted_rows
             .entry(session_name.clone())
@@ -277,9 +273,12 @@ mod tests {
                     pending_input: false,
                     quiet: false,
                     escape_pending: false,
+                    hyperlinks: false,
                 },
+                false,
             )
-            .expect("dead pane capture should render");
+            .expect("dead pane capture should render")
+            .0;
         let capture = String::from_utf8(capture).expect("capture should be utf8");
 
         assert!(

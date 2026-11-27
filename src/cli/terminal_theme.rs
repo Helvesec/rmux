@@ -214,7 +214,6 @@ mod imp {
         use super::*;
         use std::fs::File;
         use std::io::Write;
-        use std::os::fd::FromRawFd;
         use std::thread;
 
         fn palette_reply() -> String {
@@ -262,29 +261,24 @@ mod imp {
             assert_eq!(theme.ansi[15], "#0000ff");
         }
 
+        /// Allocates through the production PTY entry point so the Darwin
+        /// EREDRIVEOPEN lock and retry also cover this test.
         fn open_pty_pair() -> (File, File) {
-            let mut master = -1;
-            let mut slave = -1;
-            // SAFETY: `master` and `slave` are valid writable out-pointers. Null optional
-            // arguments request libc defaults, and success initializes both descriptors.
+            let (master, slave) = rmux_pty::PtyPair::open()
+                .expect("allocate pty pair")
+                .into_split();
+            let master = master.into_owned_fd().expect("own pty master");
+            // The responder relies on a blocking `write_all`, as with raw openpty.
+            // SAFETY: `master` is an open descriptor owned here; F_GETFL/F_SETFL
+            // only read and update its status flags.
+            let flags = unsafe { libc::fcntl(master.as_raw_fd(), libc::F_GETFL) };
+            assert_ne!(flags, -1, "F_GETFL: {}", std::io::Error::last_os_error());
+            // SAFETY: as above, clearing O_NONBLOCK on the same owned descriptor.
             let result = unsafe {
-                libc::openpty(
-                    &mut master,
-                    &mut slave,
-                    std::ptr::null_mut(),
-                    std::ptr::null_mut(),
-                    std::ptr::null_mut(),
-                )
+                libc::fcntl(master.as_raw_fd(), libc::F_SETFL, flags & !libc::O_NONBLOCK)
             };
-            assert_eq!(
-                result,
-                0,
-                "openpty failed: {}",
-                std::io::Error::last_os_error()
-            );
-            // SAFETY: `openpty` returned success, so both raw file descriptors are initialized
-            // and ownership is transferred exactly once into `File`.
-            unsafe { (File::from_raw_fd(master), File::from_raw_fd(slave)) }
+            assert_ne!(result, -1, "F_SETFL: {}", std::io::Error::last_os_error());
+            (File::from(master), File::from(slave.into_owned_fd()))
         }
     }
 }

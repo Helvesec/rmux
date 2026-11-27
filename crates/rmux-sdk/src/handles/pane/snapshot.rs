@@ -10,8 +10,13 @@ use rmux_proto::{
 use super::target::{is_already_closed_error, is_already_closed_pane_id_error, parse_error};
 
 pub(super) async fn pane_snapshot(pane: &Pane) -> Result<PaneSnapshot> {
+    Ok(listed_pane_snapshot(pane).await?.unwrap_or_default())
+}
+
+/// Captures the pane, or returns `None` when it is no longer listed.
+pub(super) async fn listed_pane_snapshot(pane: &Pane) -> Result<Option<PaneSnapshot>> {
     let Some(mut resolved_target) = pane.resolved_proto_target_ref().await? else {
-        return Ok(PaneSnapshot::default());
+        return Ok(None);
     };
 
     // The pane was listed at the start of this call, but the daemon can still
@@ -24,14 +29,12 @@ pub(super) async fn pane_snapshot(pane: &Pane) -> Result<PaneSnapshot> {
             .expect("resolved SDK pane snapshot targets are id-based");
         let resolved_session_name = resolved_target.session_name().clone();
         match request_pane_snapshot(pane, resolved_target.clone()).await {
-            Ok(response) => return snapshot_from_response(response),
+            Ok(response) => return snapshot_from_response(response).map(Some),
             Err(error)
                 if is_already_closed_error(&error, pane.target())
                     || matches!(
-                        &error,
-                        crate::RmuxError::Protocol {
-                            source: rmux_proto::RmuxError::SessionNotFound(session),
-                        } if session == resolved_session_name.as_str()
+                        error.protocol_source(),
+                        Some(rmux_proto::RmuxError::SessionNotFound(session)) if session == resolved_session_name.as_str()
                     )
                     || is_already_closed_pane_id_error(
                         &error,
@@ -41,14 +44,14 @@ pub(super) async fn pane_snapshot(pane: &Pane) -> Result<PaneSnapshot> {
             {
                 if attempt == 0 && pane.is_stable_id() {
                     let Some(retry_target) = pane.resolved_proto_target_ref().await? else {
-                        return Ok(PaneSnapshot::default());
+                        return Ok(None);
                     };
                     if retry_target != resolved_target {
                         resolved_target = retry_target;
                         continue;
                     }
                 }
-                return Ok(PaneSnapshot::default());
+                return Ok(None);
             }
             Err(error) => return Err(error),
         }
@@ -83,7 +86,7 @@ async fn request_pane_snapshot(
     } else {
         pane.transport()
             .request(Request::PaneSnapshot(PaneSnapshotRequest {
-                target: pane.target().into(),
+                target: pane.target().to_proto(),
             }))
             .await?
     };

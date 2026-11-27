@@ -1,4 +1,8 @@
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+#[cfg(not(target_has_atomic = "64"))]
+use portable_atomic::AtomicU64;
+#[cfg(target_has_atomic = "64")]
+use std::sync::atomic::AtomicU64;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
 #[derive(Debug)]
@@ -113,6 +117,24 @@ impl Drop for OperatorLease {
 #[cfg(test)]
 mod tests {
     use super::LeaseBook;
+
+    #[test]
+    fn atomic64_operator_ids_keep_high_bits_and_release_authority() {
+        let book = LeaseBook::new(None, None);
+        let high = u64::from(u32::MAX) + 1;
+        book.next_operator_id.store(high, super::Ordering::Relaxed);
+        let first = book.try_operator().expect("first operator");
+        let second = book.try_operator().expect("second operator");
+        assert_eq!(first.id, high);
+        assert_eq!(second.id, high + 1);
+        assert!(!first.is_resize_authority());
+        assert!(second.is_resize_authority());
+        drop(second);
+        assert!(first.is_resize_authority());
+        drop(first);
+        assert_eq!(book.operator_count(), 0);
+        assert_eq!(book.current_resize_operator(), None);
+    }
 
     #[test]
     fn spectator_lease_tracks_count_until_drop() {

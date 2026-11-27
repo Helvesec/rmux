@@ -1,0 +1,18 @@
+{
+  "schema": "rmux-source-budget/1",
+  "unit": "handwritten production LF physical lines measured by scripts/source-inventory/inventory.py",
+  "G": {
+    "production_lines": 301947,
+    "status": "not met",
+    "deferred_to": "0.12",
+    "basis": "Plan 28 target G = B0 - 1142, with B0 = 303089 production lines measured at the plan acceptance commit 8bdeb7632, which is absent from the squashed public history.",
+    "decision": "On 2026-11-24, the inventory counted 362972 production lines at revision 248b5008858be74aadb50b8f080abedce84a0ed5, 61025 above G. Meeting G is deferred to 0.12 and the production ratchet below is enforced meanwhile."
+  },
+  "production_ratchet": {
+    "production_lines": 362622,
+    "measured_revision": "e504ff12b21fe6784c44470482f6feafdad774e0",
+    "production_growth_envelope": 1925,
+    "production_growth_justification": "The r18 assembly at 4a8135b027b7303c0381ad78b948c99dec385327 measures 364547 handwritten production LF physical lines with the existing source inventory, 1925 above the unchanged 362622-line ratchet at e504ff12b21fe6784c44470482f6feafdad774e0. The squash-6 base d6b062825849efd942d7c3836e461ec8a9f592d6 measures 363840 lines (1218 above that ratchet); the ordered FIFO snapshot, OSC 7501 variant B, source-file cancellation, SIXEL capability (#259), command completion and resize (#261), and conditional atomic portability (#254) integrations add 707 production lines in total. The earlier documented r18 count of 363743 is not the squash-6 measurement. This records physical growth, with no reduction credit or reclassification of production as tests. All production files remain below 600 lines.",
+    "production_growth_decision": "On 2026-11-27, the r18 assembly mandate authorizes reconciling the production budget and its justification to the exact combined source measurement. The envelope is 1925 lines, with no spare allowance; the ratchet remains 362622 and target G = 301947 remains not met and deferred to 0.12."
+  }
+}

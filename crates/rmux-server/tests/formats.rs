@@ -71,7 +71,7 @@ async fn list_windows_uses_shared_formatter_through_real_socket() -> Result<(), 
         }),
     )
     .await?;
-    assert!(matches!(created, Response::NewSession(_)));
+    crate::common::assert_new_session(&created);
 
     let new_window = send_request(
         harness.socket_path(),
@@ -146,7 +146,7 @@ async fn nested_conditionals_expand_inner_templates_through_real_socket(
         }),
     )
     .await?;
-    assert!(matches!(created, Response::NewSession(_)));
+    crate::common::assert_new_session(&created);
 
     let new_window = send_request(
         harness.socket_path(),
@@ -209,7 +209,7 @@ async fn display_message_session_target_includes_active_pane_runtime_context(
         }),
     )
     .await?;
-    assert!(matches!(created, Response::NewSession(_)));
+    crate::common::assert_new_session(&created);
 
     let displayed = send_request(
         harness.socket_path(),

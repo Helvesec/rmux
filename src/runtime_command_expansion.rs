@@ -1,5 +1,6 @@
 use std::error::Error;
 use std::fmt;
+use std::io;
 
 use rmux_client::{ClientError, Connection};
 use rmux_proto::{
@@ -28,6 +29,22 @@ impl RuntimeCommandExpansionError {
                 Some(*got)
             }
             _ => None,
+        }
+    }
+
+    /// Whether the daemon closed or reset the connection without answering.
+    ///
+    /// An exiting daemon stops accepting while its endpoint stays bound until
+    /// its shutdown drain ends, so a connection queued in that window ends this
+    /// way unserved. Expansion is read-only: the probe found no serving daemon.
+    pub(crate) fn is_unanswered_by_exiting_daemon(&self) -> bool {
+        match self {
+            Self::Client(ClientError::UnexpectedEof) => true,
+            Self::Client(ClientError::Io(error)) => matches!(
+                error.kind(),
+                io::ErrorKind::ConnectionReset | io::ErrorKind::BrokenPipe
+            ),
+            Self::Client(_) | Self::Server(_) | Self::Protocol(_) => false,
         }
     }
 }
@@ -120,7 +137,12 @@ fn source_failure_message(stdout: &[u8], stderr: &[u8]) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{decode_canonical_commands, source_failure_message};
+    use std::io;
+
+    use rmux_client::ClientError;
+    use rmux_proto::RmuxError;
+
+    use super::{decode_canonical_commands, source_failure_message, RuntimeCommandExpansionError};
 
     #[test]
     fn canonical_decoder_preserves_lossless_payload_verbatim() {
@@ -138,5 +160,27 @@ mod tests {
             source_failure_message(b"ignored\n", b"stderr first\nstderr last\n"),
             "stderr last"
         );
+    }
+
+    #[test]
+    fn only_an_unanswered_close_reads_as_an_exiting_daemon() {
+        let client = |kind: io::ErrorKind| {
+            RuntimeCommandExpansionError::Client(ClientError::Io(kind.into()))
+        };
+        assert!(client(io::ErrorKind::ConnectionReset).is_unanswered_by_exiting_daemon());
+        assert!(client(io::ErrorKind::BrokenPipe).is_unanswered_by_exiting_daemon());
+        assert!(
+            RuntimeCommandExpansionError::Client(ClientError::UnexpectedEof)
+                .is_unanswered_by_exiting_daemon()
+        );
+
+        assert!(!client(io::ErrorKind::TimedOut).is_unanswered_by_exiting_daemon());
+        assert!(!client(io::ErrorKind::PermissionDenied).is_unanswered_by_exiting_daemon());
+        assert!(
+            !RuntimeCommandExpansionError::Server(RmuxError::Server("denied".to_owned()))
+                .is_unanswered_by_exiting_daemon()
+        );
+        assert!(!RuntimeCommandExpansionError::Protocol("bad".to_owned())
+            .is_unanswered_by_exiting_daemon());
     }
 }

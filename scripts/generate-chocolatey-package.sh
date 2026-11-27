@@ -18,6 +18,10 @@ Options:
 USAGE
 }
 
+layout_tool() {
+  printf '%s\n' "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/packaging/layout"
+}
+
 die() {
   printf 'error: %s\n' "$*" >&2
   exit 1
@@ -102,13 +106,56 @@ write_nuspec() {
 EOF
 }
 
+# The commands this package installs, and the archive-relative executable each
+# one points at, exactly as the descriptor declares them. The install and the
+# uninstall script are written from this one list, so they cannot disagree.
+chocolatey_shims() {
+  "$(layout_tool)" chocolatey-shims
+}
+
+# Every executable the package carries. Chocolatey shims each of them after the
+# install script runs, under their own basenames, unless a <file>.ignore sits
+# beside them; the script writes those markers from this list so the command
+# surface is the descriptor's decision instead of whatever the archive happens
+# to contain, even when a command is named differently from its file.
+chocolatey_ignores() {
+  "$(layout_tool)" chocolatey-ignores
+}
+
 write_install() {
-  local out asset sha url package_dir
+  local out asset sha url package_dir shim_lines command path
   out="$1"
   asset="rmux-$version-windows-x86_64.zip"
   sha="$(asset_sha256 "$asset")"
   url="https://github.com/$repository/releases/download/$release_tag/$asset"
   package_dir="rmux-$version-windows-x86_64"
+
+  # Both projections are taken as values and their status is read. Feeding a
+  # command substitution straight into the loop would run the refusal inside a
+  # subshell, so a refused descriptor would turn into an empty list here and
+  # the package would be written as if nothing had been declared.
+  local shim_projection ignore_projection ignore_lines relative
+  shim_projection="$(chocolatey_shims)" || die "could not project the Chocolatey shims"
+  ignore_projection="$(chocolatey_ignores)" || die "could not project the Chocolatey ignores"
+
+  shim_lines=""
+  while IFS="$(printf '\t')" read -r command path; do
+    [ -n "$command" ] || continue
+    shim_lines="$shim_lines  [pscustomobject]@{ Name = '$command'; Path = (Join-Path \$installDir '$path') }
+"
+  done <<EOF
+$shim_projection
+EOF
+  [ -n "$shim_lines" ] || die "the descriptor declares no Chocolatey shim"
+
+  ignore_lines=""
+  while IFS= read -r relative; do
+    [ -n "$relative" ] || continue
+    ignore_lines="$ignore_lines  '$relative'
+"
+  done <<EOF
+$ignore_projection
+EOF
 
   cat > "$out" <<EOF
 \$ErrorActionPreference = 'Stop'
@@ -116,8 +163,9 @@ write_install() {
 \$packageName = 'rmux'
 \$toolsDir = Split-Path -Parent \$MyInvocation.MyCommand.Definition
 \$installDir = Join-Path \$toolsDir '$package_dir'
-\$rmuxExe = Join-Path \$installDir 'rmux.exe'
-\$rmuxDaemonExe = Join-Path \$installDir 'rmux-daemon.exe'
+
+\$shims = @(
+$shim_lines)
 
 \$zipArgs = @{
   packageName = \$packageName
@@ -129,26 +177,54 @@ write_install() {
 
 Install-ChocolateyZipPackage @zipArgs
 
-if (-not (Test-Path \$rmuxExe)) {
-  throw "rmux.exe was not extracted to \$rmuxExe"
-}
-if (-not (Test-Path \$rmuxDaemonExe)) {
-  throw "rmux-daemon.exe was not extracted to \$rmuxDaemonExe"
+foreach (\$shim in \$shims) {
+  if (-not (Test-Path \$shim.Path)) {
+    throw "\$(\$shim.Name) was not extracted to \$(\$shim.Path)"
+  }
 }
 
-Install-BinFile -Name 'rmux' -Path \$rmuxExe
-Install-BinFile -Name 'rmux-daemon' -Path \$rmuxDaemonExe
+# Chocolatey's automatic pass names a command after a file's basename, so every
+# executable this package carries is marked before any command is installed.
+# The commands below are then the only ones this package adds, whatever the
+# files happen to be called. A missing marker target is a packaging error, not
+# a silent extra command.
+\$ignored = @(
+$ignore_lines)
+
+foreach (\$relative in \$ignored) {
+  \$target = Join-Path \$installDir \$relative
+  if (-not (Test-Path \$target)) {
+    throw "\$relative was not extracted to \$target"
+  }
+  New-Item -ItemType File -Path "\$target.ignore" -Force | Out-Null
+}
+
+foreach (\$shim in \$shims) {
+  Install-BinFile -Name \$shim.Name -Path \$shim.Path
+}
 EOF
 }
 
 write_uninstall() {
-  local out
+  local out command path names
   out="$1"
-  cat > "$out" <<'EOF'
-$ErrorActionPreference = 'Stop'
+  local projection
+  projection="$(chocolatey_shims)" || die "could not project the Chocolatey shims"
+  names=""
+  while IFS="$(printf '\t')" read -r command path; do
+    [ -n "$command" ] || continue
+    names="$names '$command'"
+  done <<EOF
+$projection
+EOF
+  [ -n "$names" ] || die "the descriptor declares no Chocolatey shim"
 
-Uninstall-BinFile -Name 'rmux'
-Uninstall-BinFile -Name 'rmux-daemon'
+  cat > "$out" <<EOF
+\$ErrorActionPreference = 'Stop'
+
+foreach (\$name in @($(printf '%s' "$names" | sed 's/^ //; s/ /, /g'))) {
+  Uninstall-BinFile -Name \$name
+}
 EOF
 }
 

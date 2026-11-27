@@ -171,12 +171,12 @@ impl CopyModeState {
             "jump-to-forward" => self.jump_with_arg(args, JumpKind::ToForward),
             "jump-to-mark" => self.readonly(Self::cmd_jump_to_mark, ClearPolicy::Always),
             "next-prompt" => self.readonly_args(args, ClearPolicy::Always, |state, args| {
-                let only_after = args.iter().any(|value| value == "-o");
-                state.cmd_next_prompt(only_after)
+                let output = args.iter().any(|value| value == "-o");
+                state.cmd_next_prompt(output)
             }),
             "previous-prompt" => self.readonly_args(args, ClearPolicy::Always, |state, args| {
-                let only_before = args.iter().any(|value| value == "-o");
-                state.cmd_previous_prompt(only_before)
+                let output = args.iter().any(|value| value == "-o");
+                state.cmd_previous_prompt(output)
             }),
             "middle-line" => self.readonly(Self::cmd_middle_line, ClearPolicy::EmacsOnly),
             "next-matching-bracket" => {
@@ -377,13 +377,14 @@ impl CopyModeState {
         outcome: CopyModeCommandOutcome,
         clear: ClearPolicy,
     ) -> CopyModeCommandOutcome {
-        match clear {
-            ClearPolicy::Always => self.search_highlighted = false,
-            ClearPolicy::Never => {}
-            ClearPolicy::EmacsOnly if self.mode_keys == ModeKeys::Emacs => {
-                self.search_highlighted = false;
-            }
-            ClearPolicy::EmacsOnly => {}
+        let clears = match clear {
+            ClearPolicy::Always => true,
+            ClearPolicy::Never => false,
+            ClearPolicy::EmacsOnly => self.mode_keys == ModeKeys::Emacs,
+        };
+        if clears {
+            self.search_highlighted = false;
+            self.search_marked = false;
         }
         outcome
     }

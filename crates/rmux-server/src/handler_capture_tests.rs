@@ -7,11 +7,25 @@ use rmux_proto::types::OptionScopeSelector;
 #[cfg(unix)]
 use rmux_proto::ListBuffersRequest;
 use rmux_proto::{
-    CapturePaneRequest, CapturePaneTargetActionRequest, LoadBufferRequest, NewSessionRequest,
-    PaneTarget, Request, Response, SaveBufferRequest, SendKeysRequest, SetBufferRequest,
-    SetOptionByNameRequest, SetOptionMode, ShowBufferRequest, TerminalSize,
+    CapturePaneRequest, CapturePaneTargetActionRequest, CopyModeRequest, LoadBufferRequest,
+    NewSessionRequest, OptionName, PaneOptionSetRequest, PaneTarget, PaneTargetRef, Request,
+    Response, SaveBufferRequest, ScopeSelector, SendKeysRequest, SetBufferRequest,
+    SetOptionByNameRequest, SetOptionMode, SetOptionRequest, ShowBufferRequest, SplitDirection,
+    SplitWindowRequest, SplitWindowTarget, TerminalSize, WindowTarget,
 };
 use tokio::time::sleep;
+
+#[path = "handler_capture_tests/hlink1.rs"]
+mod hlink1;
+
+#[path = "handler_capture_tests/capture_format.rs"]
+mod capture_format;
+
+#[path = "handler_capture_tests/capture_format_neighbors.rs"]
+mod capture_format_neighbors;
+
+#[path = "handler_capture_tests/capture_format_empty_print.rs"]
+mod capture_format_empty_print;
 
 static UNIQUE_ID: AtomicUsize = AtomicUsize::new(0);
 
@@ -112,7 +126,7 @@ async fn create_session_with_size(handler: &RequestHandler, name: &str, size: Te
         }))
         .await;
 
-    assert!(matches!(response, Response::NewSession(_)));
+    crate::session_fixture::assert_new_session(&response);
 }
 
 #[tokio::test]
@@ -220,6 +234,138 @@ async fn direct_and_target_action_capture_join_stop_at_active_alternate_boundary
 }
 
 #[tokio::test]
+async fn formatted_join_capture_stops_at_all_active_alternate_boundaries() {
+    let handler = RequestHandler::new();
+
+    for mode in [47, 1047, 1049] {
+        for marked in [false, true] {
+            let name = format!("formatted-boundary-{mode}-{marked}");
+            create_session_with_size(&handler, &name, TerminalSize { cols: 8, rows: 2 }).await;
+            let target = PaneTarget::with_window(session_name(&name), 0, 0);
+            let prompt_mark = if marked { "\x1b]133;A\x07" } else { "" };
+            let output_mark = if marked { "\x1b]133;C\x07" } else { "" };
+            let content = format!(
+                "{prompt_mark}\x1b[31mabcdefghijkl\x1b[0m\r\n\
+                 \x1b[?{mode}h\x1b[H{output_mark}\x1b[32mVIM\x1b[0m"
+            );
+            replace_transcript_contents(
+                &handler,
+                &target,
+                TerminalSize { cols: 8, rows: 2 },
+                content.as_bytes(),
+            )
+            .await;
+
+            let mut request = capture_pane_request(target, None, None, true, None);
+            request.start_is_absolute = true;
+            request.include_format = true;
+            request.join_wrapped = true;
+            let response = handler
+                .handle(Request::CapturePane(Box::new(request)))
+                .await;
+            let expected = if marked {
+                b"P abcdefgh\nO VIM\n- \n".as_slice()
+            } else {
+                b"- abcdefgh\n- VIM\n- \n".as_slice()
+            };
+            assert_eq!(
+                capture_stdout(response),
+                expected,
+                "mode={mode}, marked={marked}"
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn formatted_join_capture_boundary_covers_ranges_ansi_saved_and_copy_mode() {
+    let handler = RequestHandler::new();
+    create_session_with_size(
+        &handler,
+        "formatted-boundary-neighbours",
+        TerminalSize { cols: 8, rows: 2 },
+    )
+    .await;
+    let target = PaneTarget::with_window(session_name("formatted-boundary-neighbours"), 0, 0);
+    replace_transcript_contents(
+        &handler,
+        &target,
+        TerminalSize { cols: 8, rows: 2 },
+        b"\x1b]133;A\x07\x1b[31mabcdefghijkl\x1b[0m\r\n\
+          \x1b[?1049h\x1b[H\x1b]133;C\x07\x1b[32mVIM\x1b[0m",
+    )
+    .await;
+
+    let mut ansi = capture_pane_request(target.clone(), None, None, true, None);
+    ansi.start_is_absolute = true;
+    ansi.include_format = true;
+    ansi.join_wrapped = true;
+    ansi.escape_ansi = true;
+    let response = handler.handle(Request::CapturePane(Box::new(ansi))).await;
+    assert_eq!(
+        capture_stdout(response),
+        b"P \x1b[31mabcdefgh\x1b[39m\nO \x1b[32mVIM\x1b[39m\n- \n"
+    );
+
+    let mut history_only = capture_pane_request(target.clone(), Some(-1), Some(-1), true, None);
+    history_only.include_format = true;
+    history_only.join_wrapped = true;
+    let response = handler
+        .handle(Request::CapturePane(Box::new(history_only)))
+        .await;
+    assert_eq!(capture_stdout(response), b"P abcdefgh\n");
+
+    let mut alternate_only = capture_pane_request(target.clone(), Some(0), Some(0), true, None);
+    alternate_only.include_format = true;
+    alternate_only.join_wrapped = true;
+    let response = handler
+        .handle(Request::CapturePane(Box::new(alternate_only)))
+        .await;
+    assert_eq!(capture_stdout(response), b"O VIM\n");
+
+    let mut crossing = capture_pane_request(target.clone(), Some(-1), Some(0), true, None);
+    crossing.include_format = true;
+    crossing.join_wrapped = true;
+    let response = handler
+        .handle(Request::CapturePane(Box::new(crossing)))
+        .await;
+    assert_eq!(capture_stdout(response), b"P abcdefgh\nO VIM\n");
+
+    let mut saved = capture_pane_request(target.clone(), Some(0), Some(1), true, None);
+    saved.alternate = true;
+    saved.include_format = true;
+    saved.join_wrapped = true;
+    let response = handler.handle(Request::CapturePane(Box::new(saved))).await;
+    assert_eq!(capture_stdout(response), b"- ijkl\n- \n");
+
+    let response = handler
+        .handle(Request::CopyMode(CopyModeRequest {
+            target: Some(target.clone()),
+            page_down: false,
+            exit_on_scroll: false,
+            hide_position: false,
+            mouse_drag_start: false,
+            cancel_mode: false,
+            scrollbar_scroll: false,
+            source: None,
+            page_up: true,
+        }))
+        .await;
+    assert!(matches!(response, Response::CopyMode(_)));
+
+    let mut mode_capture = capture_pane_request(target, Some(0), Some(1), true, None);
+    mode_capture.include_format = true;
+    mode_capture.join_wrapped = true;
+    mode_capture.use_mode_screen = true;
+    let response = handler
+        .handle(Request::CapturePane(Box::new(mode_capture)))
+        .await;
+    // tmux 3.7b reads rows 0 and 1 of the copy-mode backing, whatever the
+    // one-row scroll of `copy-mode -u`.
+    assert_eq!(capture_stdout(response), b"O VIM\n- \n");
+}
+
+#[tokio::test]
 async fn named_capture_buffer_keeps_dch_field_boundary_like_tmux_3_7b() {
     let handler = RequestHandler::new();
     let size = TerminalSize { cols: 12, rows: 8 };
@@ -276,23 +422,28 @@ async fn replace_transcript_contents(
     size: TerminalSize,
     content: &[u8],
 ) {
+    // The pane runs a real producer. Until its startup output has landed, this
+    // synthetic Screen can still be overwritten, and the loss only becomes
+    // observable later - on Windows the alternate screen loses its OSC133 mark
+    // and content by the time copy mode reads it. Wait for observable startup
+    // first, exactly as handler_copy_mode_tests does before the same
+    // replacement. This settles the producer; it does not silence it. On Unix
+    // `RequestHandler::new()` already runs the quiet child; Windows keeps its
+    // real shell here.
+    handler
+        .wait_for_pane_startup_to_finish_for_test(target)
+        .await;
     let transcript = {
         let state = handler.state.lock().await;
         state
             .transcript_handle(target)
             .expect("session transcript must exist")
     };
-    let history_limit = transcript
-        .lock()
-        .expect("pane transcript mutex must not be poisoned")
-        .history_limit();
+    let history_limit = transcript.lock().history_limit();
     let mut screen = Screen::new(size, history_limit);
     let mut parser = InputParser::new();
     parser.parse(content, &mut screen);
-    transcript
-        .lock()
-        .expect("pane transcript mutex must not be poisoned")
-        .set_screen_for_test(screen);
+    transcript.lock().set_screen_for_test(screen);
 }
 
 async fn send_marker(handler: &RequestHandler, target: PaneTarget, marker: &str) {
@@ -451,9 +602,7 @@ async fn alternate_screen_off_keeps_program_output_on_main_screen() {
             .expect("session transcript must exist")
     };
     let output = {
-        let mut transcript = transcript
-            .lock()
-            .expect("pane transcript mutex must not be poisoned");
+        let mut transcript = transcript.lock();
         transcript.append_bytes(b"\x1b[2J\x1b[H\x1b[?1049hALTLINE\r\n\x1b[?1049lMAINLINE\r\n");
         assert!(!transcript.is_alternate());
         transcript.capture_main(ScreenCaptureRange::default(), GridRenderOptions::default())
@@ -765,4 +914,474 @@ fn temp_path(label: &str) -> std::path::PathBuf {
         "rmux-handler-{label}-{}-{unique_id}",
         std::process::id()
     ))
+}
+
+// ---------------------------------------------------------------------------
+// `scroll-on-clear` option effect.
+//
+// These fixtures prove the option mutation reaches the live pane screen: a
+// whole-screen erase either moves the used visible rows into scrollback ("on",
+// the default) or discards them in place ("off"). The discriminator is the
+// history delta plus whether the erased marker survives a capture that spans
+// history, exactly the pair tmux 3.7b separates.
+//
+// Every pane runs the quiet `default-command` producer so the only bytes in the
+// transcript are the ones the fixture injects; the producer is still settled
+// with `wait_for_pane_startup_to_finish_for_test` before the first injection.
+// The screen is never replaced with `set_screen_for_test` here, because that
+// would install a fresh `Screen` and silently drop the pushed policy.
+// ---------------------------------------------------------------------------
+
+/// Pane height used by the `scroll-on-clear` fixtures.
+const SCROLL_ON_CLEAR_ROWS: u16 = 6;
+/// Rows the seed writes, i.e. the exact number of used rows an "on" erase moves
+/// into scrollback.
+const SCROLL_ON_CLEAR_SEEDED_ROWS: usize = 3;
+
+#[derive(Debug)]
+struct ScrollOnClearObservation {
+    history_delta: usize,
+    visible: String,
+    full: String,
+}
+
+/// Blanks every row with `EL`, then writes three marker rows at the top.
+///
+/// `EL` and absolute cursor addressing are deliberately used instead of `ED 2`:
+/// the seed must not itself consult the policy under test, and it must leave a
+/// used-row count that does not depend on whatever the pane held before.
+fn scroll_on_clear_seed_bytes(marker: &str) -> Vec<u8> {
+    let mut bytes = String::new();
+    for row in 1..=SCROLL_ON_CLEAR_ROWS {
+        bytes.push_str(&format!("\x1b[{row};1H\x1b[K"));
+    }
+    for (offset, suffix) in ["A", "B", "C"].iter().enumerate() {
+        bytes.push_str(&format!("\x1b[{};1H{marker}{suffix}", offset + 1));
+    }
+    bytes.into_bytes()
+}
+
+async fn scroll_on_clear_transcript(
+    handler: &RequestHandler,
+    target: &PaneTarget,
+) -> crate::pane_transcript::SharedPaneTranscript {
+    let state = handler.state.lock().await;
+    state
+        .transcript_handle(target)
+        .expect("pane transcript must exist")
+}
+
+async fn scroll_on_clear_append(handler: &RequestHandler, target: &PaneTarget, bytes: &[u8]) {
+    let transcript = scroll_on_clear_transcript(handler, target).await;
+    transcript.lock().append_bytes(bytes);
+}
+
+async fn scroll_on_clear_history_size(handler: &RequestHandler, target: &PaneTarget) -> usize {
+    let transcript = scroll_on_clear_transcript(handler, target).await;
+    let size = transcript.lock().history_size();
+    size
+}
+
+async fn scroll_on_clear_capture(
+    handler: &RequestHandler,
+    target: &PaneTarget,
+    start: Option<i64>,
+    end: Option<i64>,
+) -> String {
+    let response = handler
+        .handle(Request::CapturePane(Box::new(capture_pane_request(
+            target.clone(),
+            start,
+            end,
+            true,
+            None,
+        ))))
+        .await;
+    String::from_utf8(capture_stdout(response)).expect("capture output is utf8")
+}
+
+async fn scroll_on_clear_set(
+    handler: &RequestHandler,
+    scope: OptionScopeSelector,
+    value: Option<&str>,
+    unset: bool,
+) {
+    let response = handler
+        .handle(Request::SetOptionByName(Box::new(SetOptionByNameRequest {
+            scope,
+            name: "scroll-on-clear".to_owned(),
+            value: value.map(str::to_owned),
+            mode: SetOptionMode::Replace,
+            only_if_unset: false,
+            unset,
+            unset_pane_overrides: false,
+            format: false,
+            format_target: None,
+        })))
+        .await;
+    assert!(
+        matches!(response, Response::SetOptionByName(_)),
+        "{response:?}"
+    );
+}
+
+/// Creates a detached session whose panes run the quiet stdin-discard command,
+/// and returns the settled first pane.
+async fn scroll_on_clear_session(handler: &RequestHandler, name: &str) -> PaneTarget {
+    let response = handler
+        .handle(Request::SetOption(SetOptionRequest {
+            scope: ScopeSelector::Global,
+            option: OptionName::DefaultCommand,
+            value: crate::test_shell::stdin_discard_command(),
+            mode: SetOptionMode::Replace,
+        }))
+        .await;
+    assert!(matches!(response, Response::SetOption(_)), "{response:?}");
+    create_session_with_size(
+        handler,
+        name,
+        TerminalSize {
+            cols: 40,
+            rows: SCROLL_ON_CLEAR_ROWS,
+        },
+    )
+    .await;
+    let target = PaneTarget::with_window(session_name(name), 0, 0);
+    handler
+        .wait_for_pane_startup_to_finish_for_test(&target)
+        .await;
+    target
+}
+
+async fn scroll_on_clear_split(handler: &RequestHandler, target: &PaneTarget) -> PaneTarget {
+    let response = handler
+        .handle(Request::SplitWindow(SplitWindowRequest {
+            target: SplitWindowTarget::Pane(target.clone()),
+            // Side-by-side keeps both panes at the full fixture height.
+            direction: SplitDirection::Horizontal,
+            before: false,
+            environment: None,
+        }))
+        .await;
+    let pane = match response {
+        Response::SplitWindow(response) => response.pane,
+        response => panic!("expected split-window success, got {response:?}"),
+    };
+    handler
+        .wait_for_pane_startup_to_finish_for_test(&pane)
+        .await;
+    pane
+}
+
+/// Seeds three marker rows, issues `ED 2`, and reports what the erase did.
+async fn scroll_on_clear_erase_and_observe(
+    handler: &RequestHandler,
+    target: &PaneTarget,
+    marker: &str,
+) -> ScrollOnClearObservation {
+    scroll_on_clear_append(handler, target, &scroll_on_clear_seed_bytes(marker)).await;
+    let seeded = scroll_on_clear_capture(handler, target, None, None).await;
+    assert!(
+        seeded.contains(&format!("{marker}A")) && seeded.contains(&format!("{marker}C")),
+        "seed must be visible before the erase: {seeded:?}"
+    );
+    let before = scroll_on_clear_history_size(handler, target).await;
+    scroll_on_clear_append(handler, target, b"\x1b[2J").await;
+    let after = scroll_on_clear_history_size(handler, target).await;
+    let visible = scroll_on_clear_capture(handler, target, None, None).await;
+    let full = scroll_on_clear_capture(handler, target, Some(-(after as i64)), None).await;
+    ScrollOnClearObservation {
+        history_delta: after.saturating_sub(before),
+        visible,
+        full,
+    }
+}
+
+fn assert_scroll_on_clear_kept(observation: &ScrollOnClearObservation, marker: &str, label: &str) {
+    assert_eq!(
+        observation.history_delta, SCROLL_ON_CLEAR_SEEDED_ROWS,
+        "{label}: the used rows must reach scrollback: {observation:?}"
+    );
+    assert!(
+        !observation.visible.contains(marker),
+        "{label}: the viewport must be blank after the erase: {observation:?}"
+    );
+    assert!(
+        observation.full.contains(&format!("{marker}A"))
+            && observation.full.contains(&format!("{marker}C")),
+        "{label}: a capture spanning history must still hold the rows: {observation:?}"
+    );
+}
+
+fn assert_scroll_on_clear_discarded(
+    observation: &ScrollOnClearObservation,
+    marker: &str,
+    label: &str,
+) {
+    assert_eq!(
+        observation.history_delta, 0,
+        "{label}: history must not grow: {observation:?}"
+    );
+    assert!(
+        !observation.visible.contains(marker),
+        "{label}: the viewport must be blank after the erase: {observation:?}"
+    );
+    assert!(
+        !observation.full.contains(marker),
+        "{label}: a capture spanning history must not hold the rows: {observation:?}"
+    );
+}
+
+#[tokio::test]
+async fn scroll_on_clear_off_at_window_global_discards_the_erased_rows() {
+    let handler = RequestHandler::new();
+    let target = scroll_on_clear_session(&handler, "soc-wg-off").await;
+
+    scroll_on_clear_set(
+        &handler,
+        OptionScopeSelector::WindowGlobal,
+        Some("off"),
+        false,
+    )
+    .await;
+    let observation = scroll_on_clear_erase_and_observe(&handler, &target, "ZQA").await;
+    assert_scroll_on_clear_discarded(&observation, "ZQA", "window-global off");
+
+    // Pre-existing history must survive an "off" erase untouched: seed a row,
+    // scroll it into scrollback with "on", switch to "off" and erase again.
+    scroll_on_clear_set(
+        &handler,
+        OptionScopeSelector::WindowGlobal,
+        Some("on"),
+        false,
+    )
+    .await;
+    let kept = scroll_on_clear_erase_and_observe(&handler, &target, "ZQB").await;
+    assert_scroll_on_clear_kept(&kept, "ZQB", "window-global back on");
+
+    scroll_on_clear_set(
+        &handler,
+        OptionScopeSelector::WindowGlobal,
+        Some("off"),
+        false,
+    )
+    .await;
+    let discarded = scroll_on_clear_erase_and_observe(&handler, &target, "ZQC").await;
+    assert_scroll_on_clear_discarded(&discarded, "ZQC", "window-global off again");
+    assert!(
+        discarded.full.contains("ZQBA"),
+        "the earlier scrollback rows must survive an off erase: {discarded:?}"
+    );
+}
+
+#[tokio::test]
+async fn scroll_on_clear_default_and_explicit_on_keep_the_erased_rows() {
+    let handler = RequestHandler::new();
+    let target = scroll_on_clear_session(&handler, "soc-wg-on").await;
+
+    // No mutation at all: the table default is "on".
+    let defaulted = scroll_on_clear_erase_and_observe(&handler, &target, "ZRA").await;
+    assert_scroll_on_clear_kept(&defaulted, "ZRA", "table default");
+
+    scroll_on_clear_set(
+        &handler,
+        OptionScopeSelector::WindowGlobal,
+        Some("on"),
+        false,
+    )
+    .await;
+    let explicit = scroll_on_clear_erase_and_observe(&handler, &target, "ZRB").await;
+    assert_scroll_on_clear_kept(&explicit, "ZRB", "window-global on");
+}
+
+#[tokio::test]
+async fn scroll_on_clear_pane_scope_overrides_window_scope() {
+    let handler = RequestHandler::new();
+    let first = scroll_on_clear_session(&handler, "soc-scope").await;
+    let second = scroll_on_clear_split(&handler, &first).await;
+
+    // Window scope applies to every pane that has no override.
+    scroll_on_clear_set(
+        &handler,
+        OptionScopeSelector::Window(WindowTarget::with_window(
+            session_name("soc-scope"),
+            first.window_index(),
+        )),
+        Some("off"),
+        false,
+    )
+    .await;
+    let inherited = scroll_on_clear_erase_and_observe(&handler, &second, "ZSA").await;
+    assert_scroll_on_clear_discarded(&inherited, "ZSA", "window scope reaches an unset pane");
+
+    // The pane-local value wins over the window value.
+    scroll_on_clear_set(
+        &handler,
+        OptionScopeSelector::Pane(first.clone()),
+        Some("on"),
+        false,
+    )
+    .await;
+    let overridden = scroll_on_clear_erase_and_observe(&handler, &first, "ZSB").await;
+    assert_scroll_on_clear_kept(&overridden, "ZSB", "pane override beats window");
+    let still_window = scroll_on_clear_erase_and_observe(&handler, &second, "ZSC").await;
+    assert_scroll_on_clear_discarded(&still_window, "ZSC", "sibling keeps the window value");
+
+    // `set -p -u` drops the pane override and falls back to the window value.
+    scroll_on_clear_set(
+        &handler,
+        OptionScopeSelector::Pane(first.clone()),
+        None,
+        true,
+    )
+    .await;
+    let fallback = scroll_on_clear_erase_and_observe(&handler, &first, "ZSD").await;
+    assert_scroll_on_clear_discarded(&fallback, "ZSD", "unset pane falls back to window");
+}
+
+#[tokio::test]
+async fn scroll_on_clear_hot_change_on_a_live_pane_takes_effect() {
+    let handler = RequestHandler::new();
+    let target = scroll_on_clear_session(&handler, "soc-hot").await;
+
+    scroll_on_clear_set(
+        &handler,
+        OptionScopeSelector::Pane(target.clone()),
+        Some("on"),
+        false,
+    )
+    .await;
+    let first = scroll_on_clear_erase_and_observe(&handler, &target, "ZTA").await;
+    assert_scroll_on_clear_kept(&first, "ZTA", "hot change: on");
+
+    scroll_on_clear_set(
+        &handler,
+        OptionScopeSelector::Pane(target.clone()),
+        Some("off"),
+        false,
+    )
+    .await;
+    let second = scroll_on_clear_erase_and_observe(&handler, &target, "ZTB").await;
+    assert_scroll_on_clear_discarded(&second, "ZTB", "hot change: off");
+
+    scroll_on_clear_set(
+        &handler,
+        OptionScopeSelector::Pane(target.clone()),
+        Some("on"),
+        false,
+    )
+    .await;
+    let third = scroll_on_clear_erase_and_observe(&handler, &target, "ZTC").await;
+    assert_scroll_on_clear_kept(&third, "ZTC", "hot change: back on");
+
+    // The pane was never respawned, so the first "on" rows are still in history.
+    assert!(
+        third.full.contains("ZTAA"),
+        "the live pane kept its scrollback across the hot changes: {third:?}"
+    );
+}
+
+#[tokio::test]
+async fn scroll_on_clear_two_panes_in_one_window_stay_isolated() {
+    let handler = RequestHandler::new();
+    let keeper = scroll_on_clear_session(&handler, "soc-isolated").await;
+    let discarder = scroll_on_clear_split(&handler, &keeper).await;
+
+    scroll_on_clear_set(
+        &handler,
+        OptionScopeSelector::Pane(keeper.clone()),
+        Some("on"),
+        false,
+    )
+    .await;
+    scroll_on_clear_set(
+        &handler,
+        OptionScopeSelector::Pane(discarder.clone()),
+        Some("off"),
+        false,
+    )
+    .await;
+
+    // Identical byte streams, one window, opposite outcomes.
+    let seed = scroll_on_clear_seed_bytes("ZUA");
+    scroll_on_clear_append(&handler, &keeper, &seed).await;
+    scroll_on_clear_append(&handler, &discarder, &seed).await;
+    let keeper_before = scroll_on_clear_history_size(&handler, &keeper).await;
+    let discarder_before = scroll_on_clear_history_size(&handler, &discarder).await;
+    scroll_on_clear_append(&handler, &keeper, b"\x1b[2J").await;
+    scroll_on_clear_append(&handler, &discarder, b"\x1b[2J").await;
+    let keeper_after = scroll_on_clear_history_size(&handler, &keeper).await;
+    let discarder_after = scroll_on_clear_history_size(&handler, &discarder).await;
+
+    assert_eq!(
+        keeper_after - keeper_before,
+        SCROLL_ON_CLEAR_SEEDED_ROWS,
+        "the on pane keeps its rows"
+    );
+    assert_eq!(
+        discarder_after, discarder_before,
+        "the off pane discards its rows"
+    );
+    let keeper_full =
+        scroll_on_clear_capture(&handler, &keeper, Some(-(keeper_after as i64)), None).await;
+    let discarder_full =
+        scroll_on_clear_capture(&handler, &discarder, Some(-(discarder_after as i64)), None).await;
+    assert!(keeper_full.contains("ZUAA"), "{keeper_full:?}");
+    assert!(!discarder_full.contains("ZUA"), "{discarder_full:?}");
+}
+
+#[tokio::test]
+async fn scroll_on_clear_pane_created_after_the_option_inherits_it() {
+    let handler = RequestHandler::new();
+    let first = scroll_on_clear_session(&handler, "soc-inherit").await;
+
+    scroll_on_clear_set(
+        &handler,
+        OptionScopeSelector::WindowGlobal,
+        Some("off"),
+        false,
+    )
+    .await;
+    // Created only now, so the value can only arrive through the spawn seeding.
+    let spawned = scroll_on_clear_split(&handler, &first).await;
+    let observation = scroll_on_clear_erase_and_observe(&handler, &spawned, "ZVA").await;
+    assert_scroll_on_clear_discarded(&observation, "ZVA", "pane spawned after the mutation");
+}
+
+#[tokio::test]
+async fn scroll_on_clear_sdk_pane_option_reaches_the_pane_screen() {
+    let handler = RequestHandler::new();
+    let target = scroll_on_clear_session(&handler, "soc-sdk").await;
+
+    let response = handler
+        .handle(Request::PaneOptionSet(PaneOptionSetRequest {
+            target: PaneTargetRef::slot(target.clone()),
+            name: "scroll-on-clear".to_owned(),
+            value: Some("off".to_owned()),
+            mode: SetOptionMode::Replace,
+            unset: false,
+        }))
+        .await;
+    assert!(
+        matches!(response, Response::PaneOptionSet(_)),
+        "{response:?}"
+    );
+    let observation = scroll_on_clear_erase_and_observe(&handler, &target, "ZWA").await;
+    assert_scroll_on_clear_discarded(&observation, "ZWA", "sdk pane option set");
+
+    let response = handler
+        .handle(Request::PaneOptionSet(PaneOptionSetRequest {
+            target: PaneTargetRef::slot(target.clone()),
+            name: "scroll-on-clear".to_owned(),
+            value: Some("on".to_owned()),
+            mode: SetOptionMode::Replace,
+            unset: false,
+        }))
+        .await;
+    assert!(
+        matches!(response, Response::PaneOptionSet(_)),
+        "{response:?}"
+    );
+    let restored = scroll_on_clear_erase_and_observe(&handler, &target, "ZWB").await;
+    assert_scroll_on_clear_kept(&restored, "ZWB", "sdk pane option back on");
 }

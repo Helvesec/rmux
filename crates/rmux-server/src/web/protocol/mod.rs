@@ -14,6 +14,7 @@
 use serde::Deserialize;
 use std::time::Duration;
 
+use rmux_core::{KEYC_MASK_KEY, KEYC_MASK_MODIFIERS, KEYC_SHIFT};
 use rmux_proto::{AttachedWindowsConsoleKey, ResizePaneAdjustment, SplitDirection, TerminalSize};
 #[cfg(windows)]
 use rmux_pty::WindowsConsoleKeyEvent;
@@ -98,14 +99,30 @@ pub(crate) enum SessionOperatorBinaryOutcome {
     Snapshot,
 }
 
-#[derive(Debug)]
 pub(crate) struct AuthMessage {
     pub(crate) pin: Option<String>,
     pub(crate) supports_session_pane_frame: bool,
     pub(crate) supports_pane_recovery_coverage: bool,
 }
 
-#[derive(Debug, Deserialize)]
+impl std::fmt::Debug for AuthMessage {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("AuthMessage")
+            .field("pin", &self.pin.as_ref().map(|_| "[REDACTED]"))
+            .field(
+                "supports_session_pane_frame",
+                &self.supports_session_pane_frame,
+            )
+            .field(
+                "supports_pane_recovery_coverage",
+                &self.supports_pane_recovery_coverage,
+            )
+            .finish()
+    }
+}
+
+#[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct AuthWireMessage {
     #[serde(rename = "type")]
@@ -114,6 +131,18 @@ struct AuthWireMessage {
     capabilities: Vec<String>,
     #[serde(default)]
     pin: Option<String>,
+}
+
+impl std::fmt::Debug for AuthWireMessage {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("AuthWireMessage")
+            .field("kind", &self.kind)
+            .field("protocol_version", &self.protocol_version)
+            .field("capabilities", &self.capabilities)
+            .field("pin", &self.pin.as_ref().map(|_| "[REDACTED]"))
+            .finish()
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -193,6 +222,11 @@ fn valid_window_name(name: &str) -> bool {
 
 fn encode_session_key(token: &str) -> Option<Vec<u8>> {
     let key = parse_key_code(token)?;
+    // Web protocol v1 keeps its published Shift-Enter line feed; terminal
+    // send-keys and attach use their legacy carriage-return encoding.
+    if (key & KEYC_MASK_KEY) == u64::from(b'\r') && (key & KEYC_MASK_MODIFIERS) == KEYC_SHIFT {
+        return Some(vec![b'\n']);
+    }
     encode_key(0, ExtendedKeyFormat::Xterm, key)
 }
 

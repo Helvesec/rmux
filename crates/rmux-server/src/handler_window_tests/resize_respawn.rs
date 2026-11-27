@@ -237,6 +237,18 @@ async fn resize_window_updates_linked_slots_and_refreshes_linked_sessions() {
                 .expect("window exists");
             assert_eq!(window.size(), expected);
         }
+        assert_eq!(
+            state
+                .options
+                .resolve_for_window(&alpha, 0, OptionName::WindowSize),
+            Some("manual")
+        );
+        assert_eq!(
+            state
+                .options
+                .resolve_for_window(&beta, 1, OptionName::WindowSize),
+            Some("manual")
+        );
     }
 
     let refresh = timeout(Duration::from_secs(2), control_rx.recv())
@@ -652,7 +664,7 @@ async fn respawn_window_reuses_shell_command_cwd_and_private_environment() {
             skip_environment_update: false,
         })))
         .await;
-    assert!(matches!(created, Response::NewSession(_)), "{created:?}");
+    crate::session_fixture::assert_new_session(&created);
 
     let initial_cwd_text = expected_window_spawn_cwd(&initial_cwd);
     let initial_line = window_respawn_probe_line(&initial_cwd_text, "initial", "initial-command");
@@ -829,7 +841,7 @@ async fn failed_respawn_window_preserves_the_old_layout_terminal_and_lifecycle()
             .pane_id_in_window(0, 0)
             .expect("initial pane exists");
         (
-            session.clone(),
+            session.test_snapshot(),
             pane_id,
             state
                 .pane_lifecycle(pane_id)
@@ -850,7 +862,13 @@ async fn failed_respawn_window_preserves_the_old_layout_terminal_and_lifecycle()
     assert!(matches!(response, Response::Error(_)), "{response:?}");
 
     let state = handler.state.lock().await;
-    assert_eq!(state.sessions.session(&alpha), Some(&session_before));
+    assert_eq!(
+        state
+            .sessions
+            .session(&alpha)
+            .map(|session| session.test_snapshot()),
+        Some(session_before)
+    );
     state
         .ensure_panes_exist(&alpha, &[pane_id])
         .expect("failed respawn must retain the old terminal");
@@ -890,7 +908,7 @@ async fn respawn_window_retains_surviving_pane_lifecycle_counters_and_redacts_en
             skip_environment_update: false,
         })))
         .await;
-    assert!(matches!(created, Response::NewSession(_)));
+    crate::session_fixture::assert_new_session(&created);
 
     let split = handler
         .handle(Request::SplitWindow(SplitWindowRequest {
@@ -1070,4 +1088,151 @@ async fn respawn_window_selects_target_window_like_tmux() {
     let state = handler.state.lock().await;
     let session = state.sessions.session(&alpha).expect("alpha should exist");
     assert_eq!(session.active_window_index(), 0);
+}
+
+/// A detached 80x40 window split four times, then `resize-window -x 6 -y 4`:
+/// five stacked one-row panes hold it at 6x9 (tmux 3.7b, R3510 M9).
+async fn manual_window_held_above_its_size(handler: &RequestHandler, name: &str) -> SessionName {
+    let session = session_name(name);
+    create_session_with_size(handler, name, TerminalSize { cols: 80, rows: 40 }).await;
+    for _ in 0..4 {
+        let split = handler
+            .handle(Request::SplitWindow(SplitWindowRequest {
+                target: SplitWindowTarget::Session(session.clone()),
+                direction: SplitDirection::Vertical,
+                before: false,
+                environment: None,
+            }))
+            .await;
+        assert!(matches!(split, Response::SplitWindow(_)), "{split:?}");
+    }
+    let resized = handler
+        .handle(Request::ResizeWindow(ResizeWindowRequest {
+            target: WindowTarget::with_window(session.clone(), 0),
+            width: Some(6),
+            height: Some(4),
+            adjustment: None,
+        }))
+        .await;
+    assert!(matches!(resized, Response::ResizeWindow(_)), "{resized:?}");
+    assert_eq!(window_geometry(handler, &session).await.0, (6, 9));
+    session
+}
+
+/// The window size and every pane's `(x, y, cols, rows)` in pane order.
+async fn window_geometry(
+    handler: &RequestHandler,
+    session: &SessionName,
+) -> ((u16, u16), Vec<(u16, u16, u16, u16)>) {
+    let state = handler.state.lock().await;
+    let window = state
+        .sessions
+        .session(session)
+        .and_then(|session| session.window_at(0))
+        .expect("window 0 should exist");
+    let panes = window
+        .panes()
+        .iter()
+        .map(|pane| {
+            let geometry = pane.geometry();
+            (geometry.x(), geometry.y(), geometry.cols(), geometry.rows())
+        })
+        .collect();
+    ((window.size().cols, window.size().rows), panes)
+}
+
+async fn kill_pane(handler: &RequestHandler, session: &SessionName, pane: u32, all_except: bool) {
+    let killed = handler
+        .handle(Request::KillPane(KillPaneRequest {
+            target: PaneTarget::with_window(session.clone(), 0, pane),
+            kill_all_except: all_except,
+        }))
+        .await;
+    assert!(matches!(killed, Response::KillPane(_)), "{killed:?}");
+}
+
+#[tokio::test]
+async fn kill_pane_returns_manual_window_to_its_layout_minimum() {
+    let handler = RequestHandler::new();
+    let session = manual_window_held_above_its_size(&handler, "m9-kill").await;
+
+    kill_pane(&handler, &session, 4, false).await;
+
+    // tmux 3.7b: 6x7, four one-row panes; H58 kept 6x9 with a 6x3 last pane.
+    assert_eq!(
+        window_geometry(&handler, &session).await,
+        (
+            (6, 7),
+            vec![(0, 0, 6, 1), (0, 2, 6, 1), (0, 4, 6, 1), (0, 6, 6, 1)]
+        )
+    );
+}
+
+#[tokio::test]
+async fn kill_other_panes_returns_manual_window_to_its_explicit_size() {
+    let handler = RequestHandler::new();
+    let session = manual_window_held_above_its_size(&handler, "m9-kill-all").await;
+
+    kill_pane(&handler, &session, 2, true).await;
+
+    // tmux 3.7b `kill-pane -a`: the lone pane fits the explicit 6x4.
+    assert_eq!(
+        window_geometry(&handler, &session).await,
+        ((6, 4), vec![(0, 0, 6, 4)])
+    );
+}
+
+#[tokio::test]
+async fn kill_pane_keeps_a_non_manual_window_at_its_size() {
+    let handler = RequestHandler::new();
+    let session = manual_window_held_above_its_size(&handler, "m9-latest").await;
+    let latest = handler
+        .handle(Request::SetOption(SetOptionRequest {
+            scope: ScopeSelector::Window(WindowTarget::with_window(session.clone(), 0)),
+            option: OptionName::WindowSize,
+            value: "latest".to_owned(),
+            mode: SetOptionMode::Replace,
+        }))
+        .await;
+    assert!(matches!(latest, Response::SetOption(_)), "{latest:?}");
+
+    kill_pane(&handler, &session, 4, false).await;
+
+    // tmux 3.7b with no client under `window-size latest`: no new size, 6x9 stays.
+    assert_eq!(
+        window_geometry(&handler, &session).await,
+        (
+            (6, 9),
+            vec![(0, 0, 6, 1), (0, 2, 6, 1), (0, 4, 6, 1), (0, 6, 6, 3)]
+        )
+    );
+}
+
+#[tokio::test]
+async fn select_layout_returns_manual_window_to_its_layout_minimum() {
+    let handler = RequestHandler::new();
+    let session = manual_window_held_above_its_size(&handler, "m9-layout").await;
+    kill_pane(&handler, &session, 4, false).await;
+
+    let selected = handler
+        .handle(Request::SelectLayout(SelectLayoutRequest {
+            target: SelectLayoutTarget::Window(WindowTarget::with_window(session.clone(), 0)),
+            layout: LayoutName::MainVertical,
+        }))
+        .await;
+    assert!(
+        matches!(selected, Response::SelectLayout(_)),
+        "{selected:?}"
+    );
+
+    // tmux 3.7b: `select-layout main-vertical` built at 6x7, then
+    // `recalculate_sizes()` takes it back towards 6x4: three stacked
+    // one-row panes beside the main pane need five rows.
+    assert_eq!(
+        window_geometry(&handler, &session).await,
+        (
+            (6, 5),
+            vec![(0, 0, 4, 5), (5, 0, 1, 1), (5, 2, 1, 1), (5, 4, 1, 1)]
+        )
+    );
 }

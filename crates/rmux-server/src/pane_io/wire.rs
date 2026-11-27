@@ -19,7 +19,7 @@ use tracing::warn;
 use crate::outer_terminal::OuterTerminal;
 
 use super::attach_transport::{AttachTransport, TryAttachRead};
-use super::types::{AttachTarget, OpenAttachTarget, PaneOutputReceiver};
+use super::types::{AttachTarget, DrainedPaneOutput, OpenAttachTarget, PaneOutputReceiver};
 
 #[cfg(unix)]
 // Eight immediate 64 KiB reads amortize readiness wakeups under sustained PTY
@@ -81,6 +81,9 @@ pub(super) fn open_attach_target(
 }
 
 #[cfg(unix)]
+// tokio 1.53.3 deprecates the safe AsyncFd constructors (RUSTSEC-2026-0386); this crate forbids
+// unsafe, and the AsyncFd owns the PtyIo, whose fd stays open.
+#[allow(deprecated)]
 pub(super) fn open_pane_writer(pane_master: PtyMaster) -> io::Result<AsyncFd<PtyIo>> {
     let pane_writer = pane_master.into_io();
     AsyncFd::new(pane_writer)
@@ -165,6 +168,7 @@ pub(super) async fn emit_attach_frame(
     write_all_to_stream(stream, &frame).await
 }
 
+#[cfg(test)]
 pub(super) async fn recv_pane_output(
     pane_output: &mut PaneOutputReceiver,
 ) -> io::Result<OutputCursorItem> {
@@ -189,9 +193,15 @@ pub(super) fn warn_pane_output_gap(gap: &OutputGap) {
 
 pub(super) async fn recv_pane_output_optional(
     pane_output: Option<&mut PaneOutputReceiver>,
-) -> io::Result<Option<OutputCursorItem>> {
+) -> io::Result<Option<DrainedPaneOutput>> {
     match pane_output {
-        Some(pane_output) => recv_pane_output(pane_output).await.map(Some),
+        Some(pane_output) => {
+            let drained = pane_output.recv_drained().await;
+            if let OutputCursorItem::Gap(gap) = &drained.item {
+                warn_pane_output_gap(gap);
+            }
+            Ok(Some(drained))
+        }
         None => pending().await,
     }
 }
@@ -255,6 +265,24 @@ pub(super) async fn emit_exited_attach_stop(
     emit_attach_bytes(stream, &bytes).await
 }
 
+/// Ends an attach stream because the server is shutting down, as tmux's
+/// `MSG_SHUTDOWN` does: the stop sequence, then the `[server exited]` banner.
+/// Only a client that opted into `stream.attach.server_exited` also receives
+/// the typed notice that turns its exit status into a failure.
+pub(super) async fn emit_server_exited_attach_stop(
+    stream: &AttachTransport,
+    current_target: &OpenAttachTarget,
+    typed_notice: bool,
+) -> io::Result<()> {
+    let mut bytes = current_target.outer_terminal.attach_stop_sequence();
+    bytes.extend_from_slice(b"[server exited]\r\n");
+    emit_attach_bytes(stream, &bytes).await?;
+    if typed_notice {
+        emit_attach_message(stream, &AttachMessage::ServerExited).await?;
+    }
+    Ok(())
+}
+
 #[cfg(unix)]
 pub(super) async fn read_from_pane(
     pane_reader: &AsyncFd<PtyIo>,
@@ -274,12 +302,15 @@ pub(super) async fn read_from_pane(
         pane_reader.get_ref().release_startup_slave_guard();
         match startup_read {
             PaneRead::Bytes(0) if !readiness.output_established() => {
-                match readiness.retry_startup_eio() {
+                match readiness
+                    .retry_startup_eio(|| pane_reader.get_ref().session_leader_has_exited())
+                {
                     StartupEioReadiness::Retry(delay) => {
                         delay_startup_eio_retry(delay).await;
                         continue;
                     }
                     StartupEioReadiness::StartupRetriesExhausted
+                    | StartupEioReadiness::SessionLeaderExited
                     | StartupEioReadiness::EstablishedEof => return Ok(0),
                 }
             }
@@ -288,12 +319,15 @@ pub(super) async fn read_from_pane(
                 return Ok(bytes_read);
             }
             PaneRead::NotReady => {}
-            PaneRead::SlaveUnavailable => match readiness.retry_startup_eio() {
+            PaneRead::SlaveUnavailable => match readiness
+                .retry_startup_eio(|| pane_reader.get_ref().session_leader_has_exited())
+            {
                 StartupEioReadiness::Retry(delay) => {
                     delay_startup_eio_retry(delay).await;
                     continue;
                 }
                 StartupEioReadiness::StartupRetriesExhausted
+                | StartupEioReadiness::SessionLeaderExited
                 | StartupEioReadiness::EstablishedEof => return Ok(0),
             },
         }
@@ -301,12 +335,15 @@ pub(super) async fn read_from_pane(
 
         let mut ready = pane_reader.readable().await?;
         match ready.try_io(|inner| inner.get_ref().try_read(&mut *buffer)) {
-            Ok(Ok(0)) if !readiness.output_established() => match readiness.retry_startup_eio() {
+            Ok(Ok(0)) if !readiness.output_established() => match readiness
+                .retry_startup_eio(|| pane_reader.get_ref().session_leader_has_exited())
+            {
                 StartupEioReadiness::Retry(delay) => {
                     delay_startup_eio_retry(delay).await;
                     continue;
                 }
                 StartupEioReadiness::StartupRetriesExhausted
+                | StartupEioReadiness::SessionLeaderExited
                 | StartupEioReadiness::EstablishedEof => return Ok(0),
             },
             Ok(Ok(bytes_read)) => {
@@ -317,12 +354,15 @@ pub(super) async fn read_from_pane(
             Ok(Err(error))
                 if error.raw_os_error() == Some(rustix::io::Errno::IO.raw_os_error()) =>
             {
-                match readiness.retry_startup_eio() {
+                match readiness
+                    .retry_startup_eio(|| pane_reader.get_ref().session_leader_has_exited())
+                {
                     StartupEioReadiness::Retry(delay) => {
                         delay_startup_eio_retry(delay).await;
                         continue;
                     }
                     StartupEioReadiness::StartupRetriesExhausted
+                    | StartupEioReadiness::SessionLeaderExited
                     | StartupEioReadiness::EstablishedEof => return Ok(0),
                 }
             }
@@ -356,6 +396,8 @@ async fn delay_startup_eio_retry(delay: StartupEioRetryDelay) {
 enum StartupEioReadiness {
     Retry(StartupEioRetryDelay),
     StartupRetriesExhausted,
+    /// The pane's process has exited, so the signal is its EOF, not startup.
+    SessionLeaderExited,
     EstablishedEof,
 }
 
@@ -404,7 +446,7 @@ mod startup_eio_retry_delay_tests {
         let mut readiness = PaneReadinessState::default();
 
         assert_eq!(
-            readiness.retry_startup_eio(),
+            readiness.retry_startup_eio(|| false),
             StartupEioReadiness::Retry(StartupEioRetryDelay::Yield)
         );
         assert_eq!(readiness.startup_eio_reads, 1);
@@ -414,10 +456,28 @@ mod startup_eio_retry_delay_tests {
         assert!(readiness.established);
         assert_eq!(readiness.startup_eio_reads, 0);
         assert_eq!(
-            readiness.retry_startup_eio(),
+            readiness.retry_startup_eio(|| false),
             StartupEioReadiness::EstablishedEof
         );
         assert!(!readiness.startup_eio_exhausted());
+    }
+
+    #[test]
+    fn readiness_state_ends_startup_once_the_session_leader_has_exited() {
+        let mut readiness = PaneReadinessState::default();
+
+        assert_eq!(
+            readiness.retry_startup_eio(|| true),
+            StartupEioReadiness::SessionLeaderExited
+        );
+        assert_eq!(readiness.startup_eio_reads, 0);
+        assert!(!readiness.startup_eio_exhausted());
+
+        readiness.record_ready_bytes(1);
+        assert_eq!(
+            readiness.retry_startup_eio(|| panic!("established output needs no exit probe")),
+            StartupEioReadiness::EstablishedEof
+        );
     }
 
     #[test]
@@ -426,13 +486,13 @@ mod startup_eio_retry_delay_tests {
 
         for _ in 0..super::MAX_STARTUP_EIO_READS {
             assert!(matches!(
-                readiness.retry_startup_eio(),
+                readiness.retry_startup_eio(|| false),
                 StartupEioReadiness::Retry(_)
             ));
         }
 
         assert_eq!(
-            readiness.retry_startup_eio(),
+            readiness.retry_startup_eio(|| false),
             StartupEioReadiness::StartupRetriesExhausted
         );
         assert!(readiness.startup_eio_exhausted());
@@ -473,7 +533,10 @@ impl PaneReadinessState {
         self.established
     }
 
-    fn retry_startup_eio(&mut self) -> StartupEioReadiness {
+    fn retry_startup_eio(
+        &mut self,
+        session_leader_exited: impl FnOnce() -> bool,
+    ) -> StartupEioReadiness {
         self.immediate_reads = 0;
         // Unix PTY masters can report EIO or a zero-length read as EOF. Linux
         // can also report it briefly before the slave side has reached a
@@ -482,6 +545,13 @@ impl PaneReadinessState {
         // established, they are normal EOF.
         if self.established {
             return StartupEioReadiness::EstablishedEof;
+        }
+        // A process that exits before writing anything is not starting. Each
+        // retry costs a scheduler wakeup, so waiting out the whole budget
+        // delayed its death by hundreds of milliseconds idle and by seconds
+        // on a loaded host.
+        if session_leader_exited() {
+            return StartupEioReadiness::SessionLeaderExited;
         }
         if self.startup_eio_reads >= MAX_STARTUP_EIO_READS {
             self.startup_eio_exhausted = true;
@@ -575,6 +645,82 @@ mod unix_tests {
             captured.contains("POST_REGISTER"),
             "expected post-registration pane output, got {captured:?}"
         );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn read_from_pane_ends_a_silent_exit_without_spending_the_startup_budget(
+    ) -> Result<(), Box<dyn Error>> {
+        let (mut master, mut child) = ChildCommand::new("sh")
+            .args(["-c", "exit 7"])
+            .size(PtyTerminalSize::new(80, 24))
+            .spawn()?
+            .into_parts();
+        let pane_reader = open_pane_writer(master.try_clone_for_startup_reader()?)?;
+        drop(master);
+        // Observed without reaping, as the pane exit handler reaps only after
+        // the reader's EOF. Liveness bound only: a loaded host may be slow to
+        // run the shell at all.
+        let deadline = Instant::now() + Duration::from_secs(60);
+        while !pane_reader.get_ref().session_leader_has_exited() {
+            assert!(Instant::now() < deadline, "sh -c 'exit 7' never exited");
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+
+        let mut readiness = PaneReadinessState::default();
+        let mut buffer = [0_u8; 256];
+        let bytes_read = read_from_pane(&pane_reader, &mut readiness, &mut buffer).await?;
+        let status = child.wait()?;
+
+        assert_eq!(bytes_read, 0, "a silent exit has no output to read");
+        assert_eq!(
+            (
+                readiness.startup_eio_reads(),
+                readiness.startup_eio_exhausted()
+            ),
+            (0, false),
+            "the EOF of an exited process is not startup latency to retry"
+        );
+        assert_eq!(status.code(), Some(7));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn read_from_pane_ends_a_silent_exit_already_reaped_by_a_status_query(
+    ) -> Result<(), Box<dyn Error>> {
+        let (mut master, mut child) = ChildCommand::new("sh")
+            .args(["-c", "exit 7"])
+            .size(PtyTerminalSize::new(80, 24))
+            .spawn()?
+            .into_parts();
+        let pane_reader = open_pane_writer(master.try_clone_for_startup_reader()?)?;
+        drop(master);
+        // `#{pane_dead}`, send-keys, pipe-pane or a respawn check ask the
+        // child handle whether the pane lives, which reaps an exited process
+        // before the reader has looked at it. Liveness bound only.
+        let deadline = Instant::now() + Duration::from_secs(60);
+        let status = loop {
+            if let Some(status) = child.try_wait()? {
+                break status;
+            }
+            assert!(Instant::now() < deadline, "sh -c 'exit 7' never exited");
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        };
+
+        let mut readiness = PaneReadinessState::default();
+        let mut buffer = [0_u8; 256];
+        let bytes_read = read_from_pane(&pane_reader, &mut readiness, &mut buffer).await?;
+
+        assert_eq!(bytes_read, 0, "a silent exit has no output to read");
+        assert_eq!(
+            (
+                readiness.startup_eio_reads(),
+                readiness.startup_eio_exhausted()
+            ),
+            (0, false),
+            "the EOF of a reaped process is not startup latency to retry"
+        );
+        assert_eq!(status.code(), Some(7));
         Ok(())
     }
 

@@ -2,82 +2,55 @@ use std::ffi::OsString;
 
 use crate::cli_args::{scan_top_level_command, Cli};
 use crate::os_string::os_str_bytes;
+use rmux_core::command_inventory::{
+    render_list_commands, render_list_commands_line, RMUX_EXTENSION_COMMANDS,
+};
 
-use super::ExitFailure;
+use super::{diagnose::DIAGNOSE_HELP, ExitFailure};
 
-const RMUX_USAGE: &str = "usage: rmux [-2CDhlNuVv] [-c shell-command] [-f file] [-L socket-name]\n            [-S socket-path] [-T features] [command [flags]]";
+pub(super) const RMUX_USAGE: &str = "usage: rmux [-2CDhlNuVv] [-c shell-command] [-f file] [-L socket-name]\n            [-S socket-path] [-T features] [command [flags]]";
 const RMUX_LONG_OPTION_USAGE: &str = "usage: rmux [-2CDlNuVv] [-c shell-command] [-f file] [-L socket-name]\n            [-S socket-path] [-T features] [command [flags]]";
-const RMUX_LONG_HELP: &str = "usage: rmux [-2CDlNuVv] [-c shell-command] [-f file] [-L socket-name]\n            [-S socket-path] [-T features] [command [flags]]\n\nRMUX extensions:\n  capabilities [--human|--json]\n  claude [install-skill|claude-args...]\n  diagnose [--human|--json]\n  doctor tmux-dropin\n  setup tmux-shim\n  wait-pane [flags]\n  pane-snapshot [flags]\n  stream-pane [--raw|--lines]\n  collect-pane-output --until-pane-exit --max-bytes bytes\n  locator|expect-pane [flags]\n  find-panes|find-sessions [flags]\n  broadcast-keys -t target... -- key ...\n  with-session session-name -- command ...\n  web-share [flags]\n  web-share list|lookup|stop|disconnect|off|config\n\nUse `rmux list-commands` for the tmux-compatible command surface.";
 
-pub(super) fn top_level_parse_failure(args: &[OsString]) -> Option<ExitFailure> {
-    let mut index = 0;
+fn rmux_long_help() -> String {
+    let mut help = format!("{RMUX_USAGE}\n\nRMUX extensions:\n");
+    for entry in RMUX_EXTENSION_COMMANDS {
+        help.push_str("  ");
+        help.push_str(&render_list_commands_line(None, entry.name, entry.alias));
+        help.push('\n');
+    }
+    // Diagnose is CLI-only; publishing it in the parser inventory would change
+    // server dispatch and list-commands. Share its handler's help here instead.
+    help.push_str("  ");
+    help.push_str(DIAGNOSE_HELP);
+    help.push_str("\n\nCommands:\n");
+    let inventory = render_list_commands(None, None).expect("bare command inventory is infallible");
+    help.push_str(&inventory.join("\n"));
+    help
+}
 
-    while let Some(argument) = args.get(index) {
-        let bytes = os_str_bytes(argument);
-        if bytes == b"--" {
-            return None;
-        }
-        if !bytes.starts_with(b"-") || bytes == b"-" {
-            return None;
-        }
-        if bytes == b"--help" {
-            return Some(ExitFailure::new(1, RMUX_LONG_HELP));
-        }
-        if bytes.starts_with(b"--") {
-            return Some(ExitFailure::new(1, RMUX_LONG_OPTION_USAGE));
-        }
-        if short_option_cluster_requests_usage(&bytes) {
-            return Some(ExitFailure::new_stdout(0, RMUX_USAGE));
-        }
-        if let Some(flag) = invalid_short_option_in_cluster(&bytes) {
-            let flag = char::from(flag);
-            return Some(ExitFailure::new(
+pub(super) use crate::cli_top_level::{top_level_decision, TopLevelDecision};
+
+impl TopLevelDecision {
+    pub(super) fn into_exit(self, invoked_as_tmux: bool) -> ExitFailure {
+        match self {
+            Self::Version => ExitFailure::new_stdout(0, top_level_version_output(invoked_as_tmux)),
+            Self::Usage => ExitFailure::new_stdout(0, RMUX_USAGE),
+            Self::LongHelp if invoked_as_tmux => ExitFailure::new(1, rmux_long_help()),
+            Self::LongHelp => ExitFailure::new_stdout(0, rmux_long_help()),
+            Self::InvalidLongOption => ExitFailure::new(1, RMUX_LONG_OPTION_USAGE),
+            Self::InvalidShortOption(flag) => ExitFailure::new(
                 1,
-                format!("rmux: unknown option -- {flag}\n{RMUX_USAGE}"),
-            ));
-        }
-        if short_option_consumes_next_argument(&bytes) {
-            index += 1;
-        }
-
-        index += 1;
-    }
-
-    None
-}
-
-pub(super) fn top_level_version_requested(args: &[OsString]) -> bool {
-    let mut index = 0;
-
-    while let Some(argument) = args.get(index) {
-        let bytes = os_str_bytes(argument);
-        if bytes == b"--" || !bytes.starts_with(b"-") || bytes == b"-" {
-            return false;
-        }
-        if !bytes.starts_with(b"--") && short_option_cluster_requests_version(&bytes) {
-            return true;
-        }
-        if short_option_consumes_next_argument(&bytes) {
-            index += 1;
-        }
-
-        index += 1;
-    }
-
-    false
-}
-
-fn short_option_cluster_requests_version(bytes: &[u8]) -> bool {
-    for flag in bytes.iter().copied().skip(1) {
-        if flag == b'V' {
-            return true;
-        }
-        if short_option_takes_argument(flag) || !short_option_takes_no_argument(flag) {
-            return false;
+                format!("rmux: unknown option -- {}\n{RMUX_USAGE}", char::from(flag)),
+            ),
+            Self::MissingArgument(flag) => ExitFailure::new(
+                1,
+                format!(
+                    "rmux: option requires an argument -- {}\n{RMUX_USAGE}",
+                    char::from(flag)
+                ),
+            ),
         }
     }
-
-    false
 }
 
 pub(super) fn top_level_version_output(invoked_as_tmux: bool) -> String {
@@ -91,50 +64,6 @@ pub(super) fn top_level_version_output(invoked_as_tmux: bool) -> String {
 
 fn tmux_compatible_version() -> &'static str {
     "3.4"
-}
-
-fn invalid_short_option_in_cluster(bytes: &[u8]) -> Option<u8> {
-    for flag in bytes.iter().copied().skip(1) {
-        if flag == b'V' {
-            return None;
-        }
-        if short_option_takes_argument(flag) {
-            return None;
-        }
-        if !short_option_takes_no_argument(flag) {
-            return Some(flag);
-        }
-    }
-
-    None
-}
-
-fn short_option_cluster_requests_usage(bytes: &[u8]) -> bool {
-    for flag in bytes.iter().copied().skip(1) {
-        if flag == b'h' {
-            return true;
-        }
-        if flag == b'V' || short_option_takes_argument(flag) {
-            return false;
-        }
-        if !short_option_takes_no_argument(flag) {
-            return false;
-        }
-    }
-
-    false
-}
-
-fn short_option_consumes_next_argument(bytes: &[u8]) -> bool {
-    bytes.len() == 2 && short_option_takes_argument(bytes[1])
-}
-
-fn short_option_takes_argument(flag: u8) -> bool {
-    matches!(flag, b'c' | b'f' | b'L' | b'S' | b'T')
-}
-
-fn short_option_takes_no_argument(flag: u8) -> bool {
-    matches!(flag, b'2' | b'C' | b'D' | b'l' | b'N' | b'u' | b'v')
 }
 
 pub(super) fn infer_client_utf8_from_env() -> bool {
@@ -275,15 +204,18 @@ pub(super) fn accept_compatibility_options(cli: &Cli) {
 #[cfg(test)]
 mod top_level_option_tests {
     use super::{
-        scan_claude_top_level_invocation, top_level_version_requested,
-        validate_claude_top_level_invocation,
+        scan_claude_top_level_invocation, top_level_decision, validate_claude_top_level_invocation,
+        TopLevelDecision,
     };
     use crate::cli_args::scan_top_level_command;
     use std::ffi::OsString;
 
     fn requests_version(args: &[&str]) -> bool {
         let args = args.iter().map(OsString::from).collect::<Vec<_>>();
-        top_level_version_requested(&args)
+        matches!(
+            top_level_decision(&args, false),
+            Some(TopLevelDecision::Version)
+        )
     }
 
     #[test]
@@ -319,6 +251,89 @@ mod top_level_option_tests {
         assert!(requests_version(&["-V"]));
         assert!(requests_version(&["-vV"]));
         assert!(requests_version(&["-CvV"]));
+    }
+
+    #[test]
+    fn decision_walk_stops_at_the_first_decisive_option() {
+        for arguments in [
+            &["-V", "-x"][..],
+            &["-V", "-h"][..],
+            &["-V", "-x", "-x"][..],
+            &["-u", "-V", "-x"][..],
+            &["-V", "--help"][..],
+            &["-V", "--version"][..],
+            &["-Vh"][..],
+            &["-uVx"][..],
+        ] {
+            assert!(requests_version(arguments), "arguments={arguments:?}");
+        }
+
+        for arguments in [&["-h", "-V"][..], &["-hV"][..]] {
+            let arguments = arguments.iter().map(OsString::from).collect::<Vec<_>>();
+            assert!(matches!(
+                top_level_decision(&arguments, false),
+                Some(TopLevelDecision::Usage)
+            ));
+        }
+
+        for arguments in [&["-x", "-V"][..], &["-uxV"][..], &["-xuV"][..]] {
+            let arguments = arguments.iter().map(OsString::from).collect::<Vec<_>>();
+            let Some(error) = top_level_decision(&arguments, false) else {
+                panic!("expected unknown-option decision for {arguments:?}");
+            };
+            let error = error.into_exit(false);
+            assert_eq!(error.exit_code(), 1);
+            assert_eq!(
+                error.message(),
+                "rmux: unknown option -- x\nusage: rmux [-2CDhlNuVv] [-c shell-command] [-f file] [-L socket-name]\n            [-S socket-path] [-T features] [command [flags]]"
+            );
+        }
+    }
+
+    #[test]
+    fn decision_walk_consumes_cluster_tail_values() {
+        for arguments in [
+            &["-vL", "-V"][..],
+            &["-uL", "-V"][..],
+            &["-vf", "-V"][..],
+            &["-2T", "-V"][..],
+            &["-vS", "-V"][..],
+            &["-vc", "-V"][..],
+        ] {
+            let arguments = arguments.iter().map(OsString::from).collect::<Vec<_>>();
+            assert!(
+                top_level_decision(&arguments, false).is_none(),
+                "the final option must consume its separate value: {arguments:?}"
+            );
+        }
+
+        assert!(requests_version(&["-vL", "sockA", "-V"]));
+    }
+
+    #[test]
+    fn decision_walk_preserves_scan_boundaries_and_long_option_surfaces() {
+        for arguments in [
+            &["--", "-V"][..],
+            &["list-sessions", "-V"][..],
+            &["-", "-V"][..],
+            &["", "-V"][..],
+        ] {
+            let arguments = arguments.iter().map(OsString::from).collect::<Vec<_>>();
+            assert!(top_level_decision(&arguments, false).is_none());
+        }
+
+        for (option, expected) in [
+            ("--help", TopLevelDecision::LongHelp),
+            ("--vesion", TopLevelDecision::InvalidLongOption),
+        ] {
+            let arguments = [OsString::from(option)];
+            for tmux in [false, true] {
+                assert_eq!(
+                    top_level_decision(&arguments, tmux).as_ref(),
+                    Some(&expected)
+                );
+            }
+        }
     }
 
     #[test]

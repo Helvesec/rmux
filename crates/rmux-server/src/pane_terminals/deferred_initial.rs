@@ -8,12 +8,16 @@ use crate::pane_terminal_process::{open_pane_terminal, pty_geometry_from_layout,
 use super::lifecycle_state::terminal_size_from_geometry;
 use super::pane_lifecycle::{clone_terminal_for_exit_watcher, clone_terminal_for_output_reader};
 use super::{
-    pane_terminal_geometry_for_session, session_not_found, CompletedDeferredInitialPane,
-    DeferredInitialPaneConsoleInputAction, DeferredInitialPaneIdentity, DeferredInitialPaneInput,
-    DeferredInitialPaneInputDrain, DeferredInitialPaneInputFlush, DeferredInitialPaneSpawn,
-    HandlerState, InitialPaneSpawnOptions, PaneExitMetadata, PaneLifecycleSpawn, PaneOutputSpawn,
-    PasteDelimiters, StartingPane, WindowNameApplication,
+    session_not_found, CompletedDeferredInitialPane, DeferredInitialPaneConsoleInputAction,
+    DeferredInitialPaneIdentity, DeferredInitialPaneInput, DeferredInitialPaneInputDrain,
+    DeferredInitialPaneInputFlush, DeferredInitialPaneSpawn, HandlerState, InitialPaneSpawnOptions,
+    PaneExitMetadata, PaneLifecycleSpawn, PaneOutputSpawn, PaneWindowGeometry, PasteDelimiters,
+    StartingPane, WindowNameApplication,
 };
+
+mod starting_input;
+
+pub(crate) use starting_input::{DeferredInputTally, DEFERRED_INPUT_PANE_STOPPED};
 
 const STARTING_PANE_INPUT_MAX_BYTES: usize = 64 * 1024;
 
@@ -41,15 +45,8 @@ impl HandlerState {
                 session.id(),
                 window.id(),
                 session.cwd(),
-                pane_terminal_geometry_for_session(
-                    session,
-                    &self.options,
-                    pane.window_index,
-                    pane.index,
-                    pane.geometry,
-                    false,
-                    false,
-                ),
+                PaneWindowGeometry::new(session.name(), pane.window_index, window)
+                    .content_geometry(&self.options, pane.index, pane.geometry, false, false),
             )
         };
         let profile = crate::terminal::TerminalProfile::for_initial_session_pane(
@@ -101,7 +98,7 @@ impl HandlerState {
             dimensions: terminal_size_from_geometry(pane.geometry),
             pid: None,
         });
-        let generation = self.insert_pending_pane_output(
+        let generation = self.insert_pane_output_state(
             &runtime_session_name,
             pane.id,
             pane_geometry,
@@ -131,6 +128,7 @@ impl HandlerState {
             command: spawn.command.cloned(),
             pane_alert_callback: spawn.pane_alert_callback,
             pane_exit_callback: spawn.pane_exit_callback,
+            pane_shell: self.pane_shell.clone(),
         })
     }
 
@@ -138,6 +136,7 @@ impl HandlerState {
         job: &DeferredInitialPaneSpawn,
     ) -> Result<PaneTerminal, RmuxError> {
         open_pane_terminal(
+            job.pane_shell.0.as_ref(),
             job.geometry,
             job.profile.clone(),
             job.runtime_window_name.clone(),
@@ -158,7 +157,8 @@ impl HandlerState {
             return Ok(None);
         };
         let Some(target) = self.pane_target_for_runtime_pane(&runtime_session_name, pane_id) else {
-            self.remove_starting_pane_if_identity(&runtime_session_name, identity);
+            let removed = self.remove_starting_pane_if_identity(&runtime_session_name, identity);
+            self.report_stopped_starting_pane(pane_id, removed);
             return Ok(None);
         };
         let (pane_geometry, session_size, terminal_pixels) = {
@@ -176,19 +176,12 @@ impl HandlerState {
                 RmuxError::invalid_target(target.to_string(), "pane index does not exist in window")
             })?;
             (
-                pane_terminal_geometry_for_session(
-                    session,
-                    &self.options,
-                    target.window_index(),
-                    pane.index(),
-                    pane.geometry(),
-                    false,
-                    false,
-                ),
+                PaneWindowGeometry::new(session.name(), target.window_index(), window)
+                    .content_geometry(&self.options, pane.index(), pane.geometry(), false, false),
                 window.size(),
-                self.attached_terminal_pixels
+                self.attached_terminal_geometry
                     .get(target.session_name())
-                    .copied(),
+                    .and_then(|geometry| geometry.pixels),
             )
         };
         terminal
@@ -282,16 +275,10 @@ impl HandlerState {
             return Ok(DeferredInitialPaneInputDrain::Missing);
         };
         let pane_id = identity.pane_id();
-        let Some(starting) = self
-            .starting_panes
-            .get_mut(&runtime_session_name)
-            .and_then(|panes| panes.get_mut(&pane_id))
-            .filter(|starting| starting.generation == identity.generation())
-        else {
+        if !self.starting_generation_matches(&runtime_session_name, identity) {
             return Ok(DeferredInitialPaneInputDrain::Missing);
-        };
-
-        if starting.queued_input.is_empty() {
+        }
+        if self.starting_queue_is_empty(&runtime_session_name, pane_id) {
             // Finish under the same state lock used to observe the empty
             // queue. A writer can now either enqueue before this removal and
             // be drained, or observe no StartingPane and write to the live
@@ -302,15 +289,16 @@ impl HandlerState {
             });
         }
 
-        let queued_input = starting.queued_input.drain(..).collect::<Vec<_>>();
-        starting.queued_input_bytes = 0;
         let target = self.pane_target_for_runtime_pane(&runtime_session_name, pane_id);
         let Some(target) = target else {
-            let _ = self.remove_starting_pane_if_identity(&runtime_session_name, identity);
+            let removed = self.remove_starting_pane_if_identity(&runtime_session_name, identity);
+            self.report_stopped_starting_pane(pane_id, removed);
             return Ok(DeferredInitialPaneInputDrain::Finished {
                 runtime_session_name,
             });
         };
+        // Resolve the live sink before draining: if it fails, the queue stays
+        // with the starting pane so the error report can name what is lost.
         let input_writer = self.terminals.clone_pane_master(
             &runtime_session_name,
             pane_id,
@@ -323,6 +311,15 @@ impl HandlerState {
             target.window_index(),
             target.pane_index(),
         )?;
+        let Some(starting) = self
+            .starting_panes
+            .get_mut(&runtime_session_name)
+            .and_then(|panes| panes.get_mut(&pane_id))
+        else {
+            return Ok(DeferredInitialPaneInputDrain::Missing);
+        };
+        let queued_input = starting.queued_input.drain(..).collect::<Vec<_>>();
+        starting.queued_input_bytes = 0;
 
         Ok(DeferredInitialPaneInputDrain::Flush {
             runtime_session_name,
@@ -334,17 +331,28 @@ impl HandlerState {
         })
     }
 
+    /// Ends a deferred flush that failed with `error`, reporting the input it
+    /// did not deliver together with everything queued since it started.
     pub(crate) fn finish_deferred_initial_pane_input_after_error(
         &mut self,
         runtime_session_name_hint: &SessionName,
         identity: DeferredInitialPaneIdentity,
+        error: &RmuxError,
+        undelivered: DeferredInputTally,
     ) {
-        let Some(runtime_session_name) =
-            self.starting_runtime_session_for_identity(runtime_session_name_hint, identity)
-        else {
-            return;
-        };
-        let _ = self.remove_starting_pane_if_identity(&runtime_session_name, identity);
+        let queued_since = self
+            .starting_runtime_session_for_identity(runtime_session_name_hint, identity)
+            .and_then(|runtime_session_name| {
+                self.remove_starting_pane_if_identity(&runtime_session_name, identity)
+            })
+            .map_or_else(DeferredInputTally::default, |starting| {
+                DeferredInputTally::of(&starting.queued_input)
+            });
+        self.report_discarded_deferred_input(
+            &error.to_string(),
+            identity.pane_id(),
+            undelivered.plus(queued_since),
+        );
     }
 
     pub(crate) fn cancel_starting_pane(
@@ -352,8 +360,32 @@ impl HandlerState {
         runtime_session_name: &SessionName,
         pane_id: PaneId,
     ) -> bool {
-        self.remove_starting_pane(runtime_session_name, pane_id)
-            .is_some()
+        let removed = self.remove_starting_pane(runtime_session_name, pane_id);
+        self.report_stopped_starting_pane(pane_id, removed)
+    }
+
+    /// Reports the input still queued for a pane removed before it finished
+    /// starting. Returns whether a starting pane was removed.
+    fn report_stopped_starting_pane(
+        &mut self,
+        pane_id: PaneId,
+        removed: Option<StartingPane>,
+    ) -> bool {
+        let Some(removed) = removed else {
+            return false;
+        };
+        let discarded = DeferredInputTally::of(&removed.queued_input);
+        if !discarded.is_empty() {
+            self.report_discarded_deferred_input(DEFERRED_INPUT_PANE_STOPPED, pane_id, discarded);
+        }
+        true
+    }
+
+    fn starting_queue_is_empty(&self, runtime_session_name: &SessionName, pane_id: PaneId) -> bool {
+        self.starting_panes
+            .get(runtime_session_name)
+            .and_then(|panes| panes.get(&pane_id))
+            .is_none_or(|starting| starting.queued_input.is_empty())
     }
 
     pub(crate) fn fail_deferred_initial_pane_spawn(
@@ -402,8 +434,7 @@ impl HandlerState {
         self.dead_panes
             .entry(runtime_session_name.clone())
             .or_default()
-            .insert(pane_id, metadata);
-        self.mark_pane_lifecycle_exited(pane_id, metadata);
+            .insert(pane_id, super::PaneExitObservation::observed(metadata));
         Some(PaneExitEvent::eof_published(
             runtime_session_name,
             pane_id,
@@ -461,101 +492,6 @@ impl HandlerState {
             .get(runtime_session_name)?
             .get(&pane_id)
             .map(|pane| crate::terminal::SessionBaseEnvironment::from_profile(&pane.profile))
-    }
-
-    pub(crate) fn queue_starting_pane_input(
-        &mut self,
-        session_name: &SessionName,
-        window_index: u32,
-        pane_index: u32,
-        bytes: &[u8],
-    ) -> Result<bool, RmuxError> {
-        if bytes.is_empty() {
-            return Ok(false);
-        }
-        self.queue_starting_pane_input_entry(
-            session_name,
-            window_index,
-            pane_index,
-            DeferredInitialPaneInput::Bytes(bytes.to_vec()),
-        )
-    }
-
-    pub(crate) fn queue_starting_pane_paste_input(
-        &mut self,
-        session_name: &SessionName,
-        window_index: u32,
-        pane_index: u32,
-        bytes: &[u8],
-        delimiters: PasteDelimiters,
-    ) -> Result<bool, RmuxError> {
-        if bytes.is_empty() {
-            return Ok(false);
-        }
-        self.queue_starting_pane_input_entry(
-            session_name,
-            window_index,
-            pane_index,
-            DeferredInitialPaneInput::Paste {
-                bytes: bytes.to_vec(),
-                delimiters,
-            },
-        )
-    }
-
-    pub(crate) fn queue_starting_pane_console_input(
-        &mut self,
-        session_name: &SessionName,
-        window_index: u32,
-        pane_index: u32,
-        action: DeferredInitialPaneConsoleInputAction,
-        byte_len: usize,
-    ) -> Result<bool, RmuxError> {
-        self.queue_starting_pane_input_entry(
-            session_name,
-            window_index,
-            pane_index,
-            DeferredInitialPaneInput::Console {
-                action,
-                byte_len: byte_len.max(1),
-            },
-        )
-    }
-
-    fn queue_starting_pane_input_entry(
-        &mut self,
-        session_name: &SessionName,
-        window_index: u32,
-        pane_index: u32,
-        input: DeferredInitialPaneInput,
-    ) -> Result<bool, RmuxError> {
-        let Some(pane_id) = self
-            .sessions
-            .session(session_name)
-            .and_then(|session| session.window_at(window_index))
-            .and_then(|window| window.pane(pane_index))
-            .map(rmux_core::Pane::id)
-        else {
-            return Ok(false);
-        };
-        let runtime_session_name = self.runtime_session_name_for_window(session_name, window_index);
-        let Some(starting) = self
-            .starting_panes
-            .get_mut(&runtime_session_name)
-            .and_then(|panes| panes.get_mut(&pane_id))
-        else {
-            return Ok(false);
-        };
-        let next_len = starting.queued_input_bytes.saturating_add(input.byte_len());
-        if next_len > STARTING_PANE_INPUT_MAX_BYTES {
-            return Err(RmuxError::Server(format!(
-                "pane {}:{window_index}.{pane_index} is still starting and its input queue is full",
-                session_name
-            )));
-        }
-        starting.queued_input.push_back(input);
-        starting.queued_input_bytes = next_len;
-        Ok(true)
     }
 
     fn starting_pane_in_window(

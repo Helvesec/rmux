@@ -53,7 +53,7 @@ async fn list_clients_uses_stable_session_identity_for_attach_and_control_format
             environment: None,
         }))
         .await;
-    assert!(matches!(created, Response::NewSession(_)), "{created:?}");
+    crate::session_fixture::assert_new_session(&created);
 
     let session_id = handler
         .state

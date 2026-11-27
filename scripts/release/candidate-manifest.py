@@ -9,6 +9,8 @@ import re
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
+from notice_assets import package_files
+from candidate_route import CANONICAL, CandidateRoute, add_arguments, from_args
 
 from candidate_manifest_evidence import (
     REPOSITORY_ID,
@@ -125,12 +127,13 @@ def mapped_paths(values: list[str] | None, label: str) -> dict[str, Path]:
 
 
 def validate_metadata(
-    metadata: dict[str, Any], identity: dict[str, Any], fast_proof: dict[str, Any]
+    metadata: dict[str, Any], identity: dict[str, Any], fast_proof: dict[str, Any],
+    route: CandidateRoute = CANONICAL,
 ) -> dict[str, dict[str, Any]]:
-    exact_keys(metadata, METADATA_KEYS, "canonical artifact metadata")
+    exact_keys(metadata, METADATA_KEYS | route.extra_keys, "canonical artifact metadata")
+    route.validate_record(metadata)
     if (
-        metadata["schema_version"] != 1
-        or metadata["status"] != "verified-for-shadow-sealing"
+        metadata["status"] != "verified-for-shadow-sealing"
         or metadata["repository_id"] != REPOSITORY_ID
         or metadata["candidate_run_attempt"] != 1
     ):
@@ -232,7 +235,6 @@ def validate_metadata(
 def validate_files(files: Any, platform_key: str) -> list[dict[str, Any]]:
     if not isinstance(files, list) or not files:
         raise ValueError("canonical build record files must be non-empty")
-    roles: list[str] = []
     paths: list[str] = []
     for item in files:
         if not isinstance(item, dict):
@@ -244,8 +246,8 @@ def validate_files(files: Any, platform_key: str) -> list[dict[str, Any]]:
         positive_integer(item["size"], "canonical file size")
         if not isinstance(item["sha256"], str) or not SHA64.fullmatch(item["sha256"]):
             raise ValueError("canonical file digest is invalid")
-        roles.append(item["role"])
         paths.append(path)
+    roles = [item["role"] for item in package_files(files)]
     if paths != sorted(paths) or len(paths) != len(set(paths)):
         raise ValueError("canonical files must be sorted and unique")
     if set(roles) != PLATFORMS[platform_key]["roles"] or len(roles) != len(set(roles)):
@@ -386,6 +388,7 @@ def canonical_entry(
 
 
 def build_manifest(args: argparse.Namespace) -> dict[str, Any]:
+    route = from_args(args)
     candidate_path = args.candidate_proof.resolve(strict=True)
     fast_path = args.fast_proof.resolve(strict=True)
     intent_path = args.candidate_intent.resolve(strict=True)
@@ -397,10 +400,10 @@ def build_manifest(args: argparse.Namespace) -> dict[str, Any]:
     policy = read_object(policy_path, "policy root")
     metadata = read_object(metadata_path, "canonical artifact metadata")
     candidate_started, candidate_verified = validate_proof(
-        candidate, "candidate", "candidate proof"
+        candidate, "candidate", "candidate proof", route
     )
-    fast_started, fast_verified = validate_proof(fast, "fast", "fast proof")
-    validate_intent(intent)
+    fast_started, fast_verified = validate_proof(fast, "fast", "fast proof", route)
+    validate_intent(intent, route)
     source_sha = candidate["source_git_sha"]
     identity = {
         "source_git_sha": source_sha,
@@ -428,7 +431,7 @@ def build_manifest(args: argparse.Namespace) -> dict[str, Any]:
             raise ValueError(f"{label} is not bound to the release policy contract")
     records = mapped_paths(args.build_record, "build record")
     bindings = mapped_paths(args.artifact_binding, "artifact binding")
-    metadata_by_platform = validate_metadata(metadata, identity, fast)
+    metadata_by_platform = validate_metadata(metadata, identity, fast, route)
     artifacts = [
         canonical_entry(
             platform,
@@ -446,7 +449,7 @@ def build_manifest(args: argparse.Namespace) -> dict[str, Any]:
         for job in candidate["jobs"]
     ]
     return {
-        "schema_version": 1,
+        **route.fields,
         "repository_id": REPOSITORY_ID,
         **identity,
         "candidate_run_attempt": 1,
@@ -458,7 +461,7 @@ def build_manifest(args: argparse.Namespace) -> dict[str, Any]:
             "workflow_path": ".github/workflows/ci.yml",
             "workflow_name": "CI",
             "event": "workflow_dispatch",
-            "branch": "main",
+            "branch": route.branch,
         },
         "proofs": {
             "fast_semantic_sha256": fast["proof_sha256"],
@@ -487,6 +490,7 @@ def parse_args() -> argparse.Namespace:
     commands = parser.add_subparsers(dest="command", required=True)
     for name in ("create", "verify"):
         command = commands.add_parser(name)
+        add_arguments(command)
         command.add_argument("--candidate-proof", type=Path, required=True)
         command.add_argument("--fast-proof", type=Path, required=True)
         command.add_argument("--candidate-intent", type=Path, required=True)

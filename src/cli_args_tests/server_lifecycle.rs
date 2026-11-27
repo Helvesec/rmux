@@ -26,7 +26,12 @@ fn start_server_parses_without_arguments() {
 #[test]
 fn start_server_rejects_extra_arguments() {
     let error = parse_args(&["start-server", "extra"]).unwrap_err();
-    assert_eq!(error.kind(), clap::error::ErrorKind::UnknownArgument);
+    // tmux 3.7b counts the extra positional instead of naming it.
+    assert_eq!(error.kind(), clap::error::ErrorKind::TooManyValues);
+    assert_eq!(
+        error.to_string(),
+        "error: command start-server: too many arguments (need at most 0)"
+    );
 }
 
 #[test]
@@ -266,7 +271,12 @@ fn kill_server_parses_without_arguments() {
 #[test]
 fn kill_server_rejects_extra_arguments() {
     let error = parse_args(&["kill-server", "extra"]).unwrap_err();
-    assert_eq!(error.kind(), clap::error::ErrorKind::UnknownArgument);
+    // tmux 3.7b counts the extra positional instead of naming it.
+    assert_eq!(error.kind(), clap::error::ErrorKind::TooManyValues);
+    assert_eq!(
+        error.to_string(),
+        "error: command kill-server: too many arguments (need at most 0)"
+    );
 }
 
 #[test]
@@ -463,7 +473,12 @@ fn lock_client_parses_client_target() {
 #[test]
 fn lock_server_rejects_extra_arguments() {
     let error = parse_args(&["lock-server", "extra"]).unwrap_err();
-    assert_eq!(error.kind(), clap::error::ErrorKind::UnknownArgument);
+    // tmux 3.7b counts the extra positional instead of naming it.
+    assert_eq!(error.kind(), clap::error::ErrorKind::TooManyValues);
+    assert_eq!(
+        error.to_string(),
+        "error: command lock-server: too many arguments (need at most 0)"
+    );
 }
 
 #[test]

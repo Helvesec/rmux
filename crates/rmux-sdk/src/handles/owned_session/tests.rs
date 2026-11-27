@@ -424,7 +424,7 @@ async fn creation_rollback_gets_a_fresh_deadline_after_the_public_operation_expi
         );
         rollback_owned_session_creation(
             SessionId::new(42),
-            RmuxError::protocol(rmux_proto::RmuxError::Server(
+            RmuxError::from_proto(rmux_proto::RmuxError::Server(
                 "injected lease timeout".to_owned(),
             )),
             &mut guard,

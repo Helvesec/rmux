@@ -200,10 +200,7 @@ async fn fill_transcript(handler: &RequestHandler, target: &PaneTarget) {
             .expect("pane transcript must exist")
     };
     let size = TerminalSize { cols: 80, rows: 24 };
-    let history_limit = transcript
-        .lock()
-        .expect("pane transcript mutex must not be poisoned")
-        .history_limit();
+    let history_limit = transcript.lock().history_limit();
     let mut screen = rmux_core::Screen::new(size, history_limit);
     let mut parser = rmux_core::input::InputParser::new();
     let mut content = Vec::new();
@@ -211,10 +208,7 @@ async fn fill_transcript(handler: &RequestHandler, target: &PaneTarget) {
         content.extend_from_slice(format!("line {line}\r\n").as_bytes());
     }
     parser.parse(&content, &mut screen);
-    transcript
-        .lock()
-        .expect("pane transcript mutex must not be poisoned")
-        .set_screen_for_test(screen);
+    transcript.lock().set_screen_for_test(screen);
 }
 
 // --------------------------------------------------------------------------
@@ -895,11 +889,7 @@ async fn in_copy_mode(handler: &RequestHandler, target: &PaneTarget) -> bool {
     let transcript = state
         .transcript_handle(target)
         .expect("pane transcript must exist");
-    let in_mode = transcript
-        .lock()
-        .expect("pane transcript mutex must not be poisoned")
-        .copy_mode_state()
-        .is_some();
+    let in_mode = transcript.lock().copy_mode_state().is_some();
     in_mode
 }
 
@@ -1457,4 +1447,100 @@ async fn mode_tree_overlay_still_wins_over_the_copy_mode_table() {
         "",
         "the copy-mode binding must not fire while the mode tree is open"
     );
+}
+
+#[tokio::test]
+async fn root_escape_binding_wins_on_the_bare_escape_path() {
+    let handler = RequestHandler::new();
+    let alpha = session_name("root-escape");
+    let requester_pid = std::process::id();
+    create_quiet_input_session(&handler, &alpha).await;
+    let _control_rx = attach(&handler, requester_pid, &alpha).await;
+    bind(
+        &handler,
+        "root",
+        "Escape",
+        &["set-option", "-g", PROBE, "HIT-Escape"],
+    )
+    .await;
+    let mut pending_input = Vec::new();
+    handler
+        .handle_attached_live_input(requester_pid, &mut pending_input, b"\x1b")
+        .await
+        .expect("retain Escape");
+    assert_eq!(pending_input, b"\x1b");
+    assert!(!handler
+        .flush_attached_pending_escape_input(requester_pid, &mut pending_input)
+        .await
+        .expect("dispatch completed Escape"));
+    assert_eq!(probe_value(&handler, PROBE).await, "HIT-Escape");
+    assert!(pending_input.is_empty());
+}
+
+/// S2485: send-prefix gives the prefix key to copy-mode, which runs that key's
+/// binding as tmux 3.7b's `cmd_send_keys_inject_key()` does. C-b is page-up in
+/// copy-mode-vi, whether C-b C-b is typed or a client sends the command; an
+/// unbound prefix (F7) does nothing. The pane's program reads nothing.
+#[tokio::test]
+async fn send_prefix_runs_the_copy_mode_binding_of_the_prefix_key() {
+    let mut failures = Vec::new();
+    for (route, prefix, pages_up) in [
+        ("typed C-b C-b", "C-b", true),
+        ("command, C-b", "C-b", true),
+        ("command, unbound F7", "F7", false),
+    ] {
+        let handler = RequestHandler::new();
+        let alpha = session_name("alpha");
+        let target = PaneTarget::new(alpha.clone(), 0);
+        let requester_pid = std::process::id();
+
+        create_quiet_input_session(&handler, &alpha).await;
+        let _control_rx = attach(&handler, requester_pid, &alpha).await;
+        set_mode_keys(&handler, &alpha, "vi").await;
+        let response = handler
+            .handle(Request::SetOption(SetOptionRequest {
+                scope: ScopeSelector::Session(alpha.clone()),
+                option: OptionName::Prefix,
+                value: prefix.to_owned(),
+                mode: SetOptionMode::Replace,
+            }))
+            .await;
+        assert!(matches!(response, Response::SetOption(_)), "{response:?}");
+        fill_transcript(&handler, &target).await;
+        enter_copy_mode(&handler, &target).await;
+        handler
+            .state
+            .lock()
+            .await
+            .start_pane_input_capture_for_test(&target);
+
+        if route.starts_with("typed") {
+            type_live(&handler, requester_pid, b"\x02").await;
+            type_live(&handler, requester_pid, b"\x02").await;
+        } else {
+            let response = handler
+                .handle(Request::SendPrefix(SendPrefixRequest {
+                    target: Some(target.clone()),
+                    secondary: false,
+                }))
+                .await;
+            assert!(matches!(response, Response::SendPrefix(_)), "{response:?}");
+        }
+
+        let scrolled = scroll_position(&handler, &target).await;
+        let pane_input = handler
+            .state
+            .lock()
+            .await
+            .pane_input_capture_for_test(&target);
+        if (scrolled > 0) != pages_up
+            || !in_copy_mode(&handler, &target).await
+            || pane_input != Some(Vec::new())
+        {
+            failures.push(format!(
+                "{route}: scroll_position {scrolled}, pane read {pane_input:?}"
+            ));
+        }
+    }
+    assert!(failures.is_empty(), "{failures:#?}");
 }

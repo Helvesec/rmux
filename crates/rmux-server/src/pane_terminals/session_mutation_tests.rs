@@ -1,3 +1,5 @@
+#[cfg(test)]
+use crate::session_fixture::SessionSetupExt as _;
 use rmux_proto::{PaneTarget, SessionName, TerminalSize, WindowTarget};
 
 use super::{HandlerState, PaneTransferGeometryContext};
@@ -33,6 +35,7 @@ fn join_or_move_geometry_uses_requested_alias_not_hashmap_first() {
     let hashmap_first_alias = state
         .sessions
         .iter()
+        .map(|session| (session.name(), session))
         .find_map(|(session_name, session)| {
             session
                 .window_at(0)
@@ -53,7 +56,7 @@ fn join_or_move_geometry_uses_requested_alias_not_hashmap_first() {
         for session_name in [&alpha, &beta] {
             state
                 .sessions
-                .session_mut(session_name)
+                .session_setup(session_name)
                 .expect("shared session")
                 .resize_window(0, resized)
                 .expect("resize shared window");
@@ -85,7 +88,7 @@ fn join_or_move_geometry_orders_source_target_then_collateral() {
         .expect("create alpha");
     state
         .sessions
-        .session_mut(&alpha)
+        .session_setup(&alpha)
         .expect("alpha")
         .create_window(original_size)
         .expect("create collateral window");
@@ -104,14 +107,14 @@ fn join_or_move_geometry_orders_source_target_then_collateral() {
     state.mutate_join_or_move_and_record_window_geometry_changes(context, |state| {
         state
             .sessions
-            .session_mut(&source)
+            .session_setup(&source)
             .expect("source")
             .resize_window(0, TerminalSize { cols: 79, rows: 24 })
             .expect("resize source");
         for session_name in [&alpha, &beta] {
-            let session = state
+            let mut session = state
                 .sessions
-                .session_mut(session_name)
+                .session_setup(session_name)
                 .expect("shared session");
             session
                 .resize_window(0, TerminalSize { cols: 78, rows: 24 })

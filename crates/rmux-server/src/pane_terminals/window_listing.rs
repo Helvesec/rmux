@@ -2,17 +2,15 @@ use std::cmp::Ordering;
 use std::collections::HashMap;
 use std::path::Path;
 
-use rmux_core::{
-    formats::{
-        is_truthy, render_list_windows_line, FormatContext, DEFAULT_LIST_WINDOWS_ALL_FORMAT,
-    },
-    Session,
+use rmux_core::formats::{
+    is_truthy, render_list_windows_line, FormatContext, DEFAULT_LIST_WINDOWS_ALL_FORMAT,
 };
 use rmux_proto::{
     CommandOutput, ListWindowsResponse, RmuxError, SessionName, WindowListEntry, WindowTarget,
 };
 
 use super::{session_not_found, HandlerState};
+use crate::client_format::ClientLoopSnapshot;
 use crate::format_runtime::{render_runtime_template, RuntimeFormatContext};
 
 pub(crate) struct ListWindowsSelection<'a> {
@@ -23,6 +21,7 @@ pub(crate) struct ListWindowsSelection<'a> {
     pub(crate) filter: Option<&'a str>,
     pub(crate) sort_order: Option<&'a str>,
     pub(crate) reversed: bool,
+    pub(crate) client_loop_snapshots: &'a [ClientLoopSnapshot],
 }
 
 pub(crate) struct ListWindowsAllSelection<'a> {
@@ -32,6 +31,7 @@ pub(crate) struct ListWindowsAllSelection<'a> {
     pub(crate) filter: Option<&'a str>,
     pub(crate) sort_order: Option<&'a str>,
     pub(crate) reversed: bool,
+    pub(crate) client_loop_snapshots: &'a [ClientLoopSnapshot],
 }
 
 impl HandlerState {
@@ -47,6 +47,7 @@ impl HandlerState {
             filter,
             sort_order,
             reversed,
+            client_loop_snapshots,
         } = selection;
         let session = self
             .sessions
@@ -63,10 +64,13 @@ impl HandlerState {
             self,
             session,
             session_name,
-            socket_path,
-            format,
-            attached_count,
-            filter,
+            WindowListRenderContext {
+                socket_path,
+                format,
+                attached_count,
+                filter,
+                client_loop_snapshots,
+            },
         );
         if sort_order != WindowListSortOrder::Index || reversed && sort_order.is_explicit() {
             sort_window_entries(&mut rows, sort_order, reversed);
@@ -85,6 +89,7 @@ impl HandlerState {
             filter,
             sort_order,
             reversed,
+            client_loop_snapshots,
         } = selection;
         let sort_order = match WindowListSortOrder::parse(sort_order) {
             Some(sort_order) => sort_order,
@@ -94,6 +99,7 @@ impl HandlerState {
         let mut session_names = self
             .sessions
             .iter()
+            .map(|session| (session.name(), session))
             .map(|(session_name, _)| session_name.clone())
             .collect::<Vec<_>>();
         session_names.sort_by(|left, right| left.as_str().cmp(right.as_str()));
@@ -108,10 +114,13 @@ impl HandlerState {
                 self,
                 session,
                 &session_name,
-                socket_path,
-                format,
-                attached_counts.get(&session_name).copied().unwrap_or(0),
-                filter,
+                WindowListRenderContext {
+                    socket_path,
+                    format,
+                    attached_count: attached_counts.get(&session_name).copied().unwrap_or(0),
+                    filter,
+                    client_loop_snapshots,
+                },
             ));
         }
         if sort_order.is_explicit() {
@@ -155,30 +164,42 @@ struct WindowListRow {
     activity_at: i64,
 }
 
+struct WindowListRenderContext<'a> {
+    socket_path: &'a Path,
+    format: Option<&'a str>,
+    attached_count: usize,
+    filter: Option<&'a str>,
+    client_loop_snapshots: &'a [ClientLoopSnapshot],
+}
+
 fn collect_window_entries(
     state: &HandlerState,
-    session: &Session,
+    session: rmux_core::ManagedSessionView<'_>,
     session_name: &SessionName,
-    socket_path: &Path,
-    format: Option<&str>,
-    attached_count: usize,
-    filter: Option<&str>,
+    render: WindowListRenderContext<'_>,
 ) -> Vec<WindowListRow> {
+    let WindowListRenderContext {
+        socket_path,
+        format,
+        attached_count,
+        filter,
+        client_loop_snapshots,
+    } = render;
     let active_window = session.active_window_index();
     let last_window = session.last_window_index();
-    let session_context =
-        FormatContext::from_session(session).with_session_attached(attached_count);
+    let session_context = FormatContext::new()
+        .with_managed_session(session)
+        .with_session_attached(attached_count);
 
     session
         .windows()
-        .iter()
         .filter_map(|(window_index, window)| {
-            let active = *window_index == active_window;
-            let last = Some(*window_index) == last_window;
+            let active = window_index == active_window;
+            let last = Some(window_index) == last_window;
             let mut context =
                 session_context
                     .clone()
-                    .with_window(*window_index, window, active, last);
+                    .with_window(window_index, window, active, last);
             if let Some(pane) = window.active_pane() {
                 context = context.with_window_pane(window, pane);
             }
@@ -186,7 +207,8 @@ fn collect_window_entries(
                 .with_state(state)
                 .with_socket_path(socket_path)
                 .with_session(session)
-                .with_window(*window_index, window);
+                .with_window(window_index, window)
+                .with_client_loop_snapshots(client_loop_snapshots);
             let runtime = match window.active_pane() {
                 Some(pane) => runtime.with_pane(pane),
                 None => runtime,
@@ -202,7 +224,7 @@ fn collect_window_entries(
 
             Some(WindowListRow {
                 entry: WindowListEntry {
-                    target: WindowTarget::with_window(session_name.clone(), *window_index),
+                    target: WindowTarget::with_window(session_name.clone(), window_index),
                     window_id: window.id().to_string(),
                     name: (!rendered_name.is_empty()).then_some(rendered_name),
                     pane_count: u32::try_from(window.pane_count()).expect("pane count fits in u32"),

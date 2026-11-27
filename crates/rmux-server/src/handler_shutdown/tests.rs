@@ -1,5 +1,44 @@
 use super::*;
 use crate::daemon::ShutdownHandle;
+use rmux_proto::OptionName;
+
+#[cfg(unix)]
+async fn assert_exit_empty_counts_replied_requester(drain_attach: bool) {
+    let handler = RequestHandler::new();
+    let (shutdown_handle, mut shutdown_rx) = ShutdownHandle::new();
+    handler.install_shutdown_handle(shutdown_handle);
+    let connection = handler.begin_detached_connection(7);
+    let forwarder = drain_attach.then(|| handler.begin_attach_forwarder());
+    handler.queue_shutdown_request(PendingShutdownReason::ExitEmpty);
+    assert!(!handler.request_shutdown_if_pending_excluding_detached_connection(Some(7)));
+    drop(forwarder);
+
+    // A retry must not inherit permission to close this still-open SDK client.
+    assert!(
+        tokio::time::timeout(SHUTDOWN_RETRY_DELAY * 3, &mut shutdown_rx)
+            .await
+            .is_err(),
+        "exit-empty closed the replied client after the attach drain"
+    );
+    assert!(!handler.request_shutdown_if_pending_excluding_detached_connection(Some(7)));
+    drop(connection);
+    tokio::time::timeout(SHUTDOWN_RETRY_DELAY * 3, shutdown_rx)
+        .await
+        .expect("exit-empty retries after the detached connection closes")
+        .expect("shutdown receiver completes");
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn unix_exit_empty_counts_replied_requester_without_attach() {
+    assert_exit_empty_counts_replied_requester(false).await;
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn unix_exit_empty_counts_replied_requester_after_attach_drain() {
+    assert_exit_empty_counts_replied_requester(true).await;
+}
 
 #[test]
 fn normal_request_close_linearizes_against_drain_admission() {
@@ -158,5 +197,160 @@ async fn lifecycle_close_cancels_pending_shutdown_retry() {
             .await
             .is_err(),
         "a cancelled retry cannot request shutdown after the lane is sealed"
+    );
+}
+
+#[tokio::test]
+async fn exit_unattached_requires_exit_empty_and_revalidates_policy_before_shutdown() {
+    use rmux_proto::{ScopeSelector, SessionName, SetOptionMode, TerminalSize};
+    let handler = RequestHandler::new();
+    {
+        let mut state = handler.state.lock().await;
+        state
+            .sessions
+            .create_session_with_base_index(
+                SessionName::new("idle").unwrap(),
+                TerminalSize { cols: 80, rows: 24 },
+                0,
+            )
+            .unwrap();
+        state
+            .options
+            .set(
+                ScopeSelector::Global,
+                OptionName::ExitUnattached,
+                "on".into(),
+                SetOptionMode::Replace,
+            )
+            .unwrap();
+        state
+            .options
+            .set(
+                ScopeSelector::Global,
+                OptionName::ExitEmpty,
+                "off".into(),
+                SetOptionMode::Replace,
+            )
+            .unwrap();
+    }
+    assert!(!handler.queue_shutdown_if_server_empty().await);
+    {
+        let mut state = handler.state.lock().await;
+        state
+            .options
+            .set(
+                ScopeSelector::Global,
+                OptionName::ExitEmpty,
+                "on".into(),
+                SetOptionMode::Replace,
+            )
+            .unwrap();
+    }
+    assert!(handler.queue_shutdown_if_server_empty().await);
+    assert_eq!(
+        handler.pending_idle_shutdown_state(PendingShutdownReason::ExitUnattached, None),
+        IdleShutdownState::StillApplies
+    );
+    {
+        let mut state = handler.state.lock().await;
+        state
+            .options
+            .set(
+                ScopeSelector::Global,
+                OptionName::ExitUnattached,
+                "off".into(),
+                SetOptionMode::Replace,
+            )
+            .unwrap();
+    }
+    assert_eq!(
+        handler.pending_idle_shutdown_state(PendingShutdownReason::ExitUnattached, None),
+        IdleShutdownState::Stale
+    );
+    assert!(!handler.request_shutdown_if_pending());
+    assert!(!handler.shutdown_requested.load(Ordering::SeqCst));
+}
+
+/// R3135: a ShutdownIfIdle already answered `shutdown: true` must keep its
+/// non-early release; the upgrade launcher relaunches without the startup lock.
+#[cfg(unix)]
+#[tokio::test]
+async fn r3135_answered_upgrade_shutdown_keeps_its_endpoint_until_the_drain() {
+    let handler = RequestHandler::new();
+    let (shutdown_handle, shutdown_rx) = ShutdownHandle::new();
+    handler.install_shutdown_handle(shutdown_handle.clone());
+
+    let requester_connection_id = 7;
+    let requester_connection = handler.begin_detached_connection(requester_connection_id);
+    let response = handler
+        .handle_shutdown_if_idle(requester_connection_id)
+        .await;
+    assert!(
+        matches!(response, rmux_proto::Response::ShutdownIfIdle(ref r) if r.shutdown),
+        "the upgrade client is told the daemon shuts down: {response:?}"
+    );
+    // The first evaluation is deferred (busy registry), as on a loaded daemon.
+    let busy = handler
+        .active_detached_connections
+        .lock()
+        .expect("active detached connection mutex must not be poisoned");
+    assert!(!handler
+        .request_shutdown_if_pending_excluding_detached_connection(Some(requester_connection_id)));
+    drop(busy);
+    // The upgrade client drops its connection; a session-less lifecycle path
+    // (pane reap, control client finish) re-queues the idle exit meanwhile.
+    drop(requester_connection);
+    let _ = handler.request_shutdown_if_server_empty().await;
+
+    tokio::time::timeout(std::time::Duration::from_millis(500), shutdown_rx)
+        .await
+        .expect("shutdown requested")
+        .expect("shutdown receiver should complete cleanly");
+    assert!(
+        !shutdown_handle.releases_endpoint_early(),
+        "an answered seamless upgrade was turned into an early endpoint release"
+    );
+}
+
+/// An exit-empty queued after an answered upgrade keeps its own retry policy:
+/// another client's open connection defers it instead of cancelling it, and
+/// the shutdown that follows still keeps the endpoint until the drain.
+#[cfg(unix)]
+#[tokio::test]
+async fn exit_empty_after_an_answered_upgrade_survives_another_open_connection() {
+    let handler = RequestHandler::new();
+    let (shutdown_handle, shutdown_rx) = ShutdownHandle::new();
+    handler.install_shutdown_handle(shutdown_handle.clone());
+
+    let requester_connection_id = 7;
+    let requester_connection = handler.begin_detached_connection(requester_connection_id);
+    let response = handler
+        .handle_shutdown_if_idle(requester_connection_id)
+        .await;
+    assert!(
+        matches!(response, rmux_proto::Response::ShutdownIfIdle(ref r) if r.shutdown),
+        "the upgrade client is told the daemon shuts down: {response:?}"
+    );
+    let busy = handler
+        .active_detached_connections
+        .lock()
+        .expect("active detached connection mutex must not be poisoned");
+    assert!(!handler
+        .request_shutdown_if_pending_excluding_detached_connection(Some(requester_connection_id)));
+    drop(busy);
+    // Another client connects before the upgrade client leaves; a session-less
+    // lifecycle path then queues exit-empty while that connection is open.
+    let other_connection = handler.begin_detached_connection(8);
+    drop(requester_connection);
+    assert!(!handler.request_shutdown_if_server_empty().await);
+    drop(other_connection);
+
+    tokio::time::timeout(SHUTDOWN_RETRY_DELAY * 6, shutdown_rx)
+        .await
+        .expect("exit-empty still shuts the empty daemon down once the other client leaves")
+        .expect("shutdown receiver should complete cleanly");
+    assert!(
+        !shutdown_handle.releases_endpoint_early(),
+        "an answered seamless upgrade was turned into an early endpoint release"
     );
 }

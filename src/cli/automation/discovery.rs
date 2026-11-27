@@ -202,6 +202,7 @@ pub(crate) fn run_broadcast_keys(
             "broadcast-keys",
         )?);
     }
+    let target_count = targets.len();
     match connection
         .pane_broadcast_input(PaneBroadcastInputRequest {
             targets,
@@ -210,15 +211,21 @@ pub(crate) fn run_broadcast_keys(
         })
         .map_err(ExitFailure::from_client)?
     {
-        Response::PaneBroadcastInput(response) if response.failures.is_empty() => Ok(0),
-        Response::PaneBroadcastInput(response) => Err(ExitFailure::new(
-            1,
-            format!(
-                "broadcast-keys failed for {} of {} targets",
-                response.failures.len(),
-                response.successes.len() + response.failures.len()
-            ),
-        )),
+        Response::PaneBroadcastInput(response) => {
+            rmux_sdk::automation::validate_broadcast_response(&response, target_count)
+                .map_err(|error| ExitFailure::new(1, error.to_string()))?;
+            if response.failures.is_empty() {
+                return Ok(0);
+            }
+            Err(ExitFailure::new(
+                1,
+                format!(
+                    "broadcast-keys failed for {} of {} targets",
+                    response.failures.len(),
+                    response.successes.len() + response.failures.len()
+                ),
+            ))
+        }
         Response::Error(error) => Err(ExitFailure::new(
             1,
             tmux_cli_error_message("broadcast-keys", &error.error),

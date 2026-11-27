@@ -28,12 +28,12 @@ assert_helper_fallback() {
   else
     status=$?
   fi
-  if [ "$status" -ne 0 ] && [ "$status" -ne 1 ]; then
+  if [ "$status" -ne 0 ] || [ -s "$stderr" ]; then
     cat "$stderr" >&2
     rm -f "$stdout" "$stderr"
     die "rmux --help failed with unexpected exit code $status"
   fi
-  if ! grep -q 'usage: rmux' "$stdout" "$stderr"; then
+  if ! grep -q 'usage: rmux' "$stdout"; then
     cat "$stderr" >&2
     rm -f "$stdout" "$stderr"
     die "rmux --help did not reach the private helper"
@@ -70,6 +70,11 @@ while [ "$#" -gt 0 ]; do
 done
 
 [ -n "$rmux" ] || die "rmux binary is required"
+if [ -n "${RMUX_FINAL_SMOKE_MANIFEST:-}" ]; then
+  [ -n "${RMUX_FINAL_SMOKE_ROOT:-}" ] || die "final smoke package root is required"
+  "${RMUX_PYTHON:-python3}" "$(dirname "${BASH_SOURCE[0]}")/release/final_artifact_smoke.py" guard \
+    --manifest "$RMUX_FINAL_SMOKE_MANIFEST" --package-root "$RMUX_FINAL_SMOKE_ROOT" --binary "$rmux"
+fi
 case "$rmux" in
   */*)
     rmux_command="$(cd "$(dirname "$rmux")" && pwd -P)/$(basename "$rmux")"

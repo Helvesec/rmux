@@ -419,7 +419,9 @@ fn control_open_pipe_keeps_follow_on_mutation_guarded_until_eof() -> Result<(), 
 }
 
 fn rmux_command() -> Command {
-    Command::new(env!("CARGO_BIN_EXE_rmux"))
+    Command::new(rmux_os::build_identity::cargo_binary(env!(
+        "CARGO_BIN_EXE_rmux"
+    )))
 }
 
 fn unique_label(prefix: &str) -> Result<String, Box<dyn Error>> {

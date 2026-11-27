@@ -1,11 +1,15 @@
 #![allow(dead_code)]
 
+#[cfg(not(target_has_atomic = "64"))]
+use portable_atomic::AtomicU64;
 use std::error::Error;
 use std::ffi::OsStr;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
-use std::sync::atomic::{AtomicU64, Ordering};
+#[cfg(target_has_atomic = "64")]
+use std::sync::atomic::AtomicU64;
+use std::sync::atomic::Ordering;
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -134,7 +138,9 @@ pub(crate) fn assert_success(output: &Output) -> Result<(), Box<dyn Error>> {
 }
 
 pub(crate) fn rmux_binary() -> &'static Path {
-    Path::new(env!("CARGO_BIN_EXE_rmux"))
+    let path = Path::new(env!("CARGO_BIN_EXE_rmux"));
+    rmux_os::build_identity::resolve(path.as_os_str()).expect("candidate executable identity");
+    path
 }
 
 fn unique_id(label: &str) -> String {

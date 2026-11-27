@@ -4,8 +4,8 @@ use super::*;
 async fn parsed_queue_resolves_bare_select_pane_against_the_current_pane() {
     let handler = RequestHandler::new();
     let alpha = session_name("alpha");
-    assert!(matches!(
-        handler
+    crate::session_fixture::assert_new_session(
+        &handler
             .handle(Request::NewSession(NewSessionRequest {
                 session_name: alpha.clone(),
                 detached: true,
@@ -13,8 +13,7 @@ async fn parsed_queue_resolves_bare_select_pane_against_the_current_pane() {
                 environment: None,
             }))
             .await,
-        Response::NewSession(_)
-    ));
+    );
     assert!(matches!(
         handler
             .handle(Request::SplitWindow(SplitWindowRequest {
@@ -57,8 +56,24 @@ async fn parsed_queue_resolves_bare_select_pane_against_the_current_pane() {
 async fn parsed_queue_select_pane_title_sets_target_title_without_selecting_it() {
     let handler = RequestHandler::new();
     let alpha = session_name("alpha");
+    // `select-pane -T` writes the title directly, but a title the pane's own
+    // program sends later replaces it. On Windows the default shell titles its
+    // console when it starts, and ConPTY forwards that OSC 0 whenever the shell
+    // is scheduled, possibly after `-T`. Refusing program titles leaves the
+    // command under test as this title's only writer.
     assert!(matches!(
         handler
+            .handle(Request::SetOption(SetOptionRequest {
+                scope: ScopeSelector::Global,
+                option: OptionName::AllowSetTitle,
+                value: "off".to_owned(),
+                mode: SetOptionMode::Replace,
+            }))
+            .await,
+        Response::SetOption(_)
+    ));
+    crate::session_fixture::assert_new_session(
+        &handler
             .handle(Request::NewSession(NewSessionRequest {
                 session_name: alpha.clone(),
                 detached: true,
@@ -66,8 +81,7 @@ async fn parsed_queue_select_pane_title_sets_target_title_without_selecting_it()
                 environment: None,
             }))
             .await,
-        Response::NewSession(_)
-    ));
+    );
     assert!(matches!(
         handler
             .handle(Request::SplitWindow(SplitWindowRequest {
@@ -106,7 +120,11 @@ async fn parsed_queue_select_pane_title_sets_target_title_without_selecting_it()
         .await
         .expect("select-pane -T should execute");
 
-    let state = handler.state.lock().await;
+    let mut state = handler.state.lock().await;
+    // The late startup title the Windows shell can send, on every platform.
+    state
+        .append_bytes_to_pane_transcript_for_test(&alpha, 0, 1, b"\x1b]0;late-shell-title\x07")
+        .expect("pane 1 transcript exists");
     let session = state.sessions.session(&alpha).expect("session exists");
     assert_eq!(
         session
@@ -131,8 +149,8 @@ async fn parsed_queue_select_pane_style_sets_target_style_and_selects_it() {
     let alpha = session_name("alpha");
     let styled = PaneTarget::with_window(alpha.clone(), 0, 1);
 
-    assert!(matches!(
-        handler
+    crate::session_fixture::assert_new_session(
+        &handler
             .handle(Request::NewSession(NewSessionRequest {
                 session_name: alpha.clone(),
                 detached: true,
@@ -140,8 +158,7 @@ async fn parsed_queue_select_pane_style_sets_target_style_and_selects_it() {
                 environment: None,
             }))
             .await,
-        Response::NewSession(_)
-    ));
+    );
     assert!(matches!(
         handler
             .handle(Request::SplitWindow(SplitWindowRequest {
@@ -188,8 +205,8 @@ async fn parsed_queue_select_pane_style_sets_target_style_and_selects_it() {
 async fn parsed_queue_resolves_move_window_renumber_target_as_session() {
     let handler = RequestHandler::new();
     let alpha = session_name("alpha");
-    assert!(matches!(
-        handler
+    crate::session_fixture::assert_new_session(
+        &handler
             .handle(Request::NewSession(NewSessionRequest {
                 session_name: alpha.clone(),
                 detached: true,
@@ -197,8 +214,7 @@ async fn parsed_queue_resolves_move_window_renumber_target_as_session() {
                 environment: None,
             }))
             .await,
-        Response::NewSession(_)
-    ));
+    );
     assert!(matches!(
         handler
             .handle(Request::NewWindow(Box::new(NewWindowRequest {
@@ -229,8 +245,8 @@ async fn parsed_queue_resolves_move_window_renumber_target_as_session() {
 async fn parsed_queue_uses_current_target_for_move_window_renumber_without_t() {
     let handler = RequestHandler::new();
     let alpha = session_name("alpha");
-    assert!(matches!(
-        handler
+    crate::session_fixture::assert_new_session(
+        &handler
             .handle(Request::NewSession(NewSessionRequest {
                 session_name: alpha.clone(),
                 detached: true,
@@ -238,8 +254,7 @@ async fn parsed_queue_uses_current_target_for_move_window_renumber_without_t() {
                 environment: None,
             }))
             .await,
-        Response::NewSession(_)
-    ));
+    );
     assert!(matches!(
         handler
             .handle(Request::NewWindow(Box::new(NewWindowRequest {
@@ -275,8 +290,8 @@ async fn parsed_queue_uses_current_target_for_move_window_renumber_without_t() {
 async fn parsed_queue_move_window_after_inserts_before_unlinking_source() {
     let handler = RequestHandler::new();
     let alpha = session_name("alpha");
-    assert!(matches!(
-        handler
+    crate::session_fixture::assert_new_session(
+        &handler
             .handle(Request::NewSession(NewSessionRequest {
                 session_name: alpha.clone(),
                 detached: true,
@@ -284,8 +299,7 @@ async fn parsed_queue_move_window_after_inserts_before_unlinking_source() {
                 environment: None,
             }))
             .await,
-        Response::NewSession(_)
-    ));
+    );
     for name in ["b", "c"] {
         assert!(matches!(
             handler
@@ -327,7 +341,10 @@ async fn parsed_queue_move_window_after_inserts_before_unlinking_source() {
     let state = handler.state.lock().await;
     let session = state.sessions.session(&alpha).expect("session exists");
     assert_eq!(
-        session.windows().keys().copied().collect::<Vec<_>>(),
+        session
+            .windows()
+            .map(|(index, _)| index)
+            .collect::<Vec<_>>(),
         vec![1, 2, 3]
     );
     assert_eq!(
@@ -343,8 +360,8 @@ async fn parsed_queue_move_window_after_inserts_before_unlinking_source() {
 async fn parsed_queue_resize_window_balanced_flags_use_attached_client_sizes() {
     let handler = RequestHandler::new();
     let alpha = session_name("alpha");
-    assert!(matches!(
-        handler
+    crate::session_fixture::assert_new_session(
+        &handler
             .handle(Request::NewSession(NewSessionRequest {
                 session_name: alpha.clone(),
                 detached: true,
@@ -352,8 +369,7 @@ async fn parsed_queue_resize_window_balanced_flags_use_attached_client_sizes() {
                 environment: None,
             }))
             .await,
-        Response::NewSession(_)
-    ));
+    );
 
     let mut control_receivers = Vec::new();
     for (pid, size) in [
@@ -427,8 +443,8 @@ async fn parsed_queue_resize_window_balanced_flags_use_attached_client_sizes() {
 async fn parsed_queue_new_window_accepts_nonexistent_target_window_index() {
     let handler = RequestHandler::new();
     let alpha = session_name("alpha");
-    assert!(matches!(
-        handler
+    crate::session_fixture::assert_new_session(
+        &handler
             .handle(Request::NewSession(NewSessionRequest {
                 session_name: alpha.clone(),
                 detached: true,
@@ -436,8 +452,7 @@ async fn parsed_queue_new_window_accepts_nonexistent_target_window_index() {
                 environment: None,
             }))
             .await,
-        Response::NewSession(_)
-    ));
+    );
     let parsed = CommandParser::new()
         .parse("new-window -d -t alpha:5 -n five")
         .expect("commands parse");
@@ -460,8 +475,8 @@ async fn parsed_queue_new_window_accepts_nonexistent_target_window_index() {
 async fn parsed_queue_new_window_rejects_oversized_target_window_index() {
     let handler = RequestHandler::new();
     let alpha = session_name("alpha");
-    assert!(matches!(
-        handler
+    crate::session_fixture::assert_new_session(
+        &handler
             .handle(Request::NewSession(NewSessionRequest {
                 session_name: alpha,
                 detached: true,
@@ -469,8 +484,7 @@ async fn parsed_queue_new_window_rejects_oversized_target_window_index() {
                 environment: None,
             }))
             .await,
-        Response::NewSession(_)
-    ));
+    );
     let parsed = CommandParser::new()
         .parse("new-window -d -t alpha:99999999999999999999 -n huge")
         .expect("commands parse");
@@ -489,8 +503,8 @@ async fn parsed_queue_new_window_rejects_oversized_target_window_index() {
 async fn parsed_queue_rejects_pane_component_for_window_index_targets() {
     let handler = RequestHandler::new();
     let alpha = session_name("alpha");
-    assert!(matches!(
-        handler
+    crate::session_fixture::assert_new_session(
+        &handler
             .handle(Request::NewSession(NewSessionRequest {
                 session_name: alpha,
                 detached: true,
@@ -498,8 +512,7 @@ async fn parsed_queue_rejects_pane_component_for_window_index_targets() {
                 environment: None,
             }))
             .await,
-        Response::NewSession(_)
-    ));
+    );
     let parsed = CommandParser::new()
         .parse("break-pane -s alpha:0.0 -t alpha:9.0")
         .expect("commands parse");
@@ -518,8 +531,8 @@ async fn parsed_queue_rejects_pane_component_for_window_index_targets() {
 #[tokio::test]
 async fn parsed_queue_exposes_gated_mouse_target_errors() {
     let handler = RequestHandler::new();
-    assert!(matches!(
-        handler
+    crate::session_fixture::assert_new_session(
+        &handler
             .handle(Request::NewSession(NewSessionRequest {
                 session_name: session_name("alpha"),
                 detached: true,
@@ -527,8 +540,7 @@ async fn parsed_queue_exposes_gated_mouse_target_errors() {
                 environment: None,
             }))
             .await,
-        Response::NewSession(_)
-    ));
+    );
     let parsed = CommandParser::new()
         .parse("display-message -p -t '{mouse}' hello")
         .expect("commands parse");
@@ -550,8 +562,8 @@ async fn parsed_queue_exposes_gated_mouse_target_errors() {
 async fn parsed_queue_resolves_mouse_targets_when_context_carries_mouse_state() {
     let handler = RequestHandler::new();
     let alpha = session_name("alpha");
-    assert!(matches!(
-        handler
+    crate::session_fixture::assert_new_session(
+        &handler
             .handle(Request::NewSession(NewSessionRequest {
                 session_name: alpha.clone(),
                 detached: true,
@@ -559,8 +571,7 @@ async fn parsed_queue_resolves_mouse_targets_when_context_carries_mouse_state() 
                 environment: None,
             }))
             .await,
-        Response::NewSession(_)
-    ));
+    );
     let parsed = CommandParser::new()
         .parse("display-message -p -t '=' '#{session_name}:#{window_index}:#{pane_index}'")
         .expect("commands parse");

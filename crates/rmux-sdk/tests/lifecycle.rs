@@ -1,10 +1,11 @@
 #![cfg(unix)]
 
+#[path = "../../../tests/support/executable_fixture.rs"]
+mod executable_fixture;
+
 mod common;
 
 use std::error::Error;
-use std::fs;
-use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -89,27 +90,26 @@ async fn pane_close_and_respawn_preserve_slot_semantics() -> TestResult {
         "respawn must clear old visible parser state"
     );
 
+    // Close hangs up the pane terminal, as tmux 3.7b kill-pane does: a job
+    // with the default HUP disposition exits, while a job that ignores HUP
+    // keeps running because close never escalates to another signal.
+    let hangup_pane = session.pane(0, 0).split(SplitDirection::Down).await?;
+    let hangup_target = hangup_pane.target().clone();
+    let hangup_pid = respawn_running(&hangup_pane, "while :; do sleep 1; done").await?;
+    assert_eq!(
+        hangup_pane.close().await?,
+        PaneCloseOutcome::Closed {
+            target: hangup_target,
+            window_destroyed: false,
+        }
+    );
+    wait_for_process_absent(hangup_pid).await?;
+
     let stubborn_pane = session.pane(0, 0).split(SplitDirection::Down).await?;
     let stubborn_target = stubborn_pane.target().clone();
-    let stubborn_before = only_pane_info(&stubborn_pane.info().await?);
-    stubborn_pane
-        .respawn(PaneRespawnOptions {
-            kill: true,
-            start_directory: None,
-            process: ProcessSpec {
-                command: Some(vec!["trap '' HUP; while :; do sleep 1; done".to_owned()]),
-                process_command: None,
-                environment: None,
-            },
-            keep_alive_on_exit: None,
-        })
-        .await?;
-    let stubborn_after = wait_for_generation(&stubborn_pane, stubborn_before.generation).await?;
-    let stubborn_pid = running_pid(&stubborn_after)?;
-    assert!(
-        process_exists(stubborn_pid)?,
-        "stubborn pane process should be running before close"
-    );
+    let stubborn_pid =
+        respawn_running(&stubborn_pane, "trap '' HUP; while :; do sleep 1; done").await?;
+    let stubborn_process = KillOnDrop(stubborn_pid);
     assert_eq!(
         stubborn_pane.close().await?,
         PaneCloseOutcome::Closed {
@@ -117,7 +117,12 @@ async fn pane_close_and_respawn_preserve_slot_semantics() -> TestResult {
             window_destroyed: false,
         }
     );
-    wait_for_process_absent(stubborn_pid).await?;
+    tokio::time::sleep(HUP_SURVIVAL_WINDOW).await;
+    assert!(
+        process_exists(stubborn_pid)?,
+        "close must not escalate past terminal hangup for a job that ignores HUP"
+    );
+    drop(stubborn_process);
 
     let close_pane = session.pane(0, 0).split(SplitDirection::Down).await?;
     let close_target = close_pane.target().clone();
@@ -649,6 +654,46 @@ async fn owned_session_signal_kill_follows_rename_and_preserves_homonym() -> Tes
     harness.finish().await
 }
 
+/// Exceeds the former 100 ms grace plus 500 ms KILL escalation, so a close
+/// that still escalated would be observed.
+const HUP_SURVIVAL_WINDOW: Duration = Duration::from_secs(1);
+
+/// Kills a pane job that the test deliberately left alive after close.
+struct KillOnDrop(u32);
+
+impl Drop for KillOnDrop {
+    fn drop(&mut self) {
+        let _ = Command::new("kill")
+            .arg("-KILL")
+            .arg(self.0.to_string())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status();
+    }
+}
+
+async fn respawn_running(pane: &rmux_sdk::Pane, command: &str) -> TestResult<u32> {
+    let before = only_pane_info(&pane.info().await?);
+    pane.respawn(PaneRespawnOptions {
+        kill: true,
+        start_directory: None,
+        process: ProcessSpec {
+            command: Some(vec![command.to_owned()]),
+            process_command: None,
+            environment: None,
+        },
+        keep_alive_on_exit: None,
+    })
+    .await?;
+    let after = wait_for_generation(pane, before.generation).await?;
+    let pid = running_pid(&after)?;
+    assert!(
+        process_exists(pid)?,
+        "respawned pane process should be running before close"
+    );
+    Ok(pid)
+}
+
 fn running_pid(info: &PaneInfo) -> TestResult<u32> {
     match info.process {
         PaneProcessState::Running { pid: Some(pid) } => Ok(pid),
@@ -770,10 +815,7 @@ fn process_exists(pid: u32) -> TestResult<bool> {
 
 fn write_executable_script(root: &Path, name: &str, body: &str) -> TestResult<PathBuf> {
     let path = root.join(name);
-    fs::write(&path, body)?;
-    let mut permissions = fs::metadata(&path)?.permissions();
-    permissions.set_mode(0o755);
-    fs::set_permissions(&path, permissions)?;
+    executable_fixture::write_executable(&path, body, 0o755)?;
     Ok(path)
 }
 

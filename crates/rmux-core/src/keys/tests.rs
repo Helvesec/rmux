@@ -29,6 +29,14 @@ fn key_lookup_accepts_hex_and_user_keys() {
 }
 
 #[test]
+fn key_lookup_rejects_non_ascii_names_across_user_prefix() {
+    // tmux 3.7b: `bind-key abc\u{e9}` -> "unknown key", `set prefix` -> "bad key".
+    for name in ["abc\u{e9}", "Use\u{e9}", "Us\u{e9}", "User\u{e9}"] {
+        assert_eq!(key_string_lookup_string(name), None, "{name:?}");
+    }
+}
+
+#[test]
 fn key_lookup_accepts_mouse_keys() {
     let key = key_string_lookup_string("MouseDown1Pane").expect("mouse key parses");
     assert_eq!(key_string_lookup_key(key, false), "MouseDown1Pane");
@@ -103,15 +111,19 @@ fn default_store_keeps_prefix_meta_layout_bindings() {
 }
 
 #[test]
-fn default_store_does_not_bind_unimplemented_refresh_client_panning() {
+fn default_store_binds_measured_refresh_client_panning() {
     let store = KeyBindingStore::default();
-    for key in ["DC", "S-Up", "S-Down", "S-Left", "S-Right"] {
-        assert!(
-            store
-                .get_binding("prefix", key_string_lookup_string(key).expect("key parses"))
-                .is_none(),
-            "default prefix table advertised unsupported refresh-client panning on {key}"
-        );
+    for (key, command) in [
+        ("DC", "refresh-client -c"),
+        ("S-Up", "refresh-client -U 10"),
+        ("S-Down", "refresh-client -D 10"),
+        ("S-Left", "refresh-client -L 10"),
+        ("S-Right", "refresh-client -R 10"),
+    ] {
+        let binding = store
+            .get_binding("prefix", key_string_lookup_string(key).expect("key"))
+            .expect("default pan binding");
+        assert_eq!(binding.commands().to_tmux_string(), command);
     }
 }
 
@@ -350,6 +362,65 @@ fn list_bindings_key_sort_handles_custom_modified_keys() {
     let bindings = store.list_bindings(None, KeyBindingSortOrder::Key, false);
     assert!(bindings.iter().any(|binding| binding.key_string() == "C-/"));
     assert!(bindings.iter().any(|binding| binding.key_string() == "M-a"));
+}
+
+#[test]
+fn custom_bindings_do_not_break_default_key_sort_order() {
+    for table in ["root", "prefix", "copy-mode", "copy-mode-vi"] {
+        let mut store = KeyBindingStore::default();
+        let original = store.list_bindings(Some(table), KeyBindingSortOrder::Key, false);
+        let key = key_string_lookup_string("C-q").expect("Ctrl+Q");
+        store.add_binding(
+            table,
+            key,
+            Some("Detach without cancelling copy mode".to_owned()),
+            false,
+            Some(parse_binding_command_tokens(&["detach-client".to_owned()]).expect("command")),
+        );
+        // This used to panic when listing copy-mode-vi: comparing a custom
+        // control key by key code contradicted comparisons by default rank.
+        let listed = store.list_bindings(Some(table), KeyBindingSortOrder::Key, false);
+        assert_eq!(listed.len(), original.len() + 1);
+        assert_eq!(&listed[..original.len()], original.as_slice());
+        assert_eq!(listed.last().expect("custom binding").binding().key(), key);
+
+        // Modified defaults join the custom bindings without disturbing the
+        // relative order of the remaining frozen default display rows.
+        let modified = original[0].binding().key();
+        store.add_binding(
+            table,
+            modified,
+            None,
+            false,
+            Some(
+                parse_binding_command_tokens(&["display-message modified".to_owned()])
+                    .expect("command"),
+            ),
+        );
+        let listed = store.list_bindings(Some(table), KeyBindingSortOrder::Key, false);
+        // Upstream may list multiple display aliases for one default key
+        // (for example Escape and C-[). Replacing it removes every alias.
+        let remaining = original
+            .iter()
+            .filter(|binding| binding.binding().key() != modified)
+            .cloned()
+            .collect::<Vec<_>>();
+        assert_eq!(&listed[..remaining.len()], remaining.as_slice());
+        let custom = &listed[remaining.len()..];
+        assert_eq!(custom.len(), 2);
+        assert!(custom[0].binding().key() <= custom[1].binding().key());
+        for table_filter in [Some(table), None] {
+            for order in [
+                KeyBindingSortOrder::Key,
+                KeyBindingSortOrder::Modifier,
+                KeyBindingSortOrder::Name,
+            ] {
+                let mut forward = store.list_bindings(table_filter, order, false);
+                forward.reverse();
+                assert_eq!(store.list_bindings(table_filter, order, true), forward);
+            }
+        }
+    }
 }
 
 #[test]

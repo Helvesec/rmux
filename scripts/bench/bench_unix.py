@@ -5,8 +5,8 @@ Contract for anything added here:
 
 * Measure only on the machine that owns the tools; never across SSH.
 * Emit a metric only for a documented strict equivalent or an explicitly
-  approximate layout operation. A missing adapter or a failed sample is
-  omitted, never estimated.
+  approximate layout operation. Never estimate a missing adapter or a failed
+  sample. Darwin failures retain attempts and leave an incomplete artifact.
 * Record the commit, platform, tool versions and every p50/p95 sample so a
   reader can re-derive a published cell.
 * Keep host identity out of the artifact: no hostname, address or absolute
@@ -16,20 +16,39 @@ Contract for anything added here:
 from __future__ import annotations
 
 import argparse
+import atexit
+import errno
 import hashlib
 import json
 import os
 import platform
 import re
+import secrets
+import shlex
 import shutil
 import statistics
 import subprocess
 import sys
 import tempfile
 import time
+import uuid
 from collections.abc import Callable
+from contextlib import contextmanager
 from pathlib import Path
 from typing import Any
+
+
+# Also support source loaders used by the repository's adapter specs.
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import qualification
+import tool_identity
+
+if sys.platform == "darwin":
+    import darwin_driver
+    import screen_environment
+    screen_environment.prepare()
+else:
+    darwin_driver = None
 
 
 ROOT = Path.cwd()
@@ -37,16 +56,128 @@ SHELL = "/bin/sh"
 TOOLS = ["rmux", "tmux", "zellij", "screen"]
 
 
+def _remove_screen_directory(directory: Path, owner: int) -> None:
+    if os.getpid() != owner:
+        return
+    try:
+        directory.rmdir()
+    except OSError as error:
+        if error.errno not in (errno.ENOENT, errno.ENOTEMPTY, errno.EEXIST):
+            raise
+
+
+if sys.platform == "linux":
+    # A 9-byte namespace fits the 79-byte session name, seven-digit PID,
+    # '-queryX' reply suffix and NUL in Linux's 108-byte sun_path (105 total).
+    # Allocate outside the timers and never reuse the caller's screen sessions.
+    for _ in range(128):
+        _screen_directory = Path("/tmp") / secrets.token_hex(2)
+        try:
+            _screen_directory.mkdir(mode=0o700)
+        except FileExistsError:
+            continue
+        os.environ["SCREENDIR"] = str(_screen_directory)
+        atexit.register(_remove_screen_directory, _screen_directory, os.getpid())
+        break
+    else:
+        raise FileExistsError("cannot allocate a private short screen socket directory")
+
+
+class FixtureCleanupError(RuntimeError):
+    def __init__(self, details: dict[str, Any]) -> None:
+        self.details = details
+        super().__init__(f"fixture cleanup failed: {details}")
+
+
 class Adapter:
-    def __init__(self, tool: str, executable: str | Path) -> None:
+    def __init__(self, tool: str, executable: str | Path, *, cleanup_timeout: float = 5.0) -> None:
         self.tool = tool
         self.executable = str(executable)
+        self.cleanup_timeout = cleanup_timeout
+        self._daemons: dict[str, Any] = {}
 
     def command(self, socket: str, args: list[str]) -> list[str]:
         return [self.executable, "-L", socket, *args]
 
-    def cleanup(self, socket: str) -> None:
-        quiet(self.command(socket, ["kill-server"]), check=False, timeout=5.0)
+    def observe_fixture(self, socket: str) -> None:
+        if darwin_driver is not None and socket not in self._daemons:
+            pid = int(captured(self.command(socket, ["display-message", "-p", "#{pid}"])))
+            self._daemons[socket] = darwin_driver.FixtureProcess(pid)
+
+    @staticmethod
+    def _absent(result: Any, *, exited: bool = False) -> bool:
+        if result.returncode != 1 or result.stdout:
+            return False
+        socket = result.args[result.args.index("-L") + 1]
+        reasons = "No such file or directory|Connection refused" if exited else "No such file or directory"
+        pattern = rf"error connecting to [^\r\n]+/{re.escape(socket)} \(({reasons})\)\n?"
+        diagnostic = result.stderr.decode(errors="replace")
+        if re.fullmatch(pattern, diagnostic) is not None:
+            return True
+        return exited and re.fullmatch(
+            rf"no server running on [^\r\n]+/{re.escape(socket)}\n?", diagnostic
+        ) is not None
+
+    def cleanup(self, socket: str, *, absent_ok: bool = False) -> None:
+        if darwin_driver is None:
+            quiet(self.command(socket, ["kill-server"]), check=False, timeout=5.0)
+            return
+        process = self._daemons.pop(socket, None)
+        details: dict[str, Any] = {"socket": socket, "pid": process.pid if process else None}
+        try:
+            if process is not None and process.poll_exit():
+                return
+            result = None
+            try:
+                result = darwin_driver.run(self.command(socket, ["kill-server"]),
+                                           env=clean_env(), check=False, timeout=self.cleanup_timeout)
+                if result.returncode:
+                    error = subprocess.CalledProcessError(result.returncode, result.args,
+                                                         result.stdout, result.stderr)
+                    details["command_error"] = failure_details(error)
+            except Exception as error:
+                details["command_error"] = failure_details(error)
+            if process is None:
+                if absent_ok and result is not None and self._absent(result):
+                    return
+                details["retirement_error"] = "fixture process identity was not established"
+            else:
+                try:
+                    process.wait(self.cleanup_timeout)
+                except Exception as error:
+                    details["retirement_error"] = failure_details(error)
+                details["exit_observed"] = process.exited
+                if process.exited and result is not None and self._absent(result, exited=True):
+                    details.pop("command_error", None)
+            if "command_error" in details or "retirement_error" in details:
+                if process is not None and not process.exited:
+                    details["forced_cleanup_attempted"] = True
+                    try:
+                        process.retire_after_failure(self.cleanup_timeout)
+                        details["forced_cleanup_exit_observed"] = process.exited
+                    except Exception as error:
+                        details["forced_cleanup_error"] = failure_details(error)
+                raise FixtureCleanupError(details)
+        finally:
+            if process is not None:
+                process.close()
+
+    def cleanup_after_error(self, socket: str, primary: BaseException) -> None:
+        try:
+            self.cleanup(socket)
+        except BaseException as cleanup_error:
+            primary.cleanup_error = cleanup_error
+            primary.add_note(f"Additional fixture cleanup failure: {cleanup_error}")
+
+    @contextmanager
+    def fixture(self, socket: str):
+        try:
+            yield
+        except BaseException as primary:
+            self.cleanup_after_error(socket, primary)
+            raise
+        else:
+            self.cleanup(socket)
 
 
 AdapterOperation = Callable[[Adapter], float]
@@ -55,12 +186,16 @@ MeasuredOperation = Callable[[], float]
 
 def clean_env() -> dict[str, str]:
     env = dict(os.environ)
-    for name in ("RMUX", "TMUX", "TERM_PROGRAM", "ZELLIJ"):
+    for name in ("RMUX", "TMUX", "TERM_PROGRAM", "ZELLIJ",
+                 "RMUX_INTERNAL_BINARY_PATH", "RMUX_ALLOW_INTERNAL_BINARY_OVERRIDE"):
         env.pop(name, None)
     return env
 
 
 def quiet(cmd: list[str], *, check: bool = True, timeout: float = 15.0) -> None:
+    if darwin_driver is not None:
+        darwin_driver.run(cmd, env=clean_env(), timeout=timeout, check=check)
+        return
     subprocess.run(
         cmd,
         stdout=subprocess.DEVNULL,
@@ -72,6 +207,8 @@ def quiet(cmd: list[str], *, check: bool = True, timeout: float = 15.0) -> None:
 
 
 def captured(cmd: list[str], *, timeout: float = 15.0) -> str:
+    if darwin_driver is not None:
+        return darwin_driver.run(cmd, env=clean_env(), timeout=timeout).stdout.decode().strip()
     return subprocess.check_output(
         cmd,
         text=True,
@@ -82,6 +219,8 @@ def captured(cmd: list[str], *, timeout: float = 15.0) -> str:
 
 
 def timed(cmd: list[str], *, timeout: float = 15.0) -> float:
+    if darwin_driver is not None:
+        return darwin_driver.run(cmd, env=clean_env(), timeout=timeout).elapsed_ms
     start = time.perf_counter()
     quiet(cmd, timeout=timeout)
     return (time.perf_counter() - start) * 1000.0
@@ -93,6 +232,8 @@ def timed_unchecked(cmd: list[str], *, timeout: float = 15.0) -> float:
     GNU `screen -ls` reports the session list on stdout and still exits
     nonzero, so the listing operation cannot be timed with `timed`.
     """
+    if darwin_driver is not None:
+        return darwin_driver.run(cmd, env=clean_env(), timeout=timeout, check=False).elapsed_ms
     start = time.perf_counter()
     quiet(cmd, check=False, timeout=timeout)
     return (time.perf_counter() - start) * 1000.0
@@ -177,15 +318,42 @@ def session(
     command: str | None = None,
     width: int | None = None,
     height: int | None = None,
+    ready_lines: int | None = None,
 ) -> None:
     args = ["new-session", "-d", "-s", name]
     if width is not None:
         args.extend(["-x", str(width)])
     if height is not None:
         args.extend(["-y", str(height)])
+    if darwin_driver is not None and ready_lines is not None:
+        if command != output_command(ready_lines):
+            raise ValueError("readiness must match the declared output workload")
+        with darwin_driver.Readiness() as ready:
+            # Signal from the producer after its last write, before its existing
+            # sleep. This is setup, not part of the timed capture command.
+            script = output_script(ready_lines, ready.shell_signal)
+            quiet(adapter.command(socket, [*args, f"{SHELL} -c {shlex.quote(script)}"]))
+            adapter.observe_fixture(socket)
+            ready.wait()
+        return
     if command is not None:
         args.append(command)
     quiet(adapter.command(socket, args))
+    adapter.observe_fixture(socket)
+    if darwin_driver is not None and command is None:
+        shell_ready(adapter, socket, name)
+
+
+def shell_ready(adapter: Adapter, socket: str, target: str) -> None:
+    """A fresh acknowledgement from the fixture's shell, outside timing.
+
+    Sending the command can return before the shell starts reading. Only the
+    private FIFO acknowledgement proves that this shell consumed the challenge.
+    The setup command is visible in the pane's history on both products.
+    """
+    with darwin_driver.Readiness() as ready:
+        quiet(adapter.command(socket, ["send-keys", "-t", target, ready.shell_signal, "Enter"]))
+        ready.wait()
 
 
 def output_command(lines: int) -> str:
@@ -208,11 +376,13 @@ def output_argv(lines: int) -> list[str]:
     return [SHELL, "-c", output_script(lines)]
 
 
-def output_script(lines: int) -> str:
+def output_script(lines: int, ready_signal: str | None = None) -> str:
     return (
         "i=0; "
         f"while [ $i -lt {lines} ]; do printf \"rmux-bench-%05d\\n\" \"$i\"; "
-        "i=$((i+1)); done; sleep 60"
+        "i=$((i+1)); done; "
+        + (f"{ready_signal}; " if ready_signal is not None else "")
+        + "sleep 60"
     )
 
 
@@ -231,18 +401,22 @@ def with_session(
     width: int | None = None,
     height: int | None = None,
     timeout: float = 15.0,
+    ready_lines: int | None = None,
 ) -> float:
     socket = socket_name(operation, adapter.tool)
-    try:
-        session(adapter, socket, command=command, width=width, height=height)
+    with adapter.fixture(socket):
+        session(adapter, socket, command=command, width=width, height=height,
+                ready_lines=ready_lines)
         if setup is not None:
             setup(socket)
         return timed(adapter.command(socket, timed_args), timeout=timeout)
-    finally:
-        adapter.cleanup(socket)
 
 
 def wait_for_target(adapter: Adapter, socket: str, target: str) -> None:
+    if darwin_driver is not None:
+        quiet(adapter.command(socket, ["list-panes", "-t", target]), timeout=5.0)
+        shell_ready(adapter, socket, target)
+        return
     deadline = time.monotonic() + 5.0
     while True:
         try:
@@ -260,25 +434,30 @@ def list_commands(adapter: Adapter) -> float:
 
 def new_session_cold_sh(adapter: Adapter) -> float:
     socket = socket_name("new_session_cold_sh", adapter.tool)
-    adapter.cleanup(socket)
-    try:
-        return timed(adapter.command(socket, ["new-session", "-d", "-s", "bench"]))
-    finally:
-        adapter.cleanup(socket)
+    adapter.cleanup(socket, absent_ok=True)
+    with adapter.fixture(socket):
+        elapsed = timed(adapter.command(socket, ["new-session", "-d", "-s", "bench"]))
+        adapter.observe_fixture(socket)
+        if darwin_driver is not None:
+            shell_ready(adapter, socket, "bench")
+        return elapsed
 
 
 def new_session_warm_sh(adapter: Adapter) -> float:
     socket = socket_name("new_session_warm_sh", adapter.tool)
-    try:
+    with adapter.fixture(socket):
         quiet(
             adapter.command(
                 socket,
                 ["start-server", ";", "set-option", "-g", "exit-empty", "off"],
             )
         )
-        return timed(adapter.command(socket, ["new-session", "-d", "-s", "bench"]))
-    finally:
-        adapter.cleanup(socket)
+        adapter.observe_fixture(socket)
+        elapsed = timed(adapter.command(socket, ["new-session", "-d", "-s", "bench"]))
+        adapter.observe_fixture(socket)
+        if darwin_driver is not None:
+            shell_ready(adapter, socket, "bench")
+        return elapsed
 
 
 def split_window_h_detached_sh(adapter: Adapter) -> float:
@@ -376,6 +555,7 @@ def capture_pane_5000_lines(adapter: Adapter) -> float:
         ["capture-pane", "-p", "-t", "bench"],
         command=output_command(5000),
         timeout=30.0,
+        ready_lines=5000,
     )
 
 
@@ -392,6 +572,7 @@ def capture_pane_200x50_scrollback_10k(adapter: Adapter) -> float:
         width=200,
         height=50,
         timeout=30.0,
+        ready_lines=10000,
     )
 
 
@@ -457,19 +638,31 @@ def batched_list_windows_20(adapter: Adapter, iterations: int) -> MeasuredOperat
             try:
                 session(adapter, socket)
                 setup_list_windows_20(adapter, socket)
-            except Exception:
-                adapter.cleanup(socket)
-                socket = None
+            except BaseException as primary:
+                try:
+                    adapter.cleanup_after_error(socket, primary)
+                finally:
+                    socket = None
                 raise
+        primary = None
         try:
             return timed(adapter.command(socket, ["list-windows", "-t", "bench"]))
+        except BaseException as error:
+            primary = error
+            remaining = 1
+            raise
         finally:
             remaining -= 1
             if remaining <= 0 and socket is not None:
-                adapter.cleanup(socket)
-                socket = None
+                try:
+                    if primary is None:
+                        adapter.cleanup(socket)
+                    else:
+                        adapter.cleanup_after_error(socket, primary)
+                finally:
+                    socket = None
 
-    return operation
+    return qualification.cancellable(operation, lambda: adapter.cleanup(socket) if socket is not None else None)
 
 
 def setup_list_panes_80(adapter: Adapter, socket: str) -> None:
@@ -504,19 +697,31 @@ def batched_list_panes_80(adapter: Adapter, iterations: int) -> MeasuredOperatio
             try:
                 session(adapter, socket)
                 setup_list_panes_80(adapter, socket)
-            except Exception:
-                adapter.cleanup(socket)
-                socket = None
+            except BaseException as primary:
+                try:
+                    adapter.cleanup_after_error(socket, primary)
+                finally:
+                    socket = None
                 raise
+        primary = None
         try:
             return timed(adapter.command(socket, ["list-panes", "-a"]), timeout=30.0)
+        except BaseException as error:
+            primary = error
+            remaining = 1
+            raise
         finally:
             remaining -= 1
             if remaining <= 0 and socket is not None:
-                adapter.cleanup(socket)
-                socket = None
+                try:
+                    if primary is None:
+                        adapter.cleanup(socket)
+                    else:
+                        adapter.cleanup_after_error(socket, primary)
+                finally:
+                    socket = None
 
-    return operation
+    return qualification.cancellable(operation, lambda: adapter.cleanup(socket) if socket is not None else None)
 
 
 
@@ -713,7 +918,7 @@ def batched_zellij_list_windows(executable: str, iterations: int) -> MeasuredOpe
                 zellij_cleanup(executable, name)
                 name = None
 
-    return operation
+    return qualification.cancellable(operation, lambda: zellij_cleanup(executable, name) if name is not None else None)
 
 
 def zellij_kill_session(executable: str) -> float:
@@ -791,7 +996,7 @@ def batched_zellij_list_panes(executable: str, iterations: int) -> MeasuredOpera
                 zellij_cleanup(executable, name)
                 name = None
 
-    return operation
+    return qualification.cancellable(operation, lambda: zellij_cleanup(executable, name) if name is not None else None)
 
 
 # GNU screen keeps at most this many characters of a session name and silently
@@ -844,8 +1049,57 @@ def screen_control_command(executable: str, name: str, args: list[str]) -> list[
     return [executable, "-S", name, *args]
 
 
+def _screen_process_start(pid: int) -> str | None:
+    if sys.platform != "linux":
+        return None
+    try:
+        fields = Path(f"/proc/{pid}/stat").read_text().rsplit(")", 1)[1].split()
+    except (FileNotFoundError, ProcessLookupError):
+        # Exit after open but before read reports ESRCH, not ENOENT.
+        return None
+    if fields[0] in ("Z", "X"):
+        # A child's leader can be Z before the whole process is waitable.
+        # Leave its exit status for the subprocess owner to collect.
+        try:
+            status = os.waitid(os.P_PID, pid, os.WEXITED | os.WNOHANG | os.WNOWAIT)
+        except ChildProcessError:
+            # Detached servers have no child status for this process to read.
+            return None
+        if status is not None:
+            return None
+    # Starttime distinguishes a subsequently reused PID.
+    return fields[19]
+
+
 def screen_cleanup(executable: str, name: str) -> None:
-    quiet(screen_control_command(executable, name, ["-X", "quit"]), check=False, timeout=5.0)
+    deadline = time.monotonic() + 5.0
+    directory = clean_env().get("SCREENDIR")
+    sockets = []
+    if directory is not None:
+        try:
+            sockets = [path for path in Path(directory).iterdir()
+                       if path.name.partition(".")[0].isdigit()
+                       and path.name.partition(".")[2] == name]
+        except FileNotFoundError:
+            pass
+    processes = {int(path.name.partition(".")[0]): _screen_process_start(
+        int(path.name.partition(".")[0])) for path in sockets}
+    quiet(screen_control_command(executable, name, ["-X", "quit"]),
+          check=False, timeout=max(0.0, deadline - time.monotonic()))
+    # The quit client only sends a request. Observe the server's own unlink
+    # and exit, outside the measured sample and within the original budget.
+    while True:
+        sockets = [path for path in sockets if path.exists()]
+        processes = {pid: start for pid, start in processes.items()
+                     if start is not None and _screen_process_start(pid) == start}
+        if not sockets and not processes:
+            return
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise FixtureCleanupError({"tool": "screen", "session": name,
+                                       "remaining_sockets": [path.name for path in sockets],
+                                       "live_processes": list(processes)})
+        time.sleep(min(0.01, remaining))
 
 
 def screen_create_session(
@@ -1017,7 +1271,7 @@ def batched_screen_list_windows(executable: str, iterations: int) -> MeasuredOpe
                 screen_cleanup(executable, name)
                 name = None
 
-    return operation
+    return qualification.cancellable(operation, lambda: screen_cleanup(executable, name) if name is not None else None)
 
 
 def screen_kill_session(executable: str) -> float:
@@ -1155,6 +1409,27 @@ def sanitize(text: str) -> str:
     return TEMP_PATH.sub("<temp>", text)
 
 
+def failure_details(error: BaseException) -> dict[str, Any]:
+    """Keep the operation's cause and any additional cleanup cause separately."""
+    details: dict[str, Any] = {"error_type": type(error).__name__,
+                               "error": sanitize(str(error))}
+    if isinstance(error, subprocess.CalledProcessError):
+        details["returncode"] = error.returncode
+    if isinstance(error, subprocess.TimeoutExpired):
+        details["timeout_s"] = error.timeout
+    for field in ("stdout", "stderr"):
+        value = getattr(error, field, None)
+        if value is not None:
+            details[field] = sanitize(value.decode(errors="replace")
+                                      if isinstance(value, bytes) else value)
+    if isinstance(error, FixtureCleanupError):
+        details["cleanup"] = error.details
+    cleanup_error = getattr(error, "cleanup_error", None)
+    if cleanup_error is not None:
+        details["cleanup_error"] = failure_details(cleanup_error)
+    return details
+
+
 def measure(
     operation: MeasuredOperation,
     iterations: int,
@@ -1163,14 +1438,40 @@ def measure(
     tool: str,
     progress_enabled: bool,
     sample_progress: bool,
+    attempts: list[dict[str, Any]] | None = None,
+    identity: dict[str, Any] | None = None,
+    checkpoint: Callable[[], None] | None = None,
 ) -> tuple[dict[str, object] | None, str | None]:
     samples: list[float] = []
+    attempts = attempts if attempts is not None else []
+    run_id = uuid.uuid4().hex
+    if identity is not None and iterations != 1:
+        raise qualification.QualificationError("one planned identity permits exactly one attempt")
     for index in range(iterations):
+        attempt = dict(identity) if identity is not None else {
+            "run_id": run_id, "tool": tool, "operation": label, "pair": index + 1,
+            "order": 0, "sequence": index + 1, "attempt_number": 1,
+            "attempt_id": f"{run_id}/{label}/{index + 1}/0/{tool}"}
+        attempt.update(sample=attempt["pair"], status="running", started_ns=time.monotonic_ns())
+        if any(row.get("attempt_id") == attempt["attempt_id"] for row in attempts):
+            raise qualification.QualificationError("retry/duplicate attempt refused before launch")
+        attempts.append(attempt)
         try:
+            if checkpoint is not None:
+                checkpoint()  # Durable intent precedes any operation/setup launch.
             if sample_progress:
                 progress(progress_enabled, f"  {tool} {label} sample {index + 1}/{iterations}")
-            samples.append(operation())
-        except Exception as error:
+            samples.append(qualification.finish_attempt(attempt, operation()))
+            attempt["ended_ns"] = time.monotonic_ns()
+            if checkpoint is not None:
+                checkpoint()
+        except BaseException as error:
+            attempt.update(status="failed" if isinstance(error, Exception) else "interrupted",
+                           ended_ns=time.monotonic_ns(), **failure_details(error))
+            if checkpoint is not None:
+                checkpoint()
+            if not isinstance(error, Exception):
+                raise
             return None, f"{tool}/{label}: {type(error).__name__}: {error}"
     return stats(samples), None
 
@@ -1179,10 +1480,14 @@ def relative_or_string(path: Path | None) -> str | None:
     if path is None:
         return None
     resolved = path.resolve()
+    # A temporary root inside the checkout still takes privacy precedence.
+    public_path = sanitize(str(resolved))
+    if public_path != str(resolved):
+        return public_path
     try:
         return str(resolved.relative_to(ROOT))
     except ValueError:
-        return sanitize(str(resolved))
+        return public_path
 
 
 def collect(
@@ -1198,15 +1503,20 @@ def collect(
     sample_progress: bool,
     only_operations: set[str] | None,
     selected_tools: set[str],
+    tool_provenance: Path | None = None,
 ) -> None:
+    qualification.verify_source(Path(__file__).read_text(), OPERATIONS)
     unknown_tools = selected_tools.difference(TOOLS)
     if unknown_tools:
         raise SystemExit(f"unknown --only-tools value(s): {', '.join(sorted(unknown_tools))}")
 
     operations_by_tool: dict[str, dict[str, MeasuredOperation]] = {}
+    rmux_executable = Path(os.path.abspath(rmux))
     if "rmux" in selected_tools:
-        operations_by_tool["rmux"] = tmux_like_operations(Adapter("rmux", rmux), iterations)
+        operations_by_tool["rmux"] = tmux_like_operations(Adapter("rmux", rmux_executable), iterations)
     tmux = shutil.which("tmux")
+    if darwin_driver is not None and "tmux" in selected_tools and tmux is None:
+        raise FileNotFoundError("selected native tmux executable is unavailable")
     if tmux and "tmux" in selected_tools:
         operations_by_tool["tmux"] = tmux_like_operations(Adapter("tmux", tmux), iterations)
     zellij = shutil.which("zellij")
@@ -1234,36 +1544,80 @@ def collect(
     rows = [{"id": label, "label": label, "metrics": {}} for label, _ in operation_specs]
     rows_by_label = {row["id"]: row for row in rows}
     errors: list[str] = []
+    attempts: list[dict[str, Any]] = []
     generated_at = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
     measured_tools = list(operations_by_tool)
+    population = qualification.population()
+    for tool, operations in operations_by_tool.items():
+        if set(operations) != set(population["tools"][tool]):
+            raise qualification.QualificationError(f"{tool} operation population changed")
+    run_id = uuid.uuid4().hex
+    expected = qualification.schedule(run_id, [label for label, _ in operation_specs],
+                                      measured_tools, iterations)
+    plan = {"run_id": run_id, "iterations": iterations,
+            "operations": [label for label, _ in operation_specs], "tools": measured_tools,
+            "expected": expected, "expected_sha256": qualification.digest(expected)}
+    declarations = {
+        tool: {"declared": str(rmux) if tool == "rmux" else tool,
+               "selected": {"rmux": str(rmux_executable), "tmux": tmux, "zellij": zellij, "screen": screen}[tool],
+               "lookup": "path" if tool == "rmux" else "PATH"}
+        for tool in TOOLS if tool in selected_tools}
+    if "rmux" in selected_tools:
+        for role, path in (("rmux_public", rmux_public_binary), ("rmux_helper", rmux_helper_binary),
+                           ("rmux_daemon", rmux_daemon_binary)):
+            if path is not None or role == "rmux_daemon":
+                declarations[role] = {"declared": str(path) if path is not None else None,
+                                      "selected": str(path) if path is not None else None, "lookup": "path"}
+    identities = tool_identity.ToolIdentity(run_id, out, declarations,
+                                            [tool for tool in TOOLS if tool in selected_tools], tool_provenance)
+    versions = {}
+    git_identity = {"branch": git("rev-parse", "--abbrev-ref", "HEAD"), "commit": git("rev-parse", "HEAD")}
+    cancellation = []
+    sampler_errors = []
+    accounting_errors = []
+    sampling_finished = False
+    cleanup_finished = False
+    population_digest = hashlib.sha256(qualification.population_bytes()).hexdigest()
 
     def payload(complete: bool) -> dict[str, Any]:
+        attempted_ids = {attempt.get("attempt_id") for attempt in attempts}
         return {
             "schema": 1,
             "kind": "rmux-public-benchmark",
             "complete": complete,
+            "driver": "darwin-posix-spawn-kqueue-waitpid" if darwin_driver else "subprocess",
             "generated_at": generated_at,
             "platform": {"id": platform_id, "name": "macOS" if platform_id == "macos" else "Linux"},
-            "git": {"branch": git("rev-parse", "--abbrev-ref", "HEAD"), "commit": git("rev-parse", "HEAD")},
+            "git": git_identity,
             "tools": measured_tools,
-            "tool_versions": {
-                "rmux": version(str(rmux), "-V"),
-                "tmux": version("tmux", "-V"),
-                "zellij": version("zellij", "--version"),
-                "screen": version("screen", "-v", accept_nonzero_exit=True),
-            },
+            "tool_versions": versions,
             "tool_environments": {tool: "native" for tool in measured_tools},
             "baseline": "tmux" if "tmux" in measured_tools else measured_tools[0],
             "units": "ms",
             "lower_is_better": True,
             "rmux_layout": rmux_layout,
             "rmux_binaries": {
-                "public": relative_or_string(rmux_public_binary or rmux),
-                "helper": relative_or_string(rmux_helper_binary),
-                "daemon": relative_or_string(rmux_daemon_binary),
+                "client": str(rmux),
+                "public": str(rmux_public_binary if rmux_public_binary is not None else rmux),
+                "helper": str(rmux_helper_binary) if rmux_helper_binary is not None else None,
+                "daemon": str(rmux_daemon_binary) if rmux_daemon_binary is not None else None,
             },
             "notes": errors,
+            "attempts": attempts,
             "operations": rows,
+            "qualification_scope": "R5-B accounting and optional R6 declared disk identities only; no transient helper, functional, thermal or statistical qualification",
+            "tool_identity": identities.state(),
+            "population_sha256": population_digest,
+            "sampling_plan": plan,
+            "requested_tools": [tool for tool in TOOLS if tool in selected_tools],
+            "unavailable_tools": [tool for tool in TOOLS if tool in selected_tools and tool not in measured_tools],
+            "unattempted": [item["attempt_id"] for item in expected
+                             if item["attempt_id"] not in attempted_ids],
+            "sampler_cleanup": cancellation,
+            "sampler_errors": sampler_errors,
+            "accounting_errors": accounting_errors,
+            "sampling_finished": sampling_finished,
+            "cleanup_finished": cleanup_finished,
         }
 
     progress(progress_enabled, f"writing incremental results to {out}")
@@ -1273,37 +1627,72 @@ def collect(
     )
     write_json_atomic(out, payload(complete=False))
 
-    for tool_index, (tool, operations) in enumerate(operations_by_tool.items(), start=1):
-        progress(progress_enabled, f"tool {tool_index}/{len(operations_by_tool)} {tool}")
-        for operation_index, (label, _) in enumerate(operation_specs, start=1):
-            operation = operations.get(label)
-            if operation is None:
-                continue
-            progress(
-                progress_enabled,
-                f"  {operation_index}/{len(operation_specs)} {label}",
-            )
+    primary = None
+    samples_by_operation: dict[tuple[str, str], list[float]] = {}
+    try:
+        identities.prepare(version)
+        versions = {tool: record["version"].get("value")
+                    for tool, record in identities.manifest["tools"].items() if tool in TOOLS}
+        write_json_atomic(out, payload(complete=False))
+        for identity in expected:
+            tool, label = identity["tool"], identity["operation"]
+            operation = operations_by_tool[tool][label]
+            if identities.required:
+                identities.check("before_attempt:" + identity["attempt_id"])
+            progress(progress_enabled, f"  {label} pair {identity['pair']}/{iterations} {tool}")
             result, error = measure(
                 operation,
-                iterations,
+                1,
                 label=label,
                 tool=tool,
                 progress_enabled=progress_enabled,
                 sample_progress=sample_progress,
+                attempts=attempts,
+                identity=identity,
+                checkpoint=lambda: write_json_atomic(out, payload(complete=False)),
             )
             if result is not None:
-                rows_by_label[label]["metrics"][tool] = result
-                progress(
-                    progress_enabled,
-                    f"    done p50={result['p50_ms']:.3f}ms p95={result['p95_ms']:.3f}ms",
-                )
+                samples = samples_by_operation.setdefault((label, tool), [])
+                samples.append(attempts[-1]["elapsed_ms"])
+                if len(samples) == iterations:
+                    rows_by_label[label]["metrics"][tool] = stats(samples)
             else:
                 message = sanitize(error or f"{tool}/{label}: failed")
-                errors.append(message)
-                progress(progress_enabled, f"    {message}")
+                raise qualification.QualificationError(message)
             write_json_atomic(out, payload(complete=False))
-
-    write_json_atomic(out, payload(complete=True))
+        sampling_finished = True
+    except BaseException as error:
+        primary = error
+        sampler_errors.append(failure_details(error))
+        errors.append(sanitize(f"{type(error).__name__}: {error}"))
+    finally:
+        # A paired batch can be open in the other tool when sampling stops.
+        # Delegate retirement to its existing cleanup, never call it for another sample.
+        for tool, operations in operations_by_tool.items():
+            for label, operation in operations.items():
+                cancel = getattr(operation, "cancel", None)
+                if cancel is None:
+                    continue
+                event = {"tool": tool, "operation": label, "phase": "sampler_cleanup"}
+                cancellation.append(event)
+                try:
+                    cancel()
+                    event["status"] = "pass"
+                except BaseException as error:
+                    event.update(status="failed", **failure_details(error))
+                    errors.append(sanitize(f"{tool}/{label} sampler cleanup: {error}"))
+        cleanup_finished = True
+        try:
+            identities.finish()
+        except Exception as error:
+            sampler_errors.append(failure_details(error))
+            errors.append(sanitize(f"tool identity final check: {error}"))
+        accounting_errors = qualification.validate_artifact(payload(complete=False))
+        write_json_atomic(out, payload(complete=primary is None and not accounting_errors))
+    if primary is not None:
+        raise primary
+    if accounting_errors:
+        raise qualification.QualificationError("; ".join(accounting_errors))
 
 
 def main() -> int:
@@ -1315,6 +1704,7 @@ def main() -> int:
     parser.add_argument("--rmux-public-binary", type=Path)
     parser.add_argument("--rmux-helper-binary", type=Path)
     parser.add_argument("--rmux-daemon-binary", type=Path)
+    parser.add_argument("--tool-provenance", type=Path, help="require declared tool identity using pinned producer receipts")
     parser.add_argument("--quiet", action="store_true", help="suppress progress output")
     parser.add_argument("--sample-progress", action="store_true", help="print every measured sample")
     parser.add_argument("--only-operations", help="comma-separated operation IDs to run")
@@ -1332,7 +1722,7 @@ def main() -> int:
     collect(
         args.out,
         args.iterations,
-        args.binary.resolve(),
+        args.binary,
         rmux_layout=args.rmux_layout,
         rmux_public_binary=args.rmux_public_binary,
         rmux_helper_binary=args.rmux_helper_binary,
@@ -1341,6 +1731,7 @@ def main() -> int:
         sample_progress=args.sample_progress,
         only_operations=comma_set(args.only_operations),
         selected_tools=comma_set(args.only_tools) or set(TOOLS),
+        tool_provenance=args.tool_provenance,
     )
     print(args.out)
     return 0

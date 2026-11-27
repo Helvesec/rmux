@@ -1,10 +1,13 @@
 use super::attach_support::AttachRegistration;
 use super::RequestHandler;
+use crate::handler::test_support::SERVER_SIGNAL_LIVENESS;
 use crate::input_keys::{MouseForwardEvent, MAX_SGR_MOUSE_FRAME_BYTES};
 use crate::mouse::{AttachedMouseEvent, MouseLocation};
 use crate::outer_terminal::OuterTerminalContext;
 use crate::pane_io::AttachControl;
 use crate::server_access::current_owner_uid;
+#[cfg(not(target_has_atomic = "64"))]
+use portable_atomic::AtomicU64;
 use rmux_core::{input::InputParser, Screen};
 use rmux_proto::request::{
     AttachSessionExt2Request, AttachSessionExt3Request, AttachSessionExtRequest,
@@ -24,7 +27,9 @@ use rmux_proto::{
 #[cfg(unix)]
 use rmux_pty::{ChildCommand, TerminalSize as PtyTerminalSize};
 use std::path::Path;
-use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+#[cfg(target_has_atomic = "64")]
+use std::sync::atomic::AtomicU64;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::mpsc;
@@ -69,6 +74,7 @@ fn take_render_frame(control: AttachControl) -> String {
         AttachControl::InteractiveInput => panic!("expected a switch refresh"),
         AttachControl::Refresh => panic!("expected a switch refresh"),
         AttachControl::Overlay(_) => panic!("expected a switch refresh"),
+        AttachControl::CoalescedPopupOverlay(_) => panic!("expected a switch refresh"),
         AttachControl::Write(_) => panic!("expected a switch refresh"),
         AttachControl::ClipboardWrite { .. } => panic!("expected a switch refresh"),
         AttachControl::LockShellCommand(_) => panic!("expected a switch refresh"),
@@ -113,7 +119,17 @@ async fn recv_matching_attach_control(
     context: &str,
     matches: impl Fn(&AttachControl) -> bool,
 ) -> AttachControl {
-    tokio::time::timeout(ATTACH_LIFECYCLE_TIMEOUT, async {
+    recv_matching_attach_control_within(ATTACH_LIFECYCLE_TIMEOUT, control_rx, context, matches)
+        .await
+}
+
+async fn recv_matching_attach_control_within(
+    bound: Duration,
+    control_rx: &mut mpsc::UnboundedReceiver<AttachControl>,
+    context: &str,
+    matches: impl Fn(&AttachControl) -> bool,
+) -> AttachControl {
+    tokio::time::timeout(bound, async {
         while let Some(control) = control_rx.recv().await {
             if matches(&control) {
                 return control;
@@ -137,8 +153,8 @@ async fn create_attached_session(
         #[cfg(unix)]
         set_unix_test_shell(handler, session).await;
 
-        assert!(matches!(
-            handler
+        crate::session_fixture::assert_new_session(
+            &handler
                 .handle(Request::NewSession(NewSessionRequest {
                     session_name: session.clone(),
                     detached: true,
@@ -146,8 +162,7 @@ async fn create_attached_session(
                     environment: None,
                 }))
                 .await,
-            Response::NewSession(_)
-        ));
+        );
     }
     let (control_tx, control_rx) = mpsc::unbounded_channel();
     handler
@@ -172,8 +187,8 @@ async fn create_attached_session_in_utf8_locale(
     #[cfg(unix)]
     set_unix_test_shell(handler, session).await;
 
-    assert!(matches!(
-        handler
+    crate::session_fixture::assert_new_session(
+        &handler
             .handle(Request::NewSession(NewSessionRequest {
                 session_name: session.clone(),
                 detached: true,
@@ -181,8 +196,7 @@ async fn create_attached_session_in_utf8_locale(
                 environment: utf8_locale::fixture_environment(),
             }))
             .await,
-        Response::NewSession(_)
-    ));
+    );
     let (control_tx, control_rx) = mpsc::unbounded_channel();
     handler
         .register_attach(requester_pid, session.clone(), control_tx)
@@ -194,8 +208,8 @@ async fn create_attached_session_in_utf8_locale(
 async fn web_render_refreshes_are_marked_pending_before_building_switches() {
     let handler = RequestHandler::new();
     let session = session_name("web-refresh-coalesce");
-    assert!(matches!(
-        handler
+    crate::session_fixture::assert_new_session(
+        &handler
             .handle(Request::NewSession(NewSessionRequest {
                 session_name: session.clone(),
                 detached: true,
@@ -203,8 +217,7 @@ async fn web_render_refreshes_are_marked_pending_before_building_switches() {
                 environment: None,
             }))
             .await,
-        Response::NewSession(_)
-    ));
+    );
 
     let (control_tx, mut control_rx) = mpsc::unbounded_channel();
     let uid = current_owner_uid();
@@ -245,8 +258,8 @@ async fn web_render_refreshes_are_marked_pending_before_building_switches() {
 async fn refresh_attached_session_removes_clients_over_backlog_limit() {
     let handler = RequestHandler::new();
     let session = session_name("refresh-backlog");
-    assert!(matches!(
-        handler
+    crate::session_fixture::assert_new_session(
+        &handler
             .handle(Request::NewSession(NewSessionRequest {
                 session_name: session.clone(),
                 detached: true,
@@ -254,8 +267,7 @@ async fn refresh_attached_session_removes_clients_over_backlog_limit() {
                 environment: None,
             }))
             .await,
-        Response::NewSession(_)
-    ));
+    );
 
     let (control_tx, mut control_rx) = mpsc::unbounded_channel();
     let control_backlog = Arc::new(AtomicUsize::new(
@@ -778,7 +790,7 @@ async fn wait_for_dead_pane(
     window_index: u32,
     pane_index: u32,
 ) {
-    let deadline = tokio::time::Instant::now() + ATTACH_LIFECYCLE_TIMEOUT;
+    let deadline = tokio::time::Instant::now() + SERVER_SIGNAL_LIVENESS;
     loop {
         let exited = {
             let mut state = handler.state.lock().await;
@@ -829,17 +841,11 @@ async fn replace_transcript_contents(
             .transcript_handle(target)
             .expect("session transcript must exist")
     };
-    let history_limit = transcript
-        .lock()
-        .expect("pane transcript mutex must not be poisoned")
-        .history_limit();
+    let history_limit = transcript.lock().history_limit();
     let mut screen = Screen::new(size, history_limit);
     let mut parser = InputParser::new();
     parser.parse(content, &mut screen);
-    transcript
-        .lock()
-        .expect("pane transcript mutex must not be poisoned")
-        .set_screen_for_test(screen);
+    transcript.lock().set_screen_for_test(screen);
 }
 
 #[cfg(not(windows))]
@@ -851,6 +857,8 @@ mod lifecycle;
 
 #[path = "handler_attach_tests/attached_help.rs"]
 mod attached_help;
+#[path = "handler_attach_tests/attached_help_close.rs"]
+mod attached_help_close;
 #[path = "handler_attach_tests/prefix_navigation.rs"]
 mod prefix_navigation;
 
@@ -858,6 +866,7 @@ mod prefix_navigation;
 mod display_panes;
 #[path = "handler_attach_tests/display_panes_identity.rs"]
 mod display_panes_identity;
+mod poll_frames;
 
 #[path = "handler_attach_tests/copy_mode_keys.rs"]
 mod copy_mode_keys;
@@ -882,6 +891,11 @@ mod attach_mutations;
 
 #[path = "handler_attach_tests/attach_render.rs"]
 mod attach_render;
+
+#[path = "handler_attach_tests/attach_explicit_target.rs"]
+mod attach_explicit_target;
+#[path = "handler_attach_tests/empty_attach.rs"]
+mod empty_attach;
 
 #[path = "handler_attach_tests/attaching_identity.rs"]
 mod attaching_identity;

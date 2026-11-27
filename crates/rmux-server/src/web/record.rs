@@ -15,6 +15,8 @@ use super::pairing::WebSharePairingCodes;
 use super::secrets::SecretHash;
 use super::tunnel::TunnelHandle;
 
+mod access_debug;
+
 const DEFAULT_LOCAL_WEBSOCKET_ENDPOINT: &str = "ws://127.0.0.1:9777/share";
 pub(crate) const OPERATOR_LIMIT_ERROR: &str = "web-share operator limit reached";
 pub(crate) const SPECTATOR_LIMIT_ERROR: &str = "web-share spectator limit reached";
@@ -295,7 +297,6 @@ impl WebShareRevokeReason {
     }
 }
 
-#[derive(Debug)]
 pub(crate) struct WebShareAccess {
     allow_loopback_development_origins: bool,
     expected_origin: String,

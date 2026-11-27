@@ -1,168 +1,26 @@
+mod attach;
+mod key_event;
+
 use std::io;
-use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle};
+use std::os::windows::io::AsRawHandle;
 use std::sync::Mutex;
 use std::time::Duration;
 
-use windows_sys::Win32::Foundation::{
-    GetLastError, ERROR_ACCESS_DENIED, GENERIC_READ, GENERIC_WRITE, HANDLE, INVALID_HANDLE_VALUE,
-};
-use windows_sys::Win32::Storage::FileSystem::{
-    CreateFileW, FILE_ATTRIBUTE_NORMAL, FILE_SHARE_READ, FILE_SHARE_WRITE, OPEN_EXISTING,
-};
+use windows_sys::Win32::Foundation::{GetLastError, HANDLE};
 use windows_sys::Win32::System::Console::{
-    AttachConsole, FreeConsole, GenerateConsoleCtrlEvent, GetConsoleMode, SetConsoleCtrlHandler,
-    WriteConsoleInputW, COORD, CTRL_C_EVENT, ENABLE_PROCESSED_INPUT, FROM_LEFT_1ST_BUTTON_PRESSED,
-    INPUT_RECORD, INPUT_RECORD_0, KEY_EVENT, KEY_EVENT_RECORD, KEY_EVENT_RECORD_0, MOUSE_EVENT,
-    MOUSE_EVENT_RECORD, MOUSE_MOVED,
+    GenerateConsoleCtrlEvent, GetConsoleMode, WriteConsoleInputW, COORD, CTRL_C_EVENT,
+    ENABLE_PROCESSED_INPUT, FROM_LEFT_1ST_BUTTON_PRESSED, INPUT_RECORD, INPUT_RECORD_0, KEY_EVENT,
+    KEY_EVENT_RECORD, KEY_EVENT_RECORD_0, MOUSE_EVENT, MOUSE_EVENT_RECORD, MOUSE_MOVED,
 };
 
 use crate::ProcessId;
+use attach::{attach_to_process_console, open_console_input};
+pub use key_event::WindowsConsoleKeyEvent;
 
 static CONSOLE_ATTACH_LOCK: Mutex<()> = Mutex::new(());
 const LEFT_CTRL_PRESSED: u32 = 0x0008;
 const CONSOLE_TEXT_KEY_BATCH: usize = 2048;
 const VK_PACKET: u16 = 0x00e7;
-
-/// A Windows console keyboard event that can be injected into a ConPTY child.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct WindowsConsoleKeyEvent {
-    virtual_key_code: u16,
-    virtual_scan_code: u16,
-    unicode_char: u16,
-    control_key_state: u32,
-    repeat_count: u16,
-}
-
-impl WindowsConsoleKeyEvent {
-    /// Creates a key event from the fields of a Windows `KEY_EVENT_RECORD`.
-    #[must_use]
-    pub const fn new(
-        virtual_key_code: u16,
-        virtual_scan_code: u16,
-        unicode_char: u16,
-        control_key_state: u32,
-        repeat_count: u16,
-    ) -> Self {
-        Self {
-            virtual_key_code,
-            virtual_scan_code,
-            unicode_char,
-            control_key_state,
-            repeat_count,
-        }
-    }
-
-    /// Creates a Ctrl-C keyboard event.
-    #[must_use]
-    pub const fn ctrl_c() -> Self {
-        Self::new(b'C' as u16, 0x2e, 0x03, LEFT_CTRL_PRESSED, 1)
-    }
-
-    /// Creates a Ctrl-D keyboard event.
-    #[must_use]
-    pub const fn ctrl_d() -> Self {
-        Self::new(b'D' as u16, 0x20, 0x04, LEFT_CTRL_PRESSED, 1)
-    }
-
-    /// Creates a Ctrl-D event carrying the POSIX EOT byte.
-    #[must_use]
-    pub const fn ctrl_d_eot() -> Self {
-        Self::new(b'D' as u16, 0, 0x04, LEFT_CTRL_PRESSED, 1)
-    }
-
-    /// Creates a Ctrl-Z keyboard event.
-    #[must_use]
-    pub const fn ctrl_z() -> Self {
-        Self::new(b'Z' as u16, 0x2c, 0x1a, LEFT_CTRL_PRESSED, 1)
-    }
-
-    /// Creates a Ctrl-letter keyboard event for an ASCII letter.
-    #[must_use]
-    pub const fn ctrl_letter(letter: u8) -> Option<Self> {
-        if letter >= b'A' && letter <= b'Z' {
-            Some(Self::new(
-                letter as u16,
-                ctrl_letter_scan_code(letter),
-                (letter - b'A' + 1) as u16,
-                LEFT_CTRL_PRESSED,
-                1,
-            ))
-        } else {
-            None
-        }
-    }
-
-    /// Returns the same key event with an adjusted repeat count.
-    #[must_use]
-    pub const fn with_repeat_count(self, repeat_count: u16) -> Self {
-        Self {
-            repeat_count,
-            ..self
-        }
-    }
-
-    /// Returns the Windows virtual-key code.
-    #[must_use]
-    pub const fn virtual_key_code(self) -> u16 {
-        self.virtual_key_code
-    }
-
-    /// Returns the Windows virtual scan code.
-    #[must_use]
-    pub const fn virtual_scan_code(self) -> u16 {
-        self.virtual_scan_code
-    }
-
-    /// Returns the UTF-16 character reported by the key event.
-    #[must_use]
-    pub const fn unicode_char(self) -> u16 {
-        self.unicode_char
-    }
-
-    /// Returns the Windows control-key-state bitset.
-    #[must_use]
-    pub const fn control_key_state(self) -> u32 {
-        self.control_key_state
-    }
-
-    /// Returns the Windows key repeat count.
-    #[must_use]
-    pub const fn repeat_count(self) -> u16 {
-        self.repeat_count
-    }
-}
-
-const fn ctrl_letter_scan_code(letter: u8) -> u16 {
-    match letter {
-        b'A' => 0x1e,
-        b'B' => 0x30,
-        b'C' => 0x2e,
-        b'D' => 0x20,
-        b'E' => 0x12,
-        b'F' => 0x21,
-        b'G' => 0x22,
-        b'H' => 0x23,
-        b'I' => 0x17,
-        b'J' => 0x24,
-        b'K' => 0x25,
-        b'L' => 0x26,
-        b'M' => 0x32,
-        b'N' => 0x31,
-        b'O' => 0x18,
-        b'P' => 0x19,
-        b'Q' => 0x10,
-        b'R' => 0x13,
-        b'S' => 0x1f,
-        b'T' => 0x14,
-        b'U' => 0x16,
-        b'V' => 0x2f,
-        b'W' => 0x11,
-        b'X' => 0x2d,
-        b'Y' => 0x15,
-        b'Z' => 0x2c,
-        _ => 0,
-    }
-}
 
 /// Writes a Windows console key press/release pair into a ConPTY child console.
 ///
@@ -561,69 +419,6 @@ fn trace_windows_ctrl_d_mode(mode: u32, suppress: bool) {
     );
 }
 
-fn attach_to_process_console(process_id: ProcessId) -> io::Result<ConsoleAttachment> {
-    if try_attach_console(process_id.as_u32()) {
-        return ConsoleAttachment::protect_current_process();
-    }
-    let first_error = last_os_error();
-    if first_error.raw_os_error() != Some(ERROR_ACCESS_DENIED as i32) {
-        return Err(first_error);
-    }
-
-    let _ = unsafe {
-        // SAFETY: FreeConsole only affects the current process console
-        // attachment. It is required before attaching to a different console.
-        FreeConsole()
-    };
-    if try_attach_console(process_id.as_u32()) {
-        return ConsoleAttachment::protect_current_process();
-    }
-    Err(last_os_error())
-}
-
-fn try_attach_console(process_id: u32) -> bool {
-    let ok = unsafe {
-        // SAFETY: AttachConsole validates the process id. On success, the
-        // current process is attached until FreeConsole is called.
-        AttachConsole(process_id)
-    };
-    ok != 0
-}
-
-fn open_console_input() -> io::Result<OwnedHandle> {
-    const CONIN: [u16; 7] = [
-        b'C' as u16,
-        b'O' as u16,
-        b'N' as u16,
-        b'I' as u16,
-        b'N' as u16,
-        b'$' as u16,
-        0,
-    ];
-    let handle = unsafe {
-        // SAFETY: `CONIN` is a NUL-terminated UTF-16 device name and all other
-        // pointer arguments are null by design.
-        CreateFileW(
-            CONIN.as_ptr(),
-            GENERIC_READ | GENERIC_WRITE,
-            FILE_SHARE_READ | FILE_SHARE_WRITE,
-            std::ptr::null(),
-            OPEN_EXISTING,
-            FILE_ATTRIBUTE_NORMAL,
-            std::ptr::null_mut(),
-        )
-    };
-    if handle.is_null() || handle == INVALID_HANDLE_VALUE {
-        return Err(last_os_error());
-    }
-    let handle = unsafe {
-        // SAFETY: CreateFileW returned a non-null owned handle that is
-        // transferred exactly once into OwnedHandle.
-        OwnedHandle::from_raw_handle(handle as _)
-    };
-    Ok(handle)
-}
-
 fn key_event_records(key: WindowsConsoleKeyEvent) -> [INPUT_RECORD; 2] {
     [
         key_input_record(key, true),
@@ -675,73 +470,6 @@ fn mouse_input_record(x: i16, y: i16, button_state: u32, event_flags: u32) -> IN
             },
         },
     }
-}
-
-struct ConsoleAttachment {
-    // This field is deliberately retained until after `FreeConsole` runs in
-    // `Drop`. Console-control delivery is asynchronous, so removing the ignore
-    // handler while RMUX is still attached creates a window where the pane's
-    // CTRL_C_EVENT can terminate the daemon itself.
-    _ignore_console_control: ConsoleControlIgnoreGuard,
-}
-
-impl ConsoleAttachment {
-    fn protect_current_process() -> io::Result<Self> {
-        match ConsoleControlIgnoreGuard::install() {
-            Ok(ignore_console_control) => Ok(Self {
-                _ignore_console_control: ignore_console_control,
-            }),
-            Err(error) => {
-                let _ = unsafe {
-                    // SAFETY: AttachConsole just succeeded, so this rolls back
-                    // that process-wide attachment before returning the error.
-                    FreeConsole()
-                };
-                Err(error)
-            }
-        }
-    }
-}
-
-impl Drop for ConsoleAttachment {
-    fn drop(&mut self) {
-        let _ = unsafe {
-            // SAFETY: This releases any console attachment owned by the current process.
-            FreeConsole()
-        };
-        // Struct fields are dropped after this method returns, so the ignore
-        // guard remains installed through the detach above.
-    }
-}
-
-struct ConsoleControlIgnoreGuard;
-
-impl ConsoleControlIgnoreGuard {
-    fn install() -> io::Result<Self> {
-        let ok = unsafe {
-            // SAFETY: The handler is a static function with the required ABI.
-            // The lock above serializes the short process-wide window.
-            SetConsoleCtrlHandler(Some(ignore_console_control_event), 1)
-        };
-        if ok == 0 {
-            return Err(last_os_error());
-        }
-        Ok(Self)
-    }
-}
-
-impl Drop for ConsoleControlIgnoreGuard {
-    fn drop(&mut self) {
-        let _ = unsafe {
-            // SAFETY: This removes the process control handler installed by
-            // `install`; failure during drop is not recoverable here.
-            SetConsoleCtrlHandler(Some(ignore_console_control_event), 0)
-        };
-    }
-}
-
-unsafe extern "system" fn ignore_console_control_event(_control_type: u32) -> i32 {
-    1
 }
 
 fn last_os_error() -> io::Error {

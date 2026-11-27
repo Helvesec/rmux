@@ -282,6 +282,57 @@ fn split_size_on_non_last_pane_preserves_unrelated_neighbour_like_tmux() {
     );
 }
 
+/// `split-window -b -l` sizes the new pane inside the cell of the pane it
+/// split, as tmux 3.7b does: the pane above that cell keeps its rows, and a
+/// size the cell cannot hold leaves the new pane where tmux 3.7b leaves it
+/// (`saved_size - size - 1` in unsigned arithmetic, then bounded).
+#[test]
+fn split_before_size_stays_inside_the_split_cell_like_tmux() {
+    // Requested rows, then (new pane rows, split target rows) measured on
+    // tmux 3.7b for `split-window -b -l N` of an 80x11 pane.
+    for (requested, new_rows, target_rows) in [
+        (1, 1, 9),
+        (5, 5, 5),
+        (9, 9, 1),
+        (10, 9, 1),
+        (11, 1, 9),
+        (20, 1, 9),
+    ] {
+        let mut session = Session::new(session_name("alpha"), TerminalSize { cols: 80, rows: 24 });
+        session
+            .split_active_pane_with_direction(SplitDirection::Horizontal)
+            .expect("first split succeeds");
+        let new_index = session
+            .split_pane_in_window_with_direction_before(0, 1, SplitDirection::Horizontal, true)
+            .expect("split before pane 1 succeeds");
+        session
+            .resize_new_split_pane_to_in_window(
+                0,
+                new_index,
+                SplitDirection::Horizontal,
+                requested,
+                true,
+            )
+            .expect("new split can be sized");
+
+        let geometries = session
+            .window()
+            .panes()
+            .iter()
+            .map(|pane| pane.geometry())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            geometries,
+            [
+                PaneGeometry::new(0, 0, 80, 12),
+                PaneGeometry::new(0, 13, 80, new_rows),
+                PaneGeometry::new(0, 14 + new_rows, 80, target_rows),
+            ],
+            "-b -l {requested}"
+        );
+    }
+}
+
 #[test]
 fn resize_pane_rejects_nonexistent_pane_index() {
     let mut session = Session::new(
@@ -299,6 +350,26 @@ fn resize_pane_rejects_nonexistent_pane_index() {
     assert_eq!(
         error,
         RmuxError::invalid_target("alpha:0.9", "pane index does not exist in session")
+    );
+}
+
+#[test]
+fn resize_pane_rejects_nonexistent_window_before_pane_index() {
+    let mut session = Session::new(
+        session_name("alpha"),
+        TerminalSize {
+            cols: 120,
+            rows: 40,
+        },
+    );
+
+    let error = session
+        .resize_pane_in_window(5, 9, ResizePaneAdjustment::AbsoluteWidth { columns: 34 })
+        .expect_err("window does not exist");
+
+    assert_eq!(
+        error,
+        RmuxError::invalid_target("alpha:5", "window index does not exist in session")
     );
 }
 

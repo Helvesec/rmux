@@ -7,7 +7,8 @@ use std::fs;
 use std::thread;
 use std::time::Duration;
 
-use common::{assert_success, CliHarness};
+use common::{assert_success, AttachedSession, CliHarness};
+use rmux_pty::TerminalSize;
 
 const DEFAULT_ITERATIONS: usize = 50;
 const MAX_FD_DRIFT: i64 = 8;
@@ -75,6 +76,74 @@ fn assert_status_ok(output: &std::process::Output) {
         String::from_utf8_lossy(&output.stdout),
         String::from_utf8_lossy(&output.stderr)
     );
+}
+
+const ISSUE_37_CYCLES: usize = 20;
+const ISSUE_37_SETTLE: Duration = Duration::from_secs(10);
+
+/// issue #37: an attached daemon under the reported pane churn (short-lived
+/// pane commands, `respawn-pane -k`, split then kill) must hold exactly one
+/// `/dev/ptmx` descriptor per live pane, instead of accumulating thousands.
+#[test]
+fn issue_37_attached_pane_churn_holds_one_ptmx_per_live_pane() -> Result<(), Box<dyn Error>> {
+    let harness = CliHarness::new("issue-37-ptmx-churn")?;
+    let daemon = harness.start_hidden_daemon()?;
+    let pid = daemon.pid();
+    assert_success(&harness.run(&[
+        "new-session",
+        "-d",
+        "-s",
+        "churn",
+        "-x",
+        "80",
+        "-y",
+        "24",
+        "--",
+        "/bin/sh",
+    ])?);
+    let _attached = AttachedSession::spawn(&harness, "churn", TerminalSize { cols: 80, rows: 24 })?;
+
+    for _ in 0..ISSUE_37_CYCLES {
+        assert_success(&harness.run(&["split-window", "-d", "-t", "churn:0.0", "true"])?);
+        assert_success(&harness.run(&["new-window", "-d", "-t", "churn", "sleep 0.1"])?);
+        assert_success(&harness.run(&["respawn-pane", "-k", "-t", "churn:0.0"])?);
+        assert_success(&harness.run(&["split-window", "-d", "-t", "churn:0.0"])?);
+        assert_success(&harness.run(&["kill-pane", "-t", "churn:0.1"])?);
+    }
+
+    let deadline = std::time::Instant::now() + ISSUE_37_SETTLE;
+    loop {
+        let panes = live_pane_count(&harness)?;
+        let ptmx = ptmx_descriptor_count(pid)?;
+        if ptmx == panes {
+            return Ok(());
+        }
+        if std::time::Instant::now() >= deadline {
+            return Err(format!(
+                "daemon holds {ptmx} /dev/ptmx descriptors for {panes} live panes after {ISSUE_37_CYCLES} churn cycles"
+            )
+            .into());
+        }
+        thread::sleep(Duration::from_millis(100));
+    }
+}
+
+fn live_pane_count(harness: &CliHarness) -> Result<usize, Box<dyn Error>> {
+    let output = harness.run(&["list-panes", "-a", "-F", "#{pane_id}"])?;
+    assert_status_ok(&output);
+    Ok(String::from_utf8_lossy(&output.stdout).lines().count())
+}
+
+fn ptmx_descriptor_count(pid: u32) -> Result<usize, Box<dyn Error>> {
+    let mut count = 0;
+    for entry in fs::read_dir(format!("/proc/{pid}/fd"))? {
+        if let Ok(target) = fs::read_link(entry?.path()) {
+            if target == std::path::Path::new("/dev/ptmx") {
+                count += 1;
+            }
+        }
+    }
+    Ok(count)
 }
 
 #[derive(Debug)]

@@ -12,14 +12,7 @@ pub(super) fn border_layout_cells_with_geometry(
     geometry: StatusGeometry,
     indicators_colour: bool,
 ) -> Vec<BorderLayoutCell> {
-    let size = geometry.content_size();
     let panes = window.panes();
-    if panes.len() <= 1 || size.cols == 0 || size.rows == 0 {
-        return Vec::new();
-    }
-
-    let mut vertical_segments = Vec::new();
-    let mut horizontal_segments = Vec::new();
     let pane_geometries = panes
         .iter()
         .map(|pane| {
@@ -29,6 +22,27 @@ pub(super) fn border_layout_cells_with_geometry(
             )
         })
         .collect::<Vec<_>>();
+    border_layout_cells_for_geometries(
+        &pane_geometries,
+        active_pane_index,
+        geometry,
+        indicators_colour,
+    )
+}
+
+pub(super) fn border_layout_cells_for_geometries(
+    pane_geometries: &[(u32, PaneGeometry)],
+    active_pane_index: u32,
+    geometry: StatusGeometry,
+    indicators_colour: bool,
+) -> Vec<BorderLayoutCell> {
+    let size = geometry.content_size();
+    if pane_geometries.len() <= 1 || size.cols == 0 || size.rows == 0 {
+        return Vec::new();
+    }
+
+    let mut vertical_segments = Vec::new();
+    let mut horizontal_segments = Vec::new();
 
     for (index, (left_index, left_geometry)) in pane_geometries.iter().enumerate() {
         for (right_index, right_geometry) in pane_geometries.iter().skip(index + 1) {
@@ -117,7 +131,7 @@ pub(super) fn border_layout_cells_with_geometry(
                 x,
                 y,
                 &cell.adjacent_panes,
-                &pane_geometries,
+                pane_geometries,
                 active_pane_index,
                 indicators_colour,
             );

@@ -4,6 +4,43 @@ use crate::style::{style_parse, Style, StyleCell};
 use super::Screen;
 
 impl Screen {
+    /// Applies a presentation palette without changing the captured source grid.
+    pub fn overlay_colour_palette(&mut self, entries: &[(u32, i32)]) {
+        use crate::grid::GridCellFlags;
+        use crate::input::COLOUR_FLAG_256;
+        let mut palette = [None; 256];
+        for &(index, colour) in entries {
+            if let Some(slot) = palette.get_mut(index as usize) {
+                *slot = Some(colour);
+            }
+        }
+        let resolve = |colour: i32| {
+            let index = match colour {
+                0..=7 => colour as usize,
+                90..=97 => (colour - 82) as usize,
+                value if value & COLOUR_FLAG_256 != 0 => (value & 255) as usize,
+                _ => return colour,
+            };
+            palette[index].unwrap_or(colour)
+        };
+        let width = self.grid.sx();
+        for y in 0..self.grid.sy() {
+            let Some(line) = self.grid.visible_line_mut(y) else {
+                continue;
+            };
+            for x in 0..width {
+                let Some(cell) = line.cell_mut(x) else {
+                    continue;
+                };
+                if cell.flags().contains(GridCellFlags::NOPALETTE) {
+                    continue;
+                }
+                cell.set_fg(resolve(cell.fg()));
+                cell.set_bg(resolve(cell.bg()));
+                cell.set_us(resolve(cell.us()));
+            }
+        }
+    }
     /// Applies `style_input` only where the application left cell styling unset.
     pub fn overlay_style_on_default_cells(&mut self, style_input: &str) {
         let Some(style) = default_cell_overlay(style_input) else {

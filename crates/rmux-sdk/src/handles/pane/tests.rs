@@ -362,25 +362,25 @@ fn pane_ref_target_selector_recognizes_session_invalidation() {
 #[test]
 fn is_already_closed_error_matches_session_not_found_for_target_session() {
     let target = PaneRef::new(rmux_proto::SessionName::new("alpha").unwrap(), 0, 0);
-    let error = RmuxError::protocol(rmux_proto::RmuxError::SessionNotFound("alpha".to_owned()));
+    let error = RmuxError::from_proto(rmux_proto::RmuxError::SessionNotFound("alpha".to_owned()));
     assert!(is_already_closed_error(&error, &target));
 }
 
 #[test]
 fn is_already_closed_error_does_not_match_session_not_found_for_other_session() {
     let target = PaneRef::new(rmux_proto::SessionName::new("alpha").unwrap(), 0, 0);
-    let error = RmuxError::protocol(rmux_proto::RmuxError::SessionNotFound("beta".to_owned()));
+    let error = RmuxError::from_proto(rmux_proto::RmuxError::SessionNotFound("beta".to_owned()));
     assert!(!is_already_closed_error(&error, &target));
 }
 
 #[test]
 fn is_already_closed_error_matches_invalid_window_or_pane_target() {
     let target = PaneRef::new(rmux_proto::SessionName::new("alpha").unwrap(), 5, 2);
-    let pane_invalid = RmuxError::protocol(rmux_proto::RmuxError::InvalidTarget {
+    let pane_invalid = RmuxError::from_proto(rmux_proto::RmuxError::InvalidTarget {
         value: "alpha:5.2".to_owned(),
         reason: "pane index does not exist in session".to_owned(),
     });
-    let window_invalid = RmuxError::protocol(rmux_proto::RmuxError::InvalidTarget {
+    let window_invalid = RmuxError::from_proto(rmux_proto::RmuxError::InvalidTarget {
         value: "alpha:5".to_owned(),
         reason: "window index does not exist in session".to_owned(),
     });
@@ -391,7 +391,7 @@ fn is_already_closed_error_matches_invalid_window_or_pane_target() {
 #[test]
 fn is_already_closed_error_ignores_unrelated_protocol_errors() {
     let target = PaneRef::new(rmux_proto::SessionName::new("alpha").unwrap(), 0, 0);
-    let error = RmuxError::protocol(rmux_proto::RmuxError::Server(
+    let error = RmuxError::from_proto(rmux_proto::RmuxError::Server(
         "daemon malfunction".to_owned(),
     ));
     assert!(!is_already_closed_error(&error, &target));
@@ -400,7 +400,7 @@ fn is_already_closed_error_ignores_unrelated_protocol_errors() {
 #[test]
 fn is_already_closed_error_ignores_invalid_target_for_other_slot() {
     let target = PaneRef::new(rmux_proto::SessionName::new("alpha").unwrap(), 5, 2);
-    let foreign = RmuxError::protocol(rmux_proto::RmuxError::InvalidTarget {
+    let foreign = RmuxError::from_proto(rmux_proto::RmuxError::InvalidTarget {
         value: "beta:0.0".to_owned(),
         reason: "pane index does not exist in session".to_owned(),
     });
@@ -645,3 +645,5 @@ fn snapshot_from_response_rejects_malformed_wire_shape() {
         "unexpected error: {error}"
     );
 }
+
+mod inert_lifecycle;

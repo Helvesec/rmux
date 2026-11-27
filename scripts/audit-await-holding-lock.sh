@@ -7,8 +7,8 @@ cd "$repo_root"
 echo "[await-lock-audit] clippy server default features"
 cargo clippy -p rmux-server --all-targets --locked -- -D warnings -D clippy::await_holding_lock
 
-echo "[await-lock-audit] clippy server perf-instrument feature"
-cargo clippy -p rmux-server --features perf-instrument --all-targets --locked -- -D warnings -D clippy::await_holding_lock
+echo "[await-lock-audit] clippy server all features (web and fuzzing)"
+cargo clippy -p rmux-server --all-features --all-targets --locked -- -D warnings -D clippy::await_holding_lock
 
 echo "[await-lock-audit] checking deferred lock-map crates stay out of rmux-server/src"
 if grep -R -n -E 'DashMap|parking_lot::' crates/rmux-server/src; then

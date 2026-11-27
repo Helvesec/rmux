@@ -783,3 +783,5 @@ mod tests {
         assert!(gap.recent_snapshot().is_empty());
     }
 }
+
+mod cursor_retention;

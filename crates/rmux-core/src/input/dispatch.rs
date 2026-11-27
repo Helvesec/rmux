@@ -66,6 +66,7 @@ pub(crate) fn dispatch_esc<W: ScreenWriter + ?Sized>(parser: &mut InputParser, w
         EscCommand::Ris => {
             parser.cell.reset();
             writer.full_reset();
+            parser.theme_event(super::ThemeAction::Subscribe(false));
         }
         EscCommand::Ind => {
             let bg = parser.cell.cell.bg;
@@ -288,16 +289,17 @@ pub(crate) fn dispatch_csi<W: ScreenWriter + ?Sized>(parser: &mut InputParser, w
                 }
             }
         }
-        CsiCommand::Da => {
-            match parser.param_list.get(0, 0, 0) {
-                0 => {
-                    // DA primary: VT100 with AVO.
-                    parser.reply("\x1b[?1;2c");
-                }
-                -1 => {}
-                _ => {}
+        CsiCommand::Da => match parser.param_list.get(0, 0, 0) {
+            0 => {
+                parser.reply(if writer.sixel_passthrough_available() {
+                    "\x1b[?1;2;4c"
+                } else {
+                    "\x1b[?1;2c"
+                });
             }
-        }
+            -1 => {}
+            _ => {}
+        },
         CsiCommand::DaTwo => {
             match parser.param_list.get(0, 0, 0) {
                 0 => {
@@ -326,51 +328,12 @@ pub(crate) fn dispatch_csi<W: ScreenWriter + ?Sized>(parser: &mut InputParser, w
             }
         }
         CsiCommand::DsrPrivate => {
-            // Private DSR: theme query etc. — server-level concerns.
-            // For now, no-op.
+            if parser.param_list.get(0, 0, 0) == 996 {
+                parser.theme_event(super::ThemeAction::Query);
+            }
         }
-        CsiCommand::QueryPrivate => {
-            // DECRPM query — server-level concern, requires option access.
-            // Surface the query for the server to handle.
-            let param = parser.param_list.get(0, 0, 0);
-            let mode_val = writer.current_mode();
-            let reply = match param {
-                1004 => {
-                    let n = if mode_val & mode::MODE_FOCUSON != 0 {
-                        1
-                    } else {
-                        2
-                    };
-                    format!("\x1b[?1004;{n}$y")
-                }
-                1006 => {
-                    let n = if mode_val & mode::MODE_MOUSE_SGR != 0 {
-                        1
-                    } else {
-                        2
-                    };
-                    format!("\x1b[?1006;{n}$y")
-                }
-                2004 => {
-                    let n = if mode_val & mode::MODE_BRACKETPASTE != 0 {
-                        1
-                    } else {
-                        2
-                    };
-                    format!("\x1b[?2004;{n}$y")
-                }
-                2026 => {
-                    let n = if mode_val & mode::MODE_SYNC != 0 {
-                        1
-                    } else {
-                        2
-                    };
-                    format!("\x1b[?2026;{n}$y")
-                }
-                2031 => "\x1b[?2031;2$y".to_owned(),
-                _ => return,
-            };
-            parser.reply(&reply);
+        CsiCommand::Query | CsiCommand::QueryPrivate => {
+            super::mode_query::dispatch(parser, writer, cmd == CsiCommand::QueryPrivate);
         }
         CsiCommand::Decstbm => {
             let n = parser.param_list.get(0, 1, 1);
@@ -392,27 +355,28 @@ pub(crate) fn dispatch_csi<W: ScreenWriter + ?Sized>(parser: &mut InputParser, w
         CsiCommand::RmPrivate => dispatch_rm_private(parser, writer),
         CsiCommand::Sgr => sgr::dispatch_sgr(parser),
         CsiCommand::SmGraphics => {
-            // Graphics mode query — typically needs sixel support.
-            // Deferred to Milestone 30.
+            super::graphics_query::dispatch(parser, writer);
         }
         CsiCommand::Modset => {
             let n = parser.param_list.get(0, 0, 0);
             if n != 4 {
                 return;
             }
+            let policy = writer.extended_key_policy();
+            if policy == super::ExtendedKeyPolicy::Off {
+                return;
+            }
             let m = parser.param_list.get(1, 0, 0);
             writer.mode_clear(mode::EXTENDED_KEY_MODES);
             match m {
                 2 => writer.mode_set(mode::MODE_KEYS_EXTENDED_2),
-                1 => writer.mode_set(mode::MODE_KEYS_EXTENDED),
+                _ if m == 1 || policy == super::ExtendedKeyPolicy::Always => {
+                    writer.mode_set(mode::MODE_KEYS_EXTENDED)
+                }
                 _ => {}
             }
         }
-        // RMUX 0.9 does not implement the complete Kitty keyboard protocol.
-        // Consume every negotiation form without replying or changing the
-        // pane's key mode: accepting Set/Push while ignoring Query advertises
-        // a partial protocol that applications cannot use losslessly, and Pop
-        // must not clear an independently enabled xterm extended-key mode.
+        // Handled before the legacy signed parameter parser above.
         CsiCommand::KittyKeyboardSet
         | CsiCommand::KittyKeyboardPush
         | CsiCommand::KittyKeyboardPop
@@ -423,6 +387,9 @@ pub(crate) fn dispatch_csi<W: ScreenWriter + ?Sized>(parser: &mut InputParser, w
                 return;
             }
             writer.mode_clear(mode::EXTENDED_KEY_MODES);
+            if writer.extended_key_policy() == super::ExtendedKeyPolicy::Always {
+                writer.mode_set(mode::MODE_KEYS_EXTENDED);
+            }
         }
         CsiCommand::Scp => {
             // Save cursor position.
@@ -443,11 +410,16 @@ pub(crate) fn dispatch_csi<W: ScreenWriter + ?Sized>(parser: &mut InputParser, w
         }
         CsiCommand::Decscusr => {
             let n = parser.param_list.get(0, 0, 0);
-            if n != -1 {
+            if (0..=6).contains(&n) {
                 writer.set_cursor_style(n as u32);
-                if n == 0 {
-                    // Go back to default blinking state.
-                    writer.mode_clear(mode::MODE_CURSOR_BLINKING_SET);
+                // DECSCUSR carries its own blink parity, so it supersedes an
+                // earlier DECSET/DECRST 12 override even for style zero.
+                writer.mode_clear(mode::MODE_CURSOR_BLINKING_SET);
+                // A raw reset would use the viewer's terminal default instead
+                // of this pane's configured default. Signal consumption even
+                // when the application style was already zero.
+                if n == 0 && writer.resolved_cursor_state().style() != 0 {
+                    parser.recovery_rebase_required = true;
                 }
             }
         }
@@ -491,6 +463,7 @@ pub(crate) fn dispatch_osc<W: ScreenWriter + ?Sized>(parser: &mut InputParser, w
     // Owned: the OSC 10/11/12 arms below mutate parser state (stored colours
     // and the reply buffer) while the payload is still in use.
     let data = String::from_utf8_lossy(&buf[i..]).into_owned();
+    let input_len = buf.len();
     let end = parser.input_end;
 
     match option {
@@ -509,6 +482,11 @@ pub(crate) fn dispatch_osc<W: ScreenWriter + ?Sized>(parser: &mut InputParser, w
         11 if !answer_osc_colour_query(parser, OscColourSlot::Background, &data, end) => {
             parser.set_osc_colour(OscColourSlot::Background, &data);
             writer.osc_bg_colour(&data, end);
+            parser.theme_event(super::ThemeAction::Background(
+                parser
+                    .osc_colour(OscColourSlot::Background)
+                    .map(str::to_owned),
+            ));
         }
         12 if !answer_osc_colour_query(parser, OscColourSlot::Cursor, &data, end) => {
             parser.set_osc_colour(OscColourSlot::Cursor, &data);
@@ -523,12 +501,16 @@ pub(crate) fn dispatch_osc<W: ScreenWriter + ?Sized>(parser: &mut InputParser, w
         111 => {
             parser.reset_osc_colour(OscColourSlot::Background);
             writer.osc_reset_bg();
+            parser.theme_event(super::ThemeAction::Background(None));
         }
         112 => {
             parser.reset_osc_colour(OscColourSlot::Cursor);
             writer.osc_reset_cursor();
         }
-        133 => writer.osc_shell_integration(&data),
+        133 => parser.dispatch_shell_integration(&data, writer),
+        7501 if writer.supports_program_status() => {
+            parser.dispatch_program_status(input_len, &data, end, writer);
+        }
         _ => {}
     }
 }
@@ -538,9 +520,24 @@ pub(crate) fn dispatch_osc<W: ScreenWriter + ?Sized>(parser: &mut InputParser, w
 pub(crate) fn dispatch_dcs<W: ScreenWriter + ?Sized>(parser: &mut InputParser, writer: &mut W) {
     let buf = &parser.input_buf;
 
+    if parser.interm_len == 0 && parser.param_len == 0 {
+        if let Some(columns) = crate::recovery_row::parse_written_extent(buf) {
+            writer.restore_recovery_written_columns(columns);
+            return;
+        }
+    }
+
     // DECRQSS: intermediate '$', first byte 'q'.
     if parser.interm_len == 1 && parser.interm_buf[0] == b'$' && !buf.is_empty() && buf[0] == b'q' {
-        parser.reply("\x1bP0$r\x1b\\"); // Not recognized.
+        if parser.param_len == 0 && buf == b"q q" {
+            // DECSCUSR cannot encode blink without a known shape: retain Ps=0
+            // in that case, rather than inventing a block cursor. Configured
+            // shapes already include effective blink parity in this state.
+            let style = writer.resolved_cursor_state().style();
+            parser.reply(&format!("\x1bP1$r{style} q\x1b\\"));
+        } else {
+            parser.reply("\x1bP0$r\x1b\\");
+        }
         return;
     }
 
@@ -561,10 +558,9 @@ pub(crate) fn dispatch_dcs<W: ScreenWriter + ?Sized>(parser: &mut InputParser, w
     }
 }
 
-/// Answers an OSC 10/11/12 colour query only when the application previously
-/// set that exact per-pane slot. RMUX cannot observe the attached terminal's
-/// palette, so an unknown value must remain unanswered rather than
-/// impersonating a confidently wrong theme. Returns false for set-colour
+/// Answers OSC queries from the current control report (fg/bg) or the
+/// application-defined slot. Unknown values stay unanswered. Report overrides
+/// never alter the underlying application state. Returns false for set-colour
 /// payloads, which callers handle as before.
 fn answer_osc_colour_query(
     parser: &mut InputParser,
@@ -576,7 +572,13 @@ fn answer_osc_colour_query(
         return false;
     }
 
-    if let Some(colour) = parser.osc_colour(slot) {
+    let reported = parser
+        .query_colours
+        .get(slot.index())
+        .copied()
+        .flatten()
+        .map(|[r, g, b]| format!("rgb:{r:02x}{r:02x}/{g:02x}{g:02x}/{b:02x}{b:02x}"));
+    if let Some(colour) = reported.as_deref().or_else(|| parser.osc_colour(slot)) {
         let reply = format!(
             "\x1b]{};{}{}",
             slot.osc_number(),

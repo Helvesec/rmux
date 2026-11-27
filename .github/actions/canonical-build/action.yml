@@ -3,7 +3,7 @@ description: Build, attest, and persist one native release bundle without public
 
 inputs:
   expected-source-sha:
-    description: Exact protected main commit to build
+    description: Exact source commit admitted by the candidate route
     required: true
   fast-run-id:
     description: Numeric Actions run ID containing the accepted fast proof
@@ -69,7 +69,11 @@ runs:
       run: |
         set -euo pipefail
         test "$GITHUB_EVENT_NAME" = workflow_dispatch
-        test "$GITHUB_REF" = refs/heads/main
+        case "${RMUX_CANDIDATE_PROFILE:-canonical}" in
+          canonical) test "$GITHUB_REF" = refs/heads/main ;;
+          premerge-rehearsal-v1) test "$GITHUB_REF" = refs/heads/release/0.11.0 ;;
+          *) exit 1 ;;
+        esac
         test "$GITHUB_RUN_ATTEMPT" = 1
         test "$GITHUB_SHA" = "$RMUX_EXPECTED_SOURCE_SHA"
         test "$(git rev-parse HEAD)" = "$RMUX_EXPECTED_SOURCE_SHA"

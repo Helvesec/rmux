@@ -3,8 +3,9 @@
 use std::collections::BTreeSet;
 use std::ffi::OsStr;
 use std::fs;
+use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Output};
+use std::process::{Command, Output, Stdio};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 fn repo_root() -> PathBuf {
@@ -32,17 +33,56 @@ fn make_executable(path: &Path) {
     fs::set_permissions(path, permissions).expect("make tool executable");
 }
 
+/// Installs `script` as the executable tool `path`.
+///
+/// Linux refuses to execute a file that any process still holds open for
+/// writing (ETXTBSY). The other tests of this binary fork from their own
+/// threads, and a child forked while this process holds a write descriptor
+/// keeps its copy until its exec closes it; a tool written here could then
+/// fail to start once the scheduler delays that child. So this process only
+/// writes a staging copy that nothing executes, and the tool itself is
+/// written by a `cp` process that has exited before this returns.
+fn install_tool(path: &Path, script: &str) {
+    install_tool_while_writing(path, script, |_| {});
+}
+
+/// `install_tool`, calling `while_writing` while this process holds the
+/// only write descriptor it ever opens, the one a concurrent fork inherits.
+fn install_tool_while_writing(path: &Path, script: &str, while_writing: impl FnOnce(&fs::File)) {
+    let name = path
+        .file_name()
+        .and_then(OsStr::to_str)
+        .expect("tool path names a file");
+    let staging = path.with_file_name(format!(".{name}.staging"));
+    let mut file = fs::File::create(&staging).expect("create tool staging copy");
+    file.write_all(script.as_bytes())
+        .expect("write tool staging copy");
+    while_writing(&file);
+    drop(file);
+    let copied = Command::new("cp")
+        .arg(&staging)
+        .arg(path)
+        .status()
+        .expect("run cp for the tool");
+    assert!(copied.success(), "cp {} failed: {copied}", path.display());
+    make_executable(path);
+}
+
 fn sha256(path: &Path) -> String {
-    let output = Command::new("sha256sum")
+    let output = Command::new("python3")
+        .args([
+            "-c",
+            "import hashlib, sys; print(hashlib.sha256(open(sys.argv[1], 'rb').read()).hexdigest())",
+        ])
         .arg(path)
         .output()
-        .expect("run sha256sum");
+        .expect("run Python SHA-256");
     assert!(output.status.success());
     String::from_utf8(output.stdout)
-        .expect("sha256sum output is UTF-8")
+        .expect("SHA-256 output is UTF-8")
         .split_whitespace()
         .next()
-        .expect("sha256sum emitted a digest")
+        .expect("SHA-256 emitted a digest")
         .to_owned()
 }
 
@@ -87,7 +127,7 @@ const APT_ARCHITECTURES: [&str; 2] = ["amd64", "arm64"];
 fn install_apt_tools(tools: &Path) {
     fs::create_dir_all(tools).expect("create APT tool directory");
     let dpkg_deb = tools.join("dpkg-deb");
-    fs::write(
+    install_tool(
         &dpkg_deb,
         r#"#!/bin/sh
 set -eu
@@ -104,9 +144,7 @@ case "${3:-}" in
   *) exit 64 ;;
 esac
 "#,
-    )
-    .expect("write dpkg-deb fixture");
-    make_executable(&dpkg_deb);
+    );
 }
 
 fn write_apt_packages(input: &Path, generation: &str) {
@@ -168,7 +206,7 @@ fn current_index_digests(suite_root: &Path, architecture: &str) -> BTreeSet<Stri
 fn install_rpm_metadata_tools(tools: &Path) {
     fs::create_dir_all(tools).expect("create RPM metadata tool directory");
     let createrepo = tools.join("createrepo_c");
-    fs::write(
+    install_tool(
         &createrepo,
         r#"#!/bin/sh
 set -eu
@@ -197,12 +235,10 @@ name = f"{digest}-primary.xml.gz"
 )
 PY
 "#,
-    )
-    .expect("write fake createrepo_c");
-    make_executable(&createrepo);
+    );
 
     let gpg = tools.join("gpg");
-    fs::write(
+    install_tool(
         &gpg,
         r#"#!/bin/sh
 set -eu
@@ -229,12 +265,10 @@ done
 test -n "$output"
 printf 'trusted-signature' > "$output"
 "#,
-    )
-    .expect("write fake gpg");
-    make_executable(&gpg);
+    );
 
     let gpgv = tools.join("gpgv");
-    fs::write(
+    install_tool(
         &gpgv,
         r#"#!/bin/sh
 set -eu
@@ -256,9 +290,7 @@ grep -q '^authorized-rpm-repository-key$' "$keyring"
 grep -q '^trusted-signature$' "$signature"
 grep -q '<repomd ' "$document"
 "#,
-    )
-    .expect("write fake gpgv");
-    make_executable(&gpgv);
+    );
 }
 
 fn generate_rpm_repository(
@@ -298,6 +330,38 @@ fn retained_metadata(repository: &Path) -> BTreeSet<Vec<u8>> {
         })
         .map(|path| fs::read(path).expect("read retained RPM metadata"))
         .collect()
+}
+
+/// The ETXTBSY race made deterministic: the write descriptor `install_tool`
+/// opens is handed to a child, as a fork from another test thread inherits
+/// it, and that child still holds it when the tool runs.
+#[test]
+#[cfg(unix)]
+fn a_tool_runs_while_a_concurrent_child_holds_its_write_descriptor() {
+    let root = temp_dir("tool-write-descriptor");
+    fs::create_dir_all(&root).expect("create tool fixture");
+    let tool = root.join("tool");
+    let mut holder = None;
+    install_tool_while_writing(&tool, "#!/bin/sh\necho ran\n", |file| {
+        let inherited = file.try_clone().expect("share the write descriptor");
+        holder = Some(
+            Command::new("cat")
+                .stdin(Stdio::piped())
+                .stdout(inherited)
+                .spawn()
+                .expect("start the descriptor holder"),
+        );
+    });
+    let mut holder = holder.expect("the write descriptor reached a child");
+
+    let ran = Command::new(&tool).output();
+    drop(holder.stdin.take());
+    holder.wait().expect("reap the descriptor holder");
+
+    let ran = ran.expect("run the tool while a child holds the write descriptor");
+    assert!(ran.status.success(), "tool failed: {}", ran.status);
+    assert_eq!(ran.stdout, b"ran\n");
+    fs::remove_dir_all(root).expect("remove tool fixture");
 }
 
 #[test]
@@ -688,3 +752,114 @@ fn release_workflows_supply_the_authenticated_previous_rpm_repository() {
     assert!(release.contains("--previous-repository-dir target/package-repository-history/rpm"));
     assert!(downstream.contains("--previous-repository-dir \"$root/history/rpm\""));
 }
+
+#[test]
+fn package_repository_deployment_keeps_credentials_out_of_git_urls() {
+    let output = Command::new("python3")
+        .args(["-B", "-c", PACKAGE_REPOSITORY_CREDENTIAL_REGRESSION])
+        .arg(repo_root())
+        .output()
+        .expect("run package repository credential regression");
+    assert!(
+        output.status.success(),
+        "{}\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+const PACKAGE_REPOSITORY_CREDENTIAL_REGRESSION: &str = r#"
+import os
+from pathlib import Path
+import re
+import shutil
+import subprocess
+import sys
+import tempfile
+import textwrap
+import unittest
+
+SOURCE = Path(sys.argv.pop())
+GIT = shutil.which('git')
+WORKFLOW = (SOURCE / '.github/workflows/release.yml').read_text()
+STEP = WORKFLOW.split('      - name: Deploy Linux package repositories\n', 1)[1]
+PREPARE = textwrap.dedent(re.search(
+    r'(?ms)^          work=.*?(?=^          expected_base=)', STEP).group())
+PUSH = textwrap.dedent(re.search(r'(?m)^          git push .*$', STEP).group())
+TOKEN = 'fixture-package-credential'
+URL = 'https://github.com/fixture/packages.git'
+
+class PackageRepositoryCredentials(unittest.TestCase):
+    def deploy(self, root, clone_fails=False):
+        home, temporary, runner = (root / name for name in ('home', 'temporary', 'runner'))
+        for path in (home, temporary, runner):
+            path.mkdir()
+        env = dict(os.environ, HOME=str(home), TMPDIR=str(temporary),
+                   RUNNER_TEMP=str(runner), GIT_CONFIG_GLOBAL=os.devnull,
+                   GIT_CONFIG_NOSYSTEM='1', GIT_ALLOW_PROTOCOL='file',
+                   RMUX_PACKAGE_REPO_TOKEN=TOKEN, RMUX_PACKAGE_REPO='fixture/packages',
+                   RMUX_PACKAGE_REPO_BRANCH='packages', FIXTURE_ROOT=str(root))
+        # Never consume a caller's Git command-scope configuration or identity.
+        for key in list(env):
+            if key.startswith(('GIT_CONFIG_', 'GIT_DIR', 'GIT_WORK_TREE', 'GIT_INDEX_FILE')):
+                if key not in ('GIT_CONFIG_GLOBAL', 'GIT_CONFIG_NOSYSTEM'):
+                    del env[key]
+        seed = root / 'seed'
+        def git(*args):
+            subprocess.run([GIT, *args], env=env, check=True, capture_output=True)
+        git('init', '--initial-branch=packages', str(seed))
+        (seed / 'payload').write_text('fixture\n')
+        git('-C', str(seed), 'add', 'payload')
+        git('-C', str(seed), '-c', 'user.name=Fixture', '-c',
+            'user.email=fixture@example.invalid', 'commit', '-m', 'fixture')
+        bare = root / 'repository.git'
+        git('clone', '--bare', str(seed), str(bare))
+        destination = root / 'missing.git' if clone_fails else bare
+        # Both historical and corrected URLs reach only this local fixture.
+        env.update(GIT_CONFIG_COUNT='2',
+                   GIT_CONFIG_KEY_0=f'url.{destination.as_uri()}.insteadOf',
+                   GIT_CONFIG_VALUE_0=URL,
+                   GIT_CONFIG_KEY_1=f'url.{destination.as_uri()}.insteadOf',
+                   GIT_CONFIG_VALUE_1=URL.replace('https://', f'https://x-access-token:{TOKEN}@'))
+        observe = '''
+cp "$work/.git/config" "$FIXTURE_ROOT/origin-config"
+printf '%s' "$package_repo_url" > "$FIXTURE_ROOT/transport-url"
+if [ -n "${GIT_ASKPASS:-}" ]; then
+  test -x "$GIT_ASKPASS"
+  printf '%s' "$GIT_ASKPASS" > "$FIXTURE_ROOT/askpass-path"
+  "$GIT_ASKPASS" 'Username for fixture' > "$FIXTURE_ROOT/username"
+  "$GIT_ASKPASS" 'Password for fixture' > "$FIXTURE_ROOT/password"
+  if "$GIT_ASKPASS" 'Unsupported prompt' > /dev/null; then exit 81; fi
+fi
+cd "$work"
+'''
+        result = subprocess.run(['/bin/bash', '-euo', 'pipefail', '-c',
+                                 'mktemp() { command mktemp "$@" "$TMPDIR/deploy.XXXXXXXX"; }\n'
+                                 + PREPARE + observe + PUSH], env=env,
+                                text=True, capture_output=True, timeout=30)
+        self.assertEqual(list(temporary.iterdir()), [], 'clone work directory leaked')
+        self.assertEqual(list(runner.iterdir()), [], 'askpass executable leaked')
+        return result
+
+    def test_clone_and_push_do_not_persist_the_credential(self):
+        with tempfile.TemporaryDirectory(prefix='rmux-package-credentials-') as name:
+            root = Path(name)
+            result = self.deploy(root)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertNotIn(TOKEN, (root / 'origin-config').read_text(),
+                             'credential persisted in Git remote configuration')
+            self.assertEqual((root / 'transport-url').read_text(), URL)
+            self.assertEqual((root / 'username').read_text(), 'x-access-token\n')
+            self.assertEqual((root / 'password').read_text(), TOKEN + '\n')
+            self.assertFalse(Path((root / 'askpass-path').read_text()).exists())
+
+    def test_clone_failure_cleans_temporary_credentials(self):
+        with tempfile.TemporaryDirectory(prefix='rmux-package-credentials-failure-') as name:
+            root = Path(name)
+            result = self.deploy(root, clone_fails=True)
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn('does not appear to be a git repository', result.stderr)
+            self.assertFalse((root / 'origin-config').exists())
+
+unittest.main()
+"#;

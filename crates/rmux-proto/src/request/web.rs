@@ -22,7 +22,7 @@ pub enum WebShareRequest {
 }
 
 /// Request payload for `web-share`.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CreateWebShareRequest {
     /// Browser-visible scope exposed by this share.
     pub scope: WebShareScope,
@@ -74,6 +74,37 @@ pub struct CreateWebShareRequest {
     /// Whether the target session should be killed when this share expires.
     #[serde(default)]
     pub kill_session_on_expire: bool,
+}
+
+impl fmt::Debug for CreateWebShareRequest {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("CreateWebShareRequest")
+            .field("scope", &self.scope)
+            .field("public_base_url", &self.public_base_url)
+            .field("tunnel_provider", &self.tunnel_provider)
+            .field("frontend_url", &self.frontend_url)
+            .field("ttl_seconds", &self.ttl_seconds)
+            .field("expires_at_unix", &self.expires_at_unix)
+            .field("max_spectators", &self.max_spectators)
+            .field("max_operators", &self.max_operators)
+            .field("url_options", &self.url_options)
+            .field("require_pin", &self.require_pin)
+            .field(
+                "operator_pin",
+                &self.operator_pin.as_ref().map(|_| "[REDACTED]"),
+            )
+            .field(
+                "spectator_pin",
+                &self.spectator_pin.as_ref().map(|_| "[REDACTED]"),
+            )
+            .field("terminal_palette", &self.terminal_palette)
+            .field("operator", &self.operator)
+            .field("spectator", &self.spectator)
+            .field("controls", &self.controls)
+            .field("kill_session_on_expire", &self.kill_session_on_expire)
+            .finish()
+    }
 }
 
 /// Browser-visible scope exposed by a web share.

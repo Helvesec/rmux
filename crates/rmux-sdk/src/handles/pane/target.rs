@@ -1,24 +1,24 @@
 use crate::{PaneId, PaneRef, RmuxError, SessionName};
 
 pub(super) fn parse_error(message: impl Into<String>) -> RmuxError {
-    RmuxError::protocol(rmux_proto::RmuxError::Server(message.into()))
+    RmuxError::from_proto(rmux_proto::RmuxError::Server(message.into()))
 }
 
 pub(super) fn stale_slot_error(target: &PaneRef) -> RmuxError {
-    RmuxError::protocol(rmux_proto::RmuxError::invalid_target(
+    RmuxError::from_proto(rmux_proto::RmuxError::invalid_target(
         target.to_proto().to_string(),
         "pane index does not exist in session",
     ))
 }
 
 pub(super) fn is_already_closed_error<T: TargetSelector>(error: &RmuxError, target: &T) -> bool {
-    match error {
-        RmuxError::Protocol {
-            source: rmux_proto::RmuxError::SessionNotFound(session),
-        } => session == target.session_name().as_str(),
-        RmuxError::Protocol {
-            source: rmux_proto::RmuxError::InvalidTarget { value, reason },
-        } => target.matches_invalid_target(value, reason),
+    match error.protocol_source() {
+        Some(rmux_proto::RmuxError::SessionNotFound(session)) => {
+            session == target.session_name().as_str()
+        }
+        Some(rmux_proto::RmuxError::InvalidTarget { value, reason }) => {
+            target.matches_invalid_target(value, reason)
+        }
         _ => false,
     }
 }
@@ -54,10 +54,8 @@ pub(super) fn is_stale_pane_id_target_error(
     };
     is_already_closed_pane_id_error(error, session_name, *pane_id)
         || matches!(
-            error,
-            RmuxError::Protocol {
-                source: rmux_proto::RmuxError::SessionNotFound(missing_session),
-            } if missing_session == session_name.as_str()
+            error.protocol_source(),
+            Some(rmux_proto::RmuxError::SessionNotFound(missing_session)) if missing_session == session_name.as_str()
         )
 }
 

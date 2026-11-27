@@ -86,7 +86,7 @@ async fn duplicate_new_session_returns_duplicate_session() -> Result<(), Box<dyn
     let first = send_request(&socket_path, &request).await?;
     let duplicate = send_request(&socket_path, &request).await?;
 
-    assert!(matches!(first, Response::NewSession(_)));
+    crate::common::assert_new_session(&first);
     assert_eq!(
         duplicate,
         Response::Error(rmux_proto::ErrorResponse {
@@ -126,7 +126,7 @@ async fn has_session_reports_live_and_missing_sessions() -> Result<(), Box<dyn E
         }),
     )
     .await?;
-    assert!(matches!(created, Response::NewSession(_)));
+    crate::common::assert_new_session(&created);
 
     let present = send_request(
         &socket_path,
@@ -160,7 +160,7 @@ async fn kill_session_is_live_then_idempotent() -> Result<(), Box<dyn Error>> {
         }),
     )
     .await?;
-    assert!(matches!(created, Response::NewSession(_)));
+    crate::common::assert_new_session(&created);
 
     let keepalive = send_request(
         &socket_path,
@@ -172,7 +172,7 @@ async fn kill_session_is_live_then_idempotent() -> Result<(), Box<dyn Error>> {
         }),
     )
     .await?;
-    assert!(matches!(keepalive, Response::NewSession(_)));
+    crate::common::assert_new_session(&keepalive);
 
     let removed = send_request(
         &socket_path,
@@ -226,7 +226,7 @@ async fn rename_session_round_trips_through_the_real_socket() -> Result<(), Box<
         }),
     )
     .await?;
-    assert!(matches!(created, Response::NewSession(_)));
+    crate::common::assert_new_session(&created);
 
     let renamed = send_request(
         &socket_path,
@@ -354,7 +354,7 @@ async fn attach_session_returns_an_upgrade_response() -> Result<(), Box<dyn Erro
         }),
     )
     .await?;
-    assert!(matches!(created, Response::NewSession(_)));
+    crate::common::assert_new_session(&created);
 
     let response = send_request(
         &socket_path,
@@ -391,7 +391,7 @@ async fn switch_and_detach_require_an_attached_client_before_any_session_lookup(
         }),
     )
     .await?;
-    assert!(matches!(created, Response::NewSession(_)));
+    crate::common::assert_new_session(&created);
 
     let switch_response = send_request(
         &socket_path,
@@ -454,7 +454,7 @@ async fn persistent_connection_handles_multiple_requests() -> Result<(), Box<dyn
             environment: None,
         }))
         .await?;
-    assert!(matches!(created, Response::NewSession(_)));
+    crate::common::assert_new_session(&created);
 
     let present = client
         .send_request(&Request::HasSession(HasSessionRequest {
@@ -497,7 +497,7 @@ async fn shutdown_closes_existing_connections() -> Result<(), Box<dyn Error>> {
             environment: None,
         }))
         .await?;
-    assert!(matches!(created, Response::NewSession(_)));
+    crate::common::assert_new_session(&created);
     handle.shutdown().await?;
     let error = client
         .send_request(&Request::HasSession(HasSessionRequest {

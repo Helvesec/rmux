@@ -138,7 +138,7 @@ inventory_tree_entries() {
         die "cannot read symbolic link in $label"
       die "$label must not contain symbolic links"
     elif [ -f "$entry" ]; then
-      sha256sum -- "$entry" >/dev/null ||
+      hash_file sha256 "$entry" >/dev/null ||
         die "cannot read regular file in $label"
     elif [ ! -d "$entry" ]; then
       die "$label contains an unsupported entry type: $entry"

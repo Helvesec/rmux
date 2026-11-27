@@ -60,7 +60,7 @@ async fn fixture(name: &str) -> (RequestHandler, SessionName, PaneTarget) {
             skip_environment_update: false,
         })))
         .await;
-    assert!(matches!(response, Response::NewSession(_)), "{response:?}");
+    crate::session_fixture::assert_new_session(&response);
     handler
         .wait_for_pane_startup_to_finish_for_test(&target)
         .await;
@@ -80,6 +80,7 @@ async fn fixture(name: &str) -> (RequestHandler, SessionName, PaneTarget) {
 
 fn mouse_event(target: &PaneTarget) -> AttachedMouseEvent {
     AttachedMouseEvent {
+        coordinates: None,
         raw: MouseForwardEvent {
             b: 0,
             lb: 0,
@@ -178,20 +179,14 @@ async fn prepare_copy_mode_fixture(
         let state = handler.state.lock().await;
         state.transcript_handle(target).expect("pane transcript")
     };
-    let history_limit = transcript
-        .lock()
-        .expect("pane transcript mutex")
-        .history_limit();
+    let history_limit = transcript.lock().history_limit();
     let mut screen = Screen::new(TerminalSize { cols: 20, rows: 6 }, history_limit);
     let mut parser = InputParser::new();
     parser.parse(
         b"zero one two three\r\nalpha beta gamma\r\nomega sigma tau\r\n",
         &mut screen,
     );
-    transcript
-        .lock()
-        .expect("pane transcript mutex")
-        .set_screen_for_test(screen);
+    transcript.lock().set_screen_for_test(screen);
 
     let (control_tx, control_rx) = mpsc::unbounded_channel();
     let _attach_id = handler
@@ -245,7 +240,7 @@ async fn wait_for_line_number_state(
     pane_id: PaneId,
     expected: bool,
 ) {
-    tokio::time::timeout(background_shell_test_timeout(), async {
+    tokio::time::timeout(SERVER_SIGNAL_LIVENESS, async {
         loop {
             let actual = {
                 let state = handler.state.lock().await;
@@ -267,7 +262,7 @@ async fn wait_for_line_number_state(
 
 async fn wait_for_display_panes_state(handler: &RequestHandler) {
     let requester_pid = std::process::id();
-    tokio::time::timeout(background_shell_test_timeout(), async {
+    tokio::time::timeout(SERVER_SIGNAL_LIVENESS, async {
         loop {
             let active = {
                 let active_attach = handler.active_attach.lock().await;
@@ -638,7 +633,7 @@ async fn display_panes_rekeys_mouse_origin_outside_the_target_client_session() {
             skip_environment_update: false,
         })))
         .await;
-    assert!(matches!(response, Response::NewSession(_)), "{response:?}");
+    crate::session_fixture::assert_new_session(&response);
     handler
         .wait_for_pane_startup_to_finish_for_test(&beta_target)
         .await;

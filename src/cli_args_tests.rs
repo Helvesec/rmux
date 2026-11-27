@@ -7,6 +7,78 @@ use std::path::PathBuf;
 const FROZEN_TMUX_REFERENCE: &str = "tests/reference/tmux_compat/frozen_reference.yaml";
 const ERROR_EXIT_MATRIX: &str = "tests/reference/tmux_compat/error_exit_matrix.yaml";
 
+#[test]
+fn long_option_values_stay_opaque_in_all_schema_projections() {
+    use super::schema::CommandSpec;
+
+    let completion = super::completion_command();
+    for (name, flags, id) in [
+        ("pane-snapshot", &["-t", "--target"][..], "target"),
+        (
+            "web-share",
+            &["--frontend-url", "--web-frontend"][..],
+            "frontend_url",
+        ),
+    ] {
+        for flag in flags {
+            for value in ["-tfoo", "-ltfoo", "--help"] {
+                for attached in [false, true] {
+                    if attached && !flag.starts_with("--") {
+                        continue;
+                    }
+                    let arguments = if attached {
+                        vec![format!("{flag}={value}")]
+                    } else {
+                        vec![(*flag).to_owned(), value.to_owned()]
+                    };
+                    for projection in [
+                        super::schema::command_help(name).unwrap(),
+                        completion.find_subcommand(name).unwrap().clone(),
+                    ] {
+                        let matches = projection.try_get_matches_from(&arguments).unwrap();
+                        assert_eq!(matches.get_raw(id).unwrap().next().unwrap(), value);
+                    }
+                    let typed = match name {
+                        "pane-snapshot" => {
+                            super::schema::PaneSnapshot::parse(arguments.clone(), String::new())
+                                .map(super::Command::PaneSnapshot)
+                        }
+                        _ => super::schema::WebShare::parse(arguments.clone(), String::new())
+                            .map(super::Command::WebShare),
+                    };
+                    let argv = ["rmux".to_owned(), name.to_owned()]
+                        .into_iter()
+                        .chain(arguments.iter().cloned())
+                        .collect::<Vec<_>>();
+                    let group = super::RuntimeCommandGroup::Canonical(
+                        std::iter::once(name.to_owned())
+                            .chain(arguments.iter().cloned())
+                            .collect::<Vec<_>>()
+                            .join(" "),
+                    );
+                    for result in [
+                        typed,
+                        parse(argv.clone()).map(|cli| cli.command.unwrap()),
+                        super::parse_with_runtime_command_groups(argv, &[group])
+                            .map(|cli| cli.command.unwrap()),
+                    ] {
+                        let command =
+                            result.unwrap_or_else(|error| panic!("{name} {arguments:?}: {error}"));
+                        let actual = match command {
+                            super::Command::PaneSnapshot(args) => {
+                                args.target.unwrap().raw().to_owned()
+                            }
+                            super::Command::WebShare(args) => args.frontend_url.unwrap(),
+                            _ => panic!("unexpected command"),
+                        };
+                        assert_eq!(actual, value, "{name} {arguments:?}");
+                    }
+                }
+            }
+        }
+    }
+}
+
 fn parse_args(args: &[&str]) -> Result<super::Cli, clap::Error> {
     let mut full_args = vec!["rmux"];
     full_args.extend_from_slice(args);
@@ -142,12 +214,175 @@ fn direct_cli_rejects_new_unknown_option_shapes_before_positionals() {
         let error =
             parse_args(&invocation).expect_err("unknown option must fail direct CLI parsing");
         assert_eq!(error.kind(), clap::error::ErrorKind::UnknownArgument);
+        // tmux 3.7b: `-x` is unknown; `--bogus` is the invalid flag '-'.
+        let flag = if arguments[0] == "--bogus" {
+            "invalid flag --".to_owned()
+        } else {
+            "unknown flag -x".to_owned()
+        };
         let rendered = error.to_string();
         assert!(
-            rendered.contains("unknown flag") || rendered.contains("unexpected argument"),
+            rendered.contains(&format!("command {command}: {flag}")),
             "unexpected direct CLI error for {command} {arguments:?}: {rendered}"
         );
     }
+}
+
+#[test]
+fn direct_cli_names_unknown_flags_and_extra_arguments_like_tmux() {
+    // tmux 3.7b, measured with a server on a private socket.
+    for (arguments, kind, expected) in [
+        (
+            &["list-sessions", "-Z"][..],
+            clap::error::ErrorKind::UnknownArgument,
+            "command list-sessions: unknown flag -Z",
+        ),
+        (
+            &["has-session", "-Z"][..],
+            clap::error::ErrorKind::UnknownArgument,
+            "command has-session: unknown flag -Z",
+        ),
+        (
+            &["list-windows", "-Q"][..],
+            clap::error::ErrorKind::UnknownArgument,
+            "command list-windows: unknown flag -Q",
+        ),
+        (
+            &["capture-pane", "-p", "-Q"][..],
+            clap::error::ErrorKind::UnknownArgument,
+            "command capture-pane: unknown flag -Q",
+        ),
+        (
+            &["list-windows", "-aQ"][..],
+            clap::error::ErrorKind::UnknownArgument,
+            "command list-windows: unknown flag -Q",
+        ),
+        (
+            &["list-sessions", "-."][..],
+            clap::error::ErrorKind::UnknownArgument,
+            "command list-sessions: invalid flag -.",
+        ),
+        (
+            &["new-window", "-."][..],
+            clap::error::ErrorKind::UnknownArgument,
+            "command new-window: invalid flag -.",
+        ),
+        (
+            &["has-session", "--bogus"][..],
+            clap::error::ErrorKind::UnknownArgument,
+            "command has-session: invalid flag --",
+        ),
+        (
+            &["new-window", "--bogus"][..],
+            clap::error::ErrorKind::UnknownArgument,
+            "command new-window: invalid flag --",
+        ),
+        (
+            &["list-sessions", "-Z", "extra"][..],
+            clap::error::ErrorKind::UnknownArgument,
+            "command list-sessions: unknown flag -Z",
+        ),
+        (
+            &["list-sessions", "extra"][..],
+            clap::error::ErrorKind::TooManyValues,
+            "command list-sessions: too many arguments (need at most 0)",
+        ),
+        (
+            &["list-sessions", "extra", "-Z"][..],
+            clap::error::ErrorKind::TooManyValues,
+            "command list-sessions: too many arguments (need at most 0)",
+        ),
+        (
+            &["list-sessions", "-"][..],
+            clap::error::ErrorKind::TooManyValues,
+            "command list-sessions: too many arguments (need at most 0)",
+        ),
+        (
+            &["list-sessions", "--", "extra"][..],
+            clap::error::ErrorKind::TooManyValues,
+            "command list-sessions: too many arguments (need at most 0)",
+        ),
+        (
+            &["kill-server", "extra"][..],
+            clap::error::ErrorKind::TooManyValues,
+            "command kill-server: too many arguments (need at most 0)",
+        ),
+        (
+            &["kill-server", "--", "extra"][..],
+            clap::error::ErrorKind::TooManyValues,
+            "command kill-server: too many arguments (need at most 0)",
+        ),
+        (
+            &["has-session", "-t", "s0", "extra"][..],
+            clap::error::ErrorKind::TooManyValues,
+            "command has-session: too many arguments (need at most 0)",
+        ),
+        (
+            &["list-windows", "-a", "--", "x"][..],
+            clap::error::ErrorKind::TooManyValues,
+            "command list-windows: too many arguments (need at most 0)",
+        ),
+        (
+            &["capture-pane", "-p", "-t", "s0", "extra"][..],
+            clap::error::ErrorKind::TooManyValues,
+            "command capture-pane: too many arguments (need at most 0)",
+        ),
+        (
+            &["rename-window", "--", "a", "b"][..],
+            clap::error::ErrorKind::TooManyValues,
+            "command rename-window: too many arguments (need at most 1)",
+        ),
+        (
+            &["list-sessions", "-?Z"][..],
+            clap::error::ErrorKind::UnknownArgument,
+            "usage: list-sessions [-r] [-F format] [-f filter] [-O order]",
+        ),
+        (
+            &["list-sessions", "-Z?"][..],
+            clap::error::ErrorKind::UnknownArgument,
+            "command list-sessions: unknown flag -Z",
+        ),
+        (
+            &["has-session", "-?"][..],
+            clap::error::ErrorKind::UnknownArgument,
+            "usage: has-session [-t target-session]",
+        ),
+    ] {
+        let error = parse_args(arguments).expect_err("tmux rejects this command line");
+        assert_eq!(error.kind(), kind, "{arguments:?}: {error}");
+        assert_eq!(
+            error.to_string(),
+            format!("error: {expected}"),
+            "{arguments:?}"
+        );
+    }
+}
+
+#[test]
+fn direct_cli_help_request_ignores_the_tokens_after_it() {
+    // Clap prints a command's help as soon as it reads --help, so the option
+    // scan must not answer `list-sessions --help x` with "too many arguments".
+    // A command read before clap, such as new-pane, keeps its own answer.
+    let mut checked = 0;
+    for entry in super::COMMAND_TABLE {
+        let Err(help) = parse_args(&[entry.name, "--help"]) else {
+            continue;
+        };
+        if help.kind() != clap::error::ErrorKind::DisplayHelp {
+            continue;
+        }
+        for tail in [&["x"][..], &["x", "y"], &["--", "x"]] {
+            let mut arguments = vec![entry.name, "--help"];
+            arguments.extend_from_slice(tail);
+            let Err(error) = parse_args(&arguments) else {
+                continue;
+            };
+            assert_eq!(error.kind(), help.kind(), "{arguments:?}: {error}");
+            assert_eq!(error.to_string(), help.to_string(), "{arguments:?}");
+        }
+        checked += 1;
+    }
+    assert!(checked > 40, "only {checked} commands print help");
 }
 
 #[test]
@@ -319,5 +554,22 @@ mod scripting_and_buffers;
 #[path = "cli_args_tests/options_and_scopes.rs"]
 mod options_and_scopes;
 
+#[path = "cli_args_tests/fmp1.rs"]
+mod fmp1;
 #[path = "cli_args_tests/server_lifecycle.rs"]
 mod server_lifecycle;
+
+#[path = "cli_args_tests/delegate_help.rs"]
+mod delegate_help;
+
+#[path = "cli_args_tests/delegate_neighbors.rs"]
+mod delegate_neighbors;
+
+#[path = "cli_args_tests/resize_value_ownership.rs"]
+mod resize_value_ownership;
+
+#[path = "cli_args_tests/resize_value_boundaries.rs"]
+mod resize_value_boundaries;
+
+#[path = "cli_args_tests/option_value_ownership.rs"]
+mod option_value_ownership;

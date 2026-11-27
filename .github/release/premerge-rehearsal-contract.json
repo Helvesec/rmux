@@ -1,0 +1,46 @@
+{
+  "schema_version": 1,
+  "profile": "premerge-rehearsal-v1",
+  "repository_id": 1239918790,
+  "source_ref": "refs/heads/release/0.11.0",
+  "package_version": "0.11.0",
+  "allowed_release_refs": [
+    "v0.11.0-rc.1",
+    "v0.11.0-rc.2"
+  ],
+  "permit_repository_variable": "RMUX_PREMERGE_REHEARSAL_PERMIT",
+  "permit_requires": [
+    "exact-squash-sha",
+    "automatic-scrub-report-sha256",
+    "independent-scrub-review-sha256"
+  ],
+  "public_main_parent_required": true,
+  "run_attempt": 1,
+  "proof_schema_version": 2,
+  "fast_run_event": "push",
+  "fast_run_branch": "release/0.11.0",
+  "entry_workflows": [
+    ".github/workflows/ci.yml",
+    ".github/workflows/release-shadow.yml",
+    ".github/workflows/release-promotion-simulation.yml"
+  ],
+  "verification_workflow": ".github/workflows/premerge-rehearsal.yml",
+  "publication_authority": false,
+  "production_signing_authority": false,
+  "technical_rc_created": false,
+  "promotion_simulation": "revalidate-live-candidate-and-reject-production-promotion",
+  "hosted_obligations": [
+    "complete-fast-run",
+    "complete-release-delta",
+    "five-canonical-platforms",
+    "build-provenance-signatures",
+    "shadow-seal",
+    "premerge-promotion-boundary"
+  ],
+  "separate_release_obligations": [
+    "technical-rc-and-assets",
+    "live-production-policy-audit",
+    "production-tag-signature",
+    "sponsor-main-merge-and-tag"
+  ]
+}

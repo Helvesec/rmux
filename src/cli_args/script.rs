@@ -71,6 +71,14 @@ pub(crate) struct RunShellArgs {
     pub(crate) target: Option<TargetSpec>,
     #[arg(allow_hyphen_values = true, trailing_var_arg = true)]
     pub(crate) command: Vec<String>,
+    #[arg(skip = String::new())]
+    pub(crate) queue_command: String,
+}
+
+impl QueuedCommand for RunShellArgs {
+    fn set_queue_command(&mut self, queue_command: String) {
+        self.queue_command = queue_command;
+    }
 }
 
 impl RunShellArgs {

@@ -15,7 +15,11 @@ async fn append_pane_output(
         .expect("pane transcript update");
 }
 
-async fn assert_activation_request_keeps_standard_encoding(request: &[u8], session_label: &str) {
+async fn assert_activation_request_encodes_acquired_event(
+    request: &[u8],
+    expected: &[u8],
+    session_label: &str,
+) {
     let handler = RequestHandler::new();
     let session = session_name(session_label);
     let requester_pid = std::process::id();
@@ -29,11 +33,10 @@ async fn assert_activation_request_keeps_standard_encoding(request: &[u8], sessi
         .await;
 
     let csi_u_shift_enter = b"\x1b[13;2u";
-    let expected = b"\n";
     let capture = RawPaneInputProbe::start(
         &handler,
         &session,
-        "ignored-kitty-activation",
+        "negotiated-kitty-activation",
         expected.len(),
     )
     .await;
@@ -48,14 +51,22 @@ async fn assert_activation_request_keeps_standard_encoding(request: &[u8], sessi
 }
 
 #[tokio::test]
-async fn live_attach_kitty_set_and_push_do_not_enable_partial_key_encoding() {
-    assert_activation_request_keeps_standard_encoding(KITTY_SET, "kitty-set-noop").await;
-    assert_activation_request_keeps_standard_encoding(KITTY_PUSH, "kitty-push-noop").await;
+async fn live_attach_kitty_set_and_push_encode_acquired_events() {
+    assert_activation_request_encodes_acquired_event(KITTY_SET, b"\x1b[13;2u", "kitty-set").await;
+    assert_activation_request_encodes_acquired_event(KITTY_PUSH, b"\r", "kitty-push").await;
 }
 
 #[tokio::test]
 async fn live_attach_kitty_pop_does_not_clear_xterm_extended_key_mode() {
     let handler = RequestHandler::new();
+    handler
+        .handle(Request::SetOption(SetOptionRequest {
+            scope: ScopeSelector::Global,
+            option: OptionName::ExtendedKeys,
+            value: "on".to_owned(),
+            mode: SetOptionMode::Replace,
+        }))
+        .await;
     let session = session_name("kitty-pop-noop");
     let requester_pid = std::process::id();
 
@@ -71,7 +82,7 @@ async fn live_attach_kitty_pop_does_not_clear_xterm_extended_key_mode() {
     let csi_u_shift_enter = b"\x1b[13;2u";
     let expected = b"\x1b[27;2;13~";
     let capture =
-        RawPaneInputProbe::start(&handler, &session, "ignored-kitty-pop", expected.len()).await;
+        RawPaneInputProbe::start(&handler, &session, "negotiated-kitty-pop", expected.len()).await;
 
     handler
         .handle_attached_live_input_for_test(requester_pid, csi_u_shift_enter)
@@ -83,7 +94,7 @@ async fn live_attach_kitty_pop_does_not_clear_xterm_extended_key_mode() {
 }
 
 #[tokio::test]
-async fn live_attach_ignored_kitty_request_preserves_legacy_escape_and_backspace() {
+async fn live_attach_kitty_request_preserves_unacquired_legacy_escape_and_backspace() {
     let handler = RequestHandler::new();
     let session = session_name("kitty-legacy-keys");
     let requester_pid = std::process::id();
@@ -100,7 +111,7 @@ async fn live_attach_ignored_kitty_request_preserves_legacy_escape_and_backspace
     let capture = RawPaneInputProbe::start(
         &handler,
         &session,
-        "ignored-kitty-legacy-keys",
+        "negotiated-kitty-legacy-keys",
         expected.len(),
     )
     .await;

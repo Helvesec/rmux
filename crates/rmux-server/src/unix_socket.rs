@@ -1,10 +1,9 @@
 use std::fs;
 use std::io;
 use std::os::unix::fs::{DirBuilderExt, FileTypeExt, MetadataExt, PermissionsExt};
-use std::os::unix::net::UnixStream as StdUnixStream;
 use std::path::{Path, PathBuf};
 
-use rmux_ipc::{LocalEndpoint, LocalListener};
+use rmux_ipc::{LocalEndpoint, LocalListener, SocketPresence};
 use tracing::debug;
 
 pub(crate) const OWNER_ONLY_DIRECTORY_MODE: u32 = 0o700;
@@ -20,14 +19,6 @@ pub(crate) enum UnixTransportAccess {
 }
 
 impl UnixTransportAccess {
-    #[must_use]
-    pub(crate) const fn directory_mode(self) -> u32 {
-        match self {
-            Self::OwnerOnly => OWNER_ONLY_DIRECTORY_MODE,
-            Self::AllowListed => SHARED_DIRECTORY_MODE,
-        }
-    }
-
     #[must_use]
     pub(crate) const fn socket_mode(self) -> u32 {
         match self {
@@ -52,7 +43,7 @@ pub(crate) fn bind_unix_listener_at(socket_path: &Path) -> io::Result<BoundUnixL
     if socket_path.as_os_str().is_empty() {
         return bind_empty_socket_listener();
     }
-    prepare_socket_path(socket_path, UnixTransportAccess::OwnerOnly)?;
+    prepare_socket_path(socket_path)?;
     bind_prepared_unix_listener(socket_path, UnixTransportAccess::OwnerOnly)
 }
 
@@ -64,7 +55,7 @@ pub(crate) fn rebind_unix_listener_at(
     if socket_path.as_os_str().is_empty() {
         return bind_empty_socket_listener();
     }
-    prepare_socket_parent(socket_path, access)?;
+    prepare_socket_parent(socket_path)?;
     remove_rebindable_socket(socket_path, current_identity)?;
     bind_prepared_unix_listener(socket_path, access)
 }
@@ -92,24 +83,16 @@ fn bind_empty_socket_listener() -> io::Result<BoundUnixListener> {
     })
 }
 
-fn prepare_socket_path(socket_path: &Path, access: UnixTransportAccess) -> io::Result<()> {
-    prepare_socket_parent(socket_path, access)?;
+fn prepare_socket_path(socket_path: &Path) -> io::Result<()> {
+    prepare_socket_parent(socket_path)?;
     remove_stale_socket_if_needed(socket_path)
 }
 
-fn prepare_socket_parent(socket_path: &Path, access: UnixTransportAccess) -> io::Result<()> {
-    ensure_parent_directory_for_access(socket_parent_or_current(socket_path)?, access)
+fn prepare_socket_parent(socket_path: &Path) -> io::Result<()> {
+    ensure_parent_directory(socket_parent_or_current(socket_path)?)
 }
 
-#[cfg(test)]
 pub(crate) fn ensure_parent_directory(parent: &Path) -> io::Result<()> {
-    ensure_parent_directory_for_access(parent, UnixTransportAccess::OwnerOnly)
-}
-
-fn ensure_parent_directory_for_access(
-    parent: &Path,
-    access: UnixTransportAccess,
-) -> io::Result<()> {
     let mut builder = fs::DirBuilder::new();
     builder.recursive(true).mode(OWNER_ONLY_DIRECTORY_MODE);
     match builder.create(parent) {
@@ -126,7 +109,7 @@ fn ensure_parent_directory_for_access(
     }
 
     if let Some(managed_directory) = managed_rmux_socket_directory(parent)? {
-        ensure_safe_rmux_socket_directory(&managed_directory, access)?;
+        ensure_safe_rmux_socket_directory(&managed_directory)?;
     }
     Ok(())
 }
@@ -152,7 +135,7 @@ pub(crate) fn managed_rmux_socket_directory(path: &Path) -> io::Result<Option<Pa
     Ok(None)
 }
 
-fn ensure_safe_rmux_socket_directory(path: &Path, access: UnixTransportAccess) -> io::Result<()> {
+fn ensure_safe_rmux_socket_directory(path: &Path) -> io::Result<()> {
     let metadata = fs::symlink_metadata(path)?;
     if metadata.file_type().is_symlink() || !metadata.is_dir() {
         return Err(io::Error::new(
@@ -180,24 +163,9 @@ fn ensure_safe_rmux_socket_directory(path: &Path, access: UnixTransportAccess) -
             format!("socket directory '{}' has unsafe ownership", path.display()),
         ));
     }
-    let expected_mode = access.directory_mode();
-    if mode != expected_mode {
-        fs::set_permissions(path, fs::Permissions::from_mode(expected_mode))?;
-        let updated = fs::symlink_metadata(path)?;
-        if updated.file_type().is_symlink()
-            || !updated.is_dir()
-            || updated.uid() != user_id
-            || updated.permissions().mode() & 0o777 != expected_mode
-        {
-            return Err(io::Error::new(
-                io::ErrorKind::PermissionDenied,
-                format!(
-                    "socket directory '{}' changed while applying permissions",
-                    path.display()
-                ),
-            ));
-        }
-    }
+    // Every `-L` server of this user shares this directory. Its traverse bits
+    // change only through the access controller, under the managed lock that
+    // serializes every sibling's narrowing scan; a bind never touches them.
     Ok(())
 }
 
@@ -262,23 +230,22 @@ pub(crate) fn remove_stale_socket_if_needed(socket_path: &Path) -> io::Result<()
         ));
     }
 
-    match StdUnixStream::connect(socket_path) {
-        Ok(_stream) => Err(io::Error::new(
+    // A stream connect cannot prove the socket stale: Darwin refuses it when a
+    // live listener's accept queue is full, and Linux blocks on that queue.
+    let endpoint = LocalEndpoint::from_path(socket_path.to_path_buf());
+    match rmux_ipc::probe_socket_presence(&endpoint)? {
+        SocketPresence::Bound => Err(io::Error::new(
             io::ErrorKind::AddrInUse,
             format!("socket '{}' is already in use", socket_path.display()),
         )),
-        Err(error) if indicates_stale_socket(&error) => {
+        SocketPresence::Unbound => {
             debug!(
-                "removing stale socket '{}' after failed connect probe: {error}",
+                "removing stale socket '{}': no live socket is bound to it",
                 socket_path.display()
             );
-            match fs::remove_file(socket_path) {
-                Ok(()) => Ok(()),
-                Err(remove_error) if remove_error.kind() == io::ErrorKind::NotFound => Ok(()),
-                Err(remove_error) => Err(remove_error),
-            }
+            remove_file_if_present(socket_path)
         }
-        Err(error) => Err(error),
+        SocketPresence::Missing => Ok(()),
     }
 }
 
@@ -369,6 +336,7 @@ fn remove_file_if_present(socket_path: &Path) -> io::Result<()> {
     }
 }
 
+#[cfg(test)]
 pub(crate) fn indicates_stale_socket(error: &io::Error) -> bool {
     matches!(
         error.kind(),
@@ -457,6 +425,82 @@ mod tests {
             unique_id
         ))
         .join("s")
+    }
+
+    #[test]
+    fn daemon_bind_keeps_the_socket_of_a_saturated_live_listener() {
+        assert_saturated_listener_survives("saturated-bind", |socket_path| {
+            bind_unix_listener_at(socket_path).map(drop)
+        });
+    }
+
+    #[test]
+    fn sigusr1_rebind_keeps_the_socket_of_a_saturated_live_listener() {
+        assert_saturated_listener_survives("saturated-rebind", |socket_path| {
+            rebind_unix_listener_at(socket_path, None, UnixTransportAccess::OwnerOnly).map(drop)
+        });
+    }
+
+    /// Binds beside a live listener whose accept queue is full: Darwin refuses
+    /// a stream connect to it and Linux blocks one, yet it is not stale.
+    fn assert_saturated_listener_survives(label: &str, bind: fn(&Path) -> io::Result<()>) {
+        let socket_path = unique_socket_path(label);
+        let parent = socket_path.parent().expect("socket parent");
+        fs::create_dir_all(parent).expect("create socket parent");
+        fs::set_permissions(parent, fs::Permissions::from_mode(0o700)).expect("secure parent");
+        let live = StdUnixListener::bind(&socket_path).expect("bind live listener");
+        rustix::net::listen(&live, 1).expect("shrink backlog");
+        let queued = fill_accept_queue(&socket_path);
+        let inode = fs::symlink_metadata(&socket_path)
+            .expect("live socket")
+            .ino();
+
+        let (sender, receiver) = std::sync::mpsc::channel();
+        let path_for_bind = socket_path.clone();
+        std::thread::spawn(move || {
+            // Binding the listener itself registers it with a Tokio reactor.
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("tokio runtime");
+            let _context = runtime.enter();
+            let _ = sender.send(bind(&path_for_bind));
+        });
+        let result = receiver
+            .recv_timeout(std::time::Duration::from_secs(10))
+            .expect("binding blocked on the saturated listener's queue");
+
+        let inode_after = fs::symlink_metadata(&socket_path).ok().map(|m| m.ino());
+        assert_eq!(
+            inode_after,
+            Some(inode),
+            "the live listener's socket was unlinked or replaced"
+        );
+        assert_eq!(
+            result.expect_err("a live listener holds the path").kind(),
+            io::ErrorKind::AddrInUse
+        );
+        drop((queued, live));
+        cleanup_socket_dir(&socket_path);
+    }
+
+    /// Fills the queue until Darwin refuses (ECONNREFUSED) or Linux rejects
+    /// (EAGAIN) a non-blocking connect.
+    fn fill_accept_queue(socket_path: &Path) -> Vec<std::os::fd::OwnedFd> {
+        use rustix::net::{connect, socket, AddressFamily, SocketAddrUnix, SocketType};
+
+        let address = SocketAddrUnix::new(socket_path).expect("socket address");
+        let mut queued = Vec::new();
+        loop {
+            let client = socket(AddressFamily::UNIX, SocketType::STREAM, None).expect("socket");
+            rustix::io::ioctl_fionbio(&client, true).expect("non-blocking client");
+            match connect(&client, &address) {
+                Ok(()) => queued.push(client),
+                Err(rustix::io::Errno::CONNREFUSED | rustix::io::Errno::AGAIN) => return queued,
+                Err(error) => panic!("unexpected connect error: {error}"),
+            }
+            assert!(queued.len() < 64, "the accept queue never filled");
+        }
     }
 
     fn cleanup_socket_dir(socket_path: &Path) {

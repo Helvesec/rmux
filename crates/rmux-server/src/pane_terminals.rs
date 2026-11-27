@@ -4,12 +4,12 @@ use std::path::Path;
 use std::sync::Mutex as StdMutex;
 
 use rmux_core::{
-    BufferStore, EnvironmentStore, HookStore, KeyBindingStore, OptionStore, PaneGeometry, PaneId,
-    Session, SessionStore,
+    BufferStore, EnvironmentStore, HookStore, KeyBindingStore, ManagedSessionStore, OptionStore,
+    PaneId,
 };
 use rmux_proto::{
     KillPaneResponse, KillWindowResponse, OptionName, PaneTarget, ProcessCommand, RmuxError,
-    SessionName, TerminalPixels, WindowTarget,
+    SessionName, WindowTarget,
 };
 #[cfg(windows)]
 use rmux_pty::WindowsConsoleKeyEvent;
@@ -20,77 +20,87 @@ use crate::pane_io::{PaneAlertCallback, PaneExitCallback, PaneOutputSender};
 #[cfg(unix)]
 use crate::pane_reader_runtime::PaneReaderRuntime;
 use crate::pane_transcript::SharedPaneTranscript;
-use crate::pane_visible_geometry::visible_pane_content_geometry;
 use crate::status_jobs::StatusJobRuntime;
 #[cfg(windows)]
 use crate::terminal::TerminalProfile;
 
-#[path = "pane_terminals/applied_window_resize.rs"]
+mod allow_rename;
 mod applied_window_resize;
+mod cursor_style;
 #[cfg(windows)]
-#[path = "pane_terminals/deferred_initial.rs"]
 mod deferred_initial;
-#[path = "pane_terminals/lifecycle_state.rs"]
+#[cfg(windows)]
+pub(crate) use deferred_initial::{DeferredInputTally, DEFERRED_INPUT_PANE_STOPPED};
+#[cfg(test)]
+mod initial_pane_tests;
 mod lifecycle_state;
-#[path = "pane_terminals/marked_pane.rs"]
 mod marked_pane;
-#[path = "pane_terminals/new_pane_command.rs"]
 mod new_pane_command;
-#[path = "pane_terminals/pane_access.rs"]
+mod pane_geometry;
+mod theme;
+use pane_geometry::PaneWindowGeometry;
+#[cfg(test)]
+mod input_capture_tests_support;
 mod pane_access;
-#[path = "pane_terminals/pane_lifecycle.rs"]
+#[cfg(test)]
+pub(crate) use input_capture_tests_support::CommittedFocusInputForTest;
 mod pane_lifecycle;
-#[path = "pane_terminals/pane_option_rekey.rs"]
 mod pane_option_rekey;
-#[path = "pane_terminals/pane_outputs.rs"]
+mod pane_option_targets;
 mod pane_outputs;
-#[path = "pane_pipe.rs"]
 mod pane_pipe;
-#[cfg(feature = "web")]
-#[path = "pane_terminals/pane_scrollback.rs"]
-mod pane_scrollback;
-#[path = "pane_terminal_store.rs"]
+mod pane_program_status;
 mod pane_terminal_store;
-#[path = "pane_terminals/pane_transcripts.rs"]
 mod pane_transcripts;
-#[path = "pane_terminals/pane_transfer.rs"]
 mod pane_transfer;
-#[path = "pane_terminals/pipes.rs"]
 mod pipes;
-#[path = "pane_terminals/rollback.rs"]
 mod rollback;
-#[path = "pane_terminals/session_mutation.rs"]
+mod scroll_on_clear;
 mod session_mutation;
+mod sixel;
+mod web_render;
 pub(crate) use session_mutation::SessionTransferSnapshot;
-#[path = "pane_terminals/session_runtime.rs"]
+pub(crate) use web_render::WebRenderState;
 mod session_runtime;
-#[path = "pane_terminals/window_indices.rs"]
+mod terminal_shutdown;
+pub(crate) use terminal_shutdown::PaneTerminalShutdown;
 mod window_indices;
-#[path = "pane_terminals/window_listing.rs"]
+mod window_layout;
 mod window_listing;
+mod window_rename_request;
 pub(crate) use window_listing::{ListWindowsAllSelection, ListWindowsSelection};
-#[path = "pane_terminals/window_link_runtime.rs"]
 mod window_link_runtime;
-#[path = "pane_terminals/window_links.rs"]
 mod window_links;
-#[path = "pane_terminals_window.rs"]
+mod window_selection;
+pub(crate) use window_selection::WindowRuntimeResizeScope;
+#[cfg(test)]
+#[path = "pane_terminals/window_selection_fixture.rs"]
+mod window_selection_fixture;
+// The process-free in-memory state the G6 multiple-links observation uses; it lives here because
+// the pane terminal store is private to this module.
+#[cfg(test)]
+#[path = "pane_terminals/g6_multiple_links_fixture.rs"]
+mod g6_multiple_links_fixture;
 mod window_support;
 
 pub(crate) use applied_window_resize::{AppliedWindowResize, AppliedWindowResizeQueue};
-#[cfg(test)]
 pub(crate) use lifecycle_state::PaneLifecycleProcessState;
 use lifecycle_state::PaneLifecycleSpawn;
 pub(crate) use lifecycle_state::PaneLifecycleState;
 use marked_pane::MarkedPane;
 pub(crate) use new_pane_command::resolve_new_pane_process_command;
 pub(in crate::pane_terminals) use pane_lifecycle::{
-    terminate_removed_terminals, LinkedWindowTransferRemovalPlan, PreparedWindowTerminal,
+    terminate_removed_terminals, LinkedWindowTransferRemovalPlan,
 };
+pub(crate) use pane_lifecycle::{SplitExitPolicyOverride, SplitPaneProcess};
 pub(crate) use pane_outputs::PaneExitMetadata;
+use pane_outputs::PaneExitObservation;
 use pane_outputs::{AttachedSubmittedLine, PaneOutputSpawn, RemovedPaneOutputs};
 use pane_pipe::PanePipeStore;
 #[cfg(test)]
 pub(crate) use pane_pipe::PipeProcessGroupProbe;
+#[cfg(all(test, target_os = "macos"))]
+pub(crate) use pane_terminal_store::native_resize::tests::ResizeCase;
 use pane_terminal_store::PaneTerminalStore;
 #[cfg_attr(windows, allow(unused_imports))]
 pub(crate) use pane_transcripts::PaneCaptureRequest;
@@ -132,12 +142,13 @@ pub(crate) struct DeferredInitialPaneSpawn {
     pub(crate) runtime_session_name: SessionName,
     pub(crate) visible_session_name: SessionName,
     pub(crate) identity: DeferredInitialPaneIdentity,
-    pub(crate) geometry: PaneGeometry,
+    pub(crate) geometry: rmux_core::PaneGeometry,
     pub(crate) profile: TerminalProfile,
     pub(crate) runtime_window_name: Option<String>,
     pub(crate) command: Option<ProcessCommand>,
     pub(crate) pane_alert_callback: Option<PaneAlertCallback>,
     pub(crate) pane_exit_callback: Option<PaneExitCallback>,
+    pub(crate) pane_shell: crate::pane_terminal_process::PaneShell,
 }
 
 #[cfg(windows)]
@@ -265,12 +276,14 @@ pub(crate) struct RespawnWindowOptions<'a> {
 
 #[derive(Debug, Default)]
 pub(crate) struct HandlerState {
-    pub(crate) sessions: SessionStore,
+    pub(crate) sessions: ManagedSessionStore,
     pub(crate) options: OptionStore,
     pub(crate) environment: EnvironmentStore,
     pub(crate) hooks: HookStore,
     pub(crate) buffers: BufferStore,
     pub(crate) key_bindings: KeyBindingStore,
+    /// Backend every pane and popup spawn of this server goes through.
+    pub(crate) pane_shell: crate::pane_terminal_process::PaneShell,
     pub(crate) retained_lifecycle_targets:
         StdMutex<crate::handler::RetainedLifecycleTargetRegistry>,
     pub(crate) message_log: VecDeque<MessageEntry>,
@@ -299,13 +312,21 @@ pub(crate) struct HandlerState {
     pane_output_generations: HashMap<SessionName, HashMap<PaneId, u64>>,
     pane_lifecycle: HashMap<PaneId, PaneLifecycleState>,
     attached_submitted_rows: HashMap<SessionName, HashMap<PaneId, AttachedSubmittedLine>>,
-    attached_terminal_pixels: HashMap<SessionName, TerminalPixels>,
+    attached_terminal_geometry: HashMap<SessionName, rmux_proto::TerminalGeometry>,
     input_disabled_panes: HashSet<PaneId>,
+    /// Attached clients with a display-popup admission between its overlay check and its
+    /// installation; see `handler_overlay/admission.rs`.
+    pub(crate) popup_admissions: std::sync::Arc<StdMutex<HashSet<u32>>>,
     #[cfg(test)]
     pane_input_captures: StdMutex<HashMap<String, Vec<u8>>>,
     #[cfg(test)]
+    pane_focus_input_captures: StdMutex<HashMap<String, Vec<CommittedFocusInputForTest>>>,
+    #[cfg(test)]
     window_runtime_resize_count: u64,
-    dead_panes: HashMap<SessionName, HashMap<PaneId, PaneExitMetadata>>,
+    #[cfg(test)]
+    respawn_startup_output_for_test: Option<Vec<u8>>,
+    dead_panes: HashMap<SessionName, HashMap<PaneId, PaneExitObservation>>,
+    kept_dead_pane_preparations: HashMap<SessionName, HashMap<PaneId, u64>>,
     marked_pane: Option<MarkedPane>,
     pipes: PanePipeStore,
     auto_named_windows: HashSet<(SessionName, u32)>,
@@ -318,14 +339,14 @@ pub(crate) struct HandlerState {
     fail_link_window_after_attach: bool,
     #[cfg(unix)]
     pane_reader_runtime: Option<PaneReaderRuntime>,
+    pub(crate) control_colour_clients: crate::control_colours::ControlColourClients,
+    pub(crate) theme_clients: Vec<crate::theme::SessionThemeClient>,
+    pub(crate) sixel_sessions: Vec<rmux_proto::SessionId>,
+    pub(crate) pane_output_read_demand: crate::pane_io::PaneOutputReadDemandRegistry,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct MessageEntry {
-    pub(crate) msg_time: i64,
-    pub(crate) msg_num: u64,
-    pub(crate) msg: String,
-}
+mod message_log;
+pub(crate) use message_log::MessageEntry;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct KilledPaneHookContext {
@@ -410,6 +431,15 @@ impl HandlerState {
         self.applied_window_resizes.take()
     }
 
+    pub(crate) fn take_applied_window_resize(
+        &mut self,
+        target: &WindowTarget,
+    ) -> Option<AppliedWindowResize> {
+        let window_id = self.window_id_at(target);
+        self.applied_window_resizes
+            .take_for_window(target, window_id)
+    }
+
     fn window_id_at(&self, target: &WindowTarget) -> Option<rmux_core::WindowId> {
         self.sessions
             .session(target.session_name())
@@ -478,6 +508,7 @@ impl HandlerState {
         let mut runtime_sessions = self
             .sessions
             .iter()
+            .map(|session| (session.name(), session))
             .map(|(session_name, _)| self.runtime_session_name(session_name))
             .collect::<Vec<_>>();
         runtime_sessions.sort_by(|left, right| left.as_str().cmp(right.as_str()));
@@ -492,23 +523,34 @@ impl HandlerState {
         }
         self.auto_named_windows.clear();
         self.attached_submitted_rows.clear();
-        self.attached_terminal_pixels.clear();
+        self.attached_terminal_geometry.clear();
         self.dead_panes.clear();
         self.pane_lifecycle.clear();
     }
 
+    #[cfg(test)]
     pub(crate) fn set_attached_terminal_pixels(
         &mut self,
         session_name: &SessionName,
-        pixels: Option<TerminalPixels>,
+        pixels: Option<rmux_proto::TerminalPixels>,
     ) {
-        match pixels {
-            Some(pixels) => {
-                self.attached_terminal_pixels
-                    .insert(session_name.clone(), pixels);
+        let mut geometry = rmux_proto::TerminalGeometry::new(80, 24);
+        geometry.pixels = pixels;
+        self.set_attached_terminal_geometry(session_name, geometry);
+    }
+
+    pub(crate) fn set_attached_terminal_geometry(
+        &mut self,
+        session_name: &SessionName,
+        geometry: rmux_proto::TerminalGeometry,
+    ) {
+        match geometry.pixels {
+            Some(_) => {
+                self.attached_terminal_geometry
+                    .insert(session_name.clone(), geometry);
             }
             None => {
-                self.attached_terminal_pixels.remove(session_name);
+                self.attached_terminal_geometry.remove(session_name);
             }
         }
     }
@@ -517,8 +559,10 @@ impl HandlerState {
     pub(crate) fn attached_terminal_pixels_for_test(
         &self,
         session_name: &SessionName,
-    ) -> Option<TerminalPixels> {
-        self.attached_terminal_pixels.get(session_name).copied()
+    ) -> Option<rmux_proto::TerminalPixels> {
+        self.attached_terminal_geometry
+            .get(session_name)
+            .and_then(|geometry| geometry.pixels)
     }
 
     #[cfg(test)]
@@ -526,36 +570,9 @@ impl HandlerState {
         self.window_runtime_resize_count
     }
 
-    pub(crate) fn add_message(&mut self, message: impl Into<String>) {
-        let message = message.into();
-        let msg_num = self.next_message_number;
-        self.next_message_number = self.next_message_number.saturating_add(1);
-        self.message_log.push_back(MessageEntry {
-            msg_time: chrono::Local::now().timestamp(),
-            msg_num,
-            msg: message,
-        });
-
-        self.trim_message_log();
-    }
-
-    pub(crate) fn trim_message_log(&mut self) {
-        let limit = self.message_limit();
-        while self.message_log.len() > limit {
-            let _ = self.message_log.pop_front();
-        }
-    }
-
     #[cfg(unix)]
     pub(crate) fn continue_stopped_panes(&mut self) {
         self.terminals.continue_stopped_panes();
-    }
-
-    fn message_limit(&self) -> usize {
-        self.options
-            .resolve(None, OptionName::MessageLimit)
-            .and_then(|value| value.parse::<usize>().ok())
-            .unwrap_or(1000)
     }
 
     fn apply_window_name(
@@ -597,53 +614,15 @@ impl HandlerState {
         if !should_update {
             return Ok(());
         }
-        self.sessions
-            .session_mut(session_name)
-            .expect("existing session must accept automatic rename update")
-            .rename_window(window_index, window_name)?;
+        let _ = self.sessions.set_automatic_window_name(
+            &WindowTarget::with_window(session_name.clone(), window_index),
+            window_name,
+        )?;
         self.mark_auto_named_window(session_name, window_index);
         self.synchronize_linked_window_from_slot(session_name, window_index)?;
         self.synchronize_session_group_from(session_name)?;
         Ok(())
     }
-}
-
-fn pane_terminal_geometry_for_session(
-    session: &Session,
-    options: &OptionStore,
-    window_index: u32,
-    pane_index: u32,
-    geometry: PaneGeometry,
-    alternate_on: bool,
-    copy_mode_active: bool,
-) -> PaneGeometry {
-    let content_rows = session_content_rows(session, options, window_index);
-    let geometry = visible_pane_content_geometry(
-        options,
-        session.name(),
-        window_index,
-        geometry,
-        content_rows,
-    );
-    crate::pane_scrollbar::PaneScrollbarConfig::resolve(
-        options,
-        session.name(),
-        window_index,
-        pane_index,
-    )
-    .content_geometry(geometry, alternate_on, copy_mode_active)
-}
-
-fn session_content_rows(session: &Session, _options: &OptionStore, window_index: u32) -> u16 {
-    let window = session
-        .window_at(window_index)
-        .unwrap_or_else(|| session.window());
-    let size = window.size();
-    if size.cols == 0 || size.rows == 0 {
-        return size.rows;
-    }
-
-    size.rows
 }
 
 pub(crate) fn session_not_found(session_name: &SessionName) -> RmuxError {
@@ -654,11 +633,9 @@ pub(crate) fn session_not_found(session_name: &SessionName) -> RmuxError {
 mod tests {
     use std::collections::HashMap;
 
-    use super::{
-        pane_terminal_geometry_for_session, session_content_rows, HandlerState,
-        InitialPaneSpawnOptions,
-    };
-    use rmux_core::{PaneGeometry, Session};
+    use super::{HandlerState, InitialPaneSpawnOptions, PaneWindowGeometry};
+    use crate::session_fixture::SessionFixture;
+    use rmux_core::PaneGeometry;
     use rmux_proto::{
         HookLifecycle, HookName, OptionName, PaneTarget, RmuxError, ScopeSelector, SessionName,
         SetOptionMode, TerminalSize, WindowTarget,
@@ -671,7 +648,7 @@ mod tests {
     #[test]
     fn session_content_rows_are_not_reconverted_from_terminal_status() {
         let alpha = session_name("alpha");
-        let mut session = Session::new(alpha.clone(), TerminalSize { cols: 80, rows: 24 });
+        let mut session = SessionFixture::new(alpha.clone(), TerminalSize { cols: 80, rows: 24 });
         session.resize_active_window_geometry(
             TerminalSize { cols: 80, rows: 24 },
             TerminalSize { cols: 80, rows: 22 },
@@ -687,7 +664,10 @@ mod tests {
                 SetOptionMode::Replace,
             )
             .expect("session status set succeeds");
-        assert_eq!(session_content_rows(&session, &state.options, 0), 22);
+        assert_eq!(
+            PaneWindowGeometry::new(session.name(), 0, session.window()).content_rows(),
+            22
+        );
 
         state
             .options
@@ -698,7 +678,10 @@ mod tests {
                 SetOptionMode::Replace,
             )
             .expect("session status set succeeds");
-        assert_eq!(session_content_rows(&session, &state.options, 0), 22);
+        assert_eq!(
+            PaneWindowGeometry::new(session.name(), 0, session.window()).content_rows(),
+            22
+        );
 
         state
             .options
@@ -709,13 +692,16 @@ mod tests {
                 SetOptionMode::Replace,
             )
             .expect("session status set succeeds");
-        assert_eq!(session_content_rows(&session, &state.options, 0), 22);
+        assert_eq!(
+            PaneWindowGeometry::new(session.name(), 0, session.window()).content_rows(),
+            22
+        );
     }
 
     #[test]
     fn content_sized_session_does_not_reserve_status_rows_after_attach() {
         let alpha = session_name("alpha");
-        let mut session = Session::new(alpha.clone(), TerminalSize { cols: 80, rows: 24 });
+        let mut session = SessionFixture::new(alpha.clone(), TerminalSize { cols: 80, rows: 24 });
         session.touch_attached();
         let mut state = HandlerState::default();
         state
@@ -728,13 +714,16 @@ mod tests {
             )
             .expect("session status set succeeds");
 
-        assert_eq!(session_content_rows(&session, &state.options, 0), 24);
+        assert_eq!(
+            PaneWindowGeometry::new(session.name(), 0, session.window()).content_rows(),
+            24
+        );
     }
 
     #[test]
     fn pane_terminal_geometry_tracks_scrollbar_mode_position_and_alternate_screen() {
         let alpha = session_name("alpha");
-        let session = Session::new(alpha.clone(), TerminalSize { cols: 20, rows: 8 });
+        let session = SessionFixture::new(alpha.clone(), TerminalSize { cols: 20, rows: 8 });
         let mut state = HandlerState::default();
         let target = WindowTarget::with_window(alpha.clone(), 0);
         state
@@ -766,10 +755,8 @@ mod tests {
             .expect("scrollbar style");
 
         assert_eq!(
-            pane_terminal_geometry_for_session(
-                &session,
+            PaneWindowGeometry::new(session.name(), 0, session.window()).content_geometry(
                 &state.options,
-                0,
                 0,
                 PaneGeometry::new(0, 0, 20, 8),
                 false,
@@ -778,10 +765,8 @@ mod tests {
             PaneGeometry::new(3, 0, 17, 8)
         );
         assert_eq!(
-            pane_terminal_geometry_for_session(
-                &session,
+            PaneWindowGeometry::new(session.name(), 0, session.window()).content_geometry(
                 &state.options,
-                0,
                 0,
                 PaneGeometry::new(0, 0, 20, 8),
                 true,
@@ -801,10 +786,8 @@ mod tests {
             )
             .expect("modal scrollbar mode");
         assert_eq!(
-            pane_terminal_geometry_for_session(
-                &session,
+            PaneWindowGeometry::new(session.name(), 0, session.window()).content_geometry(
                 &state.options,
-                0,
                 0,
                 PaneGeometry::new(0, 0, 20, 8),
                 false,
@@ -813,10 +796,8 @@ mod tests {
             PaneGeometry::new(0, 0, 20, 8)
         );
         assert_eq!(
-            pane_terminal_geometry_for_session(
-                &session,
+            PaneWindowGeometry::new(session.name(), 0, session.window()).content_geometry(
                 &state.options,
-                0,
                 0,
                 PaneGeometry::new(0, 0, 20, 8),
                 false,
@@ -1007,3 +988,6 @@ mod tests {
         state.shutdown_terminals_for_test();
     }
 }
+
+mod attached_window_resizes;
+pub(crate) use attached_window_resizes::AttachedWindowResize;

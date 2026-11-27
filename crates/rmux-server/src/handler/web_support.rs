@@ -1,0 +1,573 @@
+#[cfg(not(target_has_atomic = "64"))]
+use portable_atomic::AtomicU64;
+use std::collections::HashMap;
+use std::net::IpAddr;
+#[cfg(target_has_atomic = "64")]
+use std::sync::atomic::AtomicU64;
+use std::sync::atomic::{AtomicBool, AtomicUsize};
+use std::sync::Arc;
+use std::time::{Duration, SystemTime};
+
+use rmux_proto::{
+    CreateWebShareRequest, ErrorResponse, KillSessionRequest, KillWindowRequest, NewWindowRequest,
+    PaneInputRequest, PaneKillRequest, PaneResizeRequest, PaneSelectRequest, PaneTargetRef,
+    RenameWindowRequest, Request, ResizePaneAdjustment, Response, RmuxError, SelectWindowRequest,
+    SessionId, SessionName, SplitDirection, SplitWindowRequest, SplitWindowTarget, WebShareRequest,
+    WebShareScope, WindowId, WindowTarget,
+};
+use tokio::sync::{mpsc, watch};
+
+use super::attach_support::{
+    attach_render_target_for_session_window, attach_target_for_web_session, AttachRegistration,
+    ClientFlags,
+};
+use super::pane_support::resolve_pane_target_ref;
+use super::{NormalRequestGuard, RequestHandler};
+use crate::outer_terminal::OuterTerminalContext;
+use crate::pane_io::{self, AttachControl, LiveAttachInputContext, PaneOutputReceiver};
+use crate::pane_recovery::PaneRecoveryDraft;
+use crate::pane_terminal_lookup::pane_id_for_target;
+#[cfg(test)]
+use crate::renderer::WebSceneProjection;
+use crate::server_access::current_owner_uid;
+use crate::web::{
+    ResolvedCreateWebShareRequest, WebPaneTarget, WebSessionTarget, WebShareAccess,
+    WebShareAuthWaitPermit, WebShareExpiryPoll, WebShareTarget,
+};
+#[cfg(test)]
+use rmux_core::FloatingPaneRect;
+use rmux_core::{input::mode, PaneId};
+
+const WEB_ATTACH_PID_BASE: u32 = 0x8000_0000;
+
+mod actions;
+mod capture;
+mod initial_capture;
+use initial_capture::WebInitialCapture;
+mod scene;
+mod snapshot;
+mod stream;
+#[cfg(test)]
+#[path = "../handler_web_test_support.rs"]
+mod test_support;
+use scene::{selected_web_session_window_index, WebSessionScene};
+
+#[cfg(test)]
+pub(crate) use snapshot::WebSessionView as TestWebSessionView;
+pub(crate) use snapshot::{
+    WebPaneSnapshot, WebSessionPaneFrame, WebSessionPaneView, WebSessionSnapshot,
+};
+pub(crate) use stream::{
+    WebPaneStream, WebSessionAttachEvent, WebSessionAttachReader, WebSessionStream,
+    WebSessionWindowSelection, WebShareStream,
+};
+
+pub(crate) struct UndeliveredWebShareGuard {
+    registry: Arc<crate::web::WebShareRegistry>,
+    share_id: Option<String>,
+}
+
+impl UndeliveredWebShareGuard {
+    pub(crate) fn for_response(handler: &RequestHandler, response: &Response) -> Option<Self> {
+        let Response::WebShare(response) = response else {
+            return None;
+        };
+        let rmux_proto::WebShareResponse::Created(created) = response.as_ref() else {
+            return None;
+        };
+        Some(Self {
+            registry: Arc::clone(&handler.web_shares),
+            share_id: Some(created.share_id.clone()),
+        })
+    }
+
+    pub(crate) fn disarm(&mut self) {
+        self.share_id = None;
+    }
+}
+
+impl Drop for UndeliveredWebShareGuard {
+    fn drop(&mut self) {
+        if let Some(share_id) = self.share_id.take() {
+            self.registry.discard_undelivered(&share_id);
+        }
+    }
+}
+
+impl RequestHandler {
+    /// Admit a Web-originated state change into the same shutdown barrier as
+    /// detached and control-mode requests. Snapshot, liveness, scrollback and
+    /// viewer-count paths are observations and intentionally do not call this;
+    /// pane input, attach input and every session/window action are mutations.
+    fn begin_web_mutation(&self) -> Result<NormalRequestGuard, RmuxError> {
+        self.try_begin_normal_request(true)
+            .ok_or_else(|| RmuxError::Server("server is shutting down".to_owned()))
+    }
+
+    fn begin_web_share_forwarder(&self) -> Result<NormalRequestGuard, RmuxError> {
+        self.try_begin_normal_request(false)
+            .ok_or_else(|| RmuxError::Server("server is shutting down".to_owned()))
+    }
+
+    pub(crate) fn web_settings(&self) -> crate::web::WebShareSettings {
+        self.web_shares.settings()
+    }
+
+    pub(crate) fn update_web_listener_port(&self, port: u16) {
+        self.web_shares.update_listener_port(port);
+    }
+
+    pub(crate) fn mark_web_listener_available(&self) {
+        self.web_shares.mark_listener_available();
+    }
+
+    pub(crate) fn mark_web_listener_unavailable(&self, reason: impl Into<String>) {
+        self.web_shares.mark_listener_unavailable(reason);
+    }
+
+    pub(in crate::handler) fn has_persistent_web_listener(&self) -> bool {
+        self.web_shares.listener_available()
+    }
+
+    pub(crate) async fn ensure_web_share_listener_running(&self) -> Result<(), RmuxError> {
+        if self.web_shares.listener_available() {
+            return Ok(());
+        }
+        let _start_guard = self.web_listener_start.lock().await;
+        if self.web_shares.listener_available() {
+            return Ok(());
+        }
+        if let Err(error) = crate::web::spawn(Arc::new(self.clone())).await {
+            return Err(RmuxError::Server(format!(
+                "web-share listener unavailable: {error}"
+            )));
+        }
+        Ok(())
+    }
+
+    pub(in crate::handler) async fn handle_web_share(&self, request: WebShareRequest) -> Response {
+        let response = match request {
+            WebShareRequest::Create(request) => {
+                if let Err(error) = self.ensure_web_share_listener_running().await {
+                    return Response::Error(ErrorResponse { error });
+                }
+                let request = match self.resolve_create_web_share(request).await {
+                    Ok(request) => request,
+                    Err(error) => return Response::Error(ErrorResponse { error }),
+                };
+                if let Err(error) = self.web_shares.validate_create_options(request.request()) {
+                    return Response::Error(ErrorResponse { error });
+                }
+                let request = match self.start_web_share_tunnel(request).await {
+                    Ok(request) => request,
+                    Err(error) => return Response::Error(ErrorResponse { error }),
+                };
+                let expiry_kill_target = request.expiry_kill_target();
+                let created = {
+                    let state = self.state.lock().await;
+                    if let Err(error) = validate_resolved_web_target(&state, request.target()) {
+                        return Response::Error(ErrorResponse { error });
+                    }
+                    self.web_shares.create(request)
+                };
+                match created {
+                    Ok(created) => {
+                        let revoke_rx = self.web_shares.expiry_revoke_receiver(&created.share_id);
+                        self.spawn_web_share_expiry_task(
+                            created.share_id.clone(),
+                            created.expires_at_unix,
+                            expiry_kill_target,
+                            revoke_rx,
+                        );
+                        Ok(rmux_proto::WebShareResponse::Created(created))
+                    }
+                    Err(error) => Err(error),
+                }
+            }
+            WebShareRequest::Config(request) => {
+                if let Err(error) = self.ensure_web_share_listener_running().await {
+                    return Response::Error(ErrorResponse { error });
+                }
+                self.web_shares.handle(WebShareRequest::Config(request))
+            }
+            other => self.web_shares.handle(other),
+        };
+        match response {
+            Ok(response) => Response::WebShare(Box::new(response)),
+            Err(error) => Response::Error(ErrorResponse { error }),
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn open_web_share_token_id(
+        &self,
+        token_id: &str,
+        pin: Option<&str>,
+    ) -> Result<WebShareStream, RmuxError> {
+        let access = self.web_shares.connect_token_id(token_id, pin).await?;
+        self.open_authenticated_web_share(access).await
+    }
+
+    pub(crate) async fn authenticate_web_share_token_id_with_wait(
+        &self,
+        token_id: &str,
+        pin: Option<&str>,
+        auth_wait: &WebShareAuthWaitPermit,
+    ) -> Result<WebShareAccess, RmuxError> {
+        self.web_shares
+            .connect_token_id_with_wait(token_id, pin, auth_wait)
+            .await
+    }
+
+    pub(crate) async fn open_authenticated_web_share(
+        &self,
+        access: WebShareAccess,
+    ) -> Result<WebShareStream, RmuxError> {
+        // Authentication/backoff is cancel-safe. `WebShareAccess` reverses its viewer
+        // registration on drop, so acquire both shutdown guards only at the durable open
+        // boundary. Reserve the forwarder first: once Drain succeeds, no later gate may reject
+        // the already-admitted mutation.
+        let forwarder_admission = self.begin_web_share_forwarder()?;
+        let _open_admission = self.begin_web_mutation()?;
+        self.open_web_share_access(access, forwarder_admission)
+            .await
+    }
+
+    pub(crate) fn reserve_web_share_authentication(
+        &self,
+        token_id: &str,
+        peer: Option<IpAddr>,
+    ) -> Result<WebShareAuthWaitPermit, RmuxError> {
+        self.web_shares.reserve_authentication_wait(token_id, peer)
+    }
+
+    pub(crate) fn web_share_pre_auth_token(
+        &self,
+        token_id: &str,
+        origin: &str,
+    ) -> Option<(crate::web::SecretHashForCrypto, bool)> {
+        self.web_shares.pre_auth_token(token_id, origin)
+    }
+
+    pub(in crate::handler) fn prune_web_session(&self, removed: Option<(SessionName, SessionId)>) {
+        if let Some((name, id)) = removed {
+            self.web_shares.remove_targets_for_sessions(&[(name, id)]);
+        }
+    }
+
+    pub(in crate::handler) fn prune_web_panes(&self, pane_ids: &[PaneId]) {
+        self.web_shares.remove_targets_for_panes(pane_ids);
+    }
+
+    pub(in crate::handler) fn rekey_web_session(
+        &self,
+        old_name: &SessionName,
+        new_name: &SessionName,
+        session_id: SessionId,
+    ) {
+        self.web_shares
+            .rename_session_targets(old_name, new_name, session_id);
+    }
+
+    async fn open_web_share_access(
+        &self,
+        access: WebShareAccess,
+        forwarder_admission: NormalRequestGuard,
+    ) -> Result<WebShareStream, RmuxError> {
+        match access.target().clone() {
+            WebShareTarget::Pane(target) => {
+                drop(forwarder_admission);
+                let session_id = target.session_id();
+                let target = self.stable_web_target(&target).await?;
+                let (snapshot, output) = self.web_resnapshot(&target).await?;
+                let revoke_rx = access.revoke_receiver();
+                Ok(WebShareStream::Pane(Box::new(WebPaneStream {
+                    access,
+                    output,
+                    revoke_rx,
+                    snapshot,
+                    session_id,
+                    target,
+                })))
+            }
+            WebShareTarget::Session(session_target) => {
+                let stream = self
+                    .open_web_session_share(access, session_target, forwarder_admission)
+                    .await?;
+                Ok(WebShareStream::Session(Box::new(stream)))
+            }
+        }
+    }
+
+    fn spawn_web_share_expiry_task(
+        &self,
+        share_id: String,
+        expires_at_unix: Option<u64>,
+        kill_target: Option<WebSessionTarget>,
+        revoke_rx: Option<watch::Receiver<Option<crate::web::WebShareRevokeReason>>>,
+    ) {
+        let (Some(_), Some(revoke_rx)) = (expires_at_unix, revoke_rx) else {
+            return;
+        };
+        let handler = self.clone();
+        tokio::spawn(async move {
+            // The wire response exposes whole Unix seconds, but the registry
+            // retains the exact SystemTime deadline. Poll that exact deadline
+            // atomically with record presence so rounding cannot leave an
+            // expired share unenforced and stopping a share cannot leak a task.
+            let Some(expired) = handler
+                .wait_for_web_share_expiry(&share_id, revoke_rx)
+                .await
+            else {
+                return;
+            };
+            tracing::info!(share_id = %expired.share_id, "web_share_expired");
+            let target = kill_target.or(expired.kill_session);
+            if let Some(target) = target {
+                if let Err(error) = handler
+                    .web_session_logout(&target, std::process::id())
+                    .await
+                {
+                    tracing::debug!(
+                        share_id = %expired.share_id,
+                        session = %target.name(),
+                        "web-share expiry session kill skipped: {error}"
+                    );
+                }
+            }
+        });
+    }
+
+    async fn wait_for_web_share_expiry(
+        &self,
+        share_id: &str,
+        mut revoke_rx: watch::Receiver<Option<crate::web::WebShareRevokeReason>>,
+    ) -> Option<crate::web::ExpiredWebShare> {
+        loop {
+            match self.web_shares.poll_expiry(share_id) {
+                WebShareExpiryPoll::Expired(expired) => return Some(expired),
+                WebShareExpiryPoll::Pending(deadline) => {
+                    tokio::select! {
+                        () = tokio::time::sleep(duration_until(deadline)) => {}
+                        changed = revoke_rx.changed() => {
+                            if changed.is_err() {
+                                return None;
+                            }
+                        }
+                    }
+                }
+                WebShareExpiryPoll::Gone => return None,
+            }
+        }
+    }
+
+    async fn resolve_create_web_share(
+        &self,
+        request: CreateWebShareRequest,
+    ) -> Result<ResolvedCreateWebShareRequest, rmux_proto::RmuxError> {
+        let state = self.state.lock().await;
+        let target = match &request.scope {
+            WebShareScope::Pane(raw_target) => {
+                let target = resolve_pane_target_ref(&state, raw_target)?;
+                let session = state
+                    .sessions
+                    .session(target.session_name())
+                    .ok_or_else(|| session_not_found_web(target.session_name()))?;
+                let pane_id = pane_id_for_target(
+                    &state.sessions,
+                    target.session_name(),
+                    target.window_index(),
+                    target.pane_index(),
+                )?;
+                WebShareTarget::pane(
+                    PaneTargetRef::by_id(target.session_name().clone(), pane_id),
+                    session.id(),
+                )
+            }
+            WebShareScope::Session(session_name) => {
+                let session = state
+                    .sessions
+                    .session(session_name)
+                    .ok_or_else(|| session_not_found_web(session_name))?;
+                WebShareTarget::session(session.name().clone(), session.id())
+            }
+        };
+        Ok(ResolvedCreateWebShareRequest::new(request, target))
+    }
+
+    async fn start_web_share_tunnel(
+        &self,
+        request: ResolvedCreateWebShareRequest,
+    ) -> Result<ResolvedCreateWebShareRequest, rmux_proto::RmuxError> {
+        let provider = match request.tunnel_provider() {
+            Some(provider) => provider.to_owned(),
+            None => return Ok(request),
+        };
+        if request.public_base_url().is_some() {
+            return Err(RmuxError::Server(
+                "web-share --tunnel-url and --tunnel-provider are mutually exclusive".to_owned(),
+            ));
+        }
+        let settings = self.web_shares.settings();
+        let tunnel = crate::web::start_tunnel_provider(&provider, &settings).await?;
+        Ok(request.with_tunnel(tunnel))
+    }
+
+    async fn stable_web_target(&self, target: &WebPaneTarget) -> Result<PaneTargetRef, RmuxError> {
+        let state = self.state.lock().await;
+        state
+            .sessions
+            .session_by_id(target.session_id())
+            .filter(|session| session.name() == target.target().session_name())
+            .ok_or_else(|| session_not_found_web(target.target().session_name()))?;
+        let target = resolve_pane_target_ref(&state, target.target())?;
+        let pane_id = pane_id_for_target(
+            &state.sessions,
+            target.session_name(),
+            target.window_index(),
+            target.pane_index(),
+        )?;
+        Ok(PaneTargetRef::by_id(target.session_name().clone(), pane_id))
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn web_target_alive(&self, target: &PaneTargetRef) -> bool {
+        let state = self.state.lock().await;
+        resolve_pane_target_ref(&state, target).is_ok()
+    }
+
+    pub(crate) async fn current_web_pane_target(
+        &self,
+        session_id: SessionId,
+        target: &PaneTargetRef,
+    ) -> Result<PaneTargetRef, RmuxError> {
+        let pane_id = target.pane_id().ok_or_else(|| {
+            RmuxError::Server("web pane stream lost its stable pane id".to_owned())
+        })?;
+        let state = self.state.lock().await;
+        let session = state
+            .sessions
+            .session_by_id(session_id)
+            .ok_or_else(|| session_not_found_web(target.session_name()))?;
+        let current = PaneTargetRef::by_id(session.name().clone(), pane_id);
+        let resolved = resolve_pane_target_ref(&state, &current)?;
+        Ok(PaneTargetRef::by_id(
+            resolved.session_name().clone(),
+            pane_id,
+        ))
+    }
+
+    pub(crate) async fn web_session_alive(&self, session_target: &WebSessionTarget) -> bool {
+        self.current_web_session_target(session_target)
+            .await
+            .is_ok()
+    }
+
+    async fn current_web_session_target(
+        &self,
+        session_target: &WebSessionTarget,
+    ) -> Result<WebSessionTarget, RmuxError> {
+        let state = self.state.lock().await;
+        state
+            .sessions
+            .session_by_id(session_target.id())
+            .map(|session| WebSessionTarget::new(session.name().clone(), session.id()))
+            .ok_or_else(|| session_not_found_web(session_target.name()))
+    }
+
+    async fn current_web_window_identity(
+        &self,
+        session_target: &WebSessionTarget,
+        window_index: u32,
+    ) -> Result<(WebSessionTarget, WindowId), RmuxError> {
+        let state = self.state.lock().await;
+        let session = state
+            .sessions
+            .session_by_id(session_target.id())
+            .ok_or_else(|| session_not_found_web(session_target.name()))?;
+        let window = session.window_at(window_index).ok_or_else(|| {
+            RmuxError::invalid_target(window_index.to_string(), "window not found")
+        })?;
+        Ok((
+            WebSessionTarget::new(session.name().clone(), session.id()),
+            window.id(),
+        ))
+    }
+
+    async fn web_session_active_pane_identity(
+        &self,
+        session_target: &WebSessionTarget,
+    ) -> Result<(WebSessionTarget, PaneId), RmuxError> {
+        let state = self.state.lock().await;
+        let session = state
+            .sessions
+            .session_by_id(session_target.id())
+            .ok_or_else(|| session_not_found_web(session_target.name()))?;
+        let pane_id = session.active_pane_id().ok_or_else(|| {
+            RmuxError::invalid_target(session.name().to_string(), "pane not found")
+        })?;
+        Ok((
+            WebSessionTarget::new(session.name().clone(), session.id()),
+            pane_id,
+        ))
+    }
+
+    async fn allocate_web_attach_pid(&self) -> Result<u32, RmuxError> {
+        for _ in 0..1024 {
+            let id = self.allocate_connection_id();
+            let candidate = WEB_ATTACH_PID_BASE | (id as u32 & !WEB_ATTACH_PID_BASE);
+            if !self
+                .active_attach
+                .lock()
+                .await
+                .by_pid
+                .contains_key(&candidate)
+            {
+                return Ok(candidate);
+            }
+        }
+        Err(RmuxError::Server(
+            "failed to allocate web attach client id".to_owned(),
+        ))
+    }
+}
+
+fn validate_resolved_web_target(
+    state: &crate::pane_terminals::HandlerState,
+    target: &WebShareTarget,
+) -> Result<(), RmuxError> {
+    match target {
+        WebShareTarget::Pane(target) => state
+            .sessions
+            .session_by_id(target.session_id())
+            .filter(|session| session.name() == target.target().session_name())
+            .ok_or_else(|| session_not_found_web(target.target().session_name()))
+            .and_then(|_| resolve_pane_target_ref(state, target.target()).map(|_| ())),
+        WebShareTarget::Session(target) => state
+            .sessions
+            .session_by_id(target.id())
+            .map(|_| ())
+            .ok_or_else(|| session_not_found_web(target.name())),
+    }
+}
+
+fn duration_until(deadline: SystemTime) -> Duration {
+    deadline
+        .duration_since(SystemTime::now())
+        .unwrap_or(Duration::ZERO)
+}
+
+fn session_not_found_web(session_name: &SessionName) -> RmuxError {
+    RmuxError::Server(format!("can't find session: {session_name}"))
+}
+
+fn response_to_result(response: Response) -> Result<(), RmuxError> {
+    match response {
+        Response::Error(error) => Err(error.error),
+        _ => Ok(()),
+    }
+}
+
+#[cfg(test)]
+#[path = "../handler_web_tests.rs"]
+mod tests;

@@ -4,9 +4,6 @@ use std::{
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
-#[cfg(unix)]
-use std::os::unix::fs::PermissionsExt;
-
 use super::super::RequestHandler;
 use super::session_name;
 use crate::outer_terminal::OuterTerminalContext;
@@ -19,6 +16,17 @@ use rmux_proto::{
     SwitchClientRequest, TerminalSize, WindowTarget,
 };
 use tokio::time::sleep;
+
+#[path = "handler_copy_mode_tests/reentry_flags.rs"]
+mod reentry_flags;
+#[path = "handler_copy_mode_tests/reentry_source.rs"]
+mod reentry_source;
+#[path = "handler_copy_mode_tests/search_formats.rs"]
+mod search_formats;
+#[path = "handler_copy_mode_tests/search_match_at_cursor.rs"]
+mod search_match_at_cursor;
+#[path = "handler_copy_mode_tests/wrapped_word.rs"]
+mod wrapped_word;
 
 fn capture_request(target: PaneTarget, use_mode_screen: bool) -> CapturePaneRequest {
     CapturePaneRequest {
@@ -67,7 +75,7 @@ async fn create_session(handler: &RequestHandler, name: &str, size: TerminalSize
             skip_environment_update: false,
         })))
         .await;
-    assert!(matches!(response, Response::NewSession(_)));
+    crate::session_fixture::assert_new_session(&response);
     PaneTarget::with_window(session_name, 0, 0)
 }
 
@@ -105,17 +113,11 @@ async fn replace_transcript_contents(
             .transcript_handle(target)
             .expect("session transcript must exist")
     };
-    let history_limit = transcript
-        .lock()
-        .expect("pane transcript mutex must not be poisoned")
-        .history_limit();
+    let history_limit = transcript.lock().history_limit();
     let mut screen = Screen::new(size, history_limit);
     let mut parser = InputParser::new();
     parser.parse(content, &mut screen);
-    transcript
-        .lock()
-        .expect("pane transcript mutex must not be poisoned")
-        .set_screen_for_test(screen);
+    transcript.lock().set_screen_for_test(screen);
 }
 
 async fn wait_for_capture(
@@ -182,7 +184,6 @@ async fn direct_copy_mode_entry_enables_line_numbers() {
     };
     let enabled = transcript
         .lock()
-        .expect("pane transcript mutex must not be poisoned")
         .copy_mode_render_snapshot()
         .expect("copy-mode snapshot")
         .line_numbers_enabled;
@@ -431,8 +432,41 @@ async fn copy_mode_capture_uses_backing_screen_snapshot() {
         })
     );
 
-    let mode_capture = wait_for_capture(&handler, &target, "line2", true).await;
-    assert_eq!(mode_capture, "line1\nline2\nline3\n");
+    // Parity with tmux 3.7b: `capture-pane -M` reads the copy-mode backing
+    // screen, whose visible rows ignore the one-row scroll of `copy-mode -u`.
+    let mode_capture = wait_for_capture(&handler, &target, "line5", true).await;
+    assert_eq!(mode_capture, "line4\nline5\n\n");
+
+    // Parity with tmux 3.7b: `copy-mode -u` on a three-row pane pages one row
+    // up and puts the cursor at column 5 of the last row, just past line5.
+    let listed = handler
+        .handle(Request::ListPanes(Box::new(ListPanesRequest {
+            target: target.session_name().clone(),
+            format: Some("#{scroll_position},#{copy_cursor_x},#{copy_cursor_y}".to_owned()),
+            filter: None,
+            sort_order: None,
+            reversed: false,
+            target_window_index: None,
+        })))
+        .await;
+    let output = listed
+        .command_output()
+        .expect("list-panes returns command output");
+    assert_eq!(String::from_utf8_lossy(output.stdout()), "1,5,2\n");
+}
+
+/// How many native resizes this pane's endpoint has really been asked for.
+///
+/// The size alone cannot answer this: a resize to the size the endpoint already
+/// holds leaves it exactly as it was, so a call that changed nothing and a call
+/// that was never made read the same. On Windows they do not cost the same -
+/// the console answers an identical resize with a full repaint.
+async fn native_resize_calls(handler: &RequestHandler, target: &PaneTarget) -> u64 {
+    handler
+        .state
+        .lock()
+        .await
+        .pane_native_resize_calls_for_test(target)
 }
 
 #[tokio::test]
@@ -456,6 +490,7 @@ async fn modal_scrollbar_resizes_pty_only_while_copy_mode_is_active() {
     assert!(matches!(response, Response::SetOption(_)));
     assert_eq!(pane_terminal_size(&handler, &target).await, size);
 
+    let calls_before_modal_entry = native_resize_calls(&handler, &target).await;
     assert!(matches!(
         enter_copy_mode(&handler, &target, false).await,
         Response::CopyMode(_)
@@ -463,6 +498,10 @@ async fn modal_scrollbar_resizes_pty_only_while_copy_mode_is_active() {
     assert_eq!(
         pane_terminal_size(&handler, &target).await,
         TerminalSize { cols: 19, rows: 8 }
+    );
+    assert!(
+        native_resize_calls(&handler, &target).await > calls_before_modal_entry,
+        "a modal reserve really changes this pane's size, so the endpoint is asked"
     );
 
     let response = handler
@@ -494,13 +533,42 @@ async fn modal_scrollbar_resizes_pty_only_while_copy_mode_is_active() {
             }))
             .await;
         assert!(matches!(response, Response::SetOption(_)));
+        let expected = TerminalSize {
+            cols: expected_cols,
+            rows: 8,
+        };
+        assert_eq!(pane_terminal_size(&handler, &target).await, expected);
+
+        // Neither `off` nor `on` makes this pane's size depend on the
+        // consultation, so entering one asks the endpoint for nothing at all.
+        let calls_before_entry = native_resize_calls(&handler, &target).await;
+        assert!(matches!(
+            enter_copy_mode(&handler, &target, false).await,
+            Response::CopyMode(_)
+        ));
+        assert_eq!(pane_terminal_size(&handler, &target).await, expected);
         assert_eq!(
-            pane_terminal_size(&handler, &target).await,
-            TerminalSize {
-                cols: expected_cols,
-                rows: 8,
-            }
+            native_resize_calls(&handler, &target).await,
+            calls_before_entry,
+            "scrollbars {value}: the entry changes no geometry, so it asks for no resize"
         );
+        assert!(matches!(
+            handler
+                .handle(Request::CopyMode(CopyModeRequest {
+                    target: Some(target.clone()),
+                    page_down: false,
+                    exit_on_scroll: false,
+                    hide_position: false,
+                    mouse_drag_start: false,
+                    cancel_mode: true,
+                    scrollbar_scroll: false,
+                    source: None,
+                    page_up: false,
+                }))
+                .await,
+            Response::CopyMode(_)
+        ));
+        assert_eq!(pane_terminal_size(&handler, &target).await, expected);
     }
 }
 
@@ -524,6 +592,7 @@ async fn copy_mode_line_number_gutter_never_resizes_the_pty() {
         .await;
     assert!(matches!(response, Response::SetOption(_)));
 
+    let calls_before_entry = native_resize_calls(&handler, &target).await;
     assert!(matches!(
         enter_copy_mode(&handler, &target, false).await,
         Response::CopyMode(_)
@@ -532,6 +601,11 @@ async fn copy_mode_line_number_gutter_never_resizes_the_pty() {
         pane_terminal_size(&handler, &target).await,
         size,
         "the line-number gutter is an internal copy-mode overlay"
+    );
+    assert_eq!(
+        native_resize_calls(&handler, &target).await,
+        calls_before_entry,
+        "and with no scrollbar reserved, the entry asks the endpoint for nothing"
     );
 }
 
@@ -588,7 +662,7 @@ async fn copy_mode_formats_report_live_state() {
         .command_output()
         .expect("list-panes returns command output");
     let text = String::from_utf8_lossy(output.stdout());
-    assert_eq!(text.as_ref(), "1 copy-mode 1 1 needle 1/4\n");
+    assert_eq!(text.as_ref(), "1 copy-mode 0 1 needle 1/4\n");
 }
 
 #[tokio::test]
@@ -675,10 +749,10 @@ async fn copy_mode_command_table_dispatches_all_tmux_commands() {
         ("search-again", &[]),
         ("search-backward", &["alpha"]),
         ("search-backward-text", &["alpha"]),
-        ("search-backward-incremental", &["-:alpha"]),
+        ("search-backward-incremental", &["-alpha"]),
         ("search-forward", &["alpha"]),
         ("search-forward-text", &["alpha"]),
-        ("search-forward-incremental", &["+:alpha"]),
+        ("search-forward-incremental", &["+alpha"]),
         ("search-reverse", &[]),
         ("select-line", &[]),
         ("select-word", &[]),
@@ -1076,10 +1150,8 @@ async fn copy_mode_buffer_yank_emits_clipboard_when_set_clipboard_enabled() {
 
 #[cfg(unix)]
 fn write_executable_script(path: &Path, contents: &str) {
-    fs::write(path, contents).expect("write script");
-    let mut permissions = fs::metadata(path).expect("script metadata").permissions();
-    permissions.set_mode(0o755);
-    fs::set_permissions(path, permissions).expect("script permissions");
+    crate::test_env::executable_fixture::write_executable(path, contents, 0o755)
+        .expect("write script");
 }
 
 #[cfg(unix)]
@@ -1225,4 +1297,53 @@ async fn copy_pipe_uses_bin_sh_instead_of_default_shell_like_tmux() {
     let _ = fs::remove_file(&output_path);
     let _ = fs::remove_file(&fake_shell);
     let _ = fs::remove_dir_all(&root);
+}
+
+/// R3319 H1: `clear-history` then `refresh-from-pane` shortens the copy-mode
+/// backing below the saved mark. `jump-to-mark` and the next motion must stay
+/// inside it, and the server must keep answering every other request.
+#[tokio::test]
+async fn jump_to_mark_after_clear_history_refresh_keeps_server_answering() {
+    let handler = RequestHandler::new();
+    let size = TerminalSize { cols: 20, rows: 3 };
+    let target = create_session(&handler, "mark-after-clear", size).await;
+    let content: String = (1..=50).map(|line| format!("{line}\r\n")).collect();
+    replace_transcript_contents(&handler, &target, size, content.as_bytes()).await;
+    assert!(matches!(
+        enter_copy_mode(&handler, &target, false).await,
+        Response::CopyMode(_)
+    ));
+    for command in ["history-bottom", "set-mark"] {
+        assert!(matches!(
+            send_copy_mode_command(&handler, &target, &[command]).await,
+            Response::SendKeys(_)
+        ));
+    }
+
+    let cleared = handler
+        .handle(Request::ClearHistory(rmux_proto::ClearHistoryRequest {
+            target: target.clone(),
+            reset_hyperlinks: false,
+        }))
+        .await;
+    assert!(matches!(cleared, Response::ClearHistory(_)));
+    for command in ["refresh-from-pane", "jump-to-mark", "cursor-left"] {
+        assert!(
+            matches!(
+                send_copy_mode_command(&handler, &target, &[command]).await,
+                Response::SendKeys(_)
+            ),
+            "{command}"
+        );
+    }
+
+    let sessions = handler
+        .handle(Request::ListSessions(rmux_proto::ListSessionsRequest {
+            format: Some("#{session_name}".to_owned()),
+            filter: None,
+            sort_order: None,
+            reversed: false,
+        }))
+        .await;
+    assert!(matches!(sessions, Response::ListSessions(_)));
 }

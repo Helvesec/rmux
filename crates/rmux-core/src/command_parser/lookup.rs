@@ -47,5 +47,5 @@ pub(super) fn lookup_command_at(
         ));
     }
 
-    found.ok_or_else(|| CommandParseError::lookup(line, format!("unknown command: {name}")))
+    found.ok_or_else(|| CommandParseError::unknown(line, name))
 }

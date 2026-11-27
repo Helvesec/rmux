@@ -7,13 +7,12 @@ mod support;
 use std::collections::HashMap;
 use std::error::Error;
 use std::fs;
-use std::path::Path;
 use std::time::Duration;
 
 use common::{
     assert_socket_directory_empty, assert_success, default_socket_path_in, pane_tty_paths, stderr,
-    stdout, tty_has_input, unique_tmpdir, wait_for_no_child_processes, CliHarness,
-    BINARY_OVERRIDE_ENV,
+    stdout, tmux_shim_directories, tty_has_input, unique_tmpdir, wait_for_no_child_processes,
+    wait_for_socket_directory_empty, CliHarness, BINARY_OVERRIDE_ENV,
 };
 use rmux_client::{connect, ClientError};
 use rmux_core::Session;
@@ -38,25 +37,6 @@ const MAIN_PANE_WIDTH: u16 = 34;
 const REAP_TIMEOUT: Duration = Duration::from_secs(2);
 const DAEMON_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(5);
 const STRESS_PANE_COMMAND: &str = "/bin/cat";
-
-fn wait_for_socket_directory_empty(
-    socket_path: &Path,
-    timeout: Duration,
-) -> Result<(), Box<dyn Error>> {
-    let deadline = std::time::Instant::now() + timeout;
-
-    loop {
-        if assert_socket_directory_empty(socket_path).is_ok() {
-            return Ok(());
-        }
-
-        if std::time::Instant::now() >= deadline {
-            assert_socket_directory_empty(socket_path)?;
-        }
-
-        std::thread::sleep(Duration::from_millis(20));
-    }
-}
 
 fn shutdown_daemon(
     runtime: &tokio::runtime::Runtime,
@@ -453,6 +433,29 @@ fn wait_for_pane_capture(
 }
 
 #[test]
+#[cfg(target_os = "macos")]
+fn empty_send_keys_without_sbin_on_path() -> Result<(), Box<dyn Error>> {
+    // Keep the restricted PATH local to a child; other tests may run concurrently.
+    // The child acquires the existing live-daemon lock itself.
+    let binary = rmux_os::build_identity::resolve(std::env::current_exe()?.as_os_str())?;
+    let output = std::process::Command::new(binary)
+        .args([
+            "--exact",
+            "empty_send_keys_succeeds_through_the_cli",
+            "--test-threads=1",
+            "--nocapture",
+        ])
+        .env("PATH", "/usr/bin:/bin")
+        .output()?;
+    assert_eq!(output.status.code(), Some(0), "{}", stderr(&output));
+    assert!(
+        stdout(&output).contains("1 passed"),
+        "the empty send-keys scene must run under PATH=/usr/bin:/bin"
+    );
+    Ok(())
+}
+
+#[test]
 fn empty_send_keys_succeeds_through_the_cli() -> Result<(), Box<dyn Error>> {
     let _guard = serialize_test_execution();
     let harness = CliHarness::new("stress-sendkeys-empty")?;
@@ -545,6 +548,33 @@ fn multi_pane_kill_reaps_children_under_the_hidden_daemon() -> Result<(), Box<dy
     wait_for_socket_directory_empty(harness.socket_path(), REAP_TIMEOUT)?;
 
     common::terminate_child(daemon.child_mut())?;
+    Ok(())
+}
+
+#[test]
+fn terminate_child_lets_the_hidden_daemon_remove_its_tmux_shim() -> Result<(), Box<dyn Error>> {
+    let _guard = serialize_test_execution();
+    let harness = CliHarness::new("stress-shim-cleanup")?;
+    // The shim lives under the harness XDG_RUNTIME_DIR, outside the socket
+    // directory, so only the daemon's own cleanup removes it.
+    let runtime_dir = harness.runtime_dir();
+    let mut daemon = harness.start_hidden_daemon()?;
+    let session_name = unique_session_name("stress-shim-cleanup");
+
+    assert_success(&harness.run(&["new-session", "-d", "-s", session_name.as_str()])?);
+    assert_eq!(
+        tmux_shim_directories(runtime_dir)?.len(),
+        1,
+        "the first pane spawn must publish one tmux shim directory"
+    );
+
+    common::terminate_child(daemon.child_mut())?;
+
+    let leaked = tmux_shim_directories(runtime_dir)?;
+    assert!(
+        leaked.is_empty(),
+        "terminate_child must let the daemon remove its tmux shim, left {leaked:?}"
+    );
     Ok(())
 }
 

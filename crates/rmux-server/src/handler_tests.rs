@@ -42,6 +42,9 @@ mod clients;
 #[path = "handler_tests/list_clients_session_id.rs"]
 mod list_clients_session_id;
 
+#[path = "handler_tests/list_clients_session_group.rs"]
+mod list_clients_session_group;
+
 #[path = "handler_tests/panes.rs"]
 mod panes;
 
@@ -56,6 +59,30 @@ mod rename_session_retained_output;
 
 #[path = "handler_tests/lists_and_hooks.rs"]
 mod lists_and_hooks;
+
+#[path = "handler_tests/poisoned_pane_selection.rs"]
+mod poisoned_pane_selection;
+
+#[path = "handler_tests/poisoned_window_selection.rs"]
+mod poisoned_window_selection;
+
+#[path = "handler_tests/poisoned_transcript.rs"]
+mod poisoned_transcript;
+
+#[path = "handler_tests/poisoned_transcript_matrix.rs"]
+mod poisoned_transcript_matrix;
+
+#[path = "handler_tests/poisoned_transcript_reach.rs"]
+mod poisoned_transcript_reach;
+
+#[path = "handler_tests/poisoned_transcript_named_commands.rs"]
+mod poisoned_transcript_named_commands;
+
+#[path = "handler_tests/poisoned_transcript_transfer.rs"]
+mod poisoned_transcript_transfer;
+
+#[path = "handler_tests/poisoned_transcript_split_cell.rs"]
+mod poisoned_transcript_split_cell;
 
 #[path = "handler_send_keys_tests.rs"]
 mod send_keys_tests;

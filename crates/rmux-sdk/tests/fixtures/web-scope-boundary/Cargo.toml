@@ -1,0 +1,10 @@
+[package]
+name = "sdk-web-scope-boundary-consumer"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+[workspace]
+
+[dependencies]
+rmux-sdk = { path = "../../..", default-features = false, features = ["web"] }

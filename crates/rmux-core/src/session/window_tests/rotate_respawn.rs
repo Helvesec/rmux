@@ -1,4 +1,5 @@
 use super::*;
+use rmux_proto::ResizePaneAdjustment;
 
 #[test]
 fn rotate_window_keeps_pane_ids_stable_while_preserving_the_active_slot() {
@@ -51,6 +52,33 @@ fn rotate_window_keeps_pane_ids_stable_while_preserving_the_active_slot() {
             .map(|pane| pane.geometry())
             .collect::<Vec<_>>(),
         previous_geometries
+    );
+}
+
+#[test]
+fn rotate_window_with_zoom_restores_zoom_when_requested() {
+    let mut session = Session::new(
+        session_name("alpha"),
+        TerminalSize {
+            cols: 120,
+            rows: 40,
+        },
+    );
+    session.split_active_pane().expect("split succeeds");
+    session
+        .resize_pane_in_window(0, 1, ResizePaneAdjustment::Zoom)
+        .expect("zoom succeeds");
+
+    session
+        .rotate_window_with_zoom(0, RotateWindowDirection::Up, true)
+        .expect("rotation succeeds");
+
+    let window = session.window_at(0).expect("window exists");
+    assert!(window.is_zoomed());
+    assert_eq!(window.active_pane_index(), 1);
+    assert_eq!(
+        window.pane(1).expect("active pane exists").geometry(),
+        PaneGeometry::new(0, 0, 120, 40)
     );
 }
 

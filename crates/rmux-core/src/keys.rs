@@ -3,11 +3,8 @@
 
 use crate::command_parser::{CommandParseError, CommandParser, ParsedCommands};
 
-#[path = "keys/defaults.rs"]
 mod defaults;
-#[path = "keys/store.rs"]
 mod store;
-#[path = "keys/string_table.rs"]
 mod string_table;
 
 pub use store::{
@@ -494,3 +491,7 @@ pub fn parse_binding_command_tokens_with_parser(
 #[cfg(test)]
 #[path = "keys/tests.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "keys/menu_display_tests.rs"]
+mod menu_display_tests;

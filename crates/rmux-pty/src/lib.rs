@@ -7,13 +7,21 @@
 //! documented API that exposes:
 //! - PTY allocation,
 //! - terminal size query and resize on PTY file descriptors,
-//! - child spawning into a controlling terminal-backed PTY, and
-//! - child signaling and reaping.
+//! - child spawning into a controlling terminal-backed PTY,
+//! - child signaling and reaping, and
+//! - pluggable pane shell backends via `RmuxShell` (default `ProcessShell`).
 
 mod backend;
 mod child;
+mod process_shell;
 mod pty;
+mod shell;
 mod size;
+#[cfg(all(test, unix))]
+#[path = "../../../tests/support/rerun_exact.rs"]
+mod test_rerun;
+#[cfg(all(any(unix, windows), feature = "test-seams"))]
+pub mod test_support;
 #[cfg(windows)]
 mod windows_console_input;
 
@@ -53,9 +61,11 @@ use std::ffi::NulError;
 use std::fmt;
 
 pub use child::{ChildCommand, PtyChild, SpawnedPty};
+pub use process_shell::ProcessShell;
 #[cfg(unix)]
 pub use pty::PtySlave;
 pub use pty::{PtyIo, PtyMaster, PtyPair};
+pub use shell::{RmuxShell, ShellChild};
 pub use size::{TerminalGeometry, TerminalPixels, TerminalSize};
 #[cfg(windows)]
 pub use windows_console_input::{

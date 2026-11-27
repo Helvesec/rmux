@@ -12,7 +12,7 @@
 //!
 //! | File       | Written by | Meaning                                        |
 //! |------------|------------|------------------------------------------------|
-//! | `ready`    | child      | terminal is raw and the read is starting        |
+//! | `ready`    | child      | terminal setup is complete; read is starting        |
 //! | `out.part` | child      | the capture so far, grown as bytes arrive       |
 //! | `out`      | child      | the complete application-side capture           |
 //! | `error`    | child      | a step failed, with the reason that step gives  |
@@ -23,7 +23,9 @@
 //! by the harness, so reading it back would make teardown believe in a child
 //! for every slot it ever touched.
 //!
-//! `out` means *complete*: both children create it only by renaming an
+//! The four Unix clock-paste cases opt into a VEOF-terminated capture (see
+//! `unix_eof`): `out` then contains every byte before the controlled EOF, even
+//! if the count is wrong. The default count-bounded children create it from an
 //! `out.part` that already holds exactly the expected byte count, and any
 //! failure keeps `out.part` and writes `error` instead. A reported `error`
 //! therefore outranks everything the harness might otherwise infer from a
@@ -36,9 +38,11 @@
 //! With one, the failure names the exact bytes that arrived and the first
 //! offset at which they diverge.
 //!
-//! The child must read from a *raw* terminal: a cooked console or PTY line
+//! The default child reads from a *raw* terminal: a cooked console or PTY line
 //! discipline treats the paste's leading `ESC` as an editing command and
 //! rewrites CR/LF, so the captured bytes would say nothing about the sink. The
+//! controlled-EOF variant retains raw byte mappings and disables editing while
+//! enabling only canonical framing for its reserved VEOF. The
 //! crate is `#![forbid(unsafe_code)]`, so the child cannot be this test binary
 //! re-executed — the Windows console-mode change needs FFI.
 //!
@@ -55,25 +59,25 @@ use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::time::{Duration, Instant};
 
+/// The receiver-owning attach guard both final-sink suites send input through.
+mod attached_client;
 /// The historical standard-input byte boundary the Windows child reads through,
 /// compiled both into this binary and into that child.
-///
-/// Explicitly pathed, like this module itself: a `#[path]`-loaded module owns
-/// the directory its declaration names, not one named after itself.
-#[path = "final_sink/byte_observer.rs"]
 mod byte_observer;
 /// What the production transcript observed when a proof gave up waiting for a
 /// child's announcement. Shared, because both final-sink siblings wait for it.
-#[path = "final_sink/pane_observation.rs"]
 pub(crate) mod pane_observation;
 /// The Unix child's capture protocol. Generated on every platform so its shape
 /// is checked wherever this crate's tests run, executed only on Unix.
-#[path = "final_sink/unix_child.rs"]
 mod unix_child;
+#[cfg(unix)]
+mod unix_eof;
+#[cfg(unix)]
+mod unix_eof_witness;
 #[cfg(windows)]
-#[path = "final_sink/windows_byte_child.rs"]
 mod windows_byte_child;
 
+pub(crate) use attached_client::AttachedFinalSinkClient;
 pub(crate) use pane_observation::{describe_missing_bracketed_mode, observe_pane_output};
 
 const READY_FILE: &str = "ready";
@@ -133,6 +137,8 @@ pub(crate) struct FinalSinkSlot {
     directory: PathBuf,
     expected: Vec<u8>,
     bracket_aware: bool,
+    #[cfg(unix)]
+    capture_until_eof: bool,
     capture_timeout: Duration,
     capture_idle_gap: Duration,
     teardown_timeout: Duration,
@@ -187,6 +193,8 @@ impl FinalSinkSlot {
             directory,
             expected: expected.to_vec(),
             bracket_aware,
+            #[cfg(unix)]
+            capture_until_eof: false,
             capture_timeout: CAPTURE_TIMEOUT,
             capture_idle_gap: CAPTURE_IDLE_GAP,
             teardown_timeout: TEARDOWN_TIMEOUT,
@@ -291,7 +299,7 @@ impl FinalSinkSlot {
         let mut partial_grew_at = Instant::now();
         loop {
             // A reported failure outranks a published capture. Both children
-            // now publish `out` only after an exact capture, so the two are
+            // publish `out` only after a successful read (count or EOF), so the two are
             // mutually exclusive; checking `out` first is what let a script
             // that renamed a short partial be read as a completed publication
             // and reported as merely the wrong bytes with `child error: none`.
@@ -401,7 +409,11 @@ impl FinalSinkSlot {
     /// exposes exactly what reached the child.
     #[cfg(unix)]
     pub(crate) fn pane_command(&self) -> Vec<String> {
-        unix_child::pane_command(self)
+        if self.capture_until_eof {
+            unix_eof::pane_command(self)
+        } else {
+            unix_child::pane_command(self)
+        }
     }
 
     /// Runs the pinned Rust child, whose read boundary is the historical

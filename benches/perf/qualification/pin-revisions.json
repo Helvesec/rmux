@@ -1,0 +1,36 @@
+{
+  "schema": "rmux-ast-pin-revisions/1",
+  "archive_sha256": "d2608970b6830d4d8e0688a3828916d380850a5bd41addede3104df4929041c5",
+  "entries": [
+    {
+      "id": "D147-relative_or_string",
+      "pin": "relative_or_string",
+      "old_ast_sha256": "1cd07e5b657952cb14d37cfe960d60e4727cc61879e6a6abfa6866233e846847",
+      "new_ast_sha256": "30f6f0796bfd0112990955ec7e622f37259f2d8bcc6e04c0c7c88c937029fea3",
+      "decision": "D147",
+      "proof": {
+        "path": "benches/perf/qualification/pin-revision-proofs/R2-D155-PIN-SCOPE-INDEPENDENT-PROOF-223/PROOF.json",
+        "sha256": "d4c0da9884cd019d4d6d35c258c8f74d726b399cadd5f7725febae50f7f72fee"
+      },
+      "recorded_at": "2026-10-17T02:51:21Z",
+      "attribution": "R2-D155-PIN-SCOPE-INDEPENDENT-PROOF-223",
+      "previous_sha256": "d2608970b6830d4d8e0688a3828916d380850a5bd41addede3104df4929041c5",
+      "sha256": "5d413ffa5789d85cc03efaf6c6e2eee6a15eda3be677b78dab8c21202af8cf04"
+    },
+    {
+      "id": "D152-screen_cleanup",
+      "pin": "screen_cleanup",
+      "old_ast_sha256": "8e89afd0378d93becffe1b197c4d3f3d85d2f361117f0bdc73e10bccc869a671",
+      "new_ast_sha256": "93f2f644e5b135073197e9cec77622b85f152512d4806cc74e498a3f650c7ad4",
+      "decision": "D152",
+      "proof": {
+        "path": "benches/perf/qualification/pin-revision-proofs/R2-D155-PIN-SCOPE-INDEPENDENT-PROOF-223/PROOF.json",
+        "sha256": "d4c0da9884cd019d4d6d35c258c8f74d726b399cadd5f7725febae50f7f72fee"
+      },
+      "recorded_at": "2026-10-17T02:51:22Z",
+      "attribution": "R2-D155-PIN-SCOPE-INDEPENDENT-PROOF-223",
+      "previous_sha256": "5d413ffa5789d85cc03efaf6c6e2eee6a15eda3be677b78dab8c21202af8cf04",
+      "sha256": "9355cd55a61883e6cb55624db5a25da810c526e77f6c46ff2c5287d192ced638"
+    }
+  ]
+}

@@ -1,46 +1,97 @@
 use std::io;
 use std::mem::MaybeUninit;
-use std::os::fd::{AsRawFd, BorrowedFd, FromRawFd, OwnedFd, RawFd};
-use std::ptr;
+use std::os::fd::{AsFd, BorrowedFd, OwnedFd};
+use std::sync::Mutex;
 use std::time::Duration;
 
-use rustix::fs::{fcntl_getfl, fcntl_setfl, OFlags};
+use rustix::fs::{fcntl_getfl, fcntl_setfl, open, Mode, OFlags};
+use rustix::io::Errno;
 use rustix::process::{
     getpid, ioctl_tiocsctty, kill_process as rustix_kill_process, kill_process_group, setsid,
 };
+use rustix::pty::{grantpt, ptsname, unlockpt};
 use rustix::termios::{tcgetwinsize, tcsetpgrp, tcsetwinsize};
 
+use super::macos_grant::{grant_or_escape_stall, Grant};
 use super::unix_io;
 use crate::{size, ProcessId, Result, Signal, TerminalGeometry, TerminalSize};
 
+// Concurrent Darwin PTY allocations can race while allocating a minor number
+// and expose the kernel's internal EREDRIVEOPEN error. Serialize allocation
+// within this process; descriptor setup and child spawning remain independent.
+// The lock cannot see other processes allocating PTYs at the same time, so
+// that leaked errno is retried a bounded number of times below.
+static PTY_ALLOCATION_LOCK: Mutex<()> = Mutex::new(());
+
+// xnu's private EREDRIVEOPEN ("redrive the open"). The kernel already redrives
+// it internally and only leaks it to userspace when that budget is exhausted
+// under cross-process contention; any other errno is returned at once.
+const DARWIN_EREDRIVEOPEN: i32 = -6;
+// Total allocation attempts per pair. Immediate retries, no wall-clock delay.
+const PTY_ALLOCATION_ATTEMPTS: usize = 8;
+
+// Both ends are opened close-on-exec. Darwin's `openpty` returns inheritable
+// descriptors, and a child that another thread starts before they are marked
+// (`run-shell`, a status job, a copy pipe) keeps the pane's master and slave
+// for its whole life: it can read the pane's output and write its input.
+const PTY_OPEN_FLAGS: OFlags = OFlags::RDWR.union(OFlags::NOCTTY).union(OFlags::CLOEXEC);
+
 pub(crate) fn open_pty_pair() -> Result<(OwnedFd, OwnedFd)> {
-    let mut master = MaybeUninit::<libc::c_int>::uninit();
-    let mut slave = MaybeUninit::<libc::c_int>::uninit();
+    let _allocation_guard = PTY_ALLOCATION_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    open_pty_pair_retrying_redrive()
+}
 
-    // SAFETY: `openpty` initializes both fd out-pointers on success. The name,
-    // termios, and winsize pointers are null because RMUX configures size via
-    // the shared resize path after allocation.
-    let result = unsafe {
-        libc::openpty(
-            master.as_mut_ptr(),
-            slave.as_mut_ptr(),
-            ptr::null_mut(),
-            ptr::null_mut(),
-            ptr::null_mut(),
-        )
-    };
-    if result == -1 {
-        return Err(last_errno().into());
+/// Why one allocation attempt produced no pair.
+enum AttemptFailure {
+    Os(Errno),
+    /// The grant kept restarting in the kernel; see `macos_grant`.
+    GrantStalled,
+}
+
+impl From<Errno> for AttemptFailure {
+    fn from(errno: Errno) -> Self {
+        Self::Os(errno)
     }
+}
 
-    // SAFETY: `openpty` returned success, so both descriptors are initialized
-    // and owned by this process.
-    let master = unsafe { OwnedFd::from_raw_fd(master.assume_init()) };
-    let slave = unsafe { OwnedFd::from_raw_fd(slave.assume_init()) };
+/// Allocates one pair, retrying only the leaked Darwin EREDRIVEOPEN errno and
+/// a stalled grant up to [`PTY_ALLOCATION_ATTEMPTS`] times. A final errno is
+/// returned unchanged; a final stalled grant is reported as `ETIMEDOUT`.
+fn open_pty_pair_retrying_redrive() -> Result<(OwnedFd, OwnedFd)> {
+    let mut attempt = 1;
+    loop {
+        let retryable = match open_pty_pair_once() {
+            Ok(pair) => return Ok(pair),
+            Err(AttemptFailure::Os(errno)) => {
+                if errno.raw_os_error() != DARWIN_EREDRIVEOPEN {
+                    return Err(errno.into());
+                }
+                errno
+            }
+            Err(AttemptFailure::GrantStalled) => Errno::TIMEDOUT,
+        };
+        if attempt == PTY_ALLOCATION_ATTEMPTS {
+            return Err(retryable.into());
+        }
+        attempt += 1;
+    }
+}
 
-    set_cloexec(master.as_raw_fd())?;
-    set_cloexec(slave.as_raw_fd())?;
-
+/// The steps of Darwin's `openpty`, with both descriptors close-on-exec from
+/// the system call that creates them.
+fn open_pty_pair_once() -> std::result::Result<(OwnedFd, OwnedFd), AttemptFailure> {
+    let master = open(c"/dev/ptmx", PTY_OPEN_FLAGS, Mode::empty())?;
+    let grant = grant_or_escape_stall(master.as_fd(), || grantpt(&master))?;
+    if grant == Grant::Stalled {
+        // The swap closed this attempt's master and its minor; `master` now
+        // names /dev/null.
+        return Err(AttemptFailure::GrantStalled);
+    }
+    unlockpt(&master)?;
+    let slave_name = ptsname(&master, Vec::new())?;
+    let slave = open(slave_name.as_c_str(), PTY_OPEN_FLAGS, Mode::empty())?;
     Ok((master, slave))
 }
 
@@ -58,11 +109,13 @@ pub(crate) fn apply_geometry(fd: BorrowedFd<'_>, geometry: TerminalGeometry) -> 
     Ok(())
 }
 
-pub(crate) fn setup_child_controlling_terminal(raw_master_fd: RawFd) -> std::io::Result<()> {
-    // SAFETY: This closes only the child process' inherited copy of the PTY
-    // master fd. The parent still owns its separate descriptor.
-    unsafe { rustix::io::close(raw_master_fd) };
-
+/// Makes the slave on fd 0 the child's controlling terminal.
+///
+/// The child's copy of the master is left to exec: it is close-on-exec. Its
+/// number is not closed here, because when the caller had closed a standard
+/// descriptor the master took that number, which `Command` has since
+/// replaced with the slave.
+pub(crate) fn setup_child_controlling_terminal() -> std::io::Result<()> {
     setsid().map_err(std::io::Error::from)?;
 
     // SAFETY: `stdin` has already been wired to the PTY slave by `Command`, so
@@ -74,8 +127,8 @@ pub(crate) fn setup_child_controlling_terminal(raw_master_fd: RawFd) -> std::io:
     Ok(())
 }
 
-pub(crate) fn kill_foreground_process_group(pid: ProcessId, signal: Signal) -> Result<()> {
-    kill_process_group(pid.as_rustix_pid()?, signal.as_rustix_signal())?;
+pub(crate) fn signal_process_group(group: ProcessId, signal: Signal) -> Result<()> {
+    kill_process_group(group.as_rustix_pid()?, signal.as_rustix_signal())?;
     Ok(())
 }
 
@@ -144,25 +197,13 @@ pub(crate) fn set_nonblocking(fd: BorrowedFd<'_>) -> io::Result<()> {
     Ok(())
 }
 
-fn set_cloexec(fd: RawFd) -> Result<()> {
-    // SAFETY: `fcntl` is called with a valid fd owned by the caller.
-    let flags = unsafe { libc::fcntl(fd, libc::F_GETFD) };
-    if flags == -1 {
-        return Err(last_errno().into());
-    }
-
-    // SAFETY: `fcntl` mutates only fd flags for a valid descriptor.
-    let result = unsafe { libc::fcntl(fd, libc::F_SETFD, flags | libc::FD_CLOEXEC) };
-    if result == -1 {
-        return Err(last_errno().into());
-    }
-
-    Ok(())
-}
-
 fn last_errno() -> rustix::io::Errno {
     let raw = std::io::Error::last_os_error()
         .raw_os_error()
         .unwrap_or(libc::EIO);
     rustix::io::Errno::from_raw_os_error(raw)
 }
+
+#[cfg(test)]
+#[path = "macos_tests.rs"]
+mod tests;

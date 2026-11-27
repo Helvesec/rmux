@@ -1,3 +1,6 @@
+#[path = "../../../tests/support/executable_fixture.rs"]
+pub(crate) mod executable_fixture;
+
 use std::sync::OnceLock;
 
 use tokio::sync::{Mutex, MutexGuard};

@@ -35,3 +35,6 @@ pub(crate) use websocket::fuzz_client_frame;
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+pub(crate) use outbound::{OutboundQueueResult, WebSocketOutbound, WEB_OUTBOUND_BYTES_MAX};

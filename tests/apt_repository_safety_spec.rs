@@ -1,5 +1,8 @@
 #![cfg(unix)]
 
+#[path = "support/executable_fixture.rs"]
+mod executable_fixture;
+
 use std::collections::BTreeMap;
 use std::fs;
 use std::os::unix::fs::{symlink, PermissionsExt};
@@ -27,22 +30,14 @@ fn fixture_root(label: &str) -> PathBuf {
         .expect("clock after epoch")
         .as_nanos();
     repo_root()
-        .join(".rmux-audit/test-runs")
+        .join("target/tmp/test-runs")
         .join(format!("apt-safety-{label}-{}-{nonce}", std::process::id()))
-}
-
-fn make_executable(path: &Path) {
-    let mut permissions = fs::metadata(path)
-        .expect("read tool metadata")
-        .permissions();
-    permissions.set_mode(0o755);
-    fs::set_permissions(path, permissions).expect("make tool executable");
 }
 
 fn install_tools(root: &Path) {
     fs::create_dir_all(root).expect("create tool directory");
     let find = root.join("find");
-    fs::write(
+    executable_fixture::write_executable(
         &find,
         r#"#!/bin/sh
 set -eu
@@ -56,12 +51,12 @@ if test -n "${RMUX_TEST_FAIL_FIND_ROOT:-}"; then
 fi
 exec /usr/bin/find "$@"
 "#,
+        0o755,
     )
     .expect("write find fixture");
-    make_executable(&find);
 
     let dpkg_deb = root.join("dpkg-deb");
-    fs::write(
+    executable_fixture::write_executable(
         &dpkg_deb,
         r#"#!/bin/sh
 set -eu
@@ -89,12 +84,12 @@ case "${3:-}" in
   *) exit 64 ;;
 esac
 "#,
+        0o755,
     )
     .expect("write dpkg-deb fixture");
-    make_executable(&dpkg_deb);
 
     let gpg = root.join("gpg");
-    fs::write(
+    executable_fixture::write_executable(
         &gpg,
         r#"#!/bin/sh
 set -eu
@@ -113,9 +108,9 @@ done
 test -n "$output"
 printf 'deterministic-%s\n' "$kind" > "$output"
 "#,
+        0o755,
     )
     .expect("write gpg fixture");
-    make_executable(&gpg);
 }
 
 fn write_package(input: &Path, architecture: &str, generation: &str) {
@@ -181,6 +176,58 @@ fn generator_command(
         .env_remove("RMUX_APT_GPG_KEY")
         .current_dir(repo_root());
     command
+}
+
+#[test]
+#[cfg(target_os = "macos")]
+fn publishes_authenticated_indexes_with_native_macos_hash_tools() {
+    let root = fixture_root("native-hashes");
+    let tools = root.join("tools");
+    let input = root.join("input");
+    let first = root.join("first");
+    let second = root.join("second");
+    install_tools(&tools);
+    write_packages(&input, "first");
+    let path = std::env::join_paths([tools.as_path(), Path::new("/usr/bin"), Path::new("/bin")])
+        .expect("compose native macOS PATH");
+    let probe = Command::new("/bin/bash")
+        .args(["-c", "! command -v md5sum && ! command -v sha256sum"])
+        .env("PATH", &path)
+        .status()
+        .expect("check native hash tools");
+    assert!(
+        probe.success(),
+        "native PATH must have no GNU checksum tools"
+    );
+    for (output, previous) in [(&first, None), (&second, Some(first.as_path()))] {
+        let result = generator_command(&input, output, &tools, previous, false)
+            .env("PATH", &path)
+            .output()
+            .expect("generate with native macOS tools");
+        assert!(result.status.success(), "{}", stderr(&result));
+        let suite = output.join("dists/stable");
+        let release = fs::read_to_string(suite.join("Release")).expect("read Release");
+        for architecture in ARCHITECTURES {
+            for name in ["Packages", "Packages.gz"] {
+                let relative = format!("main/binary-{architecture}/{name}");
+                let index = suite.join(&relative);
+                let size = fs::metadata(&index).expect("index metadata").len();
+                for algorithm in ["-md5", "-sha256"] {
+                    let digest = Command::new("/usr/bin/openssl")
+                        .args(["dgst", algorithm])
+                        .arg(&index)
+                        .output()
+                        .expect("hash index with native OpenSSL");
+                    assert!(digest.status.success());
+                    let text = String::from_utf8(digest.stdout).expect("digest is UTF-8");
+                    let hash = text.split_whitespace().last().expect("digest emitted");
+                    assert!(release.contains(&format!(" {hash} {size:16} {relative}\n")));
+                }
+            }
+        }
+        write_packages(&input, "second");
+    }
+    fs::remove_dir_all(root).expect("remove native hash fixture");
 }
 
 #[derive(Debug, Eq, PartialEq)]
@@ -424,9 +471,8 @@ fn inventory_transport_ignores_tmpdir_and_rejects_sorted_record_loss() {
     let dropping_tools = root.join("dropping-tools");
     install_tools(&dropping_tools);
     let sort = dropping_tools.join("sort");
-    fs::write(&sort, "#!/bin/sh\n/bin/cat >/dev/null\nexit 0\n")
+    executable_fixture::write_executable(&sort, "#!/bin/sh\n/bin/cat >/dev/null\nexit 0\n", 0o755)
         .expect("write record-dropping sort");
-    make_executable(&sort);
     let rejected = generate(
         &input,
         &root.join("dropped-output"),
@@ -457,7 +503,7 @@ fn inventory_transport_rejects_cardinality_preserving_sort_corruption() {
     fs::write(entries.join("beta"), b"beta").expect("write beta input");
 
     let sort = tools.join("sort");
-    fs::write(
+    executable_fixture::write_executable(
         &sort,
         r#"#!/bin/bash
 set -euo pipefail
@@ -483,9 +529,9 @@ case "${RMUX_TEST_SORT_MODE:-}" in
     ;;
 esac
 "#,
+        0o755,
     )
     .expect("write corrupting sort");
-    make_executable(&sort);
 
     let path = std::env::join_paths([
         tools.as_path(),

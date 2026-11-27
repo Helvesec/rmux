@@ -65,7 +65,7 @@ async fn attached_mode_tree_acceptance_uses_mode_before_prefix_or_pty() {
 
 #[tokio::test]
 async fn attached_compact_prefix_wq_uses_choose_tree_before_the_following_key() {
-    let handler = RequestHandler::new();
+    let handler = RequestHandler::with_host_shell_for_test();
     let requester_pid = std::process::id();
     let alpha = session_name("alpha");
     let _control_rx = create_attached_session(&handler, requester_pid, &alpha).await;
@@ -139,7 +139,7 @@ async fn attached_mode_tree_consumes_lone_escape_after_input_timeout() {
 
 #[tokio::test]
 async fn attached_compact_prefix_tq_uses_clock_mode_before_the_following_key() {
-    let handler = RequestHandler::new();
+    let handler = RequestHandler::with_host_shell_for_test();
     let requester_pid = std::process::id();
     let alpha = session_name("alpha");
     let _control_rx = create_attached_session(&handler, requester_pid, &alpha).await;

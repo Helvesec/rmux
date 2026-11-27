@@ -5,6 +5,16 @@ use crate::input::InputEndType;
 /// Maximum payload size retained for one terminal graphics passthrough event.
 pub(crate) const MAX_TERMINAL_PASSTHROUGH_PAYLOAD_BYTES: usize = 8 * 1024 * 1024;
 
+/// Whether the server retains SIXEL images, as `#{sixel_support}` reports.
+///
+/// tmux 3.7b derives this server-wide format from `ENABLE_SIXEL`, which enables
+/// retained, scalable, croppable images and redraws them after resize or scroll.
+/// RMUX only forwards transient SIXEL data through an enabled native passthrough
+/// path, so this format stays false. Pane capability queries can advertise that
+/// conditional path without claiming a retained-image subsystem. The outer
+/// terminal's own capability remains available in `#{client_termfeatures}`.
+pub const SIXEL_SUPPORT: bool = false;
+
 /// Opaque terminal command that must be forwarded to a capable outer terminal.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TerminalPassthrough {

@@ -1,5 +1,6 @@
 use rmux_core::formats::FormatVariable;
 
+use super::dispatch::runtime_dispatch;
 use super::RuntimeFormatContext;
 
 impl RuntimeFormatContext<'_> {
@@ -14,11 +15,12 @@ impl RuntimeFormatContext<'_> {
         )
     }
 
-    pub(super) fn runtime_format_value(&self, variable: FormatVariable) -> Option<String> {
-        match variable {
-            FormatVariable::PaneIndex => self.visible_pane_index(),
-            FormatVariable::WindowName => self.window_name(),
-            _ => None,
+    runtime_dispatch! {
+        pub(super) fn runtime_format_value(&self, variable: FormatVariable) => variable.key();
+        coverage covers_runtime_format_value;
+        {
+            PaneIndex => self.visible_pane_index(),
+            WindowName => self.window_name(),
         }
     }
 }

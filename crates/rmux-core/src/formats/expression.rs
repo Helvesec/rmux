@@ -1,5 +1,9 @@
 use super::{format_choose, ExpandState, FormatModifier, FormatVariables};
 
+// The witnesses of this domain reach the converter directly for the edge cases
+// whose references are bit patterns rather than rendered text.
+pub(in crate::formats) mod hexadecimal;
+
 pub(super) fn format_expression<V>(
     state: &mut ExpandState,
     body: &str,
@@ -16,43 +20,49 @@ where
         return String::new();
     };
 
-    let float_precision = expression_float_precision(modifier);
+    let expression = expression_formatting(modifier);
+    // A precision the source refuses fails the whole expression, whether or not
+    // the calculation itself is a floating one (format.c:4958-4965).
+    let precision = match expression.precision {
+        ExpressionPrecision::Invalid => return String::new(),
+        precision => precision,
+    };
+
     if is_comparison_operator(operator) {
-        return match float_precision {
-            ExpressionFloatPrecision::Valid(precision) => {
-                let Some(value) =
-                    numeric_compare(operator, &left, &right, ExpressionComparisonMode::Float)
-                else {
-                    return String::new();
-                };
+        let mode = if expression.float {
+            ExpressionComparisonMode::Float
+        } else {
+            ExpressionComparisonMode::Integer
+        };
+        let Some(value) = numeric_compare(operator, &left, &right, mode) else {
+            return String::new();
+        };
+        return match precision {
+            ExpressionPrecision::Valid(precision) => {
                 format_float_value(if value { 1.0 } else { 0.0 }, precision)
             }
-            ExpressionFloatPrecision::Invalid => String::new(),
-            ExpressionFloatPrecision::Disabled => {
-                let Some(value) =
-                    numeric_compare(operator, &left, &right, ExpressionComparisonMode::Integer)
-                else {
-                    return String::new();
-                };
-                bool_string(value)
-            }
+            _ => bool_string(value),
         };
     }
 
-    match float_precision {
-        ExpressionFloatPrecision::Valid(precision) => {
-            let Some(value) = numeric_operation(operator, &left, &right) else {
-                return String::new();
-            };
-            format_float_value(value, precision)
-        }
-        ExpressionFloatPrecision::Invalid => String::new(),
-        ExpressionFloatPrecision::Disabled => {
-            let Some(value) = integer_operation(operator, &left, &right) else {
-                return String::new();
-            };
-            value
-        }
+    if expression.float {
+        let Some(value) = numeric_operation(operator, &left, &right) else {
+            return String::new();
+        };
+        return match precision {
+            ExpressionPrecision::Valid(precision) => format_float_value(value, precision),
+            // `f` always carries its own default precision, so this arm only
+            // exists to keep the match total.
+            _ => format_float_value(value, DEFAULT_FLOAT_PRECISION),
+        };
+    }
+
+    let Some(value) = integer_operation(operator, &left, &right) else {
+        return String::new();
+    };
+    match precision {
+        ExpressionPrecision::Valid(precision) => integer_value_with_precision(&value, precision),
+        _ => value,
     }
 }
 
@@ -141,7 +151,9 @@ fn comparison_operand(value: &str) -> Option<f64> {
 }
 
 fn parse_number(value: &str) -> Option<f64> {
-    let value = value.trim();
+    // Preserve the product's tolerance of surrounding C whitespace, while
+    // rejecting Unicode whitespace that strtod does not consume.
+    let value = value.trim_matches(|ch| matches!(ch, ' ' | '\t'..='\r'));
     if value.is_empty() {
         return Some(0.0);
     }
@@ -158,6 +170,10 @@ fn parse_number(value: &str) -> Option<f64> {
         .parse::<f64>()
         .ok()
         .or_else(|| parse_prefixed_integer(value).map(|integer| integer as f64))
+        // Only the forms the two paths above cannot read reach the hexadecimal
+        // significand converter: it answers None for everything else, so the
+        // decimal path, the prefixed integers and their clamps stay as they are.
+        .or_else(|| hexadecimal::parse_hexadecimal_float(value))
 }
 
 fn parse_prefixed_integer(value: &str) -> Option<i64> {
@@ -197,38 +213,77 @@ fn is_comparison_operator(operator: &str) -> bool {
 const MIN_EXPRESSION_FLOAT_PRECISION: i64 = -100;
 const MAX_EXPRESSION_FLOAT_PRECISION: i64 = 100;
 const DEFAULT_NEGATIVE_FLOAT_PRECISION: usize = 6;
+const DEFAULT_FLOAT_PRECISION: usize = 2;
 
+/// The explicit third argument of `e`, which the source validates on its own,
+/// whether or not the second one asked for a floating calculation
+/// (format.c:4951-4965).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum ExpressionFloatPrecision {
-    Disabled,
+enum ExpressionPrecision {
+    Absent,
     Valid(usize),
     Invalid,
 }
 
-fn expression_float_precision(modifier: &FormatModifier) -> ExpressionFloatPrecision {
+/// The two independent choices an `e` modifier carries: `f` decides how the
+/// operands and the result are computed, the third argument decides how many
+/// decimals the result is printed with.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ExpressionFormatting {
+    float: bool,
+    precision: ExpressionPrecision,
+}
+
+fn expression_formatting(modifier: &FormatModifier) -> ExpressionFormatting {
     let options = modifier.argv.get(1).map(String::as_str).unwrap_or_default();
-    if !options.contains('f') {
-        return ExpressionFloatPrecision::Disabled;
-    }
+    let float = options.contains('f');
     let Some(raw_precision) = modifier.argv.get(2) else {
-        return ExpressionFloatPrecision::Valid(2);
+        // No third argument at all: `f` brings its own default precision, and
+        // without it the integer result is left as it is. A third argument that
+        // is present but empty is a different thing entirely - the source
+        // validates it as soon as there are three of them (format.c:4958-4965)
+        // and an empty conversion is invalid - so it must not land here.
+        return ExpressionFormatting {
+            float,
+            precision: if float {
+                ExpressionPrecision::Valid(DEFAULT_FLOAT_PRECISION)
+            } else {
+                ExpressionPrecision::Absent
+            },
+        };
     };
-    if raw_precision.is_empty() {
-        return ExpressionFloatPrecision::Valid(2);
+    ExpressionFormatting {
+        float,
+        precision: parse_expression_precision(raw_precision),
     }
+}
+
+fn parse_expression_precision(raw_precision: &str) -> ExpressionPrecision {
+    // strtonum accepts an initial run of C whitespace, but no trailing bytes.
+    let raw_precision = raw_precision.trim_start_matches(|ch| matches!(ch, ' ' | '\t'..='\r'));
     let Ok(precision) = raw_precision.parse::<i64>() else {
-        return ExpressionFloatPrecision::Invalid;
+        return ExpressionPrecision::Invalid;
     };
     if precision < MIN_EXPRESSION_FLOAT_PRECISION {
-        return ExpressionFloatPrecision::Invalid;
+        return ExpressionPrecision::Invalid;
     }
     if precision < 0 {
-        return ExpressionFloatPrecision::Valid(DEFAULT_NEGATIVE_FLOAT_PRECISION);
+        return ExpressionPrecision::Valid(DEFAULT_NEGATIVE_FLOAT_PRECISION);
     }
     if precision > MAX_EXPRESSION_FLOAT_PRECISION {
-        return ExpressionFloatPrecision::Invalid;
+        return ExpressionPrecision::Invalid;
     }
-    ExpressionFloatPrecision::Valid(precision as usize)
+    ExpressionPrecision::Valid(precision as usize)
+}
+
+/// Prints an integer result with an explicit precision. The source keeps the
+/// integer it computed and prints it as a double (format.c:5030), so the
+/// truncation of the operands and of the result stays exactly where it was.
+fn integer_value_with_precision(value: &str, precision: usize) -> String {
+    match value.parse::<i64>() {
+        Ok(integer) => format_float_value(integer as f64, precision),
+        Err(_) => value.to_owned(),
+    }
 }
 
 fn bool_string(value: bool) -> String {

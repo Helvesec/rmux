@@ -1,0 +1,54 @@
+{
+  "schema": 1,
+  "origin": "Handwritten installed scenario; accepted 3608c43 SDK migration and API dependency witnesses, unchanged. No schema generation. Changes require explicit fixture review. R1201 F1: explicit dedicated correction, optional record_panes inside the existing timeout/cleanup scope; independent delta review required. R1201 F2/D9: only the two public projection widths 12->10, derived before execution from published 39debaeed:5-14 and R1-417 C3/R1-419 C1; original L1_033_oracle remains distinct canonical history, with internal width 12 unchanged.",
+  "files": {
+    "tests/fixtures/installed-consumers/ratatui.rs": "c2dbf97702d6219faeec1aa88e41a7bd0f8caa99e66bb96651ac9387bd8713ce",
+    "tests/fixtures/installed-consumers/scenario.rs": "4487a7bbe12166342c5345f21bb54c307a1fe69552f67d7b2d5fe40c77cfc870",
+    "tests/fixtures/installed-consumers/sdk.rs": "511cc3c3e240aa3ff49535198acc10d1c8e1088b0577942fbed5a052629a524e",
+    "tests/fixtures/installed-consumers/web-absent.rs": "b9b59898f8efebc47cce4da3017cfe3ae99a108bd29c9e378e7cf23159566a00",
+    "crates/rmux-sdk/tests/fixtures/sdk-migration/src/lib.rs": "a03f8058a65510de6f012c56fc364fb72cd2104f01459f489a8ba1260e943b59",
+    "crates/rmux-sdk/tests/fixtures/sdk-migration/src/streams.rs": "afaf80f3e99a7462dea954219840894708e2bb7430ce5d639468a779404ec061",
+    "crates/rmux-sdk/tests/fixtures/identity-boundary/supported.rs": "c51bc5854b741ce3f8568b9b1efaa570358f1a47e44baf64450d3f20ab8534a4",
+    "crates/rmux-sdk/tests/fixtures/semantic-conversion/supported.rs": "514dc0fe8f5a38576e10b33c666689b743968c691d89d129c99949b75fb50a4d",
+    "tests/fixtures/public-api-gate/sdk-dependencies.rs": "658d8d8e1ea67f969fe804dc480abdb573b246c9350ad4ee0e765fbe43e45102",
+    "tests/fixtures/public-api-gate/ratatui-consumer.rs": "d98a9ed153949d979bf974db300d77ce24fc831d33826a46dca9372b2d81ca5c"
+  },
+  "L1_033_oracle": "tmux3.7b SHA032198096ed82c1473b41c62a2ee83f16d9796a3f6a26f6830637591c24418a7; geometry032 two_floats and geometry033 native2 three_first: target12x3, successor12x5; width no-op onTopBottom root.",
+  "R1201_acceptance": {
+    "job": "S1-R1201-INSTALLED-CONSUMERS-FIXTURE-CAUSAL-FIX-211",
+    "acceptance_sha256": "3567cd6f9f44a31e7d959453f45879ee213f3f6ca17ae8d9846992c387dacb41",
+    "base": "81efa911f0a533113417e6dbdd866123f9088c9e",
+    "original_scenario_sha256": "73d579c941b299a290babcb09668c22b9047be9f98fdbd9347720e954d50a603",
+    "canonical_runtime_cells": [
+      "rmux-sdk/no-default",
+      "rmux-sdk/all-features",
+      "ratatui-rmux/default"
+    ],
+    "optional_private_cli": true,
+    "recording_error_requires_session_kill_and_daemon_shutdown": true,
+    "public_resized_rect": [
+      -3,
+      1,
+      10,
+      3
+    ],
+    "public_moved_rect": [
+      2,
+      1,
+      10,
+      3
+    ],
+    "sibling_size": [
+      12,
+      5
+    ],
+    "canonical_internal_width": 12,
+    "expected_source": "Published 39debaeed:5-14; R1-417 C3/R1-419 C1; never RMUX output",
+    "phases": [
+      "red base",
+      "green correction",
+      "red each correction withdrawn independently",
+      "green restored"
+    ]
+  }
+}

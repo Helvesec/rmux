@@ -1,3 +1,5 @@
+#[cfg(test)]
+use crate::session_fixture::SessionSetupExt as _;
 use std::collections::HashMap;
 use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
@@ -27,9 +29,13 @@ impl ProtocolSelectionModel {
             let state = handler.state.lock().await;
             let mut session_windows = HashMap::new();
             let mut window_panes = HashMap::new();
-            for (_session_name, session) in state.sessions.iter() {
+            for (_session_name, session) in state
+                .sessions
+                .iter()
+                .map(|session| (session.name(), session))
+            {
                 session_windows.insert(session.id().to_string(), session.window().id().to_string());
-                for window in session.windows().values() {
+                for window in session.windows().map(|(_, window)| window) {
                     let pane = window.active_pane().expect("test windows have panes");
                     window_panes.insert(window.id().to_string(), pane.id().to_string());
                 }
@@ -130,9 +136,9 @@ impl SwitchFixture {
 
         {
             let mut state = handler.state.lock().await;
-            let target_session = state
+            let mut target_session = state
                 .sessions
-                .session_mut(&target)
+                .session_setup(&target)
                 .expect("target session exists");
             target_session
                 .select_pane_in_window(0, 0)
@@ -158,8 +164,8 @@ fn session_name(value: &str) -> SessionName {
 }
 
 async fn create_session(handler: &RequestHandler, session_name: &SessionName) {
-    assert!(matches!(
-        handler
+    crate::session_fixture::assert_new_session(
+        &handler
             .handle(Request::NewSession(NewSessionRequest {
                 session_name: session_name.clone(),
                 detached: true,
@@ -167,8 +173,7 @@ async fn create_session(handler: &RequestHandler, session_name: &SessionName) {
                 environment: None,
             }))
             .await,
-        Response::NewSession(_)
-    ));
+    );
 }
 
 async fn new_detached_window(handler: &RequestHandler, session_name: &SessionName) -> u32 {
@@ -239,6 +244,8 @@ fn drain_notifications(rx: &mut mpsc::Receiver<ControlServerEvent>) -> Vec<Strin
             ControlServerEvent::Notification(line) => lines.push(line),
             ControlServerEvent::SessionChanged(_)
             | ControlServerEvent::SessionChangedAt { .. }
+            | ControlServerEvent::FormatSubscriptions(_)
+            | ControlServerEvent::PaneOutputActions(_)
             | ControlServerEvent::Refresh => {}
             ControlServerEvent::Exit(reason) => panic!("unexpected control exit: {reason:?}"),
         }

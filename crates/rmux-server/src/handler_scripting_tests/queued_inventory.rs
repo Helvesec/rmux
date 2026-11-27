@@ -38,7 +38,7 @@ async fn parsed_command_list_routes_start_server_and_named_inventory_lookups() {
             "set-environment|[-Fhgru] [-t target-session] variable [value]\n",
             "show-environment|[-hgs] [-t target-session] [variable]\n",
             "show-hooks|[-gpw] [-t target-pane] [hook]\n",
-            "refresh-client|[-lS] [-C XxY] [-f flags] [-F flags] [-t target-client]\n",
+            "refresh-client|[-cDLRUlS] [-A pane:state] [-B name:what:format] [-C size] [-f flags] [-F flags] [-r pane:report] [-t target-client] [adjustment]\n",
             "switch-client|[-ElnprZ] [-c target-client] [-t target-session] [-T key-table] [-O order]\n",
             "alias\n",
         )

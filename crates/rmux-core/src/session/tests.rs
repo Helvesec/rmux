@@ -36,3 +36,12 @@ mod group_sync;
 
 #[path = "tests/pane_transfer_edge_cases.rs"]
 mod pane_transfer_edge_cases;
+
+#[path = "tests/pane_transfer_floating.rs"]
+mod pane_transfer_floating;
+
+#[path = "tests/pane_transfer_floating_fmt1.rs"]
+mod pane_transfer_floating_fmt1;
+
+#[path = "tests/pane_transfer_fmt1_targets.rs"]
+mod pane_transfer_fmt1_targets;

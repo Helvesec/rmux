@@ -34,6 +34,8 @@ use crate::input::mode;
 /// intentionally *not* emitted here; a caller that needs them must order them
 /// around the painted content itself (see the web-share snapshot).
 pub fn render_dec_modes(mode_bits: u32, cursor_style: u32, out: &mut Vec<u8>) {
+    let cursor_state = crate::resolve_cursor_style_state(cursor_style, mode_bits, 0);
+    let cursor_style = cursor_state.style();
     let on = |bit: u32| mode_bits & bit != 0;
 
     // On-by-default modes: emit the reset only when currently off.
@@ -102,6 +104,12 @@ pub fn render_dec_modes(mode_bits: u32, cursor_style: u32, out: &mut Vec<u8>) {
     // Cursor style (DECSCUSR). 0 == "terminal default" → leave untouched.
     if cursor_style != 0 {
         out.extend_from_slice(format!("\x1b[{cursor_style} q").as_bytes());
+    } else if let Some(blink) = cursor_state.default_blink() {
+        out.extend_from_slice(if blink {
+            b"\x1b[?12h".as_slice()
+        } else {
+            b"\x1b[?12l".as_slice()
+        });
     }
 }
 
@@ -114,6 +122,8 @@ pub fn render_dec_modes(mode_bits: u32, cursor_style: u32, out: &mut Vec<u8>) {
 /// is always ended, never started, because a static snapshot must not leave the
 /// browser waiting for a later batch terminator.
 pub fn render_dec_modes_for_snapshot(mode_bits: u32, cursor_style: u32, out: &mut Vec<u8>) {
+    let cursor_state = crate::resolve_cursor_style_state(cursor_style, mode_bits, 0);
+    let cursor_style = cursor_state.style();
     let on = |bit: u32| mode_bits & bit != 0;
 
     out.extend_from_slice(if on(mode::MODE_WRAP) {
@@ -187,6 +197,13 @@ pub fn render_dec_modes_for_snapshot(mode_bits: u32, cursor_style: u32, out: &mu
     }
 
     out.extend_from_slice(format!("\x1b[{cursor_style} q").as_bytes());
+    if let Some(blink) = cursor_state.default_blink() {
+        out.extend_from_slice(if blink {
+            b"\x1b[?12h".as_slice()
+        } else {
+            b"\x1b[?12l".as_slice()
+        });
+    }
 }
 
 #[cfg(test)]
@@ -245,6 +262,35 @@ mod tests {
     fn cursor_style_emitted_when_set() {
         let out = rendered(mode::MODE_CURSOR | mode::MODE_WRAP, 4);
         assert!(out.contains("\x1b[4 q"), "{out:?}");
+    }
+
+    #[test]
+    fn explicit_cursor_blink_is_folded_into_decscusr_shape() {
+        let blinking = mode::MODE_CURSOR
+            | mode::MODE_WRAP
+            | mode::MODE_CURSOR_BLINKING
+            | mode::MODE_CURSOR_BLINKING_SET;
+        let steady = mode::MODE_CURSOR | mode::MODE_WRAP | mode::MODE_CURSOR_BLINKING_SET;
+
+        assert!(rendered(blinking, 6).contains("\x1b[5 q"));
+        assert!(rendered(steady, 5).contains("\x1b[6 q"));
+    }
+
+    #[test]
+    fn unresolved_default_cursor_blink_is_reasserted_without_guessing_shape() {
+        let blinking = mode::MODE_CURSOR
+            | mode::MODE_WRAP
+            | mode::MODE_CURSOR_BLINKING
+            | mode::MODE_CURSOR_BLINKING_SET;
+        let steady = mode::MODE_CURSOR | mode::MODE_WRAP | mode::MODE_CURSOR_BLINKING_SET;
+
+        let blinking = rendered(blinking, 0);
+        assert!(blinking.contains("\x1b[?12h"), "{blinking:?}");
+        assert!(!blinking.contains(" q"), "{blinking:?}");
+
+        let steady = rendered(steady, 0);
+        assert!(steady.contains("\x1b[?12l"), "{steady:?}");
+        assert!(!steady.contains(" q"), "{steady:?}");
     }
 
     #[test]

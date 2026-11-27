@@ -39,6 +39,9 @@ impl std::fmt::Debug for SignalWatcher {
 
 #[cfg(unix)]
 impl SignalWatcher {
+    // tokio 1.53.3 deprecates the safe AsyncFd constructors (RUSTSEC-2026-0386); this crate
+    // forbids unsafe, and the AsyncFd owns `wake`, whose fd stays open.
+    #[allow(deprecated)]
     pub(crate) fn install() -> io::Result<Self> {
         let wake = rmux_os::signals::install_server_signal_flags()?.into_read_fd();
         Ok(Self {

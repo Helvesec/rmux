@@ -1,8 +1,19 @@
 use super::*;
+use crate::handler::pane_support::take_delimiter_search_bytes_for_test;
 
 const LARGE_PASTE_TARGET_BYTES: usize = 64 * 1024;
 const ONE_MEBIBYTE: usize = 1024 * 1024;
 const CHUNK_PATTERN: &[usize] = &[1, 2, 4, 8, 3, 13, 89, 233, 1024, 7, 4096];
+// The live input path hands a large frame to its steps one reroute chunk (1 KiB) at a time.
+const LIVE_INPUT_REROUTE_CHUNK_BYTES: usize = 1024;
+// The paste's end is searched for through its whole body, once: each step searches the bytes it
+// was handed plus the few retained bytes a delimiter split across two steps may start in, never
+// again the paste the client already retains.
+const SPLIT_DELIMITER_BYTES: usize = b"\x1b[201~".len();
+/// A held input path never returns, whether it waits for a wake-up that never comes or spins
+/// without yielding. This only turns that hang into a failure of the test that holds it: the
+/// work is bounded by counting it, never by how long a loaded host takes to do it.
+const HELD_INPUT_PATH_GUARD: Duration = Duration::from_secs(120);
 
 #[tokio::test]
 async fn live_attach_large_bracketed_paste_survives_irregular_chunks() {
@@ -50,8 +61,51 @@ async fn live_attach_large_bracketed_paste_survives_irregular_chunks() {
     capture.assert_contents(&handler, expected).await;
 }
 
-#[tokio::test]
-async fn live_attach_one_mebibyte_bracketed_paste_has_bounded_work() {
+#[test]
+fn live_attach_one_mebibyte_bracketed_paste_has_bounded_work() {
+    fail_if_held(one_mebibyte_bracketed_paste_has_bounded_work);
+}
+
+/// Runs `test` as `#[tokio::test]` would, on a thread of its own, and fails when it has neither
+/// finished nor failed within [`HELD_INPUT_PATH_GUARD`]. The held thread is left behind, so a
+/// hang fails this test by name instead of freezing the rest of the pass, and a blocking spin is
+/// caught as surely as an await that never wakes.
+fn fail_if_held<F, Fut>(test: F)
+where
+    F: FnOnce() -> Fut + Send + 'static,
+    Fut: std::future::Future<Output = ()>,
+{
+    let (finished_tx, finished_rx) = std::sync::mpsc::channel::<()>();
+    let name = std::thread::current()
+        .name()
+        .unwrap_or("held input path guard")
+        .to_owned();
+    let worker = std::thread::Builder::new()
+        .name(name)
+        .spawn(move || {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("the test's runtime builds");
+            runtime.block_on(test());
+            drop(runtime);
+            let _ = finished_tx.send(());
+        })
+        .expect("the test's thread starts");
+    match finished_rx.recv_timeout(HELD_INPUT_PATH_GUARD) {
+        Ok(()) | Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+            if let Err(failure) = worker.join() {
+                std::panic::resume_unwind(failure);
+            }
+        }
+        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => panic!(
+            "the client's input path is held: the test neither finished nor failed within \
+             {HELD_INPUT_PATH_GUARD:?}"
+        ),
+    }
+}
+
+async fn one_mebibyte_bracketed_paste_has_bounded_work() {
     let handler = RequestHandler::new();
     let alpha = session_name("one-mebibyte-bracketed-paste");
     let requester_pid = std::process::id();
@@ -71,18 +125,27 @@ async fn live_attach_one_mebibyte_bracketed_paste_has_bounded_work() {
         RawPaneInputProbe::start(&handler, &alpha, "one-mebibyte-bracketed-paste", body.len())
             .await;
 
+    // The work is counted, not timed: a loaded host may take seconds for what costs
+    // milliseconds, while a rescan of the retained paste costs half a gibibyte at any load.
     let mut pending_input = Vec::new();
-    tokio::time::timeout(
-        if cfg!(windows) {
-            Duration::from_secs(60)
-        } else {
-            Duration::from_secs(2)
-        },
-        handler.handle_attached_live_input(requester_pid, &mut pending_input, &input),
-    )
-    .await
-    .expect("one MiB bracketed paste must finish with bounded work")
-    .expect("one MiB bracketed paste succeeds");
+    handler.live_input_work.take();
+    take_delimiter_search_bytes_for_test();
+    handler
+        .handle_attached_live_input(requester_pid, &mut pending_input, &input)
+        .await
+        .expect("one MiB bracketed paste succeeds");
+    let steps = handler.live_input_work.take().steps;
+    let searched = take_delimiter_search_bytes_for_test();
+    assert!(
+        (1..=input.len().div_ceil(LIVE_INPUT_REROUTE_CHUNK_BYTES)).contains(&steps),
+        "one MiB bracketed paste must take a live input step per reroute chunk: {steps} steps"
+    );
+    assert!(
+        (body.len()..=input.len() + steps * SPLIT_DELIMITER_BYTES).contains(&searched),
+        "one MiB bracketed paste must search each byte for its end once: {searched} bytes \
+         searched for {} typed in {steps} steps",
+        input.len()
+    );
     assert!(pending_input.is_empty());
 
     capture.finish(&handler, &alpha).await;

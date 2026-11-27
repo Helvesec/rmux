@@ -185,7 +185,7 @@ async fn live_subscription_commit_serializes_with_session_rename_rekey() {
             environment: None,
         }))
         .await;
-    assert!(matches!(created, Response::NewSession(_)), "{created:?}");
+    crate::session_fixture::assert_new_session(&created);
     handler.wait_for_initial_panes_for_test().await;
 
     let previous_key = {

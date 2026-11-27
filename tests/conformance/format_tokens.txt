@@ -116,6 +116,9 @@ pane_top
 pane_tty
 pane_unseen_changes
 pane_width
+pane_x
+pane_y
+pane_z
 pane_zoomed_flag
 pid
 scroll_region_lower

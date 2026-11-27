@@ -1,0 +1,45 @@
+{
+  "origin": {
+    "assessment_sha256": "09012d971f75671a0a49111b02f4f91d6263c4f6d7f1217444d00fd86578759e",
+    "cell": "SDK071",
+    "historical_native_credit": false
+  },
+  "processes": [
+    {
+      "pid": 25184,
+      "sequence": 2206172,
+      "parent_pid": 1864,
+      "parent_sequence": 2206171,
+      "birth": "2026-10-02T11:35:45.993588700Z",
+      "start_event_at": "2026-10-02T13:35:45.993624000+01:59",
+      "image": "\\Device\\HarddiskVolume3\\Users\\example\\AppData\\Local\\Programs\\Python\\Python313\\python.exe",
+      "exit": "0",
+      "end": "2026-10-02T11:35:46.157125900Z",
+      "exit_observed": true
+    },
+    {
+      "pid": 25184,
+      "sequence": 2207663,
+      "parent_pid": 23236,
+      "parent_sequence": 2207662,
+      "birth": "2026-10-02T11:36:08.693125700Z",
+      "start_event_at": "2026-10-02T13:36:08.693152900+01:59",
+      "image": "\\Device\\HarddiskVolume3\\Program Files\\Git\\mingw64\\bin\\git.exe",
+      "exit": "0",
+      "end": "2026-10-02T11:36:08.708476300Z",
+      "exit_observed": true
+    },
+    {
+      "pid": 25184,
+      "sequence": 2208013,
+      "parent_pid": 26520,
+      "parent_sequence": 2208012,
+      "birth": "2026-10-02T11:36:23.753571500Z",
+      "start_event_at": "2026-10-02T13:36:23.753594700+01:59",
+      "image": "\\Device\\HarddiskVolume3\\Program Files\\Git\\mingw64\\bin\\git.exe",
+      "exit": "0",
+      "end": "2026-10-02T11:36:23.768835000Z",
+      "exit_observed": true
+    }
+  ]
+}

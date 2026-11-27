@@ -17,7 +17,7 @@ async fn split_window_routes_session_and_pane_targets_to_the_expected_panes() {
             environment: None,
         }))
         .await;
-    assert!(matches!(created, Response::NewSession(_)));
+    crate::session_fixture::assert_new_session(&created);
 
     let first_split = handler
         .handle(Request::SplitWindow(SplitWindowRequest {
@@ -111,7 +111,7 @@ async fn target_action_split_and_resize_resolve_raw_targets_server_side() {
             environment: None,
         }))
         .await;
-    assert!(matches!(created, Response::NewSession(_)));
+    crate::session_fixture::assert_new_session(&created);
 
     let split = handler
         .handle(Request::SplitWindowTargetAction(Box::new(
@@ -161,8 +161,8 @@ async fn sdk_split_identity_returns_visible_base_index_and_stable_id_atomically(
     let handler = RequestHandler::new();
     let alpha = session_name("alpha");
 
-    assert!(matches!(
-        handler
+    crate::session_fixture::assert_new_session(
+        &handler
             .handle(Request::NewSession(NewSessionRequest {
                 session_name: alpha.clone(),
                 detached: true,
@@ -170,8 +170,7 @@ async fn sdk_split_identity_returns_visible_base_index_and_stable_id_atomically(
                 environment: None,
             }))
             .await,
-        Response::NewSession(_)
-    ));
+    );
     assert!(matches!(
         handler
             .handle(Request::SetOption(SetOptionRequest {
@@ -228,8 +227,8 @@ async fn sdk_split_identity_accepts_a_stable_pane_target() {
     let handler = RequestHandler::new();
     let alpha = session_name("alpha-stable-split");
 
-    assert!(matches!(
-        handler
+    crate::session_fixture::assert_new_session(
+        &handler
             .handle(Request::NewSession(NewSessionRequest {
                 session_name: alpha.clone(),
                 detached: true,
@@ -237,8 +236,7 @@ async fn sdk_split_identity_accepts_a_stable_pane_target() {
                 environment: None,
             }))
             .await,
-        Response::NewSession(_)
-    ));
+    );
     let original_pane_id = {
         let state = handler.state.lock().await;
         state
@@ -285,8 +283,8 @@ async fn sdk_split_identity_rejects_a_reindexed_replacement_after_resolution() {
     let handler = RequestHandler::new();
     let alpha = session_name("alpha-stale-split");
 
-    assert!(matches!(
-        handler
+    crate::session_fixture::assert_new_session(
+        &handler
             .handle(Request::NewSession(NewSessionRequest {
                 session_name: alpha.clone(),
                 detached: true,
@@ -294,8 +292,7 @@ async fn sdk_split_identity_rejects_a_reindexed_replacement_after_resolution() {
                 environment: None,
             }))
             .await,
-        Response::NewSession(_)
-    ));
+    );
     assert!(matches!(
         handler
             .handle(Request::SplitWindow(SplitWindowRequest {
@@ -319,7 +316,7 @@ async fn sdk_split_identity_rejects_a_reindexed_replacement_after_resolution() {
             window.pane(1).expect("second pane exists").id(),
         )
     };
-    let pause = super::super::target_action_support::install_split_target_resolution_pause(
+    let pause = super::super::target_action_support::install_target_resolution_pause(
         alpha.clone(),
         removed_pane_id,
     );
@@ -388,8 +385,8 @@ async fn select_pane_style_sets_pane_style_and_format_colours() {
     let alpha = session_name("alpha");
     let target = PaneTarget::new(alpha.clone(), 1);
 
-    assert!(matches!(
-        handler
+    crate::session_fixture::assert_new_session(
+        &handler
             .handle(Request::NewSession(NewSessionRequest {
                 session_name: alpha.clone(),
                 detached: true,
@@ -397,8 +394,7 @@ async fn select_pane_style_sets_pane_style_and_format_colours() {
                 environment: None,
             }))
             .await,
-        Response::NewSession(_)
-    ));
+    );
     assert!(matches!(
         handler
             .handle(Request::SplitWindow(SplitWindowRequest {
@@ -471,7 +467,7 @@ async fn split_window_rolls_back_the_session_when_terminal_resize_fails() {
             environment: None,
         }))
         .await;
-    assert!(matches!(created, Response::NewSession(_)));
+    crate::session_fixture::assert_new_session(&created);
 
     {
         let mut state = handler.state.lock().await;
@@ -538,7 +534,7 @@ async fn horizontal_split_updates_layout_and_geometry() {
             environment: None,
         }))
         .await;
-    assert!(matches!(created, Response::NewSession(_)));
+    crate::session_fixture::assert_new_session(&created);
 
     let split = handler
         .handle(Request::SplitWindow(SplitWindowRequest {
@@ -586,7 +582,7 @@ async fn kill_pane_removes_the_terminal_and_uses_last_pane_fallback() {
             environment: None,
         }))
         .await;
-    assert!(matches!(created, Response::NewSession(_)));
+    crate::session_fixture::assert_new_session(&created);
 
     assert!(matches!(
         handler
@@ -704,7 +700,7 @@ async fn kill_pane_rolls_back_when_terminal_resize_fails() {
             environment: None,
         }))
         .await;
-    assert!(matches!(created, Response::NewSession(_)));
+    crate::session_fixture::assert_new_session(&created);
 
     assert!(matches!(
         handler
@@ -762,20 +758,19 @@ async fn kill_last_pane_in_only_window_removes_the_session() {
     let handler = RequestHandler::new();
     let alpha = session_name("alpha");
 
-    assert!(matches!(
-        handler
+    crate::session_fixture::assert_new_session(
+        &handler
             .handle(Request::NewSession(NewSessionRequest {
                 session_name: alpha.clone(),
                 detached: true,
                 size: Some(TerminalSize {
                     cols: 120,
-                    rows: 40
+                    rows: 40,
                 }),
                 environment: None,
             }))
             .await,
-        Response::NewSession(_)
-    ));
+    );
 
     let killed = handler
         .handle(Request::KillPane(KillPaneRequest {
@@ -815,7 +810,7 @@ async fn resize_pane_rolls_back_geometry_when_terminal_resize_fails() {
             environment: None,
         }))
         .await;
-    assert!(matches!(created, Response::NewSession(_)));
+    crate::session_fixture::assert_new_session(&created);
 
     let split = handler
         .handle(Request::SplitWindow(SplitWindowRequest {
@@ -903,7 +898,7 @@ async fn resize_pane_noop_validates_target_slot() {
             environment: None,
         }))
         .await;
-    assert!(matches!(created, Response::NewSession(_)));
+    crate::session_fixture::assert_new_session(&created);
 
     let missing_pane_resize = handler
         .handle(Request::ResizePane(rmux_proto::ResizePaneRequest {
@@ -917,4 +912,139 @@ async fn resize_pane_noop_validates_target_slot() {
             error: RmuxError::invalid_target("alpha:0.9", "pane index does not exist in session"),
         })
     );
+}
+
+/// tmux 3.7b gives a pane the history limit of the session that spawns it and
+/// changes it only when `history-limit` is set (`session_update_history`).
+/// Measured there on these commands between p (2000) and other (7): every pane
+/// keeps its limit across the move, and the next `set-option -t p
+/// history-limit 11` gives each pane the limit of the session now holding it.
+/// The linked windows of link-window are checked after the move only.
+#[tokio::test]
+async fn a_pane_moved_between_sessions_keeps_its_history_limit() {
+    use super::poisoned_transcript_reach::answer;
+    const CASES: &[(&[&str], &str, Option<&str>)] = &[
+        (
+            &["move-window", "-d", "-s", "p:1", "-t", "other:5"],
+            "%0@p=2000 %1@p=2000 %2@other=2000 %3@other=7",
+            Some("%0@p=11 %1@p=11 %2@other=7 %3@other=7"),
+        ),
+        (
+            &["link-window", "-d", "-s", "p:1", "-t", "other:5"],
+            "%0@p=2000 %1@p=2000 %2@other=2000 %2@p=2000 %3@other=7",
+            None,
+        ),
+        (
+            &["swap-window", "-d", "-s", "p:1", "-t", "other:0"],
+            "%0@p=2000 %1@p=2000 %2@other=2000 %3@p=7",
+            Some("%0@p=11 %1@p=11 %2@other=7 %3@p=11"),
+        ),
+        (
+            &["swap-pane", "-d", "-s", "p:0.1", "-t", "other:0.0"],
+            "%0@p=2000 %1@other=2000 %2@p=2000 %3@p=7",
+            Some("%0@p=11 %1@other=7 %2@p=11 %3@p=11"),
+        ),
+        (
+            &["move-window", "-d", "-s", "other:0", "-t", "p:7"],
+            "%0@p=2000 %1@p=2000 %2@p=2000 %3@p=7",
+            Some("%0@p=11 %1@p=11 %2@p=11 %3@p=11"),
+        ),
+        (
+            &["join-pane", "-d", "-s", "other:0.0", "-t", "p:0.1"],
+            "%0@p=2000 %1@p=2000 %2@p=2000 %3@p=7",
+            Some("%0@p=11 %1@p=11 %2@p=11 %3@p=11"),
+        ),
+        (
+            &["move-pane", "-d", "-s", "p:0.1", "-t", "other:0.0"],
+            "%0@p=2000 %1@other=2000 %2@p=2000 %3@other=7",
+            Some("%0@p=11 %1@other=7 %2@p=11 %3@other=7"),
+        ),
+        (
+            &["link-window", "-d", "-s", "other:0", "-t", "p:7"],
+            "%0@p=2000 %1@p=2000 %2@p=2000 %3@other=7 %3@p=7",
+            None,
+        ),
+    ];
+    async fn limits(handler: &RequestHandler) -> String {
+        let listing = answer(
+            handler,
+            &[
+                "list-panes",
+                "-a",
+                "-F",
+                "#{pane_id}@#{session_name}=#{history_limit}",
+            ],
+        )
+        .await
+        .expect("list-panes -a");
+        let mut lines = listing.lines().collect::<Vec<_>>();
+        lines.sort_unstable();
+        lines.join(" ")
+    }
+
+    for (command, moved, mutated) in CASES {
+        let handler = RequestHandler::new();
+        // A quiet child keeps the live pane readers out of this test's timing.
+        assert!(matches!(
+            handler
+                .handle(Request::SetOption(SetOptionRequest {
+                    scope: ScopeSelector::Global,
+                    option: OptionName::DefaultCommand,
+                    value: crate::test_shell::stdin_discard_command(),
+                    mode: SetOptionMode::Replace,
+                }))
+                .await,
+            Response::SetOption(_)
+        ));
+        let sessions: [(&str, &[&[&str]]); 2] = [
+            (
+                "p",
+                &[
+                    &["split-window", "-d", "-t", "p:0.0"],
+                    &["new-window", "-d", "-t", "p:1"],
+                ],
+            ),
+            (
+                "other",
+                &[&["set-option", "-t", "other", "history-limit", "7"]],
+            ),
+        ];
+        for (name, setup) in sessions {
+            crate::session_fixture::assert_new_session(
+                &handler
+                    .handle(Request::NewSession(NewSessionRequest {
+                        session_name: session_name(name),
+                        detached: true,
+                        size: None,
+                        environment: None,
+                    }))
+                    .await,
+            );
+            for arguments in setup {
+                assert_eq!(answer(&handler, arguments).await, Ok(String::new()));
+            }
+        }
+        assert_eq!(
+            limits(&handler).await,
+            "%0@p=2000 %1@p=2000 %2@p=2000 %3@other=7"
+        );
+
+        assert_eq!(
+            answer(&handler, command).await,
+            Ok(String::new()),
+            "{command:?}"
+        );
+        assert_eq!(limits(&handler).await, *moved, "{command:?}");
+        if let Some(mutated) = mutated {
+            assert_eq!(
+                answer(&handler, &["set-option", "-t", "p", "history-limit", "11"]).await,
+                Ok(String::new())
+            );
+            assert_eq!(
+                limits(&handler).await,
+                *mutated,
+                "{command:?} then set p 11"
+            );
+        }
+    }
 }

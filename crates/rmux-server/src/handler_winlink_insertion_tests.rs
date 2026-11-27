@@ -1,4 +1,6 @@
 use super::RequestHandler;
+#[cfg(test)]
+use crate::session_fixture::SessionSetupExt as _;
 use rmux_core::{AlertFlags, WINLINK_ACTIVITY, WINLINK_BELL};
 use rmux_proto::{
     BreakPaneRequest, LinkWindowRequest, MoveWindowRequest, MoveWindowTarget, NewSessionExtRequest,
@@ -37,7 +39,7 @@ async fn create_session(
             skip_environment_update: false,
         })))
         .await;
-    assert!(matches!(response, Response::NewSession(_)), "{response:?}");
+    crate::session_fixture::assert_new_session(&response);
     if handler
         .state
         .lock()
@@ -75,9 +77,9 @@ async fn create_duplicate_group(
 
 async fn seed_peer_duplicate_flags(handler: &RequestHandler, peer: &SessionName) {
     let mut state = handler.state.lock().await;
-    let peer_session = state
+    let mut peer_session = state
         .sessions
-        .session_mut(peer)
+        .session_setup(peer)
         .expect("group peer exists before insertion");
     assert!(peer_session.add_winlink_alert_flags(0, WINLINK_BELL));
     assert!(peer_session.add_winlink_alert_flags(1, WINLINK_ACTIVITY));
@@ -270,4 +272,37 @@ async fn cross_session_relative_move_preserves_peer_duplicate_alias_winlink_flag
 #[tokio::test]
 async fn linked_relative_move_preserves_peer_duplicate_alias_winlink_flags() {
     assert_relative_move_preserves_flags("linked-move-insert-alerts", true).await;
+}
+
+#[tokio::test]
+async fn grouped_single_pane_break_relocates_peer_occurrence_flags() {
+    for before in [false, true] {
+        for detached in [false, true] {
+            let handler = RequestHandler::new();
+            let (owner, peer) = create_duplicate_group(&handler, "single-break-alerts").await;
+            seed_peer_duplicate_flags(&handler, &peer).await;
+            let destination = if before { 0 } else { 3 };
+            let response = handler
+                .handle(Request::BreakPane(Box::new(BreakPaneRequest {
+                    source: PaneTarget::with_window(owner.clone(), 0, 0),
+                    target: Some(WindowTarget::with_window(owner, destination)),
+                    name: None,
+                    detached,
+                    after: false,
+                    before,
+                    print_target: false,
+                    format: None,
+                })))
+                .await;
+            assert!(matches!(response, Response::BreakPane(_)), "{response:?}");
+            let state = handler.state.lock().await;
+            let peer_session = state.sessions.session(&peer).unwrap();
+            assert_eq!(peer_session.winlink_alert_flags(destination), WINLINK_BELL);
+            assert_eq!(
+                peer_session.winlink_alert_flags(if before { 2 } else { 1 }),
+                WINLINK_ACTIVITY
+            );
+            assert_eq!(peer_session.active_window_index(), destination);
+        }
+    }
 }

@@ -1,23 +1,31 @@
 use std::io;
 
 #[cfg(unix)]
-use std::os::fd::{AsFd, AsRawFd, BorrowedFd, OwnedFd, RawFd};
-use std::sync::Arc;
+use std::ffi::OsString;
 #[cfg(unix)]
-use std::sync::Mutex;
+use std::os::fd::{AsFd, AsRawFd, BorrowedFd, OwnedFd, RawFd};
+#[cfg(unix)]
+use std::os::unix::ffi::OsStringExt;
+#[cfg(unix)]
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::Duration;
 
 use crate::backend;
 #[cfg(all(not(unix), not(windows)))]
 use crate::unsupported_op;
+#[cfg(windows)]
+use crate::ProcessId;
 #[cfg(all(not(unix), not(windows)))]
 use crate::PtyError;
 use crate::{Result, TerminalGeometry, TerminalSize};
 #[cfg(unix)]
-use rustix::termios::{tcgetattr, LocalModes};
+use rustix::termios::{tcgetattr, ttyname, LocalModes};
 
-#[cfg(any(unix, windows))]
-const DEFAULT_PTY_WRITE_TIMEOUT: Duration = Duration::from_secs(2);
+mod io_endpoint;
+pub use io_endpoint::PtyIo;
+#[cfg(unix)]
+pub(crate) use io_endpoint::SessionLeaderExit;
 
 #[cfg(unix)]
 /// The slave endpoint of a Unix pseudoterminal pair.
@@ -56,259 +64,18 @@ impl AsRawFd for PtySlave {
     }
 }
 
-/// The I/O endpoint for a pseudoterminal.
-#[derive(Debug)]
-pub struct PtyIo {
-    #[cfg(unix)]
-    fd: Arc<OwnedFd>,
-    #[cfg(unix)]
-    startup_slave: Mutex<Option<OwnedFd>>,
-    #[cfg(windows)]
-    pty: Arc<backend::WindowsPty>,
-}
-
-impl PtyIo {
-    #[cfg(unix)]
-    pub(crate) fn new(fd: OwnedFd) -> Self {
-        Self {
-            fd: Arc::new(fd),
-            startup_slave: Mutex::new(None),
-        }
-    }
-
-    #[cfg(windows)]
-    pub(crate) fn new(pty: Arc<backend::WindowsPty>) -> Self {
-        Self { pty }
-    }
-
-    /// Queries the current terminal geometry for this PTY endpoint.
-    pub fn size(&self) -> Result<TerminalSize> {
-        #[cfg(unix)]
-        {
-            backend::query_size(self.fd.as_ref().as_fd())
-        }
-
-        #[cfg(not(unix))]
-        {
-            #[cfg(windows)]
-            {
-                backend::query_size(&self.pty)
-            }
-
-            #[cfg(not(windows))]
-            {
-                Err(PtyError::Unsupported(unsupported_op::QUERY_PTY_SIZE))
-            }
-        }
-    }
-
-    /// Resizes this PTY endpoint.
-    pub fn resize(&self, size: TerminalSize) -> Result<()> {
-        #[cfg(unix)]
-        {
-            backend::apply_size(self.fd.as_ref().as_fd(), size)
-        }
-
-        #[cfg(not(unix))]
-        {
-            #[cfg(windows)]
-            {
-                backend::apply_size(&self.pty, size)
-            }
-
-            #[cfg(not(windows))]
-            {
-                let _ = size;
-                Err(PtyError::Unsupported(unsupported_op::RESIZE_PTY))
-            }
-        }
-    }
-
-    /// Resizes this PTY endpoint, preserving optional pixel geometry where supported.
-    pub fn resize_geometry(&self, geometry: TerminalGeometry) -> Result<()> {
-        #[cfg(unix)]
-        {
-            backend::apply_geometry(self.fd.as_ref().as_fd(), geometry)
-        }
-
-        #[cfg(not(unix))]
-        {
-            #[cfg(windows)]
-            {
-                backend::apply_geometry(&self.pty, geometry)
-            }
-
-            #[cfg(not(windows))]
-            {
-                let _ = geometry;
-                Err(PtyError::Unsupported(unsupported_op::RESIZE_PTY))
-            }
-        }
-    }
-
-    /// Clones this PTY I/O endpoint.
-    pub fn try_clone(&self) -> Result<Self> {
-        #[cfg(unix)]
-        {
-            Ok(Self {
-                fd: Arc::clone(&self.fd),
-                startup_slave: Mutex::new(None),
-            })
-        }
-
-        #[cfg(not(unix))]
-        {
-            #[cfg(windows)]
-            {
-                Ok(Self {
-                    pty: Arc::clone(&self.pty),
-                })
-            }
-
-            #[cfg(not(windows))]
-            {
-                Err(PtyError::Unsupported(unsupported_op::CLONE_PTY_IO))
-            }
-        }
-    }
-
-    /// Reads bytes from this PTY endpoint, waiting for Unix readiness when needed.
-    pub fn read(&self, buffer: &mut [u8]) -> io::Result<usize> {
-        #[cfg(unix)]
-        {
-            backend::read(self.fd.as_ref().as_fd(), buffer)
-        }
-
-        #[cfg(not(unix))]
-        {
-            #[cfg(windows)]
-            {
-                self.pty.read(buffer)
-            }
-
-            #[cfg(not(windows))]
-            {
-                let _ = buffer;
-                Err(io::Error::new(
-                    io::ErrorKind::Unsupported,
-                    "pty I/O is unsupported on this platform",
-                ))
-            }
-        }
-    }
-
-    /// Attempts one nonblocking read from this Unix PTY endpoint.
-    #[cfg(unix)]
-    pub fn try_read(&self, buffer: &mut [u8]) -> io::Result<usize> {
-        backend::try_read(self.fd.as_ref().as_fd(), buffer)
-    }
-
-    /// Writes all bytes to this PTY endpoint with the default two-second timeout.
-    pub fn write_all(&self, bytes: &[u8]) -> io::Result<()> {
-        #[cfg(any(unix, windows))]
-        {
-            self.write_all_with_timeout(bytes, DEFAULT_PTY_WRITE_TIMEOUT)
-        }
-
-        #[cfg(not(any(unix, windows)))]
-        {
-            let _ = bytes;
-            Err(io::Error::new(
-                io::ErrorKind::Unsupported,
-                "pty I/O is unsupported on this platform",
-            ))
-        }
-    }
-
-    /// Writes all bytes to this PTY endpoint while write progress continues.
-    /// The timeout measures consecutive inactivity, so a timeout may occur
-    /// after the PTY accepted a prefix of `bytes`.
-    #[cfg(any(unix, windows))]
-    pub fn write_all_with_timeout(&self, bytes: &[u8], timeout: Duration) -> io::Result<()> {
-        #[cfg(unix)]
-        {
-            backend::write_all_with_timeout(self.fd.as_ref().as_fd(), bytes, timeout)
-        }
-
-        #[cfg(windows)]
-        {
-            self.pty.write_all_with_timeout(bytes, timeout)
-        }
-    }
-
-    /// Ensures that the underlying PTY endpoint is nonblocking.
-    /// Unix PTY masters are configured this way before they are exposed.
-    pub fn set_nonblocking(&self) -> io::Result<()> {
-        #[cfg(unix)]
-        {
-            backend::set_nonblocking(self.fd.as_ref().as_fd())
-        }
-
-        #[cfg(not(unix))]
-        {
-            #[cfg(windows)]
-            {
-                Err(io::Error::new(
-                    io::ErrorKind::Unsupported,
-                    "set_nonblocking is not applicable to ConPTY pipe handles; \
-                     async readiness is provided by the Tokio named-pipe driver",
-                ))
-            }
-
-            #[cfg(not(windows))]
-            {
-                Err(io::Error::new(
-                    io::ErrorKind::Unsupported,
-                    "pty I/O is unsupported on this platform",
-                ))
-            }
-        }
-    }
-
-    /// Returns the borrowed nonblocking Unix descriptor for readiness-driven
-    /// integration points such as `AsyncFd`.
-    #[cfg(unix)]
-    #[must_use]
-    pub fn as_fd(&self) -> BorrowedFd<'_> {
-        self.fd.as_ref().as_fd()
-    }
-
-    #[cfg(unix)]
-    pub(crate) fn raw_fd(&self) -> RawFd {
-        self.fd.as_ref().as_raw_fd()
-    }
-
-    /// Releases the one-shot Unix startup slave guard, if this endpoint owns
-    /// one for a pane output reader.
-    #[cfg(unix)]
-    pub fn release_startup_slave_guard(&self) {
-        let Ok(mut guard) = self.startup_slave.lock() else {
-            return;
-        };
-        let _ = guard.take();
-    }
-}
-
-#[cfg(unix)]
-impl AsFd for PtyIo {
-    fn as_fd(&self) -> BorrowedFd<'_> {
-        self.fd.as_ref().as_fd()
-    }
-}
-
-#[cfg(unix)]
-impl AsRawFd for PtyIo {
-    fn as_raw_fd(&self) -> RawFd {
-        self.fd.as_ref().as_raw_fd()
-    }
-}
-
 /// The master handle of a pseudoterminal.
 #[derive(Debug)]
 pub struct PtyMaster {
     io: PtyIo,
     #[cfg(unix)]
     startup_slave: Option<OwnedFd>,
+    /// The name of the slave of the pair this master was allocated with,
+    /// resolved once from the slave descriptor this process owned at that
+    /// moment. It is a name, never a retained descriptor, so it costs the pair
+    /// no lifetime: nothing here keeps a slave open.
+    #[cfg(unix)]
+    slave_path: Option<PathBuf>,
 }
 
 impl PtyMaster {
@@ -317,6 +84,7 @@ impl PtyMaster {
         Self {
             io: PtyIo::new(fd),
             startup_slave: None,
+            slave_path: None,
         }
     }
 
@@ -324,6 +92,25 @@ impl PtyMaster {
     pub(crate) fn with_startup_slave(mut self, slave: OwnedFd) -> Self {
         self.startup_slave = Some(slave);
         self
+    }
+
+    #[cfg(unix)]
+    fn with_slave_path(mut self, slave_path: Option<PathBuf>) -> Self {
+        self.slave_path = slave_path;
+        self
+    }
+
+    /// Returns the name of the slave of the PTY this master was allocated with.
+    ///
+    /// This describes the terminal the pair owns. It is fixed at allocation and
+    /// does not follow anything the child later does to its own descriptors, so
+    /// a child that replaces its standard input does not change it. `None` when
+    /// the name could not be resolved at allocation; there is no fallback and no
+    /// guess.
+    #[cfg(unix)]
+    #[must_use]
+    pub fn slave_path(&self) -> Option<&Path> {
+        self.slave_path.as_deref()
     }
 
     #[cfg(windows)]
@@ -354,6 +141,8 @@ impl PtyMaster {
             io: self.io.try_clone()?,
             #[cfg(unix)]
             startup_slave: None,
+            #[cfg(unix)]
+            slave_path: self.slave_path.clone(),
         })
     }
 
@@ -364,6 +153,8 @@ impl PtyMaster {
             io: self.io.try_clone()?,
             #[cfg(unix)]
             startup_slave: self.startup_slave.take(),
+            #[cfg(unix)]
+            slave_path: self.slave_path.clone(),
         })
     }
 
@@ -372,12 +163,13 @@ impl PtyMaster {
         self.io.try_clone()
     }
 
-    /// Returns whether byte writes reach a Windows ConPTY child verbatim.
+    /// Returns whether bracketed paste can use the Windows ConPTY input pipe.
     ///
-    /// Older Windows builds run ConPTY without passthrough mode and consume
-    /// bracketed-paste delimiters written through the input pipe. Callers that
-    /// must preserve those delimiters can inject Unicode console records
-    /// instead. Modern passthrough ConPTYs preserve the byte stream directly.
+    /// Retains the historical inbox paste compatibility selection and also
+    /// accepts the companion runtime. When false, callers can inject Unicode
+    /// console records to preserve paste delimiters. Despite the legacy name,
+    /// this is not a guarantee for arbitrary control sequences: the system
+    /// console can preserve paste while consuming OSC replies and output queries.
     #[cfg(windows)]
     #[must_use]
     pub fn preserves_verbatim_input(&self) -> bool {
@@ -444,6 +236,27 @@ impl PtyMaster {
             .write_all_with_stall_recovery(bytes, timeout, recovery_grace)
     }
 
+    /// Writes UTF-8 console records after earlier input-pipe operations for
+    /// this Windows PTY have completed.
+    #[cfg(windows)]
+    pub fn write_windows_console_utf8_ordered(
+        &self,
+        process_id: ProcessId,
+        bytes: &[u8],
+        timeout: Duration,
+    ) -> io::Result<()> {
+        self.io
+            .pty
+            .write_console_utf8_ordered(process_id, bytes, timeout)
+    }
+
+    /// Queues bytes as input for the program on the slave without waiting.
+    /// See [`PtyIo::queue_input`].
+    #[cfg(unix)]
+    pub fn queue_input(&self, bytes: &[u8]) -> io::Result<()> {
+        self.io.queue_input(bytes)
+    }
+
     /// Attempts to write bytes to a nonblocking Unix PTY master without waiting.
     ///
     /// Returns the number of bytes accepted immediately. Callers that need to
@@ -459,11 +272,6 @@ impl PtyMaster {
     pub fn local_echo_enabled(&self) -> io::Result<bool> {
         let termios = tcgetattr(self.io.fd.as_ref().as_fd())?;
         Ok(termios.local_modes.contains(LocalModes::ECHO))
-    }
-
-    #[cfg(unix)]
-    pub(crate) fn raw_fd(&self) -> RawFd {
-        self.io.raw_fd()
     }
 
     #[cfg(windows)]
@@ -489,8 +297,17 @@ impl PtyPair {
             let (master, slave) = backend::open_pty_pair()?;
             backend::set_nonblocking(master.as_fd())?;
 
+            // The name of the terminal this pair owns, taken once from the
+            // slave descriptor this process holds right here. Resolving it now
+            // is what makes it independent of anything the child later does to
+            // its own descriptors. A failure leaves it unknown rather than
+            // guessed.
+            let slave_path = ttyname(slave.as_fd(), Vec::new())
+                .ok()
+                .map(|name| PathBuf::from(OsString::from_vec(name.into_bytes())));
+
             Ok(Self {
-                master: PtyMaster::new(master),
+                master: PtyMaster::new(master).with_slave_path(slave_path),
                 slave: PtySlave { fd: slave },
             })
         }

@@ -1,8 +1,10 @@
 #![cfg(unix)]
 
+#[path = "support/executable_fixture.rs"]
+mod executable_fixture;
+
 use std::error::Error;
 use std::fs;
-use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -20,16 +22,18 @@ fn claude_launcher_prepends_private_tmux_shim_and_routes_args() -> Result<(), Bo
     let output_path = root.join("claude-output.txt");
     write_fake_claude(&bin.join("claude"))?;
 
-    let status = Command::new(env!("CARGO_BIN_EXE_rmux"))
-        .arg("claude")
-        .arg("--dangerously-skip-permissions")
-        .arg("--teammate-mode")
-        .arg("in-process")
-        .env("HOME", &home)
-        .env("PATH", &bin)
-        .env("RMUX_CLAUDE_DIRECT", "1")
-        .env("RMUX_CLAUDE_TEST_OUT", &output_path)
-        .status()?;
+    let status = Command::new(rmux_os::build_identity::cargo_binary(env!(
+        "CARGO_BIN_EXE_rmux"
+    )))
+    .arg("claude")
+    .arg("--dangerously-skip-permissions")
+    .arg("--teammate-mode")
+    .arg("in-process")
+    .env("HOME", &home)
+    .env("PATH", &bin)
+    .env("RMUX_CLAUDE_DIRECT", "1")
+    .env("RMUX_CLAUDE_TEST_OUT", &output_path)
+    .status()?;
     assert!(status.success(), "rmux claude exited with {status}");
 
     let output = fs::read_to_string(&output_path)?;
@@ -75,15 +79,17 @@ fn claude_launcher_honors_disable_tmux_shim_env() -> Result<(), Box<dyn Error>> 
     write_fake_claude(&bin.join("claude"))?;
     write_fake_tmux(&bin.join("tmux"), "external tmux 9.9")?;
 
-    let status = Command::new(env!("CARGO_BIN_EXE_rmux"))
-        .arg("claude")
-        .arg("--probe")
-        .env("HOME", &home)
-        .env("PATH", &bin)
-        .env("RMUX_CLAUDE_DIRECT", "1")
-        .env("RMUX_DISABLE_TMUX_SHIM", "1")
-        .env("RMUX_CLAUDE_TEST_OUT", &output_path)
-        .status()?;
+    let status = Command::new(rmux_os::build_identity::cargo_binary(env!(
+        "CARGO_BIN_EXE_rmux"
+    )))
+    .arg("claude")
+    .arg("--probe")
+    .env("HOME", &home)
+    .env("PATH", &bin)
+    .env("RMUX_CLAUDE_DIRECT", "1")
+    .env("RMUX_DISABLE_TMUX_SHIM", "1")
+    .env("RMUX_CLAUDE_TEST_OUT", &output_path)
+    .status()?;
     assert!(status.success(), "rmux claude exited with {status}");
 
     let output = fs::read_to_string(&output_path)?;
@@ -115,7 +121,7 @@ fn claude_launcher_honors_disable_tmux_shim_env() -> Result<(), Box<dyn Error>> 
 }
 
 fn write_fake_claude(path: &Path) -> Result<(), Box<dyn Error>> {
-    fs::write(
+    executable_fixture::write_executable(
         path,
         "#!/bin/sh\n\
          {\n\
@@ -126,24 +132,20 @@ fn write_fake_claude(path: &Path) -> Result<(), Box<dyn Error>> {
          printf 'tmux_path=%s\\n' \"$(command -v tmux)\"\n\
          printf 'tmux_version=%s\\n' \"$(tmux -V)\"\n\
          } > \"$RMUX_CLAUDE_TEST_OUT\"\n",
+        0o755,
     )?;
-    let mut permissions = fs::metadata(path)?.permissions();
-    permissions.set_mode(0o755);
-    fs::set_permissions(path, permissions)?;
     Ok(())
 }
 
 fn write_fake_tmux(path: &Path, version: &str) -> Result<(), Box<dyn Error>> {
-    fs::write(
+    executable_fixture::write_executable(
         path,
         format!(
             "#!/bin/sh\nif [ \"$1\" = \"-V\" ]; then printf '{}\\n'; exit 0; fi\nprintf 'fake tmux command\\n'\n",
             version
         ),
+        0o755,
     )?;
-    let mut permissions = fs::metadata(path)?.permissions();
-    permissions.set_mode(0o755);
-    fs::set_permissions(path, permissions)?;
     Ok(())
 }
 

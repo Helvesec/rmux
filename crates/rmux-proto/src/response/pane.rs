@@ -1,9 +1,32 @@
 use serde::{Deserialize, Serialize};
 
 use super::CommandOutput;
-use crate::{
-    PaneId, PaneOutputSubscriptionId, PaneStateSubscriptionId, PaneTarget, PaneTargetRef,
-    ResizePaneAdjustment, RmuxError, WindowTarget,
+use crate::{PaneId, PaneTarget, PaneTargetRef, ResizePaneAdjustment, RmuxError, WindowTarget};
+
+mod snapshot;
+pub use snapshot::{PaneSnapshotCell, PaneSnapshotCursor, PaneSnapshotResponse};
+
+mod output;
+pub use output::{
+    PaneOutputCursor, PaneOutputCursorResponse, PaneOutputEvent, PaneOutputLagNotice,
+    PaneOutputLagResponse, PaneRecentOutput, SubscribePaneOutputResponse,
+    UnsubscribePaneOutputResponse,
+};
+
+mod state;
+pub use state::{
+    ForegroundFieldSource, ForegroundSourcesDto, ForegroundStateDto, PaneForegroundStateResponse,
+    PaneOptionEntry, PaneStateClosedReason, PaneStateCursorResponse, PaneStateEventDto,
+    PaneStateLagResponse, PaneStateSnapshot, SubscribePaneStateResponse,
+    UnsubscribePaneStateResponse,
+};
+
+mod stream;
+pub use stream::{
+    PaneRawBytes, PaneRawRebase, PaneRawRebaseReason, PaneRecoveryCoverage,
+    PaneStreamCursorResponse, PaneStreamEndReason, PaneStreamEvent, PaneStreamLifecycleEvent,
+    PaneSurfaceDynamicColors, PaneSurfaceFrame, PaneSurfaceHyperlink, PaneSurfaceSnapshot,
+    SubscribePaneStreamResponse, UnsubscribePaneStreamResponse,
 };
 
 /// Response payload for `split-window`.
@@ -184,605 +207,6 @@ pub struct PaneOptionGetResponse {
     pub value: Option<String>,
 }
 
-/// Explicit pane option entry included in pane-state snapshots.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct PaneOptionEntry {
-    /// Canonical option name.
-    pub name: String,
-    /// Exact explicit option value rendered by the daemon.
-    pub value: String,
-}
-
-/// Source labels for best-effort foreground fields.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
-#[non_exhaustive]
-pub enum ForegroundFieldSource {
-    /// Read from the foreground process or foreground process group.
-    Process,
-    /// Read from the root pane process.
-    RootProcess,
-    /// Read from the terminal OSC 7 path.
-    Osc7,
-    /// Read from the pane launch profile.
-    Profile,
-    /// Read from the session environment.
-    Environment,
-    /// Read from RMUX's runtime window-name cache.
-    RuntimeName,
-}
-
-/// Per-field source report for best-effort foreground state.
-#[derive(Debug, Default, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct ForegroundSourcesDto {
-    /// Source for `pid`.
-    #[serde(default)]
-    pub pid: Option<ForegroundFieldSource>,
-    /// Source for `command`.
-    #[serde(default)]
-    pub command: Option<ForegroundFieldSource>,
-    /// Source for `cwd`.
-    #[serde(default)]
-    pub cwd: Option<ForegroundFieldSource>,
-    /// Source for `exe`.
-    #[serde(default)]
-    pub exe: Option<ForegroundFieldSource>,
-}
-
-/// Best-effort foreground process state for a pane.
-#[derive(Debug, Default, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct ForegroundStateDto {
-    /// Foreground or root process id, when knowable.
-    #[serde(default)]
-    pub pid: Option<u32>,
-    /// Executable command name, when knowable.
-    #[serde(default)]
-    pub command: Option<String>,
-    /// Current working directory, when knowable.
-    #[serde(default)]
-    pub cwd: Option<String>,
-    /// Executable path, when knowable.
-    #[serde(default)]
-    pub exe: Option<String>,
-    /// Per-field source labels.
-    #[serde(default)]
-    pub sources: ForegroundSourcesDto,
-}
-
-/// Initial or rebased pane-state snapshot.
-#[derive(Debug, Default, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct PaneStateSnapshot {
-    /// Global pane-state journal revision at snapshot time.
-    pub revision: u64,
-    /// Current pane title when requested.
-    #[serde(default)]
-    pub title: Option<String>,
-    /// Current explicit pane-local options when requested.
-    #[serde(default)]
-    pub options: Vec<PaneOptionEntry>,
-    /// Best-effort foreground state when requested.
-    #[serde(default)]
-    pub foreground: Option<ForegroundStateDto>,
-}
-
-/// Terminal reason for a pane-state stream close event.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
-#[non_exhaustive]
-pub enum PaneStateClosedReason {
-    /// The pane process exited and the pane was removed.
-    Exited,
-    /// The pane process died but remain-on-exit kept the pane around.
-    DiedKept,
-    /// The pane was killed by an explicit RMUX operation.
-    Killed,
-}
-
-/// One revisioned pane-state event.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[non_exhaustive]
-pub enum PaneStateEventDto {
-    /// The pane title changed.
-    TitleChanged {
-        /// Global pane-state revision.
-        revision: u64,
-        /// Stable pane id.
-        pane_id: PaneId,
-        /// Previous title.
-        old_title: String,
-        /// New title.
-        new_title: String,
-    },
-    /// A pane-local option was set or replaced.
-    OptionSet {
-        /// Global pane-state revision.
-        revision: u64,
-        /// Stable pane id.
-        pane_id: PaneId,
-        /// Canonical option name.
-        name: String,
-        /// Previous explicit value.
-        old_value: Option<String>,
-        /// New explicit value.
-        new_value: String,
-    },
-    /// A pane-local option was unset.
-    OptionUnset {
-        /// Global pane-state revision.
-        revision: u64,
-        /// Stable pane id.
-        pane_id: PaneId,
-        /// Canonical option name.
-        name: String,
-        /// Previous explicit value.
-        old_value: Option<String>,
-    },
-    /// Best-effort foreground state changed.
-    ForegroundChanged {
-        /// Global pane-state revision.
-        revision: u64,
-        /// Stable pane id.
-        pane_id: PaneId,
-        /// Previous foreground state.
-        old_state: ForegroundStateDto,
-        /// New foreground state.
-        new_state: ForegroundStateDto,
-    },
-    /// The pane reached a terminal state for this subscription.
-    Closed {
-        /// Global pane-state revision.
-        revision: u64,
-        /// Stable pane id.
-        pane_id: PaneId,
-        /// Terminal close reason.
-        reason: PaneStateClosedReason,
-    },
-}
-
-/// Response payload for subscribing to revisioned pane-state events.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct SubscribePaneStateResponse {
-    /// The newly allocated subscription identifier.
-    pub subscription_id: PaneStateSubscriptionId,
-    /// Stable pane identity for the subscribed pane.
-    pub pane_id: PaneId,
-    /// Atomic initial snapshot.
-    pub snapshot: PaneStateSnapshot,
-}
-
-/// Response payload for unsubscribing from pane-state events.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-pub struct UnsubscribePaneStateResponse {
-    /// The requested subscription identifier.
-    pub subscription_id: PaneStateSubscriptionId,
-    /// Whether a live subscription was removed.
-    pub removed: bool,
-}
-
-/// Response payload for a pane-state cursor request.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct PaneStateCursorResponse {
-    /// The polled subscription identifier.
-    pub subscription_id: PaneStateSubscriptionId,
-    /// Events delivered in strictly increasing revision order.
-    pub events: Vec<PaneStateEventDto>,
-    /// Revision callers should use as the next `after_revision` cursor.
-    pub next_revision: u64,
-}
-
-/// Response payload for a pane-state subscription lag.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct PaneStateLagResponse {
-    /// The polled subscription identifier.
-    pub subscription_id: PaneStateSubscriptionId,
-    /// The stale cursor revision that fell behind retention.
-    pub missed_from_revision: u64,
-    /// Oldest retained revision after the gap.
-    pub resume_revision: u64,
-    /// Atomic rebased snapshot.
-    pub snapshot: PaneStateSnapshot,
-}
-
-/// Response payload for a one-shot foreground state request.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct PaneForegroundStateResponse {
-    /// Stable pane id resolved by the daemon.
-    pub pane_id: PaneId,
-    /// Journal revision observed when sampling.
-    pub revision: u64,
-    /// Best-effort foreground state. `None` means the pane disappeared.
-    pub state: Option<ForegroundStateDto>,
-}
-
-/// Serializable pane-output cursor state returned by subscription endpoints.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-pub struct PaneOutputCursor {
-    /// The next output sequence the cursor expects.
-    pub next_sequence: u64,
-    /// Total output events this cursor has skipped after explicit gaps.
-    pub missed_events: u64,
-}
-
-/// One pane-output event delivered through a subscription cursor.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct PaneOutputEvent {
-    /// Monotonic per-pane output sequence.
-    pub sequence: u64,
-    /// Raw pane output bytes.
-    pub bytes: Vec<u8>,
-}
-
-/// Recent live bytes included with a lag notice.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct PaneRecentOutput {
-    /// Retained recent raw pane output bytes.
-    pub bytes: Vec<u8>,
-    /// Oldest output sequence contributing retained bytes.
-    pub oldest_sequence: Option<u64>,
-    /// Newest output sequence contributing retained bytes.
-    pub newest_sequence: Option<u64>,
-}
-
-/// Explicit report for a subscription cursor that fell behind retention.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct PaneOutputLagNotice {
-    /// Sequence the subscriber expected before lag was detected.
-    pub expected_sequence: u64,
-    /// Oldest retained sequence where the subscriber can resume.
-    pub resume_sequence: u64,
-    /// Number of output events skipped by this lag notice.
-    pub missed_events: u64,
-    /// Newest output sequence appended when lag was detected.
-    pub newest_sequence: u64,
-    /// Bounded recent live output available at lag detection time.
-    pub recent: PaneRecentOutput,
-}
-
-/// Response payload for subscribing to live pane-output events.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct SubscribePaneOutputResponse {
-    /// The newly allocated subscription identifier.
-    pub subscription_id: PaneOutputSubscriptionId,
-    /// The resolved target at subscription time.
-    pub target: PaneTarget,
-    /// Stable pane identity for the subscribed pane.
-    pub pane_id: PaneId,
-    /// Initial cursor state.
-    pub cursor: PaneOutputCursor,
-}
-
-/// Response payload for unsubscribing from live pane-output events.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-pub struct UnsubscribePaneOutputResponse {
-    /// The requested subscription identifier.
-    pub subscription_id: PaneOutputSubscriptionId,
-    /// Whether a live subscription was removed by this request.
-    pub removed: bool,
-}
-
-/// Response payload for polling a live pane-output subscription cursor.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct PaneOutputCursorResponse {
-    /// The polled subscription identifier.
-    pub subscription_id: PaneOutputSubscriptionId,
-    /// Cursor state after this poll.
-    pub cursor: PaneOutputCursor,
-    /// Output events delivered in ascending sequence order.
-    pub events: Vec<PaneOutputEvent>,
-    /// Whether this response stopped at the server-side batch cap.
-    pub limited: bool,
-}
-
-/// Response payload for a pane-output subscription lag notice.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct PaneOutputLagResponse {
-    /// The polled subscription identifier.
-    pub subscription_id: PaneOutputSubscriptionId,
-    /// Cursor state after applying the lag notice.
-    pub cursor: PaneOutputCursor,
-    /// Detailed gap report.
-    pub lag: PaneOutputLagNotice,
-}
-
-/// Why a raw pane stream emitted a new authoritative keyframe.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[non_exhaustive]
-pub enum PaneRawRebaseReason {
-    /// Initial authoritative boundary created when the stream opens.
-    Initial,
-    /// The consumer fell behind the bounded output ring.
-    Lag,
-    /// Pane geometry changed without a corresponding output byte.
-    Resize,
-    /// Retained terminal history was explicitly cleared.
-    ClearHistory,
-    /// An incomplete parser sequence expired.
-    ParserStateExpired,
-    /// The terminal state was reset.
-    TerminalReset,
-    /// Another cold-path transcript mutation invalidated continuation.
-    TranscriptMutation,
-    /// The pane process generation changed.
-    GenerationChanged,
-}
-
-/// Completeness report for a bounded raw recovery keyframe.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-pub struct PaneRecoveryCoverage {
-    /// Total scrollback rows retained by the daemon at the capture boundary.
-    pub history_rows_total: u64,
-    /// Newest whole scrollback rows represented by the keyframe.
-    pub history_rows_included: u64,
-    /// Whether terminal metadata carried by the keyframe is lossless.
-    ///
-    /// `true` guarantees exact reconstruction of stored title, OSC 7 path,
-    /// title-stack, and hyperlink values. `false` means at least one recovery
-    /// metadata value was omitted, shortened to fit a byte budget, or stripped
-    /// of control characters for safe OSC replay. This is independent of the
-    /// history-row coverage above; the visible cell grid remains authoritative.
-    pub metadata_complete: bool,
-}
-
-impl PaneRecoveryCoverage {
-    /// Returns whether every retained scrollback row is represented.
-    #[must_use]
-    pub const fn history_complete(self) -> bool {
-        self.history_rows_included >= self.history_rows_total
-    }
-}
-
-/// Complete raw-emulator recovery state delivered in-band.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct PaneRawRebase {
-    /// Stream-local epoch stamped onto subsequent raw byte events.
-    pub epoch: u64,
-    /// Pane process generation observed by the atomic boundary.
-    pub generation: u64,
-    /// Cold-path invalidation revision observed by the atomic boundary.
-    pub invalidation_revision: u64,
-    /// First pane-output sequence not represented by this keyframe.
-    pub next_sequence: u64,
-    /// Terminal width represented by the keyframe.
-    pub cols: u16,
-    /// Terminal height represented by the keyframe.
-    pub rows: u16,
-    /// ANSI bytes that reset and reconstruct a compatible terminal emulator.
-    pub keyframe: Vec<u8>,
-    /// Whether the captured pane is currently using its alternate screen.
-    pub alternate: bool,
-    /// Explicit report for bounded scrollback and terminal metadata.
-    pub coverage: PaneRecoveryCoverage,
-    /// Optional typed snapshot requested by an inspection-oriented consumer.
-    pub snapshot: Option<PaneSnapshotResponse>,
-    /// Cause of this rebase.
-    pub reason: PaneRawRebaseReason,
-}
-
-/// One raw byte event tied to a preceding rebase epoch.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct PaneRawBytes {
-    /// Stream-local epoch established by the latest raw rebase.
-    pub epoch: u64,
-    /// Monotonic pane-output sequence.
-    pub sequence: u64,
-    /// Exact output bytes published for this sequence.
-    pub bytes: Vec<u8>,
-}
-
-/// One OSC 8 hyperlink referenced by a structured pane surface.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct PaneSurfaceHyperlink {
-    /// Non-zero hyperlink inner ID stored by visible cells.
-    pub id: u32,
-    /// OSC 8 target URI associated with `id`.
-    pub uri: String,
-}
-
-/// Application-defined OSC 10/11/12 colours.
-#[derive(Debug, Default, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct PaneSurfaceDynamicColors {
-    /// OSC 10 default foreground colour, when defined by the application.
-    pub foreground: Option<String>,
-    /// OSC 11 default background colour, when defined by the application.
-    pub background: Option<String>,
-    /// OSC 12 cursor colour, when defined by the application.
-    pub cursor: Option<String>,
-}
-
-/// Authoritative structured pane state.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct PaneSurfaceSnapshot {
-    /// Visible pane width in terminal columns.
-    pub cols: u16,
-    /// Visible pane height in terminal rows.
-    pub rows: u16,
-    /// Row-major visible cells, exactly `cols * rows` long.
-    pub cells: Vec<PaneSnapshotCell>,
-    /// URI metadata keyed by the non-zero hyperlink IDs stored in `cells`.
-    pub hyperlinks: Vec<PaneSurfaceHyperlink>,
-    /// Current cursor state.
-    pub cursor: PaneSnapshotCursor,
-    /// Terminal title observed at this boundary.
-    pub title: String,
-    /// Terminal-reported working-directory path.
-    pub path: String,
-    /// Application-defined OSC 10/11/12 colours.
-    pub dynamic_colors: PaneSurfaceDynamicColors,
-    /// Whether title, path, and visible-cell hyperlink metadata was copied
-    /// completely into this transport-bounded snapshot.
-    pub metadata_complete: bool,
-    /// Raw terminal mode bitset.
-    pub mode_bits: u32,
-    /// Whether the alternate screen is active.
-    pub alternate: bool,
-    /// Inclusive top row of the scrolling region.
-    pub scroll_top: u32,
-    /// Inclusive bottom row of the scrolling region.
-    pub scroll_bottom: u32,
-    /// Number of retained scrollback rows.
-    pub history_size: u64,
-    /// Bytes retained by the terminal history representation.
-    pub history_bytes: u64,
-    /// Monotonic pane-grid revision shared with `PaneSnapshotResponse`.
-    pub revision: u64,
-}
-
-/// A self-contained surface frame; no earlier patch is required to apply it.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct PaneSurfaceFrame {
-    /// Stream-local epoch established by the latest surface reset.
-    pub epoch: u64,
-    /// Monotonic revision of the complete surface projection.
-    pub revision: u64,
-    /// First pane-output sequence not represented by this atomic surface.
-    pub next_output_sequence: u64,
-    /// Complete authoritative surface represented by this frame.
-    pub snapshot: PaneSurfaceSnapshot,
-}
-
-/// Pane lifecycle observations that do not terminate the logical stream.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[non_exhaustive]
-pub enum PaneStreamLifecycleEvent {
-    /// The current child process exited after its output reached EOF.
-    ///
-    /// A kept pane may later be respawned on the same subscription.
-    ProcessExited {
-        /// Exact output-ring sequence occupied by the EOF marker when it was
-        /// still retained. `None` means lifecycle was recovered across an
-        /// invalidation or retention gap; the adjacent rebase is authoritative
-        /// for raw sequence continuation.
-        output_sequence: Option<u64>,
-    },
-}
-
-/// Distinguishes logical pane removal from subscription termination.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[non_exhaustive]
-pub enum PaneStreamEndReason {
-    /// The logical pane resource was removed.
-    PaneRemoved,
-    /// The caller no longer has permission to observe the pane.
-    AccessRevoked,
-    /// The bounded subscription could not keep up.
-    SlowConsumer,
-    /// The idle subscription lease expired.
-    SubscriptionExpired,
-    /// The underlying detached transport was lost.
-    TransportLost,
-    /// The daemon could not materialize the requested projection.
-    ProjectionFailed,
-}
-
-/// One item in either recoverable pane projection.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[non_exhaustive]
-pub enum PaneStreamEvent {
-    /// Authoritative raw-emulator reset and reconstruction payload.
-    RawRebase(Box<PaneRawRebase>),
-    /// Exact raw output following the latest rebase.
-    RawBytes(PaneRawBytes),
-    /// Complete authoritative surface establishing a new epoch.
-    SurfaceReset(Box<PaneSurfaceFrame>),
-    /// Self-contained authoritative surface update.
-    SurfacePatch(Box<PaneSurfaceFrame>),
-    /// Non-terminal process lifecycle observation.
-    Lifecycle(PaneStreamLifecycleEvent),
-    /// Typed terminal or subscription termination.
-    End(PaneStreamEndReason),
-}
-
-/// Atomic initial event and already-reserved pane stream subscription.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct SubscribePaneStreamResponse {
-    /// Opaque stream subscription allocated by the daemon.
-    pub subscription_id: PaneOutputSubscriptionId,
-    /// Resolved pane slot at subscription time.
-    pub target: PaneTarget,
-    /// Stable pane identity at subscription time.
-    pub pane_id: PaneId,
-    /// Initial authoritative event.
-    pub event: PaneStreamEvent,
-}
-
-/// Batched recoverable pane stream events.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct PaneStreamCursorResponse {
-    /// Polled stream subscription.
-    pub subscription_id: PaneOutputSubscriptionId,
-    /// Events delivered in stream order.
-    pub events: Vec<PaneStreamEvent>,
-    /// Whether this response stopped at the server-side batch cap.
-    pub limited: bool,
-}
-
-/// Result of explicitly closing a recoverable pane stream.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-pub struct UnsubscribePaneStreamResponse {
-    /// Requested stream subscription.
-    pub subscription_id: PaneOutputSubscriptionId,
-    /// Whether a live stream was removed.
-    pub removed: bool,
-}
-
-/// One captured pane cell on the daemon snapshot wire.
-///
-/// Cells are produced from rmux-core's structured `ScreenCellView`, so the
-/// glyph text, recorded display width, and padding flag travel verbatim
-/// across the wire. Padding cells (the trailing column of a wide glyph)
-/// carry `width = 0` and `padding = true`; their `text` field carries the
-/// space sentinel rmux-core uses to represent owned padding.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct PaneSnapshotCell {
-    /// Recorded glyph text payload.
-    pub text: String,
-    /// Recorded display width of the leading glyph; `0` for padding cells.
-    pub width: u8,
-    /// Whether this cell is wide-glyph padding for the preceding column.
-    pub padding: bool,
-    /// Raw cell attribute bitset.
-    pub attributes: u16,
-    /// Raw foreground colour encoding.
-    pub fg: i32,
-    /// Raw background colour encoding.
-    pub bg: i32,
-    /// Raw underline colour encoding.
-    pub us: i32,
-    /// Hyperlink inner ID.
-    pub link: u32,
-}
-
-/// Captured cursor position on the daemon snapshot wire.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-pub struct PaneSnapshotCursor {
-    /// Zero-based cursor row within the visible viewport.
-    pub row: u16,
-    /// Zero-based cursor column within the visible viewport.
-    pub col: u16,
-    /// Whether the cursor is visible according to the live mode bits.
-    pub visible: bool,
-    /// Raw cursor style value.
-    pub style: u32,
-}
-
-/// Response payload for the daemon-backed pane snapshot endpoint.
-///
-/// `cells` is row-major with `row * cols + col` indexing and exactly
-/// `cols * rows` entries. The daemon-derived `revision` is non-zero for
-/// every captured live pane and changes whenever any observable field
-/// (cells, cursor, output_sequence, history bytes/lines, pane id) changes.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct PaneSnapshotResponse {
-    /// Visible pane width in terminal columns.
-    pub cols: u16,
-    /// Visible pane height in terminal rows.
-    pub rows: u16,
-    /// Row-major cells, `cols * rows` long.
-    pub cells: Vec<PaneSnapshotCell>,
-    /// Captured cursor coordinates and state.
-    pub cursor: PaneSnapshotCursor,
-    /// Daemon-derived revision counter for this captured state.
-    pub revision: u64,
-}
-
 /// Response payload for `list-panes`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ListPanesResponse {
@@ -795,5 +219,41 @@ impl ListPanesResponse {
     #[must_use]
     pub fn command_output(&self) -> &CommandOutput {
         &self.output
+    }
+}
+
+#[cfg(test)]
+mod pane_state_closed_event_wire_tests {
+    use super::*;
+
+    #[test]
+    fn terminal_event_wire_tags_are_append_only() {
+        let pane_id = PaneId::new(3);
+        let reason = PaneStateClosedReason::DiedKept;
+        let closed = PaneStateEventDto::Closed {
+            revision: 7,
+            pane_id,
+            reason,
+        };
+        // Legacy bincode representation: enum discriminant, then the three fields.
+        let legacy = bincode::serialize(&(4u32, 7u64, pane_id, reason)).unwrap();
+        assert_eq!(bincode::serialize(&closed).unwrap(), legacy);
+        assert_eq!(
+            bincode::deserialize::<PaneStateEventDto>(&legacy).unwrap(),
+            closed
+        );
+        let exited = PaneStateEventDto::Exited {
+            revision: 7,
+            pane_id,
+            reason,
+            exit_status: Some(3),
+            exit_signal: None,
+        };
+        let bytes = bincode::serialize(&exited).unwrap();
+        assert_eq!(&bytes[..4], &5u32.to_le_bytes());
+        assert_eq!(
+            bincode::deserialize::<PaneStateEventDto>(&bytes).unwrap(),
+            exited
+        );
     }
 }

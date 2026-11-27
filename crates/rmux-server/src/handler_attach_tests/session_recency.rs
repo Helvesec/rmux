@@ -8,6 +8,8 @@
 //! survive, and then asserts the reader's own outcome rather than the token.
 
 use super::*;
+#[cfg(test)]
+use crate::session_fixture::SessionSetupExt as _;
 
 const SIZE: TerminalSize = TerminalSize { cols: 80, rows: 24 };
 
@@ -23,7 +25,7 @@ async fn create_detached_session(handler: &RequestHandler, name: &str) {
             environment: None,
         }))
         .await;
-    assert!(matches!(created, Response::NewSession(_)), "{created:?}");
+    crate::session_fixture::assert_new_session(&created);
 }
 
 /// Creates `creation_order`, marks `use_order` as used, then pins every public
@@ -37,14 +39,14 @@ async fn same_second_handler(creation_order: &[&str], use_order: &[&str]) -> Req
     for name in use_order {
         state
             .sessions
-            .session_mut(&session_name(name))
+            .session_setup(&session_name(name))
             .expect("used session exists")
             .touch_attached();
     }
     for name in creation_order {
         state
             .sessions
-            .session_mut(&session_name(name))
+            .session_setup(&session_name(name))
             .expect("created session exists")
             .pin_public_times_for_tests(PINNED_SECOND);
     }
@@ -52,6 +54,7 @@ async fn same_second_handler(creation_order: &[&str], use_order: &[&str]) -> Req
         state
             .sessions
             .iter()
+            .map(|session| (session.name(), session))
             .all(|(_, session)| session.created_at() == PINNED_SECOND
                 && session.activity_at() == PINNED_SECOND),
         "the fixture must leave no public second able to order the sessions"
@@ -105,7 +108,7 @@ async fn targetless_attach_prefers_an_unattached_session_over_the_most_recent_on
         for name in ["a01", "z99", "m03"] {
             state
                 .sessions
-                .session_mut(&session_name(name))
+                .session_setup(&session_name(name))
                 .expect("session exists")
                 .pin_public_times_for_tests(PINNED_SECOND);
         }
@@ -135,7 +138,7 @@ async fn targetless_attach_ranks_a_later_creation_above_an_earlier_attach() {
         let mut state = handler.state.lock().await;
         state
             .sessions
-            .session_mut(&session_name("a01"))
+            .session_setup(&session_name("a01"))
             .expect("a01 exists")
             .touch_attached();
     }
@@ -149,7 +152,7 @@ async fn targetless_attach_ranks_a_later_creation_above_an_earlier_attach() {
         for name in ["m03", "a01", "z99"] {
             state
                 .sessions
-                .session_mut(&session_name(name))
+                .session_setup(&session_name(name))
                 .expect("session exists")
                 .pin_public_times_for_tests(PINNED_SECOND);
         }

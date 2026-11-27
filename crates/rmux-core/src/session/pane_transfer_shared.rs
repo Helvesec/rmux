@@ -52,6 +52,13 @@ pub(super) fn apply_swap_between_windows(
     let select_source_in_target = !options.detached || target_active_before == target.index;
     source_window.push_zoom(options.preserve_zoom);
     target_window.push_zoom(options.preserve_zoom);
+    // Both owners are unzoomed before the tmux floating-endpoint refusal.
+    // All geometry/topology/identity/selection beyond that effect is retained.
+    if source_window.is_floating_pane_id(source_pane_id)
+        || target_window.is_floating_pane_id(target_pane_id)
+    {
+        return Err(RmuxError::Server("cannot swap floating panes".to_owned()));
+    }
     source_window.replace_pane_for_swap(source.index, target.pane)?;
     target_window.replace_pane_for_swap(target.index, source.pane)?;
 
@@ -141,17 +148,6 @@ pub(super) const fn adjusted_insert_position(
     }
 }
 
-pub(super) const fn adjusted_insert_position_before(
-    source_position: usize,
-    target_position: usize,
-) -> usize {
-    if source_position < target_position {
-        target_position.saturating_sub(1)
-    } else {
-        target_position
-    }
-}
-
 pub(super) fn resolve_break_destination_index(
     session: &Session,
     target_window_index: Option<u32>,
@@ -173,4 +169,18 @@ pub(super) fn resolve_break_destination_index(
         }
         None => session.lowest_available_window_index_at_or_above(0),
     }
+}
+
+/// Completes a validated multi-pane break into its prepared, fresh owner.
+/// Destination construction intentionally keeps the standalone break semantics.
+pub(super) fn apply_break_into_window(source: &mut Window, pane_index: u32, destination: &Window) {
+    debug_assert!(source.pane_count() > 1);
+    debug_assert_eq!(
+        source.pane(pane_index).map(Pane::id),
+        destination.active_pane().map(Pane::id)
+    );
+    source.auto_unzoom();
+    let _moved_pane = source
+        .extract_pane(pane_index)
+        .expect("validated break source");
 }

@@ -1,0 +1,461 @@
+{
+  "schema": 1,
+  "source_base": "80575f422b07e12f1399e54ebee5049dc65503e6",
+  "scope": [
+    "std::sync::Mutex",
+    "std::sync::RwLock",
+    "Condvar-reacquisition"
+  ],
+  "default": "fail-closed-before-state-use",
+  "silent_recovery_allowed": false,
+  "clear_poison_is_repair": false,
+  "async_mutex_rule": "no-poison-mechanism; cancellation-invariants-still-required",
+  "error_boundary": "Return the existing typed domain error before accessing protected state, or panic at the owning invariant boundary where no such error return exists. Never convert poison into success or implicitly claim shutdown completed. Cleanup/wakeup ownership must be explicit; poison itself does not notify waiters.",
+  "recovery_contract": "Only an independently reviewed, source-bound exception can reconstruct/validate all coupled state before clearing poison. Path/symbol/owner/invariant/repair/negativecanary/reviewpin/expiry required. No exception granted here.",
+  "approved_exceptions": [],
+  "observed_sites": [
+    {
+      "path": "crates/rmux-client/src/attach/termination/tests.rs",
+      "source_sha256": "4cf4981c2bab617284cd32a286c8d154c635fc4a80f1f1b28da19837a2536c08",
+      "line": 76,
+      "kind": "poison-state-operation",
+      "text_sha256": "3246807a4f45b0fdb6b0df2d0bc8b3a7f682748669914f9f91c138934debd974",
+      "scope_hint": "test-or-conditional",
+      "disposition": "REVIEW_REQUIRED_NOT_AN_APPROVED_RECOVERY"
+    },
+    {
+      "path": "crates/rmux-client/src/attach/termination/tests.rs",
+      "source_sha256": "4cf4981c2bab617284cd32a286c8d154c635fc4a80f1f1b28da19837a2536c08",
+      "line": 105,
+      "kind": "poison-state-operation",
+      "text_sha256": "b74c33f8f473256f9810c00f856cdd5decb91a5cec070a1e8fd8589c8b897d66",
+      "scope_hint": "test-or-conditional",
+      "disposition": "REVIEW_REQUIRED_NOT_AN_APPROVED_RECOVERY"
+    },
+    {
+      "path": "crates/rmux-client/src/attach/termination/tests.rs",
+      "source_sha256": "4cf4981c2bab617284cd32a286c8d154c635fc4a80f1f1b28da19837a2536c08",
+      "line": 216,
+      "kind": "poison-state-operation",
+      "text_sha256": "b74c33f8f473256f9810c00f856cdd5decb91a5cec070a1e8fd8589c8b897d66",
+      "scope_hint": "test-or-conditional",
+      "disposition": "REVIEW_REQUIRED_NOT_AN_APPROVED_RECOVERY"
+    },
+    {
+      "path": "crates/rmux-client/src/attach/termination/tests.rs",
+      "source_sha256": "4cf4981c2bab617284cd32a286c8d154c635fc4a80f1f1b28da19837a2536c08",
+      "line": 218,
+      "kind": "recovery-candidate",
+      "text_sha256": "4a4ee0e668dec9a8252cec9a4d53dbe48b4edd1510a7e0c2fbe15108af39d7ec",
+      "scope_hint": "test-or-conditional",
+      "disposition": "REVIEW_REQUIRED_NOT_AN_APPROVED_RECOVERY"
+    },
+    {
+      "path": "crates/rmux-client/src/attach/tests.rs",
+      "source_sha256": "de33f37cf16d6f27b24bc7923c9b1a8318fe8716886f67f865574aba58d449df",
+      "line": 227,
+      "kind": "recovery-candidate",
+      "text_sha256": "7cd95cca9e49902d5e143625767b9fe839c0c1ecbc7b09c277c337b93f7f1245",
+      "scope_hint": "test-or-conditional",
+      "disposition": "REVIEW_REQUIRED_NOT_AN_APPROVED_RECOVERY"
+    },
+    {
+      "path": "crates/rmux-client/src/attach/tests.rs",
+      "source_sha256": "de33f37cf16d6f27b24bc7923c9b1a8318fe8716886f67f865574aba58d449df",
+      "line": 261,
+      "kind": "recovery-candidate",
+      "text_sha256": "7cd95cca9e49902d5e143625767b9fe839c0c1ecbc7b09c277c337b93f7f1245",
+      "scope_hint": "test-or-conditional",
+      "disposition": "REVIEW_REQUIRED_NOT_AN_APPROVED_RECOVERY"
+    },
+    {
+      "path": "crates/rmux-client/src/attach/unix/termination.rs",
+      "source_sha256": "9ecfa533aaf35948a18947154879c3d5df24ee9d7b7f3c26a2b5910f3295a0f3",
+      "line": 28,
+      "kind": "recovery-candidate",
+      "text_sha256": "7cd95cca9e49902d5e143625767b9fe839c0c1ecbc7b09c277c337b93f7f1245",
+      "scope_hint": "production-candidate",
+      "disposition": "REVIEW_REQUIRED_NOT_AN_APPROVED_RECOVERY"
+    },
+    {
+      "path": "crates/rmux-client/src/attach/windows/console_coordination.rs",
+      "source_sha256": "802c8c763930ae7c22266b4f588fec704d1270f1480eb7ff3219b0f7b985170a",
+      "line": 118,
+      "kind": "poison-state-operation",
+      "text_sha256": "6f1c9f081bf279c2498704298f2c7d0e9d9c933f283512eff70aa29e199e4ef2",
+      "scope_hint": "test-or-conditional",
+      "disposition": "REVIEW_REQUIRED_NOT_AN_APPROVED_RECOVERY"
+    },
+    {
+      "path": "crates/rmux-client/src/attach/windows/console_coordination.rs",
+      "source_sha256": "802c8c763930ae7c22266b4f588fec704d1270f1480eb7ff3219b0f7b985170a",
+      "line": 150,
+      "kind": "poison-state-operation",
+      "text_sha256": "05038a0cdf986ab09c76b90a118e93cdd9acceaf66771db3b1c1af95d886af4a",
+      "scope_hint": "test-or-conditional",
+      "disposition": "REVIEW_REQUIRED_NOT_AN_APPROVED_RECOVERY"
+    },
+    {
+      "path": "crates/rmux-client/src/attach/windows/console_coordination.rs",
+      "source_sha256": "802c8c763930ae7c22266b4f588fec704d1270f1480eb7ff3219b0f7b985170a",
+      "line": 155,
+      "kind": "poison-state-operation",
+      "text_sha256": "c6d638c4dd6cbd4f4f8a84c4f51ea903328740af8d7d863512918305d98da6e6",
+      "scope_hint": "test-or-conditional",
+      "disposition": "REVIEW_REQUIRED_NOT_AN_APPROVED_RECOVERY"
+    },
+    {
+      "path": "crates/rmux-client/src/attach/windows/console_coordination.rs",
+      "source_sha256": "802c8c763930ae7c22266b4f588fec704d1270f1480eb7ff3219b0f7b985170a",
+      "line": 210,
+      "kind": "poison-state-operation",
+      "text_sha256": "05038a0cdf986ab09c76b90a118e93cdd9acceaf66771db3b1c1af95d886af4a",
+      "scope_hint": "test-or-conditional",
+      "disposition": "REVIEW_REQUIRED_NOT_AN_APPROVED_RECOVERY"
+    },
+    {
+      "path": "crates/rmux-client/src/attach_lock_state.rs",
+      "source_sha256": "b6d877b1fad3b4654c28c1da358c15bd626c4460e5ae65ceeda4003a03e34df2",
+      "line": 175,
+      "kind": "poison-state-operation",
+      "text_sha256": "4b1ad3f1c0a8db11bf505eee5347a1fc204bc75e7ab11b5fe45780cd37ef46e4",
+      "scope_hint": "test-or-conditional",
+      "disposition": "REVIEW_REQUIRED_NOT_AN_APPROVED_RECOVERY"
+    },
+    {
+      "path": "crates/rmux-client/src/attach_lock_state.rs",
+      "source_sha256": "b6d877b1fad3b4654c28c1da358c15bd626c4460e5ae65ceeda4003a03e34df2",
+      "line": 183,
+      "kind": "recovery-candidate",
+      "text_sha256": "70a602218ee3069b0565ddaf0e3db72095461e9f72e039d5f5cec67165e18a23",
+      "scope_hint": "test-or-conditional",
+      "disposition": "REVIEW_REQUIRED_NOT_AN_APPROVED_RECOVERY"
+    },
+    {
+      "path": "crates/rmux-client/src/attach_lock_state.rs",
+      "source_sha256": "b6d877b1fad3b4654c28c1da358c15bd626c4460e5ae65ceeda4003a03e34df2",
+      "line": 222,
+      "kind": "recovery-candidate",
+      "text_sha256": "70a602218ee3069b0565ddaf0e3db72095461e9f72e039d5f5cec67165e18a23",
+      "scope_hint": "test-or-conditional",
+      "disposition": "REVIEW_REQUIRED_NOT_AN_APPROVED_RECOVERY"
+    },
+    {
+      "path": "crates/rmux-client/src/attach_lock_state.rs",
+      "source_sha256": "b6d877b1fad3b4654c28c1da358c15bd626c4460e5ae65ceeda4003a03e34df2",
+      "line": 234,
+      "kind": "recovery-candidate",
+      "text_sha256": "164c18c3ec9997f1ebf1713815dd1ce0eb1e11223eba72e504713a8e973ea4fa",
+      "scope_hint": "test-or-conditional",
+      "disposition": "REVIEW_REQUIRED_NOT_AN_APPROVED_RECOVERY"
+    },
+    {
+      "path": "crates/rmux-client/src/attach_lock_state.rs",
+      "source_sha256": "b6d877b1fad3b4654c28c1da358c15bd626c4460e5ae65ceeda4003a03e34df2",
+      "line": 320,
+      "kind": "poison-state-operation",
+      "text_sha256": "422ee77cadb50ad00bf5a901014d14592f82ef6830083355e56e8a10c467e2b6",
+      "scope_hint": "test-or-conditional",
+      "disposition": "REVIEW_REQUIRED_NOT_AN_APPROVED_RECOVERY"
+    },
+    {
+      "path": "crates/rmux-client/src/attach_lock_state.rs",
+      "source_sha256": "b6d877b1fad3b4654c28c1da358c15bd626c4460e5ae65ceeda4003a03e34df2",
+      "line": 338,
+      "kind": "poison-state-operation",
+      "text_sha256": "4b1ad3f1c0a8db11bf505eee5347a1fc204bc75e7ab11b5fe45780cd37ef46e4",
+      "scope_hint": "test-or-conditional",
+      "disposition": "REVIEW_REQUIRED_NOT_AN_APPROVED_RECOVERY"
+    },
+    {
+      "path": "crates/rmux-client/src/attach_lock_state.rs",
+      "source_sha256": "b6d877b1fad3b4654c28c1da358c15bd626c4460e5ae65ceeda4003a03e34df2",
+      "line": 382,
+      "kind": "poison-state-operation",
+      "text_sha256": "4b1ad3f1c0a8db11bf505eee5347a1fc204bc75e7ab11b5fe45780cd37ef46e4",
+      "scope_hint": "test-or-conditional",
+      "disposition": "REVIEW_REQUIRED_NOT_AN_APPROVED_RECOVERY"
+    },
+    {
+      "path": "crates/rmux-client/tests/attach_session.rs",
+      "source_sha256": "682bf34456bebd82cd883737c56de5dad0ab896cff6d74bd3db57cb7b5d1ff93",
+      "line": 298,
+      "kind": "recovery-candidate",
+      "text_sha256": "9382233e8edab93abf4aea11b4ea9e1d6e3d78863cc889538f6565dfc9f660e2",
+      "scope_hint": "test-or-conditional",
+      "disposition": "REVIEW_REQUIRED_NOT_AN_APPROVED_RECOVERY"
+    },
+    {
+      "path": "crates/rmux-sdk/src/bootstrap/discovery/tests.rs",
+      "source_sha256": "f8d9f5ae0206a3f21846d25c295a4631a09d07596b7ef2295c1f18c0e2229a1e",
+      "line": 371,
+      "kind": "recovery-candidate",
+      "text_sha256": "9382233e8edab93abf4aea11b4ea9e1d6e3d78863cc889538f6565dfc9f660e2",
+      "scope_hint": "test-or-conditional",
+      "disposition": "REVIEW_REQUIRED_NOT_AN_APPROVED_RECOVERY"
+    },
+    {
+      "path": "crates/rmux-sdk/src/transport/state.rs",
+      "source_sha256": "86bc57857d67eecb517bb79eeef54a161bf2c0641c82f0b420f9ad3bdf4936bf",
+      "line": 76,
+      "kind": "recovery-candidate",
+      "text_sha256": "9382233e8edab93abf4aea11b4ea9e1d6e3d78863cc889538f6565dfc9f660e2",
+      "scope_hint": "production-candidate",
+      "disposition": "REVIEW_REQUIRED_NOT_AN_APPROVED_RECOVERY"
+    },
+    {
+      "path": "crates/rmux-server/src/handler/pane_state_support.rs",
+      "source_sha256": "27acfa64ce3114296fd6d129e2464df3b36032d03cfee400dd891e995eab9f89",
+      "line": 41,
+      "kind": "recovery-candidate",
+      "text_sha256": "164c18c3ec9997f1ebf1713815dd1ce0eb1e11223eba72e504713a8e973ea4fa",
+      "scope_hint": "test-or-conditional",
+      "disposition": "REVIEW_REQUIRED_NOT_AN_APPROVED_RECOVERY"
+    },
+    {
+      "path": "crates/rmux-server/src/handler/pane_state_support.rs",
+      "source_sha256": "27acfa64ce3114296fd6d129e2464df3b36032d03cfee400dd891e995eab9f89",
+      "line": 49,
+      "kind": "recovery-candidate",
+      "text_sha256": "164c18c3ec9997f1ebf1713815dd1ce0eb1e11223eba72e504713a8e973ea4fa",
+      "scope_hint": "test-or-conditional",
+      "disposition": "REVIEW_REQUIRED_NOT_AN_APPROVED_RECOVERY"
+    },
+    {
+      "path": "crates/rmux-server/src/handler/pane_stream_support/guards.rs",
+      "source_sha256": "dc5a980d89f852c6046a6ef26a082a010973423cb410ce25fa2f402c84b3714d",
+      "line": 31,
+      "kind": "recovery-candidate",
+      "text_sha256": "9382233e8edab93abf4aea11b4ea9e1d6e3d78863cc889538f6565dfc9f660e2",
+      "scope_hint": "production-candidate",
+      "disposition": "REVIEW_REQUIRED_NOT_AN_APPROVED_RECOVERY"
+    },
+    {
+      "path": "crates/rmux-server/src/handler/pane_stream_support/guards.rs",
+      "source_sha256": "dc5a980d89f852c6046a6ef26a082a010973423cb410ce25fa2f402c84b3714d",
+      "line": 69,
+      "kind": "recovery-candidate",
+      "text_sha256": "9382233e8edab93abf4aea11b4ea9e1d6e3d78863cc889538f6565dfc9f660e2",
+      "scope_hint": "production-candidate",
+      "disposition": "REVIEW_REQUIRED_NOT_AN_APPROVED_RECOVERY"
+    },
+    {
+      "path": "crates/rmux-server/src/handler/pane_stream_support/guards.rs",
+      "source_sha256": "dc5a980d89f852c6046a6ef26a082a010973423cb410ce25fa2f402c84b3714d",
+      "line": 113,
+      "kind": "recovery-candidate",
+      "text_sha256": "9382233e8edab93abf4aea11b4ea9e1d6e3d78863cc889538f6565dfc9f660e2",
+      "scope_hint": "production-candidate",
+      "disposition": "REVIEW_REQUIRED_NOT_AN_APPROVED_RECOVERY"
+    },
+    {
+      "path": "crates/rmux-server/src/handler/pane_stream_support/guards.rs",
+      "source_sha256": "dc5a980d89f852c6046a6ef26a082a010973423cb410ce25fa2f402c84b3714d",
+      "line": 157,
+      "kind": "recovery-candidate",
+      "text_sha256": "9382233e8edab93abf4aea11b4ea9e1d6e3d78863cc889538f6565dfc9f660e2",
+      "scope_hint": "production-candidate",
+      "disposition": "REVIEW_REQUIRED_NOT_AN_APPROVED_RECOVERY"
+    },
+    {
+      "path": "crates/rmux-server/src/handler/pane_stream_support/raw/initialization.rs",
+      "source_sha256": "fd5ded00ea42270c9c4269b58f737cbc26dc32377859a281f907384cdf5da8c0",
+      "line": 83,
+      "kind": "recovery-candidate",
+      "text_sha256": "9382233e8edab93abf4aea11b4ea9e1d6e3d78863cc889538f6565dfc9f660e2",
+      "scope_hint": "production-candidate",
+      "disposition": "REVIEW_REQUIRED_NOT_AN_APPROVED_RECOVERY"
+    },
+    {
+      "path": "crates/rmux-server/src/handler/scripting_support/runtime.rs",
+      "source_sha256": "03c293f7b7c093f26355d31b65e6d68312ec1fd307f5ab2cb6f37b33832cd822",
+      "line": 352,
+      "kind": "recovery-candidate",
+      "text_sha256": "9382233e8edab93abf4aea11b4ea9e1d6e3d78863cc889538f6565dfc9f660e2",
+      "scope_hint": "production-candidate",
+      "disposition": "REVIEW_REQUIRED_NOT_AN_APPROVED_RECOVERY"
+    },
+    {
+      "path": "crates/rmux-server/src/handler/subscription_support.rs",
+      "source_sha256": "3e160900f7936d722d555c1563fdae27c3f2651c0fb3bc6d9243b40f13339cb0",
+      "line": 292,
+      "kind": "recovery-candidate",
+      "text_sha256": "70a602218ee3069b0565ddaf0e3db72095461e9f72e039d5f5cec67165e18a23",
+      "scope_hint": "test-or-conditional",
+      "disposition": "REVIEW_REQUIRED_NOT_AN_APPROVED_RECOVERY"
+    },
+    {
+      "path": "crates/rmux-server/src/handler/wait_support.rs",
+      "source_sha256": "43dc554e7516bd5a7d441bede3556414070e8a9e27488a7760832e8c2f9feef8",
+      "line": 276,
+      "kind": "recovery-candidate",
+      "text_sha256": "164c18c3ec9997f1ebf1713815dd1ce0eb1e11223eba72e504713a8e973ea4fa",
+      "scope_hint": "test-or-conditional",
+      "disposition": "REVIEW_REQUIRED_NOT_AN_APPROVED_RECOVERY"
+    },
+    {
+      "path": "crates/rmux-server/src/handler/wait_support.rs",
+      "source_sha256": "43dc554e7516bd5a7d441bede3556414070e8a9e27488a7760832e8c2f9feef8",
+      "line": 457,
+      "kind": "recovery-candidate",
+      "text_sha256": "164c18c3ec9997f1ebf1713815dd1ce0eb1e11223eba72e504713a8e973ea4fa",
+      "scope_hint": "test-or-conditional",
+      "disposition": "REVIEW_REQUIRED_NOT_AN_APPROVED_RECOVERY"
+    },
+    {
+      "path": "crates/rmux-server/src/pane_terminal_process.rs",
+      "source_sha256": "839e29bd1718af02492faecba4e906128f2aba0346b3456826dbb81ac3ec3a87",
+      "line": 540,
+      "kind": "recovery-candidate",
+      "text_sha256": "bb4ee58576ef29907c4a980fc29c03c394c94c29415c4b511a4e5e9a502887af",
+      "scope_hint": "test-or-conditional",
+      "disposition": "REVIEW_REQUIRED_NOT_AN_APPROVED_RECOVERY"
+    },
+    {
+      "path": "crates/rmux-server/src/pane_transcript/shared.rs",
+      "source_sha256": "d1e5a859b930f176d7e053d7bd179ad1c928cb978697108090cf4b37593cb453",
+      "line": 106,
+      "kind": "poison-state-operation",
+      "text_sha256": "9273fb91ed1b592313f77607528716a015f3b520813d68e1039cefbf6a673769",
+      "scope_hint": "production-candidate",
+      "disposition": "REVIEW_REQUIRED_NOT_AN_APPROVED_RECOVERY"
+    },
+    {
+      "path": "crates/rmux-server/src/pane_transcript/shared.rs",
+      "source_sha256": "d1e5a859b930f176d7e053d7bd179ad1c928cb978697108090cf4b37593cb453",
+      "line": 182,
+      "kind": "recovery-candidate",
+      "text_sha256": "9382233e8edab93abf4aea11b4ea9e1d6e3d78863cc889538f6565dfc9f660e2",
+      "scope_hint": "production-candidate",
+      "disposition": "REVIEW_REQUIRED_NOT_AN_APPROVED_RECOVERY"
+    },
+    {
+      "path": "crates/rmux-server/src/status_jobs.rs",
+      "source_sha256": "48b8524f8d6e3cef072a53e4c8396710cf5c0dbc4d50785dc355db851f43b114",
+      "line": 292,
+      "kind": "recovery-candidate",
+      "text_sha256": "7cd95cca9e49902d5e143625767b9fe839c0c1ecbc7b09c277c337b93f7f1245",
+      "scope_hint": "test-or-conditional",
+      "disposition": "REVIEW_REQUIRED_NOT_AN_APPROVED_RECOVERY"
+    },
+    {
+      "path": "crates/rmux-server/src/status_jobs.rs",
+      "source_sha256": "48b8524f8d6e3cef072a53e4c8396710cf5c0dbc4d50785dc355db851f43b114",
+      "line": 367,
+      "kind": "recovery-candidate",
+      "text_sha256": "9382233e8edab93abf4aea11b4ea9e1d6e3d78863cc889538f6565dfc9f660e2",
+      "scope_hint": "test-or-conditional",
+      "disposition": "REVIEW_REQUIRED_NOT_AN_APPROVED_RECOVERY"
+    },
+    {
+      "path": "crates/rmux-types/src/identity/tests.rs",
+      "source_sha256": "ce613c2316e4480e4a07419c06bafb2918cb0a52480ec9396f4951dc1b79d647",
+      "line": 117,
+      "kind": "recovery-candidate",
+      "text_sha256": "90b15e2551fd718076b9cbd25876543d6dad7bde0160b72cda03080ae8526c8b",
+      "scope_hint": "test-or-conditional",
+      "disposition": "REVIEW_REQUIRED_NOT_AN_APPROVED_RECOVERY"
+    },
+    {
+      "path": "crates/rmux-types/src/identity.rs",
+      "source_sha256": "cbae6d0f2aa93f01cfa0654db61b958941442c7f4a68ac35fa9d8ef573480fc3",
+      "line": 85,
+      "kind": "recovery-candidate",
+      "text_sha256": "843e6fac17270299d901925a2f9a99a9ea16d117c5282367ba991c3770f80884",
+      "scope_hint": "production-candidate",
+      "disposition": "REVIEW_REQUIRED_NOT_AN_APPROVED_RECOVERY"
+    },
+    {
+      "path": "crates/rmux-types/tests/identity_contract.rs",
+      "source_sha256": "c5af1066bea75e84b3039ade4e5035f38a50b55cc6ecb101b430f7ce7599ef93",
+      "line": 19,
+      "kind": "recovery-candidate",
+      "text_sha256": "dc6a3499eaaedd39c81b5e40c3d4af34f70f348bd29915f633d65d6f1e667dfe",
+      "scope_hint": "test-or-conditional",
+      "disposition": "REVIEW_REQUIRED_NOT_AN_APPROVED_RECOVERY"
+    },
+    {
+      "path": "tests/canonical_workflow.rs",
+      "source_sha256": "782aa932f8dae2fb744fffb056e61ec5f9a6643f4f1b96211b0860bd7c3dded1",
+      "line": 330,
+      "kind": "recovery-candidate",
+      "text_sha256": "9382233e8edab93abf4aea11b4ea9e1d6e3d78863cc889538f6565dfc9f660e2",
+      "scope_hint": "test-or-conditional",
+      "disposition": "REVIEW_REQUIRED_NOT_AN_APPROVED_RECOVERY"
+    },
+    {
+      "path": "tests/cli_window_surface.rs",
+      "source_sha256": "e12846be1ff7f32009ca17f8052856459cdd98da7b73c77c207e72b15cd5e204",
+      "line": 4803,
+      "kind": "recovery-candidate",
+      "text_sha256": "9382233e8edab93abf4aea11b4ea9e1d6e3d78863cc889538f6565dfc9f660e2",
+      "scope_hint": "test-or-conditional",
+      "disposition": "REVIEW_REQUIRED_NOT_AN_APPROVED_RECOVERY"
+    },
+    {
+      "path": "tests/common/cli.rs",
+      "source_sha256": "828e68f10fcc86e96a94cf8c3d606a587c1c3d9b834d95f5a5e331f0c7f2c9db",
+      "line": 258,
+      "kind": "recovery-candidate",
+      "text_sha256": "9382233e8edab93abf4aea11b4ea9e1d6e3d78863cc889538f6565dfc9f660e2",
+      "scope_hint": "test-or-conditional",
+      "disposition": "REVIEW_REQUIRED_NOT_AN_APPROVED_RECOVERY"
+    },
+    {
+      "path": "tests/stress/support.rs",
+      "source_sha256": "e2d69ee145bd0e8e502432ea8599ec7fd5f4c2675c9b8a5352673d6ab7775880",
+      "line": 43,
+      "kind": "recovery-candidate",
+      "text_sha256": "7cd95cca9e49902d5e143625767b9fe839c0c1ecbc7b09c277c337b93f7f1245",
+      "scope_hint": "test-or-conditional",
+      "disposition": "REVIEW_REQUIRED_NOT_AN_APPROVED_RECOVERY"
+    },
+    {
+      "path": "tests/tmux_compat_surface_matrix/support.rs",
+      "source_sha256": "ea14f87eab5fd2089d8cc7a272f4489cb7646697587a590f404320c2889b2f1d",
+      "line": 326,
+      "kind": "recovery-candidate",
+      "text_sha256": "9382233e8edab93abf4aea11b4ea9e1d6e3d78863cc889538f6565dfc9f660e2",
+      "scope_hint": "test-or-conditional",
+      "disposition": "REVIEW_REQUIRED_NOT_AN_APPROVED_RECOVERY"
+    },
+    {
+      "path": "tests/windows_attach_exit.rs",
+      "source_sha256": "f3acd75541f20a91809760d33cbff9d21cd64563e5926cf99e10c70b1958c3d4",
+      "line": 66,
+      "kind": "recovery-candidate",
+      "text_sha256": "7cd95cca9e49902d5e143625767b9fe839c0c1ecbc7b09c277c337b93f7f1245",
+      "scope_hint": "test-or-conditional",
+      "disposition": "REVIEW_REQUIRED_NOT_AN_APPROVED_RECOVERY"
+    }
+  ],
+  "scanner_limits": "Conservative lexical witness over src/crates/tests; into_inner may concern a non-lock wrapper, test scope is a hint, comments/macro/cfg/aliases require Rust-aware owner review. This ratchet rejects new or silently removed witnesses; it is not a complete type-aware mutex policy proof.",
+  "confirmed_examples": [
+    {
+      "path": "crates/rmux-sdk/src/transport/state.rs",
+      "symbol": "lock_terminal_failure",
+      "observation": "unwrap_or_else(|poisoned| poisoned.into_inner()) returns guarded possibly poisoned state",
+      "state": "OPEN_OWNER_REVIEW",
+      "owner": "L3 SDK"
+    },
+    {
+      "path": "crates/rmux-client/src/attach_lock_state.rs",
+      "symbol": "AttachLockState",
+      "observation": "Existing expect rejects every acquisition and Condvar reacquisition; comments explain coupled state and no implicit notification",
+      "state": "EXISTING_SOURCE_AND_TESTS_NOT_REEXECUTED",
+      "owner": "L2 runtime"
+    }
+  ],
+  "positive_control": {
+    "path": "crates/rmux-client/src/attach_lock_state.rs",
+    "sha256": "b6d877b1fad3b4654c28c1da358c15bd626c4460e5ae65ceeda4003a03e34df2",
+    "tests": [
+      "poison_is_rejected_before_every_acquisition_even_when_closed",
+      "input_idle_wait_rejects_poison_on_wakeup",
+      "locked_wait_rejects_poison_on_wakeup",
+      "closed_wait_rejects_poison_on_wakeup",
+      "poisoned_close_and_finish_do_not_complete_shutdown_or_read_cleanup"
+    ]
+  },
+  "product_policy_conformance": "OPEN_NOT_ESTABLISHED"
+}

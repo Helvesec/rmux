@@ -9,14 +9,22 @@ import json
 import os
 import re
 import subprocess
+import sys
 import tarfile
 from io import BytesIO
 from pathlib import Path
 from typing import Any
 
+from sdk_distribution_policy import crate_archive
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+from toml_reader import loads as read_toml
+
 ROOT = Path(__file__).resolve().parents[2]
 SOURCE_SHA = re.compile(r"[0-9a-f]{40}")
 VERSION = re.compile(r"[0-9]+\.[0-9]+\.[0-9]+(?:-rc\.[0-9]+)?")
+DEPENDENCY_TABLES = ("dependencies", "build-dependencies", "dev-dependencies")
+MAX_PACKAGED_MANIFEST_BYTES = 1024 * 1024
 
 
 def file_hash(path: Path) -> str:
@@ -27,10 +35,14 @@ def file_hash(path: Path) -> str:
     return digest.hexdigest()
 
 
-def cargo_metadata() -> dict[str, Any]:
+def cargo_metadata(
+    *, source_dir: Path = ROOT, cargo: str = "cargo",
+    environment: dict[str, str] | None = None,
+) -> dict[str, Any]:
     completed = subprocess.run(
-        ["cargo", "metadata", "--format-version", "1", "--no-deps", "--locked"],
-        cwd=ROOT,
+        [cargo, "metadata", "--format-version", "1", "--no-deps", "--locked"],
+        cwd=source_dir,
+        env=environment,
         check=False,
         capture_output=True,
         text=True,
@@ -69,6 +81,16 @@ def publishable_packages(
     return values
 
 
+def kept_in_packaged_manifest(dependency: dict[str, Any]) -> bool:
+    """Return whether Cargo resolves this edge on crates.io when packaging.
+
+    Cargo strips only a dev-dependency declared without a version; Cargo
+    metadata reports that one as requirement "*". Every other edge stays in the
+    packaged manifest, so its crate must already be published.
+    """
+    return dependency.get("kind") != "dev" or dependency.get("req") != "*"
+
+
 def dependency_order(
     packages: list[dict[str, Any]],
 ) -> tuple[list[str], dict[str, list[str]]]:
@@ -79,7 +101,7 @@ def dependency_order(
             dependency["name"]
             for dependency in package.get("dependencies", [])
             if isinstance(dependency, dict)
-            and dependency.get("kind") != "dev"
+            and kept_in_packaged_manifest(dependency)
             and dependency.get("path") is not None
             and dependency.get("name") in names
         }
@@ -96,6 +118,68 @@ def dependency_order(
         for deps in remaining.values():
             deps.difference_update(ready)
     return order, dependencies
+
+
+def packaged_manifest(path: Path, name: str, version: str) -> dict[str, Any]:
+    member_name = f"{name}-{version}/Cargo.toml"
+    try:
+        with tarfile.open(path, "r:gz") as archive:
+            member = archive.getmember(member_name)
+            if not member.isfile() or member.size > MAX_PACKAGED_MANIFEST_BYTES:
+                raise ValueError(f"packaged manifest is invalid: {path.name}")
+            source = archive.extractfile(member)
+            if source is None:
+                raise ValueError(f"packaged manifest is invalid: {path.name}")
+            text = source.read().decode("utf-8")
+    except (KeyError, OSError, UnicodeDecodeError, tarfile.TarError) as error:
+        raise ValueError(f"packaged manifest is unreadable: {path.name}") from error
+    return read_toml(text)
+
+
+def packaged_workspace_requirements(
+    manifest: dict[str, Any], workspace: set[str]
+) -> set[str]:
+    targets = manifest.get("target", {})
+    if not isinstance(targets, dict):
+        raise ValueError("packaged manifest target table is invalid")
+    scopes = [manifest, *targets.values()]
+    required: set[str] = set()
+    for scope in scopes:
+        if not isinstance(scope, dict):
+            raise ValueError("packaged manifest target table is invalid")
+        for table in DEPENDENCY_TABLES:
+            entries = scope.get(table, {})
+            if not isinstance(entries, dict):
+                raise ValueError(f"packaged manifest {table} table is invalid")
+            for key, specification in entries.items():
+                package = key
+                if isinstance(specification, dict):
+                    package = specification.get("package", key)
+                if package in workspace:
+                    required.add(package)
+    return required
+
+
+def verify_packaged_requirements(
+    order: list[str],
+    dependencies: dict[str, list[str]],
+    package_dir: Path,
+    version: str,
+) -> None:
+    """Bind the publish order to what each packaged manifest asks crates.io for."""
+    workspace = set(order)
+    for name in order:
+        manifest = packaged_manifest(
+            package_dir / f"{name}-{version}.crate", name, version
+        )
+        missing = packaged_workspace_requirements(manifest, workspace) - set(
+            dependencies[name]
+        )
+        if missing:
+            raise ValueError(
+                f"packaged manifest of {name} requires workspace crates outside "
+                f"its publish predecessors: {', '.join(sorted(missing))}"
+            )
 
 
 def run_cargo_package(names: list[str], target: Path) -> None:
@@ -151,6 +235,7 @@ def build_manifest(
         path = package_dir / filename
         if path.is_symlink() or not path.is_file() or path.stat().st_size <= 0:
             raise ValueError(f"crate package is missing or invalid: {filename}")
+        crate_archive(path, name, version)
         data = path.read_bytes()
         payloads[f"crates/{filename}"] = data
         entries.append(
@@ -225,6 +310,7 @@ def execute(args: argparse.Namespace) -> None:
     manifest, payloads = build_manifest(
         args.source_sha, args.version, order, dependencies, package_dir
     )
+    verify_packaged_requirements(order, dependencies, package_dir, args.version)
     output = args.output_dir / f"rmux-{args.version}-crate-package-set.tar"
     if args.command == "create":
         if not args.output_dir.is_dir() or output.exists() or output.is_symlink():

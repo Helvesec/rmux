@@ -1,5 +1,7 @@
 use super::*;
 use crate::pane_io::AttachControl;
+#[cfg(test)]
+use crate::session_fixture::SessionSetupExt as _;
 
 async fn register_read_only_attach(
     handler: &RequestHandler,
@@ -88,7 +90,7 @@ async fn read_only_switch_allowlist_rejects_privilege_targeting_and_session_muta
         let mut state = handler.state.lock().await;
         state
             .sessions
-            .session_mut(&beta)
+            .session_setup(&beta)
             .expect("beta exists")
             .create_window(TerminalSize { cols: 80, rows: 24 })
             .expect("inactive beta window is created")
@@ -227,7 +229,7 @@ async fn read_only_safe_switch_cannot_lead_a_composed_mutation() {
             .session(&beta)
             .expect("beta exists")
             .windows()
-            .len(),
+            .count(),
         1,
         "the mutation after a safe-looking first command must not execute"
     );
@@ -269,7 +271,7 @@ async fn read_only_key_table_switch_cannot_lead_a_composed_mutation() {
             .session(&alpha)
             .expect("alpha exists")
             .windows()
-            .len(),
+            .count(),
         1
     );
     assert_no_terminal_control(&mut control_rx);

@@ -5,7 +5,7 @@ use super::info::{
     current_pane_entry, current_pane_ref_for_id, pane_info_snapshot_for_absent_slot,
     pane_info_snapshot_for_id, pane_info_snapshot_for_slot,
 };
-use super::snapshot::pane_snapshot;
+use super::snapshot::{listed_pane_snapshot, pane_snapshot};
 use super::Pane;
 
 impl Pane {
@@ -69,13 +69,22 @@ impl Pane {
     /// is preserved as padding cells in the row-major layout, raw bytes
     /// that are not valid UTF-8 stay isolated to the cell text payload
     /// rather than reaching helper output, and the daemon-derived
-    /// [`revision`](PaneSnapshot::revision) is non-zero for a live pane
-    /// and changes whenever any observable pane field mutates — output,
-    /// resize, clear, exit. Stale slots resolve to a default empty
-    /// snapshot whose revision is `0`, distinct from any prior live
-    /// revision.
+    /// [`revision`](PaneSnapshot::revision) is non-zero for a live pane.
+    /// The revision identifies the state this capture observed, not a count
+    /// of mutations: a capture whose fingerprint differs from the pane's
+    /// previous capture advances it, while a change that no capture observed,
+    /// such as a resize undone before the next capture, leaves it unchanged.
+    /// See [`PaneSnapshot::revision`] for the full contract. Stale slots
+    /// resolve to a default empty snapshot whose revision is `0`, distinct
+    /// from any prior live revision.
     pub async fn snapshot(&self) -> Result<PaneSnapshot> {
         pane_snapshot(&self.begin_operation_handle()).await
+    }
+
+    /// Like [`Self::snapshot`], but `None` when the pane is no longer listed
+    /// instead of the empty default snapshot.
+    pub(crate) async fn listed_snapshot(&self) -> Result<Option<PaneSnapshot>> {
+        listed_pane_snapshot(&self.begin_operation_handle()).await
     }
 
     /// Starts a daemon `capture-pane` request builder.

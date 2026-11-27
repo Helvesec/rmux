@@ -17,7 +17,7 @@ async fn attached_client_flags_keep_tmux_order_for_extended_flag_sets() {
             environment: None,
         }))
         .await;
-    assert!(matches!(created, Response::NewSession(_)));
+    crate::session_fixture::assert_new_session(&created);
 
     let (control_tx, _control_rx) = mpsc::unbounded_channel();
     let _attach_id = handler
@@ -56,7 +56,7 @@ async fn attached_client_flags_keep_tmux_order_for_extended_flag_sets() {
         .expect("attached client exists");
     assert_eq!(
         super::super::format_attached_client_flags(active),
-        "attached,ignore-size,no-detach-on-destroy,read-only,active-pane,suspended,UTF-8"
+        "attached,focused,ignore-size,no-detach-on-destroy,read-only,active-pane,suspended,UTF-8"
     );
 }
 
@@ -74,7 +74,7 @@ async fn control_client_flags_keep_tmux_order_for_extended_flag_sets() {
             environment: None,
         }))
         .await;
-    assert!(matches!(created, Response::NewSession(_)));
+    crate::session_fixture::assert_new_session(&created);
 
     let (event_tx, _event_rx) = mpsc::channel(CONTROL_SERVER_EVENT_CAPACITY);
     let _control_id = handler
@@ -134,7 +134,7 @@ async fn refresh_client_control_size_resizes_real_control_session() {
             environment: None,
         }))
         .await;
-    assert!(matches!(created, Response::NewSession(_)));
+    crate::session_fixture::assert_new_session(&created);
 
     let (event_tx, mut event_rx) = mpsc::channel(CONTROL_SERVER_EVENT_CAPACITY);
     let _control_id = handler
@@ -363,7 +363,7 @@ async fn refresh_client_control_size_rolls_back_geometry_when_session_resize_fai
             environment: None,
         }))
         .await;
-    assert!(matches!(response, Response::NewSession(_)));
+    crate::session_fixture::assert_new_session(&response);
     handler.wait_for_initial_panes_for_test().await;
     let (_control_id, _event_rx) =
         register_control_test_client(&handler, requester_pid, &alpha).await;
@@ -411,7 +411,7 @@ async fn detach_client_target_session_detaches_control_clients() {
                 environment: None,
             }))
             .await;
-        assert!(matches!(response, Response::NewSession(_)));
+        crate::session_fixture::assert_new_session(&response);
     }
 
     let mut event_receivers = Vec::new();
@@ -477,7 +477,7 @@ async fn detach_client_target_session_preserves_reregistered_attached_client() {
                 environment: None,
             }))
             .await;
-        assert!(matches!(response, Response::NewSession(_)), "{response:?}");
+        crate::session_fixture::assert_new_session(&response);
     }
 
     let attach_pid = 91_347;
@@ -545,7 +545,7 @@ async fn detach_client_target_session_preserves_control_registered_after_snapsho
             environment: None,
         }))
         .await;
-    assert!(matches!(created, Response::NewSession(_)), "{created:?}");
+    crate::session_fixture::assert_new_session(&created);
 
     let attach_pid = 91_349;
     let (attach_tx, _attach_rx) = mpsc::unbounded_channel();
@@ -608,7 +608,7 @@ async fn detach_client_target_session_preserves_control_on_recreated_session() {
             environment: None,
         }))
         .await;
-    assert!(matches!(created, Response::NewSession(_)), "{created:?}");
+    crate::session_fixture::assert_new_session(&created);
     let old_session_id = handler
         .state
         .lock()
@@ -663,10 +663,7 @@ async fn detach_client_target_session_preserves_control_on_recreated_session() {
             environment: None,
         }))
         .await;
-    assert!(
-        matches!(recreated, Response::NewSession(_)),
-        "{recreated:?}"
-    );
+    crate::session_fixture::assert_new_session(&recreated);
     let new_session_id = handler
         .state
         .lock()
@@ -715,7 +712,7 @@ async fn detach_client_target_session_tracks_a_renamed_session_identity() {
             environment: None,
         }))
         .await;
-    assert!(matches!(created, Response::NewSession(_)), "{created:?}");
+    crate::session_fixture::assert_new_session(&created);
     let session_id = handler
         .state
         .lock()
@@ -801,7 +798,7 @@ async fn managed_client_actions_fail_closed_when_a_pid_is_reregistered() {
                 environment: None,
             }))
             .await;
-        assert!(matches!(response, Response::NewSession(_)), "{response:?}");
+        crate::session_fixture::assert_new_session(&response);
     }
 
     let control_pid = 91_348;
@@ -1050,7 +1047,7 @@ async fn list_clients_control_name_round_trips_through_client_targeting() {
             environment: None,
         }))
         .await;
-    assert!(matches!(created, Response::NewSession(_)), "{created:?}");
+    crate::session_fixture::assert_new_session(&created);
     let control_pid = 91_401;
     let (control_id, _events) = register_control_test_client(&handler, control_pid, &alpha).await;
     let name = format!("client-{control_pid}");
@@ -1086,7 +1083,7 @@ async fn list_clients_control_name_round_trips_through_client_targeting() {
     );
     assert_eq!(
         handler
-            .find_display_message_client(0, &name)
+            .find_named_client(0, &name, "display-message")
             .await
             .expect("display-message target resolves"),
         Some(resolved)
@@ -1165,7 +1162,7 @@ async fn control_mode_attach_session_tracks_the_control_clients_session() {
             environment: None,
         }))
         .await;
-    assert!(matches!(response, Response::NewSession(_)));
+    crate::session_fixture::assert_new_session(&response);
 
     let (event_tx, _event_rx) = mpsc::channel(CONTROL_SERVER_EVENT_CAPACITY);
     let _control_id = handler
@@ -1199,11 +1196,58 @@ async fn control_mode_attach_session_tracks_the_control_clients_session() {
     assert_eq!(active.session_name.as_ref(), Some(&alpha));
 }
 
+/// An attached-client stand-in whose stdin is a PTY slave owned by the test.
+///
+/// `client_tty` is read from the client's fd 0. The test process's own fd 0 is
+/// whatever the harness inherited; on macOS a pipe or socket there has no path.
+#[cfg(unix)]
+struct PtyClientProcess(rmux_pty::SpawnedPty);
+
+#[cfg(unix)]
+impl PtyClientProcess {
+    fn spawn() -> Self {
+        let spawned = rmux_pty::ChildCommand::new("sh")
+            .arg("-c")
+            .arg("sleep 60")
+            .size(rmux_pty::TerminalSize { cols: 80, rows: 24 })
+            .spawn()
+            .expect("spawn PTY client");
+        Self(spawned)
+    }
+
+    fn pid(&self) -> u32 {
+        self.0.child().pid().as_u32()
+    }
+
+    /// The controlling terminal as the kernel reports it to `ps`.
+    fn controlling_tty(&self) -> String {
+        let output = std::process::Command::new("ps")
+            .args(["-o", "tty=", "-p", &self.pid().to_string()])
+            .output()
+            .expect("run ps");
+        let tty = String::from_utf8(output.stdout).expect("utf-8 ps output");
+        format!("/dev/{}", tty.trim())
+    }
+}
+
+#[cfg(unix)]
+impl Drop for PtyClientProcess {
+    fn drop(&mut self) {
+        let _ = self.0.child().terminate_forcefully();
+        let _ = self.0.child_mut().wait();
+    }
+}
+
 #[tokio::test]
 async fn list_clients_exposes_pid_and_tty_format_variables_for_attached_clients() {
     let handler = RequestHandler::new();
     let socket_path = "/tmp/rmux-list-clients-format.sock";
     handler.set_socket_path(socket_path);
+    #[cfg(unix)]
+    let pty_client = PtyClientProcess::spawn();
+    #[cfg(unix)]
+    let requester_pid = pty_client.pid();
+    #[cfg(windows)]
     let requester_pid = std::process::id();
     let alpha = session_name("alpha");
 
@@ -1215,7 +1259,7 @@ async fn list_clients_exposes_pid_and_tty_format_variables_for_attached_clients(
             environment: None,
         }))
         .await;
-    assert!(matches!(created, Response::NewSession(_)));
+    crate::session_fixture::assert_new_session(&created);
 
     let (control_tx, _control_rx) = mpsc::unbounded_channel();
     handler
@@ -1254,7 +1298,11 @@ async fn list_clients_exposes_pid_and_tty_format_variables_for_attached_clients(
     assert_eq!(parts[4], socket_path);
     assert_eq!(parts[5], config_files);
     #[cfg(unix)]
-    assert!(!parts[2].is_empty(), "client_tty should be populated");
+    assert_eq!(
+        parts[2],
+        pty_client.controlling_tty(),
+        "client_tty should be the client's terminal"
+    );
     #[cfg(windows)]
     assert_eq!(parts[2], "");
 }
@@ -1273,7 +1321,7 @@ async fn list_clients_exposes_effective_attached_key_table_and_prefix_state() {
             environment: None,
         }))
         .await;
-    assert!(matches!(created, Response::NewSession(_)));
+    crate::session_fixture::assert_new_session(&created);
 
     let (control_tx, _control_rx) = mpsc::unbounded_channel();
     handler
@@ -1357,7 +1405,7 @@ async fn attach_session_returns_an_upgrade_response_for_existing_sessions() {
             environment: None,
         }))
         .await;
-    assert!(matches!(created, Response::NewSession(_)));
+    crate::session_fixture::assert_new_session(&created);
 
     assert_eq!(
         handler
@@ -1383,7 +1431,7 @@ async fn attach_session_dispatch_populates_the_upgrade_field() {
             environment: None,
         }))
         .await;
-    assert!(matches!(created, Response::NewSession(_)));
+    crate::session_fixture::assert_new_session(&created);
 
     let outcome = handler
         .dispatch(
@@ -1441,7 +1489,7 @@ async fn switch_client_requires_an_attached_client() {
             environment: None,
         }))
         .await;
-    assert!(matches!(created, Response::NewSession(_)));
+    crate::session_fixture::assert_new_session(&created);
 
     assert_eq!(
         handler

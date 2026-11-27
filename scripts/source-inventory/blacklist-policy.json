@@ -1,0 +1,8 @@
+{
+  "schema": 1,
+  "authority": "D65(a)",
+  "adopted": true,
+  "token_sha256": [],
+  "generic_pattern": "(?i)(fleet|orchestrat|dispatch[_-]id(?![a-z0-9])|agent[_-](role|session)|build[_-]slot)",
+  "scope": "Inventory production/assets physical lines and root/crates Cargo manifests; no path exemptions"
+}

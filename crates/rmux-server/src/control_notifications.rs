@@ -1,5 +1,5 @@
 use rmux_core::formats::FormatContext;
-use rmux_core::{encode_paste_bytes, LifecycleEvent, Session, Window};
+use rmux_core::{encode_paste_bytes, LifecycleEvent, Window, WindowId};
 use rmux_proto::{octal_escape, SessionId, SessionName, WindowTarget};
 
 use crate::client_names::is_control_client_name;
@@ -26,6 +26,7 @@ pub(crate) fn collect_control_notifications(
     state: &HandlerState,
     event: &LifecycleEvent,
     event_session_identity: Option<SessionId>,
+    event_window_identity: Option<(SessionId, WindowId)>,
     clients: &[ControlClientSnapshot],
 ) -> Vec<PreparedControlNotification> {
     match event {
@@ -33,7 +34,7 @@ pub(crate) fn collect_control_notifications(
             pane_mode_changed_notifications(state, target, clients)
         }
         LifecycleEvent::WindowLayoutChanged { target } => {
-            window_layout_changed_notifications(state, target, clients)
+            window_layout_changed_notifications(state, target, event_window_identity, clients)
         }
         LifecycleEvent::WindowPaneChanged { target } => {
             window_pane_changed_notifications(state, target, clients)
@@ -129,6 +130,8 @@ pub(crate) fn collect_control_notifications(
 
 #[must_use]
 pub(crate) fn format_control_message_line(message: &str) -> String {
+    // Control records escape CR and TAB even though pane pastes keep them raw.
+    let message = message.replace('\r', "\\r").replace('\t', "\\t");
     let escaped = String::from_utf8_lossy(&encode_paste_bytes(message.as_bytes())).into_owned();
     format!("%message {escaped}")
 }
@@ -166,9 +169,10 @@ fn pane_mode_changed_notifications(
 fn window_layout_changed_notifications(
     state: &HandlerState,
     target: &WindowTarget,
+    identity: Option<(SessionId, WindowId)>,
     clients: &[ControlClientSnapshot],
 ) -> Vec<PreparedControlNotification> {
-    let Some((window_id, line)) = render_layout_change_line(state, target) else {
+    let Some((window_id, line)) = render_layout_change_line(state, target, identity) else {
         return Vec::new();
     };
     session_scoped_clients(clients)
@@ -284,28 +288,68 @@ fn resolve_event_session<'a>(
     state: &'a HandlerState,
     session_name: &SessionName,
     session_id: Option<SessionId>,
-) -> Option<&'a Session> {
+) -> Option<rmux_core::ManagedSessionView<'a>> {
     match session_id {
         Some(session_id) => state.sessions.session_by_id(session_id),
         None => state.sessions.session(session_name),
     }
 }
 
-fn render_layout_change_line(state: &HandlerState, target: &WindowTarget) -> Option<(u32, String)> {
-    let session = state.sessions.session(target.session_name())?;
-    let window = session.window_at(target.window_index())?;
+fn render_layout_change_line(
+    state: &HandlerState,
+    target: &WindowTarget,
+    identity: Option<(SessionId, WindowId)>,
+) -> Option<(u32, String)> {
+    // Deferred attach publications must not resolve a reused name or window slot.
+    let (session, window_index) = match identity {
+        Some((session_id, window_id)) => {
+            let session = state.sessions.session_by_id(session_id)?;
+            let captured_index = target.window_index();
+            let index = if session
+                .window_at(captured_index)
+                .is_some_and(|window| window.id() == window_id)
+            {
+                captured_index
+            } else {
+                let mut matching_indices = session
+                    .windows()
+                    .filter_map(|(index, window)| (window.id() == window_id).then_some(index));
+                let only_index = matching_indices.next()?;
+                if matching_indices.next().is_some() {
+                    // No occurrence remap survives here: do not invent another alias's flags.
+                    tracing::debug!(
+                        // Field-name syntax keeps control-mode `%` tokens out of tracing.
+                        session_id = tracing::field::display(session_id),
+                        window_id = tracing::field::display(window_id),
+                        captured_index,
+                        "deferred layout notification has ambiguous window occurrence"
+                    );
+                    return None;
+                }
+                only_index
+            };
+            (session, index)
+        }
+        None => (
+            state.sessions.session(target.session_name())?,
+            target.window_index(),
+        ),
+    };
+    let window = session.window_at(window_index)?;
     if window.panes().is_empty() {
         return None;
     }
 
     let active_window = session.active_window_index();
     let last_window = session.last_window_index();
-    let mut context = FormatContext::from_session(session).with_window(
-        target.window_index(),
-        window,
-        target.window_index() == active_window,
-        Some(target.window_index()) == last_window,
-    );
+    let mut context = FormatContext::new()
+        .with_managed_session(session)
+        .with_window(
+            window_index,
+            window,
+            window_index == active_window,
+            Some(window_index) == last_window,
+        );
     if let Some(pane) = window.active_pane() {
         context = context.with_window_pane(window, pane);
     }
@@ -313,7 +357,7 @@ fn render_layout_change_line(state: &HandlerState, target: &WindowTarget) -> Opt
     let mut runtime = RuntimeFormatContext::new(context)
         .with_state(state)
         .with_session(session)
-        .with_window(target.window_index(), window);
+        .with_window(window_index, window);
     if let Some(pane) = window.active_pane() {
         runtime = runtime.with_pane(pane);
     }
@@ -367,7 +411,7 @@ fn resolve_session_window<'a>(
     state: &'a HandlerState,
     session_name: &SessionName,
     window_index: u32,
-) -> Option<(&'a Session, &'a Window)> {
+) -> Option<(rmux_core::ManagedSessionView<'a>, &'a Window)> {
     let session = state.sessions.session(session_name)?;
     let window = session.window_at(window_index)?;
     Some((session, window))
@@ -381,11 +425,24 @@ fn session_contains_window_id(
     state.sessions.session(session_name).is_some_and(|session| {
         session
             .windows()
-            .values()
+            .map(|(_, window)| window)
             .any(|window| window.id().as_u32() == window_id)
     })
 }
 
-fn session_identity(session: &Session) -> String {
+fn session_identity(session: rmux_core::ManagedSessionView<'_>) -> String {
     format!("{} {}", session.id(), session.name())
+}
+
+#[cfg(test)]
+mod message_tests {
+    use super::format_control_message_line;
+
+    #[test]
+    fn control_message_preserves_carriage_return_escaping() {
+        assert_eq!(
+            format_control_message_line("one\rtwo\n\\r café\t\\t"),
+            "%message one\\rtwo\\n\\r café\\t\\t"
+        );
+    }
 }

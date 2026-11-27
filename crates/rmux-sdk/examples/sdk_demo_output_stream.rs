@@ -8,7 +8,6 @@
 
 use rmux_sdk::PaneOutputChunk;
 
-#[path = "sdk_demo_helpers/mod.rs"]
 mod sdk_demo_helpers;
 
 #[tokio::main]

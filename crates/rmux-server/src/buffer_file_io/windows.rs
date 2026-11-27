@@ -1,8 +1,10 @@
 use std::io;
 use std::path::{Path, PathBuf};
 
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::io::AsyncWriteExt;
 use tokio::net::windows::named_pipe::ClientOptions;
+
+use super::ReadLimit;
 
 #[derive(Clone, Copy, Debug)]
 pub(super) struct SpecialFileKind;
@@ -20,13 +22,19 @@ pub(super) fn special_path(path: &Path) -> io::Result<Option<SpecialFileKind>> {
         .then_some(SpecialFileKind))
 }
 
-pub(super) async fn read(path: PathBuf, _kind: SpecialFileKind) -> io::Result<Vec<u8>> {
+pub(super) async fn read(path: PathBuf, kind: SpecialFileKind) -> io::Result<Vec<u8>> {
+    read_with_limit(path, kind, ReadLimit::Buffer).await
+}
+
+pub(super) async fn read_with_limit(
+    path: PathBuf,
+    _kind: SpecialFileKind,
+    limit: ReadLimit,
+) -> io::Result<Vec<u8>> {
     let mut options = ClientOptions::new();
     options.read(true).write(false);
     let mut pipe = options.open(path)?;
-    let mut content = Vec::new();
-    pipe.read_to_end(&mut content).await?;
-    Ok(content)
+    limit.read_async_to_end(&mut pipe).await
 }
 
 pub(super) async fn write(
@@ -44,6 +52,7 @@ pub(super) async fn write(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tokio::io::AsyncReadExt;
     use tokio::net::windows::named_pipe::ServerOptions;
 
     #[test]
@@ -73,6 +82,29 @@ mod tests {
             .await
             .expect_err("read should be cancelled")
             .is_cancelled());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn endless_named_pipe_read_is_refused_at_the_buffer_limit() -> io::Result<()> {
+        let path = format!(r"\\.\pipe\rmux-buffer-endless-read-{}", std::process::id());
+        let mut server = ServerOptions::new().access_inbound(false).create(&path)?;
+        let read_task = tokio::spawn(read(PathBuf::from(&path), SpecialFileKind));
+        server.connect().await?;
+        let writer = tokio::spawn(async move {
+            let chunk = vec![0_u8; 64 * 1024];
+            while server.write_all(&chunk).await.is_ok() {}
+        });
+
+        let error = tokio::time::timeout(std::time::Duration::from_secs(30), read_task)
+            .await
+            .expect("an endless named pipe must stop at the buffer limit")
+            .expect("join named pipe reader")
+            .expect_err("an endless named pipe must not load");
+        assert_eq!(error.kind(), io::ErrorKind::FileTooLarge);
+        writer
+            .await
+            .expect("the writer stops once the reader closes");
         Ok(())
     }
 

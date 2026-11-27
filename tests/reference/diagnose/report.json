@@ -1,0 +1,12 @@
+{
+  "schema_version": 1,
+  "version": "<version>",
+  "os": {"name": "<os>", "arch": "<arch>", "version": "<os-version>"},
+  "terminal": {"host": "iTerm.app", "term": "xterm-256color", "term_program": "iTerm.app"},
+  "shell": "~/bin/bash",
+  "socket_path": "~/absent.sock",
+  "config": {"mode": "custom", "paths": ["~/import.conf"], "messages": []},
+  "capabilities": {"conpty": "not-applicable", "osc52": "available-when-requested", "terminal_features": []},
+  "compatibility": {"registry": "tests/reference/tmux_compat/divergences.toml"},
+  "privacy": {"environment_values": "summarized-or-redacted"}
+}

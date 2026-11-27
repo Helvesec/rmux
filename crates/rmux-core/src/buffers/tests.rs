@@ -337,3 +337,21 @@ fn rename_without_explicit_source_rejects_named_only_store() {
     assert!(error.to_string().contains("no buffer"));
     assert_eq!(store.get("named"), Some(b"manual".as_slice()));
 }
+
+#[test]
+fn editing_preserves_entry_identity_and_rejects_replacement() {
+    let mut store = BufferStore::new();
+    store.set(Some("edited"), b"BASE".to_vec(), 50).unwrap();
+    let order = store.show_with_order(Some("edited")).unwrap().2;
+    let created = store.entries()[0].created();
+    assert!(store.replace_if_order_matches("edited", order, b"EDIT".to_vec()));
+    assert_eq!(
+        store.show_with_order(Some("edited")).unwrap(),
+        ("edited", b"EDIT".as_slice(), order)
+    );
+    assert_eq!(store.entries()[0].created(), created);
+    assert!(!store.replace_if_order_matches("edited", order, Vec::new()));
+    store.set(Some("edited"), b"NEW".to_vec(), 50).unwrap();
+    assert!(!store.replace_if_order_matches("edited", order, b"STALE".to_vec()));
+    assert_eq!(store.get("edited"), Some(b"NEW".as_slice()));
+}

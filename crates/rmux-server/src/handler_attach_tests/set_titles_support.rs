@@ -27,7 +27,7 @@ pub(super) async fn new_detached_session(handler: &RequestHandler, name: &rmux_p
             environment: None,
         }))
         .await;
-    assert!(matches!(created, Response::NewSession(_)));
+    crate::session_fixture::assert_new_session(&created);
 }
 
 pub(super) async fn set_global(handler: &RequestHandler, option: OptionName, value: &str) {

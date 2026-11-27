@@ -11,11 +11,18 @@ use super::*;
 
 use rmux_proto::{NewSessionExtRequest, PaneTarget, SessionName, TerminalSize};
 
+#[path = "listener_slow_reader_tests.rs"]
+pub(crate) mod slow_reader_tests;
+
+#[cfg(unix)]
+#[path = "listener_read_only_format_job_tests.rs"]
+mod read_only_format_job_tests;
+
 /// Async client end of the connection under test.
 #[cfg(unix)]
-pub(super) type TestClientStream = LocalStream;
+pub(crate) type TestClientStream = LocalStream;
 #[cfg(windows)]
-pub(super) type TestClientStream = rmux_ipc::WindowsPipeClient;
+pub(crate) type TestClientStream = rmux_ipc::WindowsPipeClient;
 
 #[cfg(unix)]
 pub(super) async fn connected_streams(_label: &str) -> io::Result<(LocalStream, TestClientStream)> {
@@ -62,7 +69,7 @@ pub(super) fn spawn_connection(
     (shutdown_tx, task)
 }
 
-pub(super) async fn finish_connection(
+pub(crate) async fn finish_connection(
     task: tokio::task::JoinHandle<io::Result<()>>,
 ) -> io::Result<()> {
     match task.await.expect("connection task") {
@@ -184,7 +191,7 @@ pub(super) async fn start_quiet_pane_sized(
             skip_environment_update: false,
         })))
         .await;
-    assert!(matches!(response, Response::NewSession(_)), "{response:?}");
+    crate::session_fixture::assert_new_session(&response);
     let target = PaneTarget::with_window(session, 0, 0);
     handler
         .wait_for_pane_startup_to_finish_for_test(&target)

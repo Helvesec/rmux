@@ -1,9 +1,11 @@
 use rmux_proto::{
-    KillWindowRequest, LastWindowRequest, LayoutName, LinkWindowRequest, ListWindowsRequest,
-    MoveWindowRequest, MoveWindowTarget, NewWindowRequest, NextWindowRequest,
-    PreviousWindowRequest, RenameWindowRequest, Request, Response, RotateWindowDirection,
-    RotateWindowRequest, SelectCustomLayoutRequest, SelectLayoutRequest, SelectLayoutTarget,
-    SelectOldLayoutRequest, SelectWindowRequest, SessionName, SplitDirection,
+    ExportWindowSnapshotRequest, ExportWindowSnapshotV2Request, KillWindowRequest,
+    LastWindowRequest, LayoutName, LinkWindowRequest, ListWindowsRequest, MoveWindowRequest,
+    MoveWindowTarget, NewWindowRequest, NextWindowRequest, PreviousWindowRequest,
+    RenameWindowRequest, Request, Response, RestoreWindowSnapshotRequest,
+    RestoreWindowSnapshotV2Request, RmuxWindowSnapshot, RmuxWindowSnapshotV2,
+    RotateWindowDirection, RotateWindowRequest, SelectCustomLayoutRequest, SelectLayoutRequest,
+    SelectLayoutTarget, SelectOldLayoutRequest, SelectWindowRequest, SessionName, SplitDirection,
     SplitWindowExtRequest, SplitWindowRequest, SplitWindowTarget, SplitWindowTargetActionRequest,
     SpreadLayoutRequest, SwapWindowRequest, UnlinkWindowRequest, WindowTarget,
 };
@@ -497,5 +499,69 @@ impl Connection {
         self.roundtrip(&Request::PreviousLayout(
             rmux_proto::PreviousLayoutRequest { target },
         ))
+    }
+
+    /// Sends an explicit RMUX window snapshot export request over the detached RPC channel.
+    pub fn export_window_snapshot(
+        &mut self,
+        target: WindowTarget,
+    ) -> Result<Response, ClientError> {
+        self.require_window_snapshot_capability()?;
+        self.roundtrip(&Request::ExportWindowSnapshot(
+            ExportWindowSnapshotRequest { target },
+        ))
+    }
+
+    /// Sends an explicit RMUX window snapshot restore request over the detached RPC channel.
+    pub fn restore_window_snapshot(
+        &mut self,
+        target: WindowTarget,
+        snapshot: RmuxWindowSnapshot,
+    ) -> Result<Response, ClientError> {
+        self.require_window_snapshot_capability()?;
+        self.roundtrip(&Request::RestoreWindowSnapshot(Box::new(
+            RestoreWindowSnapshotRequest { target, snapshot },
+        )))
+    }
+
+    /// Sends an explicit RMUX window snapshot export request over the detached RPC channel.
+    pub fn export_window_snapshot_v2(
+        &mut self,
+        target: WindowTarget,
+    ) -> Result<Response, ClientError> {
+        self.roundtrip(&Request::ExportWindowSnapshotV2(
+            ExportWindowSnapshotV2Request { target },
+        ))
+    }
+
+    /// Sends an explicit RMUX window snapshot restore request over the detached RPC channel.
+    pub fn restore_window_snapshot_v2(
+        &mut self,
+        target: WindowTarget,
+        snapshot: RmuxWindowSnapshotV2,
+    ) -> Result<Response, ClientError> {
+        self.roundtrip(&Request::RestoreWindowSnapshotV2(Box::new(
+            RestoreWindowSnapshotV2Request { target, snapshot },
+        )))
+    }
+
+    /// Sends ordered absolute axes, allowing width to commit before a height error.
+    pub fn resize_pane_axes(
+        &mut self,
+        request: rmux_proto::ResizePaneAxesRequest,
+    ) -> Result<Response, ClientError> {
+        self.roundtrip(&Request::ResizePaneAxes(Box::new(request)))
+    }
+
+    fn require_window_snapshot_capability(&mut self) -> Result<(), ClientError> {
+        if !self.supports_capability(rmux_proto::CAPABILITY_RMUX_WINDOW_SNAPSHOT_V1)? {
+            return Err(ClientError::Protocol(
+                rmux_proto::RmuxError::UnsupportedCapability {
+                    feature: rmux_proto::CAPABILITY_RMUX_WINDOW_SNAPSHOT_V1.to_owned(),
+                    supported: Vec::new(),
+                },
+            ));
+        }
+        Ok(())
     }
 }

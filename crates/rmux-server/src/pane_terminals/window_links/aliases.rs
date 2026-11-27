@@ -1,6 +1,5 @@
 use std::collections::HashSet;
 
-use rmux_core::Session;
 use rmux_proto::{PaneTarget, RmuxError, SessionName, WindowTarget};
 
 use super::super::session_not_found;
@@ -14,6 +13,32 @@ impl HandlerState {
             .unwrap_or(1)
     }
 
+    /// How many winlinks hold this window, counted the way `#{window_linked}`
+    /// counts them.
+    ///
+    /// tmux 3.7b answers 1 as soon as a second winlink, in any session, holds
+    /// the same window (`format.c:2871-2890`). A session group gives every
+    /// member its own winlink to each shared window, at the same index, so a
+    /// grouped window is held more than once even when nothing links it
+    /// explicitly. Each explicit link slot therefore stands for itself and for
+    /// the same index in every member of its session's group.
+    ///
+    /// Presentation only: `window_link_count` keeps answering the explicit
+    /// links that the kill, move and link paths reason about.
+    pub(crate) fn window_winlink_count(
+        &self,
+        session_name: &SessionName,
+        window_index: u32,
+    ) -> usize {
+        let mut winlinks = HashSet::new();
+        for slot in self.window_link_slots_for(session_name, window_index) {
+            for member in self.sessions.session_group_members(&slot.session_name) {
+                winlinks.insert((member, slot.window_index));
+            }
+        }
+        winlinks.len()
+    }
+
     pub(crate) fn window_linked_session_count(
         &self,
         session_name: &SessionName,
@@ -23,12 +48,146 @@ impl HandlerState {
             .len()
     }
 
+    /// The sessions this window is linked into, for the callers that walk them.
+    ///
+    /// `handler_window` reconciles, emits and refreshes the attached sessions in
+    /// the order this returns, and the attach resize policy reads it too. It is
+    /// exactly the body it has always had, and the presentation accessor below
+    /// is what answers the format instead.
     pub(crate) fn window_linked_sessions_list(
         &self,
         session_name: &SessionName,
         window_index: u32,
     ) -> Vec<SessionName> {
         self.window_linked_session_family_list(session_name, window_index)
+    }
+
+    /// How many sessions `#{window_linked_sessions}` counts, and only that.
+    ///
+    /// tmux counts each session group that holds the window once, and each
+    /// session in no group once (`format.c` `format_cb_window_linked_sessions`):
+    /// a window shared by a group of three is held by one, and the same window
+    /// linked into an outside session too is held by two. The kill paths keep
+    /// reading `window_linked_session_count`, which counts the members.
+    pub(crate) fn window_linked_session_group_count(
+        &self,
+        session_name: &SessionName,
+        window_index: u32,
+    ) -> usize {
+        self.window_linked_session_family_list(session_name, window_index)
+            .iter()
+            .map(|member| {
+                self.sessions
+                    .session_group_name(member)
+                    .map_or((false, member.clone()), |group| (true, group.clone()))
+            })
+            .collect::<HashSet<_>>()
+            .len()
+    }
+
+    /// The sessions `#{window_linked_sessions_list}` names, and only that.
+    ///
+    /// Its one caller is `format_runtime/window.rs`; nothing that walks the
+    /// links to do work reads this.
+    ///
+    /// tmux walks the WINDOW's own winlinks and prints one session name per
+    /// winlink, in the order those links were made (`format.c:686-714`,
+    /// `window.c:183-193`): a session that links the same window twice is named
+    /// twice, an outsider linked between a creation and a JOIN is named between
+    /// them, and a group synchronised from one member names that member before
+    /// the peers it rebuilt. The window store keeps exactly that order, for a
+    /// session group as for an explicit link; when it cannot vouch for it, this
+    /// falls back to what it answered before.
+    pub(crate) fn window_linked_sessions_presentation_list(
+        &self,
+        session_name: &SessionName,
+        window_index: u32,
+    ) -> Vec<SessionName> {
+        if let Some(made) = self.sessions.window_link_order(&WindowTarget::with_window(
+            session_name.clone(),
+            window_index,
+        )) {
+            return made;
+        }
+        if self
+            .window_link_group_id_for_slot_or_group_peer(session_name, window_index)
+            .is_some()
+        {
+            return self.window_linked_session_family_list(session_name, window_index);
+        }
+        self.window_linked_sessions_without_explicit_links(session_name)
+    }
+
+    /// `#{window_active_sessions_list}` when the window store cannot vouch for
+    /// the order of this window's links: tmux names the sessions whose current
+    /// winlink is one of the window's, in the same order as
+    /// `#{window_linked_sessions_list}` (`format.c:718-767`), so this follows
+    /// the fallback that list takes.
+    ///
+    /// With an explicit link group the current-session list keeps the answer
+    /// it gave. With none, every member of the session group carries this
+    /// window at this index, and the members are named in the order the group
+    /// took them rather than starting from whichever member is asking.
+    pub(crate) fn window_active_sessions_presentation_fallback(
+        &self,
+        session_name: &SessionName,
+        window_index: u32,
+    ) -> Vec<SessionName> {
+        if self
+            .window_link_group_id_for_slot_or_group_peer(session_name, window_index)
+            .is_some()
+        {
+            return self.window_linked_current_sessions_list(session_name, window_index);
+        }
+        self.window_linked_sessions_without_explicit_links(session_name)
+            .into_iter()
+            .filter(|member| {
+                self.sessions
+                    .session(member)
+                    .is_some_and(|session| session.active_window_index() == window_index)
+            })
+            .collect()
+    }
+
+    /// The fallback for a window nothing links explicitly and whose order the
+    /// store no longer vouches for (after a renumber or a partial detach in its
+    /// group): its session group's members, in the order the group took them.
+    ///
+    /// The group took them in the order their identities were minted, under the
+    /// invariant this store maintains - the only ways into a group are a
+    /// singleton that declares one, or an existing template joined by a session
+    /// whose identity is minted after it. That is the same invariant
+    /// `#{session_group_list}` reads, and it is narrower than the sentence it
+    /// serves: a session's birth and its JOIN are the same event HERE.
+    ///
+    /// Two things this deliberately does NOT do. It does not dedup: tmux prints
+    /// one name per winlink, so a session that links the same window twice is
+    /// named twice, and no guard here pretends otherwise. And it does not know
+    /// where an explicitly linked outsider would sit among these members: only
+    /// the store's order above knows that interleaving.
+    ///
+    /// Presentation only: `window_linked_session_family_list` is untouched, so
+    /// the runtime, resize, clipboard and navigation aggregators, the shared
+    /// deduplication and `window_linked_session_count` keep what they had.
+    /// The window index is not read: with no explicit link group every member of
+    /// the session group carries the same window list, so the members ARE the
+    /// links of any window of it.
+    fn window_linked_sessions_without_explicit_links(
+        &self,
+        session_name: &SessionName,
+    ) -> Vec<SessionName> {
+        let mut members = self.sessions.session_group_members(session_name);
+        if members.len() < 2 {
+            return members;
+        }
+        // A stable sort, so a member this store cannot resolve keeps the name
+        // order it arrived in rather than jumping to the front.
+        members.sort_by_key(|member| {
+            self.sessions
+                .session(member)
+                .map_or(u32::MAX, |session| session.id().as_u32())
+        });
+        members
     }
 
     pub(crate) fn window_linked_current_sessions_list(
@@ -47,16 +206,22 @@ impl HandlerState {
                     .filter(|member| member != &slot.session_name),
             );
             for candidate in candidates {
-                if !seen.insert(candidate.clone()) {
-                    continue;
-                }
+                // The selection comes first and the deduplication after it. A
+                // session reached through an earlier slot where it is not current
+                // must not be marked seen there: it can hold a second alias of the
+                // same window further down the slot order and really be current on
+                // that one. Slot order is kept and a session still appears once.
                 let is_current = self
                     .sessions
                     .session(&candidate)
                     .is_some_and(|session| session.active_window_index() == slot.window_index);
-                if is_current {
-                    sessions.push(candidate);
+                if !is_current {
+                    continue;
                 }
+                if !seen.insert(candidate.clone()) {
+                    continue;
+                }
+                sessions.push(candidate);
             }
         }
         sessions
@@ -99,7 +264,7 @@ impl HandlerState {
             let Some(active_window_index) = self
                 .sessions
                 .session(&session_name)
-                .map(rmux_core::Session::active_window_index)
+                .map(|session| session.active_window_index())
             else {
                 continue;
             };
@@ -156,29 +321,12 @@ impl HandlerState {
             return false;
         }
 
-        let activity = {
-            let Some(window) = self
-                .sessions
-                .session_mut(target.session_name())
-                .and_then(|session| session.window_at_mut(target.window_index()))
-            else {
-                return false;
-            };
-            if !window.touch_activity_for_pane(target.pane_index()) {
-                return false;
-            }
-            let Some(activity) = window.pane_activity_snapshot(pane_id) else {
-                return false;
-            };
-            activity
-        };
-
-        targets.into_iter().all(|window_target| {
-            self.sessions
-                .session_mut(window_target.session_name())
-                .and_then(|session| session.window_at_mut(window_target.window_index()))
-                .is_some_and(|window| window.apply_pane_activity_snapshot(activity))
-        })
+        self.sessions
+            .touch_window_pane_activity(
+                &WindowTarget::with_window(target.session_name().clone(), target.window_index()),
+                target.pane_index(),
+            )
+            .unwrap_or(false)
     }
 
     pub(crate) fn runtime_session_name_for_window(
@@ -218,10 +366,21 @@ impl HandlerState {
         }
     }
 
-    pub(crate) fn synchronize_window_alias_options_from_session(&mut self, source: &Session) {
-        for window_index in source.windows().keys().copied() {
-            self.synchronize_linked_window_options_from_slot(source.name(), window_index);
+    pub(crate) fn synchronize_window_alias_options_from_name(
+        &mut self,
+        name: &SessionName,
+    ) -> Result<(), RmuxError> {
+        let indices = self
+            .sessions
+            .session(name)
+            .ok_or_else(|| session_not_found(name))?
+            .windows()
+            .map(|(index, _)| index)
+            .collect::<Vec<_>>();
+        for index in indices {
+            self.synchronize_linked_window_options_from_slot(name, index);
         }
+        Ok(())
     }
 
     fn window_link_group_id_for_slot_or_group_peer(
@@ -278,42 +437,10 @@ impl HandlerState {
         session_name: &SessionName,
         window_index: u32,
     ) -> Result<(), RmuxError> {
-        let source_slot = self.window_link_slot(session_name, window_index);
-        let Some(group_id) = self
-            .window_link_group_id_for_slot_or_group_peer(session_name, window_index)
-            .copied()
-        else {
-            return Ok(());
-        };
-        let Some(group) = self.window_link_groups.get(&group_id).cloned() else {
-            return Ok(());
-        };
-        if group.slots.len() <= 1 {
-            return Ok(());
-        }
-
-        let source_window = self
-            .sessions
-            .session(session_name)
-            .and_then(|session| session.window_at(window_index))
-            .cloned()
-            .ok_or_else(|| {
-                RmuxError::invalid_target(
-                    format!("{session_name}:{window_index}"),
-                    "window index does not exist in session",
-                )
-            })?;
-
-        for slot in group.slots {
-            if slot == source_slot {
-                continue;
-            }
-            self.sessions
-                .session_mut(&slot.session_name)
-                .ok_or_else(|| session_not_found(&slot.session_name))?
-                .replace_window(slot.window_index, source_window.clone())?;
-        }
-
+        self.sessions.window(&WindowTarget::with_window(
+            session_name.clone(),
+            window_index,
+        ))?;
         Ok(())
     }
 
@@ -338,34 +465,11 @@ impl HandlerState {
         session_name: &SessionName,
         window_index: u32,
     ) -> Result<Vec<SessionName>, RmuxError> {
-        let source = WindowTarget::with_window(session_name.clone(), window_index);
-        let source_window = self
-            .sessions
-            .session(session_name)
-            .and_then(|session| session.window_at(window_index))
-            .cloned()
-            .ok_or_else(|| {
-                RmuxError::invalid_target(
-                    source.to_string(),
-                    "window index does not exist in session",
-                )
-            })?;
-        let targets = self.window_linked_window_targets(session_name, window_index);
-        let mut synchronized_sessions = Vec::new();
-        let mut seen_sessions = HashSet::new();
-        for target in targets {
-            if seen_sessions.insert(target.session_name().clone()) {
-                synchronized_sessions.push(target.session_name().clone());
-            }
-            if target == source {
-                continue;
-            }
-            self.sessions
-                .session_mut(target.session_name())
-                .ok_or_else(|| session_not_found(target.session_name()))?
-                .replace_window(target.window_index(), source_window.clone())?;
-        }
-        Ok(synchronized_sessions)
+        self.sessions.window(&WindowTarget::with_window(
+            session_name.clone(),
+            window_index,
+        ))?;
+        Ok(self.window_linked_session_family_list(session_name, window_index))
     }
 
     pub(super) fn auto_named_window_key(

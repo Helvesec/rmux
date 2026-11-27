@@ -1,0 +1,22 @@
+name: PowerPC without 64-bit atomics
+
+on:
+  push:
+    branches: [main, release/0.11.0]
+  pull_request:
+    branches: [main, release/0.11.0]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  powerpc-linux-gnu:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
+        with:
+          persist-credentials: false
+      - name: Cross-build and test with qemu-user in Docker
+        run: scripts/test-powerpc-linux-gnu.sh

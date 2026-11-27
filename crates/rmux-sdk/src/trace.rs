@@ -115,7 +115,7 @@ impl TraceSession {
             .map(serde_json::to_string)
             .collect::<core::result::Result<Vec<_>, _>>()
             .map_err(|error| {
-                RmuxError::protocol(rmux_proto::RmuxError::Server(format!(
+                RmuxError::from_proto(rmux_proto::RmuxError::Server(format!(
                     "failed to encode rmux trace event: {error}"
                 )))
             })?
@@ -178,7 +178,7 @@ fn trace_io_error(error: std::io::Error) -> RmuxError {
 }
 
 fn lock_error<T>(error: std::sync::PoisonError<T>) -> RmuxError {
-    RmuxError::protocol(rmux_proto::RmuxError::Server(format!(
+    RmuxError::from_proto(rmux_proto::RmuxError::Server(format!(
         "rmux trace lock poisoned: {error}"
     )))
 }

@@ -96,6 +96,7 @@ pub enum MissingCurrentTargetFallback {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TargetFindContext {
     current: Option<Target>,
+    current_follows_client: bool,
     missing_current_target_fallback: MissingCurrentTargetFallback,
     mouse_target: Option<Target>,
     marked_target: Option<Target>,
@@ -108,6 +109,7 @@ impl TargetFindContext {
     pub fn new(current: Option<Target>) -> Self {
         Self {
             current,
+            current_follows_client: false,
             missing_current_target_fallback: MissingCurrentTargetFallback::AllowDefaultSession,
             mouse_target: None,
             marked_target: None,
@@ -120,6 +122,7 @@ impl TargetFindContext {
     pub fn from_target(target: Target) -> Self {
         Self {
             current: Some(target),
+            current_follows_client: false,
             missing_current_target_fallback: MissingCurrentTargetFallback::AllowDefaultSession,
             mouse_target: None,
             marked_target: None,
@@ -131,6 +134,26 @@ impl TargetFindContext {
     #[must_use]
     pub const fn current(&self) -> Option<&Target> {
         self.current.as_ref()
+    }
+
+    /// Marks the current target as derived from the requesting client (its
+    /// inherited pane, attached session or the default session) rather than
+    /// pinned by a queue state such as a hook, a key binding or `-t`.
+    ///
+    /// tmux 3.7b `cmd_find_from_client` makes such a client's current window
+    /// its session's active window, even when the caller's pane sits in
+    /// another window of that session.
+    #[must_use]
+    pub fn following_client(mut self) -> Self {
+        self.current_follows_client = true;
+        self
+    }
+
+    /// Returns whether the current target was derived from the requesting
+    /// client; see [`Self::following_client`].
+    #[must_use]
+    pub const fn current_follows_client(&self) -> bool {
+        self.current_follows_client
     }
 
     /// Disables default-session fallback when a supplied current target no

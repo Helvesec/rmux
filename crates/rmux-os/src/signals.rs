@@ -41,33 +41,27 @@ pub struct ServerSignalWake {
     read_fd: SignalWakeReadFd,
 }
 
-/// Process-global read side of the signal wake pipe.
+/// Owned per-watcher duplicate of the process-global signal wake pipe reader.
 ///
-/// The matching write fd is stored as a raw descriptor for use from signal
-/// handlers, so this wrapper intentionally does not close the descriptor on
-/// drop. Both sides live until daemon process exit.
+/// Dropping this reader closes only the duplicate. The global pipe pair stays
+/// open until process exit so signal handlers can continue to wake new watchers.
 #[cfg(unix)]
 #[derive(Debug)]
 pub struct SignalWakeReadFd {
-    fd: RawFd,
+    fd: OwnedFd,
 }
 
 #[cfg(unix)]
 impl AsRawFd for SignalWakeReadFd {
     fn as_raw_fd(&self) -> RawFd {
-        self.fd
+        self.fd.as_raw_fd()
     }
 }
 
 #[cfg(unix)]
 impl AsFd for SignalWakeReadFd {
     fn as_fd(&self) -> BorrowedFd<'_> {
-        unsafe {
-            // SAFETY: `SignalWakeReadFd` wraps the process-global read side of
-            // the daemon signal wake pipe. The descriptor is intentionally kept
-            // open until process exit.
-            BorrowedFd::borrow_raw(self.fd)
-        }
+        self.fd.as_fd()
     }
 }
 
@@ -143,14 +137,12 @@ fn install_server_signal_flags_impl() -> io::Result<ServerSignalWake> {
             return Err(error);
         }
     }
-    let watcher = Ok(ServerSignalWake {
-        read_fd: SignalWakeReadFd {
-            fd: read_fd.as_raw_fd(),
-        },
-    });
+    // The handlers retain this one global pair; every watcher, including the
+    // first, gets a separate owned duplicate. A duplicate setup failure must
+    // leave the global pair available for the next installation attempt.
     std::mem::forget(read_fd);
     std::mem::forget(write_fd);
-    watcher
+    duplicate_signal_wake_reader()
 }
 
 #[cfg(unix)]
@@ -331,7 +323,11 @@ fn duplicate_signal_wake_reader() -> io::Result<ServerSignalWake> {
     if duplicated < 0 {
         return Err(io::Error::last_os_error());
     }
-    set_close_on_exec_if_available(duplicated)?;
+    let duplicated = unsafe {
+        // SAFETY: `dup` returned a fresh descriptor whose ownership is transferred here.
+        OwnedFd::from_raw_fd(duplicated)
+    };
+    set_close_on_exec_if_available(duplicated.as_raw_fd())?;
     Ok(ServerSignalWake {
         read_fd: SignalWakeReadFd { fd: duplicated },
     })
@@ -339,6 +335,8 @@ fn duplicate_signal_wake_reader() -> io::Result<ServerSignalWake> {
 
 #[cfg(unix)]
 fn set_close_on_exec_if_available(fd: libc::c_int) -> io::Result<()> {
+    #[cfg(test)]
+    tests::fail_close_on_exec_if_requested(fd)?;
     let current = unsafe {
         // SAFETY: `fcntl(F_GETFD)` observes descriptor flags for a valid fd.
         libc::fcntl(fd, libc::F_GETFD)
@@ -428,3 +426,7 @@ fn reset_signal(signal: libc::c_int) -> io::Result<()> {
 fn reset_child_signal_dispositions_impl() -> io::Result<()> {
     Ok(())
 }
+
+#[cfg(all(test, unix))]
+#[path = "signals_tests.rs"]
+mod tests;

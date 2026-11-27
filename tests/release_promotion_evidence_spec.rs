@@ -1,12 +1,16 @@
 #![cfg(unix)]
 
+#[cfg(not(target_has_atomic = "64"))]
+use portable_atomic::AtomicU64;
 use serde_json::{json, Value};
 use std::ffi::OsString;
 use std::fs;
 use std::os::unix::fs::symlink;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
-use std::sync::atomic::{AtomicU64, Ordering};
+#[cfg(target_has_atomic = "64")]
+use std::sync::atomic::AtomicU64;
+use std::sync::atomic::Ordering;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 const SOURCE: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";

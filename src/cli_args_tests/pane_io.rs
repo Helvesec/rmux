@@ -120,6 +120,27 @@ fn last_pane_accepts_combined_input_flags_like_tmux() {
 }
 
 #[test]
+fn select_pane_accepts_combined_input_flags_like_tmux() {
+    for flags in [
+        &["-de"][..],
+        &["-d", "-e"],
+        &["-e", "-d"],
+        &["-l", "-d", "-e"],
+    ] {
+        let mut argv = vec!["select-pane"];
+        argv.extend_from_slice(flags);
+        let cli = parse_args(&argv).expect("tmux accepts both select-pane input flags");
+        match cli.command.expect("parsed command") {
+            super::super::Command::SelectPane(args) => {
+                assert!(args.disable_input);
+                assert!(args.enable_input);
+            }
+            _ => panic!("expected SelectPane command"),
+        }
+    }
+}
+
+#[test]
 fn kill_pane_accepts_session_targets_like_tmux() {
     let cli = parse_args(&["kill-pane", "-t", "alpha"]).unwrap();
     match cli.command.expect("parsed command") {

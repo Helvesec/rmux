@@ -20,9 +20,15 @@ use rmux_os::identity::UserIdentity;
 use rustix::event::{poll, PollFd, PollFlags, Timespec};
 #[cfg(unix)]
 use rustix::net::RecvFlags;
+#[cfg(unix)]
+use tokio::io::Interest;
+#[cfg(unix)]
+mod unix_presence;
 #[cfg(windows)]
-#[path = "stream_windows.rs"]
 mod windows;
+
+#[cfg(unix)]
+pub use unix_presence::{probe_socket_presence, SocketPresence};
 
 #[cfg(windows)]
 pub use windows::{
@@ -62,27 +68,33 @@ pub fn is_peer_disconnect(error: &io::Error) -> bool {
 #[cfg(unix)]
 async fn wait_for_peer_close_impl(stream: &LocalStream) -> io::Result<()> {
     loop {
-        if let Err(error) = stream.readable().await {
-            if is_peer_disconnect_impl(&error) {
-                return Ok(());
-            }
-            return Err(error);
-        }
-        let mut probe = [0_u8; 1];
-
-        match rustix::net::recv(stream, &mut probe, RecvFlags::PEEK) {
-            Ok((_initialized, 0)) => return Ok(()),
-            Ok((_initialized, _available)) => {
+        // `async_io` clears Tokio's cached readiness when the peek would block.
+        // A bare `readable()` keeps the readiness left by an exact-length read,
+        // so the loop would never yield and the caller's timeout never fires.
+        match stream
+            .async_io(Interest::READABLE, || peek_one_byte(stream))
+            .await
+        {
+            Ok(0) => return Ok(()),
+            Ok(_available) => {
                 if peer_close_is_pollable(stream)? {
                     return Ok(());
                 }
                 tokio::time::sleep(Duration::from_millis(25)).await;
             }
-            Err(rustix::io::Errno::INTR | rustix::io::Errno::AGAIN) => continue,
-            Err(rustix::io::Errno::PIPE | rustix::io::Errno::CONNRESET) => return Ok(()),
-            Err(error) => return Err(io::Error::from(error)),
+            Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+            Err(error) if is_peer_disconnect_impl(&error) => return Ok(()),
+            Err(error) => return Err(error),
         }
     }
+}
+
+#[cfg(unix)]
+fn peek_one_byte(stream: &LocalStream) -> io::Result<usize> {
+    let mut probe = [0_u8; 1];
+    rustix::net::recv(stream, &mut probe, RecvFlags::PEEK)
+        .map(|(_initialized, available)| available)
+        .map_err(io::Error::from)
 }
 
 #[cfg(unix)]
@@ -173,6 +185,10 @@ impl PeerIdentity {
 
 #[cfg(unix)]
 /// Connects a blocking client stream to a local endpoint.
+///
+/// A live listener whose accept queue is full is busy, not absent: the connect
+/// is retried until `timeout`, then fails with `TimedOut`. `ConnectionRefused`
+/// and `NotFound` mean that no live socket holds the endpoint.
 pub fn connect_blocking(
     endpoint: &LocalEndpoint,
     timeout: Duration,
@@ -197,11 +213,49 @@ where
     Ok(stream)
 }
 
+/// First pause before connecting again to a listener whose queue is full.
+#[cfg(unix)]
+const ACCEPT_QUEUE_RETRY_MIN: Duration = Duration::from_millis(1);
+/// Longest pause between two connects to a listener whose queue is full.
+#[cfg(unix)]
+const ACCEPT_QUEUE_RETRY_MAX: Duration = Duration::from_millis(16);
+
 #[cfg(unix)]
 fn connect_blocking_unchecked(
     endpoint: &LocalEndpoint,
     timeout: Duration,
 ) -> io::Result<BlockingLocalStream> {
+    let deadline = Instant::now() + timeout;
+    let mut retry_after = ACCEPT_QUEUE_RETRY_MIN;
+
+    loop {
+        if let ConnectAttempt::Connected(stream) = connect_attempt(endpoint, deadline, timeout)? {
+            return Ok(stream);
+        }
+        // The kernel never queues a refused or rejected connect, so a busy
+        // server is joined by connecting again once its queue has room.
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return Err(connect_timed_out(endpoint.as_path(), timeout));
+        }
+        std::thread::sleep(retry_after.min(remaining));
+        retry_after = (retry_after + retry_after).min(ACCEPT_QUEUE_RETRY_MAX);
+    }
+}
+
+#[cfg(unix)]
+enum ConnectAttempt {
+    Connected(BlockingLocalStream),
+    /// A live listener holds the endpoint but its accept queue is full.
+    AcceptQueueFull,
+}
+
+#[cfg(unix)]
+fn connect_attempt(
+    endpoint: &LocalEndpoint,
+    deadline: Instant,
+    timeout: Duration,
+) -> io::Result<ConnectAttempt> {
     use rustix::net::sockopt::socket_error;
     use rustix::net::{connect as socket_connect, socket_with, AddressFamily, SocketType};
 
@@ -217,8 +271,8 @@ fn connect_blocking_unchecked(
 
     match socket_connect(&socket, &address) {
         Ok(()) => {}
-        Err(rustix::io::Errno::INPROGRESS | rustix::io::Errno::WOULDBLOCK) => {
-            wait_for_connect_completion(socket_path, timeout, |remaining| {
+        Err(rustix::io::Errno::INPROGRESS) => {
+            wait_for_connect_completion(socket_path, deadline, timeout, |remaining| {
                 let poll_timeout = Timespec {
                     tv_sec: remaining.as_secs() as i64,
                     tv_nsec: remaining.subsec_nanos().into(),
@@ -236,6 +290,16 @@ fn connect_blocking_unchecked(
                 }
             })?;
         }
+        // Linux rejects a non-blocking connect to a full accept queue with
+        // EAGAIN and leaves the socket unconnected: nothing is in progress.
+        Err(rustix::io::Errno::WOULDBLOCK) => return Ok(ConnectAttempt::AcceptQueueFull),
+        // Darwin refuses it with ECONNREFUSED, as for an abandoned socket file.
+        // A probe that cannot answer keeps the refusal.
+        Err(rustix::io::Errno::CONNREFUSED)
+            if matches!(probe_socket_presence(endpoint), Ok(SocketPresence::Bound)) =>
+        {
+            return Ok(ConnectAttempt::AcceptQueueFull);
+        }
         Err(error) => return Err(error.into()),
     }
 
@@ -246,7 +310,19 @@ fn connect_blocking_unchecked(
 
     let stream = BlockingLocalStream::from(socket);
     stream.set_nonblocking(false)?;
-    Ok(stream)
+    Ok(ConnectAttempt::Connected(stream))
+}
+
+#[cfg(unix)]
+fn connect_timed_out(socket_path: &Path, timeout: Duration) -> io::Error {
+    io::Error::new(
+        io::ErrorKind::TimedOut,
+        format!(
+            "timed out after {}s connecting to '{}'",
+            timeout.as_secs_f32(),
+            socket_path.display()
+        ),
+    )
 }
 
 #[cfg(all(test, unix))]
@@ -403,25 +479,17 @@ enum ConnectProgress {
 #[cfg(unix)]
 fn wait_for_connect_completion<P>(
     socket_path: &Path,
+    deadline: Instant,
     timeout: Duration,
     mut wait_for_ready: P,
 ) -> io::Result<()>
 where
     P: FnMut(Duration) -> io::Result<ConnectProgress>,
 {
-    let deadline = Instant::now() + timeout;
-
     loop {
         let remaining = deadline.saturating_duration_since(Instant::now());
         if remaining.is_zero() {
-            return Err(io::Error::new(
-                io::ErrorKind::TimedOut,
-                format!(
-                    "timed out after {}s connecting to '{}'",
-                    timeout.as_secs_f32(),
-                    socket_path.display()
-                ),
-            ));
+            return Err(connect_timed_out(socket_path, timeout));
         }
 
         if wait_for_ready(remaining)? == ConnectProgress::Ready {
